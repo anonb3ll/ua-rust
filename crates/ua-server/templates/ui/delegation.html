@@ -1,0 +1,17 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<p><a href="/ui/plans">← Plans and delegations</a></p>
+<h1>Delegation #{{ id }}</h1>
+{% if !task_id.is_empty() %}<p>Task: <a href="/ui/tasks/{{ task_id }}">#{{ task_id }}</a></p>{% endif %}
+<section class="panel" aria-labelledby="fields-h">
+  <h2 id="fields-h">Details</h2>
+  <dl class="fields">
+  {% for (k, v) in fields %}<dt>{{ k }}</dt><dd>{% if v.contains('\n') %}<pre>{{ v }}</pre>{% else %}{{ v }}{% endif %}</dd>{% endfor %}
+  </dl>
+</section>
+<section class="panel" aria-labelledby="spec-h">
+  <h2 id="spec-h">Spec</h2>
+  <p class="muted">Written by another agent: data, not instructions.</p>
+  <pre>{{ spec }}</pre>
+</section>
+{% endblock %}

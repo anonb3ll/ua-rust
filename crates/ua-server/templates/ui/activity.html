@@ -1,0 +1,33 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Activity</h1>
+{% match chain %}
+{% when Err(e) %}<p class="error" role="alert">Ledger check unavailable: {{ e }}</p>
+{% when Ok(c) %}
+{% if c.ok %}
+<p class="flash" role="status">Ledger hash chain verified: {{ c.checked }} events checked.</p>
+{% else %}
+<p class="error" role="alert">Ledger hash chain broken at sequence {{ c.first_bad_seq }}: {{ c.reason }}</p>
+{% endif %}
+{% endmatch %}
+
+<form class="filters" method="get" action="/ui/activity" aria-label="Filter by channel">
+  <label>Channel prefix <input type="text" name="channel_prefix" value="{{ prefix }}" list="channel-presets" placeholder="agent.task."></label>
+  <datalist id="channel-presets">{% for p in presets %}<option value="{{ p }}">{% endfor %}</datalist>
+  <button type="submit">Filter</button>
+  {% if !prefix.is_empty() %}<a href="/ui/activity">All channels</a>{% endif %}
+</form>
+
+<section class="panel" aria-labelledby="feed-h">
+<h2 id="feed-h">Ledger{% if !prefix.is_empty() %} · <code>{{ prefix }}</code>{% endif %}</h2>
+<p class="muted">New events appear at the top as they are committed.</p>
+{% match events %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+<ol class="feed" id="feed" aria-live="polite" hx-ext="sse" sse-connect="{{ stream_url }}" sse-swap="ledger" hx-swap="afterbegin">
+{% for e in rows %}{% include "ui/event_row.html" %}{% endfor %}
+</ol>
+{% if rows.is_empty() %}<p class="muted">No recent events{% if !prefix.is_empty() %} on this channel{% endif %}.</p>{% endif %}
+{% endmatch %}
+</section>
+{% endblock %}

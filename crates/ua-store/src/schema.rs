@@ -29,8 +29,10 @@ pub fn apply(conn: &mut Connection, parts: &[SchemaPart]) -> anyhow::Result<Vec<
         match existing {
             Some(prev) if prev == checksum => continue,
             Some(_) => {
-                tracing::warn!(part = part.name, "schema part changed after release; not re-applied");
-                continue;
+                anyhow::bail!(
+                    "schema part {} changed after it was applied; released parts are immutable, add a new part instead",
+                    part.name
+                );
             }
             None => {}
         }
@@ -43,4 +45,21 @@ pub fn apply(conn: &mut Connection, parts: &[SchemaPart]) -> anyhow::Result<Vec<
     }
     tx.commit()?;
     Ok(applied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_changed_released_part_is_a_startup_error() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let v1 = SchemaPart { name: "demo.v1", sql: "CREATE TABLE IF NOT EXISTS demo (id INTEGER);" };
+        assert_eq!(apply(&mut conn, &[v1]).unwrap(), ["demo.v1"]);
+        assert!(apply(&mut conn, &[v1]).unwrap().is_empty(), "re-applying is a no-op");
+        let edited =
+            SchemaPart { name: "demo.v1", sql: "CREATE TABLE IF NOT EXISTS demo (id INTEGER, x TEXT);" };
+        let err = apply(&mut conn, &[edited]).unwrap_err();
+        assert!(err.to_string().contains("demo.v1"), "{err}");
+    }
 }
