@@ -1131,6 +1131,13 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     }
 
     let mut env = base_env();
+    // A scratch HOME: commands never see the operator's dotfiles, credential
+    // helpers or the hub's own data directory through `~`.
+    let scratch_home = ctx.hub.cfg().home.join("run-home");
+    std::fs::create_dir_all(&scratch_home)
+        .map_err(|e| UaError::internal(format!("cannot prepare the command HOME: {e}")))?;
+    env.retain(|(k, _)| k != "HOME");
+    env.push(("HOME".into(), scratch_home.to_string_lossy().into_owned()));
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
         for (k, v) in [
