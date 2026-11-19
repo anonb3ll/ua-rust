@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 158 tools are registered and the core families are ported.
+> **Status: alpha.** 161 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -96,6 +96,7 @@ vulnerability.
 | Memory and vault | Memory notes (FTS5, optional embeddings), Obsidian vault read/write, graph query, journal | |
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
+| Remote nodes | Node registry: `POST /api/node/register` and `/api/node/heartbeat` under the node's agent token, `GET /api/nodes` with derived liveness, bounded host facts, operator retire and un-retire, a `fleet_nodes` doctor row | |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
@@ -104,10 +105,11 @@ vulnerability.
 
 ## Not yet ported
 
-Remote nodes and cloud executors, ACP, Slack and Zulip connectors, role
-workflows, the TypeScript SDK's platform routes (`/api/runs`, `/api/nodes`,
-`/api/platform/*` answer 501), billing and usage ledgers, and tenancy
-(`org_id`).
+The remote-node work queue (claims, receipts, wake, and the other
+`/api/node/*` routes answer 501), cloud executors, ACP, Slack and Zulip
+connectors, role workflows, the TypeScript SDK's platform routes
+(`/api/runs`, `/api/platform/*` answer 501), billing and usage ledgers, and
+tenancy (`org_id`).
 
 ## License
 

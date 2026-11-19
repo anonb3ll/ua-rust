@@ -84,9 +84,11 @@ routes with the same request and response shapes:
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
 | `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |
+| `GET /api/nodes` | `node_list` |
+| `POST /api/node/register`, `POST /api/node/heartbeat` | `node_register`, `node_heartbeat` (agent token only) |
 
-`/api/runs`, `/api/nodes`, `/api/work-products`, `/api/evidence` and
-`/api/platform/*` answer `501` with
+`/api/runs`, `/api/nodes/*`, the node work-queue routes under `/api/node/`,
+`/api/work-products`, `/api/evidence` and `/api/platform/*` answer `501` with
 `{"error": "not_implemented", "capability": "..."}` until their tool
 families exist.
 
