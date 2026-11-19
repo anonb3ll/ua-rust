@@ -626,3 +626,87 @@ async fn run_cmd_refuses_cargo_under_an_ancestor_cargo_config() {
     let warning = ua_tools::families::workspace::cargo_config_warning(env.hub.cfg()).unwrap();
     assert!(warning.contains(&planted.display().to_string()), "{warning}");
 }
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The refusal reason of a `run_cmd` call refused for a cargo config.
+async fn cargo_config_refusal(env: &Env, command: &str) -> String {
+    match env.call("run_cmd", json!({ "command": command })).await {
+        Err(UaError::Denied { reason_code, reason }) if reason_code == "cargo-config" => reason,
+        other => panic!("expected a cargo-config refusal, got {other:?}"),
+    }
+}
+
+/// An operator can let cargo read a reviewed ancestor cargo config by
+/// pinning its path and SHA-256 in `trusted_cargo_configs`. An unlisted
+/// config, or a listed one whose content changed, is still refused, and
+/// the refusal names the setting and the file's current hash.
+#[tokio::test]
+async fn run_cmd_runs_cargo_under_a_trusted_ancestor_cargo_config_while_it_is_unchanged() {
+    use ua_core::config::TrustedCargoConfig;
+    let outer = tempfile::tempdir().unwrap();
+    let top = outer.path().canonicalize().unwrap();
+    let ws = top.join("nested/ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let planted = top.join(".cargo/config.toml");
+    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    let content = b"[build]\nrustc-wrapper = \"sccache\"\n";
+    std::fs::write(&planted, content).unwrap();
+    let sha = sha256_hex(content);
+    // Configs the host itself has above the temp dir are trusted as they
+    // are, so only this test's file decides the outcome.
+    let host: Vec<TrustedCargoConfig> = ua_tools::families::workspace::ancestor_cargo_configs(&ws)
+        .into_iter()
+        .filter(|p| !p.starts_with(&top))
+        .map(|p| TrustedCargoConfig { sha256: sha256_hex(&std::fs::read(&p).unwrap_or_default()), path: p })
+        .collect();
+    let with = |trusted: Vec<TrustedCargoConfig>| {
+        let (ws, host) = (ws.clone(), host.clone());
+        setup_with(move |c| {
+            c.workspace = Some(ws);
+            c.shell_allowlist = vec!["cargo".into()];
+            c.trusted_cargo_configs = host.into_iter().chain(trusted).collect();
+        })
+    };
+
+    // Unlisted: refused, and the refusal says how to trust this content.
+    let env = with(Vec::new());
+    let reason = cargo_config_refusal(&env, "cargo --version").await;
+    assert!(reason.contains(&planted.display().to_string()), "{reason}");
+    assert!(reason.contains("trusted_cargo_configs"), "{reason}");
+    assert!(reason.contains(&format!("sha256 = \"{sha}\"")), "{reason}");
+    assert!(reason.contains("outside that directory tree"), "{reason}");
+    let warning = ua_tools::families::workspace::cargo_config_warning(env.hub.cfg()).unwrap();
+    assert!(warning.contains(&sha), "{warning}");
+
+    // Listed with the matching hash (in any case): cargo runs.
+    let pin = |sha256: &str| TrustedCargoConfig { path: planted.clone(), sha256: sha256.into() };
+    let env = with(vec![pin(&sha.to_ascii_uppercase())]);
+    let r = env.call("run_cmd", json!({ "command": "cargo --version" })).await;
+    assert!(r.is_ok(), "a trusted config refused cargo: {r:?}");
+    let check = env.call("run_cmd_check", json!({ "command": "cargo build" })).await.unwrap();
+    assert!(!check["findings"].as_array().unwrap().iter().any(|f| f["code"] == "cargo-config"), "{check}");
+    assert!(ua_tools::families::workspace::cargo_config_warning(env.hub.cfg()).is_none());
+
+    // The file changes after it was pinned: refused again, naming both hashes.
+    let changed = b"[build]\nrustc-wrapper = \"/tmp/other\"\n";
+    std::fs::write(&planted, changed).unwrap();
+    let now = sha256_hex(changed);
+    let reason = cargo_config_refusal(&env, "cargo --version").await;
+    assert!(reason.contains(&format!("sha256 = \"{now}\"")), "{reason}");
+    assert!(reason.contains(&format!("changed since trusted_cargo_configs pinned sha256 {sha}")), "{reason}");
+    let check = env.call("run_cmd_check", json!({ "command": "cargo build" })).await.unwrap();
+    assert_eq!(check["verdict"], "block", "{check}");
+
+    // A second, unlisted config next to the trusted one is refused too.
+    std::fs::write(&planted, content).unwrap();
+    let other = top.join("nested/.cargo/config");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "").unwrap();
+    let reason = cargo_config_refusal(&env, "cargo --version").await;
+    assert!(reason.contains(&other.display().to_string()), "{reason}");
+    assert!(!reason.contains(&planted.display().to_string()), "the trusted file is not named: {reason}");
+}
