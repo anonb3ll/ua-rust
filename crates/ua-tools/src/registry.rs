@@ -192,6 +192,7 @@ impl Registry {
         }
 
         let mut policy_gated = false;
+        let mut reservation: Option<i64> = None;
         match loaded {
             None => {}
             Some(Err(reason)) => {
@@ -201,10 +202,19 @@ impl Registry {
                 return Err(err);
             }
             Some(Ok(p)) => {
+                // Evaluate and reserve the `tool_calls` row in one write
+                // transaction. The single writer serializes concurrent calls,
+                // so rate limits and cooldowns count calls still in flight.
                 let (c, n, a) = (caller.clone(), name.to_string(), args.clone());
                 let verdict = hub
                     .db()
-                    .read_async(move |conn| Ok(policy::evaluate(conn, &p, &c, &n, &a)))
+                    .write_async(move |tx| match policy::evaluate(tx, &p, &c, &n, &a) {
+                        Ok(v) => {
+                            let id = reserve_call(tx, &c, &n)?;
+                            Ok(Ok((v, id)))
+                        }
+                        Err(r) => Ok(Err(r)),
+                    })
                     .await
                     .unwrap_or_else(|e| {
                         Err(policy::Refusal {
@@ -216,8 +226,11 @@ impl Registry {
                         })
                     });
                 match verdict {
-                    Ok(Verdict::Allow) => {}
-                    Ok(Verdict::RequireApproval(_)) => policy_gated = true,
+                    Ok((Verdict::Allow, id)) => reservation = Some(id),
+                    Ok((Verdict::RequireApproval(_), id)) => {
+                        reservation = Some(id);
+                        policy_gated = true;
+                    }
                     Err(refusal) => {
                         record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
                         return Err(refusal.error);
@@ -230,16 +243,26 @@ impl Registry {
             && let Err(refusal) = policy::check_prod_action(hub.cfg(), caller, name)
         {
             record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
+            release_reservation(hub, reservation).await;
             return Err(refusal.error);
         }
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
         if gated {
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), args.clone());
-            let outcome = hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await?;
+            let outcome = match hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    release_reservation(hub, reservation).await;
+                    return Err(e);
+                }
+            };
             match outcome {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => {
+                    // A parked call has not run; it does not count against limits.
+                    release_reservation(hub, reservation).await;
                     return Err(UaError::ApprovalRequired { tool: name.to_string(), approval_id });
                 }
                 GateOutcome::Denied { approval_id, reason } => {
@@ -248,6 +271,7 @@ impl Registry {
                         format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
                     );
                     record_decision(hub, caller, name, &err).await;
+                    release_reservation(hub, reservation).await;
                     return Err(err);
                 }
             }
@@ -257,7 +281,7 @@ impl Registry {
         let started_at = ua_core::time::now();
         let clock = std::time::Instant::now();
         let result = (def.handler)(ctx, args).await;
-        record_call(hub, caller, name, started_at, clock.elapsed(), &result).await;
+        record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation).await;
         result
     }
 }
@@ -270,6 +294,7 @@ async fn record_call(
     started_at: String,
     elapsed: std::time::Duration,
     result: &UaResult<Value>,
+    reservation: Option<i64>,
 ) {
     let outcome = match result {
         Ok(_) => "ok".to_string(),
@@ -290,11 +315,17 @@ async fn record_call(
     let res = hub
         .db()
         .write_async(move |tx| {
-            tx.execute(
-                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
-            )?;
+            match reservation {
+                Some(id) => tx.execute(
+                    "UPDATE tool_calls SET duration_ms = ?2, outcome = ?3 WHERE id = ?1",
+                    rusqlite::params![id, row.5, row.6],
+                )?,
+                None => tx.execute(
+                    "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+                )?,
+            };
             Ok(())
         })
         .await;
@@ -334,5 +365,44 @@ async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaEr
         .await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "could not record gateway decision");
+    }
+}
+
+fn transport_name(caller: &Caller) -> String {
+    serde_json::to_value(caller.transport)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Insert an in-flight `tool_calls` row (outcome `running`) so policy limits
+/// see calls that have not finished yet. Returns its id.
+fn reserve_call(tx: &rusqlite::Transaction<'_>, caller: &Caller, tool: &str) -> rusqlite::Result<i64> {
+    tx.execute(
+        "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'running')",
+        rusqlite::params![
+            tool,
+            caller.label,
+            caller.profile.as_str(),
+            transport_name(caller),
+            ua_core::time::now()
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Drop a reservation for a call that never ran (parked or refused later).
+async fn release_reservation(hub: &Hub, reservation: Option<i64>) {
+    let Some(id) = reservation else { return };
+    let res = hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute("DELETE FROM tool_calls WHERE id = ?1 AND outcome = 'running'", [id])?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "could not release a tool_calls reservation");
     }
 }
