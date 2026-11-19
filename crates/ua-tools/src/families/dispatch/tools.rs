@@ -1,6 +1,6 @@
 //! The dispatch tools.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
@@ -10,12 +10,13 @@ use ua_core::{ActorKind, Caller, Profile, UaError, UaResult};
 
 use super::executor::{self, LaunchSpec};
 use super::{
-    Edge, Outcome, after_seconds, check_run_owner, classify_termination, finalize_cancellation,
-    live_run_for_task, load_run, now, record_outcome, record_transition, refusal, run_object, states,
-    transition,
+    Edge, Outcome, after_seconds, check_agent_or_operator, check_run_owner, classify_termination,
+    finalize_cancellation, live_run_for_task, load_run, now, record_outcome, record_transition, refusal,
+    run_object, states, transition,
 };
+use crate::approvals::{self, GateOutcome};
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
-use crate::registry::{Registry, ToolCtx, tool};
+use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 const PROMPT_CAP: usize = 32 * 1024;
 const MAX_LEASE_SECONDS: i64 = 86_400;
@@ -25,8 +26,9 @@ const MAX_LEASE_SECONDS: i64 = 86_400;
 pub struct TaskArgs {
     /// Task to dispatch.
     pub task_id: i64,
-    /// Agent label the run belongs to. Only this identity may report,
-    /// cancel or resume the run.
+    /// Agent label the run belongs to. Only this identity may report or
+    /// resume the run; it or an operator may cancel it. The caller must be
+    /// this agent or an operator.
     pub agent: String,
     /// Harness name from the hub's `[harnesses.<name>]` config. Omitted, the
     /// run is recorded and marked launched but no process is started.
@@ -101,12 +103,16 @@ pub fn register(r: &mut Registry) {
             "dispatch_task",
             "Dispatch a task to an agent harness: mint a run (claimed, fence 1, with a lease), claim the task \
              for the agent, and start the configured harness as a child process in the task's worktree with an \
-             allowlisted environment. Always needs a one-time human approval. Returns {ok, run_id, state, fence, \
-             pid, log_path, spawned, stub}.",
+             allowlisted environment. The caller must be the agent or an operator. Always needs a one-time \
+             human approval, bound to what will run: the approval shows the run id, resolved workdir, harness \
+             argv template, env allowlist, prompt_sha256 and whether the agent's token is passed, and a pass \
+             is refused (approval_binding_changed) if any of them changed since. Returns {ok, run_id, state, \
+             fence, pid, log_path, spawned, stub}.",
             |ctx: ToolCtx, a: TaskArgs| async move { dispatch_task(ctx, a).await },
         )
-        .family("dispatch")
-        .always_gated(),
+        // Gated in the handler, not by the registry: the approval must cover
+        // values resolved from the task and config, not just the arguments.
+        .family("dispatch"),
     );
     r.add(
         tool(
@@ -122,9 +128,10 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "dispatch_cancel",
-            "Cancel the caller's live dispatch run: record the intent, stop the run's process group when this \
-             hub started it, and record whether cessation is confirmed. Returns {ok, run_id, state, termination, \
-             cessation}.",
+            "Cancel a live dispatch run (the caller's own, or any run for an operator or human): record the \
+             intent and who cancelled, stop the run's process group when this hub started it or can prove it \
+             is this hub's orphan, and record whether cessation is confirmed. Returns {ok, run_id, state, \
+             termination, cessation, cancelled_by}.",
             |ctx: ToolCtx, a: CancelArgs| async move { cancel(ctx, a).await },
         )
         .family("dispatch"),
@@ -218,18 +225,15 @@ async fn require_run(ctx: &ToolCtx, run_id: &str) -> UaResult<super::Run> {
         .ok_or_else(|| UaError::not_found(format!("unknown dispatch run: {run_id}")))
 }
 
-fn new_run_id(task_id: i64) -> String {
-    let hex = uuid::Uuid::new_v4().simple().to_string();
-    format!("run-{task_id}-{}", &hex[..8])
-}
-
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-/// Resolve and check the directory a harness runs in.
-fn resolve_workdir(raw: &str) -> UaResult<PathBuf> {
+/// Resolve and check the directory a harness runs in: absolute, existing,
+/// not the filesystem root and not inside the hub's home (`$UA_HOME`, which
+/// holds the database and run logs).
+fn resolve_workdir(raw: &str, ua_home: &Path) -> UaResult<PathBuf> {
     let p = PathBuf::from(raw);
     if !p.is_absolute() {
         return Err(UaError::invalid(format!("worktree {raw:?} must be an absolute path")));
@@ -240,6 +244,12 @@ fn resolve_workdir(raw: &str) -> UaResult<PathBuf> {
     }
     if canon.parent().is_none() {
         return Err(UaError::invalid("a harness may not run in the filesystem root"));
+    }
+    let home = ua_home.canonicalize().unwrap_or_else(|_| ua_home.to_path_buf());
+    if canon.starts_with(&home) {
+        return Err(UaError::invalid(format!(
+            "worktree {raw:?} is inside the hub home; a harness may not run there"
+        )));
     }
     Ok(canon)
 }
@@ -287,7 +297,8 @@ fn bind_task(
     Ok(())
 }
 
-/// Attach the approval pass the registry just consumed for this call.
+/// Attach the approval pass the registry just consumed for this call. Exactly
+/// one row must be linked; anything else fails the caller's transaction.
 fn link_approval(
     tx: &rusqlite::Connection,
     tool: &str,
@@ -295,12 +306,30 @@ fn link_approval(
     payload: &str,
     run_id: &str,
 ) -> UaResult<()> {
-    tx.execute(
+    let n = tx.execute(
         "UPDATE approvals SET run_id = ?1 WHERE id = (SELECT id FROM approvals WHERE tool = ?2 \
          AND status = 'consumed' AND requested_by = ?3 AND payload = ?4 AND run_id IS NULL \
          ORDER BY consumed_at DESC, id DESC LIMIT 1)",
         params![run_id, tool, requester, payload],
     )?;
+    expect_one_link(n, run_id)
+}
+
+/// Attach approval `approval_id` (just consumed) to the run.
+fn link_approval_id(tx: &rusqlite::Connection, approval_id: i64, run_id: &str) -> UaResult<()> {
+    let n = tx.execute(
+        "UPDATE approvals SET run_id = ?1 WHERE id = ?2 AND status = 'consumed' AND run_id IS NULL",
+        params![run_id, approval_id],
+    )?;
+    expect_one_link(n, run_id)
+}
+
+fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
+    if n != 1 {
+        return Err(UaError::conflict(format!(
+            "approval_link_failed: expected one consumed approval to link to run {run_id}, found {n}"
+        )));
+    }
     Ok(())
 }
 
@@ -308,9 +337,84 @@ fn link_approval(
 // dispatch_task
 // ---------------------------------------------------------------------------
 
+/// Argument keys of a `dispatch_task` approval payload; the rest of the
+/// payload is the binding resolved from them.
+const ARG_KEYS: [&str; 5] = ["task_id", "agent", "harness", "prompt", "lease_seconds"];
+const BOUND_KEYS: [&str; 7] =
+    ["run_id", "workdir", "argv", "env_allowlist", "prompt_source", "prompt_sha256", "passes_token_of"];
+
+/// A run id that is stable between the call that requests the approval and
+/// the call that consumes it: derived from a random per-database salt, the
+/// task, how many runs it has had, and the agent. Another run of the task in
+/// between changes it, which the approval binding then reports.
+fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResult<String> {
+    let salt: Option<String> = tx
+        .query_row("SELECT value FROM dispatch_meta WHERE key = 'run_id_salt'", [], |r| r.get(0))
+        .optional()?;
+    let salt = match salt {
+        Some(s) => s,
+        None => {
+            let s = uuid::Uuid::new_v4().simple().to_string();
+            tx.execute("INSERT INTO dispatch_meta (key, value) VALUES ('run_id_salt', ?1)", [&s])?;
+            s
+        }
+    };
+    let prior: i64 =
+        tx.query_row("SELECT COUNT(*) FROM dispatch_runs WHERE task_id = ?1", [task_id], |r| r.get(0))?;
+    let h = sha256_hex(&format!("{salt}:{task_id}:{prior}:{agent}"));
+    Ok(format!("run-{task_id}-{}", &h[..8]))
+}
+
+/// The default prompt: the task title and notes, and the run to report on.
+fn default_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str) -> String {
+    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+    format!(
+        "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id}. When done, call \
+         dispatch_report_self(state, run_id=\"{run_id}\", evidence=...).",
+        str_field(task, "title").unwrap_or_default()
+    )
+}
+
+/// An approved, unconsumed pass for the same arguments whose binding no
+/// longer matches: its id and the bound fields that changed.
+fn stale_pass(
+    tx: &rusqlite::Connection,
+    requester: &str,
+    payload: &Value,
+) -> UaResult<Option<(i64, Vec<String>)>> {
+    let mut stmt = tx.prepare(
+        "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND requested_by = ?1 \
+         AND status = 'approved' ORDER BY id DESC",
+    )?;
+    let rows: Vec<(i64, String)> =
+        stmt.query_map([requester], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    for (id, text) in rows {
+        let Ok(old) = serde_json::from_str::<Value>(&text) else { continue };
+        if ARG_KEYS.iter().any(|k| old.get(k) != payload.get(k)) {
+            continue;
+        }
+        let changed: Vec<String> =
+            BOUND_KEYS.iter().filter(|k| old.get(**k) != payload.get(**k)).map(|k| k.to_string()).collect();
+        if !changed.is_empty() {
+            return Ok(Some((id, changed)));
+        }
+    }
+    Ok(None)
+}
+
+enum Gated {
+    Run { run_id: String, prompt: String, workdir: Option<PathBuf> },
+    Pending { approval_id: i64, stale: Option<(i64, Vec<String>)> },
+    Denied { approval_id: i64, reason: Option<String> },
+}
+
 async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
-    let cfg = ctx.hub.cfg().clone();
     let agent = check_slug("agent", &a.agent)?;
+    check_agent_or_operator(&ctx.caller, "dispatch_task", &agent)?;
+    if let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "dispatch_task") {
+        return Err(refusal.error);
+    }
+    let cfg = ctx.hub.cfg().clone();
     let harness = match a.harness.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => Some((
             name.to_string(),
@@ -333,64 +437,117 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         Some(s) => s as u64,
         None => cfg.dispatch_lease_seconds.max(1),
     };
-    let payload = crate::approvals::canonical_payload(&serde_json::to_value(&a)?);
-
-    let tid = a.task_id;
-    let task = ctx.hub.db().read_async(move |c| require_task(c, tid)).await?;
-    let workdir = match &harness {
-        None => None,
-        Some((name, h)) => {
-            let raw = str_field(&task, "worktree_path")
-                .map(str::to_string)
-                .or_else(|| h.workdir.as_ref().map(|p| p.display().to_string()))
-                .ok_or_else(|| {
-                    UaError::invalid(format!(
-                        "task {tid} records no worktree and harness {name:?} sets no workdir"
-                    ))
-                })?;
-            Some(resolve_workdir(&raw)?)
-        }
-    };
-    let run_id = new_run_id(tid);
-    let prompt = match a.prompt {
-        Some(p) => p,
-        None => {
-            let notes: String = str_field(&task, "notes").unwrap_or_default().chars().take(8000).collect();
-            format!(
-                "Task #{tid}: {}\n\n{notes}\n\nYou are dispatch run {run_id}. When done, call \
-                 dispatch_report_self(state, run_id=\"{run_id}\", evidence=...).",
-                str_field(&task, "title").unwrap_or_default()
-            )
-        }
-    };
-    if prompt.len() > PROMPT_CAP {
+    if a.prompt.as_ref().is_some_and(|p| p.len() > PROMPT_CAP) {
         return Err(UaError::invalid(format!("prompt is longer than {PROMPT_CAP} bytes")));
     }
 
-    let (rid, ag, actor) = (run_id.clone(), agent.clone(), ctx.caller.label.clone());
-    let (hname, wd, pr) = (
-        harness.as_ref().map(|(n, _)| n.clone()),
-        workdir.as_ref().map(|p| p.display().to_string()),
-        prompt.clone(),
-    );
+    // Resolve what will run, gate on it, and mint the run, in one write
+    // transaction: nothing the approval covers can change in between.
+    let tid = a.task_id;
+    let (hub, caller, ag) = (ctx.hub.clone(), ctx.caller.clone(), agent.clone());
+    let h2 = harness.clone();
     let lease_at = after_seconds(lease);
-    ctx.hub
+    let gated = ctx
+        .hub
         .db()
         .write_async(move |tx| {
+            let task = require_task(tx, tid)?;
             check_task_free(tx, tid, &ag, None)?;
+            let workdir = match &h2 {
+                None => None,
+                Some((name, h)) => {
+                    let raw = str_field(&task, "worktree_path")
+                        .map(str::to_string)
+                        .or_else(|| h.workdir.as_ref().map(|p| p.display().to_string()))
+                        .ok_or_else(|| {
+                            UaError::invalid(format!(
+                                "task {tid} records no worktree and harness {name:?} sets no workdir"
+                            ))
+                        })?;
+                    Some(resolve_workdir(&raw, &hub.cfg().home)?)
+                }
+            };
+            let run_id = derive_run_id(tx, tid, &ag)?;
+            let (prompt, source) = match &a.prompt {
+                Some(p) => (p.clone(), "args"),
+                None => (default_prompt(tid, &task, &run_id), "task"),
+            };
+            if prompt.len() > PROMPT_CAP {
+                return Err(UaError::invalid(format!("prompt is longer than {PROMPT_CAP} bytes")));
+            }
+            let prompt_sha = sha256_hex(&prompt);
+            let mut payload = json!({
+                "task_id": tid,
+                "agent": ag,
+                "harness": h2.as_ref().map(|(n, _)| n.clone()),
+                "lease_seconds": lease,
+                "run_id": run_id,
+                "workdir": workdir.as_ref().map(|p| p.display().to_string()),
+                "argv": h2.as_ref().map(|(_, h)| h.argv.clone()),
+                "env_allowlist": h2.as_ref().map(|(_, h)| h.env_allowlist.clone()),
+                "prompt_source": source,
+                "prompt_sha256": prompt_sha,
+            });
+            if let Some(p) = &a.prompt {
+                payload["prompt"] = json!(p);
+            }
+            if h2.as_ref().is_some_and(|(_, h)| h.pass_agent_token) {
+                payload["passes_token_of"] = json!(ag);
+            }
+            let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_task", &payload)? {
+                GateOutcome::Pass { approval_id } => approval_id,
+                GateOutcome::Pending { approval_id } => {
+                    let stale = stale_pass(tx, &caller.label, &payload)?;
+                    return Ok(Gated::Pending { approval_id, stale });
+                }
+                GateOutcome::Denied { approval_id, reason } => return Ok(Gated::Denied { approval_id, reason }),
+            };
             let ts = now();
             tx.execute(
                 "INSERT INTO dispatch_runs (run_id, task_id, agent_label, harness, state, actor, lease_owner, \
                  lease_expires_at, attempt, fence, workdir, prompt, prompt_sha256, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, 'claimed', ?5, ?5, ?6, 1, 1, ?7, ?8, ?9, ?10, ?10)",
-                params![rid, tid, ag, hname, actor, lease_at, wd, pr, sha256_hex(&pr), ts],
+                params![
+                    run_id,
+                    tid,
+                    ag,
+                    payload["harness"].as_str(),
+                    caller.label,
+                    lease_at,
+                    payload["workdir"].as_str(),
+                    prompt,
+                    prompt_sha,
+                    ts
+                ],
             )?;
-            bind_task(tx, tid, &rid, &ag, &lease_at)?;
-            link_approval(tx, "dispatch_task", &actor, &payload, &rid)?;
-            record_transition(tx, &rid, "claimed", &actor, json!({}))?;
-            Ok(())
+            bind_task(tx, tid, &run_id, &ag, &lease_at)?;
+            link_approval_id(tx, approval_id, &run_id)?;
+            record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
+            Ok(Gated::Run { run_id, prompt, workdir })
         })
         .await?;
+    let (run_id, prompt, workdir) = match gated {
+        Gated::Run { run_id, prompt, workdir } => (run_id, prompt, workdir),
+        Gated::Pending { approval_id, stale: None } => {
+            return Err(UaError::ApprovalRequired { tool: "dispatch_task".into(), approval_id });
+        }
+        Gated::Pending { approval_id, stale: Some((old, changed)) } => {
+            return Err(UaError::denied(
+                "approval_binding_changed",
+                format!(
+                    "approval {old} no longer matches what would run (changed: {}); approval {approval_id} \
+                     was requested for the current values",
+                    changed.join(", ")
+                ),
+            ));
+        }
+        Gated::Denied { approval_id, reason } => {
+            return Err(UaError::denied(
+                "approval_denied",
+                format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+            ));
+        }
+    };
 
     let mut out = match harness {
         None => executor::launch_stub(&ctx.hub, run_id.clone(), ctx.caller.label.clone()).await?,
@@ -493,7 +650,7 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     verified(&ctx.caller, "dispatch_cancel")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
-    check_run_owner(&ctx.caller, "dispatch_cancel", &run)?;
+    check_agent_or_operator(&ctx.caller, "dispatch_cancel", &run.agent_label)?;
     let reason =
         a.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or("client cancelled".into());
     let actor = ctx.caller.label.clone();
@@ -519,13 +676,22 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
             }
             let edge = Edge {
                 to: None,
-                sets: vec![("termination_outcome", "requested".to_string().into())],
+                sets: vec![
+                    ("termination_outcome", "requested".to_string().into()),
+                    ("cancelled_by", actor2.clone().into()),
+                ],
                 require_unlocked: true,
             };
             if let Err(why) = transition(tx, &run, edge)? {
                 return Ok(Err(refusal(why, &rid2, json!({ "state": run.state }))));
             }
-            record_transition(tx, &rid2, "cancel_requested", &actor2, json!({ "reason": reason2 }))?;
+            record_transition(
+                tx,
+                &rid2,
+                "cancel_requested",
+                &actor2,
+                json!({ "reason": reason2, "cancelled_by": actor2, "on_behalf": actor2 != run.agent_label }),
+            )?;
             Ok(Ok(()))
         })
         .await?;
@@ -535,16 +701,22 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
 
     // 2. Stop the process (re-read: a launch may have recorded a pid since).
     let fresh = require_run(&ctx, &rid).await?;
-    let termination = executor::terminate(&rid, fresh.pid);
+    let termination = blocking(move || Ok(executor::terminate(&fresh))).await?;
     let cessation = classify_termination(termination);
 
     // 3. Commit the outcome.
-    ctx.hub
+    let by = actor.clone();
+    let mut out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             finalize_cancellation(tx, &rid, &actor, "cancel", &reason, termination, cessation)
         })
-        .await
+        .await?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("cancelled_by".into(), json!(by));
+    }
+    Ok(out)
 }
 
 fn reconcilable_for_retry(run: &super::Run) -> bool {
@@ -562,7 +734,7 @@ async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             run.state, run.termination_outcome
         )));
     }
-    let termination = executor::terminate(&rid, run.pid);
+    let termination = blocking(move || Ok(executor::terminate(&run))).await?;
     let cessation = classify_termination(termination);
     let actor = ctx.caller.label.clone();
     let res = ctx
@@ -654,7 +826,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         )),
     };
     let workdir = match (&harness, run.workdir.as_deref()) {
-        (Some(_), Some(w)) => Some(resolve_workdir(w)?),
+        (Some(_), Some(w)) => Some(resolve_workdir(w, &cfg.home)?),
         (Some(_), None) => {
             return Err(UaError::conflict("dispatch resume failed: the run recorded no workdir"));
         }
@@ -690,6 +862,11 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 .null("evidence_ref")
                 .null("termination_outcome")
                 .null("pid")
+                .null("pgid")
+                .null("pid_start_time")
+                .null("supervisor_pid")
+                .null("supervisor_start_time")
+                .null("cancelled_by")
                 .null("exit_code")
                 .null("exit_signal")
                 .null("output_bytes")
@@ -789,7 +966,9 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
     let approval_outcome = match &approval {
         Some((_, status)) if status == "consumed" => "approved".to_string(),
         Some((_, status)) => status.clone(),
-        None if claimed => "approved".into(),
+        // A minted run with no approval row behind it is never reported as
+        // approved.
+        None if claimed => "unlinked".into(),
         None => "not_requested".into(),
     };
     let mut receipts_stmt = conn.prepare("SELECT * FROM dispatch_receipts WHERE run_id = ?1 ORDER BY id")?;
@@ -820,6 +999,7 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
         "evidence_ref": get("evidence_ref"),
         "failure_reason": get("failure_reason"),
         "termination_outcome": get("termination_outcome"),
+        "cancelled_by": get("cancelled_by"),
         "final_task_state": task_state,
         "run_state": state,
         "terminal": states::is_terminal(&state),

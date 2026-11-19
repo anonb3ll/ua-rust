@@ -188,7 +188,6 @@ async fn main() -> anyhow::Result<()> {
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
     let state = AppState { hub: hub.clone(), registry: registry.clone() };
-    let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
 
     match cli.cmd {
         Cmd::Serve => {
@@ -207,6 +206,11 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
             }
             ua_tools::families::workspace::sweep_run_homes();
+            // Reconcile runs a previous hub process left behind, then keep
+            // sweeping. Only the server reaps: a short-lived `ua call` or a
+            // stdio session must not judge another process's children.
+            ua_tools::families::dispatch::startup_sweep(&hub).await;
+            let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {
