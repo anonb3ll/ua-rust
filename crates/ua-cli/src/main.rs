@@ -80,6 +80,10 @@ enum ImportCmd {
         /// check without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Import even if some source rows carry an `org_id`. ua-rust has no
+        /// tenant scope, so those rows lose their boundary.
+        #[arg(long)]
+        drop_org_scope: bool,
     },
 }
 
@@ -164,17 +168,23 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run } } = &cli.cmd {
+    if let Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } = &cli.cmd {
         let report = if *dry_run {
             ua_import::dry_run(from)?
         } else {
+            // Held until the import ends: no hub may run on this database.
+            let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
             let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
-            ua_import::import(&db, from, &ua_import::Options::default())?
+            let opts = ua_import::Options { drop_org_scope: *drop_org_scope, ..Default::default() };
+            ua_import::import(&db, from, &opts)?
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
+    // Every command that opens the hub holds a shared lock while it runs, so an
+    // import (which takes it exclusively) refuses while any of them is live.
+    let _hub_lock = ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?;
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
     let state = AppState { hub: hub.clone(), registry: registry.clone() };
