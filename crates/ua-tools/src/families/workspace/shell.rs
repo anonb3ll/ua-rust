@@ -1012,20 +1012,24 @@ fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
 }
 
 fn program_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&path).any(|dir| {
-        let p = dir.join(program);
-        std::fs::metadata(&p).is_ok_and(|m| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                m.is_file() && m.permissions().mode() & 0o111 != 0
-            }
-            #[cfg(not(unix))]
-            {
-                m.is_file()
-            }
-        })
+    std::env::var_os("PATH").is_some_and(|path| find_on_path(program, &path).is_some())
+}
+
+fn find_on_path(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).map(|dir| dir.join(program)).find(|p| is_executable(p))
+}
+
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            m.is_file() && m.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            m.is_file()
+        }
     })
 }
 
@@ -1130,17 +1134,16 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         force_gate(&ctx, json!({ "command": a.command, "cwd": a.cwd, "advisory_codes": codes })).await?;
     }
 
-    let mut env = base_env();
     // A fresh, empty HOME per call, removed afterwards: commands never see
-    // the operator's dotfiles or credential helpers, and nothing one call
-    // writes under `~` (tool config, rc files) reaches a later call. What
-    // common work needs from HOME is set explicitly instead: a git identity
-    // for the caller, the Rust toolchain, and one shared persistent cache.
+    // the operator's dotfiles, cargo home or credential helpers, and nothing
+    // one call writes under `~` (tool config, rc files) reaches a later call.
+    // What common work needs from HOME is set explicitly instead: a git
+    // identity for the caller, the Rust toolchain on PATH, and the caller's
+    // own persistent caches.
     let scratch_home = ScratchHome::new()?;
-    env.retain(|(k, _)| k != "HOME");
-    env.push(("HOME".into(), scratch_home.path.to_string_lossy().into_owned()));
-    env.extend(git_identity_env(&ctx.caller.label));
-    env.extend(toolchain_and_cache_env(&ctx.hub.cfg().home));
+    let ua_home = &ctx.hub.cfg().home;
+    let host = HostRust::get(ua_home).await;
+    let mut env = command_env(ua_home, &ctx.caller.label, &scratch_home.path, host);
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
         for (k, v) in [
@@ -1309,40 +1312,137 @@ fn git_identity_env(label: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The Rust toolchain from the hub's real home, and one persistent cache
-/// shared by every call (`$UA_HOME/run-cache/`), so tools do not download
-/// the same packages on every call.
+/// What `run_cmd` takes from the hub's own environment, resolved once: the
+/// hub's PATH with the default Rust toolchain's `bin` directory in front.
 ///
-/// - `RUSTUP_HOME` and `CARGO_HOME`: passed through, else `~/.rustup` and
-///   `~/.cargo` of the hub's real HOME when they exist. The cargo registry
-///   cache lives under `CARGO_HOME`, so it persists with it; without a
-///   cargo home, `CARGO_HOME` is the shared cache's `cargo/`.
-/// - `XDG_CACHE_HOME` and `UV_CACHE_DIR`: under the shared cache.
-fn toolchain_and_cache_env(ua_home: &Path) -> Vec<(String, String)> {
-    let real_home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
-    let resolve = |var: &str, dot: &str| -> Option<PathBuf> {
-        std::env::var_os(var)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| real_home.as_ref().map(|h| h.join(dot)).filter(|p| p.is_dir()))
-    };
-    let cache = ua_home.join("run-cache");
-    let cache_ok = private_dir(&cache).is_ok();
-    let mut env = Vec::new();
-    let mut put = |k: &str, v: &Path| env.push((k.to_string(), v.to_string_lossy().into_owned()));
-    if let Some(p) = resolve("RUSTUP_HOME", ".rustup") {
-        put("RUSTUP_HOME", &p);
+/// The toolchain is reached through its real `bin` directory (the one that
+/// holds `cargo` and `rustc` themselves, not the rustup proxies), so a
+/// command never gets `RUSTUP_HOME` or the operator's `CARGO_HOME`. Rustup
+/// proxies need a `RUSTUP_HOME`, and through it a command could install
+/// toolchains or change the operator's rustup settings; with the resolved
+/// `bin` first on PATH they are never reached for `cargo` or `rustc`. The
+/// cost: a `rust-toolchain.toml` in the workspace and `cargo +toolchain`
+/// are not honored, and `rustup` itself does not work inside `run_cmd`.
+#[derive(Debug, Clone)]
+struct HostRust {
+    /// PATH for commands.
+    path: String,
+}
+
+static HOST_RUST: tokio::sync::OnceCell<HostRust> = tokio::sync::OnceCell::const_new();
+
+impl HostRust {
+    async fn get(ua_home: &Path) -> &'static HostRust {
+        HOST_RUST
+            .get_or_init(|| async {
+                let vars: Vec<(String, String)> = std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .collect();
+                HostRust::resolve(&vars, ua_home).await
+            })
+            .await
     }
-    match resolve("CARGO_HOME", ".cargo") {
-        Some(p) => put("CARGO_HOME", &p),
-        None if cache_ok => put("CARGO_HOME", &cache.join("cargo")),
-        None => {}
+
+    /// Resolve from `vars` (the hub's environment). The default toolchain
+    /// is asked for with `ua_home` as the working directory, a hub-owned
+    /// directory, so no override file an agent wrote can pick it.
+    async fn resolve(vars: &[(String, String)], ua_home: &Path) -> HostRust {
+        let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
+        let path = match toolchain_bin(vars, &path, ua_home).await {
+            Some(bin) => {
+                let rest = std::env::split_paths(&path).filter(|p| p != &bin).collect::<Vec<_>>();
+                std::env::join_paths(std::iter::once(bin).chain(rest))
+                    .ok()
+                    .and_then(|p| p.into_string().ok())
+                    .unwrap_or(path)
+            }
+            None => path,
+        };
+        HostRust { path }
     }
-    if cache_ok {
-        put("XDG_CACHE_HOME", &cache.join("xdg"));
-        put("UV_CACHE_DIR", &cache.join("uv"));
+}
+
+fn var(vars: &[(String, String)], key: &str) -> Option<String> {
+    vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).filter(|v| !v.is_empty())
+}
+
+/// The `bin` directory of the toolchain `rustc --print sysroot` names, when
+/// it holds a `rustc`. `rustc` is looked up in `$CARGO_HOME/bin`, then PATH.
+async fn toolchain_bin(vars: &[(String, String)], path: &str, cwd: &Path) -> Option<PathBuf> {
+    let rustc = var(vars, "CARGO_HOME")
+        .map(|h| PathBuf::from(h).join("bin").join("rustc"))
+        .filter(|p| is_executable(p))
+        .or_else(|| find_on_path("rustc", std::ffi::OsStr::new(path)))?;
+    let args = ["--print".to_string(), "sysroot".to_string()];
+    let cwd = if cwd.is_dir() { cwd.to_path_buf() } else { std::env::temp_dir() };
+    let out = run_program(&rustc.to_string_lossy(), &args, &cwd, vars, Duration::from_secs(30), 4096).await;
+    let out = out.ok().filter(|o| o.exit_code == 0 && !o.timed_out)?;
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let bin = sysroot.join("bin");
+    (sysroot.is_absolute() && is_executable(&bin.join("rustc"))).then_some(bin)
+}
+
+/// The per-caller cache directory name: the label reduced to safe
+/// characters, plus a digest of the exact label so two labels that reduce
+/// to the same text still get different directories.
+fn cache_key(label: &str) -> String {
+    let safe: String = label
+        .chars()
+        .take(48)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches(['.', '-']);
+    let safe = if safe.is_empty() { "agent" } else { safe };
+    format!("{safe}-{}", &sha256_hex(label.as_bytes())[..12])
+}
+
+/// Files that would make a cargo home more than a download cache.
+const CARGO_HOME_SCRUB: &[&str] = &["config", "config.toml", "credentials", "credentials.toml"];
+
+/// PATH, `CARGO_HOME`, `XDG_CACHE_HOME` and `UV_CACHE_DIR` for one caller.
+///
+/// The caches persist between calls, so tools do not download the same
+/// packages every time, but each caller label has its own directory
+/// (`$UA_HOME/run-cache/<label>-<digest>/`), so one agent cannot poison
+/// another agent's caches. `CARGO_HOME` is that directory's `cargo/`, never
+/// the operator's: cargo config and credential files are removed from it
+/// before every call, so it only ever serves as the registry and git cache.
+/// Without a usable cache directory, the cache variables are left out and
+/// tools fall back to the empty per-call HOME.
+fn toolchain_and_cache_env(ua_home: &Path, label: &str, host: &HostRust) -> Vec<(String, String)> {
+    let mut out = vec![("PATH".to_string(), host.path.clone())];
+    let root = ua_home.join("run-cache");
+    let dir = root.join(cache_key(label));
+    if private_dir(&root).is_err() || private_dir(&dir).is_err() {
+        return out;
     }
-    env
+    let cargo = dir.join("cargo");
+    if std::fs::create_dir_all(&cargo).is_ok() {
+        for name in CARGO_HOME_SCRUB {
+            let p = cargo.join(name);
+            if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        out.push(("CARGO_HOME".into(), cargo.to_string_lossy().into_owned()));
+    }
+    out.push(("XDG_CACHE_HOME".into(), dir.join("xdg").to_string_lossy().into_owned()));
+    out.push(("UV_CACHE_DIR".into(), dir.join("uv").to_string_lossy().into_owned()));
+    out
+}
+
+/// The whole environment of one `run_cmd` call: the minimal base, the
+/// per-call HOME, the caller's git identity, PATH with the toolchain, and
+/// the caller's caches.
+fn command_env(ua_home: &Path, label: &str, home: &Path, host: &HostRust) -> Vec<(String, String)> {
+    let mut out = base_env();
+    out.retain(|(k, _)| k != "HOME" && k != "PATH");
+    out.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    out.extend(git_identity_env(label));
+    out.extend(toolchain_and_cache_env(ua_home, label, host));
+    out
 }
 
 /// A per-call HOME directory under [`run_home_parent`], deleted on drop.
@@ -1397,5 +1497,159 @@ mod run_env_tests {
         let path = home.path.clone();
         drop(home);
         assert!(!path.exists());
+    }
+
+    fn as_map(v: Vec<(String, String)>) -> std::collections::HashMap<String, String> {
+        v.into_iter().collect()
+    }
+
+    #[test]
+    fn each_label_gets_its_own_cache() {
+        let ua_home = tempfile::tempdir().unwrap();
+        let host = HostRust { path: "/usr/bin:/bin".into() };
+        let a = as_map(toolchain_and_cache_env(ua_home.path(), "builder-1", &host));
+        let b = as_map(toolchain_and_cache_env(ua_home.path(), "builder-2", &host));
+        // Labels that reduce to the same safe text still differ.
+        let c = as_map(toolchain_and_cache_env(ua_home.path(), "builder 1", &host));
+        for key in ["CARGO_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR"] {
+            assert_ne!(a[key], b[key], "{key}");
+            assert_ne!(a[key], c[key], "{key}");
+            for m in [&a, &b, &c] {
+                assert!(
+                    Path::new(&m[key]).starts_with(ua_home.path().join("run-cache")),
+                    "{key}: {}",
+                    m[key]
+                );
+            }
+        }
+        assert!(Path::new(&a["CARGO_HOME"]).ends_with("cargo"));
+        // Path separators and dots never escape the cache root.
+        let odd = as_map(toolchain_and_cache_env(ua_home.path(), "../../x/..", &host));
+        let dir = Path::new(&odd["CARGO_HOME"]).parent().unwrap();
+        assert_eq!(dir.parent().unwrap(), ua_home.path().join("run-cache"));
+        assert!(!dir.file_name().unwrap().to_string_lossy().contains('/'));
+    }
+
+    /// A fake operator setup: a real-looking cargo home holding credentials
+    /// and config, a `rustc` proxy in its `bin/` that names a toolchain.
+    #[cfg(unix)]
+    struct FakeOperator {
+        _dir: tempfile::TempDir,
+        cargo_home: PathBuf,
+        rustup_home: PathBuf,
+        toolchain_bin: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn fake_operator() -> FakeOperator {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cargo_home = root.join("cargo-home");
+        let rustup_home = root.join("rustup-home");
+        let toolchain_bin = rustup_home.join("toolchains/stable/bin");
+        std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+        std::fs::create_dir_all(&toolchain_bin).unwrap();
+        std::fs::write(cargo_home.join("credentials.toml"), "[registry]\ntoken = \"planted\"\n").unwrap();
+        std::fs::write(cargo_home.join("config.toml"), "[alias]\nleak = \"version\"\n").unwrap();
+        let exe = |p: &Path, body: &str| {
+            std::fs::write(p, body).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let sysroot = toolchain_bin.parent().unwrap().display().to_string();
+        exe(&cargo_home.join("bin/rustc"), &format!("#!/bin/sh\necho '{sysroot}'\n"));
+        exe(&toolchain_bin.join("rustc"), "#!/bin/sh\nexit 0\n");
+        FakeOperator { _dir: dir, cargo_home, rustup_home, toolchain_bin }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commands_get_the_toolchain_on_path_and_never_the_real_cargo_home() {
+        let op = fake_operator();
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+            ("RUSTUP_HOME".to_string(), op.rustup_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let host = HostRust::resolve(&vars, ua_home.path()).await;
+        let first = std::env::split_paths(&host.path).next().unwrap();
+        assert_eq!(first, op.toolchain_bin, "the resolved toolchain bin comes first: {}", host.path);
+
+        let scratch = ScratchHome::new().unwrap();
+        let env = command_env(ua_home.path(), "builder-1", &scratch.path, &host);
+        let real = op.cargo_home.display().to_string();
+        let rustup = op.rustup_home.display().to_string();
+        for (k, v) in &env {
+            assert_ne!(k, "RUSTUP_HOME", "rustup proxies are not reachable, so no RUSTUP_HOME");
+            assert!(!v.contains(&real), "{k}={v} exposes the operator's cargo home");
+            if k != "PATH" {
+                assert!(!v.contains(&rustup), "{k}={v} exposes the operator's rustup home");
+            }
+        }
+        let map = as_map(env.clone());
+        let cargo_home = PathBuf::from(&map["CARGO_HOME"]);
+        assert!(cargo_home.starts_with(ua_home.path()));
+        assert!(!cargo_home.join("credentials.toml").exists());
+
+        // Credentials or config a command leaves in its own cargo home are
+        // removed before the next call.
+        std::fs::write(cargo_home.join("credentials.toml"), "x").unwrap();
+        std::fs::write(cargo_home.join("config.toml"), "x").unwrap();
+        command_env(ua_home.path(), "builder-1", &scratch.path, &host);
+        assert!(!cargo_home.join("credentials.toml").exists());
+        assert!(!cargo_home.join("config.toml").exists());
+    }
+
+    /// With the real toolchain, when there is one: cargo run with the
+    /// command environment does not read the operator's cargo config and
+    /// does not touch the operator's credentials.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_cargo_cannot_see_or_change_the_operator_cargo_home() {
+        let op = fake_operator();
+        std::fs::remove_file(op.cargo_home.join("bin/rustc")).unwrap();
+        let mut vars: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| k != "CARGO_HOME")
+            .collect();
+        vars.push(("CARGO_HOME".into(), op.cargo_home.display().to_string()));
+        let ua_home = tempfile::tempdir().unwrap();
+        let host = HostRust::resolve(&vars, ua_home.path()).await;
+        let path = std::ffi::OsString::from(&host.path);
+        let Some(cargo) = find_on_path("cargo", &path) else {
+            eprintln!("no cargo on PATH; skipping");
+            return;
+        };
+        let work = tempfile::tempdir().unwrap();
+        let scratch = ScratchHome::new().unwrap();
+        let env = command_env(ua_home.path(), "builder-1", &scratch.path, &host);
+        let run = |args: &[&str], env: Vec<(String, String)>| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let cargo = cargo.to_string_lossy().into_owned();
+            let cwd = work.path().to_path_buf();
+            async move { run_program(&cargo, &args, &cwd, &env, Duration::from_secs(60), 65536).await.unwrap() }
+        };
+
+        // The planted alias works against the operator's home (so the
+        // check below means something), and not with the command env.
+        let mut exposed = env.clone();
+        exposed.retain(|(k, _)| k != "CARGO_HOME");
+        exposed.push(("CARGO_HOME".into(), op.cargo_home.display().to_string()));
+        let direct = run(&["leak"], exposed).await;
+        if direct.exit_code != 0 {
+            eprintln!(
+                "toolchain cargo is not usable here; skipping: {}",
+                String::from_utf8_lossy(&direct.stderr)
+            );
+            return;
+        }
+        let out = run(&["leak"], env.clone()).await;
+        assert_ne!(out.exit_code, 0, "the operator's cargo config was read");
+
+        let before = std::fs::read(op.cargo_home.join("credentials.toml")).unwrap();
+        let _ = run(&["logout"], env).await;
+        assert_eq!(std::fs::read(op.cargo_home.join("credentials.toml")).unwrap(), before);
+        assert!(op.cargo_home.join("config.toml").exists());
     }
 }
