@@ -26,9 +26,15 @@ and steps to reproduce. You will get an acknowledgement within a week.
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
   so a profile or policy that refuses the tool refuses the stream. An open
   stream re-checks its caller every 60 seconds, and at once when a token
-  revocation or rotation, logout, session end or profile change is
-  recorded: the credential must still resolve to the same identity and
-  its profile must still allow `event_log_query`, or the stream ends.
+  revocation or rotation, logout, session end, profile change or config
+  revision is recorded: the credential must still resolve to the same
+  identity, and the admission the stream opened with (profile after any
+  policy overlay, then the policy rules, with the stream's scope as the
+  arguments) must still let it in without a new approval. Per-call
+  throttles (`rate_limit`, `cooldown`) apply when a stream opens, not to
+  the re-check. When the caller is no longer let in, the stream sends a
+  final `auth_revoked` event with a short reason code and ends, so
+  clients can stop reconnecting.
 - **Dynamic client registration is bounded.** Clients that never receive a
   grant are pruned after `oauth_dcr_unused_ttl_hours`, unused clients are
   capped (the oldest is evicted), and each address may register
@@ -48,4 +54,20 @@ and steps to reproduce. You will get an acknowledgement within a week.
   `cargo +toolchain` and a workspace `rust-toolchain.toml` are not honored
   inside `run_cmd`. A caller's cache persists between its calls, so an
   agent can affect its own later builds through it, but not another
-  agent's.
+  agent's. `ua serve` removes caches unused for 30 days at startup (by the
+  mtime of a marker each call touches); there is no size cap.
+- **Cargo config above the workspace.** Cargo reads `.cargo/config` and
+  `.cargo/config.toml` in every ancestor of its working directory, and
+  `CARGO_HOME` does not stop that walk; cargo has no supported switch to
+  turn it off. With the default workspace `~/.ua-rust/workspace`, the hub
+  user's `~/.cargo/config.toml` is such an ancestor, and its aliases,
+  `[env]`, `build.rustc-wrapper`, source replacement and credential
+  providers would apply inside `run_cmd`. So `run_cmd` (and
+  `run_cmd_check`) refuse `cargo` and `cargo-*` with the advisory
+  `cargo-config`, naming the file, whenever such a file exists above the
+  workspace root, and `ua serve` warns at startup. Fix it by moving the
+  workspace outside that directory tree (`workspace = "/srv/ua-workspace"`
+  or similar), or by removing the file. Configs inside the workspace are
+  the workspace's own and are not refused. Cargo started indirectly (by
+  an interpreter or build tool, which already needs approval) is not
+  covered by this check.

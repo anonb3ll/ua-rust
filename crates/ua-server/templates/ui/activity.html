@@ -24,7 +24,7 @@
 {% match events %}
 {% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
 {% when Ok(rows) %}
-<ol class="feed" id="feed" aria-live="polite" hx-ext="sse" sse-connect="{{ stream_url }}" sse-swap="ledger" hx-swap="afterbegin">
+<ol class="feed" id="feed" aria-live="polite" hx-ext="sse" sse-connect="{{ stream_url }}" sse-swap="ledger" sse-close="auth_revoked" hx-swap="afterbegin">
 {% for e in rows %}{% include "ui/event_row.html" %}{% endfor %}
 </ol>
 {% if rows.is_empty() %}<p class="muted">No recent events{% if !prefix.is_empty() %} on this channel{% endif %}.</p>{% endif %}
