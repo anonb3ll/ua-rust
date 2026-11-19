@@ -49,6 +49,8 @@ async fn doctor_reports_every_capability_without_secrets() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path());
     cfg.agent_tokens = Some(SecretString::from(format!("builder-1:{TOKEN}")));
+    // Tokens exist but auth is explicitly switched off: the doctor flags it.
+    cfg.enforce_auth = false;
     cfg.notify_webhook_url = Some(format!("https://hooks.example.com/services/{HOOK_PATH_SECRET}"));
     cfg.notify_webhook_secret = Some(SecretString::from(HOOK_HEADER_SECRET));
     cfg.approval_tools = vec!["event_log_verify".into()];

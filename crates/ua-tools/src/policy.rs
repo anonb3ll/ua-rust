@@ -888,9 +888,13 @@ pub fn evaluate(
                 let cooldown = rule.cooldown_seconds.unwrap_or(0.0);
                 if cooldown > 0.0 {
                     let last: Option<String> = conn
-                        .query_row("SELECT MAX(started_at) FROM tool_calls WHERE tool = ?1", [tool], |r| {
-                            r.get(0)
-                        })
+                        // Per caller: one identity's call must not put every
+                        // other identity into cooldown.
+                        .query_row(
+                            "SELECT MAX(started_at) FROM tool_calls WHERE tool = ?1 AND caller = ?2",
+                            params![tool, caller.label],
+                            |r| r.get(0),
+                        )
                         .optional()
                         .map_err(|e| unavailable(&rule.name, e))?
                         .flatten();

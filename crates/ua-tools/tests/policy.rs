@@ -248,7 +248,27 @@ async fn episode_rules_fail_closed_and_cooldown_spaces_calls() {
     let env =
         setup("rules:\n  - {name: breathe, type: cooldown, tool: profile_status, cooldown_seconds: 600}\n");
     env.call(&dev("builder-1"), "profile_status", json!({})).await.unwrap();
-    assert_eq!(env.denied(&dev("builder-2"), "profile_status", json!({})).await, "episode_limited");
+    assert_eq!(env.denied(&dev("builder-1"), "profile_status", json!({})).await, "episode_limited");
+    // Cooldowns are per caller: another identity is not held back.
+    env.call(&dev("builder-2"), "profile_status", json!({})).await.unwrap();
+}
+
+#[tokio::test]
+async fn rate_limit_counts_calls_still_in_flight() {
+    let env = setup(
+        "rules:\n  - name: burst\n    type: rate_limit\n    tool: profile_status\n    max_calls: 2\n    window_seconds: 60\n",
+    );
+    let a = dev("builder-1");
+    let (r1, r2, r3, r4, r5, r6) = tokio::join!(
+        env.call(&a, "profile_status", json!({})),
+        env.call(&a, "profile_status", json!({})),
+        env.call(&a, "profile_status", json!({})),
+        env.call(&a, "profile_status", json!({})),
+        env.call(&a, "profile_status", json!({})),
+        env.call(&a, "profile_status", json!({})),
+    );
+    let ok = [r1, r2, r3, r4, r5, r6].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok, 2, "concurrent calls must not slip past the limit");
 }
 
 #[tokio::test]

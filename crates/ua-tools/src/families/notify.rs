@@ -115,7 +115,13 @@ fn clip(s: &str) -> String {
 async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
     // rustls is built without a default provider; install ring once.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(timeout)
+        // Never follow redirects: a custom secret header would be replayed to
+        // whatever host the redirect names.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             return Delivery {
