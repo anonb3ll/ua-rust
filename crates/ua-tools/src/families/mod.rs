@@ -5,6 +5,7 @@
 //! line to each list below. Keep the lists alphabetical to make merges easy.
 
 pub mod agents;
+pub mod audit;
 pub mod code;
 pub mod core_schema;
 pub mod cycles;
@@ -13,12 +14,15 @@ pub mod dispatch;
 pub mod events;
 pub mod evidence;
 pub mod export;
+pub mod injection;
 pub mod memory;
 pub mod messaging;
 pub mod notify;
 pub mod observability;
 pub mod plans;
 pub mod routines;
+pub mod sessions_lifecycle;
+pub mod skills;
 pub mod tasks;
 pub mod tokens;
 pub mod vault;
@@ -53,6 +57,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 pub fn register(r: &mut Registry) {
     // family registrations (alphabetical)
     agents::register(r);
+    audit::register(r);
     code::register(r);
     cycles::register(r);
     delegation::register(r);
@@ -60,12 +65,15 @@ pub fn register(r: &mut Registry) {
     events::register(r);
     evidence::register(r);
     export::register(r);
+    injection::register(r);
     memory::register(r);
     messaging::register(r);
     notify::register(r);
     observability::register(r);
     plans::register(r);
     routines::register(r);
+    sessions_lifecycle::register(r);
+    skills::register(r);
     tasks::register(r);
     tokens::register(r);
     vault::register(r);
