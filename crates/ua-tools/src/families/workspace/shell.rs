@@ -1131,13 +1131,12 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     }
 
     let mut env = base_env();
-    // A scratch HOME: commands never see the operator's dotfiles, credential
-    // helpers or the hub's own data directory through `~`.
-    let scratch_home = ctx.hub.cfg().home.join("run-home");
-    std::fs::create_dir_all(&scratch_home)
-        .map_err(|e| UaError::internal(format!("cannot prepare the command HOME: {e}")))?;
+    // A fresh, empty HOME per call, removed afterwards: commands never see
+    // the operator's dotfiles or credential helpers, and nothing one call
+    // writes under `~` (caches, tool config, rc files) reaches a later call.
+    let scratch_home = ScratchHome::new(&ctx.hub.cfg().home)?;
     env.retain(|(k, _)| k != "HOME");
-    env.push(("HOME".into(), scratch_home.to_string_lossy().into_owned()));
+    env.push(("HOME".into(), scratch_home.path.to_string_lossy().into_owned()));
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
         for (k, v) in [
@@ -1213,4 +1212,29 @@ pub fn register(r: &mut Registry) {
         .family("workspace")
         .read_only(),
     );
+}
+
+/// A per-call HOME directory under `$UA_HOME/run-home/`, deleted on drop.
+struct ScratchHome {
+    path: std::path::PathBuf,
+}
+
+impl ScratchHome {
+    fn new(ua_home: &std::path::Path) -> UaResult<Self> {
+        let path = ua_home.join("run-home").join(ulid::Ulid::generate().to_string());
+        std::fs::create_dir_all(&path)
+            .map_err(|e| UaError::internal(format!("cannot prepare the command HOME: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

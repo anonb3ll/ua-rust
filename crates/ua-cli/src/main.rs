@@ -79,23 +79,47 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 
 /// The caller for a local CLI invocation.
 ///
-/// Acting as a human (who may approve gated calls) needs an explicit
-/// `--label` naming a configured human identity. The label is never
-/// defaulted to a human, and a label that only came from `UA_AGENT_LABEL`
-/// never makes the caller human: that variable is how agent processes are
-/// launched, so an agent's shell cannot approve its own calls.
+/// Acting as a human (who may approve gated calls) needs all of:
+/// - an explicit `--label` naming a configured human identity (never a
+///   default, and never a label that only came from `UA_AGENT_LABEL`, which
+///   is how agent processes are launched);
+/// - no `UA_AGENT_LABEL` in the environment at all;
+/// - the operator typing the label back on an interactive terminal.
+///
+/// These are speed bumps, not a security boundary. Anything running as the
+/// hub's OS user can read the database file directly, so the real boundary
+/// is the OS account: run agents under a different user than the hub (see
+/// SECURITY.md).
 fn local_caller(cfg: &Config, label: Option<String>) -> Caller {
     let from_env = std::env::var("UA_AGENT_LABEL").ok();
-    local_caller_with(cfg, label, from_env.as_deref())
+    local_caller_with(cfg, label, from_env.as_deref(), confirm_on_tty)
 }
 
-fn local_caller_with(cfg: &Config, label: Option<String>, agent_env: Option<&str>) -> Caller {
-    let explicit = label.as_deref().is_some_and(|l| agent_env != Some(l));
+fn local_caller_with(
+    cfg: &Config,
+    label: Option<String>,
+    agent_env: Option<&str>,
+    confirm: impl FnOnce(&str) -> bool,
+) -> Caller {
+    let explicit = label.is_some() && agent_env.is_none();
     let mut c = Caller::local(label.unwrap_or_else(|| "local".into()), Transport::Cli);
-    if explicit && cfg.is_human(&c.label) {
+    if explicit && cfg.is_human(&c.label) && confirm(&c.label) {
         c.kind = ActorKind::Human;
     }
     c
+}
+
+/// Ask the operator to type `label` on an interactive terminal.
+fn confirm_on_tty(label: &str) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("note: acting as human {label:?} needs an interactive terminal; continuing as non-human");
+        return false;
+    }
+    eprint!("Act as human {label:?}? Type the label to confirm: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim() == label
 }
 
 #[tokio::main]
@@ -160,6 +184,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Issue { label, note } => {
+                // A token for a human identity grants approval rights over HTTP;
+                // mint one only on an operator's explicit confirmation.
+                if cfg.is_human(&label)
+                    && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label))
+                {
+                    anyhow::bail!(
+                        "issuing a token for human {label:?} needs an operator at an interactive terminal"
+                    );
+                }
                 let mut raw = [0u8; 32];
                 rand::rng().fill_bytes(&mut raw);
                 let token = format!("ua_{}", hex::encode(raw));
@@ -246,22 +279,31 @@ mod tests {
 
     #[test]
     fn no_label_is_never_human() {
-        let c = local_caller_with(&cfg(), None, None);
+        let c = local_caller_with(&cfg(), None, None, |_| true);
         assert_eq!(c.kind, ActorKind::Anonymous);
         assert_eq!(c.label, "local");
     }
 
     #[test]
-    fn explicit_human_label_is_human() {
-        let c = local_caller_with(&cfg(), Some("operator".into()), None);
+    fn explicit_human_label_is_human_only_when_confirmed() {
+        let c = local_caller_with(&cfg(), Some("operator".into()), None, |l| l == "operator");
         assert_eq!(c.kind, ActorKind::Human);
+        let c = local_caller_with(&cfg(), Some("operator".into()), None, |_| false);
+        assert_eq!(c.kind, ActorKind::Anonymous, "no terminal confirmation, no human");
+    }
+
+    #[test]
+    fn an_agent_environment_cannot_claim_a_human_label() {
+        // UA_AGENT_LABEL=agent-1 and an explicit --label operator: still not human.
+        let c = local_caller_with(&cfg(), Some("operator".into()), Some("agent-1"), |_| true);
+        assert_eq!(c.kind, ActorKind::Anonymous);
     }
 
     #[test]
     fn agent_env_label_is_never_human() {
         // `--label` falls back to UA_AGENT_LABEL; a label from there is not
         // an operator's explicit choice.
-        let c = local_caller_with(&cfg(), Some("operator".into()), Some("operator"));
+        let c = local_caller_with(&cfg(), Some("operator".into()), Some("operator"), |_| true);
         assert_eq!(c.kind, ActorKind::Anonymous);
     }
 }
