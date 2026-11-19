@@ -6,6 +6,8 @@
 //! - Hook-execution directories (`.git`, `.hg`, `.svn`, `.husky`) are refused:
 //!   a write there would run unattended on the next commit.
 //! - [`guard_secret_filename`] refuses reading credential-bearing files.
+//! - [`resolve_in_vault`] confines a note path to a Markdown vault: no `..`,
+//!   no hidden entries, writes only below the configured write directories.
 //! - [`vet_command`] splits a command line without a shell and accepts only
 //!   allowlisted programs.
 
@@ -168,6 +170,77 @@ pub fn guard_secret_filename(p: &Path) -> UaResult<()> {
         return Err(UaError::denied("secret_file", format!("{name:?} looks like a credential file")));
     }
     Ok(())
+}
+
+/// Note extensions vault writes may create.
+pub const VAULT_WRITE_SUFFIXES: &[&str] = &["md", "txt"];
+
+/// Resolve a vault-relative (or absolute) note path inside the vault `root`.
+///
+/// Refused: a NUL byte, any `..` component, a path that resolves (symlinks
+/// followed) outside the root, and any hidden component below the root
+/// (`.obsidian`, `.git`, `.trash`). Writes (`for_write`) must also land below
+/// one of `write_dirs` (vault-relative directories, matched per component) and
+/// name a `.md` or `.txt` file. Returns the canonical path.
+pub fn resolve_in_vault(
+    path: &str,
+    root: &Path,
+    write_dirs: &[String],
+    for_write: bool,
+) -> UaResult<PathBuf> {
+    if path.contains('\0') {
+        return Err(UaError::invalid("path contains a NUL byte"));
+    }
+    let raw = Path::new(if path.trim().is_empty() { "." } else { path });
+    if raw.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(UaError::denied(
+            "parent_traversal",
+            format!("{path:?} contains '..'; use a vault-relative path"),
+        ));
+    }
+    let root =
+        root.canonicalize().map_err(|_| UaError::not_found("the vault root does not exist on this host"))?;
+    let joined = if raw.is_absolute() { raw.to_path_buf() } else { root.join(raw) };
+    let resolved = canonicalize_lenient(&joined)
+        .map_err(|e| UaError::invalid(format!("cannot resolve {path:?}: {e}")))?;
+    let Ok(rel) = resolved.strip_prefix(&root) else {
+        return Err(UaError::denied("outside_vault", format!("{path:?} is outside the vault")));
+    };
+    if rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+        return Err(UaError::denied(
+            "hidden_path",
+            format!(
+                "{path:?} targets a hidden file or directory; vault tools do not touch .obsidian/.git internals"
+            ),
+        ));
+    }
+    if for_write {
+        let allowed = write_dirs.iter().any(|d| {
+            let dir = Path::new(d.trim().trim_matches('/'));
+            !d.trim().trim_matches('/').is_empty()
+                && dir.components().all(|c| matches!(c, Component::Normal(_)))
+                && rel.starts_with(dir)
+                && rel != dir
+        });
+        if !allowed {
+            return Err(UaError::denied(
+                "vault_write_dir",
+                format!(
+                    "vault writes are restricted to {}; {:?} is outside",
+                    if write_dirs.is_empty() { "no directories".to_string() } else { write_dirs.join(", ") },
+                    rel.to_string_lossy()
+                ),
+            ));
+        }
+        let ext = resolved.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+        if !VAULT_WRITE_SUFFIXES.contains(&ext.as_str()) {
+            return Err(UaError::denied(
+                "vault_file_type",
+                format!("vault writes are limited to .md and .txt notes; got {path:?}"),
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 /// A vetted command: program plus arguments, split without a shell.
@@ -481,5 +554,42 @@ mod tests {
         assert!(resolve_in_root(".GIT/config", std::slice::from_ref(&ws_root), true).is_err());
         assert!(readable_entry(&ws_root.join("service.env"), std::slice::from_ref(&ws_root)).is_none());
         assert!(readable_entry(&abs, &[ws_root.clone(), extra_root.clone()]).is_some());
+    }
+
+    #[test]
+    fn vault_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("Wiki")).unwrap();
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        let dirs = vec!["Wiki".to_string(), "Logs/".to_string()];
+        assert_eq!(resolve_in_vault("Wiki/a.md", &root, &dirs, true).unwrap(), root.join("Wiki/a.md"));
+        assert_eq!(
+            resolve_in_vault("Logs/2026-01-01.md", &root, &dirs, true).unwrap(),
+            root.join("Logs/2026-01-01.md")
+        );
+        assert!(resolve_in_vault("Notes/a.md", &root, &dirs, false).is_ok());
+        assert!(resolve_in_vault("Notes/a.md", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("Wikipedia/a.md", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("Wiki", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("Wiki/a.png", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("Wiki/../Notes/a.md", &root, &dirs, false).is_err());
+        assert!(resolve_in_vault(".obsidian/app.json", &root, &dirs, false).is_err());
+        assert!(resolve_in_vault("Wiki/.hidden/a.md", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("/etc/passwd", &root, &dirs, false).is_err());
+        assert_eq!(resolve_in_vault("", &root, &dirs, false).unwrap(), root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_refuses_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("Wiki")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("Wiki/out")).unwrap();
+        let dirs = vec!["Wiki".to_string()];
+        assert!(resolve_in_vault("Wiki/out/x.md", &root, &dirs, true).is_err());
+        assert!(resolve_in_vault("Wiki/out/x.md", &root, &dirs, false).is_err());
     }
 }

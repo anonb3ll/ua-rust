@@ -45,6 +45,17 @@ pub struct Config {
     /// Vault directories (relative to the vault) agents may write to.
     #[serde(deserialize_with = "string_or_list")]
     pub vault_write_dirs: Vec<String>,
+    /// Vault directory holding raw captures (the steward inbox).
+    pub vault_inbox_dir: String,
+    /// Refuse a `vault_write` overwrite of an existing note without `expected_revision`.
+    pub vault_require_revision: bool,
+    /// Lowest memory-note confidence `memory_promote` accepts.
+    pub promote_min_confidence: f64,
+    /// Obsidian Local REST API base URL (loopback only), e.g. `https://127.0.0.1:27124`.
+    pub obsidian_api_url: Option<String>,
+    /// Obsidian Local REST API key (`UA_OBSIDIAN_API_KEY`).
+    #[serde(skip_serializing)]
+    pub obsidian_api_key: Option<SecretString>,
     /// HTTP listen address. Keep it on loopback and put a proxy in front.
     pub bind: SocketAddr,
     /// Require a verified credential on every HTTP request.
@@ -93,6 +104,11 @@ impl Default for Config {
             read_roots: Vec::new(),
             vault_path: None,
             vault_write_dirs: DEFAULT_VAULT_WRITE_DIRS.iter().map(|s| s.to_string()).collect(),
+            vault_inbox_dir: "Inbox".into(),
+            vault_require_revision: false,
+            promote_min_confidence: 0.7,
+            obsidian_api_url: None,
+            obsidian_api_key: None,
             bind: SocketAddr::from(([127, 0, 0, 1], 8765)),
             enforce_auth: false,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
