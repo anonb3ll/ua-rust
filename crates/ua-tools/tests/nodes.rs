@@ -77,6 +77,20 @@ fn count_events(hub: &Hub, channel: &str) -> i64 {
         .unwrap()
 }
 
+fn last_payload(hub: &Hub, channel: &str) -> Value {
+    let channel = channel.to_string();
+    hub.db()
+        .read(move |c| {
+            let text: String = c.query_row(
+                "SELECT payload FROM event_log WHERE channel = ?1 ORDER BY seq DESC LIMIT 1",
+                [&channel],
+                |r| r.get(0),
+            )?;
+            Ok(serde_json::from_str(&text).unwrap())
+        })
+        .unwrap()
+}
+
 /// Set a node's stored heartbeat `secs` seconds ago (negative: in the future).
 fn beat_at(hub: &Hub, node: &str, secs: i64) {
     let ts = ua_core::time::format_ts(
@@ -91,8 +105,9 @@ fn beat_at(hub: &Hub, node: &str, secs: i64) {
         .unwrap();
 }
 
+/// The listing as a lifecycle operator sees it: full facts for every node.
 async fn list(reg: &Registry, hub: &Hub) -> Value {
-    call(reg, hub, &agent("viewer-1"), "node_list", json!({})).await
+    call(reg, hub, &operator(), "node_list", json!({})).await
 }
 
 async fn listed(reg: &Registry, hub: &Hub, node: &str) -> Value {
@@ -170,16 +185,35 @@ async fn register_heartbeat_and_list() {
     assert_eq!(row["backends"], json!(["claude", "codex"]), "registration facts are kept");
     assert_eq!(row["code_sha"], Value::Null, "a malformed code_sha clears the stored one");
 
-    // Any other key is a full replacement.
-    call(&reg, &hub, &me, "node_heartbeat", json!({ "node": "node-a", "facts": { "backends": ["codex"] } }))
-        .await;
+    // Host facts cannot ride a heartbeat: they are dropped and reported, and
+    // the beat still counts.
+    let beat =
+        json!({ "node": "node-a", "facts": { "backends": ["codex"], "worktree_roots": [], "surfaces": {} } });
+    let out = call(&reg, &hub, &me, "node_heartbeat", beat).await;
+    assert_eq!(out["dropped_fact_keys"], json!(["backends", "worktree_roots"]));
     let row = listed(&reg, &hub, "node-a").await;
-    assert_eq!(row["backends"], json!(["codex"]));
-    assert_eq!(row["worktree_roots"], json!([]));
+    assert_eq!(row["backends"], json!(["claude", "codex"]));
+    assert_eq!(row["worktree_roots"], json!(["/srv/work"]));
+    assert_eq!(row["surfaces"]["hermes_profiles"], json!([]), "the advisory key was applied");
+    assert_eq!(count_events(&hub, "agent.node.register"), 1);
 
-    // Re-registering is idempotent and not a first registration.
-    let again = call(&reg, &hub, &me, "node_register", json!({ "node": "node-a" })).await;
+    // An identical re-registration (a node restart) is not ledgered.
+    let args = json!({ "node": "node-a", "facts": facts(), "version": "0.1.0" });
+    let again = call(&reg, &hub, &me, "node_register", args).await;
     assert_eq!(again["first_registration"], false);
+    assert_eq!((again["ledgered"].clone(), again["changed"].clone()), (json!(false), json!([])));
+    assert_eq!(count_events(&hub, "agent.node.register"), 1);
+
+    // A real change is, naming what changed, with no paths in the event.
+    let mut moved = facts();
+    moved["worktree_roots"] = json!([{ "path": "/srv/other", "realpath": "/srv/other" }]);
+    let args = json!({ "node": "node-a", "facts": moved, "version": "0.2.0" });
+    let out = call(&reg, &hub, &me, "node_register", args).await;
+    assert_eq!(out["changed"], json!(["version", "worktree_roots"]));
+    assert_eq!(count_events(&hub, "agent.node.register"), 2);
+    let payload = last_payload(&hub, "agent.node.register");
+    assert_eq!(payload["worktree_roots"], 1, "roots are counted, not listed");
+    assert!(!payload.to_string().contains("/srv/"), "{payload}");
     assert_eq!(list(&reg, &hub).await["counts"]["live"], 1);
 
     // An unregistered node's heartbeat says so (a node re-registers on it).
@@ -445,4 +479,101 @@ async fn doctor_reports_the_fleet() {
     let row = doctor_row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
     assert_eq!(row["status"], "LIVE", "{row}");
     assert_eq!(row["retired"], json!(["node-b"]));
+}
+
+#[tokio::test]
+async fn an_agent_holds_a_bounded_number_of_nodes() {
+    let mut cfg = config();
+    cfg.node_max_per_agent = 2;
+    let (hub, reg) = (hub_with(cfg), builtin_registry());
+    let me = agent("builder-1");
+    call(&reg, &hub, &me, "node_register", json!({ "node": "node-a" })).await;
+    call(&reg, &hub, &me, "node_register", json!({ "node": "node-b" })).await;
+    let e = fail(&reg, &hub, &me, "node_register", json!({ "node": "node-c" })).await;
+    assert_eq!(reason_code(&e), "node_limit");
+    // Re-registering a node it already holds is not a new one.
+    call(&reg, &hub, &me, "node_register", json!({ "node": "node-a", "version": "2" })).await;
+    // Another agent has its own allowance.
+    call(&reg, &hub, &agent("builder-2"), "node_register", json!({ "node": "node-c" })).await;
+    // A retired node no longer counts.
+    manage(&reg, &hub, &operator(), "node_retire", json!({ "node": "node-b", "reason": "gone" }))
+        .await
+        .unwrap();
+    call(&reg, &hub, &me, "node_register", json!({ "node": "node-d" })).await;
+}
+
+#[tokio::test]
+async fn operators_reassign_and_forget_node_names() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let old = agent("builder-1");
+    let new = agent("builder-1b");
+    call(&reg, &hub, &old, "node_register", json!({ "node": "node-a" })).await;
+
+    let params = json!({ "node": "node-a", "to_agent": "builder-1b", "reason": "label renamed" });
+    let e = manage(&reg, &hub, &old, "node_reassign", params.clone()).await.unwrap_err();
+    assert_eq!(reason_code(&e), "not_lifecycle_operator");
+    let bad = json!({ "node": "node-a", "to_agent": "not a label", "reason": "x" });
+    let e = manage(&reg, &hub, &operator(), "node_reassign", bad).await.unwrap_err();
+    assert!(matches!(e, UaError::InvalidArgument(_)), "{e:?}");
+
+    let out = manage(&reg, &hub, &operator(), "node_reassign", params.clone()).await.unwrap();
+    assert_eq!((out["changed"].clone(), out["previous_agent"].clone()), (json!(true), json!("builder-1")));
+    assert_eq!(count_events(&hub, "agent.node.reassign"), 1);
+    let again = manage(&reg, &hub, &operator(), "node_reassign", params).await.unwrap();
+    assert_eq!(again["changed"], false);
+    assert_eq!(count_events(&hub, "agent.node.reassign"), 1);
+
+    // The old label lost it; the new owner's node is fenced until it beats.
+    let e = fail(&reg, &hub, &old, "node_heartbeat", json!({ "node": "node-a" })).await;
+    assert_eq!(reason_code(&e), "node_owned_elsewhere");
+    let row = listed(&reg, &hub, "node-a").await;
+    assert_eq!((row["agent"].as_str(), row["status"].as_str()), (Some("builder-1b"), Some("offline")));
+    call(&reg, &hub, &new, "node_register", json!({ "node": "node-a" })).await;
+    assert_eq!(listed(&reg, &hub, "node-a").await["status"], "live");
+
+    // Forget: operators only, and only a retired node.
+    let forget = json!({ "node": "node-a", "reason": "host decommissioned" });
+    let e = manage(&reg, &hub, &new, "node_forget", forget.clone()).await.unwrap_err();
+    assert_eq!(reason_code(&e), "not_lifecycle_operator");
+    let e = manage(&reg, &hub, &operator(), "node_forget", forget.clone()).await.unwrap_err();
+    assert!(matches!(e, UaError::Conflict(_)), "a node in service is retired first: {e:?}");
+    manage(&reg, &hub, &operator(), "node_retire", forget.clone()).await.unwrap();
+    let out = manage(&reg, &hub, &operator(), "node_forget", forget.clone()).await.unwrap();
+    assert_eq!(out["forgotten"], true);
+    assert_eq!(count_events(&hub, "agent.node.forget"), 1);
+    let e = manage(&reg, &hub, &operator(), "node_forget", forget).await.unwrap_err();
+    assert!(matches!(e, UaError::NotFound(_)), "{e:?}");
+
+    // The name is free again, for any label.
+    let out = call(&reg, &hub, &old, "node_register", json!({ "node": "node-a" })).await;
+    assert_eq!(out["first_registration"], true);
+}
+
+#[tokio::test]
+async fn other_viewers_see_a_summary() {
+    let (hub, reg) = (hub(), builtin_registry());
+    call(&reg, &hub, &agent("builder-1"), "node_register", json!({ "node": "node-a", "facts": facts() }))
+        .await;
+    let session = json!({ "harness": "claude", "external_session_id": "s1", "cwd_realpath": "/srv/work/app", "title": "secret plan" });
+    let beat = json!({ "node": "node-a", "facts": { "native_sessions": [session] } });
+    call(&reg, &hub, &agent("builder-1"), "node_heartbeat", beat).await;
+
+    let rows = |v: Value| v["nodes"][0].clone();
+    let owner = rows(call(&reg, &hub, &agent("builder-1"), "node_list", json!({})).await);
+    assert_eq!(owner["detail"], "full");
+    assert_eq!(owner["native_sessions"][0]["title"], "secret plan");
+    assert_eq!(rows(list(&reg, &hub).await)["detail"], "full", "lifecycle operators see full facts");
+
+    for viewer in [agent("builder-2"), Caller::local("local", Transport::Stdio)] {
+        let row = rows(call(&reg, &hub, &viewer, "node_list", json!({})).await);
+        assert_eq!(row["detail"], "summary");
+        assert_eq!((row["node"].as_str(), row["agent"].as_str()), (Some("node-a"), Some("builder-1")));
+        assert_eq!((row["status"].as_str(), row["live"].as_bool()), (Some("live"), Some(true)));
+        assert_eq!(row["backends"], json!(["claude", "codex"]));
+        assert_eq!(row["harness_names"], json!(["claude"]));
+        let text = row.to_string();
+        for leak in ["/srv/work", "/usr/bin/claude", "secret plan", "repos", "worktree_roots"] {
+            assert!(!text.contains(leak), "{leak} leaked to {}: {text}", viewer.label);
+        }
+    }
 }

@@ -3,26 +3,38 @@
 //!
 //! Tools: `node_register` and `node_heartbeat` (an authenticated agent
 //! reporting its own node), `node_list` (read-only), and the
-//! `coordination_manage` actions `node_retire` and `node_unretire` (lifecycle
-//! operators only). The HTTP device plane (`POST /api/node/register`,
+//! `coordination_manage` actions `node_retire`, `node_unretire`,
+//! `node_reassign` and `node_forget` (lifecycle operators only). The HTTP device plane (`POST /api/node/register`,
 //! `POST /api/node/heartbeat`, `GET /api/nodes`) calls these tools.
 //!
 //! Ownership: a node row belongs to the agent label that first registered it.
 //! The owner is always the verified caller, never a request field, and another
 //! label using the same node name is refused. Only that check passing reveals
-//! whether the node is retired.
+//! whether the node is retired. An agent holds at most `node_max_per_agent`
+//! nodes in service. An operator moves a name to another label with
+//! `node_reassign`, or deletes a retired row with `node_forget` so the name
+//! can be registered afresh.
+//!
+//! Visibility: `node_list` gives full facts to the node's own agent and to
+//! lifecycle operators; everyone else sees a summary without paths,
+//! checkouts, harness binaries or session titles.
 //!
 //! Facts: a node reports host facts (OS, harnesses, worktree roots,
 //! checkouts, discovered sessions, ...). They are bounded on write: a raw
 //! report over [`MAX_FACTS_BYTES`] is refused, unknown keys are dropped (and
 //! named in the reply), and every list and string is capped. Nothing a node
-//! sends is stored verbatim.
+//! sends is stored verbatim. A heartbeat refreshes only the advisory
+//! [`HEARTBEAT_KEYS`]; other keys are dropped and reported, so host facts
+//! (roots, repos, harnesses) change only by registering again.
 //!
 //! Liveness is derived at read time: a node is live while its heartbeat is at
 //! most [`NODE_LIVE_WINDOW_S`] old and at most [`NODE_CLOCK_SKEW_S`] in the
-//! future. Heartbeats only move the row; they are not ledgered. Registration,
-//! retirement and un-retirement each append one `agent.node.<kind>` event in
-//! the same transaction.
+//! future. Heartbeats only move the row; they are not ledgered. A first
+//! registration, or one that changes the version, backends, harness names,
+//! roots or repos, appends `agent.node.register`; an identical
+//! re-registration does not. Retire, un-retire, reassign and forget each
+//! append one `agent.node.<kind>` event. Every event is written in the same
+//! transaction as the change.
 //!
 //! Retirement keeps the row and its history but leaves the node out of the
 //! listing and the doctor's fleet row, and refuses its registration and
@@ -30,8 +42,9 @@
 //! un-retiring both fence the stored heartbeat (`heartbeat_floor`): the node is
 //! not live again until it registers or sends a newer heartbeat.
 //!
-//! Retiring is refused while the node still has queued or claimed work. The
-//! sources of such work are listed in [`RETIRE_BLOCKERS`].
+//! Retiring, reassigning and forgetting are refused while the node still has
+//! queued or claimed work. The sources of such work are listed in
+//! [`RETIRE_BLOCKERS`].
 
 use std::collections::BTreeSet;
 
@@ -44,7 +57,7 @@ use ua_core::time::parse_ts;
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
-use super::agents::{STATUS_THRESHOLDS, verified};
+use super::agents::{STATUS_THRESHOLDS, validate_label, verified};
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -530,20 +543,23 @@ fn bound_facts(raw: &Map<String, Value>) -> (Map<String, Value>, Vec<String>) {
     (out, dropped)
 }
 
-/// A heartbeat's facts applied to the stored ones. A report made only of
-/// [`HEARTBEAT_KEYS`] refreshes those keys and keeps the rest (a malformed
-/// value clears its key); anything else is a full replacement.
+/// A heartbeat's facts applied to the stored ones: each of
+/// [`HEARTBEAT_KEYS`] present replaces its stored value (a malformed value
+/// clears its key) and the rest are kept. Any other key is dropped and
+/// reported: roots, repos, harnesses and the like change only through a
+/// (ledgered) registration.
 fn heartbeat_facts(
     existing: Map<String, Value>,
     update: &Map<String, Value>,
 ) -> (Map<String, Value>, Vec<String>) {
-    if !update.keys().all(|k| HEARTBEAT_KEYS.contains(&k.as_str())) {
-        return bound_facts(update);
-    }
     let roots = root_paths(&existing);
     let mut out = existing;
     let mut dropped = Vec::new();
     for (key, v) in update {
+        if !HEARTBEAT_KEYS.contains(&key.as_str()) {
+            dropped.push(clip(key, MAX_NAME));
+            continue;
+        }
         out.remove(key);
         match bound_fact(key, v, &roots) {
             Some(b) => {
@@ -552,6 +568,7 @@ fn heartbeat_facts(
             None => dropped.push(key.clone()),
         }
     }
+    dropped.truncate(MAX_DROPPED_KEYS);
     fit(&mut out);
     (out, dropped)
 }
@@ -639,6 +656,7 @@ fn node_json(r: &Row<'_>, now: Timestamp) -> rusqlite::Result<Value> {
     let facts = load_facts(&r.get::<_, String>("facts_json")?);
     let fact = |k: &str, empty: Value| facts.get(k).cloned().unwrap_or(empty);
     let mut row = json!({
+        "detail": "full",
         "node": r.get::<_, String>("node")?,
         "agent": r.get::<_, String>("agent")?,
         "version": r.get::<_, Option<String>>("version")?,
@@ -666,6 +684,56 @@ fn node_json(r: &Row<'_>, now: Timestamp) -> rusqlite::Result<Value> {
         row["retired_reason"] = json!(r.get::<_, Option<String>>("retired_reason")?);
     }
     Ok(row)
+}
+
+/// What a viewer who is neither the node's agent nor a lifecycle operator
+/// sees: identity, liveness, version and capability names, but no paths,
+/// checkouts, harness binaries or session titles.
+fn summary(full: &Value) -> Value {
+    let harness_names: Vec<&String> =
+        full["harnesses"].as_object().map(|m| m.keys().collect()).unwrap_or_default();
+    let mut row = json!({ "detail": "summary", "harness_names": harness_names });
+    for key in [
+        "node",
+        "agent",
+        "status",
+        "heartbeat_status",
+        "live",
+        "live_heartbeat",
+        "version",
+        "last_heartbeat",
+        "registered_at",
+        "backends",
+    ] {
+        row[key] = full[key].clone();
+    }
+    row
+}
+
+/// Facts the ledger records a registration for: a first registration, or a
+/// change in any of these between the stored row and the new one.
+fn identity_facts(version: Option<&str>, facts: &Map<String, Value>) -> Map<String, Value> {
+    let names = |k: &str| -> Value {
+        facts
+            .get(k)
+            .and_then(Value::as_object)
+            .map(|m| json!(m.keys().collect::<Vec<_>>()))
+            .unwrap_or(json!([]))
+    };
+    let repos: Vec<&str> = facts
+        .get("repos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("realpath").and_then(Value::as_str))
+        .collect();
+    let mut out = Map::new();
+    out.insert("version".into(), json!(version));
+    out.insert("backends".into(), facts.get("backends").cloned().unwrap_or(json!([])));
+    out.insert("harnesses".into(), names("harnesses"));
+    out.insert("worktree_roots".into(), json!(root_list(facts)));
+    out.insert("repos".into(), json!(repos));
+    out
 }
 
 fn read_nodes(c: &Connection, now: Timestamp) -> UaResult<Vec<Value>> {
@@ -740,9 +808,10 @@ pub struct HeartbeatArgs {
     /// this hub has no node work queue yet, so there is no lease to renew and
     /// `cancel` is always empty.
     pub running: Option<Value>,
-    /// Facts. Only `surfaces`, `harness_config`, `vault_sync`,
-    /// `native_sessions` and `code_sha` refresh those keys and keep the rest;
-    /// any other key makes it a full replacement, bounded as at registration.
+    /// Advisory facts: `surfaces`, `harness_config`, `vault_sync`,
+    /// `native_sessions` and `code_sha` replace those keys and keep the rest.
+    /// Any other key is dropped and named in `dropped_fact_keys`; host facts
+    /// such as roots, repos and harnesses change only by registering again.
     pub facts: Option<Value>,
     /// Progress note for the running item. Accepted for compatibility; with
     /// no work queue there is no item to record it against.
@@ -758,7 +827,19 @@ pub struct NodeListArgs {}
 pub struct RetireArgs {
     /// Node name.
     pub node: String,
-    /// Why, 1-500 characters. Required; recorded on the row and the ledger.
+    /// Why, 1-500 characters. Required; recorded on the ledger (and, for a
+    /// retirement, on the row).
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReassignArgs {
+    /// Node name.
+    pub node: String,
+    /// The agent label that owns the node from now on.
+    pub to_agent: String,
+    /// Why, 1-500 characters. Required; recorded on the ledger.
     pub reason: Option<String>,
 }
 
@@ -780,17 +861,45 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
         Some(raw) => bound_facts(&raw),
         None => (Map::new(), Vec::new()),
     };
+    let cap = i64::from(ctx.hub.cfg().node_max_per_agent);
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let existing: Option<(String, Option<String>)> = tx
-                .query_row("SELECT agent, retired_at FROM nodes WHERE node = ?1", [&name], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+            let existing: Option<(String, Option<String>, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT agent, retired_at, version, facts_json FROM nodes WHERE node = ?1",
+                    [&name],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
                 .optional()?;
-            if let Some((owner, retired_at)) = &existing {
+            if let Some((owner, retired_at, _, _)) = &existing {
                 check_owner(owner, retired_at.is_some(), &name, &agent)?;
+            } else {
+                let held: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE agent = ?1 AND retired_at IS NULL",
+                    [&agent],
+                    |r| r.get(0),
+                )?;
+                if held >= cap {
+                    return Err(UaError::denied(
+                        "node_limit",
+                        format!(
+                            "agent {agent:?} already holds {held} node(s) in service, the limit \
+                             (node_max_per_agent = {cap}); an operator must retire one first"
+                        ),
+                    ));
+                }
             }
+            // Which ledgered facts differ from the stored row (all of them
+            // on a first registration).
+            let new_identity = identity_facts(version.as_deref(), &facts);
+            let changed: Vec<String> = match &existing {
+                None => new_identity.keys().cloned().collect(),
+                Some((_, _, old_version, old_facts)) => {
+                    let old = identity_facts(old_version.as_deref(), &load_facts(old_facts));
+                    new_identity.iter().filter(|(k, v)| old.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect()
+                }
+            };
             let now = ua_core::time::now();
             let facts_json = Value::Object(facts.clone()).to_string();
             // A registration is a fresh beat, so the fence set by retire or
@@ -803,26 +912,33 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
                 params![name, agent, facts_json, version, now],
             )?;
             let first = existing.is_none();
-            ledger::append(
-                tx,
-                EventInput::new(
-                    "agent.node.register",
-                    json!({
-                        "kind": "register",
-                        "node": name,
-                        "agent": agent,
-                        "version": version,
-                        "backends": facts.get("backends").cloned().unwrap_or_else(|| json!([])),
-                        "first_registration": first,
-                    }),
-                )
-                .by(agent.clone()),
-            )?;
+            // An identical re-registration (a node restarting) is not news.
+            let ledgered = !changed.is_empty();
+            if ledgered {
+                let mut payload = json!({
+                    "kind": "register",
+                    "node": name,
+                    "agent": agent,
+                    "first_registration": first,
+                    "changed": changed,
+                });
+                // Names and counts only: the ledger is read more widely than
+                // the node's own facts, so paths stay out of it.
+                for (k, v) in &new_identity {
+                    payload[k] = match k.as_str() {
+                        "worktree_roots" | "repos" => json!(v.as_array().map_or(0, Vec::len)),
+                        _ => v.clone(),
+                    };
+                }
+                ledger::append(tx, EventInput::new("agent.node.register", payload).by(agent.clone()))?;
+            }
             Ok(json!({
                 "node": name,
                 "agent": agent,
                 "registered": true,
                 "first_registration": first,
+                "changed": changed,
+                "ledgered": ledgered,
                 "as_of": now,
                 "hub_features": HUB_FEATURES,
                 "dropped_fact_keys": dropped,
@@ -868,12 +984,23 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
 }
 
 async fn node_list(ctx: ToolCtx, _a: NodeListArgs) -> UaResult<Value> {
+    // Full facts for the node's own agent and for lifecycle operators; a
+    // summary for everyone else, including unverified callers.
+    let viewer = verified(&ctx.caller).map(str::to_string);
+    let operator = viewer.as_deref().is_some_and(|v| ctx.hub.cfg().is_lifecycle_operator(v));
     ctx.hub
         .db()
-        .read_async(|c| {
+        .read_async(move |c| {
             let now = Timestamp::now();
             let (retired, nodes): (Vec<Value>, Vec<Value>) =
                 read_nodes(c, now)?.into_iter().partition(|n| n["status"] == "retired");
+            let nodes: Vec<Value> = nodes
+                .into_iter()
+                .map(|n| {
+                    let mine = viewer.as_deref().is_some_and(|v| n["agent"] == v);
+                    if operator || mine { n } else { summary(&n) }
+                })
+                .collect();
             let mut counts = json!({ "live": 0, "stale": 0, "offline": 0 });
             for n in &nodes {
                 if let Some(s) = n["status"].as_str() {
@@ -934,6 +1061,24 @@ fn retire_reason(raw: Option<&str>) -> UaResult<String> {
     Ok(text)
 }
 
+/// A conflict while any [`RETIRE_BLOCKERS`] probe reports queued or claimed
+/// work for `name`, so no work is stranded by `doing` (retiring, reassigning
+/// or forgetting the node).
+fn refuse_open_work(tx: &mut WriteTx<'_>, name: &str, doing: &str) -> UaResult<()> {
+    let mut open: Vec<String> = Vec::new();
+    for probe in RETIRE_BLOCKERS {
+        open.extend(probe(tx, name)?);
+    }
+    if open.is_empty() {
+        return Ok(());
+    }
+    open.truncate(20);
+    Err(UaError::conflict(format!(
+        "node {name:?} has queued or claimed work ({}); cancel it before {doing} the node",
+        open.join(", ")
+    )))
+}
+
 /// `agent, last_heartbeat, retired_at, retired_by, retired_reason`.
 type RetireRow = (String, Option<String>, Option<String>, Option<String>, Option<String>);
 
@@ -959,17 +1104,7 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
         }));
     }
     if retire {
-        let mut open: Vec<String> = Vec::new();
-        for probe in RETIRE_BLOCKERS {
-            open.extend(probe(tx, name)?);
-        }
-        if !open.is_empty() {
-            open.truncate(20);
-            return Err(UaError::conflict(format!(
-                "node {name:?} has queued or claimed work ({}); cancel it before retiring the node",
-                open.join(", ")
-            )));
-        }
+        refuse_open_work(tx, name, "retiring")?;
     }
     let now = ua_core::time::now();
     // Either way the stored beat becomes the fence: it predates the refusal,
@@ -1032,11 +1167,121 @@ pub(crate) async fn node_unretire(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value
     change_retirement(ctx, a, false).await
 }
 
+fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str) -> UaResult<Value> {
+    let row: Option<RetireRow> = tx
+        .query_row(
+            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes WHERE node = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((from, last_heartbeat, retired_at, _, _)) = row else {
+        return Err(UaError::not_found(format!("node {name:?} is not registered")));
+    };
+    if from == to {
+        return Ok(json!({ "node": name, "agent": to, "changed": false }));
+    }
+    refuse_open_work(tx, name, "reassigning")?;
+    let now = ua_core::time::now();
+    // The stored beat was the previous owner's: the new owner's node is not
+    // live until it registers or beats itself.
+    tx.execute(
+        "UPDATE nodes SET agent = ?2, heartbeat_floor = last_heartbeat, updated_at = ?3 WHERE node = ?1",
+        params![name, to, now],
+    )?;
+    let event = ledger::append(
+        tx,
+        EventInput::new(
+            "agent.node.reassign",
+            json!({
+                "kind": "reassign",
+                "node": name,
+                "from_agent": from,
+                "to_agent": to,
+                "actor": who,
+                "reason": reason,
+                "retired": retired_at.is_some(),
+                "last_heartbeat": last_heartbeat,
+                "at": now,
+            }),
+        )
+        .by(who.to_string()),
+    )?;
+    Ok(json!({
+        "node": name,
+        "agent": to,
+        "previous_agent": from,
+        "changed": true,
+        "retired": retired_at.is_some(),
+        "event_ulid": event.map(|e| e.ulid),
+    }))
+}
+
+fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult<Value> {
+    let row: Option<RetireRow> = tx
+        .query_row(
+            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes WHERE node = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((agent, last_heartbeat, retired_at, retired_by, retired_reason)) = row else {
+        return Err(UaError::not_found(format!("node {name:?} is not registered")));
+    };
+    if retired_at.is_none() {
+        return Err(UaError::conflict(format!(
+            "node {name:?} is in service; retire it (coordination_manage node_retire) before forgetting it"
+        )));
+    }
+    refuse_open_work(tx, name, "forgetting")?;
+    tx.execute("DELETE FROM nodes WHERE node = ?1", [name])?;
+    let now = ua_core::time::now();
+    let event = ledger::append(
+        tx,
+        EventInput::new(
+            "agent.node.forget",
+            json!({
+                "kind": "forget",
+                "node": name,
+                "agent": agent,
+                "actor": who,
+                "reason": reason,
+                "retired_at": retired_at,
+                "retired_by": retired_by,
+                "retired_reason": retired_reason,
+                "last_heartbeat": last_heartbeat,
+                "at": now,
+            }),
+        )
+        .by(who.to_string()),
+    )?;
+    Ok(json!({ "node": name, "agent": agent, "forgotten": true, "event_ulid": event.map(|e| e.ulid) }))
+}
+
+/// `coordination_manage(action="node_reassign")`: move a node name to
+/// another agent label (for example after a label change).
+pub(crate) async fn node_reassign(ctx: ToolCtx, a: ReassignArgs) -> UaResult<Value> {
+    let who = lifecycle_operator(&ctx, "reassign")?;
+    let name = validate_node_name(&a.node)?;
+    let to = validate_label(Some(&a.to_agent), "to_agent")?;
+    let reason = retire_reason(a.reason.as_deref())?;
+    ctx.hub.db().write_async(move |tx| reassign(tx, &name, &to, &who, &reason)).await
+}
+
+/// `coordination_manage(action="node_forget")`: delete a retired node's row
+/// so its name can be registered afresh.
+pub(crate) async fn node_forget(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value> {
+    let who = lifecycle_operator(&ctx, "forget")?;
+    let name = validate_node_name(&a.node)?;
+    let reason = retire_reason(a.reason.as_deref())?;
+    ctx.hub.db().write_async(move |tx| forget(tx, &name, &who, &reason)).await
+}
+
 pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "node_register",
-            "Register (or re-register) a remote node under the calling agent. The owner is the verified agent; a node name another agent registered is refused, and a retired node is refused with reason_code node_retired. Facts are bounded and unknown keys dropped. Returns {node, agent, registered, first_registration, as_of, hub_features, dropped_fact_keys}.",
+            "Register (or re-register) a remote node under the calling agent. The owner is the verified agent; a node name another agent registered is refused (node_owned_elsewhere), a retired node is refused (node_retired), and a new name past node_max_per_agent nodes in service is refused (node_limit). Facts are bounded and unknown keys dropped. Ledgered only when first registered or when version, backends, harness names, roots or repos change. Returns {node, agent, registered, first_registration, changed, ledgered, as_of, hub_features, dropped_fact_keys}.",
             node_register,
         )
         .family("nodes"),
@@ -1044,7 +1289,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "node_heartbeat",
-            "Mark the calling agent's node alive and optionally refresh its facts. Not ledgered. Refused for a node another agent owns, an unregistered node (not_found) or a retired one (node_retired). Returns {node, as_of, cancel, dropped_fact_keys}.",
+            "Mark the calling agent's node alive and optionally refresh its advisory facts (surfaces, harness_config, vault_sync, native_sessions, code_sha); other fact keys are dropped and reported. Not ledgered. Refused for a node another agent owns, an unregistered node (not_found) or a retired one (node_retired). Returns {node, as_of, cancel, dropped_fact_keys}.",
             node_heartbeat,
         )
         .family("nodes"),
@@ -1052,7 +1297,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "node_list",
-            "List registered nodes with liveness derived at read time: status live (heartbeat within 90s, at most 60s in the future), stale, offline or retired, plus heartbeat_status (online/idle/stale/offline/unknown). Retired nodes are left out of `nodes` and listed in `retired_nodes`. Returns {nodes, retired_nodes, counts, as_of}.",
+            "List registered nodes with liveness derived at read time: status live (heartbeat within 90s, at most 60s in the future), stale, offline or retired, plus heartbeat_status (online/idle/stale/offline/unknown). Retired nodes are left out of `nodes` and listed in `retired_nodes`. Rows carry full facts (detail=full) for the node's own agent and lifecycle operators, otherwise a summary (detail=summary: liveness, version, backends, harness_names). Returns {nodes, retired_nodes, counts, as_of}.",
             node_list,
         )
         .family("nodes")

@@ -74,6 +74,9 @@ pub struct Config {
     /// nobody. Setting it replaces that default rather than adding to it.
     #[serde(default, deserialize_with = "opt_string_or_list", skip_serializing_if = "Option::is_none")]
     pub lifecycle_operators: Option<Vec<String>>,
+    /// Remote nodes one agent may hold in service (registered, not retired).
+    /// A registration of a new node name past it is refused (`node_limit`).
+    pub node_max_per_agent: u32,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -272,6 +275,7 @@ impl Default for Config {
             agent_tokens: None,
             human_identities: Vec::new(),
             lifecycle_operators: None,
+            node_max_per_agent: 8,
             shell_allowlist: Vec::new(),
             approval_tools: Vec::new(),
             approval_pass_ttl_hours: 24.0,
