@@ -66,10 +66,22 @@ and steps to reproduce. You will get an acknowledgement within a week.
   `[env]`, `build.rustc-wrapper`, source replacement and credential
   providers would apply inside `run_cmd`. So `run_cmd` (and
   `run_cmd_check`) refuse `cargo` and `cargo-*` with the advisory
-  `cargo-config`, naming the file, whenever such a file exists above the
-  workspace root, and `ua serve` warns at startup. Fix it by moving the
-  workspace outside that directory tree (`workspace = "/srv/ua-workspace"`
-  or similar), or by removing the file. Configs inside the workspace are
-  the workspace's own and are not refused. Cargo started indirectly (by
+  `cargo-config`, naming the file and the SHA-256 of its content, whenever
+  such a file exists above the workspace root, and `ua serve` warns at
+  startup. Fix it by moving the workspace outside that directory tree
+  (`workspace = "/srv/ua-workspace"` or similar), by removing the file, or
+  by trusting it: after reviewing the file, pin its path and current hash
+  in the hub config,
+  `trusted_cargo_configs = [{ path = "~/.cargo/config.toml", sha256 = "<hex>" }]`
+  (the refusal prints the line to copy). A pinned file is hashed again on
+  every call; when its content changes, or when another unpinned config
+  appears above the workspace, cargo is refused again until the new
+  content is pinned. Residual risks of a pin: the file is read and hashed
+  when `run_cmd` is called and cargo reads it again when it starts, so a
+  change made in between (by something that can already write outside the
+  workspace as the hub user) is not caught; and only the file's own bytes
+  are pinned, not what it points to (a `rustc-wrapper` or linker binary,
+  a credential provider, an `include`d file). Configs inside the workspace
+  are the workspace's own and are not refused. Cargo started indirectly (by
   an interpreter or build tool, which already needs approval) is not
   covered by this check.

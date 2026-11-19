@@ -16,6 +16,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use ua_core::config::TrustedCargoConfig;
 use ua_core::safety::{
     canonicalize_lenient, git_global_options, git_subcommand, guard_secret_filename, resolve_in_root,
     split_command, vet_command,
@@ -272,9 +273,124 @@ pub fn ancestor_cargo_configs(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A startup warning when cargo config files sit above any configured
-/// workspace root (the default root and each per-agent root); `None` when
-/// there are none. `run_cmd` refuses cargo in such a workspace.
+/// Largest cargo config file hashed for the `trusted_cargo_configs` check;
+/// a bigger one is refused rather than read.
+const CARGO_CONFIG_READ_CAP: u64 = 1024 * 1024;
+
+/// The cargo configs above `root` that cargo may not read: every one not
+/// pinned in `trusted`, or whose content no longer matches its pin. Each is
+/// described with its path and current SHA-256, for the refusal text.
+///
+/// The file is read once and that content is hashed. Cargo reads it again
+/// when it starts, so a change made in between is not caught; only a
+/// process that can already write outside the workspace can make one.
+fn untrusted_cargo_configs(root: &Path, trusted: &[TrustedCargoConfig]) -> Vec<UntrustedCargoConfig> {
+    ancestor_cargo_configs(root)
+        .into_iter()
+        .filter_map(|path| {
+            let pins: Vec<&TrustedCargoConfig> =
+                trusted.iter().filter(|t| same_file(&t.path, &path)).collect();
+            let sha256 = match read_capped(&path, CARGO_CONFIG_READ_CAP) {
+                Ok(bytes) => sha256_hex(&bytes),
+                Err(e) => return Some(UntrustedCargoConfig { path, sha256: None, why: e }),
+            };
+            if pins.iter().any(|t| t.sha256.trim().eq_ignore_ascii_case(&sha256)) {
+                return None;
+            }
+            let why = match pins.first() {
+                None => "not in trusted_cargo_configs".to_string(),
+                Some(t) => format!(
+                    "changed since trusted_cargo_configs pinned sha256 {}",
+                    t.sha256.trim().to_ascii_lowercase()
+                ),
+            };
+            Some(UntrustedCargoConfig { path, sha256: Some(sha256), why })
+        })
+        .collect()
+}
+
+/// A cargo config above the workspace that cargo may not read.
+struct UntrustedCargoConfig {
+    path: PathBuf,
+    /// SHA-256 of its current content; `None` when it could not be read.
+    sha256: Option<String>,
+    why: String,
+}
+
+impl UntrustedCargoConfig {
+    fn describe(list: &[Self]) -> String {
+        list.iter()
+            .map(|c| match &c.sha256 {
+                Some(h) => format!("{} (sha256 {h}, {})", c.path.display(), c.why),
+                None => format!("{} ({})", c.path.display(), c.why),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The fix: move the workspace, or pin the files' current content.
+    fn remedy(list: &[Self]) -> String {
+        let pins: Vec<String> = list
+            .iter()
+            .filter_map(|c| {
+                let h = c.sha256.as_ref()?;
+                Some(format!("{{ path = {}, sha256 = \"{h}\" }}", toml_string(&c.path.display().to_string())))
+            })
+            .collect();
+        let mut out = "Move the workspace outside that directory tree".to_string();
+        if !pins.is_empty() {
+            out.push_str(&format!(
+                ", or, after reviewing the file, trust its current content in the hub config: \
+                 trusted_cargo_configs = [{}]. Any later change to the file is refused again",
+                pins.join(", ")
+            ));
+        }
+        out.push('.');
+        out
+    }
+}
+
+/// `s` as a TOML basic string.
+fn toml_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether `a` and `b` name the same file, literally or after resolving links.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || a.canonicalize().ok().is_some_and(|ca| b.canonicalize().ok() == Some(ca))
+}
+
+/// The bytes of the regular file `p` (links followed), refusing anything
+/// else (a FIFO would block) and anything over `cap` bytes.
+fn read_capped(p: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).map_err(|e| format!("unreadable: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("unreadable: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    f.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("unreadable: {e}"))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("larger than {cap} bytes"));
+    }
+    Ok(bytes)
+}
+
+/// A startup warning when cargo config files that are not trusted (see
+/// `trusted_cargo_configs`) sit above any configured workspace root (the
+/// default root and each per-agent root); `None` when there are none.
+/// `run_cmd` refuses cargo in such a workspace.
 pub fn cargo_config_warning(cfg: &ua_core::Config) -> Option<String> {
     let mut roots = vec![cfg.workspace_root()];
     roots.extend(
@@ -283,18 +399,21 @@ pub fn cargo_config_warning(cfg: &ua_core::Config) -> Option<String> {
             .filter(|v| !v.trim().eq_ignore_ascii_case("deny"))
             .map(|v| super::expand_tilde(v.trim())),
     );
-    let mut found: Vec<PathBuf> =
-        roots.iter().filter_map(|r| r.canonicalize().ok()).flat_map(|r| ancestor_cargo_configs(&r)).collect();
-    found.sort();
-    found.dedup();
+    let mut found: Vec<UntrustedCargoConfig> = roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .flat_map(|r| untrusted_cargo_configs(&r, &cfg.trusted_cargo_configs))
+        .collect();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found.dedup_by(|a, b| a.path == b.path);
     if found.is_empty() {
         return None;
     }
-    let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
     Some(format!(
         "cargo config above a workspace root: {}. Cargo reads every ancestor .cargo/config of its cwd, so \
-         run_cmd refuses cargo in that workspace; move the workspace outside that directory tree.",
-        list.join(", ")
+         run_cmd refuses cargo in that workspace. {}",
+        UntrustedCargoConfig::describe(&found),
+        UntrustedCargoConfig::remedy(&found)
     ))
 }
 
@@ -832,8 +951,9 @@ fn mutation_risk(argv: &[String]) -> &'static str {
     }
 }
 
-/// Advisory findings for a vetted argv.
-fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
+/// Advisory findings for a vetted argv. `trusted` is the operator's
+/// `trusted_cargo_configs`.
+fn advisories(argv: &[String], workdir: &Path, root: &Path, trusted: &[TrustedCargoConfig]) -> Vec<Finding> {
     let mut out = Vec::new();
     let Some((prog, rest)) = argv.split_first() else { return out };
     let name = program_name(prog);
@@ -1041,17 +1161,17 @@ fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
         ));
     }
     if name == "cargo" || name.starts_with("cargo-") {
-        let found = ancestor_cargo_configs(root);
+        let found = untrusted_cargo_configs(root, trusted);
         if !found.is_empty() {
-            let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
             out.push(finding(
                 "block",
                 "cargo-config",
                 format!(
                     "cargo reads every .cargo/config in the directories above its cwd, so it would apply {} \
                      (aliases, [env], build.rustc-wrapper, source replacement, credential providers) from \
-                     outside the workspace. Move the workspace outside that directory tree.",
-                    list.join(", ")
+                     outside the workspace. {}",
+                    UntrustedCargoConfig::describe(&found),
+                    UntrustedCargoConfig::remedy(&found)
                 ),
             ));
         }
@@ -1127,7 +1247,7 @@ fn run_cmd_check(ctx: &ToolCtx, a: CheckArgs) -> UaResult<Value> {
             format!("{program:?} not found on PATH; run_cmd would return exit code 127."),
         ));
     }
-    findings.extend(advisories(&argv, &workdir, &sb.root));
+    findings.extend(advisories(&argv, &workdir, &sb.root, &ctx.hub.cfg().trusted_cargo_configs));
     let blocked = findings.iter().any(|f| f.severity == "block");
     let warned = findings.iter().any(|f| f.severity == "warn");
     Ok(json!({
@@ -1171,7 +1291,7 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let workdir = resolve_cwd(&sb, &a.cwd)?;
     let argv: Vec<String> =
         std::iter::once(vetted.program.clone()).chain(vetted.args.iter().cloned()).collect();
-    let findings = advisories(&argv, &workdir, &sb.root);
+    let findings = advisories(&argv, &workdir, &sb.root, &ctx.hub.cfg().trusted_cargo_configs);
     if let Some(block) = findings.iter().find(|f| f.severity == "block") {
         return Err(UaError::denied(block.code, block.message.clone()));
     }
