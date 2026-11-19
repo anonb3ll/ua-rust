@@ -21,6 +21,21 @@ approval_tools = ["git_merge_task"]
 # Programs run_cmd may start. Setting this replaces the built-in list.
 # shell_allowlist = ["git", "ls", "cat", "grep", "cargo"]
 
+# Reviewed YAML workflow definitions (workflow_run). Treat this directory as code.
+# workflow_dir = "~/.ua-rust/workflows"
+
+# Run due cron routines from `ua serve` once a minute, and allow routine_fire.
+routines_enabled = false
+
+# Default autonomous-cycle budgets.
+autonomy_max_time_s = 3600.0
+autonomy_max_tokens = 100000
+autonomy_max_retries = 3
+autonomy_max_cost_cents = 1000.0
+# Green-path validation gates, run in the task worktree; empty means every
+# cycle merge and PR transition waits for a human approval.
+# cycle_validation_command = ["cargo", "test", "--quiet"]
+
 # Default profile per identity. Unlisted identities get "developer".
 [profiles]
 operator = "operator"

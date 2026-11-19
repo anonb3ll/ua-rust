@@ -128,7 +128,8 @@ fn approval_action(to: &str) -> Option<&'static str> {
 }
 
 static EVIDENCE_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://\S+$").expect("static regex"));
-static EVIDENCE_SHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{7,40}$").expect("static regex"));
+static EVIDENCE_SHA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{7,40}$").expect("static regex"));
 
 /// Changed paths that always need a human merge decision.
 const RED_TIER_PATTERNS: &[&str] = &[
@@ -221,7 +222,13 @@ fn transition_json(c: &Connection, where_sql: &str, p: &[&dyn rusqlite::ToSql]) 
     Ok(c.query_row(&sql, p, |r| Ok(Value::Object(row_map(r)?))).optional()?)
 }
 
-fn updated_event(tx: &mut WriteTx<'_>, by: &str, cycle: &Map<String, Value>, action: &str, extra: Value) -> UaResult<()> {
+fn updated_event(
+    tx: &mut WriteTx<'_>,
+    by: &str,
+    cycle: &Map<String, Value>,
+    action: &str,
+    extra: Value,
+) -> UaResult<()> {
     let mut payload = json!({
         "action": action,
         "cycle_id": cycle.get("id"),
@@ -311,7 +318,8 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
     } else {
         ("blocked", Some(format!("capability policy denied: {}", denied.join(", "))))
     };
-    let caps_json = requested.map(|r| serde_json::to_string(&r.into_iter().collect::<Vec<_>>())).transpose()?;
+    let caps_json =
+        requested.map(|r| serde_json::to_string(&r.into_iter().collect::<Vec<_>>())).transpose()?;
     let id = new_cycle_id();
     let (task_id, plan_id, delegation_id, max_rework) = (a.task_id, a.plan_id, a.delegation_id, a.max_rework);
     ctx.hub
@@ -476,7 +484,9 @@ enum Phase {
 }
 
 fn check_live(cycle: &Map<String, Value>, a: &TransitionArgs, key: &str, c: &Connection) -> UaResult<Phase> {
-    if let Some(existing) = transition_json(c, "cycle_id = ?1 AND idempotency_key = ?2", &[&a.cycle_id, &key])? {
+    if let Some(existing) =
+        transition_json(c, "cycle_id = ?1 AND idempotency_key = ?2", &[&a.cycle_id, &key])?
+    {
         if existing["to_state"] != a.to_state && !(existing["to_state"] == "blocked") {
             return Err(UaError::conflict("idempotency key was already used for another transition"));
         }
@@ -486,7 +496,9 @@ fn check_live(cycle: &Map<String, Value>, a: &TransitionArgs, key: &str, c: &Con
     if let Some(expected) = a.expected_version
         && expected != version
     {
-        return Err(UaError::conflict(format!("stale cycle version: expected {expected}, current {version}")));
+        return Err(UaError::conflict(format!(
+            "stale cycle version: expected {expected}, current {version}"
+        )));
     }
     let current = s(cycle, "state").unwrap_or_default();
     if !transitions(current).contains(&a.to_state.as_str()) {
@@ -511,7 +523,9 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
     }
     let pr_url = a.pr_url.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(String::from);
     if a.to_state == "pr" {
-        let Some(p) = &pr_url else { return Err(UaError::invalid("pr_url is required before entering pr state")) };
+        let Some(p) = &pr_url else {
+            return Err(UaError::invalid("pr_url is required before entering pr state"));
+        };
         if !(EVIDENCE_URL.is_match(p) || EVIDENCE_SHA.is_match(p)) {
             return Err(UaError::invalid(
                 "pr_url must be a verifiable pointer (an http(s) URL or a 7-40 character commit SHA), not free text",
@@ -564,7 +578,8 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
         });
         let gate_tool = format!("autonomous_cycle:{action}");
         let (h, c, g) = (ctx.hub.clone(), ctx.caller.clone(), gate_tool.clone());
-        let outcome = ctx.hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &g, &payload)).await?;
+        let outcome =
+            ctx.hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &g, &payload)).await?;
         match outcome {
             GateOutcome::Pass { .. } => {}
             GateOutcome::Pending { approval_id } => {
@@ -717,7 +732,8 @@ pub struct UsageArgs {
 
 async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
     let actor = actor(&ctx.caller, &a.agent)?;
-    if [a.elapsed_s, a.cost_cents].iter().any(|v| !v.is_finite() || *v < 0.0) || a.tokens < 0 || a.retries < 0 {
+    if [a.elapsed_s, a.cost_cents].iter().any(|v| !v.is_finite() || *v < 0.0) || a.tokens < 0 || a.retries < 0
+    {
         return Err(UaError::invalid("usage values must be finite and nonnegative"));
     }
     if a.usage_run_id.is_some() != a.usage_id.is_some() {
@@ -829,9 +845,11 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
             };
             let blocks_now = reason.is_some() && !terminal && state != "blocked";
             let new_state = if blocks_now { "blocked".to_string() } else { state.clone() };
-            let stop_reason = if blocks_now {
-                reason.clone()
-            } else if state == "blocked" && !terminal && a.usage_run_id.is_none() && reason.is_some() {
+            // A newly blocked cycle, or a blocked one exceeding again, takes the
+            // new reason; otherwise (terminal, replay-keyed, or within budget)
+            // the recorded stop reason is kept.
+            let refresh = state == "blocked" && !terminal && a.usage_run_id.is_none() && reason.is_some();
+            let stop_reason = if blocks_now || refresh {
                 reason.clone()
             } else {
                 s(&cycle, "stop_reason").map(String::from)
@@ -934,8 +952,13 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
             break;
         }
     }
-    let files: Vec<String> =
-        changed.unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    let files: Vec<String> = changed
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
     if files.is_empty() {
         return no(reasons, "the change set is empty or could not be read; holding for a human");
     }
@@ -989,7 +1012,10 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
             ),
         );
     }
-    reasons.push(format!("validation gates passed at pinned commit {}", &head_before[..head_before.len().min(12)]));
+    reasons.push(format!(
+        "validation gates passed at pinned commit {}",
+        &head_before[..head_before.len().min(12)]
+    ));
     Verdict { eligible: true, reasons }
 }
 

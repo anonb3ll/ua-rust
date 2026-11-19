@@ -36,8 +36,12 @@ static DIGEST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{64}$
 
 fn research_definition(auto_record: bool) -> Definition {
     let mut steps = vec![
-        StepDef::call("search", "web_search", json!({ "query": "{{ inputs.query }}", "max_results": 3 })).gated(GATE),
-        StepDef::local("synthesize", json!({ "query": "{{ inputs.query }}", "results": "{{ steps.search }}" })),
+        StepDef::call("search", "web_search", json!({ "query": "{{ inputs.query }}", "max_results": 3 }))
+            .gated(GATE),
+        StepDef::local(
+            "synthesize",
+            json!({ "query": "{{ inputs.query }}", "results": "{{ steps.search }}" }),
+        ),
     ];
     if auto_record {
         steps.push(StepDef::call(
@@ -75,9 +79,15 @@ fn governed_definition() -> Definition {
         description: Some("Governed plan, build, verify, merge chain with gated receipts.".into()),
         inputs: ["task_id", "query", "run_id", "claimed_by"].map(String::from).to_vec(),
         steps: vec![
-            StepDef::local("plan", json!({ "hop": "plan", "task_id": "{{ inputs.task_id }}", "query": "{{ inputs.query }}" })),
+            StepDef::local(
+                "plan",
+                json!({ "hop": "plan", "task_id": "{{ inputs.task_id }}", "query": "{{ inputs.query }}" }),
+            ),
             StepDef::call("build", "task_update", receipt("build", "plan")).gated(GATE),
-            StepDef::local("verify", json!({ "hop": "verify", "build_sha256": "{{ steps.build | sha256 }}" })),
+            StepDef::local(
+                "verify",
+                json!({ "hop": "verify", "build_sha256": "{{ steps.build | sha256 }}" }),
+            ),
             StepDef::call("merge", "task_update", receipt("merge", "verify")).gated(GATE),
         ],
     }
@@ -148,7 +158,9 @@ async fn start_authority(hub: &Hub, caller: &Caller, task_id: i64) -> UaResult<S
     if task_id <= 0 {
         return Err(UaError::invalid("task_id must be a positive integer"));
     }
-    let task = task_state(hub, task_id).await?.ok_or_else(|| UaError::invalid(format!("task #{task_id} not found")))?;
+    let task = task_state(hub, task_id)
+        .await?
+        .ok_or_else(|| UaError::invalid(format!("task #{task_id} not found")))?;
     if task.status != "doing" {
         return Err(UaError::invalid(format!(
             "task #{task_id} is in status '{}'; it must be 'doing' to run",
@@ -191,7 +203,9 @@ fn classify(report: &Report) -> (&'static str, &'static str, Option<String>) {
     match report.status.as_str() {
         "done" => ("completed", "run_completed", None),
         "pending-approval" => ("interrupted", "approval_interrupted", None),
-        "denied" => ("denied", "run_denied", Some(report.code.clone().unwrap_or_else(|| "policy_denied".into()))),
+        "denied" => {
+            ("denied", "run_denied", Some(report.code.clone().unwrap_or_else(|| "policy_denied".into())))
+        }
         "conflict" => ("conflict", "run_conflict", report.code.clone()),
         "indeterminate" => ("failed", "run_failed", Some("run_error".into())),
         _ => ("failed", "run_failed", Some("gateway_failed".into())),
@@ -254,7 +268,10 @@ fn report_result(report: &Report, task_id: Option<i64>, resumed: bool, output: V
     m.insert("events".into(), events(report));
     m.insert("output".into(), if status == "completed" { output } else { Value::Null });
     if let Some(id) = report.approval_id {
-        m.insert("interrupted_by".into(), json!({ "approval_id": id, "tool": GATE, "step": report.pending_step }));
+        m.insert(
+            "interrupted_by".into(),
+            json!({ "approval_id": id, "tool": GATE, "step": report.pending_step }),
+        );
     }
     m
 }
@@ -273,7 +290,13 @@ async fn resume_checks(
     let rid = run_id.to_string();
     let run = hub.db().read_async(move |c| engine::load_run(c, &rid)).await?;
     let Some(run) = run else {
-        return Ok(Err(refusal(run_id, task_id, "run_failed", "checkpoint_missing", "no checkpoint exists for this run")));
+        return Ok(Err(refusal(
+            run_id,
+            task_id,
+            "run_failed",
+            "checkpoint_missing",
+            "no checkpoint exists for this run",
+        )));
     };
     if run.kind != kind {
         return Ok(Err(refusal(
@@ -369,7 +392,8 @@ async fn langgraph_run(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             return Err(UaError::invalid("query does not match the run"));
         }
         let task_id = run.task_id.unwrap_or_default();
-        let stored = run.inputs.get("budget_revision").and_then(Value::as_str).unwrap_or_default().to_string();
+        let stored =
+            run.inputs.get("budget_revision").and_then(Value::as_str).unwrap_or_default().to_string();
         if run.status != "done" && stored != budget_revision(hub, task_id) {
             return Ok(refusal(
                 run_id,
@@ -382,7 +406,13 @@ async fn langgraph_run(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         let auto_record = run.inputs.get("auto_record").and_then(Value::as_bool).unwrap_or(true);
         let def = research_definition(auto_record);
         if def.digest() != run.definition_digest {
-            return Ok(refusal(run_id, run.task_id, "run_failed", "checkpoint_incompatible", "graph definition changed"));
+            return Ok(refusal(
+                run_id,
+                run.task_id,
+                "run_failed",
+                "checkpoint_incompatible",
+                "graph definition changed",
+            ));
         }
         let report = engine::execute(hub, &ctx.caller, &run, &def).await?;
         return Ok(research_result(&report, &run, stored, true));
@@ -444,7 +474,13 @@ async fn langgraph_workflow_run(ctx: ToolCtx, a: WorkflowRunArgs) -> UaResult<Va
                 return Err(UaError::invalid("query does not match the run"));
             }
             if def.digest() != run.definition_digest {
-                return Ok(refusal(run_id, run.task_id, "run_failed", "checkpoint_incompatible", "graph definition changed"));
+                return Ok(refusal(
+                    run_id,
+                    run.task_id,
+                    "run_failed",
+                    "checkpoint_incompatible",
+                    "graph definition changed",
+                ));
             }
             let report = engine::execute(hub, &ctx.caller, &run, &def).await?;
             (run, report, true)
@@ -452,7 +488,8 @@ async fn langgraph_workflow_run(ctx: ToolCtx, a: WorkflowRunArgs) -> UaResult<Va
         None => {
             let claimed_by = start_authority(hub, &ctx.caller, a.task_id).await?;
             let run_id = engine::new_run_id();
-            let inputs = json!({ "task_id": a.task_id, "query": query, "run_id": run_id, "claimed_by": claimed_by });
+            let inputs =
+                json!({ "task_id": a.task_id, "query": query, "run_id": run_id, "claimed_by": claimed_by });
             let inputs = inputs.as_object().cloned().unwrap_or_default();
             let (run, report) = start(hub, &ctx.caller, &run_id, GOVERNED, &def, inputs, a.task_id).await?;
             (run, report, false)
