@@ -911,6 +911,18 @@ fn copy_ledger(
         };
         let copied = db
             .write(|tx| {
+                // Re-check inside the write transaction: the target ledger must
+                // still end exactly where this import left it. Another writer
+                // appending in between would interleave two histories.
+                let target_max: Option<i64> =
+                    tx.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?;
+                let expected = (cursor > 0).then_some(cursor);
+                if target_max != expected {
+                    return Err(UaError::conflict(format!(
+                        "the target ledger changed during the import (last seq {target_max:?}, expected \
+                         {expected:?}); stop every hub process and retry"
+                    )));
+                }
                 let mut n = 0u64;
                 for row in &rows {
                     let ev = row.as_ref().map_err(|(seq, why)| {

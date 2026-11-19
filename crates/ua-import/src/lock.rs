@@ -1,9 +1,11 @@
-//! An advisory lock that says "a hub owns this database".
+//! An advisory lock that says "a hub is using this database".
 //!
-//! `ua serve` holds an exclusive lock on a file next to the database for its
-//! whole lifetime; an import takes the same lock, so it cannot start against a
-//! live hub (and a hub cannot start in the middle of an import). The lock is
-//! released by the OS when the holder exits, so a crash leaves nothing stale.
+//! Every `ua` command that opens the hub (`serve`, `mcp`, `call`, `token`,
+//! ...) holds a shared lock on a file next to the database for as long as it
+//! runs, so they can run side by side. An import takes the lock exclusively:
+//! it cannot start while any of them runs, and none can start during an
+//! import. The OS releases the lock when the holder exits, so a crash leaves
+//! nothing stale.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -17,15 +19,26 @@ pub fn lock_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name(name)
 }
 
-/// An exclusive hold on a database. Dropping it (or exiting) releases it.
+/// A hold on a database. Dropping it (or exiting) releases it.
 #[derive(Debug)]
 pub struct HubLock {
     _file: File,
 }
 
 impl HubLock {
-    /// Take the lock for `db_path`, or fail with advice to stop the hub.
+    /// Take the lock exclusively (an import), or fail with advice to stop
+    /// every hub process.
     pub fn acquire(db_path: &Path, what: &str) -> anyhow::Result<HubLock> {
+        Self::take(db_path, what, true)
+    }
+
+    /// Take the lock shared (any command that opens the hub). Fails only
+    /// while an import holds it.
+    pub fn acquire_shared(db_path: &Path, what: &str) -> anyhow::Result<HubLock> {
+        Self::take(db_path, what, false)
+    }
+
+    fn take(db_path: &Path, what: &str, exclusive: bool) -> anyhow::Result<HubLock> {
         let path = lock_path(db_path);
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -36,10 +49,16 @@ impl HubLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening lock file {}", path.display()))?;
-        if !try_lock_exclusive(&file)? {
+        if !try_lock(&file, exclusive)? {
+            if exclusive {
+                bail!(
+                    "the database {} is in use by a running hub process (ua serve, ua mcp, ua call, ...) \
+                     or another import: {what} refused. Stop them first, then retry",
+                    db_path.display()
+                );
+            }
             bail!(
-                "the database {} is in use by a running hub (or another import): {what} refused. \
-                 Stop the hub first, then retry",
+                "the database {} is being imported into: {what} refused until it finishes",
                 db_path.display()
             );
         }
@@ -48,10 +67,11 @@ impl HubLock {
 }
 
 #[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> anyhow::Result<bool> {
+fn try_lock(file: &File, exclusive: bool) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd;
+    let mode = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
     // SAFETY: `flock` on a descriptor owned by `file`, which outlives the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) };
     if rc == 0 {
         return Ok(true);
     }
@@ -64,8 +84,13 @@ fn try_lock_exclusive(file: &File) -> anyhow::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> anyhow::Result<bool> {
-    // No advisory lock on this platform: the caller must stop the hub itself.
+fn try_lock(_file: &File, exclusive: bool) -> anyhow::Result<bool> {
+    // No advisory lock on this platform yet. Say so instead of pretending.
+    if exclusive {
+        eprintln!(
+            "warning: database locking is not supported on this platform; make sure no hub process is running"
+        );
+    }
     Ok(true)
 }
 
@@ -77,12 +102,29 @@ mod tests {
     fn a_held_lock_blocks_a_second_holder_until_released() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("ua.db");
-        let first = HubLock::acquire(&db, "serve").unwrap();
+        let first = HubLock::acquire(&db, "import").unwrap();
         assert!(lock_path(&db).is_file());
         let err = HubLock::acquire(&db, "import").unwrap_err().to_string();
-        assert!(err.contains("Stop the hub first"), "{err}");
+        assert!(err.contains("Stop them first"), "{err}");
         drop(first);
         HubLock::acquire(&db, "import").unwrap();
+    }
+
+    #[test]
+    fn hub_processes_share_the_lock_and_block_an_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let serve = HubLock::acquire_shared(&db, "serve").unwrap();
+        let mcp = HubLock::acquire_shared(&db, "mcp").unwrap();
+        let err = HubLock::acquire(&db, "import").unwrap_err().to_string();
+        assert!(err.contains("Stop them first"), "{err}");
+        drop(serve);
+        assert!(HubLock::acquire(&db, "import").is_err(), "one hub process is still running");
+        drop(mcp);
+        let import = HubLock::acquire(&db, "import").unwrap();
+        let err = HubLock::acquire_shared(&db, "serve").unwrap_err().to_string();
+        assert!(err.contains("being imported"), "{err}");
+        drop(import);
     }
 
     #[test]
