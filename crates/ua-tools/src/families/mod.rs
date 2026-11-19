@@ -12,6 +12,7 @@ pub mod memory;
 pub mod messaging;
 pub mod plans;
 pub mod tasks;
+pub mod vault;
 pub mod workspace;
 
 use ua_store::SchemaPart;
@@ -23,6 +24,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     // family schema parts (alphabetical)
     parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());
+    parts.extend(vault::schema_parts());
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
     parts.push(plans::SCHEMA);
@@ -38,5 +40,6 @@ pub fn register(r: &mut Registry) {
     messaging::register(r);
     plans::register(r);
     tasks::register(r);
+    vault::register(r);
     workspace::register(r);
 }
