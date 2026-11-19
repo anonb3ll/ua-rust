@@ -11,6 +11,7 @@ pub mod events;
 pub mod messaging;
 pub mod plans;
 pub mod tasks;
+pub mod workspace;
 
 use ua_store::SchemaPart;
 
@@ -34,4 +35,5 @@ pub fn register(r: &mut Registry) {
     messaging::register(r);
     plans::register(r);
     tasks::register(r);
+    workspace::register(r);
 }

@@ -1,0 +1,1209 @@
+//! `run_cmd` and `run_cmd_check`.
+//!
+//! The command line is split without a shell and the program must be on the
+//! allowlist (`ua_core::safety::vet_command`, which also refuses destructive
+//! argv such as `rm -rf`). Only `cwd` is confined; arguments are not, so the
+//! advisories below flag arguments that escape the workspace, programs that
+//! can run other programs, and similar surprises. The `path-escape`,
+//! `allowlist-bypass` and `arbitrary-code` advisories, and `git push`, force
+//! a one-time human approval even when `run_cmd` is not in `approval_tools`.
+
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use regex::Regex;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use ua_core::safety::{
+    canonicalize_lenient, git_global_options, git_subcommand, guard_secret_filename, resolve_in_root,
+    split_command, vet_command,
+};
+use ua_core::{UaError, UaResult};
+
+use super::{Sandbox, base_env, record, run_program, sandbox, sha256_hex};
+use crate::approvals::{self, GateOutcome};
+use crate::registry::{Registry, ToolCtx, tool};
+
+/// Longest `run_cmd` timeout, seconds.
+pub const CMD_TIMEOUT_CAP_S: u64 = 120;
+/// Combined stdout + stderr kept, bytes.
+pub const CMD_OUTPUT_CAP: usize = 50 * 1024;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunArgs {
+    /// Command line. Split like a POSIX shell would split words, but no shell
+    /// runs: no pipes, redirection, globbing or `$VAR` expansion.
+    pub command: String,
+    /// Working directory inside the workspace (default: the root).
+    #[serde(default = "dot")]
+    pub cwd: String,
+    /// Seconds before the whole process group is killed, 1-120 (default 30).
+    #[serde(default = "default_timeout")]
+    pub timeout_s: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckArgs {
+    /// Command line to vet; nothing is executed.
+    pub command: String,
+    /// Working directory inside the workspace (default: the root).
+    #[serde(default = "dot")]
+    pub cwd: String,
+}
+
+fn dot() -> String {
+    ".".into()
+}
+
+fn default_timeout() -> i64 {
+    30
+}
+
+/// One vetting note.
+#[derive(Debug, Clone, Serialize)]
+pub struct Finding {
+    /// `block` (run_cmd refuses), `warn` (probably not intended) or `info`.
+    pub severity: &'static str,
+    pub code: &'static str,
+    pub message: String,
+}
+
+fn finding(severity: &'static str, code: &'static str, message: impl Into<String>) -> Finding {
+    Finding { severity, code, message: message.into() }
+}
+
+/// Codes that force the approval gate.
+const APPROVAL_REQUIRED_CODES: &[&str] = &["path-escape", "allowlist-bypass", "arbitrary-code"];
+
+const SHELL_SYNTAX_TOKENS: &[&str] =
+    &["|", "||", "&&", ";", "&", ">", ">>", "<", "<<", "2>", "2>>", "2>&1", "1>&2"];
+const READ_ONLY_PROGRAMS: &[&str] =
+    &["ls", "cat", "head", "tail", "grep", "wc", "diff", "which", "echo", "date"];
+const CONTENT_READERS: &[&str] = &["cat", "head", "tail", "grep", "diff", "uniq", "sort", "sed", "awk", "wc"];
+const FIND_SIDE_EFFECTS: &[&str] =
+    &["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"];
+const HARMLESS_INFO_ARGS: &[&str] = &["-h", "--help", "-V", "--version"];
+const GIT_READ_ONLY: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "grep",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "describe",
+    "shortlog",
+    "reflog",
+    "cat-file",
+];
+const GIT_MUTATING: &[&str] = &[
+    "add",
+    "commit",
+    "push",
+    "fetch",
+    "pull",
+    "merge",
+    "rebase",
+    "reset",
+    "restore",
+    "checkout",
+    "switch",
+    "clean",
+    "rm",
+    "mv",
+    "cherry-pick",
+    "revert",
+    "am",
+    "apply",
+    "clone",
+    "init",
+    "gc",
+    "prune",
+    "submodule",
+];
+const GIT_NETWORK: &[&str] = &["push", "fetch", "pull", "clone", "ls-remote"];
+const GIT_OUTPUT_SUBCOMMANDS: &[&str] =
+    &["log", "show", "diff", "diff-tree", "diff-index", "diff-files", "format-patch", "whatchanged"];
+/// Built-in git commands. git never lets an alias shadow one of these, so
+/// any other subcommand may be `alias.<name>=!cmd` from a repository config.
+const GIT_KNOWN_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "am",
+    "annotate",
+    "apply",
+    "archive",
+    "bisect",
+    "blame",
+    "branch",
+    "bugreport",
+    "bundle",
+    "cat-file",
+    "check-attr",
+    "check-ignore",
+    "check-mailmap",
+    "check-ref-format",
+    "checkout",
+    "checkout-index",
+    "cherry",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "column",
+    "commit",
+    "commit-graph",
+    "commit-tree",
+    "config",
+    "count-objects",
+    "credential",
+    "describe",
+    "diagnose",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "difftool",
+    "fast-export",
+    "fast-import",
+    "fetch",
+    "fetch-pack",
+    "filter-branch",
+    "fmt-merge-msg",
+    "for-each-ref",
+    "for-each-repo",
+    "format-patch",
+    "fsck",
+    "gc",
+    "get-tar-commit-id",
+    "grep",
+    "hash-object",
+    "help",
+    "hook",
+    "index-pack",
+    "init",
+    "interpret-trailers",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "mailinfo",
+    "mailsplit",
+    "maintenance",
+    "merge",
+    "merge-base",
+    "merge-file",
+    "merge-tree",
+    "mergetool",
+    "mktag",
+    "mktree",
+    "multi-pack-index",
+    "mv",
+    "name-rev",
+    "notes",
+    "pack-objects",
+    "pack-refs",
+    "patch-id",
+    "prune",
+    "pull",
+    "push",
+    "range-diff",
+    "read-tree",
+    "rebase",
+    "reflog",
+    "remote",
+    "repack",
+    "replace",
+    "request-pull",
+    "rerere",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "show-branch",
+    "show-index",
+    "show-ref",
+    "sparse-checkout",
+    "stash",
+    "status",
+    "stripspace",
+    "submodule",
+    "switch",
+    "symbolic-ref",
+    "tag",
+    "unpack-file",
+    "unpack-objects",
+    "update-index",
+    "update-ref",
+    "var",
+    "verify-commit",
+    "verify-pack",
+    "verify-tag",
+    "version",
+    "whatchanged",
+    "worktree",
+    "write-tree",
+];
+
+static EXPANSION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"\$[\w{(]|`").ok());
+
+fn program_name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// First token naming one of `names` (bare, `=value`, or an unambiguous
+/// long-option prefix) or starting with `short`.
+fn has_flag<'a>(args: &'a [String], names: &[&str], short: Option<&str>) -> Option<&'a str> {
+    for tok in args {
+        if names.contains(&tok.as_str()) {
+            return Some(tok);
+        }
+        if tok.starts_with("--") {
+            let name = tok.split('=').next().unwrap_or(tok);
+            if name.len() >= 3 && names.iter().any(|n| n.starts_with("--") && n.starts_with(name)) {
+                return Some(tok);
+            }
+            continue;
+        }
+        if let Some(s) = short
+            && tok.starts_with(s)
+        {
+            return Some(tok);
+        }
+    }
+    None
+}
+
+/// Short options whose attached value is a path (`git -C/x`, `sort -o/x`).
+fn attached_path_value<'a>(prog: &str, tok: &'a str) -> Option<&'a str> {
+    let opts: &[&str] = match program_name(prog) {
+        "git" => &["-C"],
+        "sort" => &["-o", "-T"],
+        _ => &[],
+    };
+    opts.iter().find_map(|o| tok.strip_prefix(o).filter(|v| !v.is_empty()))
+}
+
+/// Candidate path strings: bare operands, `--opt=value` and known `-Xvalue`.
+fn arg_path_values(prog: &str, rest: &[String]) -> Vec<String> {
+    let is_git = program_name(prog) == "git";
+    let text_opts = ["-m", "--message"];
+    let mut out = Vec::new();
+    let mut skip = false;
+    for tok in rest {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if is_git && text_opts.contains(&tok.as_str()) {
+            skip = true;
+            continue;
+        }
+        if tok.starts_with("--") {
+            if let Some((name, value)) = tok.split_once('=')
+                && !(is_git && text_opts.contains(&name))
+            {
+                out.push(value.to_string());
+            }
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 2 {
+            if let Some(v) = attached_path_value(prog, tok) {
+                out.push(v.to_string());
+            }
+            continue;
+        }
+        if !tok.starts_with('-') {
+            out.push(tok.clone());
+        }
+    }
+    out.retain(|v| !v.is_empty());
+    out
+}
+
+/// Write destinations of `sort`: `-o F`, `-oF`, `--output[=]F` (by prefix).
+fn sort_output_paths(rest: &[String]) -> Vec<String> {
+    const VALUE_OPTS: &[&str] = &[
+        "--buffer-size",
+        "--compress-program",
+        "--field-separator",
+        "--files0-from",
+        "--key",
+        "--output",
+        "--parallel",
+        "--random-source",
+        "--sort",
+        "--temporary-directory",
+    ];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        let next = rest.get(i + 1);
+        if tok == "--" {
+            break;
+        }
+        if tok.starts_with("--") {
+            let (name, value) = match tok.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (tok.as_str(), None),
+            };
+            let hits: Vec<&&str> = VALUE_OPTS.iter().filter(|o| o.starts_with(name)).collect();
+            if name.len() >= 3 && hits.len() == 1 {
+                if *hits[0] == "--output"
+                    && let Some(v) = value.map(str::to_string).or_else(|| next.cloned())
+                {
+                    out.push(v);
+                }
+                if value.is_none() && next.is_some() {
+                    i += 1;
+                }
+            }
+        } else if tok.starts_with('-') && tok.len() > 1 {
+            let cluster = &tok[1..];
+            for (j, c) in cluster.char_indices() {
+                if !"ktoST".contains(c) {
+                    continue;
+                }
+                let value = &cluster[j + c.len_utf8()..];
+                if c == 'o' {
+                    if !value.is_empty() {
+                        out.push(value.to_string());
+                    } else if let Some(n) = next {
+                        out.push(n.clone());
+                    }
+                }
+                if value.is_empty() && next.is_some() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    out.retain(|v| !v.is_empty());
+    out
+}
+
+/// `uniq [OPTION]... [IN [OUT]]`: OUT is a write.
+fn uniq_output_paths(rest: &[String]) -> Vec<String> {
+    let mut operands: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if tok == "--" {
+            operands.extend(rest[i + 1..].iter().cloned());
+            break;
+        }
+        if ["-f", "-s", "-w"].contains(&tok.as_str()) {
+            i += 2;
+            continue;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            operands.push(tok.clone());
+        }
+        i += 1;
+    }
+    operands.into_iter().skip(1).take(1).collect()
+}
+
+fn expand_user(tok: &str) -> PathBuf {
+    if (tok == "~" || tok.starts_with("~/"))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(tok.trim_start_matches('~').trim_start_matches('/'));
+    }
+    PathBuf::from(tok)
+}
+
+fn resolve_arg(tok: &str, workdir: &Path) -> PathBuf {
+    let p = expand_user(tok);
+    let joined = if p.is_absolute() { p } else { workdir.join(p) };
+    canonicalize_lenient(&joined).unwrap_or(joined)
+}
+
+/// True when a path argument lands inside `.git`/`.hg` (config, hooks) or a `.husky` tree.
+fn targets_hook_dir(value: &str, workdir: &Path) -> bool {
+    let resolved = resolve_arg(value, workdir);
+    let parts: Vec<String> = resolved
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if parts.iter().any(|p| p == ".husky") {
+        return true;
+    }
+    parts.iter().take(parts.len().saturating_sub(1)).any(|p| p == ".git" || p == ".hg")
+}
+
+fn sed_in_place(rest: &[String]) -> bool {
+    rest.iter().any(|a| {
+        a.starts_with("--in-place") || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('i'))
+    })
+}
+
+/// Inline sed scripts and `-f` script files.
+fn sed_sources(rest: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut scripts, mut files) = (Vec::new(), Vec::new());
+    let mut explicit = false;
+    let mut first_operand: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        let next = rest.get(i + 1).cloned();
+        if tok == "--" {
+            if first_operand.is_none() {
+                first_operand = next;
+            }
+            break;
+        }
+        if tok == "-e" || tok == "--expression" {
+            explicit = true;
+            scripts.extend(next);
+            i += 2;
+            continue;
+        }
+        if tok == "-f" || tok == "--file" {
+            explicit = true;
+            files.extend(next);
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--expression=") {
+            explicit = true;
+            scripts.push(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("--file=") {
+            explicit = true;
+            files.push(v.to_string());
+        } else if tok.starts_with('-') && !tok.starts_with("--") && tok.len() > 1 {
+            // A short cluster: the first e/f takes the rest (or the next token).
+            let cluster = &tok[1..];
+            if let Some(pos) = cluster.find(['e', 'f', 'l']) {
+                let opt = &cluster[pos..pos + 1];
+                let value = &cluster[pos + 1..];
+                let v = if value.is_empty() {
+                    i += 1;
+                    next.clone().unwrap_or_default()
+                } else {
+                    value.to_string()
+                };
+                match opt {
+                    "e" => {
+                        explicit = true;
+                        scripts.push(v);
+                    }
+                    "f" => {
+                        explicit = true;
+                        files.push(v);
+                    }
+                    _ => {}
+                }
+            }
+        } else if !tok.starts_with('-') && first_operand.is_none() {
+            first_operand = Some(tok.clone());
+        }
+        i += 1;
+    }
+    if !explicit && let Some(s) = first_operand {
+        scripts.push(s);
+    }
+    (scripts, files)
+}
+
+/// Skip a delimited sed field starting after the opening delimiter.
+fn skip_delimited(s: &[char], mut i: usize, delim: char) -> usize {
+    while i < s.len() {
+        if s[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if s[i] == delim {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// True when a sed script uses `e`, `w` or `W` (as a command or an `s` flag).
+fn sed_script_has_exec_or_write(script: &str) -> bool {
+    let s: Vec<char> = script.chars().collect();
+    let n = s.len();
+    let mut i = 0;
+    while i < n {
+        let begin = i;
+        // Skip separators and addresses.
+        while i < n && (s[i].is_whitespace() || s[i] == ';' || s[i] == '{' || s[i] == '}') {
+            i += 1;
+        }
+        loop {
+            if i >= n {
+                break;
+            }
+            let c = s[i];
+            if c.is_ascii_digit() || matches!(c, '$' | ',' | '!' | '~' | '+' | ' ') {
+                i += 1;
+            } else if c == '/' {
+                i = skip_delimited(&s, i + 1, '/');
+            } else if c == '\\' && i + 1 < n {
+                let d = s[i + 1];
+                i = skip_delimited(&s, i + 2, d);
+            } else if (c == 'I' || c == 'M') && i > begin && matches!(s[i - 1], '/' | 'I' | 'M') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i >= n {
+            break;
+        }
+        let cmd = s[i];
+        i += 1;
+        match cmd {
+            'e' | 'w' | 'W' => return true,
+            's' => {
+                if i >= n {
+                    break;
+                }
+                let d = s[i];
+                i = skip_delimited(&s, i + 1, d);
+                i = skip_delimited(&s, i, d);
+                while i < n && !matches!(s[i], ';' | '\n' | '}') {
+                    if matches!(s[i], 'e' | 'w') {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            'y' => {
+                if i < n {
+                    let d = s[i];
+                    i = skip_delimited(&s, i + 1, d);
+                    i = skip_delimited(&s, i, d);
+                }
+            }
+            'a' | 'i' | 'c' | 'r' | 'R' | 'b' | 't' | 'T' | ':' => {
+                // Text, file name or label to the end of the line (labels also end at ';').
+                let stop_semicolon = matches!(cmd, 'b' | 't' | 'T' | ':');
+                while i < n && s[i] != '\n' && !(stop_semicolon && s[i] == ';') {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        if i <= begin {
+            i = begin + 1;
+        }
+    }
+    false
+}
+
+/// True when awk is given program text, `-f`/`-e`, or an explicit `system(`.
+fn awk_can_run_code(rest: &[String]) -> bool {
+    if rest.iter().any(|t| t.contains("system(")) {
+        return true;
+    }
+    let program_opts = ["-f", "--file", "-e", "--source", "-E", "--exec"];
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok == "--" {
+            return i + 1 < rest.len();
+        }
+        if program_opts.contains(&tok) || tok.starts_with("--file=") || tok.starts_with("--source=") {
+            return true;
+        }
+        if (tok.starts_with("-f") || tok.starts_with("-e")) && tok.len() > 2 && !tok.starts_with("--") {
+            return true;
+        }
+        let takes_value = ["-F", "-v", "--field-separator", "--assign"].contains(&tok);
+        let attached = (tok.starts_with("-F") || tok.starts_with("-v")) && tok.len() > 2
+            || tok.starts_with("--field-separator=")
+            || tok.starts_with("--assign=");
+        if takes_value || attached {
+            i += if attached { 1 } else { 2 };
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn git_config_writes(args: &[String]) -> bool {
+    const READ_FLAGS: &[&str] = &[
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--get-color",
+        "--get-colorbool",
+        "-l",
+        "--list",
+    ];
+    const WRITE_FLAGS: &[&str] = &[
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+        "-e",
+        "--edit",
+    ];
+    const VALUE_FLAGS: &[&str] = &["-f", "--file", "--blob", "-t", "--type", "--default", "--comment"];
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if READ_FLAGS.contains(&tok) {
+            return false;
+        }
+        if WRITE_FLAGS.contains(&tok) {
+            return true;
+        }
+        if VALUE_FLAGS.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if !tok.starts_with('-') {
+            positionals.push(tok);
+        }
+        i += 1;
+    }
+    if positionals.first().is_some_and(|p| *p == "get" || *p == "list") {
+        return false;
+    }
+    positionals.len() != 1 || ["set", "unset", "edit"].contains(&positionals[0])
+}
+
+/// Why a git argv runs a caller-supplied program, if it does.
+fn git_exec_reason(rest: &[String]) -> Option<String> {
+    let (sub, args) = git_subcommand(rest)?;
+    if !GIT_KNOWN_SUBCOMMANDS.contains(&sub.as_str()) {
+        return Some(format!(
+            "git {sub} is not a built-in git command; it may run alias.{sub}=!cmd from a repository \
+             config or an external git-{sub} program"
+        ));
+    }
+    if sub == "config" && git_config_writes(args) {
+        return Some(
+            "git config writes configuration; a key such as alias.<name>=!cmd, core.pager, \
+             core.hooksPath or include.path makes a later git call run an arbitrary program"
+                .into(),
+        );
+    }
+    if ["filter-branch", "difftool", "mergetool"].contains(&sub.as_str()) {
+        return Some(format!("git {sub} runs external commands or configured tools"));
+    }
+    if sub == "grep"
+        && let Some(hit) = has_flag(args, &["--open-files-in-pager"], Some("-O"))
+    {
+        return Some(format!("git grep {hit} runs the named pager program"));
+    }
+    if sub == "rebase"
+        && let Some(hit) = has_flag(args, &["--exec"], Some("-x"))
+    {
+        return Some(format!("git rebase {hit} runs a command after each commit"));
+    }
+    if sub == "bisect" && args.first().is_some_and(|a| a == "run") {
+        return Some("git bisect run executes a command".into());
+    }
+    if sub == "submodule" && args.iter().any(|a| a == "foreach") {
+        return Some("git submodule foreach executes a command in every submodule".into());
+    }
+    if ["ls-remote", "fetch", "pull", "clone", "push", "archive"].contains(&sub.as_str()) {
+        let mut hit = has_flag(args, &["--upload-pack", "--receive-pack", "--exec", "--template"], None);
+        if hit.is_none() && (sub == "ls-remote" || sub == "clone") {
+            hit = has_flag(args, &[], Some("-u"));
+        }
+        if let Some(hit) = hit {
+            return Some(format!("git {sub} {hit} runs a supplied program or installs template hooks"));
+        }
+    }
+    None
+}
+
+/// `no` / `maybe` / `yes`: a heuristic estimate of filesystem mutation.
+fn mutation_risk(argv: &[String]) -> &'static str {
+    let Some((prog, rest)) = argv.split_first() else { return "no" };
+    let name = program_name(prog);
+    if READ_ONLY_PROGRAMS.contains(&name) {
+        return "no";
+    }
+    match name {
+        "sort" => {
+            if sort_output_paths(rest).is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        }
+        "uniq" => {
+            if uniq_output_paths(rest).is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        }
+        "find" => {
+            if rest.iter().any(|t| FIND_SIDE_EFFECTS.contains(&t.as_str())) {
+                "yes"
+            } else {
+                "no"
+            }
+        }
+        "sed" => {
+            if sed_in_place(rest) {
+                "yes"
+            } else {
+                "no"
+            }
+        }
+        "ruff" => {
+            let format_writes = rest.first().is_some_and(|a| a == "format")
+                && !rest.iter().any(|a| a == "--check" || a == "--diff");
+            if rest.iter().any(|a| a == "--fix") || format_writes { "yes" } else { "no" }
+        }
+        "git" => match git_subcommand(rest) {
+            Some((sub, args))
+                if GIT_OUTPUT_SUBCOMMANDS.contains(&sub.as_str())
+                    && has_flag(args, &["--output"], None).is_some() =>
+            {
+                "yes"
+            }
+            Some((sub, _)) if GIT_READ_ONLY.contains(&sub.as_str()) => "no",
+            Some((sub, _)) if GIT_MUTATING.contains(&sub.as_str()) => "yes",
+            _ => "maybe",
+        },
+        _ => "maybe",
+    }
+}
+
+/// Advisory findings for a vetted argv.
+fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let Some((prog, rest)) = argv.split_first() else { return out };
+    let name = program_name(prog);
+
+    let mut syntax: Vec<&str> = rest
+        .iter()
+        .map(String::as_str)
+        .filter(|t| SHELL_SYNTAX_TOKENS.contains(t) || (t.len() > 1 && t.ends_with(';')))
+        .filter(|t| !(name == "find" && *t == ";"))
+        .collect();
+    syntax.sort_unstable();
+    syntax.dedup();
+    if !syntax.is_empty() {
+        out.push(finding(
+            "warn",
+            "shell-syntax",
+            format!(
+                "run_cmd uses no shell: {} reach {name} as literal arguments, so pipes, redirection and \
+                 chaining will not happen. Make separate run_cmd calls instead (or fs_write to save output).",
+                syntax.join(", ")
+            ),
+        ));
+    }
+    if let Some(rx) = EXPANSION_RE.as_ref()
+        && let Some(tok) = argv.iter().find(|t| rx.is_match(t))
+    {
+        out.push(finding(
+            "warn",
+            "no-expansion",
+            format!(
+                "no shell expansion: {tok:?} is passed literally ($VAR, $(...) and backticks never expand)."
+            ),
+        ));
+    }
+
+    // Arguments that resolve outside the workspace.
+    let output_paths = match name {
+        "sort" => sort_output_paths(rest),
+        "uniq" => uniq_output_paths(rest),
+        _ => Vec::new(),
+    };
+    let candidates =
+        rest.iter().map(|r| (r.as_str(), false)).chain(output_paths.iter().map(|r| (r.as_str(), true)));
+    for (raw, explicit) in candidates {
+        let mut tok = raw;
+        if !explicit && tok.starts_with('-') {
+            if let Some((_, v)) = tok.split_once('=') {
+                tok = v;
+            } else if let Some(v) = attached_path_value(prog, tok).filter(|_| !tok.starts_with("--")) {
+                tok = v;
+            } else {
+                continue;
+            }
+        }
+        if tok.is_empty() {
+            continue;
+        }
+        let looks_like_path = tok.starts_with('/')
+            || tok.starts_with('~')
+            || tok.starts_with("./")
+            || tok.starts_with("../")
+            || tok == "."
+            || tok == ".."
+            || tok.contains("/../");
+        if !explicit && !looks_like_path {
+            continue;
+        }
+        if !resolve_arg(tok, workdir).starts_with(root) {
+            out.push(finding(
+                "warn",
+                "path-escape",
+                format!(
+                    "argument {raw:?} resolves outside the workspace root. run_cmd only confines cwd, not \
+                     arguments; {name} could read or write there. Keep paths inside the workspace."
+                ),
+            ));
+        }
+    }
+
+    // Content readers must not print what fs_read refuses.
+    if CONTENT_READERS.contains(&name) {
+        for value in arg_path_values(prog, rest) {
+            let candidate = {
+                let p = expand_user(&value);
+                if p.is_absolute() { p } else { workdir.join(p) }
+            };
+            if candidate.symlink_metadata().is_err() {
+                continue;
+            }
+            let resolved = canonicalize_lenient(&candidate).unwrap_or(candidate);
+            let inside = resolved
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| resolved.file_name().map(PathBuf::from).unwrap_or_default());
+            let refused =
+                inside.components().find_map(|c| guard_secret_filename(Path::new(c.as_os_str())).err());
+            if let Some(e) = refused {
+                out.push(finding("block", "secret-path", format!("{name}: {e}")));
+                break;
+            }
+        }
+    }
+
+    if name == "find"
+        && let Some(hit) = rest.iter().find(|t| FIND_SIDE_EFFECTS.contains(&t.as_str()))
+    {
+        out.push(finding(
+            "warn",
+            "allowlist-bypass",
+            format!(
+                "find {hit} writes files or runs an arbitrary program, sidestepping the run_cmd allowlist."
+            ),
+        ));
+    }
+    if name == "sort"
+        && let Some(hit) = has_flag(rest, &["--compress-program"], None)
+    {
+        out.push(finding(
+            "warn",
+            "allowlist-bypass",
+            format!("sort {hit} pipes data through the named program, sidestepping the run_cmd allowlist."),
+        ));
+    }
+    let hook_candidates = if READ_ONLY_PROGRAMS.contains(&name) {
+        Vec::new()
+    } else if name == "sort" || name == "uniq" {
+        output_paths.clone()
+    } else {
+        arg_path_values(prog, rest)
+    };
+    if let Some(hit) = hook_candidates.iter().find(|v| targets_hook_dir(v, workdir)) {
+        out.push(finding(
+            "warn",
+            "allowlist-bypass",
+            format!(
+                "argument {hit:?} points into .git, .hg or .husky; a hook or config written there runs a \
+                 program on the next git operation, sidestepping the run_cmd allowlist."
+            ),
+        ));
+    }
+    if name == "awk" && awk_can_run_code(rest) {
+        out.push(finding(
+            "warn",
+            "allowlist-bypass",
+            "awk program text or a -f/-e script can call system(), sidestepping the run_cmd allowlist.",
+        ));
+    }
+    if name == "sed" {
+        let (scripts, files) = sed_sources(rest);
+        if scripts.iter().any(|s| sed_script_has_exec_or_write(s)) {
+            out.push(finding(
+                "warn",
+                "allowlist-bypass",
+                "sed script contains the e, w or W command, which runs a program or writes a file and \
+                 sidesteps the run_cmd allowlist.",
+            ));
+        }
+        if let Some(f) = files.first() {
+            out.push(finding(
+                "warn",
+                "allowlist-bypass",
+                format!("sed -f {f:?}: a script file is not inspected and may use e, w or W."),
+            ));
+        }
+    }
+    if name == "git" {
+        for tok in git_global_options(rest) {
+            if tok == "--git-dir"
+                || tok == "--work-tree"
+                || tok.starts_with("--git-dir=")
+                || tok.starts_with("--work-tree=")
+            {
+                out.push(finding(
+                    "warn",
+                    "allowlist-bypass",
+                    format!(
+                        "git {tok} selects a repository whose config (aliases, pager, hooks) may have been \
+                         written by the agent, sidestepping the run_cmd allowlist."
+                    ),
+                ));
+            }
+        }
+        if let Some(reason) = git_exec_reason(rest) {
+            out.push(finding(
+                "warn",
+                "allowlist-bypass",
+                format!("{reason}, sidestepping the run_cmd allowlist."),
+            ));
+        }
+        if let Some((sub, _)) = git_subcommand(rest)
+            && GIT_NETWORK.contains(&sub.as_str())
+        {
+            out.push(finding("warn", "network", format!("git {sub} contacts remote repositories.")));
+        }
+    }
+    let info_only = !rest.is_empty() && rest.iter().all(|a| HARMLESS_INFO_ARGS.contains(&a.as_str()));
+    if (name == "python3" || name == "python") && !info_only {
+        out.push(finding(
+            "warn",
+            "arbitrary-code",
+            format!(
+                "{name} executes arbitrary code (a script, -m, -c, or the REPL); only its cwd is confined to \
+                 the workspace."
+            ),
+        ));
+    }
+    if ["uv", "pytest", "cargo"].contains(&name) && !info_only {
+        out.push(finding(
+            "warn",
+            "arbitrary-code",
+            format!("{name} executes arbitrary project code; only its cwd is confined to the workspace."),
+        ));
+    }
+    out
+}
+
+fn program_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| {
+        let p = dir.join(program);
+        std::fs::metadata(&p).is_ok_and(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.is_file() && m.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                m.is_file()
+            }
+        })
+    })
+}
+
+/// Resolve `cwd` inside the workspace root; it must be a directory.
+fn resolve_cwd(sb: &Sandbox, cwd: &str) -> UaResult<PathBuf> {
+    let dir = resolve_in_root(cwd, std::slice::from_ref(&sb.root), true)?;
+    if !dir.is_dir() {
+        return Err(UaError::invalid(format!("cwd {cwd:?} is not a directory")));
+    }
+    Ok(dir)
+}
+
+fn run_cmd_check(ctx: &ToolCtx, a: CheckArgs) -> UaResult<Value> {
+    let sb = sandbox(ctx)?;
+    let mut findings = Vec::new();
+    let argv: Vec<String> = match vet_command(&a.command, &ctx.hub.cfg().shell_allowlist()) {
+        Ok(v) => std::iter::once(v.program).chain(v.args).collect(),
+        Err(e) => {
+            let code = match &e {
+                UaError::Denied { reason_code, .. } if reason_code == "destructive" => "destructive",
+                _ => "rejected",
+            };
+            findings.push(finding("block", code, e.to_string()));
+            split_command(&a.command).unwrap_or_default()
+        }
+    };
+    let workdir = match resolve_cwd(&sb, &a.cwd) {
+        Ok(d) => d,
+        Err(e) => {
+            findings.push(finding("block", "cwd", e.to_string()));
+            sb.root.clone()
+        }
+    };
+    let program = argv.first().cloned().unwrap_or_default();
+    let program_found = !program.is_empty() && !program.contains('/') && program_on_path(&program);
+    if !program.is_empty() && !program_found {
+        findings.push(finding(
+            "warn",
+            "not-found",
+            format!("{program:?} not found on PATH; run_cmd would return exit code 127."),
+        ));
+    }
+    findings.extend(advisories(&argv, &workdir, &sb.root));
+    let blocked = findings.iter().any(|f| f.severity == "block");
+    let warned = findings.iter().any(|f| f.severity == "warn");
+    Ok(json!({
+        "ok": !blocked,
+        "verdict": if blocked { "block" } else if warned { "warn" } else { "ok" },
+        "argv": argv,
+        "program": program,
+        "program_found": program_found,
+        "mutates": mutation_risk(&argv),
+        "findings": findings,
+    }))
+}
+
+/// Force the approval gate for a dangerous command unless the registry
+/// already gated this call because `run_cmd` is in `approval_tools`.
+async fn force_gate(ctx: &ToolCtx, payload: Value) -> UaResult<()> {
+    if ctx.hub.cfg().approval_tools.iter().any(|t| t == "run_cmd") {
+        return Ok(());
+    }
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    let outcome = ctx
+        .hub
+        .db()
+        .write_async(move |tx| approvals::gate(tx, hub.cfg(), &caller, "run_cmd", &payload))
+        .await?;
+    match outcome {
+        GateOutcome::Pass { .. } => Ok(()),
+        GateOutcome::Pending { approval_id } => {
+            Err(UaError::ApprovalRequired { tool: "run_cmd".into(), approval_id })
+        }
+        GateOutcome::Denied { approval_id, reason } => Err(UaError::denied(
+            "approval_denied",
+            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+        )),
+    }
+}
+
+async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
+    let sb = sandbox(&ctx)?;
+    let vetted = vet_command(&a.command, &ctx.hub.cfg().shell_allowlist())?;
+    let workdir = resolve_cwd(&sb, &a.cwd)?;
+    let argv: Vec<String> =
+        std::iter::once(vetted.program.clone()).chain(vetted.args.iter().cloned()).collect();
+    let findings = advisories(&argv, &workdir, &sb.root);
+    if let Some(block) = findings.iter().find(|f| f.severity == "block") {
+        return Err(UaError::denied(block.code, block.message.clone()));
+    }
+    let warnings: Vec<String> =
+        findings.iter().filter(|f| f.severity == "warn").map(|f| f.message.clone()).collect();
+
+    let mut codes: Vec<&str> =
+        findings.iter().map(|f| f.code).filter(|c| APPROVAL_REQUIRED_CODES.contains(c)).collect();
+    if vetted.program == "git" && git_subcommand(&vetted.args).is_some_and(|(s, _)| s == "push") {
+        codes.push("network");
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    if !codes.is_empty() {
+        force_gate(&ctx, json!({ "command": a.command, "cwd": a.cwd, "advisory_codes": codes })).await?;
+    }
+
+    let mut env = base_env();
+    if vetted.program == "git" {
+        // Never discover a bare repository an agent laid out with fs_write.
+        for (k, v) in [
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "safe.bareRepository"),
+            ("GIT_CONFIG_VALUE_0", "explicit"),
+        ] {
+            env.push((k.into(), v.into()));
+        }
+    }
+    let timeout = Duration::from_secs(a.timeout_s.clamp(1, CMD_TIMEOUT_CAP_S as i64) as u64);
+    let res = run_program(&vetted.program, &vetted.args, &workdir, &env, timeout, CMD_OUTPUT_CAP).await;
+    let (exit_code, mut stdout, mut stderr, truncated, timed_out) = match res {
+        Ok(o) => {
+            let truncated = o.stdout_total + o.stderr_total > CMD_OUTPUT_CAP;
+            (o.exit_code, o.stdout, o.stderr, truncated, o.timed_out)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (127, Vec::new(), format!("command not found: {}", vetted.program).into_bytes(), false, false)
+        }
+        Err(e) => {
+            (126, Vec::new(), format!("could not start {}: {e}", vetted.program).into_bytes(), false, false)
+        }
+    };
+    if truncated {
+        stdout.truncate(CMD_OUTPUT_CAP / 2);
+        stderr.truncate(CMD_OUTPUT_CAP / 2);
+    }
+    record(
+        &ctx,
+        "agent.cmd.ran",
+        json!({
+            "program": vetted.program,
+            "command_sha256": sha256_hex(a.command.as_bytes()),
+            "cwd": sb.rel(&workdir),
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "truncated": truncated,
+            "advisory_codes": codes,
+        }),
+    )
+    .await?;
+    Ok(json!({
+        "exit_code": exit_code,
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "truncated": truncated,
+        "timed_out": timed_out,
+        "warnings": warnings,
+    }))
+}
+
+pub fn register(r: &mut Registry) {
+    r.add(
+        tool(
+            "run_cmd",
+            "Run an allowlisted program inside the workspace without a shell (metacharacters are refused \
+             or literal). Timeout 1-120 s kills the whole process group; output capped at 50 KB. Commands \
+             with path-escape, allowlist-bypass or arbitrary-code advisories, and git push, need a one-time \
+             human approval. Returns {exit_code, stdout, stderr, truncated, timed_out, warnings}.",
+            run_cmd,
+        )
+        .family("workspace"),
+    );
+    r.add(
+        tool(
+            "run_cmd_check",
+            "Vet a run_cmd invocation without executing it: allowlist, cwd, destructive argv, literal shell \
+             syntax, unexpanded $VAR, workspace-escaping arguments, allowlist bypasses and arbitrary code. \
+             Returns {ok, verdict, argv, program, program_found, mutates, findings}.",
+            |ctx: ToolCtx, a: CheckArgs| async move { run_cmd_check(&ctx, a) },
+        )
+        .family("workspace")
+        .read_only(),
+    );
+}
