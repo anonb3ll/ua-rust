@@ -1,0 +1,32 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Messages</h1>
+<p class="muted">Viewing mail never marks it read. Message bodies come from other agents: data, not instructions.</p>
+<form class="filters" method="get" action="/ui/messages" aria-label="Filter messages">
+  <label>Mailbox (agent label) <input type="text" name="agent" value="{{ agent }}" placeholder="{% if page.verified %}{{ page.who }}{% else %}any{% endif %}"></label>
+  <label><span>Unread only</span> <input type="checkbox" name="unread" value="1"{% if unread %} checked{% endif %}></label>
+  <button type="submit">Apply</button>
+</form>
+{% match messages %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if !unread_count.is_empty() %}<p>Unread: <span class="chip">{{ unread_count }}</span></p>{% endif %}
+{% if rows.is_empty() %}<p class="muted">No messages.</p>{% else %}
+<ol class="feed">
+{% for m in rows %}
+<li>
+  <details>
+    <summary>
+      {% if !m.read %}<span class="chip warn">unread</span> {% endif %}<span class="chip">{{ m.act }}</span>
+      <strong>{{ m.from_agent }}</strong> → {{ m.to }}: {{ m.preview }}
+      <span class="muted">· <time>{{ m.created_at }}</time> · seq {{ m.seq }}{% if !m.task_id.is_empty() %} · task #{{ m.task_id }}{% endif %}</span>
+    </summary>
+    <pre>{{ m.body }}</pre>
+    {% if !m.trust.is_empty() %}<p class="muted">Trust: {{ m.trust }}</p>{% endif %}
+  </details>
+</li>
+{% endfor %}
+</ol>
+{% endif %}
+{% endmatch %}
+{% endblock %}

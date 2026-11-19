@@ -1,0 +1,26 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Memory</h1>
+<form class="filters" method="get" action="/ui/memory" role="search" aria-label="Search memory">
+  <label>Search <input type="search" name="q" value="{{ q }}" placeholder="words in title or content"></label>
+  <label>Tag <input type="text" name="tag" value="{{ tag }}" placeholder="project:demo"></label>
+  <button type="submit">Search</button>
+</form>
+<h2>{{ mode }}</h2>
+{% match notes %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if rows.is_empty() %}<p class="muted">No notes found.</p>{% else %}
+<ol class="feed">
+{% for n in rows %}
+<li>
+  <a href="/ui/memory/{{ n.id }}"><strong>{{ n.title }}</strong></a>
+  <span class="muted">· <time>{{ n.updated_at }}</time>{% if !n.author.is_empty() %} · {{ n.author }}{% endif %}</span>
+  {% for t in n.tags %} <a class="chip" href="/ui/memory?tag={{ t|urlencode }}">{{ t }}</a>{% endfor %}
+  {% if !n.snippet.is_empty() %}<div class="muted">{{ n.snippet }}</div>{% endif %}
+</li>
+{% endfor %}
+</ol>
+{% endif %}
+{% endmatch %}
+{% endblock %}

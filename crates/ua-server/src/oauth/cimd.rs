@@ -296,6 +296,7 @@ async fn fetch(client_id: &str, host: &str) -> Result<Vec<u8>, CimdError> {
         .map_err(|_| CimdError("client_id host does not resolve".into()))?;
     let addrs: Vec<SocketAddr> = lookup.collect();
     let pinned = vet_addresses(&addrs)?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()

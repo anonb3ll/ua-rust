@@ -34,7 +34,16 @@ base64 = "0.22"
 url = "2.5"
 axum-extra = { version = "0.12", features = ["cookie-private"] }
 webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Same TLS setup as ua-tools: rustls with the ring provider (no C toolchain).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+askama = "0.16.1"
+askama_web = { version = "0.16.0", features = ["axum-0.8"] }
+memory-serve = "2.4.0"
+serde_urlencoded = "0.7"
+
+[build-dependencies]
+memory-serve = "2.4.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

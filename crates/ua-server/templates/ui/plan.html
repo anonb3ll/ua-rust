@@ -1,0 +1,29 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<p><a href="/ui/plans">← Plans</a></p>
+<h1>{{ plan.title }}</h1>
+<p>
+  <span class="chip">{{ plan.status }}</span> <span class="chip">scope {{ plan.scope }}</span>
+  {% if plan.needs_human %}<span class="chip bad">needs human</span>{% endif %}
+  <span class="muted">· updated <time>{{ plan.updated_at }}</time>{% if !plan.author.is_empty() %} · by {{ plan.author }}{% endif %} · {{ checkpoints }} checkpoint(s)</span>
+</p>
+{% if !goal.is_empty() && goal != plan.title %}<p><strong>Goal:</strong> {{ goal }}</p>{% endif %}
+{% if !description.is_empty() %}<pre>{{ description }}</pre>{% endif %}
+<section class="panel" aria-labelledby="steps-h">
+<h2 id="steps-h">Steps</h2>
+{% if !next_step.is_empty() %}<p class="muted">Next actionable step: {{ next_step }}</p>{% endif %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">#</th><th scope="col">Step</th><th scope="col">Status</th><th scope="col">Owner</th><th scope="col">Depends on</th><th scope="col">Retries</th></tr></thead>
+<tbody>
+{% for s in steps %}
+<tr>
+  <td>{{ s.idx }}</td>
+  <td>{{ s.description }}{% if !s.note.is_empty() %}<div class="muted">{{ s.note }}</div>{% endif %}</td>
+  <td><span class="chip">{{ s.status }}</span></td>
+  <td>{{ s.owner }}</td><td>{{ s.depends_on }}</td><td>{{ s.retries }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+</section>
+{% endblock %}
