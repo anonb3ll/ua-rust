@@ -1,0 +1,114 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<p><a href="/ui/work">← Work</a></p>
+<h1>#{{ task.id }} {{ task.title }}</h1>
+<p>
+  <span class="chip">{{ task.status }}</span>
+  <span class="chip {{ task.priority }}">{{ task.priority }}</span>
+  <span class="chip">{{ task.project }}</span>
+  {% if task.untrusted %}<span class="chip bad">untrusted</span>{% endif %}
+</p>
+
+<div class="grid2">
+<section class="panel" aria-labelledby="fields-h">
+  <h2 id="fields-h">Details</h2>
+  <dl class="fields">
+    <dt>Lane</dt><dd>{{ task.lane }}</dd>
+    <dt>Domain</dt><dd>{{ task.domain }}</dd>
+    <dt>Claimed by</dt><dd>{% if task.claimed_by.is_empty() %}<span class="muted">nobody</span>{% else %}{{ task.claimed_by }}{% if !task.lock_expires_at.is_empty() %} <span class="muted">until {{ task.lock_expires_at }}</span>{% endif %}{% endif %}</dd>
+    {% if !task.parent_id.is_empty() %}<dt>Parent</dt><dd><a href="/ui/tasks/{{ task.parent_id }}">#{{ task.parent_id }}</a></dd>{% endif %}
+    {% if !task.next_owner.is_empty() %}<dt>Next owner</dt><dd>{{ task.next_owner }}</dd>{% endif %}
+    {% if !task.waiting_on.is_empty() %}<dt>Waiting on</dt><dd>{{ task.waiting_on }}</dd>{% endif %}
+    {% if !task.due_at.is_empty() %}<dt>Due</dt><dd>{{ task.due_at }}</dd>{% endif %}
+    {% if !task.evidence_ref.is_empty() %}<dt>Evidence</dt><dd class="mono">{{ task.evidence_ref }}</dd>{% endif %}
+    {% if !task.branch.is_empty() %}<dt>Branch</dt><dd class="mono">{{ task.branch }}</dd>{% endif %}
+    {% if !task.worktree_path.is_empty() %}<dt>Worktree</dt><dd class="mono">{{ task.worktree_path }}</dd>{% endif %}
+    <dt>Created</dt><dd>{{ task.created_at }}</dd>
+    <dt>Updated</dt><dd>{{ task.updated_at }}</dd>
+    {% if !task.completed_at.is_empty() %}<dt>Completed</dt><dd>{{ task.completed_at }}</dd>{% endif %}
+  </dl>
+</section>
+
+<section class="panel" aria-labelledby="edit-h">
+  <h2 id="edit-h">Update</h2>
+  <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/update">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Title <input type="text" name="title" value="{{ task.title }}" maxlength="300"></label>
+    <div class="grid2">
+      <label>Status
+        <select name="status">{% for (s, l) in statuses %}<option value="{{ s }}"{% if *s == task.status.as_str() %} selected{% endif %}>{{ l }}</option>{% endfor %}</select>
+      </label>
+      <label>Priority
+        <select name="priority">{% for p in priorities %}<option value="{{ p }}"{% if *p == task.priority.as_str() %} selected{% endif %}>{{ p }}</option>{% endfor %}</select>
+      </label>
+      <label>Project <input type="text" name="project" value="{{ task.project }}"></label>
+      <label>Lane <input type="text" name="lane" value="{{ task.lane }}"></label>
+      <label>Due <input type="text" name="due_at" value="{{ task.due_at }}" placeholder="2026-12-01"></label>
+      <label>Evidence <input type="text" name="evidence_ref" value="{{ task.evidence_ref }}"></label>
+    </div>
+    <div><button class="primary" type="submit">Save changes</button></div>
+  </form>
+</section>
+</div>
+
+<section class="panel" aria-labelledby="notes-h">
+  <h2 id="notes-h">Notes</h2>
+  {% if task.notes.is_empty() %}<p class="muted">No notes.</p>{% else %}<pre>{{ task.notes }}</pre>{% endif %}
+  <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/note">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Append a note <textarea name="append_note" rows="3" required maxlength="2000"></textarea></label>
+    <div><button type="submit">Append note</button></div>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="deps-h">
+  <h2 id="deps-h">Dependencies</h2>
+  {% match deps %}
+  {% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+  {% when Ok(d) %}
+  <h3>Waits on</h3>
+  {% if d.waits_on.is_empty() %}<p class="muted">Nothing.</p>{% else %}
+  <ul>
+  {% for e in d.waits_on %}
+    <li><a href="/ui/tasks/{{ e.other }}">#{{ e.other }}</a> <span class="muted">added by {{ e.created_by }}</span>
+      <form class="inline" method="post" action="/ui/tasks/{{ task.id }}/dependencies/{{ e.id }}/remove">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="danger" type="submit" aria-label="Remove dependency on #{{ e.other }}">Remove</button>
+      </form>
+    </li>
+  {% endfor %}
+  </ul>
+  {% endif %}
+  <h3>Blocks</h3>
+  {% if d.blocks.is_empty() %}<p class="muted">Nothing.</p>{% else %}
+  <ul>{% for e in d.blocks %}<li><a href="/ui/tasks/{{ e.other }}">#{{ e.other }}</a></li>{% endfor %}</ul>
+  {% endif %}
+  {% endmatch %}
+  <form class="inline" method="post" action="/ui/tasks/{{ task.id }}/dependencies">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Wait on task id <input type="text" name="depends_on_task_id" inputmode="numeric" required size="8"></label>
+    <button type="submit">Add dependency</button>
+  </form>
+</section>
+
+<section class="panel" aria-labelledby="comments-h">
+  <h2 id="comments-h">Comments</h2>
+  {% match comments %}
+  {% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+  {% when Ok(list) %}
+  {% if list.is_empty() %}<p class="muted">No comments yet.</p>{% else %}
+  <ol class="feed">
+  {% for c in list %}
+    <li id="comment-{{ c.id }}"><strong>{{ c.author }}</strong> <span class="muted"><time>{{ c.created_at }}</time>{% if !c.reply_to.is_empty() %} · reply to #{{ c.reply_to }}{% endif %}</span>
+      <div><pre>{{ c.body }}</pre></div></li>
+  {% endfor %}
+  </ol>
+  {% endif %}
+  {% endmatch %}
+  <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/comments">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Comment <textarea name="body" rows="3" required maxlength="8000"></textarea></label>
+    <div><button type="submit">Add comment</button></div>
+  </form>
+</section>
+{% endblock %}

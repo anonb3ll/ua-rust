@@ -1,0 +1,1 @@
+<li id="ev-{{ e.seq }}"><span class="chip">#{{ e.seq }}</span> <code>{{ e.channel }}</code> <span class="muted">{% if !e.originator.is_empty() %}by {{ e.originator }} {% endif %}<time>{{ e.created_at }}</time></span><span class="payload">{{ e.payload }}</span></li>

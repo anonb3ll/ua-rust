@@ -26,3 +26,16 @@ subtle.workspace = true
 secrecy.workspace = true
 rusqlite.workspace = true
 rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+askama = "0.16.1"
+askama_web = { version = "0.16.0", features = ["axum-0.8"] }
+memory-serve = "2.4.0"
+rand.workspace = true
+serde_urlencoded = "0.7"
+jiff.workspace = true
+
+[build-dependencies]
+memory-serve = "2.4.0"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

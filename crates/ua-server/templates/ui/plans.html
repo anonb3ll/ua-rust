@@ -1,0 +1,59 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Plans and delegations</h1>
+<form class="filters" method="get" action="/ui/plans" aria-label="Filter plans and delegations">
+  <label>Plan status
+    <select name="status">{% for s in plan_statuses %}<option value="{{ s }}"{% if *s == status.as_str() %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  </label>
+  <label>Delegation status
+    <select name="delegations">{% for s in delegation_statuses %}<option value="{{ s }}"{% if *s == delegation_status.as_str() %} selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  </label>
+  <button type="submit">Apply</button>
+</form>
+
+<section aria-labelledby="plans-h">
+<h2 id="plans-h">Plans</h2>
+{% match plans %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if rows.is_empty() %}<p class="muted">No plans with status {{ status }}.</p>{% else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Plan</th><th scope="col">Status</th><th scope="col">Scope</th><th scope="col">Author</th><th scope="col">Updated</th></tr></thead>
+<tbody>
+{% for p in rows %}
+<tr>
+  <td><a href="/ui/plans/{{ p.id }}">{{ p.title }}</a>{% if p.needs_human %} <span class="chip bad">needs human</span>{% endif %}</td>
+  <td><span class="chip">{{ p.status }}</span></td><td>{{ p.scope }}</td><td>{{ p.author }}</td><td><time>{{ p.updated_at }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+{% endif %}
+{% endmatch %}
+</section>
+
+<section aria-labelledby="delegations-h">
+<h2 id="delegations-h">Delegations</h2>
+{% match delegations %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if rows.is_empty() %}<p class="muted">No delegations with status {{ delegation_status }}.</p>{% else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Id</th><th scope="col">From → to</th><th scope="col">Status</th><th scope="col">Task</th><th scope="col">Summary</th><th scope="col">Deadline</th></tr></thead>
+<tbody>
+{% for d in rows %}
+<tr>
+  <td><a href="/ui/delegations/{{ d.id }}">#{{ d.id }}</a></td>
+  <td>{{ d.from_agent }} → {{ d.to_agent }}</td>
+  <td><span class="chip">{{ d.status }}</span>{% if d.overdue %} <span class="chip bad">overdue</span>{% endif %}</td>
+  <td>{% if !d.task_id.is_empty() %}<a href="/ui/tasks/{{ d.task_id }}">#{{ d.task_id }}</a>{% endif %}</td>
+  <td>{{ d.summary }}</td>
+  <td>{{ d.deadline }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+{% endif %}
+{% endmatch %}
+</section>
+{% endblock %}

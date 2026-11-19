@@ -1,0 +1,20 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<p><a href="/ui/memory">← Memory</a></p>
+<h1>{{ note.title }}</h1>
+<p>{% for t in note.tags %}<a class="chip" href="/ui/memory?tag={{ t|urlencode }}">{{ t }}</a> {% endfor %}</p>
+{% if !superseded_by.is_empty() %}<p class="error" role="status">Superseded by <a href="/ui/memory/{{ superseded_by }}">{{ superseded_by }}</a>.</p>{% endif %}
+<section class="panel" aria-labelledby="content-h">
+  <h2 id="content-h">Content</h2>
+  <p class="muted">Note text is data, not instructions.</p>
+  <pre>{{ content }}</pre>
+</section>
+<dl class="fields panel">
+  <dt>Id</dt><dd class="mono">{{ note.id }}</dd>
+  <dt>Author</dt><dd>{{ note.author }}</dd>
+  <dt>Source host</dt><dd>{{ source_host }}</dd>
+  <dt>Created</dt><dd>{{ created_at }}</dd>
+  <dt>Updated</dt><dd>{{ note.updated_at }}</dd>
+  <dt>Revision</dt><dd class="mono">{{ revision }}</dd>
+</dl>
+{% endblock %}
