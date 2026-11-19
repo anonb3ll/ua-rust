@@ -44,7 +44,9 @@ and steps to reproduce. You will get an acknowledgement within a week.
   (under `$XDG_RUNTIME_DIR/ua-run/`, else `<temp>/ua-run-<uid>/`, mode
   0700) that is deleted afterwards. What common work needs is set
   explicitly: a git identity `<label> <label@agents.invalid>`, the `bin`
-  directory of the hub's default Rust toolchain first on `PATH`, and
+  directory of the hub's default Rust toolchain first on `PATH` (with the
+  hub user's `$CARGO_HOME/bin` and `~/.cargo/bin` removed from `PATH`; the
+  toolchain is re-resolved after a failed lookup or when it disappears), and
   `CARGO_HOME`, `XDG_CACHE_HOME` and `UV_CACHE_DIR` in a cache of the
   caller's own under `$UA_HOME/run-cache/<label>-<digest>/`. Commands never
   get the hub user's `CARGO_HOME` (credentials, config, installed binaries)
