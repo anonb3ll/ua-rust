@@ -1,0 +1,76 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Inbox</h1>
+{% match queue %}
+{% when Err(e) %}
+<p class="error" role="alert">{{ e }}</p>
+{% when Ok(q) %}
+<p class="muted">
+  Gated tools: {% if q.gated_tools.is_empty() %}none configured{% else %}{% for t in q.gated_tools %}<code>{{ t }}</code>{% if !loop.last %}, {% endif %}{% endfor %}{% endif %}.
+  An approved pass lasts {{ q.ttl_hours }} hours and authorizes one identical call.
+</p>
+
+<section aria-labelledby="pending-h">
+<h2 id="pending-h">Pending approvals <span class="chip">{{ q.pending.len() }}</span></h2>
+{% if q.pending.is_empty() %}
+<p class="muted">Nothing is waiting for a decision.</p>
+{% else %}
+{% for a in q.pending %}
+<article class="panel" id="approval-{{ a.id }}" aria-labelledby="approval-{{ a.id }}-h">
+  <h3 id="approval-{{ a.id }}-h">#{{ a.id }} <code>{{ a.tool }}</code></h3>
+  <p class="muted">Requested by <strong>{{ a.requested_by }}</strong> at <time>{{ a.created_at }}</time></p>
+  <details><summary>Arguments</summary><pre>{{ a.payload }}</pre></details>
+  <form class="inline" method="post" action="/ui/approvals/{{ a.id }}/resolve">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Reason <input type="text" name="reason" maxlength="500" autocomplete="off"></label>
+    <button class="primary" type="submit" name="decision" value="approve">Approve</button>
+    <button class="danger" type="submit" name="decision" value="deny">Deny</button>
+  </form>
+</article>
+{% endfor %}
+{% endif %}
+</section>
+
+<section aria-labelledby="live-h">
+<h2 id="live-h">Live passes <span class="chip">{{ q.live.len() }}</span></h2>
+{% if q.live.is_empty() %}
+<p class="muted">No approved pass is waiting to be used.</p>
+{% else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Id</th><th scope="col">Tool</th><th scope="col">Requester</th><th scope="col">Approved by</th><th scope="col">Approved at</th><th scope="col">Expires</th><th scope="col"><span class="muted">Action</span></th></tr></thead>
+<tbody>
+{% for a in q.live %}
+<tr id="approval-{{ a.id }}">
+  <td>#{{ a.id }}</td><td><code>{{ a.tool }}</code></td><td>{{ a.requested_by }}</td><td>{{ a.resolved_by }}</td><td><time>{{ a.resolved_at }}</time></td><td><time>{{ a.expires_at }}</time></td>
+  <td>
+    <form class="inline" method="post" action="/ui/approvals/{{ a.id }}/resolve">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="danger" type="submit" name="decision" value="revoke">Revoke</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+{% endif %}
+</section>
+
+<section aria-labelledby="expired-h">
+<h2 id="expired-h">Expired passes <span class="chip">{{ q.expired.len() }}</span></h2>
+{% if q.expired.is_empty() %}
+<p class="muted">None.</p>
+{% else %}
+<details><summary>Show expired passes (they authorize nothing)</summary>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Id</th><th scope="col">Tool</th><th scope="col">Requester</th><th scope="col">Approved by</th><th scope="col">Expired</th></tr></thead>
+<tbody>
+{% for a in q.expired %}
+<tr><td>#{{ a.id }}</td><td><code>{{ a.tool }}</code></td><td>{{ a.requested_by }}</td><td>{{ a.resolved_by }}</td><td><time>{{ a.expires_at }}</time></td></tr>
+{% endfor %}
+</tbody>
+</table></div>
+</details>
+{% endif %}
+</section>
+{% endmatch %}
+{% endblock %}

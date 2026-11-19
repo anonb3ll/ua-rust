@@ -1,0 +1,51 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Agents and sessions</h1>
+<section aria-labelledby="roster-h">
+<h2 id="roster-h">Roster</h2>
+{% match agents %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if rows.is_empty() %}<p class="muted">No agent has been seen yet.</p>{% else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Agent</th><th scope="col">Liveness</th><th scope="col">Kind</th><th scope="col">Host</th><th scope="col">Last seen</th><th scope="col">Open sessions</th><th scope="col">Active tasks</th></tr></thead>
+<tbody>
+{% for a in rows %}
+<tr>
+  <td><strong>{{ a.label }}</strong></td>
+  <td><span class="chip {{ a.status }}">{{ a.status }}</span></td>
+  <td>{{ a.kind }}</td><td>{{ a.host }}</td><td><time>{{ a.last_seen }}</time></td>
+  <td>{{ a.open_sessions }}</td><td>{{ a.active_tasks }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+{% endif %}
+{% endmatch %}
+</section>
+
+<section aria-labelledby="sessions-h">
+<h2 id="sessions-h">Open sessions</h2>
+{% match sessions %}
+{% when Err(e) %}<p class="error" role="alert">{{ e }}</p>
+{% when Ok(rows) %}
+{% if rows.is_empty() %}<p class="muted">No open sessions.</p>{% else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Session</th><th scope="col">Agent</th><th scope="col">Kind</th><th scope="col">Status</th><th scope="col">Task</th><th scope="col">Branch</th><th scope="col">Heartbeat</th></tr></thead>
+<tbody>
+{% for s in rows %}
+<tr>
+  <td class="mono">{{ s.id }}</td>
+  <td>{{ s.agent }}</td><td>{{ s.kind }}</td>
+  <td><span class="chip">{{ s.status }}</span> {% if s.live %}<span class="chip live">live</span>{% else %}<span class="chip stale">quiet</span>{% endif %}</td>
+  <td>{% if !s.task_id.is_empty() %}<a href="/ui/tasks/{{ s.task_id }}">#{{ s.task_id }}</a> {{ s.task_title }}{% endif %}</td>
+  <td class="mono">{{ s.branch }}</td>
+  <td><time>{{ s.last_heartbeat_at }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table></div>
+{% endif %}
+{% endmatch %}
+</section>
+{% endblock %}

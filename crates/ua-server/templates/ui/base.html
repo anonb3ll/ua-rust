@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
+<title>{{ page.title }} · Control Center</title>
+<link rel="stylesheet" href="/ui/static/ui.css">
+<script src="/ui/static/htmx-2.0.11.min.js" defer></script>
+<script src="/ui/static/htmx-ext-sse-2.2.4.js" defer></script>
+</head>
+<body hx-boost="true" hx-headers='{"X-CSRF-Token": "{{ page.csrf }}"}'>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <a class="brand" href="/ui/inbox">Control Center</a>
+  <nav aria-label="Main">
+    <ul>
+      <li><a href="/ui/inbox"{% if page.nav == "inbox" %} aria-current="page"{% endif %}>Inbox</a></li>
+      <li><a href="/ui/work"{% if page.nav == "work" %} aria-current="page"{% endif %}>Work</a></li>
+      <li><a href="/ui/plans"{% if page.nav == "plans" %} aria-current="page"{% endif %}>Plans</a></li>
+      <li><a href="/ui/agents"{% if page.nav == "agents" %} aria-current="page"{% endif %}>Agents</a></li>
+      <li><a href="/ui/messages"{% if page.nav == "messages" %} aria-current="page"{% endif %}>Messages</a></li>
+      <li><a href="/ui/memory"{% if page.nav == "memory" %} aria-current="page"{% endif %}>Memory</a></li>
+      <li><a href="/ui/activity"{% if page.nav == "activity" %} aria-current="page"{% endif %}>Activity</a></li>
+    </ul>
+  </nav>
+  <div class="who">
+    {% if page.verified %}
+      Signed in as <strong>{{ page.who }}</strong> <span class="chip">{{ page.kind }}</span> <span class="chip">{{ page.profile }}</span>
+      · <a href="/logout" hx-boost="false">Sign out</a>
+    {% else %}
+      Local, not signed in <span class="chip">{{ page.profile }}</span>
+      · <a href="/login" hx-boost="false">Sign in</a>
+    {% endif %}
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  {% if let Some(f) = page.flash %}<p class="flash" role="status">{{ f }}</p>{% endif %}
+  {% if let Some(e) = page.error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
