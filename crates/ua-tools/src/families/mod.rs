@@ -8,6 +8,7 @@ pub mod agents;
 pub mod core_schema;
 pub mod delegation;
 pub mod events;
+pub mod memory;
 pub mod messaging;
 pub mod plans;
 pub mod tasks;
@@ -20,6 +21,7 @@ use crate::registry::Registry;
 pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts = vec![core_schema::SCHEMA];
     // family schema parts (alphabetical)
+    parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
@@ -32,6 +34,7 @@ pub fn register(r: &mut Registry) {
     agents::register(r);
     delegation::register(r);
     events::register(r);
+    memory::register(r);
     messaging::register(r);
     plans::register(r);
     tasks::register(r);
