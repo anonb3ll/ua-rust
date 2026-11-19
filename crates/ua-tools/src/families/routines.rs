@@ -98,11 +98,13 @@ fn parse_cron(schedule: &str) -> UaResult<croner::Cron> {
 }
 
 fn to_chrono(ts: jiff::Timestamp) -> UaResult<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp(ts.as_second(), 0).ok_or_else(|| UaError::invalid("timestamp out of range"))
+    chrono::DateTime::from_timestamp(ts.as_second(), 0)
+        .ok_or_else(|| UaError::invalid("timestamp out of range"))
 }
 
 fn from_chrono(dt: chrono::DateTime<chrono::Utc>) -> UaResult<jiff::Timestamp> {
-    jiff::Timestamp::from_second(dt.timestamp()).map_err(|e| UaError::invalid(format!("timestamp out of range: {e}")))
+    jiff::Timestamp::from_second(dt.timestamp())
+        .map_err(|e| UaError::invalid(format!("timestamp out of range: {e}")))
 }
 
 fn minute_floor(ts: jiff::Timestamp) -> jiff::Timestamp {
@@ -120,7 +122,11 @@ pub fn cron_next(schedule: &str, after: jiff::Timestamp) -> UaResult<jiff::Times
 }
 
 /// Latest occurrence in `(after, cutoff]`, without replaying the ones between.
-fn cron_latest(schedule: &str, cutoff: jiff::Timestamp, after: jiff::Timestamp) -> UaResult<Option<jiff::Timestamp>> {
+fn cron_latest(
+    schedule: &str,
+    cutoff: jiff::Timestamp,
+    after: jiff::Timestamp,
+) -> UaResult<Option<jiff::Timestamp>> {
     let cron = parse_cron(schedule)?;
     let Ok(prev) = cron.find_previous_occurrence(&to_chrono(cutoff)?, true) else { return Ok(None) };
     let prev = from_chrono(prev)?;
@@ -128,7 +134,8 @@ fn cron_latest(schedule: &str, cutoff: jiff::Timestamp, after: jiff::Timestamp) 
 }
 
 fn parse_ts(s: &str) -> UaResult<jiff::Timestamp> {
-    ua_core::time::parse_ts(s).ok_or_else(|| UaError::invalid(format!("timestamp {s:?} must be RFC 3339 with an offset")))
+    ua_core::time::parse_ts(s)
+        .ok_or_else(|| UaError::invalid(format!("timestamp {s:?} must be RFC 3339 with an offset")))
 }
 
 // ---------------------------------------------------------------------------
@@ -356,8 +363,9 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64) -> Option<Value> {
     let loaded = hub
         .db()
         .read_async(move |c| {
-            let routine_id: Option<i64> =
-                c.query_row("SELECT routine_id FROM routine_runs WHERE id = ?1", [run_row], |r| r.get(0)).optional()?;
+            let routine_id: Option<i64> = c
+                .query_row("SELECT routine_id FROM routine_runs WHERE id = ?1", [run_row], |r| r.get(0))
+                .optional()?;
             Ok(match routine_id {
                 Some(id) => routine_by_id(c, id)?,
                 None => None,
@@ -624,7 +632,9 @@ async fn routine_add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
     if !["org", "project"].contains(&a.activity_gate_scope.as_str()) {
         return Err(UaError::invalid("activity_gate_scope must be org or project"));
     }
-    if !["skip", "queue"].contains(&a.concurrency.as_str()) || !["none", "last", "all"].contains(&a.catch_up.as_str()) {
+    if !["skip", "queue"].contains(&a.concurrency.as_str())
+        || !["none", "last", "all"].contains(&a.catch_up.as_str())
+    {
         return Err(UaError::invalid("invalid concurrency or catch_up policy"));
     }
     let project = check_slug("project", &a.project)?;
@@ -756,8 +766,11 @@ async fn routine_pause(ctx: ToolCtx, a: PauseArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new("agent.routine.paused", json!({ "routine_id": a.routine_id, "paused": a.paused }))
-                    .by(by),
+                EventInput::new(
+                    "agent.routine.paused",
+                    json!({ "routine_id": a.routine_id, "paused": a.paused }),
+                )
+                .by(by),
             )?;
             Ok(json!({ "id": a.routine_id, "paused": i64::from(a.paused) }))
         })
@@ -784,7 +797,8 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let routine = routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
+            let routine =
+                routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
             let key = format!("event:{}", a.idempotency_key);
             let previous: Option<(String, Option<i64>)> = tx
                 .query_row(

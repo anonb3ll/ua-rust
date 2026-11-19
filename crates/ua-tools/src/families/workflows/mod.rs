@@ -206,7 +206,10 @@ async fn workflow_run(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 .await?
                 .ok_or_else(|| UaError::not_found(format!("no workflow run {run_id:?}")))?;
             if run.kind != "workflow" || run.name != def.name {
-                return Err(UaError::invalid(format!("run {run_id} is not a run of workflow {:?}", def.name)));
+                return Err(UaError::invalid(format!(
+                    "run {run_id} is not a run of workflow {:?}",
+                    def.name
+                )));
             }
             check_resume_authority(&ctx.caller, &run)?;
             if let Some(inputs) = &a.inputs

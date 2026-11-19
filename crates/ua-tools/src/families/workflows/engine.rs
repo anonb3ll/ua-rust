@@ -223,7 +223,10 @@ impl Definition {
                 }
             }
             if !seen.insert(step.name.as_str()) {
-                return Err(UaError::invalid(format!("workflow {name:?} has duplicate step name {:?}", step.name)));
+                return Err(UaError::invalid(format!(
+                    "workflow {name:?} has duplicate step name {:?}",
+                    step.name
+                )));
             }
         }
         Ok(())
@@ -345,7 +348,9 @@ pub(crate) fn load_definition(cfg: &Config, name: &str) -> UaResult<Definition> 
         )));
     };
     if meta.len() > MAX_DEFINITION_BYTES {
-        return Err(UaError::invalid(format!("workflow {name:?} is larger than {MAX_DEFINITION_BYTES} bytes")));
+        return Err(UaError::invalid(format!(
+            "workflow {name:?} is larger than {MAX_DEFINITION_BYTES} bytes"
+        )));
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| UaError::invalid(format!("cannot read workflow {name:?}: {e}")))?;
@@ -643,7 +648,11 @@ fn latest_checkpoints(conn: &Connection, run_id: &str) -> UaResult<BTreeMap<Stri
     Ok(out)
 }
 
-fn step_reports(conn: &Connection, run_id: &str, def: &Definition) -> UaResult<(Vec<Value>, Map<String, Value>)> {
+fn step_reports(
+    conn: &Connection,
+    run_id: &str,
+    def: &Definition,
+) -> UaResult<(Vec<Value>, Map<String, Value>)> {
     let latest = latest_checkpoints(conn, run_id)?;
     let mut steps = Vec::new();
     let mut outputs = Map::new();
@@ -798,7 +807,10 @@ async fn run_one(hub: &Hub, caller: &Caller, run_id: &str, step: &StepDef, scope
             Ok(GateOutcome::Pass { .. }) => {}
             Ok(GateOutcome::Pending { approval_id }) => {
                 return (
-                    Outcome::Pending { approval_id, error: format!("waiting on approval {approval_id} for {gate}") },
+                    Outcome::Pending {
+                        approval_id,
+                        error: format!("waiting on approval {approval_id} for {gate}"),
+                    },
                     0,
                 );
             }
@@ -852,9 +864,9 @@ async fn checkpoint(
     token: &str,
     idx: usize,
     step: &StepDef,
-    outcome: &Outcome,
-    attempts: i64,
+    result: &(Outcome, i64),
 ) -> UaResult<bool> {
+    let (outcome, attempts) = (&result.0, result.1);
     let (output, digest) = match outcome {
         Outcome::Done(v) => {
             let text = serde_json::to_string(v)?;
@@ -930,14 +942,21 @@ async fn checkpoint(
         .await
 }
 
-async fn run_steps(hub: &Hub, caller: &Caller, run: &RunRow, def: &Definition, token: &str) -> UaResult<Report> {
+async fn run_steps(
+    hub: &Hub,
+    caller: &Caller,
+    run: &RunRow,
+    def: &Definition,
+    token: &str,
+) -> UaResult<Report> {
     let (rid, d) = (run.run_id.clone(), def.clone());
     let (_, done_outputs) = hub.db().read_async(move |c| step_reports(c, &rid, &d)).await?;
     let mut steps_scope = Map::new();
     for (name, out) in &done_outputs {
         steps_scope.insert(name.clone(), as_scope_value(out));
     }
-    let mut scope = json!({ "inputs": Value::Object(run.inputs.clone()), "steps": Value::Object(steps_scope) });
+    let mut scope =
+        json!({ "inputs": Value::Object(run.inputs.clone()), "steps": Value::Object(steps_scope) });
 
     let mut final_status = "done";
     let mut code = None;
@@ -948,14 +967,14 @@ async fn run_steps(hub: &Hub, caller: &Caller, run: &RunRow, def: &Definition, t
         if done_outputs.contains_key(&step.name) {
             continue;
         }
-        let (outcome, attempts) = run_one(hub, caller, &run.run_id, step, &scope).await;
-        if !checkpoint(hub, caller, run, token, idx, step, &outcome, attempts).await? {
+        let result = run_one(hub, caller, &run.run_id, step, &scope).await;
+        if !checkpoint(hub, caller, run, token, idx, step, &result).await? {
             let mut report = finished_report(hub, run, def, "conflict", None, false).await?;
             report.code = Some("lease_lost".into());
             report.error = Some("this executor's lease expired and another took the run over".into());
             return Ok(report);
         }
-        match outcome {
+        match result.0 {
             Outcome::Done(v) => {
                 scope["steps"][&step.name] = as_scope_value(&v);
             }
@@ -1030,8 +1049,9 @@ mod tests {
     #[test]
     fn substitution_keeps_types_and_interpolates() {
         let scope = json!({ "inputs": { "n": 3, "s": "hi" }, "steps": { "a": { "out": [1, 2] } } });
-        let v = substitute(&json!({ "x": "{{ inputs.n }}", "y": "say {{ inputs.s }} {{steps.a.out}}" }), &scope)
-            .unwrap();
+        let v =
+            substitute(&json!({ "x": "{{ inputs.n }}", "y": "say {{ inputs.s }} {{steps.a.out}}" }), &scope)
+                .unwrap();
         assert_eq!(v, json!({ "x": 3, "y": "say hi [1,2]" }));
         let d = substitute(&json!("{{ inputs.s | sha256 }}"), &scope).unwrap();
         assert_eq!(d, json!(sha256_hex("hi")));
@@ -1043,7 +1063,8 @@ mod tests {
         let ok = "name: demo\ninputs: [msg]\nsteps:\n  - name: a\n    tool: run_cmd_check\n    args:\n      command: \"echo {{ inputs.msg }}\"\n";
         let def = parse_definition("demo", ok).unwrap();
         assert_eq!(def.steps.len(), 1);
-        let bad_ref = "steps:\n  - name: a\n    tool: run_cmd_check\n    args: { command: \"{{ steps.b.x }}\" }\n";
+        let bad_ref =
+            "steps:\n  - name: a\n    tool: run_cmd_check\n    args: { command: \"{{ steps.b.x }}\" }\n";
         assert!(parse_definition("x", bad_ref).is_err());
         let recursion = "steps:\n  - name: a\n    tool: workflow_run\n    args: {}\n";
         assert!(parse_definition("x", recursion).is_err());

@@ -183,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve => {
             warn_if_locked_out(&state).await;
+            if cfg.routines_enabled {
+                tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone()));
+            }
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {
