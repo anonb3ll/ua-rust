@@ -102,6 +102,17 @@ pub fn replace_regular_text(
     if !meta.is_file() || meta.len() > REPLACE_LIMIT {
         return Err(refuse());
     }
+    // A rename over a hardlinked file would split the link.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file has more than one hard link",
+            ));
+        }
+    }
     let mut buf = Vec::new();
     (&mut file).take(REPLACE_LIMIT + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > REPLACE_LIMIT {
@@ -120,6 +131,12 @@ pub fn replace_regular_text(
         let mut topts = OpenOptions::new();
         topts.write(true).create_new(true);
         nofollow_flags(&mut topts);
+        // Never wider than the original, even before the final chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            topts.mode(meta.mode() & 0o7777);
+        }
         let mut t = topts.open(&tmp)?;
         t.write_all(new.as_bytes())?;
         t.set_permissions(meta.permissions())?;
@@ -131,8 +148,23 @@ pub fn replace_regular_text(
             if now.dev() != meta.dev() || now.ino() != meta.ino() {
                 return Err(std::io::Error::other("file was replaced during the update"));
             }
+            // The same descriptor must still show what was read: an in-place
+            // edit since then would be silently overwritten.
+            let cur = file.metadata()?;
+            if cur.len() != meta.len()
+                || cur.mtime() != meta.mtime()
+                || cur.mtime_nsec() != meta.mtime_nsec()
+                || cur.ctime() != meta.ctime()
+                || cur.ctime_nsec() != meta.ctime_nsec()
+                || cur.nlink() != 1
+            {
+                return Err(std::io::Error::other("file was modified during the update"));
+            }
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -199,6 +231,35 @@ mod tests {
         assert!(replace_regular_text(&f, |b| Ok(Some(format!("{}!", String::from_utf8_lossy(b))))).unwrap());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "old!");
         assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file is left");
+    }
+
+    #[test]
+    fn hardlinked_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::hard_link(&f, dir.path().join("b.txt")).unwrap();
+        assert!(replace_regular_text(&f, |_| Ok(Some("new".into()))).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn an_in_place_edit_between_read_and_commit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        let err = replace_regular_text(&f, |_| {
+            // Same length, different bytes, edited in place.
+            let w = OpenOptions::new().write(true).open(&f)?;
+            (&w).write_all(b"mid")?;
+            w.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+            Ok(Some("new".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("modified"), "{err}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mid");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file is left");
     }
 

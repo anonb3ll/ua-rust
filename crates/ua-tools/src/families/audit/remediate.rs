@@ -149,13 +149,41 @@ impl Fixer<'_> {
     fn modify(&mut self, rel: &str, f: impl FnOnce(&str) -> Option<(String, String)>) -> std::io::Result<()> {
         let path = self.root.join(rel);
         let ours = self.overlay.get(rel).cloned();
-        let planned = match (&self.mode, ours) {
-            (Mode::Apply(_), None) => None,
-            (_, ours) => Some(ours),
-        };
-        if let Some(ours) = planned {
-            // Plan mode, or a file this run already produced: no disk write
-            // except, in apply mode, re-writing our own earlier output.
+        if let (Mode::Apply(expected), Some(ours)) = (&self.mode, ours.as_ref()) {
+            // A file this run already wrote: the disk must still hold our
+            // output, and the final bytes must match the approved plan.
+            let first_before = self.changes.get(rel).and_then(|c| c.sha256_before.clone());
+            let our_hash = sha(ours.as_bytes());
+            let mut done: Option<(String, String)> = None;
+            replace_regular_text(&path, |bytes| {
+                if sha(bytes) != our_hash {
+                    return Err(io_err("file changed since the plan was approved"));
+                }
+                let Some((new, desc)) = f(ours) else { return Ok(None) };
+                let after = sha(new.as_bytes());
+                if !expected
+                    .iter()
+                    .any(|c| c.path == rel && c.sha256_before == first_before && c.sha256_after == after)
+                {
+                    return Err(io_err("the change differs from the approved plan"));
+                }
+                done = Some((new.clone(), desc));
+                Ok(Some(new))
+            })
+            .map_err(|e| {
+                if e.raw_os_error().is_some() || e.kind() == std::io::ErrorKind::NotFound {
+                    io_err("not a readable regular file")
+                } else {
+                    e
+                }
+            })?;
+            if let Some((new, desc)) = done {
+                self.record(rel, None, &new, desc);
+            }
+            return Ok(());
+        }
+        if matches!(self.mode, Mode::Plan) {
+            // Plan mode: nothing is written.
             let (cur, before) = match ours {
                 Some(t) => (t, None),
                 None => {
@@ -170,9 +198,6 @@ impl Fixer<'_> {
                 }
             };
             if let Some((new, desc)) = f(&cur) {
-                if matches!(self.mode, Mode::Apply(_)) {
-                    replace_regular_text(&path, |_| Ok(Some(new.clone())))?;
-                }
                 self.record(rel, before, &new, desc);
             }
             return Ok(());
@@ -353,6 +378,46 @@ mod tests {
         let done = remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan));
         assert!(done.is_empty());
         assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "target/\n");
+    }
+
+    #[test]
+    fn overlay_branch_checks_disk_and_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "target/\n").unwrap();
+        let hidden = "a\u{200b}b\n";
+        std::fs::write(dir.path().join("AGENTS.md"), hidden).unwrap();
+        let mk = |p: &str| {
+            let mut f = finding("AGENT-HIDDEN-UNICODE");
+            f.path = Some(p.into());
+            f
+        };
+        let mut fs = [mk("AGENTS.md"), mk("AGENTS.md")];
+        let plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+        assert_eq!(plan.len(), 1);
+        // Happy path: the second finding hits the overlay and is a no-op.
+        let mut fs = [mk("AGENTS.md"), mk("AGENTS.md")];
+        assert_eq!(remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan)).len(), 1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "ab\n");
+
+        // Overlay with a tampered plan: the second write must not slip through.
+        let mut fx = Fixer {
+            root: dir.path(),
+            mode: Mode::Apply(&plan),
+            overlay: BTreeMap::new(),
+            changes: BTreeMap::new(),
+        };
+        std::fs::write(&gi, "x\n").unwrap();
+        fx.record(".gitignore", None, "x\n", "d".into());
+        // Disk drifted from our output.
+        std::fs::write(&gi, "drift\n").unwrap();
+        let err = fx.modify(".gitignore", |c| Some((format!("{c}y"), "d".into()))).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        // Disk matches, but the result is not in the plan.
+        std::fs::write(&gi, "x\n").unwrap();
+        let err = fx.modify(".gitignore", |c| Some((format!("{c}y"), "d".into()))).unwrap_err();
+        assert!(err.to_string().contains("approved plan"), "{err}");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "x\n");
     }
 
     #[test]
