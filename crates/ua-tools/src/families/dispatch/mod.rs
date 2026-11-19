@@ -355,49 +355,26 @@ pub(crate) fn insert_receipt(
     reported_by: &str,
     event_ulid: Option<&str>,
 ) -> UaResult<()> {
-    let (fence, task_id, agent, state, evidence, reason, exit_code, outcome): (
-        i64,
-        i64,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-    ) = tx.query_row(
-        "SELECT fence, task_id, agent_label, state, evidence_ref, failure_reason, exit_code, termination_outcome \
-         FROM dispatch_runs WHERE run_id = ?1",
+    // The hash covers the receipt's own fields (sorted keys), so a stored
+    // receipt can be re-checked against the row and its ledger event.
+    let mut body = tx.query_row(
+        "SELECT run_id, fence, task_id, agent_label, state, evidence_ref, failure_reason, exit_code, \
+         termination_outcome FROM dispatch_runs WHERE run_id = ?1",
         [run_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        crate::families::tasks::row_object,
     )?;
     let created_at = now();
-    let body = json!({
-        "run_id": run_id, "fence": fence, "task_id": task_id, "agent_label": agent, "state": state,
-        "source": source, "reported_by": reported_by, "evidence_ref": evidence, "failure_reason": reason,
-        "exit_code": exit_code, "termination_outcome": outcome, "event_ulid": event_ulid,
-        "created_at": created_at,
-    });
-    let hash = hex::encode(Sha256::digest(body.to_string().as_bytes()));
+    body.insert("source".into(), json!(source));
+    body.insert("reported_by".into(), json!(reported_by));
+    body.insert("event_ulid".into(), json!(event_ulid));
+    body.insert("created_at".into(), json!(created_at));
+    let hash = hex::encode(Sha256::digest(Value::Object(body).to_string().as_bytes()));
     tx.execute(
         "INSERT INTO dispatch_receipts (run_id, fence, task_id, agent_label, state, source, reported_by, \
          evidence_ref, failure_reason, exit_code, termination_outcome, event_ulid, receipt_hash, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            run_id,
-            fence,
-            task_id,
-            agent,
-            state,
-            source,
-            reported_by,
-            evidence,
-            reason,
-            exit_code,
-            outcome,
-            event_ulid,
-            hash,
-            created_at
-        ],
+         SELECT run_id, fence, task_id, agent_label, state, ?2, ?3, evidence_ref, failure_reason, exit_code, \
+         termination_outcome, ?4, ?5, ?6 FROM dispatch_runs WHERE run_id = ?1",
+        params![run_id, source, reported_by, event_ulid, hash, created_at],
     )?;
     Ok(())
 }
