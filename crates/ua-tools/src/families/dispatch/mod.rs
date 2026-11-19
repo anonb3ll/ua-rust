@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
-pub use reaper::{reap_expired_leases, spawn_reaper};
+pub use reaper::{reap_expired_leases, spawn_reaper, startup_sweep};
 
 use crate::registry::Registry;
 
@@ -106,8 +106,34 @@ CREATE INDEX IF NOT EXISTS idx_dispatch_receipts_run ON dispatch_receipts(run_id
 ",
 };
 
+/// Process identity for orphan proof, who cancelled a run, and per-database
+/// dispatch values.
+///
+/// `pgid` is the child's process group, `pid_start_time` its start time in
+/// clock ticks since boot (`/proc/<pid>/stat` field 22, Linux only), and
+/// `supervisor_pid` / `supervisor_start_time` the same for the hub process
+/// that started it. Together they let a later hub process prove that a
+/// still-running pid is the child it recorded (not a reused pid) and that
+/// its supervisor is gone, before it signals the group.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "dispatch.v2",
+    sql: "
+ALTER TABLE dispatch_runs ADD COLUMN pgid INTEGER;
+ALTER TABLE dispatch_runs ADD COLUMN pid_start_time INTEGER;
+ALTER TABLE dispatch_runs ADD COLUMN supervisor_pid INTEGER;
+ALTER TABLE dispatch_runs ADD COLUMN supervisor_start_time INTEGER;
+ALTER TABLE dispatch_runs ADD COLUMN cancelled_by TEXT;
+-- Per-database values: `run_id_salt` makes derived run ids unique to this
+-- database.
+CREATE TABLE IF NOT EXISTS dispatch_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+",
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA]
+    vec![SCHEMA, SCHEMA_V2]
 }
 
 pub fn register(r: &mut Registry) {
@@ -135,10 +161,15 @@ pub(crate) struct Run {
     pub lease_expires_at: Option<String>,
     pub workdir: Option<String>,
     pub prompt: Option<String>,
+    pub pgid: Option<i64>,
+    pub pid_start_time: Option<i64>,
+    pub supervisor_pid: Option<i64>,
+    pub supervisor_start_time: Option<i64>,
 }
 
 const RUN_COLUMNS: &str = "run_id, task_id, agent_label, harness, state, fence, attempt, termination_outcome, \
-                           pid, evidence_ref, failure_reason, lease_expires_at, workdir, prompt";
+                           pid, evidence_ref, failure_reason, lease_expires_at, workdir, prompt, pgid, \
+                           pid_start_time, supervisor_pid, supervisor_start_time";
 
 fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -156,6 +187,10 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         lease_expires_at: r.get(11)?,
         workdir: r.get(12)?,
         prompt: r.get(13)?,
+        pgid: r.get(14)?,
+        pid_start_time: r.get(15)?,
+        supervisor_pid: r.get(16)?,
+        supervisor_start_time: r.get(17)?,
     })
 }
 
@@ -556,9 +591,36 @@ pub(crate) fn finalize_cancellation(
 /// Map a stop attempt to the claim it supports.
 pub(crate) fn classify_termination(termination: &str) -> &'static str {
     match termination {
-        "killed" | "already_gone" | "operator_confirmed" => "confirmed",
+        "killed" | "killed_orphan" | "already_gone" | "operator_confirmed" => "confirmed",
         _ => "unknown",
     }
+}
+
+/// Whether `caller` may act for another agent: a human, or the operator
+/// profile.
+pub(crate) fn is_operator(caller: &ua_core::Caller) -> bool {
+    caller.kind != ua_core::ActorKind::Anonymous
+        && (caller.is_human() || caller.profile == ua_core::Profile::Operator)
+}
+
+/// Check that a verified caller is `agent` itself or an operator.
+pub(crate) fn check_agent_or_operator(caller: &ua_core::Caller, tool: &str, agent: &str) -> UaResult<()> {
+    if caller.kind == ua_core::ActorKind::Anonymous {
+        return Err(UaError::denied(
+            "unauthenticated",
+            format!("{tool} requires an authenticated hub identity; anonymous callers cannot bind a run"),
+        ));
+    }
+    if caller.label != agent && !is_operator(caller) {
+        return Err(UaError::denied(
+            "identity_mismatch",
+            format!(
+                "identity mismatch: verified as {:?}, which is neither agent {agent:?} nor an operator",
+                caller.label
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Check an identity-bound tool's caller: verified, and the run's agent.

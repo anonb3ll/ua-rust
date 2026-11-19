@@ -91,7 +91,13 @@ impl H {
         if let Some(h) = harness {
             args["harness"] = json!(h);
         }
-        self.gated(&lead(), "dispatch_task", args).await.unwrap()
+        self.gated(&agent("agent-1"), "dispatch_task", args).await.unwrap()
+    }
+
+    /// The approval row for `id`, payload parsed.
+    fn approval_payload(&self, id: i64) -> Value {
+        let text = self.scalar(&format!("SELECT payload FROM approvals WHERE id = {id}"));
+        serde_json::from_str(text.as_str().unwrap()).unwrap()
     }
 
     fn sql(&self, stmt: &str) {
@@ -183,7 +189,7 @@ async fn dispatch_task_is_always_gated_and_records_a_stub_run() {
     let h = H::new();
     let tid = h.task().await;
     let args = json!({ "task_id": tid, "agent": "agent-1" });
-    let parked = h.err(&lead(), "dispatch_task", args.clone()).await;
+    let parked = h.err(&agent("agent-1"), "dispatch_task", args.clone()).await;
     assert_eq!(parked.code(), "approval_required");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM dispatch_runs"), json!(0), "nothing runs before approval");
 
@@ -204,17 +210,20 @@ async fn dispatch_task_is_always_gated_and_records_a_stub_run() {
     assert_eq!(r["lease"]["active"], true);
     assert_eq!(r["terminal"], false);
 
-    // One live run per task.
-    let dup =
-        h.gated(&lead(), "dispatch_task", json!({ "task_id": tid, "agent": "agent-2" })).await.unwrap_err();
+    // One live run per task, refused before any approval is requested.
+    let dup = h.err(&agent("agent-2"), "dispatch_task", json!({ "task_id": tid, "agent": "agent-2" })).await;
     assert!(dup.to_string().contains("task_claimed") || dup.to_string().contains("already_claimed"), "{dup}");
 
     // An unknown harness is refused.
     let tid2 = h.task().await;
     let bad = h
-        .gated(&lead(), "dispatch_task", json!({ "task_id": tid2, "agent": "agent-1", "harness": "nope" }))
+        .err(
+            &agent("agent-1"),
+            "dispatch_task",
+            json!({ "task_id": tid2, "agent": "agent-1", "harness": "nope" }),
+        )
         .await;
-    assert_eq!(bad.unwrap_err().code(), "invalid_argument");
+    assert_eq!(bad.code(), "invalid_argument");
 
     let list = h.ok(&human(), "dispatch_delivery_receipts_list", json!({ "task_id": tid })).await;
     assert_eq!(list["count"], 1);
@@ -347,8 +356,7 @@ async fn cancel_confirm_and_resume_under_a_new_fence() {
     // Unconfirmed cessation keeps the slot and blocks a resume.
     let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid })).await.unwrap_err();
     assert!(e.to_string().contains("cessation_unconfirmed"), "{e}");
-    let e =
-        h.gated(&lead(), "dispatch_task", json!({ "task_id": tid, "agent": "agent-1" })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_task", json!({ "task_id": tid, "agent": "agent-1" })).await;
     assert!(e.to_string().contains("already_claimed"), "{e}");
     let again = h.ok(&me, "dispatch_cancel", json!({ "run_id": rid })).await;
     assert_eq!(again["reason"], "already_terminal");
@@ -465,6 +473,143 @@ async fn lease_expiry_hands_a_run_back() {
     assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid3}'")), "cancelled");
 }
 
+fn operator_agent(label: &str) -> Caller {
+    // An operator-profile agent session that does not enforce profiles (the
+    // shipped operator allowlist hides dispatch_task and dispatch_cancel).
+    Caller { profile: Profile::Operator, enforce_profile: false, ..agent(label) }
+}
+
+#[tokio::test]
+async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
+    let h = H::new();
+    let me = agent("agent-1");
+    let tid = h.task().await;
+    let args = json!({ "task_id": tid, "agent": "agent-1", "harness": "echo" });
+
+    let parked = h.err(&me, "dispatch_task", args.clone()).await;
+    let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked}") };
+    let p = h.approval_payload(approval_id);
+    let wt = std::fs::canonicalize(h.dir.path().join(format!("wt-{tid}"))).unwrap();
+    assert_eq!(p["workdir"], json!(wt.display().to_string()), "{p}");
+    assert_eq!(p["argv"][0], "/bin/sh");
+    assert_eq!(p["prompt_source"], "task");
+    assert_eq!(p["prompt_sha256"].as_str().unwrap().len(), 64);
+    assert!(p["run_id"].as_str().unwrap().starts_with(&format!("run-{tid}-")));
+    assert!(p.get("passes_token_of").is_none(), "no token is passed: {p}");
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+
+    // The task changes after the approval: the default prompt no longer
+    // hashes to what was approved, so the pass is refused.
+    h.sql(&format!("UPDATE tasks SET notes = 'also delete the backups' WHERE id = {tid}"));
+    let e = h.err(&me, "dispatch_task", args.clone()).await;
+    assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+    assert!(e.to_string().contains("prompt_sha256"), "{e}");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM dispatch_runs"), json!(0), "nothing ran");
+    assert_eq!(
+        h.scalar(&format!("SELECT status FROM approvals WHERE id = {approval_id}")),
+        "approved",
+        "the stale pass is not consumed"
+    );
+
+    // A moved worktree is caught the same way.
+    let tid2 = h.task().await;
+    let args2 = json!({ "task_id": tid2, "agent": "agent-1", "harness": "echo" });
+    let UaError::ApprovalRequired { approval_id: a2, .. } = h.err(&me, "dispatch_task", args2.clone()).await
+    else {
+        panic!()
+    };
+    h.ok(&human(), "approval_resolve", json!({ "id": a2, "decision": "approve" })).await;
+    let other = h.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    h.sql(&format!("UPDATE tasks SET worktree_path = '{}' WHERE id = {tid2}", other.display()));
+    let e = h.err(&me, "dispatch_task", args2).await;
+    assert!(e.to_string().contains("workdir"), "{e}");
+
+    // Approving the request for the current values lets the call run,
+    // linked to that approval.
+    let current = h.scalar(&format!(
+        "SELECT id FROM approvals WHERE status = 'pending' AND json_extract(payload, '$.task_id') = {tid}"
+    ));
+    h.ok(&human(), "approval_resolve", json!({ "id": current, "decision": "approve" })).await;
+    let run = h.ok(&me, "dispatch_task", args).await;
+    assert_eq!(run["ok"], true, "{run}");
+    let rid = run["run_id"].as_str().unwrap().to_string();
+    let r = h.wait_for(&rid, |r| r["terminal"] == true).await;
+    assert_eq!(r["approval_outcome"], "approved");
+    let linked = r["approval_id"].as_i64().unwrap();
+    assert_eq!(h.approval_payload(linked)["run_id"], json!(rid));
+    assert_eq!(
+        h.scalar(&format!("SELECT prompt_sha256 FROM dispatch_runs WHERE run_id = '{rid}'")),
+        h.approval_payload(linked)["prompt_sha256"]
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_without_a_linked_approval_is_unlinked() {
+    let h = H::new();
+    let tid = h.task().await;
+    let rid = h.dispatch(tid, None).await["run_id"].as_str().unwrap().to_string();
+    assert_eq!(h.receipt(&rid).await["approval_outcome"], "approved");
+    h.sql(&format!("UPDATE approvals SET run_id = NULL WHERE run_id = '{rid}'"));
+    let r = h.receipt(&rid).await;
+    assert_eq!(r["approval_outcome"], "unlinked", "{r}");
+    assert_eq!(r["approval_id"], Value::Null);
+    assert_eq!(r["policy_outcome"], "approved", "the claim itself happened");
+}
+
+#[tokio::test]
+async fn dispatch_task_checks_the_caller_against_the_agent() {
+    let h = H::with(|c| {
+        let mut h = harness(&["/usr/bin/env"], 20);
+        h.pass_agent_token = true;
+        c.harnesses.insert("tokened".into(), h);
+    });
+    let tid = h.task().await;
+    let args = json!({ "task_id": tid, "agent": "agent-1" });
+
+    let anon = Caller::local("agent-1", Transport::Mcp);
+    assert_eq!(reason(&h.err(&anon, "dispatch_task", args.clone()).await), "unauthenticated");
+    // Another developer cannot dispatch work in agent-1's name.
+    assert_eq!(reason(&h.err(&lead(), "dispatch_task", args.clone()).await), "identity_mismatch");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals"), json!(0), "a refused caller requests nothing");
+
+    // The agent itself, an operator-profile agent and a human may.
+    for who in [agent("agent-1"), operator_agent("ops-1"), Caller { label: "lead-human".into(), ..human() }] {
+        let e = h.err(&who, "dispatch_task", args.clone()).await;
+        assert_eq!(e.code(), "approval_required", "{}: {e}", who.label);
+    }
+
+    // A harness that passes the agent's token says so on the approval.
+    let tid2 = h.task().await;
+    let e = h
+        .err(
+            &agent("agent-1"),
+            "dispatch_task",
+            json!({ "task_id": tid2, "agent": "agent-1", "harness": "tokened" }),
+        )
+        .await;
+    let UaError::ApprovalRequired { approval_id, .. } = e else { panic!("{e}") };
+    assert_eq!(h.approval_payload(approval_id)["passes_token_of"], "agent-1");
+}
+
+#[tokio::test]
+async fn a_workdir_inside_the_hub_home_is_refused() {
+    let h = H::new();
+    let tid = h.task().await;
+    let inside = h.hub.cfg().home.join("projects").join("x");
+    std::fs::create_dir_all(&inside).unwrap();
+    h.sql(&format!("UPDATE tasks SET worktree_path = '{}' WHERE id = {tid}", inside.display()));
+    let e = h
+        .err(
+            &agent("agent-1"),
+            "dispatch_task",
+            json!({ "task_id": tid, "agent": "agent-1", "harness": "echo" }),
+        )
+        .await;
+    assert_eq!(e.code(), "invalid_argument");
+    assert!(e.to_string().contains("hub home"), "{e}");
+}
+
 #[cfg(unix)]
 mod spawn {
     use super::*;
@@ -508,7 +653,7 @@ mod spawn {
         let tid = h.task().await;
         let args =
             json!({ "task_id": tid, "agent": "agent-1", "harness": "echo", "prompt": "a; rm -rf / && b" });
-        let run = h.gated(&lead(), "dispatch_task", args).await.unwrap();
+        let run = h.gated(&me, "dispatch_task", args).await.unwrap();
         let r = h.wait_for(run["run_id"].as_str().unwrap(), |r| r["terminal"] == true).await;
         assert_eq!(r["run_state"], "finished");
         let log = h.log(&r);
@@ -597,5 +742,133 @@ mod spawn {
         let c = h.ok(&me, "dispatch_cancel", json!({ "run_id": rid })).await;
         assert_eq!(c["cessation"], "confirmed");
         h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_cancels_another_agents_running_harness() {
+        let h = H::new();
+        let tid = h.task().await;
+        let run = h.dispatch(tid, Some("sleep")).await;
+        assert_eq!(run["state"], "running", "{run}");
+        let rid = run["run_id"].as_str().unwrap().to_string();
+        let pid = run["pid"].as_i64().unwrap();
+
+        let e = h.err(&agent("agent-2"), "dispatch_cancel", json!({ "run_id": rid })).await;
+        assert_eq!(reason(&e), "identity_mismatch", "a peer still cannot cancel it");
+
+        let c = h
+            .ok(&operator_agent("ops-1"), "dispatch_cancel", json!({ "run_id": rid, "reason": "runaway" }))
+            .await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["termination"], "killed");
+        assert_eq!(c["cessation"], "confirmed");
+        assert_eq!(c["cancelled_by"], "ops-1");
+        let r = h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+        assert_eq!(r["run_state"], "cancelled");
+        assert_eq!(r["cancelled_by"], "ops-1");
+        assert!(r["receipts"].as_array().unwrap().iter().any(|x| x["reported_by"] == "ops-1"));
+        assert!(!executor::pid_is_alive(Some(pid)));
+
+        // A human can cancel too.
+        let tid2 = h.task().await;
+        let rid2 = h.dispatch(tid2, Some("sleep")).await["run_id"].as_str().unwrap().to_string();
+        let c = h.ok(&human(), "dispatch_cancel", json!({ "run_id": rid2 })).await;
+        assert_eq!(c["cessation"], "confirmed", "{c}");
+        assert_eq!(c["cancelled_by"], "operator");
+        h.wait_for(&rid2, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
+    #[tokio::test]
+    async fn run_logs_are_private_and_a_missing_program_is_a_config_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = H::with(|c| {
+            c.harnesses.insert("missing".into(), harness(&["/nonexistent/agent-cli", "{prompt}"], 5));
+        });
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, Some("echo")).await["run_id"].as_str().unwrap().to_string();
+        let r = h.wait_for(&rid, |r| r["terminal"] == true).await;
+        let log = std::path::PathBuf::from(r["log_path"].as_str().unwrap());
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(mode(log.parent().unwrap()), 0o700);
+
+        let tid = h.task().await;
+        let run = h.dispatch(tid, Some("missing")).await;
+        assert_eq!(run["ok"], false, "{run}");
+        assert_eq!(run["reason"], "launch_failed");
+        let rid = run["run_id"].as_str().unwrap();
+        assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid}'")), "failed");
+        assert_eq!(
+            h.scalar(&format!("SELECT failure_class FROM dispatch_runs WHERE run_id = '{rid}'")),
+            "config"
+        );
+    }
+
+    /// A restarted hub finds a run whose child is still running: it proves
+    /// the pid is its orphan (start time and group match, the supervisor no
+    /// longer holds it), kills the group and hands the run back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_restart_sweep_kills_a_proven_orphan() {
+        let h = H::new();
+        let tid = h.task().await;
+        let run = h.dispatch(tid, Some("sleep")).await;
+        assert_eq!(run["state"], "running", "{run}");
+        let rid = run["run_id"].as_str().unwrap().to_string();
+        let pid = run["pid"].as_i64().unwrap();
+        assert_eq!(h.scalar(&format!("SELECT pgid FROM dispatch_runs WHERE run_id = '{rid}'")), json!(pid));
+        assert!(
+            h.scalar(&format!("SELECT pid_start_time FROM dispatch_runs WHERE run_id = '{rid}'")).is_i64()
+        );
+
+        // The restart: this process no longer supervises the child, and the
+        // lease ran out while nobody renewed it.
+        executor::forget_supervision(&rid);
+        assert!(!executor::supervises(&rid, 1));
+        h.sql(&format!(
+            "UPDATE dispatch_runs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE run_id = '{rid}'"
+        ));
+        let swept = reap_expired_leases(&h.hub).unwrap();
+        assert_eq!(swept["reclaimed"][0]["run_id"], json!(rid), "{swept}");
+        assert_eq!(swept["reclaimed"][0]["termination"], "killed_orphan");
+        assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid}'")), "retryable");
+        assert_eq!(
+            h.scalar(&format!("SELECT failure_reason FROM dispatch_runs WHERE run_id = '{rid}'")),
+            "lease_expired_orphan_killed"
+        );
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = executor::proc_identity(pid).is_some_and(|p| p.state != 'Z');
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "the orphan {pid} survived the sweep");
+
+        // Cessation is proven, so the run can be resumed.
+        let resumed = h.gated(&agent("agent-1"), "dispatch_resume", json!({ "run_id": rid })).await.unwrap();
+        assert_eq!(resumed["fence"], 2, "{resumed}");
+        let c = h.ok(&agent("agent-1"), "dispatch_cancel", json!({ "run_id": rid })).await;
+        assert_eq!(c["cessation"], "confirmed");
+        h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
+    /// A pid whose start time does not match the record was reused: the
+    /// recorded child is gone, and nothing is signalled.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reused_pid_is_gone_not_ours() {
+        let h = H::new();
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, None).await["run_id"].as_str().unwrap().to_string();
+        let me = std::process::id();
+        h.sql(&format!(
+            "UPDATE dispatch_runs SET pid = {me}, pgid = {me}, pid_start_time = 1, supervisor_pid = 1, \
+             supervisor_start_time = 1 WHERE run_id = '{rid}'"
+        ));
+        let c = h.ok(&agent("agent-1"), "dispatch_cancel", json!({ "run_id": rid })).await;
+        assert_eq!(c["termination"], "already_gone", "{c}");
+        assert_eq!(c["cessation"], "confirmed");
     }
 }

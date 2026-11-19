@@ -174,9 +174,10 @@ pub struct Config {
     pub harnesses: BTreeMap<String, HarnessConfig>,
     /// Seconds a dispatch run's lease lasts; a live supervisor renews it.
     pub dispatch_lease_seconds: u64,
-    /// Seconds between lease-reaper sweeps under `ua serve`; 0 (default) keeps
-    /// the background loop off.
-    pub dispatch_reaper_interval_s: u64,
+    /// Seconds between lease-reaper sweeps under `ua serve`. Unset, a third of
+    /// `dispatch_lease_seconds`; 0 turns the background loop off (the one
+    /// sweep at startup still runs).
+    pub dispatch_reaper_interval_s: Option<u64>,
 }
 
 /// One agent harness: a CLI coding agent dispatch runs as a child process.
@@ -277,7 +278,7 @@ impl Default for Config {
             notify_max_attempts: 3,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
-            dispatch_reaper_interval_s: 0,
+            dispatch_reaper_interval_s: None,
         }
     }
 }
@@ -344,6 +345,12 @@ impl Config {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
         }
         self
+    }
+
+    /// Seconds between lease-reaper sweeps; 0 means off. See
+    /// `dispatch_reaper_interval_s`.
+    pub fn dispatch_reaper_interval(&self) -> u64 {
+        self.dispatch_reaper_interval_s.unwrap_or_else(|| (self.dispatch_lease_seconds / 3).max(1))
     }
 
     /// Give every OAuth identity without an explicit `profiles` entry the
@@ -538,6 +545,9 @@ mod tests {
         assert_eq!(h.timeout_s, 5);
         assert_eq!(h.output_cap_bytes, 1024 * 1024, "unset fields keep their defaults");
         assert_eq!(cfg.dispatch_lease_seconds, 60);
-        assert_eq!(cfg.dispatch_reaper_interval_s, 0, "the reaper loop is off by default");
+        assert_eq!(cfg.dispatch_reaper_interval(), 20, "the reaper runs every third of a lease by default");
+        let off = dir.path().join("off.toml");
+        std::fs::write(&off, "dispatch_reaper_interval_s = 0\n").unwrap();
+        assert_eq!(Config::load_inner(Some(&off), false).unwrap().dispatch_reaper_interval(), 0);
     }
 }
