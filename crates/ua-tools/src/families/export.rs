@@ -97,7 +97,8 @@ async fn deliver(
     let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
     let path = blocking(move || {
         let dir = ua_core::safety::resolve_in_root(EXPORT_DIR, std::slice::from_ref(&root), true)?;
-        std::fs::create_dir_all(&dir).map_err(|e| UaError::internal(format!("cannot create {EXPORT_DIR}/: {e}")))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| UaError::internal(format!("cannot create {EXPORT_DIR}/: {e}")))?;
         let file = create_exclusive(&dir, &format!("{name}-{stamp}"), ext, content.as_bytes())?;
         Ok(file.strip_prefix(&root).unwrap_or(&file).to_string_lossy().into_owned())
     })
@@ -108,8 +109,11 @@ async fn deliver(
         .write_async(move |tx| {
             ledger::append(
                 tx,
-                EventInput::new("agent.export.written", json!({ "kind": name, "path": rel, "rows": rows, "bytes": bytes }))
-                    .by(by),
+                EventInput::new(
+                    "agent.export.written",
+                    json!({ "kind": name, "path": rel, "rows": rows, "bytes": bytes }),
+                )
+                .by(by),
             )?;
             Ok(())
         })
@@ -151,7 +155,11 @@ fn md_cell(v: &Value) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
-fn task_rows(c: &Connection, status: Option<&str>, project: Option<&str>) -> UaResult<Vec<Map<String, Value>>> {
+fn task_rows(
+    c: &Connection,
+    status: Option<&str>,
+    project: Option<&str>,
+) -> UaResult<Vec<Map<String, Value>>> {
     let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", TASK_COLUMNS.join(", "));
     let mut args: Vec<SqlValue> = Vec::new();
     if let Some(s) = status {
@@ -173,7 +181,8 @@ async fn export_tasks(ctx: ToolCtx, a: TasksArgs) -> UaResult<Value> {
     if !["csv", "json", "markdown"].contains(&format.as_str()) {
         return Err(UaError::invalid(format!("format must be one of csv, json, markdown, got {format:?}")));
     }
-    let status = a.status.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "all").map(str::to_string);
+    let status =
+        a.status.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "all").map(str::to_string);
     if let Some(s) = &status
         && !TASK_STATUSES.contains(&s.as_str())
     {
@@ -229,7 +238,9 @@ pub struct MemoryArgs {
 }
 
 fn json_list(raw: Option<&str>) -> Value {
-    raw.and_then(|s| serde_json::from_str::<Value>(s).ok()).filter(Value::is_array).unwrap_or_else(|| json!([]))
+    raw.and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(Value::is_array)
+        .unwrap_or_else(|| json!([]))
 }
 
 fn is_index_id(id: &str) -> bool {
@@ -290,9 +301,11 @@ async fn export_memory(ctx: ToolCtx, a: MemoryArgs) -> UaResult<Value> {
     if format != "jsonl" && format != "json" {
         return Err(UaError::invalid(format!("format must be one of jsonl, json, got {format:?}")));
     }
-    let since_day = a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
+    let since_day =
+        a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
     let tag = a.tag.clone();
-    let records = ctx.hub.db().read_async(move |c| memory_records(c, tag.as_deref(), since_day.as_deref())).await?;
+    let records =
+        ctx.hub.db().read_async(move |c| memory_records(c, tag.as_deref(), since_day.as_deref())).await?;
     let n = records.len();
     let (content, ext) = if format == "jsonl" {
         let mut out = String::new();
@@ -355,7 +368,13 @@ fn daily_date(name: &str) -> Option<&str> {
     (stem.len() == 10 && stem.parse::<jiff::civil::Date>().is_ok()).then_some(stem)
 }
 
-fn journal_entries_in(dir: &Path, machine: &str, agent: Option<&str>, since: Option<&str>, out: &mut Vec<Value>) {
+fn journal_entries_in(
+    dir: &Path,
+    machine: &str,
+    agent: Option<&str>,
+    since: Option<&str>,
+    out: &mut Vec<Value>,
+) {
     let Ok(read) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<PathBuf> = read
         .filter_map(Result::ok)
@@ -364,7 +383,8 @@ fn journal_entries_in(dir: &Path, machine: &str, agent: Option<&str>, since: Opt
         .collect();
     files.sort();
     for f in files {
-        let Some(date) = f.file_name().and_then(|n| n.to_str()).and_then(daily_date).map(str::to_string) else {
+        let Some(date) = f.file_name().and_then(|n| n.to_str()).and_then(daily_date).map(str::to_string)
+        else {
             continue;
         };
         if since.is_some_and(|s| date.as_str() < s) {
@@ -389,7 +409,8 @@ async fn export_journal(ctx: ToolCtx, a: JournalArgs) -> UaResult<Value> {
     let Some(vault) = ctx.hub.cfg().vault_path.clone() else {
         return Err(UaError::invalid("no vault is configured (UA_VAULT_PATH)"));
     };
-    let since = a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
+    let since =
+        a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
     let agent = a.agent.clone();
     let entries = blocking(move || {
         let logs = vault.join("Logs");
@@ -410,7 +431,11 @@ async fn export_journal(ctx: ToolCtx, a: JournalArgs) -> UaResult<Value> {
         }
         out.sort_by(|x, y| {
             let key = |v: &Value| {
-                (v["date"].as_str().unwrap_or("").to_string(), v["time"].as_str().unwrap_or("").to_string(), v["machine"].as_str().unwrap_or("").to_string())
+                (
+                    v["date"].as_str().unwrap_or("").to_string(),
+                    v["time"].as_str().unwrap_or("").to_string(),
+                    v["machine"].as_str().unwrap_or("").to_string(),
+                )
             };
             key(x).cmp(&key(y))
         });
@@ -445,9 +470,9 @@ async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
         "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", &action, a.params)?).await,
         "memory" | "export_memory" => export_memory(ctx, parse_params("export", &action, a.params)?).await,
         "journal" | "export_journal" => export_journal(ctx, parse_params("export", &action, a.params)?).await,
-        "manifest" | "compare" | "import" | "rollback" => {
-            Err(UaError::invalid(format!("export action {action:?} (migration manifests) is not available in this build")))
-        }
+        "manifest" | "compare" | "import" | "rollback" => Err(UaError::invalid(format!(
+            "export action {action:?} (migration manifests) is not available in this build"
+        ))),
         _ => Err(UaError::invalid("action must be one of tasks, memory, journal")),
     }
 }

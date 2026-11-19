@@ -196,12 +196,7 @@ fn grouped(c: &Connection, sql: &str, ids: &[i64]) -> UaResult<BTreeMap<i64, Vec
     Ok(out)
 }
 
-fn tool_call_window(
-    c: &Connection,
-    callers: &BTreeSet<String>,
-    since: &str,
-    until: &str,
-) -> UaResult<Value> {
+fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, until: &str) -> UaResult<Value> {
     if callers.is_empty() {
         return Ok(json!({
             "attribution": "caller_and_window",
@@ -239,7 +234,12 @@ fn tool_call_window(
     }))
 }
 
-fn build_report(c: &Connection, a: &ReportArgs, caller_label: &str, verified_caller: bool) -> UaResult<Value> {
+fn build_report(
+    c: &Connection,
+    a: &ReportArgs,
+    caller_label: &str,
+    verified_caller: bool,
+) -> UaResult<Value> {
     let since = a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?;
     let until = a.until.as_deref().map(|s| normalize_until("until", s)).transpose()?;
     if let Some(item) = &a.item
@@ -364,7 +364,8 @@ fn build_report(c: &Connection, a: &ReportArgs, caller_label: &str, verified_cal
     for task in &tasks {
         let id = task.get("id").and_then(Value::as_i64).unwrap_or_default();
         let s = |k: &str| task.get(k).and_then(Value::as_str).map(str::to_string);
-        let evs: Vec<Value> = events.get(&id).cloned().unwrap_or_default().into_iter().map(Value::Object).collect();
+        let evs: Vec<Value> =
+            events.get(&id).cloned().unwrap_or_default().into_iter().map(Value::Object).collect();
         let apps = approvals.get(&id).cloned().unwrap_or_default();
         let dels = delegations.get(&id).cloned().unwrap_or_default();
 
@@ -377,7 +378,8 @@ fn build_report(c: &Connection, a: &ReportArgs, caller_label: &str, verified_cal
             .iter()
             .find(|e| e["channel"] == "agent.task.created")
             .and_then(|e| e["originator"].as_str().map(str::to_string));
-        let agent = s("claimed_by").or(claim_originator).or(creator).unwrap_or_else(|| UNATTRIBUTED.to_string());
+        let agent =
+            s("claimed_by").or(claim_originator).or(creator).unwrap_or_else(|| UNATTRIBUTED.to_string());
 
         let mut participants: BTreeSet<String> =
             evs.iter().filter_map(|e| e["originator"].as_str().map(str::to_string)).collect();
@@ -427,10 +429,8 @@ fn build_report(c: &Connection, a: &ReportArgs, caller_label: &str, verified_cal
     }
 
     let project_chain = a.project_id.map(|pid| {
-        let done: Vec<&Value> = records
-            .iter()
-            .filter(|r| r["task_id"] != pid && r["action"]["status"] == "done")
-            .collect();
+        let done: Vec<&Value> =
+            records.iter().filter(|r| r["task_id"] != pid && r["action"]["status"] == "done").collect();
         let evidence: Vec<Value> = done
             .iter()
             .filter(|r| {
@@ -527,7 +527,8 @@ struct FtsIndex {
 }
 
 fn fts_indexes(c: &Connection) -> UaResult<Vec<FtsIndex>> {
-    let mut stmt = c.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql LIKE '%USING fts5%'")?;
+    let mut stmt =
+        c.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql LIKE '%USING fts5%'")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {
@@ -620,7 +621,10 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
                 for n in &names {
                     tx.execute(&format!("INSERT INTO \"{n}\"(\"{n}\") VALUES ('rebuild')"), [])?;
                 }
-                ledger::append(tx, EventInput::new("agent.state.resynced", json!({ "fts_indexes": names })).by(by))?;
+                ledger::append(
+                    tx,
+                    EventInput::new("agent.state.resynced", json!({ "fts_indexes": names })).by(by),
+                )?;
                 Ok(())
             })
             .await?;

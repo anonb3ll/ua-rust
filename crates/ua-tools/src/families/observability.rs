@@ -91,8 +91,17 @@ pub(crate) fn channel_kind(channel: &str) -> String {
 
 /// The object a ledger payload is about, as text.
 pub(crate) fn payload_ref(payload: &Value) -> Option<String> {
-    const KEYS: [&str; 9] =
-        ["task_id", "id", "note_id", "plan_id", "session_id", "delegation_id", "goal_id", "approval_id", "outbox_id"];
+    const KEYS: [&str; 9] = [
+        "task_id",
+        "id",
+        "note_id",
+        "plan_id",
+        "session_id",
+        "delegation_id",
+        "goal_id",
+        "approval_id",
+        "outbox_id",
+    ];
     KEYS.iter().find_map(|k| match payload.get(*k)? {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
@@ -149,7 +158,8 @@ pub struct ActivityArgs {
 }
 
 fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
-    let mut sql = String::from("SELECT seq, originator, created_at, channel, payload FROM event_log WHERE 1=1");
+    let mut sql =
+        String::from("SELECT seq, originator, created_at, channel, payload FROM event_log WHERE 1=1");
     let mut args: Vec<String> = Vec::new();
     if let Some(agent) = a.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         sql.push_str(" AND originator = ?");
@@ -230,8 +240,9 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
     }
     let mut cycle: Vec<f64> = Vec::new();
     {
-        let mut stmt = c
-            .prepare("SELECT created_at, completed_at FROM tasks WHERE status = 'done' AND completed_at IS NOT NULL")?;
+        let mut stmt = c.prepare(
+            "SELECT created_at, completed_at FROM tasks WHERE status = 'done' AND completed_at IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (created, completed) = row?;
@@ -295,7 +306,11 @@ impl Bucket {
         self.durations.sort_unstable();
         let d = &self.durations;
         let calls = d.len() as i64;
-        let avg = if d.is_empty() { Value::Null } else { json!(round(d.iter().sum::<i64>() as f64 / d.len() as f64, 3)) };
+        let avg = if d.is_empty() {
+            Value::Null
+        } else {
+            json!(round(d.iter().sum::<i64>() as f64 / d.len() as f64, 3))
+        };
         let mut out = json!({
             "calls": calls,
             "errors": self.errors,
@@ -387,7 +402,12 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
              WHERE status = 'doing' AND archived_at IS NULL AND updated_at < ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([&cutoff], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
         })?;
         for row in rows {
             let (id, title, updated, holder) = row?;
@@ -429,8 +449,9 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
         let mut stmt = c.prepare(
             "SELECT payload, COALESCE(originator, ''), created_at FROM event_log WHERE channel = 'agent.task.claimed'",
         )?;
-        let rows =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
         for row in rows {
             let (payload, originator, at) = row?;
             let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
@@ -458,7 +479,8 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
             }
         }
         for (task, (n, agents_seen)) in per_task {
-            let threshold = if agents_seen.len() >= 2 { REASSIGN_MIN_CLAIMS } else { REASSIGN_MIN_CLAIMS * 2 };
+            let threshold =
+                if agents_seen.len() >= 2 { REASSIGN_MIN_CLAIMS } else { REASSIGN_MIN_CLAIMS * 2 };
             if n < threshold {
                 continue;
             }
@@ -790,7 +812,9 @@ fn bind_check(cfg: &Config) -> Value {
     let loopback = cfg.bind.ip().is_loopback();
     let (status, detail) = match (loopback, cfg.enforce_auth) {
         (true, _) => (LIVE, format!("listening on loopback port {}", cfg.bind.port())),
-        (false, true) => (LIVE, format!("listening beyond loopback on port {} with auth enforced", cfg.bind.port())),
+        (false, true) => {
+            (LIVE, format!("listening beyond loopback on port {} with auth enforced", cfg.bind.port()))
+        }
         (false, false) => (
             MISCONFIGURED,
             format!("listening beyond loopback on port {} without enforced auth", cfg.bind.port()),
@@ -828,7 +852,12 @@ fn vault_check(cfg: &Config) -> Value {
         return finding("vault", DORMANT, "no vault path is configured", gate);
     };
     if !vault.is_dir() {
-        return finding("vault", MISCONFIGURED, "the configured vault path is not a directory on this host", gate);
+        return finding(
+            "vault",
+            MISCONFIGURED,
+            "the configured vault path is not a directory on this host",
+            gate,
+        );
     }
     let mut missing = Vec::new();
     let mut readonly = Vec::new();
@@ -846,7 +875,12 @@ fn vault_check(cfg: &Config) -> Value {
     } else if n == 0 {
         finding("vault", DEGRADED, "vault is readable; no write directories are configured", gate)
     } else if !missing.is_empty() {
-        finding("vault", DEGRADED, format!("write dirs missing (created on first write): {}", missing.join(", ")), gate)
+        finding(
+            "vault",
+            DEGRADED,
+            format!("write dirs missing (created on first write): {}", missing.join(", ")),
+            gate,
+        )
     } else {
         finding("vault", LIVE, format!("vault readable; {n} write dir(s) present and writable"), gate)
     }
@@ -925,7 +959,12 @@ fn embeddings_check(facts: &DbFacts) -> Value {
     if facts.notes == 0 {
         finding("semantic_search", DORMANT, "no memory notes to embed yet", gate)
     } else if missing > 0 {
-        finding("semantic_search", MISCONFIGURED, format!("{missing} of {} notes have no embedding", facts.notes), gate)
+        finding(
+            "semantic_search",
+            MISCONFIGURED,
+            format!("{missing} of {} notes have no embedding", facts.notes),
+            gate,
+        )
     } else {
         finding(
             "semantic_search",
@@ -1015,7 +1054,12 @@ fn schema_check(facts: &DbFacts) -> Value {
     if !missing.is_empty() {
         finding("schema", MISCONFIGURED, format!("schema parts not applied: {}", missing.join(", ")), gate)
     } else if !drifted.is_empty() {
-        finding("schema", DEGRADED, format!("applied parts differ from this build: {}", drifted.join(", ")), gate)
+        finding(
+            "schema",
+            DEGRADED,
+            format!("applied parts differ from this build: {}", drifted.join(", ")),
+            gate,
+        )
     } else {
         let note = if extra > 0 { format!("; {extra} part(s) from another build") } else { String::new() };
         finding("schema", LIVE, format!("all {} schema parts applied{note}", expected.len()), gate)
@@ -1025,7 +1069,12 @@ fn schema_check(facts: &DbFacts) -> Value {
 fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
     let gate = "UA_NOTIFY_WEBHOOK_URL, UA_NOTIFY_WEBHOOK_SECRET";
     let Some(raw) = cfg.notify_webhook_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-        return finding("notify_webhook", DORMANT, "no webhook URL is configured; notifications stay in the outbox", gate);
+        return finding(
+            "notify_webhook",
+            DORMANT,
+            "no webhook URL is configured; notifications stay in the outbox",
+            gate,
+        );
     };
     // Webhook URLs often embed a credential in their path: report only scheme and host.
     let Ok(url) = reqwest::Url::parse(raw) else {
@@ -1038,7 +1087,9 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
     match url.scheme() {
         "https" => {}
         "http" if loopback => {}
-        "http" => return finding("notify_webhook", DEGRADED, format!("{base}; plain http to a remote host"), gate),
+        "http" => {
+            return finding("notify_webhook", DEGRADED, format!("{base}; plain http to a remote host"), gate);
+        }
         _ => return finding("notify_webhook", MISCONFIGURED, "the webhook URL must be http or https", gate),
     }
     match &facts.last_delivery {
@@ -1089,8 +1140,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         policy_check(cfg),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
-    let mut summary: BTreeMap<String, i64> =
-        ["live", "dormant", "degraded", "misconfigured", "unknown"].iter().map(|k| (k.to_string(), 0)).collect();
+    let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]
+        .iter()
+        .map(|k| (k.to_string(), 0))
+        .collect();
     for c in &checks {
         if let Some(s) = c["status"].as_str() {
             *summary.entry(s.to_ascii_lowercase()).or_default() += 1;
@@ -1138,8 +1191,10 @@ pub(crate) fn schema_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::Tool
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
-            let all: BTreeSet<String> =
-                t.input_schema["properties"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            let all: BTreeSet<String> = t.input_schema["properties"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
             let optional: Vec<&String> = all.difference(&required).collect();
             let required: Vec<&String> = required.iter().collect();
             format!(
@@ -1164,7 +1219,7 @@ pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::To
         h.update(name.as_bytes());
         h.update([0u8]);
         h.update(schema.as_bytes());
-        h.update([b'\n']);
+        h.update(*b"\n");
     }
     hex::encode(h.finalize())
 }
@@ -1184,7 +1239,8 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
             "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 \
              GROUP BY transport ORDER BY transport",
         )?;
-        let rows = stmt.query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let rows = stmt
+            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
         for row in rows {
             let (t, n, e) = row?;
             by_transport.insert(t, json!({ "calls": n, "errors": e }));
@@ -1196,7 +1252,8 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
             "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 \
              GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20",
         )?;
-        let rows = stmt.query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let rows = stmt
+            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
         for row in rows {
             let (t, n, e) = row?;
             top.push(json!({ "tool": t, "calls": n, "errors": e }));
@@ -1220,7 +1277,8 @@ async fn mcp_health_telemetry(ctx: ToolCtx, _a: NoArgs) -> UaResult<Value> {
     let semantic = semantic_fingerprint(callable());
     let calls_24 = calls["last_24h"]["calls"].as_i64().unwrap_or(0);
     let rate_24 = calls["last_24h"]["error_rate"].as_f64().unwrap_or(0.0);
-    let status = if calls_24 >= TOOL_ERROR_MIN_CALLS && rate_24 >= TOOL_ERROR_RATE { "degraded" } else { "healthy" };
+    let status =
+        if calls_24 >= TOOL_ERROR_MIN_CALLS && rate_24 >= TOOL_ERROR_RATE { "degraded" } else { "healthy" };
     Ok(json!({
         "status": status,
         "server": { "name": "ua-rust", "version": env!("CARGO_PKG_VERSION") },

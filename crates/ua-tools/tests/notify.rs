@@ -96,7 +96,11 @@ async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) 
 }
 
 fn outbox_message(hub: &Hub, id: i64) -> Option<String> {
-    hub.db().read(move |c| Ok(c.query_row("SELECT message FROM notify_outbox WHERE id = ?1", [id], |r| r.get(0))?)).unwrap()
+    hub.db()
+        .read(
+            move |c| Ok(c.query_row("SELECT message FROM notify_outbox WHERE id = ?1", [id], |r| r.get(0))?),
+        )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -127,7 +131,8 @@ async fn unconfigured_notifications_stay_in_the_outbox() {
     let res = call(&reg, &hub, &who, "notify", json!({ "message": long })).await;
     assert_eq!(res["chars"].as_u64().unwrap(), 8000 + "\n…(truncated)".chars().count() as u64);
 
-    let events = call(&reg, &hub, &who, "event_log_query", json!({ "channels": ["agent.notify.queued"] })).await;
+    let events =
+        call(&reg, &hub, &who, "event_log_query", json!({ "channels": ["agent.notify.queued"] })).await;
     assert_eq!(events["count"], 2);
     assert!(!events.to_string().contains("build is green"));
 }
@@ -161,9 +166,14 @@ async fn webhook_delivery_retries_server_errors() {
     assert_eq!(status["success_count"], 1);
     assert_eq!(status["deliveries"][0]["attempts"], 2);
     let text = status.to_string();
-    assert!(!text.contains("deploy finished") && !text.contains("path-secret") && !text.contains("test-webhook-secret"));
+    assert!(
+        !text.contains("deploy finished")
+            && !text.contains("path-secret")
+            && !text.contains("test-webhook-secret")
+    );
 
-    let delivered = call(&reg, &hub, &who, "event_log_query", json!({ "channels": ["agent.notify.delivered"] })).await;
+    let delivered =
+        call(&reg, &hub, &who, "event_log_query", json!({ "channels": ["agent.notify.delivered"] })).await;
     assert_eq!(delivered["count"], 1);
 }
 
@@ -233,14 +243,8 @@ async fn digests_batch_and_flush() {
     assert_eq!(empty["flushed_count"], 0);
 
     // Reaching max_batch_size flushes on its own.
-    let auto = call(
-        &reg,
-        &hub,
-        &dev,
-        "batch_notify",
-        json!({ "messages": ["a", "b"], "max_batch_size": 2 }),
-    )
-    .await;
+    let auto =
+        call(&reg, &hub, &dev, "batch_notify", json!({ "messages": ["a", "b"], "max_batch_size": 2 })).await;
     assert_eq!(auto["flushed"], true);
     assert_eq!(auto["total_pending"], 0);
     assert_eq!(auto["delivery_result"]["flushed_count"], 2);

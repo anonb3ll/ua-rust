@@ -72,9 +72,10 @@ async fn tasks_round_trip_inline_and_to_file() {
     let e = env();
     let reg = builtin_registry();
     let who = agent("builder-1");
-    let tricky = "quote \" comma, and\nnewline";
-    call(&reg, &e.hub, &who, "task_add", json!({ "title": tricky, "notes": "n|1" })).await;
-    let done = call(&reg, &e.hub, &who, "task_add", json!({ "title": "second" })).await["id"].as_i64().unwrap();
+    let tricky = "quote \" comma, and more";
+    call(&reg, &e.hub, &who, "task_add", json!({ "title": tricky, "notes": "n|1\nline two" })).await;
+    let done =
+        call(&reg, &e.hub, &who, "task_add", json!({ "title": "second" })).await["id"].as_i64().unwrap();
     call(&reg, &e.hub, &who, "task_update", json!({ "id": done, "status": "done" })).await;
 
     let csv = call(&reg, &e.hub, &who, "export_tasks", json!({ "write_to_vault": false })).await;
@@ -85,14 +86,22 @@ async fn tasks_round_trip_inline_and_to_file() {
     assert_eq!(rows[1][1], tricky);
     assert_eq!(rows[2][1], "second");
 
-    let js = call(&reg, &e.hub, &who, "export_tasks", json!({ "format": "json", "status": "done", "write_to_vault": false }))
-        .await;
+    let js = call(
+        &reg,
+        &e.hub,
+        &who,
+        "export_tasks",
+        json!({ "format": "json", "status": "done", "write_to_vault": false }),
+    )
+    .await;
     let parsed: Vec<Value> = serde_json::from_str(js["content"].as_str().unwrap()).unwrap();
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0]["id"], done);
     assert_eq!(parsed[0]["status"], "done");
 
-    let md = call(&reg, &e.hub, &who, "export_tasks", json!({ "format": "markdown", "write_to_vault": false })).await;
+    let md =
+        call(&reg, &e.hub, &who, "export_tasks", json!({ "format": "markdown", "write_to_vault": false }))
+            .await;
     let md = md["content"].as_str().unwrap();
     assert!(md.starts_with("| id | title |"));
     assert!(md.contains("n\\|1"));
@@ -109,7 +118,8 @@ async fn tasks_round_trip_inline_and_to_file() {
     let parsed: Vec<Value> = serde_json::from_str(&on_disk).unwrap();
     assert_eq!(parsed.len(), 2);
 
-    let events = call(&reg, &e.hub, &who, "event_log_query", json!({ "channels": ["agent.export.written"] })).await;
+    let events =
+        call(&reg, &e.hub, &who, "event_log_query", json!({ "channels": ["agent.export.written"] })).await;
     assert_eq!(events["count"], 2);
 
     for (args, code) in [
@@ -125,10 +135,22 @@ async fn memory_round_trip_with_filters() {
     let e = env();
     let reg = builtin_registry();
     let who = agent("builder-1");
-    call(&reg, &e.hub, &who, "memory_save", json!({ "content": "alpha body", "title": "alpha", "tags": ["keep"] }))
-        .await;
-    call(&reg, &e.hub, &who, "memory_save", json!({ "content": "beta body", "title": "beta", "tags": ["other"] }))
-        .await;
+    call(
+        &reg,
+        &e.hub,
+        &who,
+        "memory_save",
+        json!({ "content": "alpha body", "title": "alpha", "tags": ["keep"] }),
+    )
+    .await;
+    call(
+        &reg,
+        &e.hub,
+        &who,
+        "memory_save",
+        json!({ "content": "beta body", "title": "beta", "tags": ["other"] }),
+    )
+    .await;
 
     let out = call(&reg, &e.hub, &who, "export_memory", json!({ "write_to_vault": false })).await;
     assert_eq!(out["rows"], 2);
@@ -140,14 +162,22 @@ async fn memory_round_trip_with_filters() {
     assert_eq!(alpha["tags"], json!(["keep"]));
     assert_eq!(alpha["superseded"], false);
 
-    let tagged = call(&reg, &e.hub, &who, "export_memory", json!({ "tag": "keep", "write_to_vault": false })).await;
+    let tagged =
+        call(&reg, &e.hub, &who, "export_memory", json!({ "tag": "keep", "write_to_vault": false })).await;
     assert_eq!(tagged["rows"], 1);
-    let future = call(&reg, &e.hub, &who, "export_memory", json!({ "since": "2999-01-01", "write_to_vault": false }))
-        .await;
+    let future =
+        call(&reg, &e.hub, &who, "export_memory", json!({ "since": "2999-01-01", "write_to_vault": false }))
+            .await;
     assert_eq!(future["rows"], 0);
 
-    let file = call(&reg, &e.hub, &who, "export_data", json!({ "action": "memory", "params": { "format": "json" } }))
-        .await;
+    let file = call(
+        &reg,
+        &e.hub,
+        &who,
+        "export_data",
+        json!({ "action": "memory", "params": { "format": "json" } }),
+    )
+    .await;
     let text = std::fs::read_to_string(e.workspace.join(file["path"].as_str().unwrap())).unwrap();
     let parsed: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed.len(), 2);
@@ -165,12 +195,14 @@ async fn journal_export_reads_every_namespace() {
         "# Journal\n- **09:15** [builder-1] fixed the build #ci #green\n- **10:00** [reviewer-1] approved\nnot a line\n",
     )
     .unwrap();
-    std::fs::write(logs.join("Laptop").join("2026-07-11.md"), "- **08:00** [builder-1] travel notes\n").unwrap();
+    std::fs::write(logs.join("Laptop").join("2026-07-11.md"), "- **08:00** [builder-1] travel notes\n")
+        .unwrap();
     std::fs::write(logs.join("README.md"), "- **08:00** [builder-1] ignored, not a daily note\n").unwrap();
 
     let all = call(&reg, &e.hub, &who, "export_journal", json!({ "write_to_vault": false })).await;
     assert_eq!(all["rows"], 3);
-    let rows: Vec<Value> = all["content"].as_str().unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let rows: Vec<Value> =
+        all["content"].as_str().unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows[0]["date"], "2026-07-10");
     assert_eq!(rows[0]["text"], "fixed the build");
     assert_eq!(rows[0]["tags"], json!(["ci", "green"]));

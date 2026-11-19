@@ -51,7 +51,8 @@ fn synthetic_calls(hub: &Hub, caller: &str, n: usize, failed: usize) {
 
 /// A task taken from creation to done with evidence.
 async fn finished_task(reg: &Registry, hub: &Hub, who: &Caller) -> i64 {
-    let id = call(reg, hub, who, "task_add", json!({ "title": "ship the widget" })).await["id"].as_i64().unwrap();
+    let id =
+        call(reg, hub, who, "task_add", json!({ "title": "ship the widget" })).await["id"].as_i64().unwrap();
     call(reg, hub, who, "task_claim", json!({ "id": id, "agent": who.label })).await;
     synthetic_calls(hub, &who.label, 4, 1);
     call(
@@ -91,7 +92,8 @@ async fn report_for_a_finished_task() {
     assert_eq!(rec["task_id"], id);
     assert_eq!(rec["agent"], "builder-1");
     assert_eq!(rec["action"]["status"], "done");
-    let channels: Vec<&str> = rec["events"].as_array().unwrap().iter().map(|e| e["channel"].as_str().unwrap()).collect();
+    let channels: Vec<&str> =
+        rec["events"].as_array().unwrap().iter().map(|e| e["channel"].as_str().unwrap()).collect();
     for ch in ["agent.task.created", "agent.task.claimed", "agent.task.updated", "agent.task.completed"] {
         assert!(channels.contains(&ch), "{ch} missing from {channels:?}");
     }
@@ -109,7 +111,8 @@ async fn report_for_a_finished_task() {
     assert!(calls["total"].as_i64().unwrap() >= 5);
 
     // Filters: agent and pr match, a foreign agent and PR do not.
-    let by_agent = call(&reg, &hub, &who, "evidence_report", json!({ "agent": "builder-1", "pr": "pull/7" })).await;
+    let by_agent =
+        call(&reg, &hub, &who, "evidence_report", json!({ "agent": "builder-1", "pr": "pull/7" })).await;
     assert_eq!(by_agent["total_records"], 1);
     let none = call(&reg, &hub, &who, "evidence_report", json!({ "agent": "builder-2" })).await;
     assert_eq!(none["total_records"], 0);
@@ -131,21 +134,29 @@ async fn project_chain_and_tampered_ledger() {
     let hub = hub();
     let reg = builtin_registry();
     let who = agent("builder-1");
-    let plain = call(&reg, &hub, &who, "task_add", json!({ "title": "no marker" })).await["id"].as_i64().unwrap();
+    let plain =
+        call(&reg, &hub, &who, "task_add", json!({ "title": "no marker" })).await["id"].as_i64().unwrap();
     let err = reg.call(&hub, &who, "evidence_report", json!({ "project_id": plain })).await.unwrap_err();
     assert_eq!(err.code(), "invalid_argument");
     let err = reg.call(&hub, &who, "evidence_report", json!({ "project_id": 9999 })).await.unwrap_err();
     assert_eq!(err.code(), "not_found");
 
-    let root = call(&reg, &hub, &who, "task_add", json!({ "title": "project", "notes": "[project-spec] build it" }))
-        .await["id"]
-        .as_i64()
-        .unwrap();
+    let root =
+        call(&reg, &hub, &who, "task_add", json!({ "title": "project", "notes": "[project-spec] build it" }))
+            .await["id"]
+            .as_i64()
+            .unwrap();
     let child = call(&reg, &hub, &who, "task_add", json!({ "title": "step", "parent_id": root })).await["id"]
         .as_i64()
         .unwrap();
-    call(&reg, &hub, &who, "task_update", json!({ "id": child, "status": "done", "evidence_ref": "deadbeef1" }))
-        .await;
+    call(
+        &reg,
+        &hub,
+        &who,
+        "task_update",
+        json!({ "id": child, "status": "done", "evidence_ref": "deadbeef1" }),
+    )
+    .await;
     let report = call(&reg, &hub, &who, "evidence_report", json!({ "project_id": root })).await;
     let chain = &report["project_chain"];
     assert_eq!(chain["project_id"], root);
@@ -196,7 +207,8 @@ async fn state_sync_verify_detects_and_repairs_drift() {
     assert_eq!(drift["resynced"], true);
     assert_eq!(drift["drift_details"]["fts_drift"], json!(["task_fts"]));
     assert_eq!(drift["checks"]["dangling_references"]["by_reference"]["memory.superseded_by->memory"], 1);
-    let task_fts = drift["checks"]["fts"].as_array().unwrap().iter().find(|f| f["index"] == "task_fts").unwrap();
+    let task_fts =
+        drift["checks"]["fts"].as_array().unwrap().iter().find(|f| f["index"] == "task_fts").unwrap();
     assert_eq!(task_fts["missing_from_index"], 1);
 
     // The index was rebuilt; only the dangling reference remains.

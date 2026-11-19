@@ -74,7 +74,8 @@ async fn doctor_reports_every_capability_without_secrets() {
     for c in checks {
         assert!(c["detail"].is_string() && c["gate"].is_string(), "{c}");
         assert!(
-            ["LIVE", "DORMANT", "DEGRADED", "MISCONFIGURED", "UNKNOWN"].contains(&c["status"].as_str().unwrap()),
+            ["LIVE", "DORMANT", "DEGRADED", "MISCONFIGURED", "UNKNOWN"]
+                .contains(&c["status"].as_str().unwrap()),
             "{c}"
         );
     }
@@ -107,12 +108,10 @@ async fn doctor_flags_a_tampered_ledger() {
     let who = agent("builder-1", Profile::Developer);
     call(&reg, &hub, &who, "task_add", json!({ "title": "one" })).await;
     call(&reg, &hub, &who, "task_add", json!({ "title": "two" })).await;
-    exec(
-        &hub,
-        "DROP TRIGGER event_log_no_update; UPDATE event_log SET payload = '{\"x\":1}' WHERE seq = 1;",
-    );
+    exec(&hub, "DROP TRIGGER event_log_no_update; UPDATE event_log SET payload = '{\"x\":1}' WHERE seq = 1;");
     let report = call(&reg, &hub, &who, "system_doctor", json!({})).await;
-    let row = report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "ledger_chain").unwrap();
+    let row =
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "ledger_chain").unwrap();
     assert_eq!(row["status"], "DEGRADED", "{row}");
 
     let anomalies = call(&reg, &hub, &who, "check_anomalies", json!({})).await;
@@ -203,7 +202,9 @@ async fn activity_metrics_and_task_anomalies() {
     let events = act["events"].as_array().unwrap();
     assert!(!events.is_empty());
     assert!(events.iter().all(|e| e["kind"] == "task"));
-    assert!(events.iter().any(|e| e["ref_id"] == id.to_string() && e["summary"] == "agent.task.created"));
+    assert!(
+        events.iter().any(|e| e["ref_id"] == id.to_string().as_str() && e["summary"] == "agent.task.created")
+    );
     assert_eq!(act["truncated"], false);
 
     let err = reg.call(&hub, &who, "agent_activity", json!({ "since": "last tuesday" })).await.unwrap_err();
@@ -228,12 +229,16 @@ async fn activity_metrics_and_task_anomalies() {
         ),
     );
     let anomalies = call(&reg, &hub, &who, "observability_manage", json!({ "action": "anomalies" })).await;
-    let rules: Vec<&str> = anomalies["anomalies"].as_array().unwrap().iter().map(|a| a["rule"].as_str().unwrap()).collect();
+    let rules: Vec<&str> =
+        anomalies["anomalies"].as_array().unwrap().iter().map(|a| a["rule"].as_str().unwrap()).collect();
     assert!(rules.contains(&"stale_doing_task"), "{rules:?}");
     assert!(rules.contains(&"approval_queue_age"), "{rules:?}");
     assert!(rules.contains(&"unverified_done"), "{rules:?}");
 
-    let bad = reg.call(&hub, &who, "observability_manage", json!({ "action": "runs_in_flight" })).await.unwrap_err();
+    let bad = reg
+        .call(&hub, &who, "observability_manage", json!({ "action": "runs_in_flight" }))
+        .await
+        .unwrap_err();
     assert_eq!(bad.code(), "invalid_argument");
     let bad = reg
         .call(&hub, &who, "observability_manage", json!({ "action": "activity", "params": { "bogus": 1 } }))
@@ -251,7 +256,8 @@ async fn cloud_assistant_reaches_only_its_actions() {
     assert!(list["agents"].is_array());
     let ctx = call(&reg, &hub, &cloud, "observability_manage", json!({ "action": "agent_context" })).await;
     assert!(ctx.is_object());
-    let err = reg.call(&hub, &cloud, "observability_manage", json!({ "action": "metrics" })).await.unwrap_err();
+    let err =
+        reg.call(&hub, &cloud, "observability_manage", json!({ "action": "metrics" })).await.unwrap_err();
     assert_eq!(err.code(), "denied");
     // The legacy standalone tools are not on its surface.
     let err = reg.call(&hub, &cloud, "perf_summary", json!({})).await.unwrap_err();
@@ -277,7 +283,11 @@ async fn schema_fingerprint_and_call_counts() {
     // The first call is now on record.
     assert!(second["calls"]["total_calls"].as_i64().unwrap() >= 1);
     assert!(
-        second["calls"]["top_tools_24h"].as_array().unwrap().iter().any(|t| t["tool"] == "mcp_health_telemetry")
+        second["calls"]["top_tools_24h"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["tool"] == "mcp_health_telemetry")
     );
 
     // A narrower surface has a different callable fingerprint, same registry one.

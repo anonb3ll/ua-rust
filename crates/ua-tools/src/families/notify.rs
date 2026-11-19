@@ -348,7 +348,7 @@ async fn batch_notify(ctx: ToolCtx, a: BatchArgs) -> UaResult<Value> {
         .iter()
         .map(|m| m.trim())
         .filter(|m| !m.is_empty())
-        .map(|m| prepare_message(m))
+        .map(prepare_message)
         .collect::<UaResult<_>>()?;
     if valid.is_empty() {
         return Err(UaError::invalid("all messages in list were empty"));
@@ -380,7 +380,8 @@ async fn batch_notify(ctx: ToolCtx, a: BatchArgs) -> UaResult<Value> {
         })
         .await?;
     let flush = a.flush_now || total >= max_batch;
-    let delivery = if flush { Some(flush_digest(ctx, FlushArgs { category: Some(category) }).await?) } else { None };
+    let delivery =
+        if flush { Some(flush_digest(ctx, FlushArgs { category: Some(category) }).await?) } else { None };
     Ok(json!({
         "queued": queued,
         "total_pending": if flush { 0 } else { total },
@@ -423,7 +424,12 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
                      WHERE ?1 IS NULL OR category = ?1 ORDER BY id",
                 )?;
                 let mapped = stmt.query_map([&cat], |r| {
-                    Ok(PendingRow { id: r.get(0)?, category: r.get(1)?, message: r.get(2)?, agent: r.get(3)? })
+                    Ok(PendingRow {
+                        id: r.get(0)?,
+                        category: r.get(1)?,
+                        message: r.get(2)?,
+                        agent: r.get(3)?,
+                    })
                 })?;
                 mapped.collect::<Result<Vec<_>, _>>()?
             };
@@ -434,7 +440,9 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
         })
         .await?;
     if rows.is_empty() {
-        return Ok(json!({ "flushed_count": 0, "delivered": false, "error": "No pending notifications to flush" }));
+        return Ok(
+            json!({ "flushed_count": 0, "delivered": false, "error": "No pending notifications to flush" }),
+        );
     }
     let mut text = digest_text(&rows);
     if text.chars().count() > MAX_CHARS {
