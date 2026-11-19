@@ -231,18 +231,35 @@ fn revoke_tokens(hub: &TestHub, label: &str) {
         .unwrap();
 }
 
-/// Read an SSE body until it ends; false when it is still open after a
-/// few seconds.
-async fn ends_soon(resp: Response<Body>) -> bool {
+/// Read an SSE body until it ends and return the `auth_revoked` reason it
+/// sent last; `None` when it is still open after a few seconds. Fails when
+/// it ended without a revocation notice, or sent anything after it.
+async fn revoked_soon(resp: Response<Body>) -> Option<String> {
     let mut body = resp.into_body();
+    let mut text = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout_at(deadline, body.frame()).await {
-            Ok(Some(Ok(_))) => continue,
-            Ok(None) | Ok(Some(Err(_))) => return true,
-            Err(_) => return false,
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                }
+            }
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Err(_) => return None,
         }
     }
+    let at =
+        text.rfind("event: auth_revoked\n").unwrap_or_else(|| panic!("no auth_revoked event in {text:?}"));
+    let tail = &text[at..];
+    let data = tail.lines().find_map(|l| l.strip_prefix("data: ")).expect("auth_revoked data");
+    let v: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(v["auth_revoked"], true);
+    assert!(
+        !tail.lines().any(|l| l.starts_with("event: ") && l != "event: auth_revoked"),
+        "events after the revocation: {tail:?}"
+    );
+    Some(v["reason"].as_str().unwrap().to_string())
 }
 
 #[tokio::test]
@@ -270,7 +287,8 @@ async fn revoking_the_token_ends_an_open_stream() {
 
     // Its own revocation ends it, without waiting for the periodic check.
     revoke_tokens(&hub, "agent-c");
-    assert!(ends_soon(Response::new(body)).await, "the stream outlived its token");
+    let reason = revoked_soon(Response::new(body)).await.expect("the stream outlived its token");
+    assert_eq!(reason, "credential_invalid");
     // And a new stream with the revoked token is refused.
     let resp = hub.send(get("/api/events/stream", None, Some(MANAGED))).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -285,7 +303,120 @@ async fn logging_out_ends_an_open_activity_stream() {
     assert_eq!(resp.status(), StatusCode::OK);
     let out = hub.send(common::form("/logout", &[("csrf", &csrf)], Some(&cookie))).await;
     assert!(out.status().is_redirection());
-    assert!(ends_soon(resp).await, "the stream outlived its session");
+    let reason = revoked_soon(resp).await.expect("the stream outlived its session");
+    assert_eq!(reason, "credential_invalid");
+}
+
+/// A private directory under the system temp dir, removed on drop.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!("ua-hardening-{}", ulid::Ulid::generate()));
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A stream for `agent-a` (default profile) under a policy file in `dir`.
+async fn policy_stream(
+    dir: &std::path::Path,
+    initial: &str,
+) -> (TestHub, std::path::PathBuf, Response<Body>) {
+    let path = dir.join("policy.yaml");
+    std::fs::write(&path, initial).unwrap();
+    let mut cfg = stream_config();
+    cfg.policy_file = Some(path.clone());
+    let hub = TestHub::new(cfg);
+    let resp = hub.send(get("/api/events/stream?channel_prefix=test.keep", None, Some(AGENT_A))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    (hub, path, resp)
+}
+
+/// Rewrite the policy file and broadcast the change the way a config
+/// revision does.
+fn change_policy(hub: &TestHub, path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    ua_tools::policy::invalidate(path);
+    append(hub, "agent.config.revision", 0);
+}
+
+#[tokio::test]
+async fn a_profile_overlay_that_narrows_access_ends_the_stream() {
+    let dir = TempDir::new();
+    let (hub, path, resp) = policy_stream(dir.path(), "version: 1\n").await;
+    // `public` does not include event_log_query.
+    std::fs::write(&path, "version: 1\nprofile_defaults:\n  agent-a: public\n").unwrap();
+    ua_tools::policy::invalidate(&path);
+    append(&hub, "agent.profile.changed", 0);
+    assert_eq!(revoked_soon(resp).await.as_deref(), Some("profile_denied"));
+}
+
+#[tokio::test]
+async fn a_policy_rule_that_denies_the_stream_ends_it() {
+    let dir = TempDir::new();
+    let (hub, path, resp) = policy_stream(dir.path(), "version: 1\n").await;
+    let mut body = resp.into_body();
+    // A rule for another agent re-checks the stream but keeps it open.
+    change_policy(
+        &hub,
+        &path,
+        "version: 1\nrules:\n  - name: other\n    type: tool\n    tool: event_log_query\n    action: deny\n    bind:\n      agent: agent-z\n",
+    );
+    let keep = append(&hub, "test.keep", 0);
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !text.contains(&format!("id: {keep}\n")) {
+        let frame = tokio::time::timeout_at(deadline, body.frame()).await.expect("stream stalled");
+        let frame = frame.expect("stream ended on another agent's rule").unwrap();
+        if let Ok(data) = frame.into_data() {
+            text.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+    change_policy(
+        &hub,
+        &path,
+        "version: 1\nrules:\n  - name: no-stream\n    type: tool\n    tool: event_log_query\n    action: deny\n    bind:\n      agent: agent-a\n",
+    );
+    assert_eq!(revoked_soon(Response::new(body)).await.as_deref(), Some("policy_denied"));
+}
+
+#[tokio::test]
+async fn a_policy_that_newly_requires_approval_ends_the_stream() {
+    let dir = TempDir::new();
+    let (hub, path, resp) = policy_stream(dir.path(), "version: 1\n").await;
+    change_policy(
+        &hub,
+        &path,
+        "version: 1\nrules:\n  - name: gated\n    type: tool\n    tool: event_log_query\n    action: require_approval\n",
+    );
+    assert_eq!(revoked_soon(resp).await.as_deref(), Some("approval_required"));
+}
+
+#[tokio::test]
+async fn throttles_do_not_end_an_admitted_stream() {
+    // The stream's own admission is the one call these rules allow, so a
+    // re-check that counted it would end the stream at once.
+    let dir = TempDir::new();
+    let throttled = "version: 1\nrules:\n  - name: spacing\n    type: cooldown\n    tool: event_log_query\n    cooldown_seconds: 600\n  - name: rate\n    type: rate_limit\n    tool: event_log_query\n    max_calls: 1\n    window_seconds: 600\n";
+    let (hub, _path, resp) = policy_stream(dir.path(), throttled).await;
+    append(&hub, "agent.profile.changed", 0);
+    let keep = append(&hub, "test.keep", 1);
+    let text = read_sse(resp, |t| t.contains(&format!("id: {keep}\n"))).await;
+    assert!(text.contains(&format!("id: {keep}\n")), "stream ended: {text:?}");
+    assert!(!text.contains("auth_revoked"));
+    // A second stream is still throttled at open.
+    let again = hub.send(get("/api/events/stream", None, Some(AGENT_A))).await;
+    assert_ne!(again.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------- approvals
