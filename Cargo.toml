@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/anonb3ll/ua-rust"
+
+[workspace.dependencies]
+ua-core = { path = "crates/ua-core" }
+ua-store = { path = "crates/ua-store" }
+ua-tools = { path = "crates/ua-tools" }
+ua-server = { path = "crates/ua-server" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.2"
+jiff = { version = "1.0", features = ["serde"] }
+ulid = "3"
+uuid = { version = "1.29", features = ["v7", "serde"] }
+sha2 = "0.11"
+hex = "0.4"
+subtle = "2.6"
+rand = "0.9"
+figment = { version = "0.10", features = ["toml", "env"] }
+secrecy = { version = "0.10", features = ["serde"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1.54", features = ["full"] }
+rusqlite = { version = "0.43", features = ["bundled", "serde_json"] }
+rusqlite_migration = "2"
+clap = { version = "4.6", features = ["derive", "env"] }
+tempfile = "3"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

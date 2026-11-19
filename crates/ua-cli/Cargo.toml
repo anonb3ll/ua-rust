@@ -1,0 +1,17 @@
+[package]
+name = "ua-cli"
+description = "The ua command: hub server, MCP stdio adapter and tool CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ua"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ua-core.workspace = true

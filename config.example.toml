@@ -1,0 +1,31 @@
+# ua-rust configuration. Copy to $UA_HOME/config.toml.
+# UA_* environment variables override anything set here.
+
+home = "~/.ua-rust"
+workspace = "~/projects"
+# Extra read-only roots for fs_read / fs_list / fs_search.
+read_roots = []
+# vault_path = "~/notes"
+vault_write_dirs = ["Inbox", "Logs", "Wiki"]
+
+bind = "127.0.0.1:8765"
+enforce_auth = true
+allowed_hosts = ["localhost", "127.0.0.1"]
+
+# Who counts as a human operator. Only humans resolve approvals.
+human_identities = ["operator"]
+
+# Tools that always need a one-time human approval.
+approval_tools = ["git_merge_task"]
+
+# Programs run_cmd may start. Setting this replaces the built-in list.
+# shell_allowlist = ["git", "ls", "cat", "grep", "cargo"]
+
+# Default profile per identity. Unlisted identities get "developer".
+[profiles]
+operator = "operator"
+reviewer-1 = "cto"
+
+# Per-agent workspace roots, or "deny".
+[agent_workspaces]
+# researcher-1 = "deny"
