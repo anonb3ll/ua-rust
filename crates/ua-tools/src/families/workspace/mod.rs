@@ -17,7 +17,9 @@ mod git;
 mod shell;
 
 pub(crate) use shell::ScratchHome;
-pub use shell::sweep_run_homes;
+pub use shell::{
+    RUN_CACHE_MAX_AGE, ancestor_cargo_configs, cargo_config_warning, prune_run_caches, sweep_run_homes,
+};
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

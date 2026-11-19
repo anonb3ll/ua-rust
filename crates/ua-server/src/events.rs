@@ -8,10 +8,13 @@
 //!
 //! The caller stays authorized only while it would still be let in: every
 //! [`RECHECK_EVERY`], and at once when a token-revoked, logout,
-//! session-ended or profile-changed event is broadcast, the stream checks
-//! that the credential it was opened with still resolves to the same
-//! identity and that its profile (after any policy overlay) still allows
-//! `event_log_query`. When it does not, the stream ends.
+//! session-ended, profile-changed or config-revision event is broadcast, the
+//! stream checks that the credential it was opened with still resolves to
+//! the same identity and that the same admission `open` ran (profile after
+//! any policy overlay, then the policy rules, with the stream's own scope as
+//! the arguments) still lets it in. The re-check runs on the blocking pool,
+//! since it reads the policy file and the database. When the caller is no
+//! longer let in, the stream sends one [`StreamItem::Revoked`] and ends.
 //!
 //! Nothing is dropped silently:
 //! - A reconnect with `Last-Event-ID: <seq>` first replays the scoped rows
@@ -28,7 +31,9 @@
 //! therefore remembers the seqs it has delivered rather than only the
 //! highest one.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, header};
@@ -40,6 +45,7 @@ use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, UaResult};
 use ua_store::ledger::Event;
 use ua_tools::families::events::EventScope;
+use ua_tools::policy::{self, Policy, RuleKind, Verdict};
 
 use crate::AppState;
 use crate::auth::{AuthIdentity, caller_for, resolve_bearer};
@@ -63,7 +69,10 @@ const AUTH_CHANNELS: &[&str] = &[
     "agent.ui.logout",
     "agent.session.ended",
     "agent.profile.changed",
+    "agent.config.revision",
 ];
+/// The tool whose admission a stream holds.
+const TOOL: &str = "event_log_query";
 
 /// One item of a scoped stream.
 #[derive(Debug, Clone)]
@@ -76,12 +85,22 @@ pub enum StreamItem {
         until_seq: Option<i64>,
         reason: &'static str,
     },
+    /// The caller is no longer let in; the stream ends after this item.
+    /// `reason` is a short code, never a credential.
+    Revoked {
+        reason: &'static str,
+    },
 }
 
 impl StreamItem {
     /// The JSON body of a gap item.
     pub fn gap_json(after_seq: i64, until_seq: Option<i64>, reason: &str) -> serde_json::Value {
         serde_json::json!({ "gap": true, "after_seq": after_seq, "until_seq": until_seq, "reason": reason })
+    }
+
+    /// The JSON body of a revocation item.
+    pub fn revoked_json(reason: &str) -> serde_json::Value {
+        serde_json::json!({ "auth_revoked": true, "reason": reason })
     }
 }
 
@@ -148,53 +167,118 @@ impl StreamAuth {
     }
 
     /// Whether the caller would still be let in: the credential resolves to
-    /// the same identity, and its profile, after any policy overlay, allows
-    /// `event_log_query`.
-    pub fn still_allowed(&self, state: &AppState) -> bool {
+    /// the same identity, and [`admit`] still lets it in with this scope.
+    /// `admitted_gated` is whether the stream itself was admitted through an
+    /// approval; a policy that newly requires one ends the stream.
+    /// Blocking: it reads the database and the policy file.
+    fn recheck(
+        &self,
+        state: &AppState,
+        scope: &EventScope,
+        admitted_gated: bool,
+    ) -> Result<(), &'static str> {
         let id = match &self.credential {
             Credential::Unverified => {
                 AuthIdentity { label: self.label.clone(), kind: self.kind, verified: false }
             }
-            Credential::Bearer(t) => match resolve_bearer(state, t.expose_secret(), self.path) {
-                Some(id) => id,
-                None => return false,
-            },
+            Credential::Bearer(t) => {
+                resolve_bearer(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
+            }
             Credential::Cookie(h) => match crate::login::session_from_headers(state, h) {
                 Some(s) => AuthIdentity { label: s.label, kind: ActorKind::Human, verified: true },
-                None => return false,
+                None => return Err("credential_invalid"),
             },
         };
         if id.label != self.label {
-            return false;
+            return Err("identity_changed");
         }
         let caller = caller_for(state, &id, self.session_key.clone(), self.transport);
-        if !caller.enforce_profile {
-            return true;
+        match admit(state, &caller, scope)? {
+            Admission::NeedsApproval if !admitted_gated => Err("approval_required"),
+            _ => Ok(()),
         }
-        let mut profile = caller.profile;
-        if let Some(path) = state.hub.cfg().policy_file.as_deref() {
-            // Same overlay as the registry; a policy that cannot be loaded
-            // refuses, as the registry does.
-            let Ok(policy) = ua_tools::policy::load(path) else { return false };
-            if caller.kind != ActorKind::Human {
-                let code_default = ua_tools::sessions::default_profile(&state.hub, &caller.label);
-                let tools = state.registry.all().map(|t| t.name);
-                if let Some(overlay) =
-                    ua_tools::policy::overlay_profile(&policy, &caller.label, code_default, tools)
-                    && profile.rank() > overlay.rank()
-                {
-                    profile = overlay;
-                }
-            }
-        }
-        profile.allows_tool("event_log_query")
     }
+}
+
+/// How [`admit`] lets a caller in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Allowed,
+    /// The policy sends the call through the approval queue.
+    NeedsApproval,
+}
+
+/// The admission of [`Registry::call`](ua_tools::Registry::call) for
+/// `event_log_query` with the stream's scope as arguments: the profile
+/// (after any policy overlay), then the policy rules. A policy file that
+/// cannot be loaded refuses, as the registry does.
+///
+/// Per-call throttles (`rate_limit`, and a `cooldown` that needs no episode)
+/// are left out: they limit how often the tool is called, and the stream's
+/// own admission was such a call, so counting it again would end every
+/// stream under a cooldown. They still apply when a stream is opened.
+/// Blocking: it reads the database and the policy file (cached by mtime and
+/// size in [`policy::load`]).
+fn admit(state: &AppState, caller: &Caller, scope: &EventScope) -> Result<Admission, &'static str> {
+    let loaded = state.hub.cfg().policy_file.as_deref().map(policy::load);
+    let mut profile = caller.profile;
+    if let Some(Ok(p)) = &loaded
+        && caller.enforce_profile
+        && caller.kind != ActorKind::Human
+    {
+        let code_default = ua_tools::sessions::default_profile(&state.hub, &caller.label);
+        let tools = state.registry.all().map(|t| t.name);
+        if let Some(overlay) = policy::overlay_profile(p, &caller.label, code_default, tools)
+            && profile.rank() > overlay.rank()
+        {
+            profile = overlay;
+        }
+    }
+    if caller.enforce_profile && !profile.allows_tool(TOOL) {
+        return Err("profile_denied");
+    }
+    let Some(loaded) = loaded else { return Ok(Admission::Allowed) };
+    let policy = loaded.map_err(|_| "policy_unavailable")?;
+    let policy = without_throttles(&policy);
+    let caller = Caller { profile, ..caller.clone() };
+    let args = scope.admission_args();
+    let verdict = state
+        .hub
+        .db()
+        .read(|c| Ok(policy::evaluate(c, &policy, &caller, TOOL, &args)))
+        .map_err(|_| "policy_unavailable")?;
+    match verdict {
+        Ok(Verdict::Allow) => Ok(Admission::Allowed),
+        Ok(Verdict::RequireApproval(_)) => Ok(Admission::NeedsApproval),
+        Err(_) => Err("policy_denied"),
+    }
+}
+
+/// `policy` with its per-call throttles switched off (see [`admit`]). The
+/// rules stay in place, so `default_action: deny` counts them as before.
+fn without_throttles(policy: &Policy) -> Cow<'_, Policy> {
+    let throttle =
+        |k: RuleKind, episode: bool| k == RuleKind::RateLimit || (k == RuleKind::Cooldown && !episode);
+    if !policy.rules.iter().any(|r| throttle(r.kind, r.require_episode)) {
+        return Cow::Borrowed(policy);
+    }
+    let mut out = policy.clone();
+    for r in &mut out.rules {
+        if r.kind == RuleKind::RateLimit {
+            r.max_calls = None;
+        } else if r.kind == RuleKind::Cooldown && !r.require_episode {
+            r.cooldown_seconds = None;
+        }
+    }
+    Cow::Owned(out)
 }
 
 struct Cursor {
     state: AppState,
     scope: EventScope,
-    auth: StreamAuth,
+    auth: Arc<StreamAuth>,
+    /// The stream was admitted through an approval.
+    admitted_gated: bool,
     rx: broadcast::Receiver<Event>,
     recheck: Interval,
     /// Every seq at or below this was delivered or predates the stream.
@@ -215,6 +299,7 @@ impl Cursor {
         state: AppState,
         scope: EventScope,
         auth: StreamAuth,
+        admitted_gated: bool,
         rx: broadcast::Receiver<Event>,
         start: i64,
     ) -> Self {
@@ -224,7 +309,8 @@ impl Cursor {
         Self {
             state,
             scope,
-            auth,
+            auth: Arc::new(auth),
+            admitted_gated,
             rx,
             recheck,
             floor: start,
@@ -291,6 +377,23 @@ impl Cursor {
         }
     }
 
+    /// Re-check the caller on the blocking pool.
+    async fn still_allowed(&self) -> Result<(), &'static str> {
+        let (auth, state, scope, gated) =
+            (self.auth.clone(), self.state.clone(), self.scope.clone(), self.admitted_gated);
+        tokio::task::spawn_blocking(move || auth.recheck(&state, &scope, gated))
+            .await
+            .unwrap_or(Err("recheck_failed"))
+    }
+
+    /// End the stream with a revocation notice and nothing after it.
+    fn revoke(&mut self, reason: &'static str) {
+        self.queue.clear();
+        self.pending_gap = None;
+        self.queue.push_back(StreamItem::Revoked { reason });
+        self.closed = true;
+    }
+
     /// A live row with `seq` arrived: a pending gap ends just before it.
     fn close_gap(&mut self, seq: i64) {
         if let Some((after, reason)) = self.pending_gap
@@ -313,14 +416,17 @@ impl Cursor {
             }
             tokio::select! {
                 _ = self.recheck.tick() => {
-                    if !self.auth.still_allowed(&self.state) {
-                        return None;
+                    if let Err(reason) = self.still_allowed().await {
+                        self.revoke(reason);
                     }
                 }
                 recv = self.rx.recv() => match recv {
                     Ok(ev) => {
-                        if AUTH_CHANNELS.contains(&ev.channel.as_str()) && !self.auth.still_allowed(&self.state) {
-                            return None;
+                        if AUTH_CHANNELS.contains(&ev.channel.as_str())
+                            && let Err(reason) = self.still_allowed().await
+                        {
+                            self.revoke(reason);
+                            continue;
                         }
                         self.close_gap(ev.seq);
                         if self.accept(ev.seq) && self.scope.matches(&ev) {
@@ -357,7 +463,19 @@ pub async fn open(
     scope: EventScope,
     resume_after: Option<i64>,
 ) -> UaResult<impl Stream<Item = StreamItem> + Send + 'static> {
-    state.registry.call(&state.hub, caller, "event_log_query", scope.admission_args()).await?;
+    state.registry.call(&state.hub, caller, TOOL, scope.admission_args()).await?;
+    // Whether that admission went through an approval, so a re-check can
+    // tell a policy that newly requires one. It changing in between refuses.
+    let admitted_gated = {
+        let (state, caller, scope) = (state.clone(), caller.clone(), scope.clone());
+        tokio::task::spawn_blocking(move || admit(&state, &caller, &scope))
+            .await
+            .map_err(|e| ua_core::UaError::internal(format!("blocking task failed: {e}")))?
+            .map_err(|reason| {
+                ua_core::UaError::denied(reason, "the stream's admission changed while it opened")
+            })?
+            == Admission::NeedsApproval
+    };
     // Subscribe before reading the end of the ledger, so no row commits in
     // between unseen.
     let rx = state.hub.db().subscribe();
@@ -367,7 +485,7 @@ pub async fn open(
         .read_async(|c| Ok(c.query_row("SELECT COALESCE(MAX(seq), 0) FROM event_log", [], |r| r.get(0))?))
         .await?;
     let start = resume_after.map_or(end, |n| n.min(end));
-    let mut cursor = Cursor::new(state.clone(), scope, auth, rx, start);
+    let mut cursor = Cursor::new(state.clone(), scope, auth, admitted_gated, rx, start);
     if resume_after.is_some() && start < end {
         cursor.backfill(start).await;
     }
@@ -413,7 +531,7 @@ mod tests {
 
     fn cursor(state: &AppState, start: i64) -> Cursor {
         let scope = EventScope { channels: None, channel_prefix: Some("test.keep".into()) };
-        let mut c = Cursor::new(state.clone(), scope, local_auth(), state.hub.db().subscribe(), start);
+        let mut c = Cursor::new(state.clone(), scope, local_auth(), false, state.hub.db().subscribe(), start);
         c.page = 10;
         c.cap = 30;
         c
@@ -445,12 +563,33 @@ mod tests {
                     assert!(until_seq.is_none_or(|u| u > after_seq + 1), "empty gap {item:?}");
                     gaps.push((*after_seq, *until_seq));
                 }
+                StreamItem::Revoked { reason } => panic!("unexpected revocation: {reason}"),
             }
         }
         for seq in scoped {
             let in_gap = gaps.iter().any(|(a, u)| seq > a && u.is_none_or(|u| *seq < u));
             assert!(delivered.contains(seq) || in_gap, "seq {seq} silently skipped");
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_recheck_sends_one_revocation_and_ends() {
+        let state = state();
+        let auth = StreamAuth {
+            credential: Credential::Bearer(SecretString::from("not-a-known-token".to_string())),
+            ..local_auth()
+        };
+        let scope = EventScope::default();
+        let c = Cursor::new(state.clone(), scope, auth, false, state.hub.db().subscribe(), 0);
+        append(&state, "agent.token.revoked");
+        append(&state, "test.keep");
+        let (item, c) = tokio::time::timeout(Duration::from_secs(5), c.next())
+            .await
+            .expect("stream stalled")
+            .expect("stream ended without a notice");
+        assert!(matches!(item, StreamItem::Revoked { reason: "credential_invalid" }), "{item:?}");
+        let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
+        assert!(after.is_none(), "items after the revocation");
     }
 
     #[tokio::test]

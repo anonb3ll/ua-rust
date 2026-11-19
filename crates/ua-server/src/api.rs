@@ -111,7 +111,8 @@ struct StreamQuery {
 
 /// Ledger events as server-sent events: event name = channel, id = seq,
 /// data = the event as JSON. A `gap` event names a range that may be
-/// missing. Scoped and resumable as described in [`crate::events`].
+/// missing. A final `auth_revoked` event (data `{auth_revoked, reason}`)
+/// says the caller is no longer let in; clients should stop reconnecting. Scoped and resumable as described in [`crate::events`].
 async fn event_stream(
     State(state): State<AppState>,
     Extension(id): Extension<AuthIdentity>,
@@ -137,5 +138,8 @@ fn sse_json(item: StreamItem) -> Result<SseEvent, Infallible> {
         StreamItem::Gap { after_seq, until_seq, reason } => SseEvent::default()
             .event("gap")
             .data(StreamItem::gap_json(after_seq, until_seq, reason).to_string()),
+        StreamItem::Revoked { reason } => {
+            SseEvent::default().event("auth_revoked").data(StreamItem::revoked_json(reason).to_string())
+        }
     })
 }

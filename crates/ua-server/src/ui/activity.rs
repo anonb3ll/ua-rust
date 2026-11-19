@@ -158,7 +158,8 @@ async fn backfill(ui: &Ui, prefix: &str) -> Result<Vec<EventRow>, String> {
 
 /// Rendered ledger rows as server-sent events named `ledger`, through the
 /// same scoped, resumable stream as `/api/events/stream`
-/// ([`crate::events`]). A gap renders as its own row.
+/// ([`crate::events`]). A gap renders as its own row. A final
+/// `auth_revoked` event ends the stream when the caller is no longer let in.
 pub async fn stream(ui: Ui, headers: HeaderMap, Query(q): Query<ActivityQuery>) -> Response {
     let prefix = clean_prefix(&q.channel_prefix);
     let scope = EventScope { channels: None, channel_prefix: (!prefix.is_empty()).then_some(prefix) };
@@ -186,6 +187,10 @@ fn sse_row(item: StreamItem) -> Result<SseEvent, Infallible> {
                 "<li class=\"gap\"><span class=\"chip\">gap</span> Some events {range} could not be loaded; reload the page to see them.</li>"
             );
             SseEvent::default().event("ledger").data(html)
+        }
+        // The page closes its EventSource on this event (`sse-close`).
+        StreamItem::Revoked { reason } => {
+            SseEvent::default().event("auth_revoked").data(StreamItem::revoked_json(reason).to_string())
         }
     })
 }
