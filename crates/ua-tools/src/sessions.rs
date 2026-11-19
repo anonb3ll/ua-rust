@@ -23,6 +23,28 @@ CREATE TABLE IF NOT EXISTS session_profiles (
 ",
 };
 
+/// Managed agent tokens, stored as SHA-256 hashes.
+pub const TOKENS_SCHEMA: SchemaPart = SchemaPart {
+    name: "tokens.v1",
+    sql: "
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_label TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    hash_algo TEXT NOT NULL DEFAULT 'sha256',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','rotated','revoked','expired')),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT,
+    rotated_from INTEGER REFERENCES agent_tokens(id) ON DELETE SET NULL,
+    rotated_at TEXT,
+    revoked_at TEXT,
+    issued_by TEXT,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tokens_label ON agent_tokens(agent_label, status);
+",
+};
+
 /// The profile an identity gets when nothing is activated.
 pub fn default_profile(hub: &Hub, label: &str) -> Profile {
     hub.cfg().profiles.get(label).and_then(|p| p.parse().ok()).unwrap_or(Profile::Developer)

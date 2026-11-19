@@ -26,7 +26,8 @@ use ua_store::SchemaPart;
 
 /// Every schema part, in application order.
 pub fn schema_parts() -> Vec<SchemaPart> {
-    let mut parts = vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA];
+    let mut parts =
+        vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
     parts.extend(families::schema_parts());
     parts
 }

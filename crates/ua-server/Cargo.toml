@@ -1,0 +1,28 @@
+[package]
+name = "ua-server"
+description = "HTTP/JSON API, MCP adapter and web UI for ua-rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ua-core.workspace = true
+ua-store.workspace = true
+ua-tools.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+axum = "0.8.9"
+tower-http = { version = "0.7", features = ["trace"] }
+tokio-util = "0.7"
+futures = "0.3"
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+secrecy.workspace = true
+rusqlite.workspace = true
+rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
