@@ -26,18 +26,19 @@ hex.workspace = true
 jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-    "hf-hub-rustls-tls",
-    "onnx",
-    "ort-download-binaries-rustls-tls",
-[target.'cfg(unix)'.dependencies]
-] }
-fastembed = { version = "7.7", optional = true, default-features = false, features = [
 globset = "0.4"
 ignore = "0.4"
-libc = "0.2"
 regex = "1.12"
 ulid.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+fastembed = { version = "7.7", optional = true, default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "onnx",
+    "ort-download-binaries-rustls-tls",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
