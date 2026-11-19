@@ -137,8 +137,8 @@ fn may(caller: &Caller, tool: &str) -> bool {
     !caller.enforce_profile || caller.profile.allows_tool(tool)
 }
 
-fn is_human(state: &AppState, id: &AuthIdentity) -> bool {
-    id.kind == ActorKind::Human || state.hub.cfg().is_human(&id.label)
+fn is_human(id: &AuthIdentity) -> bool {
+    id.verified && id.kind == ActorKind::Human
 }
 
 /// Normalize an ISO 8601 date or datetime to the stored UTC form. A value
@@ -426,7 +426,7 @@ async fn action_approval(
     if !id.verified {
         return err(StatusCode::UNAUTHORIZED, "authenticated identity required");
     }
-    if !is_human(&state, &id) {
+    if !is_human(&id) {
         return err(StatusCode::FORBIDDEN, "approval resolution requires a human identity");
     }
     let approval_id = match body.get("id") {
@@ -616,7 +616,11 @@ enum RequestOutcome {
     Pending(i64),
     Approved(i64),
     Denied(i64, Option<String>),
+    TooMany,
 }
+
+/// Open approval requests one requester may have queued at once.
+const MAX_PENDING_PER_REQUESTER: i64 = 20;
 
 async fn approval_request(
     State(state): State<AppState>,
@@ -656,6 +660,11 @@ async fn approval_request(
     if !may(&caller, "approval_pending") {
         return err(StatusCode::FORBIDDEN, "approval requests are not exposed by the active profile");
     }
+    // Only for a tool the caller could actually run: no inbox spam for tools
+    // its profile hides.
+    if !may(&caller, &tool) {
+        return err(StatusCode::FORBIDDEN, format!("tool {tool:?} is not available to the active profile"));
+    }
     let gated = def.always_gated || state.hub.cfg().approval_tools.contains(&tool);
     if !gated {
         return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
@@ -677,6 +686,16 @@ async fn approval_request(
                 .optional()?;
             if let Some((id, reason)) = denied {
                 return Ok(RequestOutcome::Denied(id, reason));
+            }
+            // Bound the human inbox: one requester cannot queue more than
+            // MAX_PENDING_PER_REQUESTER open requests.
+            let open: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM approvals WHERE requested_by = ?1 AND status = 'pending'",
+                params![c.label],
+                |r| r.get(0),
+            )?;
+            if open >= MAX_PENDING_PER_REQUESTER {
+                return Ok(RequestOutcome::TooMany);
             }
             // A live pass is reported, never consumed: this route runs nothing.
             let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
@@ -705,6 +724,12 @@ async fn approval_request(
         Ok(RequestOutcome::Pending(a)) => (StatusCode::ACCEPTED, a, "pending", None),
         Ok(RequestOutcome::Approved(a)) => (StatusCode::OK, a, "approved", None),
         Ok(RequestOutcome::Denied(a, r)) => (StatusCode::OK, a, "denied", r),
+        Ok(RequestOutcome::TooMany) => {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("{MAX_PENDING_PER_REQUESTER} approval requests are already open for this identity"),
+            );
+        }
         Err(e) => return tool_err(&e),
     };
     let mut out = json!({ "approval_id": approval_id, "status": decision, "tool": tool, "payload": payload });

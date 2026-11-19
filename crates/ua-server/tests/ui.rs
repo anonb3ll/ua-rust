@@ -605,6 +605,13 @@ async fn api_approvals_resolve_detail_and_request() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // A tool the requester's profile hides cannot be queued for a human.
+    let resp = send(
+        &app,
+        post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "profile_activate" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -654,4 +661,44 @@ async fn api_sessions_catalog_board_and_unbuilt_routes() {
         assert_eq!(v["error"], "not_implemented");
         assert!(v["capability"].is_string());
     }
+}
+
+#[tokio::test]
+async fn api_writes_refuse_cross_site_and_non_json_bodies() {
+    let (app, _state) = app(local_config());
+
+    // A cross-site page can send text/plain without a preflight; refuse it.
+    let req = Request::post("/api/tasks")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from(r#"{"title":"from another site"}"#))
+        .unwrap();
+    assert_eq!(send(&app, req).await.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let mut req = post_json("/api/tasks", None, json!({ "title": "x" }));
+    req.headers_mut().insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+    req.headers_mut().insert(header::HOST, "localhost:8765".parse().unwrap());
+    assert_eq!(send(&app, req).await.status(), StatusCode::FORBIDDEN);
+
+    let mut req = post_json("/api/tasks", None, json!({ "title": "x" }));
+    req.headers_mut().insert("sec-fetch-site", "cross-site".parse().unwrap());
+    assert_eq!(send(&app, req).await.status(), StatusCode::FORBIDDEN);
+
+    // Same-origin JSON still works.
+    let mut req = post_json("/api/tasks", None, json!({ "title": "same origin" }));
+    req.headers_mut().insert(header::ORIGIN, "http://localhost:8765".parse().unwrap());
+    req.headers_mut().insert(header::HOST, "localhost:8765".parse().unwrap());
+    assert!(send(&app, req).await.status().is_success());
+}
+
+#[tokio::test]
+async fn unknown_hosts_are_refused_for_api_and_ui() {
+    let (app, _state) = app(local_config());
+    for uri in ["/api/tasks", "/ui"] {
+        let mut req = get(uri, None);
+        req.headers_mut().insert(header::HOST, "rebound.example.com".parse().unwrap());
+        assert_eq!(send(&app, req).await.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    let mut req = get("/healthz", None);
+    req.headers_mut().insert(header::HOST, "rebound.example.com".parse().unwrap());
+    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
 }
