@@ -133,25 +133,159 @@ async fn a_lagging_stream_backfills_from_the_ledger() {
     assert!(!text.contains("event: gap"), "{text}");
 }
 
-#[tokio::test]
-async fn a_backfill_that_cannot_be_complete_says_so() {
-    let hub = TestHub::new(stream_config());
-    let resp = hub.send(get("/api/events/stream?channel_prefix=test.keep", None, Some(AGENT_A))).await;
-    let mut last = 0;
-    for i in 0..1100 {
-        last = append(&hub, "test.keep", i);
-    }
-    let text = read_sse(resp, |t| t.contains(&format!("id: {last}"))).await;
-    assert!(text.contains("event: gap"), "a lost range must be visible");
-    let gap: Value = text
-        .split("event: gap\n")
-        .nth(1)
-        .and_then(|rest| rest.lines().next())
-        .and_then(|l| l.strip_prefix("data: "))
+/// The `data:` line after each `event: gap` line.
+fn sse_gaps(text: &str) -> Vec<Value> {
+    text.split("event: gap\n")
+        .skip(1)
+        .filter_map(|rest| rest.lines().next())
+        .filter_map(|l| l.strip_prefix("data: "))
         .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_resume_past_the_backfill_cap_reports_the_rest_up_to_the_next_live_row() {
+    let hub = TestHub::new(stream_config());
+    let cap = ua_server::events::BACKFILL_CAP;
+    let mut scoped = Vec::new();
+    for i in 0..cap + 150 {
+        if i % 50 == 0 {
+            append(&hub, "test.noise", i);
+        }
+        scoped.push(append(&hub, "test.keep", i));
+    }
+    let mut req = get("/api/events/stream?channel_prefix=test.keep", None, Some(AGENT_A));
+    req.headers_mut().insert("last-event-id", "0".parse().unwrap());
+    let resp = hub.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let live = append(&hub, "test.keep", 0);
+    scoped.push(live);
+    let text = read_sse(resp, |t| t.contains(&format!("id: {live}\n"))).await;
+
+    // Every scoped seq is either delivered or inside a reported gap.
+    let ids = sse_ids(&text);
+    let gaps = sse_gaps(&text);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    let (after, until) = (gaps[0]["after_seq"].as_i64().unwrap(), gaps[0]["until_seq"].as_i64());
+    assert_eq!(gaps[0]["reason"], "backfill_limit");
+    assert_eq!(after, scoped[cap - 1], "the gap starts at the last row read");
+    assert_eq!(until, Some(live), "the gap ends at the next live row");
+    for seq in &scoped {
+        let in_gap = *seq > after && until.is_none_or(|u| *seq < u);
+        assert!(ids.contains(seq) != in_gap, "seq {seq}: delivered or in the gap, exactly one");
+    }
+    assert_eq!(ids.len(), cap + 1);
+}
+
+#[tokio::test]
+async fn the_activity_stream_renders_a_gap_as_its_range() {
+    let hub = TestHub::new(stream_config());
+    let cap = ua_server::events::BACKFILL_CAP;
+    let mut last_read = 0;
+    for i in 0..cap + 10 {
+        let seq = append(&hub, "test.keep", i);
+        if i + 1 == cap {
+            last_read = seq;
+        }
+    }
+    let mut req = get("/ui/activity/stream?channel_prefix=test.keep", None, Some(AGENT_A));
+    req.headers_mut().insert("last-event-id", "0".parse().unwrap());
+    let resp = hub.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let live = append(&hub, "test.keep", 0);
+    let text = read_sse(resp, |t| t.contains(&format!("id: {live}\n"))).await;
+    let expected = format!("Some events #{} to #{} could not be loaded", last_read + 1, live - 1);
+    assert!(text.contains(&expected), "missing {expected:?}");
+}
+
+/// A managed token for `label`, as `agent_token_issue` stores it.
+fn managed_token(hub: &TestHub, label: &str, token: &str) {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    hub.state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO agent_tokens (agent_label, token_hash, issued_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![label, hash, ua_core::time::now()],
+            )?;
+            Ok(())
+        })
         .unwrap();
-    assert_eq!(gap["reason"], "backfill_limit");
-    assert!(gap["until_seq"].as_i64().unwrap() > gap["after_seq"].as_i64().unwrap());
+}
+
+/// Revoke `label`'s managed tokens the way the CLI does.
+fn revoke_tokens(hub: &TestHub, label: &str) {
+    hub.state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 WHERE agent_label = ?1",
+                rusqlite::params![label, ua_core::time::now()],
+            )?;
+            ledger::append(tx, EventInput::new("agent.token.revoked", json!({ "agent": label })).by("cli"))?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Read an SSE body until it ends; false when it is still open after a
+/// few seconds.
+async fn ends_soon(resp: Response<Body>) -> bool {
+    let mut body = resp.into_body();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) | Ok(Some(Err(_))) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn revoking_the_token_ends_an_open_stream() {
+    let hub = TestHub::new(stream_config());
+    const MANAGED: &str = "agent-c-managed-token-0004";
+    managed_token(&hub, "agent-c", MANAGED);
+    managed_token(&hub, "agent-d", "agent-d-managed-token-0005");
+    let resp = hub.send(get("/api/events/stream?channel_prefix=test.keep", None, Some(MANAGED))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+
+    // Another identity's revocation re-checks this stream but keeps it open.
+    revoke_tokens(&hub, "agent-d");
+    let keep = append(&hub, "test.keep", 0);
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !text.contains(&format!("id: {keep}\n")) {
+        let frame = tokio::time::timeout_at(deadline, body.frame()).await.expect("stream stalled");
+        let frame = frame.expect("stream ended on another identity's revocation").unwrap();
+        if let Ok(data) = frame.into_data() {
+            text.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+
+    // Its own revocation ends it, without waiting for the periodic check.
+    revoke_tokens(&hub, "agent-c");
+    assert!(ends_soon(Response::new(body)).await, "the stream outlived its token");
+    // And a new stream with the revoked token is refused.
+    let resp = hub.send(get("/api/events/stream", None, Some(MANAGED))).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logging_out_ends_an_open_activity_stream() {
+    let hub = TestHub::new(stream_config());
+    let cookie = hub.sign_in("operator").await;
+    let csrf = hub.csrf(&cookie).await;
+    let resp = hub.send(get("/ui/activity/stream", Some(&cookie), None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = hub.send(common::form("/logout", &[("csrf", &csrf)], Some(&cookie))).await;
+    assert!(out.status().is_redirection());
+    assert!(ends_soon(resp).await, "the stream outlived its session");
 }
 
 // ---------------------------------------------------------------- approvals
