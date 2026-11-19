@@ -3010,7 +3010,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "tracing",
  "ua-core",
  "ulid",
 ]
