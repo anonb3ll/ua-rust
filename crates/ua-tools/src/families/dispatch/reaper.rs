@@ -5,14 +5,18 @@
 //!    (a crash between the intent write and the stop attempt), so the lease
 //!    path below never turns such a run into a plain `retryable` one;
 //! 2. for every live run whose lease has passed: renews it when this process
-//!    still supervises the child at the same fence; fails it with
-//!    `lease_expired_outcome_unknown` when a recorded pid this process cannot
-//!    vouch for is still alive (a resume would overlap it); otherwise hands
+//!    still supervises the child at the same fence; kills the group of a
+//!    recorded child proven to be an orphan (see
+//!    [`executor::orphan_proof`]) and hands the run back as `retryable`
+//!    (`lease_expired_orphan_killed`); fails it with
+//!    `lease_expired_outcome_unknown` when a recorded pid that cannot be
+//!    proven ours is still alive (a resume would overlap it); otherwise hands
 //!    it back as `retryable` (`lease_expired`) for `dispatch_resume`.
 //!
-//! [`reap_expired_leases`] is callable directly (tests, an operator CLI);
-//! [`spawn_reaper`] runs it on an interval when `dispatch_reaper_interval_s`
-//! is set.
+//! `ua serve` runs one sweep at startup, so runs a previous hub process left
+//! behind are reconciled before new work arrives, then [`spawn_reaper`] runs
+//! it every `Config::dispatch_reaper_interval()` seconds (a third of the
+//! lease by default). [`reap_expired_leases`] is also callable directly.
 
 use std::time::Duration;
 
@@ -32,7 +36,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
     let pending = db.read(|c| runs_where(c, "termination_outcome = 'requested'"))?;
     let mut reconciled = Vec::new();
     for run in pending {
-        let termination = executor::terminate(&run.run_id, run.pid);
+        let termination = executor::terminate(&run);
         let cessation = classify_termination(termination);
         let res = db.write(|tx| {
             finalize_cancellation(
@@ -78,12 +82,13 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
             renewed.push(json!({ "run_id": run.run_id }));
             continue;
         }
-        let orphan_alive = executor::pid_is_alive(run.pid);
-        let (state, reason) = if orphan_alive {
-            ("failed", "lease_expired_outcome_unknown")
-        } else {
-            ("retryable", "lease_expired")
+        let termination = executor::terminate(&run);
+        let (state, reason) = match termination {
+            "already_gone" => ("retryable", "lease_expired"),
+            "killed" | "killed_orphan" => ("retryable", "lease_expired_orphan_killed"),
+            _ => ("failed", "lease_expired_outcome_unknown"),
         };
+        let orphan_alive = state == "failed";
         let res = db.write(|tx| {
             super::record_outcome(
                 tx,
@@ -101,7 +106,10 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
             )
         })?;
         if res["ok"] == json!(true) {
-            let row = json!({ "run_id": run.run_id, "task_id": run.task_id, "state": state, "failure_reason": reason });
+            let row = json!({
+                "run_id": run.run_id, "task_id": run.task_id, "state": state, "failure_reason": reason,
+                "termination": termination,
+            });
             if orphan_alive { failed.push(row) } else { reclaimed.push(row) }
         }
     }
@@ -113,15 +121,37 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
     }))
 }
 
-/// Start the background reaper when `dispatch_reaper_interval_s` is above 0.
+/// Run one sweep off the async runtime, logging what it did. `ua serve`
+/// calls it once before it starts serving.
+pub async fn startup_sweep(hub: &Hub) {
+    let h = hub.clone();
+    match tokio::task::spawn_blocking(move || reap_expired_leases(&h)).await {
+        Ok(Ok(v)) => {
+            let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+            tracing::info!(
+                reconciled = n("reconciled"),
+                reclaimed = n("reclaimed"),
+                failed = n("failed"),
+                "dispatch startup sweep"
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "dispatch startup sweep failed"),
+        Err(e) => tracing::warn!(error = %e, "dispatch startup sweep task failed"),
+    }
+}
+
+/// Start the background reaper unless `dispatch_reaper_interval_s` is 0.
 pub fn spawn_reaper(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
-    let secs = hub.cfg().dispatch_reaper_interval_s;
+    let secs = hub.cfg().dispatch_reaper_interval();
     if secs == 0 {
         return None;
     }
     let hub = hub.clone();
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        // The first sweep is one period out: `ua serve` sweeps once itself
+        // at startup ([`startup_sweep`]).
+        let period = Duration::from_secs(secs);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
