@@ -17,6 +17,7 @@ pub mod notify;
 pub mod observability;
 pub mod plans;
 pub mod tasks;
+pub mod tokens;
 pub mod vault;
 pub mod web;
 pub mod workspace;
@@ -31,6 +32,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.extend(code::schema_parts());
     parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());
+    parts.extend(tokens::schema_parts());
     parts.extend(vault::schema_parts());
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
@@ -54,6 +56,7 @@ pub fn register(r: &mut Registry) {
     observability::register(r);
     plans::register(r);
     tasks::register(r);
+    tokens::register(r);
     vault::register(r);
     web::register(r);
     workspace::register(r);
