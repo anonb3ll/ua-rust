@@ -5053,6 +5053,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ua-core",
+ "ua-import",
  "ua-server",
  "ua-store",
  "ua-tools",
@@ -5071,6 +5072,23 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "ua-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "ua-core",
+ "ua-store",
+ "ua-tools",
 ]
 
 [[package]]
