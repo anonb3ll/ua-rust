@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::rules::Finding;
-use super::safe_io::{HARDLINK_MSG, create_regular_text, read_regular_text_strict, replace_regular_text};
+use super::safe_io::{create_regular_text, is_hardlink, read_regular_text_strict, replace_regular_text};
 use crate::families::injection::hidden_char_regex;
 
 const DEFAULT_GITIGNORE: &str = "# Default .gitignore created by audit auto-remediation
@@ -102,7 +102,7 @@ enum Phase {
 /// carries no path or content.
 fn cause(e: std::io::Error, phase: Phase) -> std::io::Error {
     use std::io::ErrorKind as K;
-    if e.kind() == K::InvalidInput && e.to_string() == HARDLINK_MSG {
+    if is_hardlink(&e) {
         return io_err("file has more than one hard link");
     }
     let os = e.raw_os_error();
@@ -221,6 +221,25 @@ impl Fixer<'_> {
     }
 }
 
+/// Whether the `.gitignore` text already ignores `.env`: a whole non-comment
+/// line naming it, not undone by a later `!` line.
+fn ignores_env(text: &str) -> bool {
+    let covers = |p: &str| matches!(p, ".env" | ".env*" | "*.env" | "/.env" | "**/.env" | "**/.env*");
+    let mut covered = false;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.strip_prefix('!') {
+            Some(p) if covers(p) => covered = false,
+            Some(_) => {}
+            None if covers(line) => covered = true,
+            None => {}
+        }
+    }
+    covered
+}
+
 /// "strip 3 hidden chars on lines 2, 9": counts and line numbers only.
 fn strip_description(original: &str) -> String {
     let re = hidden_char_regex();
@@ -261,24 +280,28 @@ pub fn remediate_findings(root: &Path, findings: &mut [Finding], mode: Mode<'_>)
                 }
             }
             "SECRETS-ENV-EXPOSED" => {
+                let mut wrote = false;
                 let result = if fx.exists(".gitignore") {
                     fx.modify(".gitignore", |cur| {
-                        if [".env*", "*.env", ".env"].iter().any(|p| cur.contains(p)) {
+                        if ignores_env(cur) {
                             return None;
                         }
+                        wrote = true;
                         Some((
                             format!("{cur}\n# Added by audit auto-remediation\n.env*\n"),
                             "append `.env*` to .gitignore".to_string(),
                         ))
                     })
                 } else {
+                    wrote = true;
                     fx.create(".gitignore", DEFAULT_GITIGNORE, "create default .gitignore")
                 };
                 match result {
-                    Ok(()) => {
+                    Ok(()) if wrote => {
                         fd.fixed = true;
                         fd.message = format!("[AUTO-FIXED] Added `.env*` to .gitignore: {}", fd.message);
                     }
+                    Ok(()) => {}
                     Err(e) => fail(fd, "Failed to update .gitignore", e),
                 }
             }
@@ -487,6 +510,30 @@ mod tests {
         assert_eq!(plan[0].sha256_before, None);
         run(Mode::Apply(&plan));
         assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn env_lookalikes_do_not_count_as_ignored() {
+        for text in ["!.env\n", ".envrc\n", ".env.example\n", "# .env\n", ".env\n!.env\n"] {
+            assert!(!ignores_env(text), "{text:?}");
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".gitignore"), text).unwrap();
+            let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+            let plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+            assert_eq!(plan.len(), 1, "{text:?}");
+            assert!(fs[0].fixed);
+            let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+            assert_eq!(remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan)).len(), 1);
+            assert!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap().ends_with(".env*\n"));
+        }
+        for text in [".env\n", "x\n.env*\n", "*.env\n", "/.env\n", "!.env\n.env\n"] {
+            assert!(ignores_env(text), "{text:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        assert!(remediate_findings(dir.path(), &mut fs, Mode::Plan).is_empty());
+        assert!(!fs[0].fixed, "nothing written, nothing reported fixed");
     }
 
     #[cfg(unix)]

@@ -68,8 +68,21 @@ fn nofollow_flags(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
-/// The message of the hard-link refusal, so callers can name the cause.
-pub const HARDLINK_MSG: &str = "file has more than one hard link";
+/// Payload of the hard-link refusal, so callers can name the cause.
+#[derive(Debug)]
+pub struct HardLink;
+
+impl std::fmt::Display for HardLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("file has more than one hard link")
+    }
+}
+
+impl std::error::Error for HardLink {}
+
+pub fn is_hardlink(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.downcast_ref::<HardLink>().is_some())
+}
 
 fn refuse() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
@@ -81,11 +94,29 @@ const REPLACE_LIMIT: u64 = 8 << 20;
 /// a file that appeared after the scan, and `O_NOFOLLOW` plus the exclusive
 /// create refuse a symlink at the path.
 pub fn create_regular_text(path: &Path, text: &str) -> std::io::Result<()> {
+    create_with(path, |f| f.write_all(text.as_bytes()))
+}
+
+/// Create `path` exclusively and fill it with `write`. We created the file,
+/// so any failure after the create removes it again: a partial file would
+/// block every later run with "already exists".
+fn create_with(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     nofollow_flags(&mut opts);
     let mut file = opts.open(path)?;
-    file.write_all(text.as_bytes())
+    if let Err(e) = write(&mut file).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Err(e) = File::open(dir).and_then(|d| d.sync_all())
+    {
+        tracing::warn!(kind = ?e.kind(), "audit: created file but the directory sync failed");
+    }
+    Ok(())
 }
 
 /// Read `path` (a regular file, never followed through a symlink) from ONE
@@ -110,7 +141,7 @@ pub fn replace_regular_text(
     {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() > 1 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, HARDLINK_MSG));
+            return Err(std::io::Error::other(HardLink));
         }
     }
     let mut buf = Vec::new();
@@ -204,6 +235,23 @@ mod tests {
         let err = create_regular_text(&f, "two").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "one");
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        let err = create_with(&f, |w| {
+            w.write_all(b"par")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(!f.exists(), "partial file removed");
+        create_regular_text(&f, "ok").unwrap();
+        // An existing file we did not create is never removed on refusal.
+        assert!(create_with(&f, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "ok");
     }
 
     #[test]
