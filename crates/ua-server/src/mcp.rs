@@ -104,7 +104,8 @@ pub fn http_service(
     state: AppState,
     ct: CancellationToken,
 ) -> StreamableHttpService<UaMcp, LocalSessionManager> {
-    let hosts = state.hub.cfg().allowed_hosts.clone();
+    // Same list as the `/api` and `/ui` guard: `allowed_hosts` plus the host of `public_url`.
+    let hosts = crate::guard::effective_allowed_hosts(state.hub.cfg());
     let config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(hosts)
         .with_legacy_session_mode(true)

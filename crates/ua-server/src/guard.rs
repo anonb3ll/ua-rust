@@ -1,20 +1,30 @@
 //! Browser-facing request guard for `/api` and `/ui`.
 //!
-//! - DNS rebinding: a request whose `Host` is not in `allowed_hosts` is
-//!   refused. (A request with no `Host` header cannot come from a browser
-//!   and is let through.)
+//! - DNS rebinding: a request whose `Host` is neither in `allowed_hosts` nor
+//!   the host of `public_url` is refused, and each refused host is logged
+//!   once at warn level. (A request with no `Host` header cannot come from a
+//!   browser and is let through.)
 //! - CSRF on the JSON API: a state-changing `/api` request must not be
 //!   cross-site (`Sec-Fetch-Site`, `Origin`), and a body must be sent as
 //!   `application/json`, which a cross-site page cannot do without a CORS
 //!   preflight this server never grants. The `/ui` forms have their own
 //!   double-submit token check (`ui::csrf`).
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use ua_core::Config;
+
 use crate::AppState;
+
+/// Refused hosts already logged; bounded so a flood of names cannot grow it.
+static LOGGED_HOSTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+const LOGGED_HOSTS_MAX: usize = 256;
 
 fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
@@ -41,6 +51,29 @@ pub fn host_allowed(allowed: &[String], h: &HeaderMap) -> bool {
     let Some(host) = header_str(h, header::HOST.as_str()) else { return true };
     let host = host_only(host);
     allowed.iter().any(|a| host_only(a) == host)
+}
+
+/// `allowed_hosts` plus the host of `public_url`, when it is set.
+pub fn effective_allowed_hosts(cfg: &Config) -> Vec<String> {
+    let mut hosts = cfg.allowed_hosts.clone();
+    if let Some(h) = cfg
+        .public_url
+        .as_deref()
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']').to_string()))
+    {
+        hosts.push(h);
+    }
+    hosts
+}
+
+/// True the first time `host` is seen (so it is logged once).
+fn first_refusal(host: &str) -> bool {
+    let Ok(mut seen) = LOGGED_HOSTS.lock() else { return false };
+    if seen.contains(host) || seen.len() >= LOGGED_HOSTS_MAX {
+        return false;
+    }
+    seen.insert(host.to_string())
 }
 
 fn same_origin(h: &HeaderMap) -> bool {
@@ -74,7 +107,17 @@ pub async fn protect(State(state): State<AppState>, req: Request, next: Next) ->
         return next.run(req).await;
     }
     let h = req.headers();
-    if !host_allowed(&state.hub.cfg().allowed_hosts, h) {
+    if !host_allowed(&effective_allowed_hosts(state.hub.cfg()), h) {
+        let host: String = header_str(h, header::HOST.as_str())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(255)
+            .collect();
+        if first_refusal(&host) {
+            tracing::warn!(host = %host, "refused a request for a host outside allowed_hosts and public_url; \
+                add it to allowed_hosts if this hub is reached by that name (logged once per host)");
+        }
         return refuse(StatusCode::FORBIDDEN, "host not allowed (add it to allowed_hosts)");
     }
     let safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
@@ -108,5 +151,26 @@ mod tests {
             h.insert(header::HOST, host.parse().unwrap());
             assert_eq!(host_allowed(&allowed, &h), ok, "{host}");
         }
+    }
+
+    #[test]
+    fn public_url_host_is_allowed_automatically() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.public_url = Some("https://hub.example.com".into());
+        let allowed = effective_allowed_hosts(&cfg);
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "hub.example.com".parse().unwrap());
+        assert!(host_allowed(&allowed, &h));
+        h.insert(header::HOST, "other.example.com".parse().unwrap());
+        assert!(!host_allowed(&allowed, &h));
+        cfg.public_url = Some("http://[::1]:8765".into());
+        assert!(effective_allowed_hosts(&cfg).contains(&"::1".to_string()));
+    }
+
+    #[test]
+    fn each_refused_host_is_logged_once() {
+        assert!(first_refusal("once.example.com"));
+        assert!(!first_refusal("once.example.com"));
+        assert!(first_refusal("twice.example.com"));
     }
 }

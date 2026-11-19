@@ -32,6 +32,8 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 | `public_url` | `http://<bind>` | The hub's public base URL. OAuth issuer, passkey origin, base of login links. Set it, e.g. `https://hub.example.com`. |
 | `oauth_enabled` | `false` | Serve the authorization server and accept OAuth access tokens. |
 | `oauth_dcr_enabled` | `true` | Accept RFC 7591 dynamic client registration (only while OAuth is on). |
+| `oauth_dcr_unused_ttl_hours` | `24` | A registered client that never received a grant is pruned after this many hours (checked on each registration and when `ua serve` starts). |
+| `oauth_dcr_rate_per_hour` | `20` | Registrations allowed per remote address per hour. Behind a loopback reverse proxy the last `X-Forwarded-For` address counts. |
 | `oauth_cimd_enabled` | `false` | Accept URL client ids (Client ID Metadata Documents). The hub then fetches public HTTPS URLs on behalf of unauthenticated callers. |
 | `oauth_cimd_allow` | empty | Hosts whose metadata documents may be fetched; `.example.com` admits subdomains. Empty admits any public host. |
 | `oauth_identities` | `remote-agent` | Identities a human may bind a grant to on the consent page. Human identities are always refused. |
@@ -39,13 +41,53 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 | `oauth_access_ttl_secs` | `3600` | Access token lifetime (clamped to 60 s .. 30 days). |
 | `oauth_refresh_ttl_days` | `30` | Refresh token lifetime (clamped to 1 .. 365 days). |
 | `oauth_client_credentials` | none | Confidential clients for `client_credentials`: `client_id\|secret\|identity` entries separated by commas or newlines. Secret; never printed. A client id listed twice is dropped. |
-| `ui_cookie_secure` | `true` | Send the session cookie with `Secure`. Turn off only for plain `http://localhost`. |
+| `ui_cookie_secure` | `true` | Send the session cookie with `Secure`. Leave it on: browsers treat `http://localhost` and loopback addresses as secure contexts and keep `Secure` cookies there. Turning it off does not make plain `http://` to another host safe; use HTTPS instead (see "Remote access"). |
 | `ui_session_ttl_hours` | `12` | Browser session lifetime. |
 | `login_link_ttl_secs` | `600` | Lifetime of a `ua login-link` URL. |
 | `webauthn_rp_id` | host of `public_url` | WebAuthn relying-party id. |
 
-The MCP endpoint also checks the `Host` header against `allowed_hosts`. Add
-the host of `public_url` there when the hub is reached by name.
+`allowed_hosts` (default `localhost`, `127.0.0.1`, `::1`) lists the `Host`
+headers `/mcp`, `/api` and `/ui` answer, as protection against DNS
+rebinding. The host of `public_url` is always allowed as well, so a hub
+reached only through its public name needs no entry. Add every other name
+the hub is reached by, for example:
+
+```toml
+public_url = "https://hub.example-tailnet.ts.net"
+allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.lan.example.com"]
+```
+
+A refused host is logged once at warn level (`refused a request for a host
+outside allowed_hosts and public_url`), so a misconfigured name shows up in
+the log instead of only as a 403 in the browser.
+
+## Remote access
+
+Browser sign-in needs a secure context. Browsers drop `Secure` cookies on
+plain `http://` to any host other than localhost or a loopback address, and
+WebAuthn (passkeys) refuses to run there. On such an origin a login link or
+passkey appears to work and then bounces back to `/login`. `ua serve` warns
+at startup when the effective public origin (`public_url`, else
+`http://<bind>`) is plain `http://` on a non-loopback host while the session
+cookie is `Secure` or human identities are configured. It warns rather than
+refuses, because bearer-token clients on `/mcp` and `/api` keep working over
+plain HTTP on a trusted network.
+
+For remote use, keep `bind` on loopback and put TLS in front:
+
+- **`tailscale serve`** (recommended for a personal hub): HTTPS with a
+  certificate for the machine's tailnet name, reachable only from your
+  tailnet. Do not use Tailscale Funnel, which publishes the hub to the whole
+  internet.
+
+  ```
+  tailscale serve --bg 8765
+  ```
+
+  then set `public_url = "https://hub.example-tailnet.ts.net"` (your
+  machine's tailnet name). Its host is allowed automatically.
+- Any other TLS-terminating reverse proxy (Caddy, nginx, ...) with the same
+  `public_url` setting.
 
 ## OAuth 2.1 authorization server
 
@@ -72,6 +114,12 @@ Rules the server enforces:
   (native apps). An unregistered redirect URI gets an error page, never a
   redirect.
 - **`iss` on every authorization response** (RFC 9207), success or error.
+- **Bounded registration.** `/oauth/register` is unauthenticated, so a
+  client that never receives a grant is pruned after
+  `oauth_dcr_unused_ttl_hours`, at most 1000 such clients are kept (a new
+  registration evicts the oldest instead of failing), only clients holding a
+  grant count against the 10 000-client cap, and each remote address may
+  register `oauth_dcr_rate_per_hour` clients per hour (HTTP 429 beyond).
 - **Resource indicators** (RFC 8707). `resource` may be omitted (the token is
   for `/mcp`), `<public_url>/mcp`, or `<public_url>` (valid on `/mcp` and
   `/api`). Anything else is `invalid_target`. The bearer check enforces the
@@ -134,6 +182,15 @@ unless `ui_cookie_secure` is off. It has no `Max-Age`; the server-side row
 bounds its life. Removing a label from `human_identities` ends its sessions at
 once.
 
+The cookie is `SameSite=Lax`, not `Strict`, on purpose. An MCP client starts
+OAuth by sending the browser from another site (the client's page or a
+native app) to `/oauth/authorize`. That is a cross-site top-level
+navigation: a `Strict` cookie would not be sent, the human would look signed
+out on the consent page and have to sign in again on every authorization.
+`Lax` sends the cookie on top-level `GET` navigations only; cross-site
+`POST`s, fetches and iframes still go without it, and every state-changing
+cookie request needs the CSRF token as well.
+
 ## CSRF: integrating the UI
 
 Every state-changing request (anything but `GET`, `HEAD`, `OPTIONS`) that
@@ -190,7 +247,7 @@ value.
 
 ## Ledger events
 
-`agent.oauth.client_registered`, `agent.oauth.consent`,
+`agent.oauth.client_registered`, `agent.oauth.clients_pruned`, `agent.oauth.consent`,
 `agent.oauth.token_issued`, `agent.oauth.token_revoked`,
 `agent.oauth.code_reuse`, `agent.oauth.refresh_reuse`,
 `agent.oauth.sessions_revoked`, `agent.ui.login`, `agent.ui.logout`,
