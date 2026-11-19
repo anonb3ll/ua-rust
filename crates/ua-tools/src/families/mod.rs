@@ -8,8 +8,12 @@ pub mod agents;
 pub mod core_schema;
 pub mod delegation;
 pub mod events;
+pub mod evidence;
+pub mod export;
 pub mod memory;
 pub mod messaging;
+pub mod notify;
+pub mod observability;
 pub mod plans;
 pub mod tasks;
 pub mod workspace;
@@ -25,6 +29,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.extend(tasks::schema_parts());
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
+    parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
     parts
 }
@@ -34,8 +39,12 @@ pub fn register(r: &mut Registry) {
     agents::register(r);
     delegation::register(r);
     events::register(r);
+    evidence::register(r);
+    export::register(r);
     memory::register(r);
     messaging::register(r);
+    notify::register(r);
+    observability::register(r);
     plans::register(r);
     tasks::register(r);
     workspace::register(r);
