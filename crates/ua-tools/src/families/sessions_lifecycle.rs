@@ -1046,6 +1046,14 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
+    // The steward profile may watch a crew but not steer it. The profile table
+    // does not list this tool, so the tool enforces it itself.
+    if ctx.caller.profile == ua_core::Profile::Steward {
+        return Err(UaError::denied(
+            "profile_denied",
+            "crew_intervene is not available to the steward profile",
+        ));
+    }
     let sid = a.session_id.trim().to_string();
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
