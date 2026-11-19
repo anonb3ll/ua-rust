@@ -121,7 +121,8 @@ async fn event_stream(
     let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
     let scope = EventScope { channels: None, channel_prefix: q.channel_prefix.filter(|p| !p.is_empty()) };
     let resume = events::resume_point(&headers, q.after_seq);
-    match events::open(&state, &caller, scope, resume).await {
+    let auth = events::StreamAuth::from_request(&headers, &caller, "/api/events/stream");
+    match events::open(&state, &caller, auth, scope, resume).await {
         Ok(stream) => Sse::new(stream.map(sse_json)).keep_alive(KeepAlive::default()).into_response(),
         Err(e) => (status_for(&e), Json(e.to_json())).into_response(),
     }

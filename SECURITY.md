@@ -24,7 +24,11 @@ and steps to reproduce. You will get an acknowledgement within a week.
   cross-site or have non-JSON bodies.
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
-  so a profile or policy that refuses the tool refuses the stream.
+  so a profile or policy that refuses the tool refuses the stream. An open
+  stream re-checks its caller every 60 seconds, and at once when a token
+  revocation or rotation, logout, session end or profile change is
+  recorded: the credential must still resolve to the same identity and
+  its profile must still allow `event_log_query`, or the stream ends.
 - **Dynamic client registration is bounded.** Clients that never receive a
   grant are pruned after `oauth_dcr_unused_ttl_hours`, unused clients are
   capped (the oldest is evicted), and each address may register
