@@ -16,6 +16,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use ua_core::config::TrustedCargoConfig;
 use ua_core::safety::{
     canonicalize_lenient, git_global_options, git_subcommand, guard_secret_filename, resolve_in_root,
     split_command, vet_command,
@@ -272,9 +273,124 @@ pub fn ancestor_cargo_configs(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A startup warning when cargo config files sit above any configured
-/// workspace root (the default root and each per-agent root); `None` when
-/// there are none. `run_cmd` refuses cargo in such a workspace.
+/// Largest cargo config file hashed for the `trusted_cargo_configs` check;
+/// a bigger one is refused rather than read.
+const CARGO_CONFIG_READ_CAP: u64 = 1024 * 1024;
+
+/// The cargo configs above `root` that cargo may not read: every one not
+/// pinned in `trusted`, or whose content no longer matches its pin. Each is
+/// described with its path and current SHA-256, for the refusal text.
+///
+/// The file is read once and that content is hashed. Cargo reads it again
+/// when it starts, so a change made in between is not caught; only a
+/// process that can already write outside the workspace can make one.
+fn untrusted_cargo_configs(root: &Path, trusted: &[TrustedCargoConfig]) -> Vec<UntrustedCargoConfig> {
+    ancestor_cargo_configs(root)
+        .into_iter()
+        .filter_map(|path| {
+            let pins: Vec<&TrustedCargoConfig> =
+                trusted.iter().filter(|t| same_file(&t.path, &path)).collect();
+            let sha256 = match read_capped(&path, CARGO_CONFIG_READ_CAP) {
+                Ok(bytes) => sha256_hex(&bytes),
+                Err(e) => return Some(UntrustedCargoConfig { path, sha256: None, why: e }),
+            };
+            if pins.iter().any(|t| t.sha256.trim().eq_ignore_ascii_case(&sha256)) {
+                return None;
+            }
+            let why = match pins.first() {
+                None => "not in trusted_cargo_configs".to_string(),
+                Some(t) => format!(
+                    "changed since trusted_cargo_configs pinned sha256 {}",
+                    t.sha256.trim().to_ascii_lowercase()
+                ),
+            };
+            Some(UntrustedCargoConfig { path, sha256: Some(sha256), why })
+        })
+        .collect()
+}
+
+/// A cargo config above the workspace that cargo may not read.
+struct UntrustedCargoConfig {
+    path: PathBuf,
+    /// SHA-256 of its current content; `None` when it could not be read.
+    sha256: Option<String>,
+    why: String,
+}
+
+impl UntrustedCargoConfig {
+    fn describe(list: &[Self]) -> String {
+        list.iter()
+            .map(|c| match &c.sha256 {
+                Some(h) => format!("{} (sha256 {h}, {})", c.path.display(), c.why),
+                None => format!("{} ({})", c.path.display(), c.why),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The fix: move the workspace, or pin the files' current content.
+    fn remedy(list: &[Self]) -> String {
+        let pins: Vec<String> = list
+            .iter()
+            .filter_map(|c| {
+                let h = c.sha256.as_ref()?;
+                Some(format!("{{ path = {}, sha256 = \"{h}\" }}", toml_string(&c.path.display().to_string())))
+            })
+            .collect();
+        let mut out = "Move the workspace outside that directory tree".to_string();
+        if !pins.is_empty() {
+            out.push_str(&format!(
+                ", or, after reviewing the file, trust its current content in the hub config: \
+                 trusted_cargo_configs = [{}]. Any later change to the file is refused again",
+                pins.join(", ")
+            ));
+        }
+        out.push('.');
+        out
+    }
+}
+
+/// `s` as a TOML basic string.
+fn toml_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether `a` and `b` name the same file, literally or after resolving links.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || a.canonicalize().ok().is_some_and(|ca| b.canonicalize().ok() == Some(ca))
+}
+
+/// The bytes of the regular file `p` (links followed), refusing anything
+/// else (a FIFO would block) and anything over `cap` bytes.
+fn read_capped(p: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).map_err(|e| format!("unreadable: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("unreadable: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    f.take(cap + 1).read_to_end(&mut bytes).map_err(|e| format!("unreadable: {e}"))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("larger than {cap} bytes"));
+    }
+    Ok(bytes)
+}
+
+/// A startup warning when cargo config files that are not trusted (see
+/// `trusted_cargo_configs`) sit above any configured workspace root (the
+/// default root and each per-agent root); `None` when there are none.
+/// `run_cmd` refuses cargo in such a workspace.
 pub fn cargo_config_warning(cfg: &ua_core::Config) -> Option<String> {
     let mut roots = vec![cfg.workspace_root()];
     roots.extend(
@@ -283,18 +399,21 @@ pub fn cargo_config_warning(cfg: &ua_core::Config) -> Option<String> {
             .filter(|v| !v.trim().eq_ignore_ascii_case("deny"))
             .map(|v| super::expand_tilde(v.trim())),
     );
-    let mut found: Vec<PathBuf> =
-        roots.iter().filter_map(|r| r.canonicalize().ok()).flat_map(|r| ancestor_cargo_configs(&r)).collect();
-    found.sort();
-    found.dedup();
+    let mut found: Vec<UntrustedCargoConfig> = roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .flat_map(|r| untrusted_cargo_configs(&r, &cfg.trusted_cargo_configs))
+        .collect();
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found.dedup_by(|a, b| a.path == b.path);
     if found.is_empty() {
         return None;
     }
-    let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
     Some(format!(
         "cargo config above a workspace root: {}. Cargo reads every ancestor .cargo/config of its cwd, so \
-         run_cmd refuses cargo in that workspace; move the workspace outside that directory tree.",
-        list.join(", ")
+         run_cmd refuses cargo in that workspace. {}",
+        UntrustedCargoConfig::describe(&found),
+        UntrustedCargoConfig::remedy(&found)
     ))
 }
 
@@ -832,8 +951,9 @@ fn mutation_risk(argv: &[String]) -> &'static str {
     }
 }
 
-/// Advisory findings for a vetted argv.
-fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
+/// Advisory findings for a vetted argv. `trusted` is the operator's
+/// `trusted_cargo_configs`.
+fn advisories(argv: &[String], workdir: &Path, root: &Path, trusted: &[TrustedCargoConfig]) -> Vec<Finding> {
     let mut out = Vec::new();
     let Some((prog, rest)) = argv.split_first() else { return out };
     let name = program_name(prog);
@@ -1041,17 +1161,17 @@ fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
         ));
     }
     if name == "cargo" || name.starts_with("cargo-") {
-        let found = ancestor_cargo_configs(root);
+        let found = untrusted_cargo_configs(root, trusted);
         if !found.is_empty() {
-            let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
             out.push(finding(
                 "block",
                 "cargo-config",
                 format!(
                     "cargo reads every .cargo/config in the directories above its cwd, so it would apply {} \
                      (aliases, [env], build.rustc-wrapper, source replacement, credential providers) from \
-                     outside the workspace. Move the workspace outside that directory tree.",
-                    list.join(", ")
+                     outside the workspace. {}",
+                    UntrustedCargoConfig::describe(&found),
+                    UntrustedCargoConfig::remedy(&found)
                 ),
             ));
         }
@@ -1127,7 +1247,7 @@ fn run_cmd_check(ctx: &ToolCtx, a: CheckArgs) -> UaResult<Value> {
             format!("{program:?} not found on PATH; run_cmd would return exit code 127."),
         ));
     }
-    findings.extend(advisories(&argv, &workdir, &sb.root));
+    findings.extend(advisories(&argv, &workdir, &sb.root, &ctx.hub.cfg().trusted_cargo_configs));
     let blocked = findings.iter().any(|f| f.severity == "block");
     let warned = findings.iter().any(|f| f.severity == "warn");
     Ok(json!({
@@ -1171,7 +1291,7 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let workdir = resolve_cwd(&sb, &a.cwd)?;
     let argv: Vec<String> =
         std::iter::once(vetted.program.clone()).chain(vetted.args.iter().cloned()).collect();
-    let findings = advisories(&argv, &workdir, &sb.root);
+    let findings = advisories(&argv, &workdir, &sb.root, &ctx.hub.cfg().trusted_cargo_configs);
     if let Some(block) = findings.iter().find(|f| f.severity == "block") {
         return Err(UaError::denied(block.code, block.message.clone()));
     }
@@ -1197,7 +1317,7 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     // own persistent caches.
     let scratch_home = ScratchHome::new()?;
     let ua_home = &ctx.hub.cfg().home;
-    let host = HostRust::get(ua_home).await;
+    let host = HostRust::get(&vetted.program, ua_home).await;
     let mut env = command_env(ua_home, &ctx.caller.label, &scratch_home.path, &host);
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
@@ -1386,51 +1506,132 @@ struct HostRust {
     toolchain: Option<PathBuf>,
 }
 
-/// The last resolution and when it was made. A successful one is kept until
-/// its toolchain is gone; a failed one (no toolchain found) is kept for
+/// The last resolution and when it was made, plus a lock that lets only one
+/// resolution run at a time. A successful one is kept until its toolchain
+/// is gone; a failed one (no toolchain found) is kept for
 /// [`HOST_RUST_RETRY`], so a host without a working default toolchain does
 /// not run `rustc` on every `run_cmd` call.
-type HostRustSlot = tokio::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>;
-static HOST_RUST: HostRustSlot = tokio::sync::Mutex::const_new(None);
+///
+/// The cached value sits behind a plain mutex that is never held across an
+/// await; the lookup runs under `flight` instead, which only programs that
+/// need the toolchain wait on.
+struct HostRustSlot {
+    last: std::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>,
+    flight: tokio::sync::Mutex<()>,
+}
+
+impl HostRustSlot {
+    const fn new() -> Self {
+        Self { last: std::sync::Mutex::new(None), flight: tokio::sync::Mutex::const_new(()) }
+    }
+
+    /// The cached resolution while it is still usable.
+    fn fresh(&self) -> Option<Arc<HostRust>> {
+        let (host, at) = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let usable = match &host.toolchain {
+            Some(bin) => is_executable(&bin.join("rustc")),
+            None => at.elapsed() < HOST_RUST_RETRY,
+        };
+        usable.then_some(host)
+    }
+
+    fn store(&self, host: Arc<HostRust>) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, std::time::Instant::now()));
+    }
+}
+
+static HOST_RUST: HostRustSlot = HostRustSlot::new();
 
 /// How long a failed toolchain lookup is reused before trying again.
 const HOST_RUST_RETRY: Duration = Duration::from_secs(60);
 
+/// Whether `program` is part of the Rust toolchain, so `run_cmd` must look
+/// the toolchain up before running it.
+fn needs_rust_toolchain(program: &str) -> bool {
+    let name = program_name(program);
+    name.starts_with("cargo") || name.starts_with("rust") || matches!(name, "clippy-driver" | "miri")
+}
+
+/// Start one toolchain lookup in the background and return at once. `ua
+/// serve` calls it at startup, so a program that only starts cargo
+/// indirectly (`make`, `just`, a script) finds the toolchain on a fresh hub
+/// without a direct `cargo` or `rustc` call first. Nothing waits on it: a
+/// toolchain program that runs meanwhile joins the same lookup, and any
+/// other program runs without the toolchain until the lookup is done. Must
+/// be called inside a Tokio runtime.
+pub fn warm_host_rust(ua_home: &Path) {
+    drop(HostRust::warm(&HOST_RUST, hub_vars(), ua_home.to_path_buf()));
+}
+
+/// The hub's own environment, as UTF-8 pairs.
+fn hub_vars() -> Vec<(String, String)> {
+    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
+}
+
 impl HostRust {
-    async fn get(ua_home: &Path) -> Arc<HostRust> {
-        let vars: Vec<(String, String)> = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect();
-        Self::cached(&HOST_RUST, &vars, ua_home).await
+    /// The environment for running `program`. Only Rust toolchain programs
+    /// wait for the toolchain lookup; any other program takes the last
+    /// usable lookup, else PATH without a toolchain, and never runs
+    /// `rustc` or waits on a lookup in progress. [`warm_host_rust`] runs a
+    /// lookup at startup, so cargo started indirectly (by an interpreter or
+    /// build tool) finds the toolchain once that lookup is done.
+    async fn get(program: &str, ua_home: &Path) -> Arc<HostRust> {
+        Self::for_program(&HOST_RUST, program, &hub_vars(), ua_home).await
     }
 
-    /// `slot`'s resolution while its toolchain still holds a `rustc`, else
-    /// a fresh one, kept only when it found a toolchain.
+    /// Fill `slot` in a spawned task, unless it is already usable.
+    fn warm(
+        slot: &'static HostRustSlot,
+        vars: Vec<(String, String)>,
+        ua_home: PathBuf,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            Self::cached(slot, &vars, &ua_home).await;
+        })
+    }
+
+    async fn for_program(
+        slot: &HostRustSlot,
+        program: &str,
+        vars: &[(String, String)],
+        ua_home: &Path,
+    ) -> Arc<HostRust> {
+        if needs_rust_toolchain(program) {
+            Self::cached(slot, vars, ua_home).await
+        } else {
+            slot.fresh().unwrap_or_else(|| Arc::new(Self::with_toolchain(vars, None)))
+        }
+    }
+
+    /// `slot`'s resolution while it is usable, else a fresh one. Only one
+    /// lookup runs at a time; callers that waited for it take its result.
     async fn cached(slot: &HostRustSlot, vars: &[(String, String)], ua_home: &Path) -> Arc<HostRust> {
-        let mut slot = slot.lock().await;
-        if let Some((host, at)) = slot.as_ref() {
-            let fresh = match &host.toolchain {
-                Some(bin) => is_executable(&bin.join("rustc")),
-                None => at.elapsed() < HOST_RUST_RETRY,
-            };
-            if fresh {
-                return host.clone();
-            }
+        if let Some(host) = slot.fresh() {
+            return host;
+        }
+        let _flight = slot.flight.lock().await;
+        if let Some(host) = slot.fresh() {
+            return host;
         }
         let host = Arc::new(HostRust::resolve(vars, ua_home).await);
-        *slot = Some((host.clone(), std::time::Instant::now()));
+        slot.store(host.clone());
         host
     }
 
     /// Resolve from `vars` (the hub's environment). The default toolchain
     /// is asked for with `ua_home` as the working directory, a hub-owned
-    /// directory, so no override file an agent wrote can pick it. The hub
-    /// user's cargo `bin` directories (`$CARGO_HOME/bin`, `~/.cargo/bin`:
-    /// `cargo install` binaries, `cargo-*` subcommands, rustup proxies) are
-    /// dropped from PATH; the toolchain's own `bin` goes first instead.
+    /// directory, so no override file an agent wrote can pick it.
     async fn resolve(vars: &[(String, String)], ua_home: &Path) -> HostRust {
         let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
         let toolchain = toolchain_bin(vars, &path, ua_home).await;
+        Self::with_toolchain(vars, toolchain)
+    }
+
+    /// The hub's PATH with `toolchain` first. The hub user's cargo `bin`
+    /// directories (`$CARGO_HOME/bin`, `~/.cargo/bin`: `cargo install`
+    /// binaries, `cargo-*` subcommands, rustup proxies) are dropped.
+    fn with_toolchain(vars: &[(String, String)], toolchain: Option<PathBuf>) -> HostRust {
+        let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
         let dropped = operator_cargo_bins(vars);
         let same = |a: &Path, b: &Path| {
             a == b || a.canonicalize().ok().is_some_and(|c| b.canonicalize().ok() == Some(c))
@@ -1836,7 +2037,7 @@ mod run_env_tests {
     async fn a_failed_lookup_is_retried_only_after_a_while() {
         let op = fake_operator();
         let ua_home = tempfile::tempdir().unwrap();
-        let slot: HostRustSlot = tokio::sync::Mutex::new(None);
+        let slot = HostRustSlot::new();
         let expire = |slot: &mut Option<(Arc<HostRust>, std::time::Instant)>| {
             let entry = slot.as_mut().unwrap();
             entry.1 = std::time::Instant::now().checked_sub(HOST_RUST_RETRY * 2).unwrap();
@@ -1852,7 +2053,7 @@ mod run_env_tests {
         let still = HostRust::cached(&slot, &vars, ua_home.path()).await;
         assert!(Arc::ptr_eq(&failed, &still), "a recent failure is reused, not re-run");
         // Once it is old, the next call resolves again and keeps the result.
-        expire(&mut *slot.lock().await);
+        expire(&mut slot.last.lock().unwrap());
         let host = HostRust::cached(&slot, &vars, ua_home.path()).await;
         assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
         let again = HostRust::cached(&slot, &none, ua_home.path()).await;
@@ -1861,6 +2062,119 @@ mod run_env_tests {
         std::fs::remove_file(op.toolchain_bin.join("rustc")).unwrap();
         let after = HostRust::cached(&slot, &none, ua_home.path()).await;
         assert!(after.toolchain.is_none());
+    }
+
+    /// A fake operator whose `rustc` proxy appends a line to the returned
+    /// log each time it runs.
+    #[cfg(unix)]
+    fn counting_operator() -> (FakeOperator, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let op = fake_operator();
+        let log = op.cargo_home.parent().unwrap().join("rustc-runs");
+        let sysroot = op.toolchain_bin.parent().unwrap().display().to_string();
+        let proxy = op.cargo_home.join("bin/rustc");
+        std::fs::write(&proxy, format!("#!/bin/sh\necho run >> '{}'\necho '{sysroot}'\n", log.display()))
+            .unwrap();
+        std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (op, log)
+    }
+
+    fn runs(log: &Path) -> usize {
+        std::fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// Only Rust toolchain programs look the toolchain up; other programs
+    /// reuse a lookup that was already made, and still never get the
+    /// operator's cargo `bin` on PATH.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_toolchain_programs_run_the_toolchain_lookup() {
+        let (op, log) = counting_operator();
+        let path = format!("{}:/usr/bin:/bin", op.cargo_home.join("bin").display());
+        let vars =
+            vec![("PATH".to_string(), path), ("CARGO_HOME".to_string(), op.cargo_home.display().to_string())];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot = HostRustSlot::new();
+        for program in ["git", "ls", "python3", "/usr/bin/git"] {
+            let host = HostRust::for_program(&slot, program, &vars, ua_home.path()).await;
+            assert!(host.toolchain.is_none(), "{program}");
+            assert_eq!(host.path, "/usr/bin:/bin", "{program}");
+        }
+        assert_eq!(runs(&log), 0, "a non-Rust program ran the toolchain lookup");
+
+        let host = HostRust::for_program(&slot, "cargo", &vars, ua_home.path()).await;
+        assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
+        assert_eq!(runs(&log), 1);
+        // Later programs of either kind reuse it.
+        for program in ["rustc", "cargo-clippy", "git"] {
+            let again = HostRust::for_program(&slot, program, &vars, ua_home.path()).await;
+            assert!(Arc::ptr_eq(&host, &again), "{program}");
+        }
+        assert_eq!(runs(&log), 1);
+        for (program, rust) in [("cargo", true), ("rustfmt", true), ("clippy-driver", true), ("git", false)] {
+            assert_eq!(needs_rust_toolchain(program), rust, "{program}");
+        }
+    }
+
+    /// A lookup in progress makes other toolchain programs wait for its
+    /// result, but never a program that does not need the toolchain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_lookup_never_blocks_other_programs() {
+        let (op, log) = counting_operator();
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot = HostRustSlot::new();
+        // A lookup is running (it holds the flight lock).
+        let flight = slot.flight.lock().await;
+        let ls = tokio::time::timeout(
+            Duration::from_secs(5),
+            HostRust::for_program(&slot, "ls", &vars, ua_home.path()),
+        )
+        .await
+        .expect("ls waited for the toolchain lookup");
+        assert!(ls.toolchain.is_none());
+        let cargo = tokio::time::timeout(
+            Duration::from_millis(200),
+            HostRust::for_program(&slot, "cargo", &vars, ua_home.path()),
+        )
+        .await;
+        assert!(cargo.is_err(), "a second lookup ran beside the first");
+        assert_eq!(runs(&log), 0);
+        drop(flight);
+        let cargo = HostRust::for_program(&slot, "cargo", &vars, ua_home.path()).await;
+        assert!(cargo.toolchain.is_some());
+        assert_eq!(runs(&log), 1);
+    }
+
+    /// The startup warm-up returns at once, even while another lookup holds
+    /// the slot, and then fills it, so a build tool that runs cargo
+    /// indirectly gets the toolchain without any direct cargo call first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_warm_up_fills_the_slot_without_blocking() {
+        let (op, log) = counting_operator();
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot: &'static HostRustSlot = Box::leak(Box::new(HostRustSlot::new()));
+        let flight = slot.flight.lock().await;
+        let started = std::time::Instant::now();
+        let warm = HostRust::warm(slot, vars.clone(), ua_home.path().to_path_buf());
+        assert!(started.elapsed() < Duration::from_secs(1), "the warm-up blocked its caller");
+        let make = HostRust::for_program(slot, "make", &vars, ua_home.path()).await;
+        assert!(make.toolchain.is_none(), "nothing waits on the warm-up");
+        drop(flight);
+        tokio::time::timeout(Duration::from_secs(10), warm).await.unwrap().unwrap();
+        assert_eq!(runs(&log), 1);
+        let make = HostRust::for_program(slot, "make", &vars, ua_home.path()).await;
+        assert_eq!(make.toolchain.as_deref(), Some(op.toolchain_bin.as_path()), "{}", make.path);
+        assert_eq!(runs(&log), 1, "the build tool reused the warm-up's lookup");
     }
 
     /// With the real toolchain, when there is one: cargo run with the
