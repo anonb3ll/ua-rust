@@ -46,7 +46,7 @@ fastembed = { version = "7.7", optional = true, default-features = false, featur
 ] }
 
 # web and code families
-# Shared HTTP client (web, vault/Obsidian). ring as the rustls provider: no C
+# Shared HTTP client (web, vault/Obsidian, notify webhooks). ring as the rustls provider: no C
 # toolchain (aws-lc-sys) needed.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "charset", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

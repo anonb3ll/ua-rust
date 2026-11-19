@@ -116,6 +116,16 @@ pub struct Config {
     /// cannot be set from TOML or the environment.
     #[serde(skip)]
     pub search_endpoint: Option<String>,
+    /// Outbound notification webhook (`notify`, `flush_digest`). Unset keeps
+    /// notifications in the outbox with status `not_configured`.
+    pub notify_webhook_url: Option<String>,
+    /// Header name that carries `notify_webhook_secret`.
+    pub notify_webhook_header: String,
+    /// Header value sent with every webhook delivery (e.g. `Bearer ...`).
+    #[serde(skip_serializing)]
+    pub notify_webhook_secret: Option<SecretString>,
+    /// Delivery attempts per notification (1-10) before it is marked failed.
+    pub notify_max_attempts: u32,
 }
 
 impl Default for Config {
@@ -154,6 +164,10 @@ impl Default for Config {
             dash_docsets: Vec::new(),
             fetch_allow_loopback: false,
             search_endpoint: None,
+            notify_webhook_url: None,
+            notify_webhook_header: "Authorization".into(),
+            notify_webhook_secret: None,
+            notify_max_attempts: 3,
         }
     }
 }
