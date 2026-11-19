@@ -339,13 +339,27 @@ fn repo(path: &str) -> tempfile::TempDir {
     dir
 }
 
-async fn cycle_at_pr(h: &H, b: &Caller, wt: &Path) -> String {
+fn head(dir: &Path) -> String {
+    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Commit one more change in `dir` (the task branch moves with it unless
+/// HEAD is detached).
+fn commit(dir: &Path, name: &str) {
+    std::fs::write(dir.join(name), "more\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", name]);
+}
+
+/// A cycle in `pr` for a task bound to `wt` on branch `task`, with `pr_url`.
+async fn cycle_at_pr_with(h: &H, b: &Caller, wt: &Path, pr_url: &str) -> String {
     let task = h.ok(b, "task_add", json!({ "title": "Green" })).await["id"].as_i64().unwrap();
     h.ok(b, "task_claim", json!({ "id": task, "worktree_path": wt.to_string_lossy(), "branch": "task" }))
         .await;
     let id = h.start(b, json!({ "task_id": task })).await["id"].as_str().unwrap().to_string();
     to_reviewing(h, b, &id).await;
-    let pr = json!({ "cycle_id": id, "to_state": "pr", "idempotency_key": "pr", "agent": b.label, "pr_url": "https://example.com/pr/2" });
+    let pr = json!({ "cycle_id": id, "to_state": "pr", "idempotency_key": "pr", "agent": b.label, "pr_url": pr_url });
     if let Err(e) = h.manage(b, "transition", pr.clone()).await {
         h.approve(approval_id(&e)).await;
         h.manage(b, "transition", pr).await.unwrap();
@@ -353,9 +367,22 @@ async fn cycle_at_pr(h: &H, b: &Caller, wt: &Path) -> String {
     id
 }
 
+/// A cycle in `pr` whose recorded PR head is the worktree's HEAD.
+async fn cycle_at_pr(h: &H, b: &Caller, wt: &Path) -> String {
+    cycle_at_pr_with(h, b, wt, &head(wt)).await
+}
+
+async fn verdict(h: &H, b: &Caller, id: &str) -> Value {
+    h.ok(b, "autonomous_cycle_green_path_eligibility", json!({ "cycle_id": id })).await
+}
+
+fn has_git() -> bool {
+    Command::new("git").arg("--version").output().is_ok()
+}
+
 #[tokio::test]
 async fn green_path_merges_without_a_human_only_when_every_check_passes() {
-    if Command::new("git").arg("--version").output().is_err() {
+    if !has_git() {
         return;
     }
     let b = agent("builder-1");
@@ -364,14 +391,14 @@ async fn green_path_merges_without_a_human_only_when_every_check_passes() {
     let h = H::new();
     let wt = repo("src/lib.rs");
     let id = cycle_at_pr(&h, &b, wt.path()).await;
-    let v = h.ok(&b, "autonomous_cycle_green_path_eligibility", json!({ "cycle_id": id })).await;
+    let v = verdict(&h, &b, &id).await;
     assert_eq!(v["eligible"], false);
     assert!(v["reasons"].to_string().contains("no validation gates configured"), "{v}");
 
     // A passing validation command on a clean change: completed with no approval.
     let h = H::with(|c| c.cycle_validation_command = vec!["true".into()]);
     let id = cycle_at_pr(&h, &b, wt.path()).await;
-    let v = h.ok(&b, "autonomous_cycle_green_path_eligibility", json!({ "cycle_id": id })).await;
+    let v = verdict(&h, &b, &id).await;
     assert_eq!(v["eligible"], true, "{v}");
     let done = h.go(&b, &id, "completed", "merge").await.unwrap();
     assert_eq!(done["cycle"]["state"], "completed");
@@ -380,13 +407,107 @@ async fn green_path_merges_without_a_human_only_when_every_check_passes() {
     // A red-tier path holds for a human.
     let red = repo("deploy/unit.service");
     let id = cycle_at_pr(&h, &b, red.path()).await;
-    let v = h.ok(&b, "autonomous_cycle_green_path_eligibility", json!({ "cycle_id": id })).await;
+    let v = verdict(&h, &b, &id).await;
     assert!(v["reasons"].to_string().contains("red-tier"), "{v}");
     assert_eq!(h.go(&b, &id, "completed", "merge").await.unwrap_err().code(), "approval_required");
 
     // A failing validation command holds too.
     let h = H::with(|c| c.cycle_validation_command = vec!["false".into()]);
     let id = cycle_at_pr(&h, &b, wt.path()).await;
-    let v = h.ok(&b, "autonomous_cycle_green_path_eligibility", json!({ "cycle_id": id })).await;
+    let v = verdict(&h, &b, &id).await;
     assert!(v["reasons"].to_string().contains("validation gates failed"), "{v}");
+}
+
+#[tokio::test]
+async fn a_merge_is_bound_to_the_validated_head() {
+    if !has_git() {
+        return;
+    }
+    let b = agent("builder-1");
+    let h = H::with(|c| c.cycle_validation_command = vec!["true".into()]);
+
+    // A PR recorded only as a URL cannot be checked offline.
+    let wt = repo("src/lib.rs");
+    let id = cycle_at_pr_with(&h, &b, wt.path(), "https://example.com/pr/2").await;
+    let v = verdict(&h, &b, &id).await;
+    assert_eq!(v["eligible"], false);
+    assert!(v["reasons"].to_string().contains("cannot be verified offline"), "{v}");
+    assert_eq!(h.go(&b, &id, "completed", "merge").await.unwrap_err().code(), "approval_required");
+
+    // The PR was recorded at one commit, then the branch moved on.
+    let wt = repo("src/lib.rs");
+    let id = cycle_at_pr(&h, &b, wt.path()).await;
+    commit(wt.path(), "later.rs");
+    let v = verdict(&h, &b, &id).await;
+    assert_eq!(v["eligible"], false);
+    assert!(v["reasons"].to_string().contains("is not the worktree HEAD"), "{v}");
+    assert_eq!(h.go(&b, &id, "completed", "merge").await.unwrap_err().code(), "approval_required");
+
+    // The worktree HEAD left the task branch: the branch tip is not what
+    // would be validated.
+    let wt = repo("src/lib.rs");
+    git(wt.path(), &["checkout", "-q", "--detach"]);
+    commit(wt.path(), "detached.rs");
+    let id = cycle_at_pr(&h, &b, wt.path()).await;
+    let v = verdict(&h, &b, &id).await;
+    assert_eq!(v["eligible"], false);
+    assert!(
+        v["reasons"].to_string().contains("not the worktree HEAD")
+            && v["reasons"].to_string().contains("task branch"),
+        "{v}"
+    );
+
+    // HEAD moves while the validation command runs.
+    let h = H::with(|c| {
+        c.cycle_validation_command = [
+            "git",
+            "-c",
+            "user.name=v",
+            "-c",
+            "user.email=v@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "sneak",
+        ]
+        .map(String::from)
+        .to_vec()
+    });
+    let wt = repo("src/lib.rs");
+    let task = h.ok(&b, "task_add", json!({ "title": "Moving" })).await["id"].as_i64().unwrap();
+    h.ok(
+        &b,
+        "task_claim",
+        json!({ "id": task, "worktree_path": wt.path().to_string_lossy(), "branch": "task" }),
+    )
+    .await;
+    let v = h
+        .ok(
+            &b,
+            "autonomous_cycle_green_path_eligibility",
+            json!({ "task_id": task, "cycle": { "state": "pr", "pr_url": head(wt.path()) } }),
+        )
+        .await;
+    assert_eq!(v["eligible"], false);
+    assert!(v["reasons"].to_string().contains("moved during validation"), "{v}");
+}
+
+#[tokio::test]
+async fn validation_runs_with_a_cleared_environment_and_fresh_home() {
+    if !has_git() {
+        return;
+    }
+    let b = agent("builder-1");
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    // Passes only when HOME is a fresh directory, not the hub's, and the
+    // variables cargo gave this test process did not reach the child.
+    let script = r#"test -d "$HOME" && test "$HOME" != "$1" && test -z "$(ls -A "$HOME")" && test -z "$CARGO_MANIFEST_DIR" && test -z "$CARGO_PKG_NAME""#;
+    let h = H::with(|c| {
+        c.cycle_validation_command = vec!["sh".into(), "-c".into(), script.into(), "sh".into(), real_home];
+    });
+    let wt = repo("src/lib.rs");
+    let id = cycle_at_pr(&h, &b, wt.path()).await;
+    let v = verdict(&h, &b, &id).await;
+    assert_eq!(v["eligible"], true, "{v}");
 }

@@ -162,6 +162,8 @@ static RED_TIER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&RED_TIER_PATTERNS.join("|")).expect("static regex"));
 
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(900);
+/// Validation output is drained and discarded past this many bytes per stream.
+const VALIDATION_OUTPUT_CAP: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -885,10 +887,21 @@ fn no(mut reasons: Vec<String>, why: impl Into<String>) -> Verdict {
     Verdict { eligible: false, reasons }
 }
 
+/// Run git in an agent-controlled worktree with a cleared environment that
+/// keeps repository config from starting a filesystem monitor or prompting.
 async fn git(dir: &str, args: &[&str]) -> Option<String> {
+    let env = crate::families::workspace::git_env();
     let out = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new("git").arg("-C").arg(dir).args(args).kill_on_drop(true).output(),
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_clear()
+            .envs(env)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()?
@@ -901,10 +914,64 @@ fn sha_prefix_matches(a: &str, b: &str) -> bool {
     a.len() >= 7 && b.len() >= 7 && (a.starts_with(&b) || b.starts_with(&a))
 }
 
+fn short(h: &str) -> String {
+    h.chars().take(12).collect()
+}
+
+/// The commit `rev` names in the worktree, as a full SHA.
+async fn resolve(dir: &str, rev: &str) -> Option<String> {
+    if rev.starts_with('-') {
+        return None;
+    }
+    let spec = format!("{rev}^{{commit}}");
+    git(dir, &["rev-parse", "--verify", "--quiet", &spec])
+        .await
+        .filter(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// When the task names a branch, its tip must be the commit being validated.
+async fn branch_matches(dir: &str, branch: Option<&str>, head: &str) -> Result<Option<String>, String> {
+    let Some(b) = branch else { return Ok(None) };
+    match resolve(dir, b).await {
+        Some(tip) if tip == head => Ok(Some(format!("task branch {b:?} is at the validated commit"))),
+        Some(tip) => {
+            Err(format!("task branch {b:?} is at {}, not the worktree HEAD {}", short(&tip), short(head)))
+        }
+        None => {
+            Err(format!("task branch {b:?} could not be resolved locally to bind it to the worktree HEAD"))
+        }
+    }
+}
+
+/// The validation command's environment: the dispatch executor's safe names
+/// (never `UA_*` or credential-looking ones, and none of the `XDG_*`
+/// directories that lead back into the operator's home), the operator's
+/// `cycle_validation_env` additions under the same rules, and a fresh HOME.
+pub(crate) fn validation_env(
+    parent: impl IntoIterator<Item = (String, String)>,
+    extra: &[String],
+    home: &std::path::Path,
+) -> Vec<(String, String)> {
+    use crate::families::dispatch::executor::{SAFE_ENV, harness_may_pass, looks_secret};
+    let mut env: Vec<(String, String)> = parent
+        .into_iter()
+        .filter(|(k, _)| {
+            let safe = SAFE_ENV.contains(&k.as_str()) && !k.starts_with("XDG_");
+            let listed = extra.iter().any(|n| n == k) && harness_may_pass(k);
+            k != "HOME" && (safe || listed) && !looks_secret(k)
+        })
+        .collect();
+    env.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    env
+}
+
 /// The green-path verdict: a decision, never an action. Checks in order
 /// (first failure wins): state, recorded pr_url (merge only), no
-/// stop_reason, a readable diff touching no red-tier path, and the configured
-/// validation command passing at a HEAD pinned before and after it runs.
+/// stop_reason, the worktree HEAD (and the task branch tip, when named)
+/// pinned, the PR head bound to that commit, a readable `main...<HEAD>` diff
+/// touching no red-tier path, and the configured validation command passing
+/// with the HEAD unchanged afterwards. A PR head that cannot be checked
+/// offline (a URL rather than the head commit SHA) is never eligible.
 async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>, mode: Mode) -> Verdict {
     let mut reasons = Vec::new();
     let state = s(cycle, "state").unwrap_or_default();
@@ -917,12 +984,17 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
         }
         _ => reasons.push(format!("cycle state is {state:?}")),
     }
-    if let Mode::Merge = mode {
-        match s(cycle, "pr_url").map(str::trim).filter(|p| !p.is_empty()) {
-            Some(p) => reasons.push(format!("evidence recorded: {p}")),
+    let pr_head = match &mode {
+        Mode::Merge => match s(cycle, "pr_url").map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => {
+                reasons.push(format!("evidence recorded: {p}"));
+                p.to_string()
+            }
             None => return no(reasons, "no pr_url recorded"),
-        }
-    }
+        },
+        Mode::Pr(Some(p)) => p.clone(),
+        Mode::Pr(None) => return no(reasons, "no pr_url given"),
+    };
     if let Some(r) = s(cycle, "stop_reason").filter(|r| !r.is_empty()) {
         return no(reasons, format!("cycle carries a stop_reason: {r:?}"));
     }
@@ -944,10 +1016,40 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
     if !std::path::Path::new(&dir).is_dir() {
         return no(reasons, "no git worktree found for this task");
     }
-    let target = branch.filter(|b| !b.trim().is_empty()).unwrap_or_else(|| "HEAD".into());
+    let branch = branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+
+    // Pin the commit everything below judges.
+    let Some(head_before) = resolve(&dir, "HEAD").await else {
+        return no(reasons, "worktree HEAD could not be resolved before validation");
+    };
+    match branch_matches(&dir, branch.as_deref(), &head_before).await {
+        Ok(Some(why)) => reasons.push(why),
+        Ok(None) => {}
+        Err(why) => return no(reasons, why),
+    }
+    if !EVIDENCE_SHA.is_match(&pr_head) {
+        return no(
+            reasons,
+            "PR head cannot be verified offline (pr_url is not the head commit SHA); holding for a human",
+        );
+    }
+    if !sha_prefix_matches(&pr_head, &head_before) {
+        return no(
+            reasons,
+            format!(
+                "PR head {} is not the worktree HEAD {}; holding for a human",
+                short(&pr_head),
+                short(&head_before)
+            ),
+        );
+    }
+    reasons.push(format!("PR head bound to worktree HEAD {}", short(&head_before)));
+
     let mut changed = None;
     for base in ["main", "origin/main"] {
-        if let Some(out) = git(&dir, &["diff", "--name-only", &format!("{base}...{target}")]).await {
+        let range = format!("{base}...{head_before}");
+        if let Some(out) = git(&dir, &["diff", "--no-ext-diff", "--no-textconv", "--name-only", &range]).await
+        {
             changed = Some(out);
             break;
         }
@@ -968,41 +1070,35 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
     }
     reasons.push("no red-tier files touched".into());
 
-    let Some(head_before) = git(&dir, &["rev-parse", "HEAD"]).await else {
-        return no(reasons, "worktree HEAD could not be resolved before validation");
-    };
-    if let Mode::Pr(Some(pr)) = &mode {
-        if EVIDENCE_SHA.is_match(pr) && sha_prefix_matches(pr, &head_before) {
-            reasons.push("pr_url bound to worktree HEAD".into());
-        } else {
-            return no(reasons, "pr_url could not be bound to the worktree HEAD");
-        }
-    }
-    let argv = hub.cfg().cycle_validation_command.clone();
-    let Some((program, args)) = argv.split_first() else {
+    let cfg = hub.cfg();
+    let Some((program, args)) = cfg.cycle_validation_command.split_first() else {
         return no(reasons, "no validation gates configured (cycle_validation_command)");
     };
-    let run = tokio::time::timeout(
+    let home = match crate::families::workspace::ScratchHome::new(&cfg.home) {
+        Ok(h) => h,
+        Err(e) => return no(reasons, format!("validation gates could not start: {e}")),
+    };
+    let env = validation_env(std::env::vars(), &cfg.cycle_validation_env, &home.path);
+    let run = crate::families::workspace::run_program(
+        program,
+        args,
+        std::path::Path::new(&dir),
+        &env,
         VALIDATION_TIMEOUT,
-        tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        VALIDATION_OUTPUT_CAP,
     )
     .await;
+    drop(home);
     match run {
-        Err(_) => return no(reasons, "validation gates timed out"),
-        Ok(Err(e)) => return no(reasons, format!("validation gates could not start: {e}")),
-        Ok(Ok(out)) if !out.status.success() => {
-            return no(reasons, format!("validation gates failed: {}", out.status));
+        Err(e) => return no(reasons, format!("validation gates could not start: {e}")),
+        Ok(out) if out.timed_out => return no(reasons, "validation gates timed out"),
+        Ok(out) if out.exit_code != 0 => {
+            return no(reasons, format!("validation gates failed: exit code {}", out.exit_code));
         }
-        Ok(Ok(_)) => {}
+        Ok(_) => {}
     }
-    let head_after = git(&dir, &["rev-parse", "HEAD"]).await;
+    let head_after = resolve(&dir, "HEAD").await;
     if head_after.as_deref() != Some(head_before.as_str()) {
-        let short = |h: &str| h.chars().take(12).collect::<String>();
         return no(
             reasons,
             format!(
@@ -1012,10 +1108,10 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
             ),
         );
     }
-    reasons.push(format!(
-        "validation gates passed at pinned commit {}",
-        &head_before[..head_before.len().min(12)]
-    ));
+    if let Err(why) = branch_matches(&dir, branch.as_deref(), &head_before).await {
+        return no(reasons, format!("after validation: {why}"));
+    }
+    reasons.push(format!("validation gates passed at pinned commit {}", short(&head_before)));
     Verdict { eligible: true, reasons }
 }
 
@@ -1137,11 +1233,92 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "autonomous_cycle_green_path_eligibility",
-            "Green-path verdict for a cycle as {eligible, reasons}: state pr or completed, a pr_url, no \
-             stop_reason, a readable diff with no red-tier file, and the configured validation command \
-             passing at a pinned worktree HEAD. A decision only; it merges nothing.",
+            "Green-path verdict for a cycle as {eligible, reasons}: state pr or completed, a pr_url that is \
+             the PR head commit SHA and equals the worktree HEAD (and the task branch tip), no stop_reason, a \
+             readable main...HEAD diff with no red-tier file, and the configured validation command passing \
+             (cleared environment, fresh HOME) with HEAD unchanged. A PR head that cannot be checked offline \
+             is never eligible. A decision only; it merges nothing.",
             green_path,
         )
         .family("cycles"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parent() -> Vec<(String, String)> {
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/srv/hub"),
+            ("LANG", "C.UTF-8"),
+            ("XDG_CONFIG_HOME", "/srv/hub/.config"),
+            ("UA_AGENT_TOKENS", "hub-secret"),
+            ("UA_HTTP_BEARER", "hub-secret"),
+            ("UA_HOME", "/hub/state"),
+            ("EXAMPLE_API_KEY", "hub-secret"),
+            ("SOME_TOKEN", "hub-secret"),
+            ("TOOLCHAIN_DIR", "/opt/toolchain"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .to_vec()
+    }
+
+    #[test]
+    fn validation_env_keeps_hub_secrets_out() {
+        // Even when an operator lists them, hub and credential names stay out.
+        let extra: Vec<String> =
+            ["TOOLCHAIN_DIR", "UA_AGENT_TOKENS", "UA_HOME", "EXAMPLE_API_KEY", "SOME_TOKEN"]
+                .map(String::from)
+                .to_vec();
+        let env = validation_env(parent(), &extra, std::path::Path::new("/scratch/home"));
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["PATH", "LANG", "TOOLCHAIN_DIR", "HOME"]);
+        assert!(env.contains(&("HOME".into(), "/scratch/home".into())));
+        assert!(env.iter().all(|(_, v)| v != "hub-secret"));
+        // Unlisted, a plain variable is not passed either.
+        let env = validation_env(parent(), &[], std::path::Path::new("/scratch/home"));
+        assert!(!env.iter().any(|(k, _)| k == "TOOLCHAIN_DIR"));
+    }
+
+    #[tokio::test]
+    async fn a_hub_secret_does_not_reach_the_validation_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = validation_env(parent(), &["UA_AGENT_TOKENS".into()], dir.path());
+        let args: Vec<String> = [
+            "-c",
+            r#"test -z "$UA_AGENT_TOKENS$UA_HTTP_BEARER$EXAMPLE_API_KEY$SOME_TOKEN" && test "$HOME" = "$1""#,
+            "sh",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([dir.path().to_string_lossy().into_owned()])
+        .collect();
+        let out = crate::families::workspace::run_program(
+            "sh",
+            &args,
+            dir.path(),
+            &env,
+            Duration::from_secs(10),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+        // The same check fails when the secret is present, so it is a real check.
+        let mut leaky = env.clone();
+        leaky.push(("UA_AGENT_TOKENS".into(), "hub-secret".into()));
+        let out = crate::families::workspace::run_program(
+            "sh",
+            &args,
+            dir.path(),
+            &leaky,
+            Duration::from_secs(10),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_ne!(out.exit_code, 0);
+    }
 }

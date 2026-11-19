@@ -200,10 +200,17 @@ impl Definition {
                         step.name
                     )));
                 }
-                if registry().get(tool).is_none() {
+                let Some(def) = registry().get(tool) else {
                     return Err(UaError::invalid(format!(
                         "workflow {name:?} step {:?}: tool {tool:?} is not registered on this build; refusing \
                          an ungoverned fallback",
+                        step.name
+                    )));
+                };
+                if step.retries > 0 && !def.read_only {
+                    return Err(UaError::invalid(format!(
+                        "workflow {name:?} step {:?}: retries are allowed only on read-only tools; {tool:?} \
+                         changes state, so a failure is left for an operator instead of being re-run",
                         step.name
                     )));
                 }
@@ -827,9 +834,14 @@ async fn run_one(hub: &Hub, caller: &Caller, run_id: &str, step: &StepDef, scope
         }
     }
     let Some(tool) = &step.tool else { return (Outcome::Done(args), 1) };
+    // Only a read-only tool is safe to call again: a mutating tool that
+    // failed may have changed something before it did, so it runs once and a
+    // failure is left `indeterminate` for an operator.
+    let read_only = registry().get(tool).is_some_and(|d| d.read_only);
+    let max_attempts = if read_only { i64::from(step.retries) + 1 } else { 1 };
     let mut attempts = 0;
     let mut last_error = String::new();
-    while attempts <= i64::from(step.retries) {
+    while attempts < max_attempts {
         attempts += 1;
         match registry().call(hub, caller, tool, args.clone()).await {
             Ok(v) => {
@@ -853,7 +865,17 @@ async fn run_one(hub: &Hub, caller: &Caller, run_id: &str, step: &StepDef, scope
             }
         }
     }
-    (Outcome::Failed(last_error), attempts)
+    if read_only {
+        (Outcome::Failed(last_error), attempts)
+    } else {
+        (
+            Outcome::Indeterminate(format!(
+                "{tool} failed and may have changed state before it did; it is not retried automatically. \
+                 Verify its effects, then resume the run: {last_error}"
+            )),
+            attempts,
+        )
+    }
 }
 
 /// Record one step outcome. Returns false when the lease was lost.

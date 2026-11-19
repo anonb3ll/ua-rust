@@ -193,6 +193,12 @@ pub struct Config {
     /// PR transition waits for a human approval.
     #[serde(deserialize_with = "string_or_list")]
     pub cycle_validation_command: Vec<String>,
+    /// Extra hub environment variable names passed through to the validation
+    /// command (for example a toolchain location). The command otherwise
+    /// gets a cleared environment with a fresh, empty HOME. `UA_*` names and
+    /// credential-looking names are never passed, even when listed.
+    #[serde(deserialize_with = "string_or_list")]
+    pub cycle_validation_env: Vec<String>,
 }
 
 /// One agent harness: a CLI coding agent dispatch runs as a child process.
@@ -299,6 +305,7 @@ impl Default for Config {
             autonomy_max_retries: 3,
             autonomy_max_cost_cents: 1000.0,
             cycle_validation_command: Vec::new(),
+            cycle_validation_env: Vec::new(),
         }
     }
 }

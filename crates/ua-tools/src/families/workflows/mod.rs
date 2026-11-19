@@ -15,11 +15,15 @@
 //!   - name: echo
 //!     tool: run_cmd           # from the curated step tool list
 //!     args: { command: "echo {{ inputs.message }}" }
-//!     retries: 1              # 0-3; refusals and approvals are never retried
 //!   - name: vet
 //!     tool: run_cmd_check
 //!     args: { command: "echo {{ steps.echo.stdout }}" }
+//!     retries: 1              # 0-3, read-only tools only; refusals and
+//!                             # approvals are never retried
 //! ```
+//!
+//! A failed step whose tool changes state is never retried: the run stops as
+//! `indeterminate`, for an operator to check its effects and resume.
 //!
 //! Each step calls its tool through the governed registry path with the
 //! caller's own identity and profile, so a step can never do what the caller
@@ -269,7 +273,9 @@ pub fn register(r: &mut Registry) {
             "Run a reviewed YAML workflow. Each step calls one curated tool through the same governed path \
              as a direct call, with your identity and profile, so the profile, policy, approval queue and \
              sandbox apply to every step. Args take {{ inputs.<name> }} and {{ steps.<step>.<field> }}. \
-             Failed steps retry up to `retries` (max 3) then the run stops as `failed`; a step held by the \
+             A failed read-only step retries up to `retries` (max 3) then the run stops as `failed`; a failed \
+             step whose tool changes state is never retried and stops the run as `indeterminate` for an \
+             operator to verify and resume; a step held by the \
              approval queue stops it as `pending-approval`; a refused step stops it as `denied`. Every step \
              is checkpointed: continue a stopped run with run_id and resume=true from its first unfinished \
              step. Returns {workflow, run_id, status, steps, outputs, resumed, duplicate}.",
