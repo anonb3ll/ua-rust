@@ -101,6 +101,11 @@ pub struct Config {
     pub oauth_enabled: bool,
     /// Accept RFC 7591 dynamic client registration at `/oauth/register`.
     pub oauth_dcr_enabled: bool,
+    /// Hours a dynamically registered client that never received a grant
+    /// is kept before it is pruned.
+    pub oauth_dcr_unused_ttl_hours: f64,
+    /// Dynamic client registrations allowed per remote address per hour.
+    pub oauth_dcr_rate_per_hour: u32,
     /// Accept URL client ids (Client ID Metadata Documents). The hub then
     /// fetches public HTTPS URLs on behalf of unauthenticated `/oauth/authorize` calls.
     pub oauth_cimd_enabled: bool,
@@ -273,6 +278,8 @@ impl Default for Config {
             public_url: None,
             oauth_enabled: false,
             oauth_dcr_enabled: true,
+            oauth_dcr_unused_ttl_hours: 24.0,
+            oauth_dcr_rate_per_hour: 20,
             oauth_cimd_enabled: false,
             oauth_cimd_allow: Vec::new(),
             oauth_identities: vec!["remote-agent".into()],

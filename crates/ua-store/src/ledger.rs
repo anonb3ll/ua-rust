@@ -301,8 +301,14 @@ pub fn query(conn: &Connection, q: &EventQuery) -> UaResult<Vec<Event>> {
         args.push(Box::new(o.clone()));
     }
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    // Newest `limit` rows, returned oldest first.
-    let sql = format!("SELECT * FROM ({sql} ORDER BY seq DESC LIMIT {limit}) ORDER BY seq ASC");
+    // With a cursor, page forward: the oldest `limit` rows after it, so a
+    // poller never skips rows. Without one, the newest `limit` rows. Both are
+    // returned oldest first.
+    let sql = if q.after_seq.is_some() {
+        format!("{sql} ORDER BY seq ASC LIMIT {limit}")
+    } else {
+        format!("SELECT * FROM ({sql} ORDER BY seq DESC LIMIT {limit}) ORDER BY seq ASC")
+    };
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -389,6 +395,27 @@ mod tests {
             None,
         );
         assert_eq!(h, include_str!("../tests/fixtures/py_hash.txt").trim());
+    }
+
+    #[test]
+    fn a_cursor_pages_forward_without_skipping() {
+        let db = Db::open_in_memory(&[SCHEMA]).unwrap();
+        for i in 0..10 {
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+        }
+        let page = |after: i64| {
+            db.read(|c| {
+                query(c, &EventQuery { after_seq: Some(after), limit: Some(3), ..Default::default() })
+            })
+            .unwrap()
+        };
+        let first = page(0);
+        assert_eq!(first.iter().map(|e| e.payload["i"].as_i64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
+        let next = page(first.last().unwrap().seq);
+        assert_eq!(next.iter().map(|e| e.payload["i"].as_i64().unwrap()).collect::<Vec<_>>(), [3, 4, 5]);
+        // Without a cursor: the newest rows, oldest first.
+        let newest = db.read(|c| query(c, &EventQuery { limit: Some(2), ..Default::default() })).unwrap();
+        assert_eq!(newest.iter().map(|e| e.payload["i"].as_i64().unwrap()).collect::<Vec<_>>(), [8, 9]);
     }
 
     #[test]

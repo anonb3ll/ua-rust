@@ -1133,10 +1133,14 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let mut env = base_env();
     // A fresh, empty HOME per call, removed afterwards: commands never see
     // the operator's dotfiles or credential helpers, and nothing one call
-    // writes under `~` (caches, tool config, rc files) reaches a later call.
-    let scratch_home = ScratchHome::new(&ctx.hub.cfg().home)?;
+    // writes under `~` (tool config, rc files) reaches a later call. What
+    // common work needs from HOME is set explicitly instead: a git identity
+    // for the caller, the Rust toolchain, and one shared persistent cache.
+    let scratch_home = ScratchHome::new()?;
     env.retain(|(k, _)| k != "HOME");
     env.push(("HOME".into(), scratch_home.path.to_string_lossy().into_owned()));
+    env.extend(git_identity_env(&ctx.caller.label));
+    env.extend(toolchain_and_cache_env(&ctx.hub.cfg().home));
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
         for (k, v) in [
@@ -1214,21 +1218,145 @@ pub fn register(r: &mut Registry) {
     );
 }
 
-/// A per-call HOME directory under `$UA_HOME/run-home/`, deleted on drop.
+/// Run homes older than this are left over from a crashed process; no call
+/// lives longer than [`CMD_TIMEOUT_CAP_S`] plus a few seconds.
+const STALE_RUN_HOME: Duration = Duration::from_secs(600);
+
+/// Parent of the per-call homes: `$XDG_RUNTIME_DIR/ua-run/` when set, else
+/// `<temp>/ua-run-<uid>/`. Outside `$UA_HOME`, so a command never lands in
+/// the hub's data directory, and on a runtime dir when there is one.
+fn run_home_parent() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(rt) => PathBuf::from(rt).join("ua-run"),
+        None => {
+            #[cfg(unix)]
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let uid = unsafe { libc::geteuid() };
+            #[cfg(not(unix))]
+            let uid = 0;
+            std::env::temp_dir().join(format!("ua-run-{uid}"))
+        }
+    }
+}
+
+/// Create `dir` (mode 0700) or accept an existing one only when it is a real
+/// directory owned by this user, never a symlink: in a shared temp dir
+/// another user could have created the name first.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)?,
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!("{} is not a directory", dir.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::other(format!("{} belongs to another user", dir.display())));
+        }
+        if meta.mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove run homes left over by a crashed process. `ua serve` calls this
+/// at startup. Only entries older than a few minutes go, so a concurrent
+/// process's live homes are kept.
+pub fn sweep_run_homes() {
+    let parent = run_home_parent();
+    if private_dir(&parent).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&parent) else { return };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_RUN_HOME);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// `GIT_AUTHOR_*` and `GIT_COMMITTER_*` for the caller, so `git commit`
+/// works in an empty HOME and agent commits name the agent. The address
+/// uses the reserved `.invalid` domain.
+fn git_identity_env(label: &str) -> Vec<(String, String)> {
+    let name: String = label.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>')).collect();
+    let name = if name.trim().is_empty() { "agent".to_string() } else { name.trim().to_string() };
+    let local: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .collect();
+    let local = local.trim_matches(['.', '-']);
+    let email = format!("{}@agents.invalid", if local.is_empty() { "agent" } else { local });
+    ["AUTHOR", "COMMITTER"]
+        .iter()
+        .flat_map(|who| {
+            [(format!("GIT_{who}_NAME"), name.clone()), (format!("GIT_{who}_EMAIL"), email.clone())]
+        })
+        .collect()
+}
+
+/// The Rust toolchain from the hub's real home, and one persistent cache
+/// shared by every call (`$UA_HOME/run-cache/`), so tools do not download
+/// the same packages on every call.
+///
+/// - `RUSTUP_HOME` and `CARGO_HOME`: passed through, else `~/.rustup` and
+///   `~/.cargo` of the hub's real HOME when they exist. The cargo registry
+///   cache lives under `CARGO_HOME`, so it persists with it; without a
+///   cargo home, `CARGO_HOME` is the shared cache's `cargo/`.
+/// - `XDG_CACHE_HOME` and `UV_CACHE_DIR`: under the shared cache.
+fn toolchain_and_cache_env(ua_home: &Path) -> Vec<(String, String)> {
+    let real_home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let resolve = |var: &str, dot: &str| -> Option<PathBuf> {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| real_home.as_ref().map(|h| h.join(dot)).filter(|p| p.is_dir()))
+    };
+    let cache = ua_home.join("run-cache");
+    let cache_ok = private_dir(&cache).is_ok();
+    let mut env = Vec::new();
+    let mut put = |k: &str, v: &Path| env.push((k.to_string(), v.to_string_lossy().into_owned()));
+    if let Some(p) = resolve("RUSTUP_HOME", ".rustup") {
+        put("RUSTUP_HOME", &p);
+    }
+    match resolve("CARGO_HOME", ".cargo") {
+        Some(p) => put("CARGO_HOME", &p),
+        None if cache_ok => put("CARGO_HOME", &cache.join("cargo")),
+        None => {}
+    }
+    if cache_ok {
+        put("XDG_CACHE_HOME", &cache.join("xdg"));
+        put("UV_CACHE_DIR", &cache.join("uv"));
+    }
+    env
+}
+
+/// A per-call HOME directory under [`run_home_parent`], deleted on drop.
 pub(crate) struct ScratchHome {
-    pub(crate) path: std::path::PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 impl ScratchHome {
-    pub(crate) fn new(ua_home: &std::path::Path) -> UaResult<Self> {
-        let path = ua_home.join("run-home").join(ulid::Ulid::generate().to_string());
-        std::fs::create_dir_all(&path)
-            .map_err(|e| UaError::internal(format!("cannot prepare the command HOME: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-        }
+    pub(crate) fn new() -> UaResult<Self> {
+        let fail = |e: std::io::Error| UaError::internal(format!("cannot prepare the command HOME: {e}"));
+        let parent = run_home_parent();
+        private_dir(&parent).map_err(fail)?;
+        let path = parent.join(ulid::Ulid::generate().to_string());
+        private_dir(&path).map_err(fail)?;
         Ok(Self { path })
     }
 }
@@ -1236,5 +1364,38 @@ impl ScratchHome {
 impl Drop for ScratchHome {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod run_env_tests {
+    use super::*;
+
+    #[test]
+    fn git_identity_comes_from_the_label() {
+        let env: std::collections::HashMap<_, _> = git_identity_env("builder-1").into_iter().collect();
+        assert_eq!(env["GIT_AUTHOR_NAME"], "builder-1");
+        assert_eq!(env["GIT_COMMITTER_EMAIL"], "builder-1@agents.invalid");
+        let env: std::collections::HashMap<_, _> = git_identity_env("Odd <label> x").into_iter().collect();
+        assert_eq!(env["GIT_AUTHOR_NAME"], "Odd label x");
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "Odd-label-x@agents.invalid");
+        let env: std::collections::HashMap<_, _> = git_identity_env("  ").into_iter().collect();
+        assert_eq!(env["GIT_AUTHOR_EMAIL"], "agent@agents.invalid");
+    }
+
+    #[test]
+    fn run_homes_live_outside_ua_home_and_are_private() {
+        let home = ScratchHome::new().unwrap();
+        assert!(home.path.starts_with(run_home_parent()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [run_home_parent(), home.path.clone()] {
+                assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o700, "{p:?}");
+            }
+        }
+        let path = home.path.clone();
+        drop(home);
+        assert!(!path.exists());
     }
 }

@@ -19,9 +19,23 @@ and steps to reproduce. You will get an acknowledgement within a week.
   session over HTTP, or the confirmed CLI path on the hub host. A
   client-supplied `resolved_by` is never trusted.
 - **Auth is on by default** (`enforce_auth = true`). `/api` and `/ui` refuse
-  hosts outside `allowed_hosts`, as protection against DNS rebinding. They
-  also refuse state-changing requests that are cross-site or have non-JSON
-  bodies.
+  hosts outside `allowed_hosts` and the host of `public_url`, as protection
+  against DNS rebinding. They also refuse state-changing requests that are
+  cross-site or have non-JSON bodies.
+- **Event streams are governed.** `/api/events/stream` and
+  `/ui/activity/stream` open with an `event_log_query` call as the caller,
+  so a profile or policy that refuses the tool refuses the stream.
+- **Dynamic client registration is bounded.** Clients that never receive a
+  grant are pruned after `oauth_dcr_unused_ttl_hours`, unused clients are
+  capped (the oldest is evicted), and each address may register
+  `oauth_dcr_rate_per_hour` clients per hour.
 - **`run_cmd`** runs without a shell, from an allowlist. Interpreters and
   build tools park for human approval. Each call gets a fresh, empty `HOME`
-  that is deleted afterwards.
+  (under `$XDG_RUNTIME_DIR/ua-run/`, else `<temp>/ua-run-<uid>/`, mode
+  0700) that is deleted afterwards. What common work needs is set
+  explicitly: a git identity `<label> <label@agents.invalid>`, `RUSTUP_HOME`
+  and `CARGO_HOME` from the hub's own home, and `XDG_CACHE_HOME` and
+  `UV_CACHE_DIR` in one cache under `$UA_HOME/run-cache/` shared by every
+  agent. That cache and the cargo home are writable by every command, so
+  one agent can affect another agent's builds through them; give agents
+  that must not share a cache their own hub.

@@ -6,6 +6,7 @@
 pub mod api;
 pub mod auth;
 pub mod compat_api;
+pub mod events;
 pub mod guard;
 pub mod login;
 pub mod mcp;
@@ -51,7 +52,7 @@ pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Resul
     let bind = state.hub.cfg().bind;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, tools = state.registry.len(), "hub listening");
-    let app = router(state, ct.clone());
+    let app = router(state, ct.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).with_graceful_shutdown(async move { ct.cancelled_owned().await }).await?;
     Ok(())
 }
