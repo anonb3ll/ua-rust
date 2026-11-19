@@ -584,3 +584,45 @@ async fn run_cmd_caches_are_per_caller_and_cargo_home_is_the_hubs() {
         assert_ne!(Path::new(&a["CARGO_HOME"]), Path::new(&real));
     }
 }
+
+/// Cargo reads `.cargo/config*` in every ancestor of its cwd, so a config
+/// above the workspace root would reach run_cmd's cargo: refused, with
+/// the path named.
+#[tokio::test]
+async fn run_cmd_refuses_cargo_under_an_ancestor_cargo_config() {
+    let outer = tempfile::tempdir().unwrap();
+    let top = outer.path().canonicalize().unwrap();
+    let ws = top.join("nested/ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let env = setup_with(|c| {
+        c.workspace = Some(ws.clone());
+        c.shell_allowlist = vec!["cargo".into(), "echo".into()];
+    });
+    // Nothing above the workspace yet (outside the temp dir, the host may
+    // have its own; only ones under `top` are this test's).
+    let ours = |p: &PathBuf| p.starts_with(&top);
+    assert!(!ua_tools::families::workspace::ancestor_cargo_configs(&ws).iter().any(ours));
+
+    let planted = top.join(".cargo/config.toml");
+    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    std::fs::write(&planted, "[alias]\nleak = \"version\"\n").unwrap();
+
+    let err = env.call("run_cmd", json!({ "command": "cargo leak" })).await.unwrap_err();
+    match &err {
+        UaError::Denied { reason_code, reason } => {
+            assert_eq!(reason_code, "cargo-config");
+            assert!(reason.contains(&planted.display().to_string()), "{reason}");
+            assert!(reason.contains("outside that directory tree"), "{reason}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let check = env.call("run_cmd_check", json!({ "command": "cargo build" })).await.unwrap();
+    assert_eq!(check["verdict"], "block", "{check}");
+    assert!(check["findings"].as_array().unwrap().iter().any(|f| f["code"] == "cargo-config"), "{check}");
+    // Other programs are unaffected.
+    let r = env.call("run_cmd", json!({ "command": "echo ok" })).await.unwrap();
+    assert_eq!(r["exit_code"], 0, "{r}");
+    // The startup warning names the file too.
+    let warning = ua_tools::families::workspace::cargo_config_warning(env.hub.cfg()).unwrap();
+    assert!(warning.contains(&planted.display().to_string()), "{warning}");
+}

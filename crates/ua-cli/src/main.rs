@@ -206,6 +206,16 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
             }
             ua_tools::families::workspace::sweep_run_homes();
+            if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
+                tracing::warn!("{w}");
+            }
+            let pruned = ua_tools::families::workspace::prune_run_caches(
+                &cfg.home,
+                ua_tools::families::workspace::RUN_CACHE_MAX_AGE,
+            );
+            if pruned > 0 {
+                tracing::info!(pruned, "removed run_cmd caches unused for 30 days");
+            }
             // Reconcile runs a previous hub process left behind, then keep
             // sweeping. Only the server reaps: a short-lived `ua call` or a
             // stdio session must not judge another process's children.
