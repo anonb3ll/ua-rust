@@ -28,7 +28,7 @@ impl Env {
     }
 }
 
-fn verdict<'a>(r: &'a Value, line: u64) -> &'a Value {
+fn verdict(r: &Value, line: u64) -> &Value {
     r["verdicts"]
         .as_array()
         .unwrap()
