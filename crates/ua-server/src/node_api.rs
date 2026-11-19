@@ -39,8 +39,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/nodes", get(list))
 }
 
-/// `{"error", "code"}`: a denial's reason code, else the error's code.
-fn node_err(e: &UaError) -> Response {
+/// `{"error", "code"}`: a denial's reason code, else the error's code. An
+/// internal error's detail is never sent.
+fn node_err_body(e: &UaError) -> Value {
     let code = match e {
         UaError::Denied { reason_code, .. } => reason_code.clone(),
         other => other.code().to_string(),
@@ -49,7 +50,11 @@ fn node_err(e: &UaError) -> Response {
         UaError::Internal(_) => "internal error".to_string(),
         other => other.to_string(),
     };
-    (status_for(e), Json(json!({ "error": message, "code": code }))).into_response()
+    json!({ "error": message, "code": code })
+}
+
+fn node_err(e: &UaError) -> Response {
+    (status_for(e), Json(node_err_body(e))).into_response()
 }
 
 async fn call(
@@ -101,6 +106,23 @@ async fn list(
     let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
     match state.registry.call(&state.hub, &caller, "node_list", json!({})).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (status_for(&e), Json(json!({ "nodes": [], "error": e.to_string() }))).into_response(),
+        Err(e) => {
+            let mut body = node_err_body(&e);
+            body["nodes"] = json!([]);
+            (status_for(&e), Json(body)).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_errors_are_masked() {
+        let body = node_err_body(&UaError::internal("disk I/O error at /var/lib/hub/ua.db"));
+        assert_eq!(body, json!({ "error": "internal error", "code": "internal" }));
+        let body = node_err_body(&UaError::denied("node_retired", "node retired"));
+        assert_eq!(body["code"], "node_retired");
     }
 }
