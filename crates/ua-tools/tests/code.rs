@@ -131,8 +131,8 @@ func main() {
 "#;
 
 const PNG_3X5: &[u8] = &[
-    0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 3, 0, 0, 0, 5,
-    8, 6, 0, 0, 0,
+    0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 3, 0, 0,
+    0, 5, 8, 6, 0, 0, 0,
 ];
 
 struct Env {
@@ -306,7 +306,8 @@ async fn search_list_and_reindex() {
     env.ok("fs_index_symbols", json!({ "path": "." })).await;
 
     let res = env.ok("fs_search_symbols", json!({ "query": "greet" })).await;
-    let names: Vec<&str> = res["results"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> =
+        res["results"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
     assert_eq!(names[0], "greet", "exact match first: {names:?}");
     assert!(names.contains(&"Greeter") && names.contains(&"make_greeter"));
     assert_eq!(res["results"][0]["file_path"], "src/lib.rs");
@@ -342,7 +343,8 @@ async fn search_list_and_reindex() {
     // Paths stay inside the workspace.
     let err = env.call("fs_index_symbols", json!({ "path": "../" })).await.unwrap_err();
     assert_eq!(reason(&err), "outside_sandbox");
-    let err = env.call("fs_list_symbols", json!({ "file_path": "node_modules/dep/index.js" })).await.unwrap_err();
+    let err =
+        env.call("fs_list_symbols", json!({ "file_path": "node_modules/dep/index.js" })).await.unwrap_err();
     assert_eq!(reason(&err), "dependency_dir");
     let err = env.call("fs_index_symbols", json!({ "path": "nope" })).await.unwrap_err();
     assert_eq!(err.code(), "not_found");
@@ -361,7 +363,11 @@ async fn repo_map_ranks_and_budgets() {
     assert!(text.contains("`struct Greeter`"), "{text}");
     assert!(text.contains("`fn new(name: &str) -> Self`"), "{text}");
     assert!(text.contains("`def load_inventory(path, **kwargs)`"), "{text}");
-    assert!(text.contains("`func Server.Start(addr string) error`") || text.contains("`func Start(addr string) error`"), "{text}");
+    assert!(
+        text.contains("`func Server.Start(addr string) error`")
+            || text.contains("`func Start(addr string) error`"),
+        "{text}"
+    );
 
     let sub = env.ok("fs_repo_map", json!({ "path": "web" })).await;
     let sub_text = sub["repo_map"].as_str().unwrap();
@@ -398,20 +404,32 @@ async fn reads_images() {
 async fn renders_formats() {
     let env = setup();
     let t = env
-        .ok("format_render", json!({ "kind": "table", "payload": { "columns": ["id", "name"], "rows": [[1, "a|b"], [22]] } }))
+        .ok(
+            "format_render",
+            json!({ "kind": "table", "payload": { "columns": ["id", "name"], "rows": [[1, "a|b"], [22]] } }),
+        )
         .await;
     assert_eq!(t["markdown"], "| id | name |\n| --- | --- |\n| 1 | a\\|b |\n| 22 |  |");
     assert_eq!(t["text"], "id  name\n--  ----\n1   a|b\n22");
 
-    let s = env.ok("format_render", json!({ "kind": "section", "payload": { "summary": "Logs", "body": "x" } })).await;
+    let s = env
+        .ok("format_render", json!({ "kind": "section", "payload": { "summary": "Logs", "body": "x" } }))
+        .await;
     assert_eq!(s["markdown"], "<details>\n<summary>Logs</summary>\n\nx\n</details>");
     assert_eq!(s["text"], "Logs\n----\nx");
 
-    let c = env.ok("format_render", json!({ "kind": "code", "payload": { "content": "print(1)", "filename": "a.py" } })).await;
+    let c = env
+        .ok(
+            "format_render",
+            json!({ "kind": "code", "payload": { "content": "print(1)", "filename": "a.py" } }),
+        )
+        .await;
     assert_eq!(c["markdown"], "`a.py`\n```python\nprint(1)\n```");
     assert_eq!(c["text"], "a.py:\nprint(1)");
 
-    let ch = env.ok("format_render", json!({ "kind": "chips", "payload": { "mapping": { "ci": "green", "n": 3 } } })).await;
+    let ch = env
+        .ok("format_render", json!({ "kind": "chips", "payload": { "mapping": { "ci": "green", "n": 3 } } }))
+        .await;
     assert_eq!(ch["markdown"], "`ci: green` `n: 3`");
     assert_eq!(ch["text"], "ci=green · n=3");
 
@@ -425,23 +443,36 @@ async fn renders_formats() {
 async fn detects_dev_servers() {
     let env = setup();
     let p = env.ws.join("proj");
-    write(&p, "package.json", r#"{"name": "site", "scripts": {"dev": "vite --port 5173", "build": "vite build", "lint": "eslint ."}}"#);
+    write(
+        &p,
+        "package.json",
+        r#"{"name": "site", "scripts": {"dev": "vite --port 5173", "build": "vite build", "lint": "eslint ."}}"#,
+    );
     write(&p, "pnpm-lock.yaml", "");
     write(
         &p,
         "pyproject.toml",
         "[project]\nname = \"svc\"\n[project.scripts]\nsvc-server = \"svc.server:main\"\nsvc-cli = \"svc.cli:main\"\n",
     );
-    write(&p, "src/svc/server.py", "import os, uvicorn\nport = int(os.getenv('SVC_PORT', '8765'))\nuvicorn.run(app)\n");
+    write(
+        &p,
+        "src/svc/server.py",
+        "import os, uvicorn\nport = int(os.getenv('SVC_PORT', '8765'))\nuvicorn.run(app)\n",
+    );
     write(&p, "src/svc/cli.py", "def main():\n    print('hi')\n");
     write(&p, "Cargo.toml", "[package]\nname = \"api\"\n\n[dependencies]\naxum = \"0.8\"\n");
     write(&p, "src/main.rs", "async fn main() { let l = bind(\"0.0.0.0:8080\").await; }\n");
-    write(&p, "docker-compose.yml", "services:\n  db:\n    image: postgres\n    ports:\n      - \"5433:5432\"\n  worker:\n    image: busybox\n");
+    write(
+        &p,
+        "docker-compose.yml",
+        "services:\n  db:\n    image: postgres\n    ports:\n      - \"5433:5432\"\n  worker:\n    image: busybox\n",
+    );
     write(&p, "Procfile", "web: gunicorn app:app\n# comment\nworker: python worker.py\n");
 
     let out = env.ok("detect_dev_servers", json!({ "path": "proj" })).await;
     let cfgs = out["configurations"].as_array().unwrap();
-    let by_name = |n: &str| cfgs.iter().find(|c| c["name"] == n).unwrap_or_else(|| panic!("{n} missing: {out}"));
+    let by_name =
+        |n: &str| cfgs.iter().find(|c| c["name"] == n).unwrap_or_else(|| panic!("{n} missing: {out}"));
 
     let dev = by_name("site (dev)");
     assert_eq!(dev["runtimeExecutable"], "pnpm");
@@ -528,7 +559,8 @@ async fn dash_searches_and_views_docsets() {
     assert_eq!(list["docsets"][0]["platform"], "rust");
 
     let res = env.ok("dash_search", json!({ "query": "vec" })).await;
-    let names: Vec<&str> = res["results"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> =
+        res["results"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["Vec", "VecDeque", "into_vec"]);
     let err = env.call("dash_search", json!({ "query": "vec", "docset": "python" })).await.unwrap_err();
     assert_eq!(err.code(), "not_found");
@@ -537,9 +569,11 @@ async fn dash_searches_and_views_docsets() {
     assert!(page["content"].as_str().unwrap().contains("contiguous growable array"), "{page}");
     assert_eq!(page["truncated"], false);
 
-    let err = env.call("dash_view", json!({ "docset_id": "rusty", "path": "../../Info.plist" })).await.unwrap_err();
+    let err =
+        env.call("dash_view", json!({ "docset_id": "rusty", "path": "../../Info.plist" })).await.unwrap_err();
     assert_eq!(reason(&err), "outside_docset");
-    let err = env.call("dash_view", json!({ "docset_id": "rusty", "path": "std/none.html" })).await.unwrap_err();
+    let err =
+        env.call("dash_view", json!({ "docset_id": "rusty", "path": "std/none.html" })).await.unwrap_err();
     assert_eq!(err.code(), "not_found");
     assert!(env.docs.join("Rusty.docset").is_dir());
 }

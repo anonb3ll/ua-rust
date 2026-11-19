@@ -196,12 +196,17 @@ async fn vet_url(url: &Url, allow_loopback: bool) -> UaResult<()> {
     }
     let host = url.host().ok_or_else(|| UaError::invalid(format!("invalid URL (no host): {url}")))?;
     match host {
-        url::Host::Ipv4(ip) => vet_ip(IpAddr::V4(ip), allow_loopback).map_err(|w| ssrf_denied(&ip.to_string(), w)),
-        url::Host::Ipv6(ip) => vet_ip(IpAddr::V6(ip), allow_loopback).map_err(|w| ssrf_denied(&ip.to_string(), w)),
+        url::Host::Ipv4(ip) => {
+            vet_ip(IpAddr::V4(ip), allow_loopback).map_err(|w| ssrf_denied(&ip.to_string(), w))
+        }
+        url::Host::Ipv6(ip) => {
+            vet_ip(IpAddr::V6(ip), allow_loopback).map_err(|w| ssrf_denied(&ip.to_string(), w))
+        }
         url::Host::Domain(name) => {
-            let addrs = resolve(name).await.map_err(|e| UaError::invalid(e))?;
+            let addrs = resolve(name).await.map_err(UaError::invalid)?;
             for a in &addrs {
-                vet_ip(a.ip(), allow_loopback).map_err(|w| ssrf_denied(name, format!("it resolves to {w}")))?;
+                vet_ip(a.ip(), allow_loopback)
+                    .map_err(|w| ssrf_denied(name, format!("it resolves to {w}")))?;
             }
             Ok(())
         }
@@ -325,12 +330,11 @@ async fn fetch(client: &reqwest::Client, allow_loopback: bool, mut spec: Request
         let mut resp = rb.send().await.map_err(|e| send_error(&spec.url, e))?;
         let status = resp.status();
         if status.is_redirection() && status != reqwest::StatusCode::NOT_MODIFIED {
-            let loc = resp
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| UaError::invalid(format!("HTTP {} without a Location header", status.as_u16())))?;
-            let next = spec.url.join(loc).map_err(|e| UaError::invalid(format!("bad redirect target: {e}")))?;
+            let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or_else(|| {
+                UaError::invalid(format!("HTTP {} without a Location header", status.as_u16()))
+            })?;
+            let next =
+                spec.url.join(loc).map_err(|e| UaError::invalid(format!("bad redirect target: {e}")))?;
             if hop == MAX_REDIRECTS {
                 return Err(UaError::invalid(format!("stopped after {MAX_REDIRECTS} redirects")));
             }
@@ -423,7 +427,8 @@ fn is_html(content_type: &str, text: &str) -> bool {
     if content_type == "text/html" || content_type == "application/xhtml+xml" {
         return true;
     }
-    if !content_type.is_empty() && content_type != "text/plain" && content_type != "application/octet-stream" {
+    if !content_type.is_empty() && content_type != "text/plain" && content_type != "application/octet-stream"
+    {
         return false;
     }
     let head: String = text.chars().take(1024).collect::<String>().to_ascii_lowercase();
@@ -519,7 +524,11 @@ fn shape_fetch(url: String, f: Fetched, cap: usize, raw: bool, pdf_base64: bool)
         return media_result("pdf", "application/pdf".into(), pdf_note(f.body.len(), pdf_base64));
     }
     if f.body[..f.body.len().min(8192)].contains(&0) {
-        let mime = if f.content_type.is_empty() { "application/octet-stream".into() } else { f.content_type.clone() };
+        let mime = if f.content_type.is_empty() {
+            "application/octet-stream".into()
+        } else {
+            f.content_type.clone()
+        };
         let note = format!("Binary content, {} bytes; returned as base64.", f.body.len());
         return media_result("binary", mime, note);
     }
@@ -606,7 +615,11 @@ impl Provider {
 
 fn api_key(configured: &Option<SecretString>, env: &str) -> Option<SecretString> {
     configured.clone().or_else(|| {
-        std::env::var(env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).map(SecretString::from)
+        std::env::var(env)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(SecretString::from)
     })
 }
 
@@ -676,7 +689,8 @@ pub fn parse_ddg(html: &str, max: usize) -> Result<Vec<SearchHit>, String> {
             let Some(a) = r.try_select("a.result__a") else { continue };
             let a = a.first();
             let Some(url) = a.attr("href").and_then(|h| ddg_target(&h)) else { continue };
-            let snippet = r.try_select(".result__snippet").map(|s| collapse_ws(&s.first().text())).unwrap_or_default();
+            let snippet =
+                r.try_select(".result__snippet").map(|s| collapse_ws(&s.first().text())).unwrap_or_default();
             out.push(SearchHit { title: collapse_ws(&a.text()), url, snippet });
         }
     }
@@ -747,13 +761,15 @@ async fn search_ddg(cfg: &Config, query: &str, max: usize) -> UaResult<Vec<Searc
 }
 
 fn secret_header(value: &str) -> UaResult<HeaderValue> {
-    let mut v = HeaderValue::from_str(value).map_err(|_| UaError::invalid("the API key is not a valid header value"))?;
+    let mut v = HeaderValue::from_str(value)
+        .map_err(|_| UaError::invalid("the API key is not a valid header value"))?;
     v.set_sensitive(true);
     Ok(v)
 }
 
 fn json_body(f: &Fetched) -> UaResult<Value> {
-    serde_json::from_slice(&f.body).map_err(|e| UaError::invalid(format!("search API returned invalid JSON: {e}")))
+    serde_json::from_slice(&f.body)
+        .map_err(|e| UaError::invalid(format!("search API returned invalid JSON: {e}")))
 }
 
 fn hits_from(items: Option<&Vec<Value>>, snippet_key: &str, max: usize) -> Vec<SearchHit> {
@@ -805,7 +821,12 @@ fn cache_cutoff(ttl_min: f64) -> String {
     ua_core::time::format_ts(ts)
 }
 
-async fn cache_get(ctx: &ToolCtx, provider: &'static str, query: String, max: usize) -> UaResult<Option<Value>> {
+async fn cache_get(
+    ctx: &ToolCtx,
+    provider: &'static str,
+    query: String,
+    max: usize,
+) -> UaResult<Option<Value>> {
     let ttl = ctx.hub.cfg().search_cache_ttl_min;
     if ttl <= 0.0 {
         return Ok(None);

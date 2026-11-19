@@ -314,11 +314,11 @@ fn list_symbols(conn: &Connection, sb: &Sandbox, file_path: &str) -> UaResult<Va
         return Err(UaError::not_found(format!("file {file_path:?} does not exist")));
     }
     let rel = rel_slash(&sb.root, &p);
-    let mut stmt = conn.prepare(
-        "SELECT * FROM code_symbols WHERE workspace = ?1 AND file_path = ?2 ORDER BY line_no, id",
-    )?;
-    let rows: Vec<Value> =
-        stmt.query_map([workspace_key(sb), rel.clone()], |r| row_json(r, false))?.collect::<Result<_, _>>()?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM code_symbols WHERE workspace = ?1 AND file_path = ?2 ORDER BY line_no, id")?;
+    let rows: Vec<Value> = stmt
+        .query_map([workspace_key(sb), rel.clone()], |r| row_json(r, false))?
+        .collect::<Result<_, _>>()?;
     if !rows.is_empty() {
         return Ok(json!({ "symbols": rows, "degraded": false, "source": "index" }));
     }
@@ -331,7 +331,8 @@ fn list_symbols(conn: &Connection, sb: &Sandbox, file_path: &str) -> UaResult<Va
             "note": format!("no grammar for this file type; supported: {}", SUPPORTED_LANGUAGES.join(", ")),
         }));
     };
-    let meta = std::fs::metadata(&p).map_err(|e| UaError::invalid(format!("cannot read {file_path}: {e}")))?;
+    let meta =
+        std::fs::metadata(&p).map_err(|e| UaError::invalid(format!("cannot read {file_path}: {e}")))?;
     if meta.len() > INDEX_FILE_MAX_BYTES {
         return Err(UaError::invalid(format!("file is larger than {INDEX_FILE_MAX_BYTES} bytes")));
     }
@@ -516,7 +517,9 @@ fn file_block(file: &str, syms: &[&MapSym]) -> Vec<String> {
             l.push_str(&format!(" — *{}*", c.docstring));
         }
         lines.push(l);
-        for m in syms.iter().filter(|m| m.sym_type == "method" && m.parent.as_deref() == Some(c.name.as_str())) {
+        for m in
+            syms.iter().filter(|m| m.sym_type == "method" && m.parent.as_deref() == Some(c.name.as_str()))
+        {
             shown_methods.insert((m.name.as_str(), m.line_no));
             lines.push(format!("    - `{} {}{}`", function_keyword(&m.language), m.name, m.signature));
         }
@@ -529,7 +532,10 @@ fn file_block(file: &str, syms: &[&MapSym]) -> Vec<String> {
         lines.push(l);
     }
     // Methods of types declared elsewhere (impl blocks, Go receivers).
-    for m in syms.iter().filter(|m| m.sym_type == "method" && !shown_methods.contains(&(m.name.as_str(), m.line_no))) {
+    for m in syms
+        .iter()
+        .filter(|m| m.sym_type == "method" && !shown_methods.contains(&(m.name.as_str(), m.line_no)))
+    {
         let parent = m.parent.as_deref().unwrap_or("?");
         lines.push(format!("  - `{} {parent}.{}{}`", function_keyword(&m.language), m.name, m.signature));
     }

@@ -28,7 +28,8 @@ const COMPOSE_NAMES: &[&str] = &["docker-compose.yml", "docker-compose.yaml", "c
 const RUST_SERVER_CRATES: &[&str] =
     &["axum", "actix-web", "rocket", "warp", "hyper", "poem", "tide", "salvo", "tower-http", "rmcp"];
 
-static PORT_FLAG: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(?:--port|-p)[\s=](\d{2,5})\b").ok());
+static PORT_FLAG: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?:--port|-p)[\s=](\d{2,5})\b").ok());
 static PORT_ENV: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"\bPORT\s*=\s*(\d{2,5})\b").ok());
 static PORT_GETENV: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"getenv\(\s*["']\w*PORT\w*["']\s*,\s*["']?(\d{2,5})"#).ok());
@@ -63,11 +64,17 @@ fn read_text(p: &Path) -> Option<String> {
 }
 
 fn port_in(re: &Option<Regex>, text: &str) -> Option<u16> {
-    re.as_ref()?
-        .captures(text).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok())
+    re.as_ref()?.captures(text).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok())
 }
 
-fn config(name: String, exe: &str, args: Vec<String>, port: Option<u16>, source: &str, note: Option<&str>) -> Value {
+fn config(
+    name: String,
+    exe: &str,
+    args: Vec<String>,
+    port: Option<u16>,
+    source: &str,
+    note: Option<&str>,
+) -> Value {
     json!({
         "name": name,
         "runtimeExecutable": exe,
@@ -87,16 +94,18 @@ fn detect_node(root: &Path, out: &mut Vec<Value>, warnings: &mut Vec<String>) {
             return;
         }
     };
-    let manager = NODE_LOCKFILES.iter().find(|(f, _)| root.join(f).is_file()).map(|(_, m)| *m).unwrap_or("npm");
-    let pkg_name = pkg
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    let manager =
+        NODE_LOCKFILES.iter().find(|(f, _)| root.join(f).is_file()).map(|(_, m)| *m).unwrap_or("npm");
+    let pkg_name =
+        pkg.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+            root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        });
     let Some(scripts) = pkg.get("scripts").and_then(Value::as_object) else { return };
     for (name, cmd) in scripts {
         let Some(cmd) = cmd.as_str() else { continue };
-        if !NODE_DEV_SCRIPT_NAMES.contains(&name.as_str()) && !NODE_DEV_SCRIPT_TOKENS.iter().any(|t| cmd.contains(t)) {
+        if !NODE_DEV_SCRIPT_NAMES.contains(&name.as_str())
+            && !NODE_DEV_SCRIPT_TOKENS.iter().any(|t| cmd.contains(t))
+        {
             continue;
         }
         let port = port_in(&PORT_FLAG, cmd).or_else(|| port_in(&PORT_ENV, cmd));
@@ -288,7 +297,9 @@ fn detect_procfile(root: &Path, out: &mut Vec<Value>) {
             parts.collect(),
             None,
             "Procfile",
-            Some("Procfile processes typically read $PORT at runtime; set it explicitly if starting standalone"),
+            Some(
+                "Procfile processes typically read $PORT at runtime; set it explicitly if starting standalone",
+            ),
         );
         c["runtimeExecutable"] = json!(exe);
         out.push(c);

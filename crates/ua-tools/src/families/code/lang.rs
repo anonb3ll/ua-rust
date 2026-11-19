@@ -169,7 +169,9 @@ impl<'a> Extractor<'a> {
     fn signature(&self, n: Node) -> String {
         let params = n.child_by_field_name("parameters").map(|p| self.text(p)).unwrap_or("");
         let ret = match self.lang {
-            Lang::Rust | Lang::Python => n.child_by_field_name("return_type").map(|r| format!(" -> {}", self.text(r))),
+            Lang::Rust | Lang::Python => {
+                n.child_by_field_name("return_type").map(|r| format!(" -> {}", self.text(r)))
+            }
             Lang::Go => n.child_by_field_name("result").map(|r| format!(" {}", self.text(r))),
             _ => n.child_by_field_name("return_type").map(|r| self.text(r).to_string()),
         };
@@ -220,12 +222,17 @@ impl<'a> Extractor<'a> {
                 cur = c.prev_sibling();
                 continue;
             }
-            if !kind.contains("comment") || c.end_position().row + 1 < expected_row {
+            if !kind.contains("comment") {
                 break;
             }
             let text = self.text(c);
+            // Node text may include a trailing newline; count only real lines.
+            let end_row = c.start_position().row + text.trim_end().lines().count().saturating_sub(1);
+            if end_row + 1 < expected_row {
+                break;
+            }
             let doc = match self.lang {
-                Lang::Rust => text.starts_with("///") || text.starts_with("/**") || text.starts_with("//!"),
+                Lang::Rust => text.starts_with("///") || text.starts_with("/**"),
                 Lang::Go => text.starts_with("//") || text.starts_with("/*"),
                 _ => text.starts_with("/**") || text.starts_with("//"),
             };
@@ -444,7 +451,10 @@ impl<'a> Extractor<'a> {
                     let mut sig = self.signature(value);
                     if sig.is_empty() {
                         // `x => x`: a single bare parameter.
-                        sig = value.child_by_field_name("parameter").map(|p| format!("({})", self.text(p))).unwrap_or_default();
+                        sig = value
+                            .child_by_field_name("parameter")
+                            .map(|p| format!("({})", self.text(p)))
+                            .unwrap_or_default();
                     }
                     // Document comments sit above the declaration statement.
                     self.push(n, name, "function", parent, sig);
@@ -477,7 +487,10 @@ mod tests {
         let src = "/// A point.\n#[derive(Debug)]\npub struct Point { x: i32 }\n\nimpl Point {\n    /// Make one.\n    pub fn new(x: i32) -> Self { Point { x } }\n}\n\nfn helper() {}\n";
         let s = parse_symbols(Lang::Rust, src).unwrap();
         let names: Vec<_> = s.iter().map(|s| (s.name.as_str(), s.sym_type, s.parent.as_deref())).collect();
-        assert_eq!(names, [("Point", "class", None), ("new", "method", Some("Point")), ("helper", "function", None)]);
+        assert_eq!(
+            names,
+            [("Point", "class", None), ("new", "method", Some("Point")), ("helper", "function", None)]
+        );
         assert_eq!(s[0].docstring, "A point.");
         assert_eq!(s[1].docstring, "Make one.");
         assert_eq!(s[1].signature, "(x: i32) -> Self");

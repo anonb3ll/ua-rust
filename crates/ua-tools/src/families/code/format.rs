@@ -74,7 +74,13 @@ pub fn format_table(columns: &[Value], rows: &[Value]) -> UaResult<Value> {
         }
     }
     let mut txt = vec![
-        cols.iter().enumerate().map(|(i, c)| pad(c, widths[i])).collect::<Vec<_>>().join("  ").trim_end().to_string(),
+        cols.iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string(),
         widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "),
     ];
     for cells in &norm {
@@ -133,7 +139,8 @@ pub fn format_chips(mapping: &Map<String, Value>) -> UaResult<Value> {
 }
 
 pub fn format_render(kind: &str, payload: &Map<String, Value>) -> UaResult<Value> {
-    let missing = |key: &str| UaError::invalid(format!("payload for kind={kind:?} is missing required key '{key}'"));
+    let missing =
+        |key: &str| UaError::invalid(format!("payload for kind={kind:?} is missing required key '{key}'"));
     let wrong = |key: &str, ty: &str| UaError::invalid(format!("payload key '{key}' must be {ty}"));
     let string = |key: &str| -> UaResult<String> {
         match payload.get(key) {
@@ -166,7 +173,9 @@ pub fn format_render(kind: &str, payload: &Map<String, Value>) -> UaResult<Value
             let mapping = payload.get("mapping").ok_or_else(|| missing("mapping"))?;
             format_chips(mapping.as_object().ok_or_else(|| wrong("mapping", "an object"))?)
         }
-        other => Err(UaError::invalid(format!("kind must be one of table|section|code|chips, got {other:?}"))),
+        other => {
+            Err(UaError::invalid(format!("kind must be one of table|section|code|chips, got {other:?}")))
+        }
     }
 }
 

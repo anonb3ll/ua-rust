@@ -64,8 +64,8 @@ const DDG_LITE: &str = r#"<html><body><table>
 </table></body></html>"#;
 
 const PNG_1X2: &[u8] = &[
-    0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 2,
-    8, 6, 0, 0, 0,
+    0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0,
+    0, 2, 8, 6, 0, 0, 0,
 ];
 
 struct Server {
@@ -91,12 +91,18 @@ async fn spawn_server() -> Server {
                 ([(header::CONTENT_TYPE, "text/plain; charset=iso-8859-1")], b"caf\xe9".to_vec())
             }),
         )
-        .route("/image", get(|| async { ([(header::CONTENT_TYPE, "application/octet-stream")], PNG_1X2.to_vec()) }))
+        .route(
+            "/image",
+            get(|| async { ([(header::CONTENT_TYPE, "application/octet-stream")], PNG_1X2.to_vec()) }),
+        )
         .route(
             "/doc.pdf",
             get(|| async { ([(header::CONTENT_TYPE, "application/pdf")], b"%PDF-1.4\n%fake\n".to_vec()) }),
         )
-        .route("/big", get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "a".repeat(3 * 1024 * 1024)) }))
+        .route(
+            "/big",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "a".repeat(3 * 1024 * 1024)) }),
+        )
         .route("/missing", get(|| async { StatusCode::NOT_FOUND }))
         .route("/to-private", get(|| redirect("http://10.0.0.1/".into())))
         .route("/to-metadata", get(|| redirect("http://169.254.169.254/latest/meta-data/".into())))
@@ -106,7 +112,11 @@ async fn spawn_server() -> Server {
         .route(
             "/chain/{n}",
             get(|Path(n): Path<u32>| async move {
-                if n == 0 { redirect("/plain".into()).await } else { redirect(format!("/chain/{}", n - 1)).await }
+                if n == 0 {
+                    redirect("/plain".into()).await
+                } else {
+                    redirect(format!("/chain/{}", n - 1)).await
+                }
             }),
         )
         .route(
@@ -119,7 +129,12 @@ async fn spawn_server() -> Server {
                 }
             }),
         )
-        .route("/ddg-challenge", any(|| async { ([(header::CONTENT_TYPE, "text/html")], "<div class=\"anomaly-modal\">bots</div>") }));
+        .route(
+            "/ddg-challenge",
+            any(|| async {
+                ([(header::CONTENT_TYPE, "text/html")], "<div class=\"anomaly-modal\">bots</div>")
+            }),
+        );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -243,7 +258,10 @@ async fn extracts_readable_markdown() {
     assert!(content.contains("**borrow checking**"), "{content}");
     assert!(content.contains("Water daily"), "{content}");
     assert!(!content.contains("window.tracking"), "{content}");
-    assert!(page["title"].as_str().unwrap().contains("Field Notes") || page["title"].as_str().unwrap().contains("Rust Garden"));
+    assert!(
+        page["title"].as_str().unwrap().contains("Field Notes")
+            || page["title"].as_str().unwrap().contains("Rust Garden")
+    );
     assert_eq!(page["untrusted"], true);
     assert_eq!(page["truncated"], false);
 
@@ -251,7 +269,8 @@ async fn extracts_readable_markdown() {
     assert!(raw["content"].as_str().unwrap().starts_with("<!doctype html>"));
     assert_eq!(raw["title"], Value::Null);
 
-    let capped = env.call("web_fetch", json!({ "url": format!("{base}/article"), "max_chars": 10 })).await.unwrap();
+    let capped =
+        env.call("web_fetch", json!({ "url": format!("{base}/article"), "max_chars": 10 })).await.unwrap();
     assert_eq!(capped["content"].as_str().unwrap().chars().count(), 100, "max_chars is clamped to 100");
     assert_eq!(capped["truncated"], true);
 
@@ -260,7 +279,8 @@ async fn extracts_readable_markdown() {
     let latin = env.fetch(&format!("{base}/latin1")).await.unwrap();
     assert_eq!(latin["content"], "café");
 
-    let big = env.call("web_fetch", json!({ "url": format!("{base}/big"), "max_chars": 200000 })).await.unwrap();
+    let big =
+        env.call("web_fetch", json!({ "url": format!("{base}/big"), "max_chars": 200000 })).await.unwrap();
     assert_eq!(big["truncated"], true);
 
     let err = env.fetch(&format!("{base}/missing")).await.unwrap_err();
@@ -282,7 +302,8 @@ async fn binary_bodies_come_back_as_base64() {
     assert_eq!(pdf["kind"], "pdf");
     assert!(pdf["base64"].as_str().unwrap().starts_with("JVBERi0"));
     assert!(pdf["note"].as_str().unwrap().contains("no in-process PDF text extraction"));
-    let asked = env.call("web_fetch", json!({ "url": format!("{base}/doc.pdf"), "pdf_base64": true })).await.unwrap();
+    let asked =
+        env.call("web_fetch", json!({ "url": format!("{base}/doc.pdf"), "pdf_base64": true })).await.unwrap();
     assert!(!asked["note"].as_str().unwrap().contains("no in-process"));
 }
 
@@ -310,7 +331,7 @@ fn converts_fixture_html() {
     let (title, md) = html_to_markdown(ARTICLE, Some("https://example.com/notes"));
     assert!(title.is_some());
     assert!(md.contains("Tending a Rust Garden") || md.contains("Compilers are patient"), "{md}");
-    assert!(md.contains("- Water daily") || md.contains("* Water daily"), "{md}");
+    assert!(md.contains("Water daily") && md.contains("Prune weekly"), "{md}");
     assert!(!md.contains("tracking"));
 }
 

@@ -132,8 +132,10 @@ fn search(cfg: &Config, query: &str, docset: Option<&str>) -> UaResult<Value> {
     let mut results: Vec<(u8, usize, String, Value)> = Vec::new();
     for d in &docsets {
         let db = d.path.join("Contents/Resources/docSet.dsidx");
-        let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        else {
+        let Ok(conn) = Connection::open_with_flags(
+            &db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
             continue;
         };
         let Ok(mut stmt) =
@@ -154,7 +156,8 @@ fn search(cfg: &Config, query: &str, docset: Option<&str>) -> UaResult<Value> {
             } else {
                 2
             };
-            let row = json!({ "docset_name": d.name, "docset_id": d.id, "name": name, "type": ty, "path": path });
+            let row =
+                json!({ "docset_name": d.name, "docset_id": d.id, "name": name, "type": ty, "path": path });
             results.push((score, name.chars().count(), nl, row));
         }
     }
@@ -184,11 +187,16 @@ fn view(cfg: &Config, docset_id: &str, path: &str) -> UaResult<Value> {
         .canonicalize()
         .map_err(|_| UaError::not_found("docset has no Documents directory"))?;
     let candidate = docs_root.join(&clean);
-    let resolved = candidate.canonicalize().map_err(|_| UaError::not_found(format!("page not found: {clean}")))?;
+    let resolved =
+        candidate.canonicalize().map_err(|_| UaError::not_found(format!("page not found: {clean}")))?;
     if !resolved.starts_with(&docs_root) {
-        return Err(UaError::denied("outside_docset", format!("path {path:?} escapes the docset documents root")));
+        return Err(UaError::denied(
+            "outside_docset",
+            format!("path {path:?} escapes the docset documents root"),
+        ));
     }
-    let meta = std::fs::metadata(&resolved).map_err(|_| UaError::not_found(format!("page not found: {clean}")))?;
+    let meta =
+        std::fs::metadata(&resolved).map_err(|_| UaError::not_found(format!("page not found: {clean}")))?;
     if !meta.is_file() {
         return Err(UaError::not_found(format!("page not found: {clean}")));
     }
