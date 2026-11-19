@@ -143,6 +143,7 @@
   "approval_resolve",
   "check_agent_capability",
   "crew_view",
+  "dispatch_cancel",
   "dispatch_confirm_cancellation",
   "dispatch_delivery_receipt",
   "dispatch_retry_cancellation",
