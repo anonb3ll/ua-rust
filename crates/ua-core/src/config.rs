@@ -64,6 +64,8 @@ pub struct Config {
     /// Tools that always need a one-time human approval.
     #[serde(deserialize_with = "string_or_list")]
     pub approval_tools: Vec<String>,
+    /// Hours an approved, unconsumed one-shot pass stays valid.
+    pub approval_pass_ttl_hours: f64,
     /// Policy rules file (YAML).
     pub policy_file: Option<PathBuf>,
     /// Identity label → default profile name. Unlisted identities get `developer`.
@@ -92,6 +94,7 @@ impl Default for Config {
             human_identities: Vec::new(),
             shell_allowlist: Vec::new(),
             approval_tools: Vec::new(),
+            approval_pass_ttl_hours: 24.0,
             policy_file: None,
             profiles: BTreeMap::new(),
             agent_workspaces: BTreeMap::new(),
