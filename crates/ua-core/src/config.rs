@@ -93,6 +93,29 @@ pub struct Config {
     pub embed_model: String,
     /// Edition: `full` (default) or `core`, which hides ledger features.
     pub edition: String,
+    /// `web_search` provider: `auto` (an API provider whose key is set, else
+    /// `ddg`), `ddg` (keyless DuckDuckGo), `brave` or `tavily`.
+    pub search_provider: String,
+    /// Brave Search API key. `BRAVE_API_KEY` is also read when this is unset.
+    #[serde(skip_serializing)]
+    pub brave_api_key: Option<SecretString>,
+    /// Tavily API key. `TAVILY_API_KEY` is also read when this is unset.
+    #[serde(skip_serializing)]
+    pub tavily_api_key: Option<SecretString>,
+    /// Minutes a cached `web_search` answer stays fresh; 0 turns the cache off.
+    pub search_cache_ttl_min: f64,
+    /// Directories holding Dash/Zeal `.docset` bundles, as a list or a
+    /// colon-separated string. The `dash_*` tools are off when empty.
+    #[serde(deserialize_with = "colon_or_list")]
+    pub dash_docsets: Vec<PathBuf>,
+    /// Test hook: lets `web_fetch` and `web_search` reach loopback addresses
+    /// (and only those). It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub fetch_allow_loopback: bool,
+    /// Test hook: replaces the DuckDuckGo endpoint `web_search` queries. It
+    /// cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub search_endpoint: Option<String>,
 }
 
 impl Default for Config {
@@ -124,6 +147,13 @@ impl Default for Config {
             agent_workspaces: BTreeMap::new(),
             embed_model: "BAAI/bge-small-en-v1.5".into(),
             edition: "full".into(),
+            search_provider: "auto".into(),
+            brave_api_key: None,
+            tavily_api_key: None,
+            search_cache_ttl_min: 60.0,
+            dash_docsets: Vec::new(),
+            fetch_allow_loopback: false,
+            search_endpoint: None,
         }
     }
 }
@@ -183,6 +213,7 @@ impl Config {
         self.vault_path = self.vault_path.map(|p| expand_tilde(&p));
         self.read_roots = self.read_roots.iter().map(|p| expand_tilde(p)).collect();
         self.policy_file = self.policy_file.map(|p| expand_tilde(&p));
+        self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
         self
     }
 
@@ -275,6 +306,28 @@ where
     let items = match OneOrMany::deserialize(d)? {
         OneOrMany::One(s) => {
             s.split([',', ' ', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+        }
+        OneOrMany::Many(v) => v,
+    };
+    Ok(items.into_iter().map(T::from).collect())
+}
+
+/// Deserialize either a list or a colon/newline separated string. Paths can
+/// hold spaces, so unlike [`string_or_list`] a space does not split.
+fn colon_or_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: From<String>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let items = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => {
+            s.split([':', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
         }
         OneOrMany::Many(v) => v,
     };
