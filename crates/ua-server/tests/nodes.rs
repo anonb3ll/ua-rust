@@ -12,12 +12,15 @@ use ua_core::{ActorKind, Caller, Config, Profile, identity::Transport};
 const BUILDER: &str = "builder-1-test-token-0001";
 const OTHER: &str = "builder-2-test-token-0002";
 const OPERATOR: &str = "operator-test-token-0003";
+const PUBLIC: &str = "public-test-token-0004";
 
 fn config() -> Config {
     let mut cfg = common::config();
     cfg.oauth_enabled = false;
-    cfg.agent_tokens =
-        Some(SecretString::from(format!("builder-1:{BUILDER},builder-2:{OTHER},operator:{OPERATOR}")));
+    cfg.agent_tokens = Some(SecretString::from(format!(
+        "builder-1:{BUILDER},builder-2:{OTHER},operator:{OPERATOR},viewer-1:{PUBLIC}"
+    )));
+    cfg.profiles.insert("viewer-1".into(), "public".into());
     cfg
 }
 
@@ -63,10 +66,16 @@ async fn an_agent_registers_heartbeats_and_lists_its_node() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["cancel"], json!([]));
 
-    let resp = hub.send(get("/api/nodes", None, Some(OTHER))).await;
+    // The owner sees full facts; another agent a summary without paths.
+    let v = json_body(hub.send(get("/api/nodes", None, Some(OTHER))).await).await;
+    assert_eq!(v["nodes"][0]["detail"], "summary");
+    assert_eq!(v["nodes"][0]["status"], "live");
+    assert!(!v.to_string().contains("/srv/work"), "{v}");
+    let resp = hub.send(get("/api/nodes", None, Some(BUILDER))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     assert_eq!(v["nodes"][0]["node"], "node-a");
+    assert_eq!(v["nodes"][0]["detail"], "full");
     assert_eq!(v["nodes"][0]["status"], "live");
     assert_eq!(v["nodes"][0]["backends"], json!(["codex"]));
     assert_eq!(v["nodes"][0]["worktree_roots"], json!(["/srv/work"]));
@@ -143,4 +152,15 @@ async fn queue_routes_are_not_built_yet() {
     assert_eq!(v["capability"], "node_queue");
     let resp = hub.send(get("/api/nodes/acceptance", None, Some(BUILDER))).await;
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn a_refused_listing_answers_in_the_node_error_shape() {
+    let hub = TestHub::new(config());
+    let resp = hub.send(get("/api/nodes", None, Some(PUBLIC))).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v = json_body(resp).await;
+    assert_eq!(v["code"], "profile_denied", "{v}");
+    assert_eq!(v["nodes"], json!([]));
+    assert!(v["error"].is_string());
 }
