@@ -9,7 +9,7 @@
 //! a one-time human approval even when `run_cmd` is not in `approval_tools`.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -257,6 +257,45 @@ static EXPANSION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"\$[
 
 fn program_name(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
+}
+
+/// Cargo config files in the directories above `root` (not in `root` or
+/// below it, which the workspace owns). Cargo reads `.cargo/config` and
+/// `.cargo/config.toml` in every ancestor of its cwd and has no supported
+/// switch to stop that walk, so a config there applies to every cargo
+/// command run in the workspace, whatever `CARGO_HOME` says.
+pub fn ancestor_cargo_configs(root: &Path) -> Vec<PathBuf> {
+    root.ancestors()
+        .skip(1)
+        .flat_map(|dir| ["config", "config.toml"].map(|f| dir.join(".cargo").join(f)))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .collect()
+}
+
+/// A startup warning when cargo config files sit above any configured
+/// workspace root (the default root and each per-agent root); `None` when
+/// there are none. `run_cmd` refuses cargo in such a workspace.
+pub fn cargo_config_warning(cfg: &ua_core::Config) -> Option<String> {
+    let mut roots = vec![cfg.workspace_root()];
+    roots.extend(
+        cfg.agent_workspaces
+            .values()
+            .filter(|v| !v.trim().eq_ignore_ascii_case("deny"))
+            .map(|v| super::expand_tilde(v.trim())),
+    );
+    let mut found: Vec<PathBuf> =
+        roots.iter().filter_map(|r| r.canonicalize().ok()).flat_map(|r| ancestor_cargo_configs(&r)).collect();
+    found.sort();
+    found.dedup();
+    if found.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+    Some(format!(
+        "cargo config above a workspace root: {}. Cargo reads every ancestor .cargo/config of its cwd, so \
+         run_cmd refuses cargo in that workspace; move the workspace outside that directory tree.",
+        list.join(", ")
+    ))
 }
 
 /// First token naming one of `names` (bare, `=value`, or an unambiguous
@@ -1001,6 +1040,22 @@ fn advisories(argv: &[String], workdir: &Path, root: &Path) -> Vec<Finding> {
             ),
         ));
     }
+    if name == "cargo" || name.starts_with("cargo-") {
+        let found = ancestor_cargo_configs(root);
+        if !found.is_empty() {
+            let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+            out.push(finding(
+                "block",
+                "cargo-config",
+                format!(
+                    "cargo reads every .cargo/config in the directories above its cwd, so it would apply {} \
+                     (aliases, [env], build.rustc-wrapper, source replacement, credential providers) from \
+                     outside the workspace. Move the workspace outside that directory tree.",
+                    list.join(", ")
+                ),
+            ));
+        }
+    }
     if ["uv", "pytest", "cargo"].contains(&name) && !info_only {
         out.push(finding(
             "warn",
@@ -1143,7 +1198,7 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let scratch_home = ScratchHome::new()?;
     let ua_home = &ctx.hub.cfg().home;
     let host = HostRust::get(ua_home).await;
-    let mut env = command_env(ua_home, &ctx.caller.label, &scratch_home.path, host);
+    let mut env = command_env(ua_home, &ctx.caller.label, &scratch_home.path, &host);
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
         for (k, v) in [
@@ -1327,39 +1382,81 @@ fn git_identity_env(label: &str) -> Vec<(String, String)> {
 struct HostRust {
     /// PATH for commands.
     path: String,
+    /// The toolchain `bin` first on `path`, when one was found.
+    toolchain: Option<PathBuf>,
 }
 
-static HOST_RUST: tokio::sync::OnceCell<HostRust> = tokio::sync::OnceCell::const_new();
+/// The last resolution and when it was made. A successful one is kept until
+/// its toolchain is gone; a failed one (no toolchain found) is kept for
+/// [`HOST_RUST_RETRY`], so a host without a working default toolchain does
+/// not run `rustc` on every `run_cmd` call.
+type HostRustSlot = tokio::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>;
+static HOST_RUST: HostRustSlot = tokio::sync::Mutex::const_new(None);
+
+/// How long a failed toolchain lookup is reused before trying again.
+const HOST_RUST_RETRY: Duration = Duration::from_secs(60);
 
 impl HostRust {
-    async fn get(ua_home: &Path) -> &'static HostRust {
-        HOST_RUST
-            .get_or_init(|| async {
-                let vars: Vec<(String, String)> = std::env::vars_os()
-                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                    .collect();
-                HostRust::resolve(&vars, ua_home).await
-            })
-            .await
+    async fn get(ua_home: &Path) -> Arc<HostRust> {
+        let vars: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        Self::cached(&HOST_RUST, &vars, ua_home).await
+    }
+
+    /// `slot`'s resolution while its toolchain still holds a `rustc`, else
+    /// a fresh one, kept only when it found a toolchain.
+    async fn cached(slot: &HostRustSlot, vars: &[(String, String)], ua_home: &Path) -> Arc<HostRust> {
+        let mut slot = slot.lock().await;
+        if let Some((host, at)) = slot.as_ref() {
+            let fresh = match &host.toolchain {
+                Some(bin) => is_executable(&bin.join("rustc")),
+                None => at.elapsed() < HOST_RUST_RETRY,
+            };
+            if fresh {
+                return host.clone();
+            }
+        }
+        let host = Arc::new(HostRust::resolve(vars, ua_home).await);
+        *slot = Some((host.clone(), std::time::Instant::now()));
+        host
     }
 
     /// Resolve from `vars` (the hub's environment). The default toolchain
     /// is asked for with `ua_home` as the working directory, a hub-owned
-    /// directory, so no override file an agent wrote can pick it.
+    /// directory, so no override file an agent wrote can pick it. The hub
+    /// user's cargo `bin` directories (`$CARGO_HOME/bin`, `~/.cargo/bin`:
+    /// `cargo install` binaries, `cargo-*` subcommands, rustup proxies) are
+    /// dropped from PATH; the toolchain's own `bin` goes first instead.
     async fn resolve(vars: &[(String, String)], ua_home: &Path) -> HostRust {
         let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
-        let path = match toolchain_bin(vars, &path, ua_home).await {
-            Some(bin) => {
-                let rest = std::env::split_paths(&path).filter(|p| p != &bin).collect::<Vec<_>>();
-                std::env::join_paths(std::iter::once(bin).chain(rest))
-                    .ok()
-                    .and_then(|p| p.into_string().ok())
-                    .unwrap_or(path)
-            }
-            None => path,
+        let toolchain = toolchain_bin(vars, &path, ua_home).await;
+        let dropped = operator_cargo_bins(vars);
+        let same = |a: &Path, b: &Path| {
+            a == b || a.canonicalize().ok().is_some_and(|c| b.canonicalize().ok() == Some(c))
         };
-        HostRust { path }
+        let rest = std::env::split_paths(&path).filter(|p| {
+            !dropped.iter().any(|d| same(p, d)) && toolchain.as_deref().is_none_or(|t| !same(p, t))
+        });
+        let path = std::env::join_paths(toolchain.clone().into_iter().chain(rest))
+            .ok()
+            .and_then(|p| p.into_string().ok())
+            .unwrap_or_else(|| "/usr/bin:/bin".into());
+        HostRust { path, toolchain }
     }
+}
+
+/// The hub user's cargo `bin` directories: `$CARGO_HOME/bin` and
+/// `$HOME/.cargo/bin`.
+fn operator_cargo_bins(vars: &[(String, String)]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(h) = var(vars, "CARGO_HOME") {
+        out.push(PathBuf::from(h).join("bin"));
+    }
+    if let Some(h) = var(vars, "HOME") {
+        out.push(PathBuf::from(h).join(".cargo").join("bin"));
+    }
+    out
 }
 
 fn var(vars: &[(String, String)], key: &str) -> Option<String> {
@@ -1396,6 +1493,51 @@ fn cache_key(label: &str) -> String {
     format!("{safe}-{}", &sha256_hex(label.as_bytes())[..12])
 }
 
+/// Touched in a cache directory each time a call uses it; its mtime is the
+/// last use [`prune_run_caches`] goes by.
+const CACHE_MARKER: &str = ".last-used";
+/// Cache directories unused for this long are removed at `ua serve` startup.
+pub const RUN_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Create `p` or set its modification time to now.
+fn touch(p: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(p) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Remove the per-caller cache directories under `$UA_HOME/run-cache/`
+/// whose marker is older than `max_age`; returns how many went. A directory
+/// without a marker (made before markers existed) gets one now and is kept,
+/// so its age counts from today. Only real directories directly under a
+/// private `run-cache/` are touched; symlinks are left alone.
+pub fn prune_run_caches(ua_home: &Path, max_age: Duration) -> usize {
+    let root = ua_home.join("run-cache");
+    if std::fs::symlink_metadata(&root).is_err() || private_dir(&root).is_err() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let marker = dir.join(CACHE_MARKER);
+        let age = match std::fs::symlink_metadata(&marker) {
+            Ok(m) => m.modified().ok().and_then(|t| t.elapsed().ok()),
+            Err(_) => {
+                touch(&marker);
+                continue;
+            }
+        };
+        if age.is_some_and(|a| a > max_age) && std::fs::remove_dir_all(&dir).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Files that would make a cargo home more than a download cache.
 const CARGO_HOME_SCRUB: &[&str] = &["config", "config.toml", "credentials", "credentials.toml"];
 
@@ -1416,6 +1558,7 @@ fn toolchain_and_cache_env(ua_home: &Path, label: &str, host: &HostRust) -> Vec<
     if private_dir(&root).is_err() || private_dir(&dir).is_err() {
         return out;
     }
+    touch(&dir.join(CACHE_MARKER));
     let cargo = dir.join("cargo");
     if std::fs::create_dir_all(&cargo).is_ok() {
         for name in CARGO_HOME_SCRUB {
@@ -1472,6 +1615,61 @@ mod run_env_tests {
     use super::*;
 
     #[test]
+    fn ancestor_cargo_configs_are_found_above_the_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap();
+        let ws = top.join("a/ws");
+        std::fs::create_dir_all(ws.join(".cargo")).unwrap();
+        std::fs::write(ws.join(".cargo/config.toml"), "").unwrap();
+        assert!(ancestor_cargo_configs(&ws).iter().all(|p| !p.starts_with(&top)));
+        std::fs::create_dir_all(top.join(".cargo")).unwrap();
+        std::fs::write(top.join(".cargo/config"), "").unwrap();
+        std::fs::create_dir_all(top.join("a/.cargo")).unwrap();
+        std::fs::write(top.join("a/.cargo/config.toml"), "").unwrap();
+        let found: Vec<_> = ancestor_cargo_configs(&ws).into_iter().filter(|p| p.starts_with(&top)).collect();
+        assert_eq!(found, vec![top.join("a/.cargo/config.toml"), top.join(".cargo/config")]);
+    }
+
+    #[test]
+    fn unused_run_caches_are_pruned() {
+        let ua_home = tempfile::tempdir().unwrap();
+        let host = HostRust { path: "/usr/bin".into(), toolchain: None };
+        toolchain_and_cache_env(ua_home.path(), "fresh", &host);
+        toolchain_and_cache_env(ua_home.path(), "stale", &host);
+        let root = ua_home.path().join("run-cache");
+        let (fresh, stale) = (root.join(cache_key("fresh")), root.join(cache_key("stale")));
+        assert!(fresh.join(CACHE_MARKER).exists());
+        let old = std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(stale.join(CACHE_MARKER))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // A cache from before markers existed starts its clock now.
+        let legacy = root.join("legacy-000000000000");
+        std::fs::create_dir_all(legacy.join("cargo")).unwrap();
+        // A symlink in the cache root is never followed or removed.
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+
+        assert_eq!(prune_run_caches(ua_home.path(), RUN_CACHE_MAX_AGE), 1);
+        assert!(fresh.exists());
+        assert!(!stale.exists());
+        assert!(legacy.join(CACHE_MARKER).exists());
+        assert!(outside.path().exists());
+        // A use refreshes the marker, so a later prune keeps it.
+        toolchain_and_cache_env(ua_home.path(), "stale", &host);
+        assert_eq!(prune_run_caches(ua_home.path(), RUN_CACHE_MAX_AGE), 0);
+        assert!(stale.exists());
+        // A missing run-cache directory is not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(prune_run_caches(empty.path(), RUN_CACHE_MAX_AGE), 0);
+        assert!(!empty.path().join("run-cache").exists());
+    }
+
+    #[test]
     fn git_identity_comes_from_the_label() {
         let env: std::collections::HashMap<_, _> = git_identity_env("builder-1").into_iter().collect();
         assert_eq!(env["GIT_AUTHOR_NAME"], "builder-1");
@@ -1506,7 +1704,7 @@ mod run_env_tests {
     #[test]
     fn each_label_gets_its_own_cache() {
         let ua_home = tempfile::tempdir().unwrap();
-        let host = HostRust { path: "/usr/bin:/bin".into() };
+        let host = HostRust { path: "/usr/bin:/bin".into(), toolchain: None };
         let a = as_map(toolchain_and_cache_env(ua_home.path(), "builder-1", &host));
         let b = as_map(toolchain_and_cache_env(ua_home.path(), "builder-2", &host));
         // Labels that reduce to the same safe text still differ.
@@ -1599,6 +1797,70 @@ mod run_env_tests {
         command_env(ua_home.path(), "builder-1", &scratch.path, &host);
         assert!(!cargo_home.join("credentials.toml").exists());
         assert!(!cargo_home.join("config.toml").exists());
+    }
+
+    /// The hub user's cargo `bin` directories never reach a command's
+    /// PATH, by either spelling, and the toolchain still comes first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_cargo_bins_are_dropped_from_path() {
+        let op = fake_operator();
+        let home = op.cargo_home.parent().unwrap().join("home");
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        let path = format!(
+            "{}:/usr/bin:{}/:{}:/bin",
+            op.cargo_home.join("bin").display(),
+            home.join(".cargo/bin").display(),
+            home.join(".cargo/../.cargo/bin").display(),
+        );
+        let vars = vec![
+            ("PATH".to_string(), path),
+            ("HOME".to_string(), home.display().to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let host = HostRust::resolve(&vars, ua_home.path()).await;
+        let dirs: Vec<PathBuf> = std::env::split_paths(&host.path).collect();
+        assert_eq!(
+            dirs,
+            vec![op.toolchain_bin.clone(), PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+            "{}",
+            host.path
+        );
+    }
+
+    /// A working toolchain is kept until it disappears; a failed lookup is
+    /// reused for `HOST_RUST_RETRY`, then tried again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_lookup_is_retried_only_after_a_while() {
+        let op = fake_operator();
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot: HostRustSlot = tokio::sync::Mutex::new(None);
+        let expire = |slot: &mut Option<(Arc<HostRust>, std::time::Instant)>| {
+            let entry = slot.as_mut().unwrap();
+            entry.1 = std::time::Instant::now().checked_sub(HOST_RUST_RETRY * 2).unwrap();
+        };
+        // No rustc anywhere: the failure is kept for a while.
+        let none = vec![("PATH".to_string(), "/nonexistent".to_string())];
+        let failed = HostRust::cached(&slot, &none, ua_home.path()).await;
+        assert!(failed.toolchain.is_none());
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let still = HostRust::cached(&slot, &vars, ua_home.path()).await;
+        assert!(Arc::ptr_eq(&failed, &still), "a recent failure is reused, not re-run");
+        // Once it is old, the next call resolves again and keeps the result.
+        expire(&mut *slot.lock().await);
+        let host = HostRust::cached(&slot, &vars, ua_home.path()).await;
+        assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
+        let again = HostRust::cached(&slot, &none, ua_home.path()).await;
+        assert!(Arc::ptr_eq(&host, &again), "a working toolchain is reused");
+        // The toolchain disappears: resolved again at once.
+        std::fs::remove_file(op.toolchain_bin.join("rustc")).unwrap();
+        let after = HostRust::cached(&slot, &none, ua_home.path()).await;
+        assert!(after.toolchain.is_none());
     }
 
     /// With the real toolchain, when there is one: cargo run with the
