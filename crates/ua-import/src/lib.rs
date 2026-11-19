@@ -423,7 +423,7 @@ fn col_value<'v>(cols: &[String], vals: &'v [SqlValue], name: &str) -> Option<&'
     cols.iter().position(|c| c == name).and_then(|i| vals.get(i))
 }
 
-fn as_text<'v>(v: Option<&'v SqlValue>) -> Option<&'v str> {
+fn as_text(v: Option<&SqlValue>) -> Option<&str> {
     match v {
         Some(SqlValue::Text(s)) => Some(s.as_str()),
         _ => None,
