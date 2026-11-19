@@ -7,7 +7,7 @@
 //! [`EventScope`] the tool applies.
 //!
 //! The caller stays authorized only while it would still be let in: every
-//! [`RECHECK_EVERY`], and at once when a token-revoked, logout,
+//! [`RECHECK_EVERY`], and soon after a token-revoked, logout,
 //! session-ended, profile-changed or config-revision event is broadcast, the
 //! stream checks that the credential it was opened with still resolves to
 //! the same identity and that the same admission `open` ran (profile after
@@ -15,6 +15,16 @@
 //! the arguments) still lets it in. The re-check runs on the blocking pool,
 //! since it reads the policy file and the database. When the caller is no
 //! longer let in, the stream sends one [`StreamItem::Revoked`] and ends.
+//!
+//! Auth events come in bursts (a config revision touches every stream), so
+//! a stream does not re-check once per event: the first one schedules a
+//! re-check [`RECHECK_COALESCE`] later, and the events that arrive until
+//! then are covered by it. Each stream runs at most one re-check at a time,
+//! and an auth event that arrives while one runs schedules another, so the
+//! last change is always checked. Rows that arrive while a re-check is
+//! pending are held back until it passes, so nothing is delivered after an
+//! auth event before the caller is checked again. A lagged receiver may
+//! have dropped auth events, so a lag schedules a re-check too.
 //!
 //! Nothing is dropped silently:
 //! - A reconnect with `Last-Event-ID: <seq>` first replays the scoped rows
@@ -56,6 +66,9 @@ pub const BACKFILL_PAGE: usize = 1000;
 pub const BACKFILL_CAP: usize = 5000;
 /// How often an open stream re-checks its caller.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(60);
+/// How long after an auth event a stream re-checks its caller; further
+/// auth events in that window share the one re-check.
+pub const RECHECK_COALESCE: Duration = Duration::from_millis(250);
 /// Delivered seqs remembered for de-duplication; older ones become the floor.
 const SEEN_CAP: usize = 4096;
 /// How far below the highest delivered seq a lag backfill starts, to cover
@@ -281,6 +294,12 @@ struct Cursor {
     admitted_gated: bool,
     rx: broadcast::Receiver<Event>,
     recheck: Interval,
+    /// When the re-check an auth event scheduled runs; `None` when none is pending.
+    recheck_due: Option<tokio::time::Instant>,
+    /// Items that arrived while a re-check was pending, released when it passes.
+    held: VecDeque<StreamItem>,
+    /// Re-checks run so far.
+    rechecks: u64,
     /// Every seq at or below this was delivered or predates the stream.
     floor: i64,
     seen: BTreeSet<i64>,
@@ -313,6 +332,9 @@ impl Cursor {
             admitted_gated,
             rx,
             recheck,
+            recheck_due: None,
+            held: VecDeque::new(),
+            rechecks: 0,
             floor: start,
             seen: BTreeSet::new(),
             max_seen: start,
@@ -321,6 +343,37 @@ impl Cursor {
             closed: false,
             page: BACKFILL_PAGE,
             cap: BACKFILL_CAP,
+        }
+    }
+
+    /// Queue `item`, or hold it back while a re-check is pending.
+    fn emit(&mut self, item: StreamItem) {
+        if self.recheck_due.is_some() {
+            self.held.push_back(item);
+        } else {
+            self.queue.push_back(item);
+        }
+    }
+
+    /// Schedule a re-check [`RECHECK_COALESCE`] from now, unless one is
+    /// already pending (it then covers this request too).
+    fn schedule_recheck(&mut self) {
+        if self.recheck_due.is_none() {
+            self.recheck_due = Some(tokio::time::Instant::now() + RECHECK_COALESCE);
+        }
+    }
+
+    /// Run a re-check now: release the held items when the caller is still
+    /// let in, end the stream when not.
+    async fn run_recheck(&mut self) {
+        self.recheck_due = None;
+        self.recheck.reset();
+        match self.still_allowed().await {
+            Ok(()) => {
+                let held = std::mem::take(&mut self.held);
+                self.queue.extend(held);
+            }
+            Err(reason) => self.revoke(reason),
         }
     }
 
@@ -356,7 +409,7 @@ impl Cursor {
                     for row in rows {
                         pos = pos.max(row.seq);
                         if self.accept(row.seq) {
-                            self.queue.push_back(StreamItem::Event(Box::new(row)));
+                            self.emit(StreamItem::Event(Box::new(row)));
                         }
                     }
                     read += n;
@@ -378,7 +431,8 @@ impl Cursor {
     }
 
     /// Re-check the caller on the blocking pool.
-    async fn still_allowed(&self) -> Result<(), &'static str> {
+    async fn still_allowed(&mut self) -> Result<(), &'static str> {
+        self.rechecks += 1;
         let (auth, state, scope, gated) =
             (self.auth.clone(), self.state.clone(), self.scope.clone(), self.admitted_gated);
         tokio::task::spawn_blocking(move || auth.recheck(&state, &scope, gated))
@@ -389,6 +443,8 @@ impl Cursor {
     /// End the stream with a revocation notice and nothing after it.
     fn revoke(&mut self, reason: &'static str) {
         self.queue.clear();
+        self.held.clear();
+        self.recheck_due = None;
         self.pending_gap = None;
         self.queue.push_back(StreamItem::Revoked { reason });
         self.closed = true;
@@ -401,7 +457,7 @@ impl Cursor {
         {
             self.pending_gap = None;
             if seq > after + 1 {
-                self.queue.push_back(StreamItem::Gap { after_seq: after, until_seq: Some(seq), reason });
+                self.emit(StreamItem::Gap { after_seq: after, until_seq: Some(seq), reason });
             }
         }
     }
@@ -414,30 +470,35 @@ impl Cursor {
             if self.closed {
                 return None;
             }
+            let due = self.recheck_due;
             tokio::select! {
-                _ = self.recheck.tick() => {
-                    if let Err(reason) = self.still_allowed().await {
-                        self.revoke(reason);
-                    }
-                }
+                _ = sleep_until_due(due), if due.is_some() => self.run_recheck().await,
+                _ = self.recheck.tick() => self.run_recheck().await,
                 recv = self.rx.recv() => match recv {
                     Ok(ev) => {
-                        if AUTH_CHANNELS.contains(&ev.channel.as_str())
-                            && let Err(reason) = self.still_allowed().await
-                        {
-                            self.revoke(reason);
-                            continue;
+                        if AUTH_CHANNELS.contains(&ev.channel.as_str()) {
+                            self.schedule_recheck();
                         }
                         self.close_gap(ev.seq);
                         if self.accept(ev.seq) && self.scope.matches(&ev) {
-                            self.queue.push_back(StreamItem::Event(Box::new(ev)));
+                            self.emit(StreamItem::Event(Box::new(ev)));
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
+                        // The dropped events may have included auth events.
+                        self.schedule_recheck();
                         let after = self.floor.max(self.max_seen - REORDER_SLACK);
                         self.backfill(after).await;
                     }
                     Err(RecvError::Closed) => {
+                        // Settle a pending re-check first, so held rows are
+                        // either delivered or dropped with a revocation.
+                        if self.recheck_due.is_some() {
+                            self.run_recheck().await;
+                            if self.closed {
+                                continue;
+                            }
+                        }
                         if let Some((after_seq, reason)) = self.pending_gap.take() {
                             self.queue.push_back(StreamItem::Gap { after_seq, until_seq: None, reason });
                         }
@@ -446,6 +507,14 @@ impl Cursor {
                 },
             }
         }
+    }
+}
+
+/// Sleep until `due`; never returns when it is `None`.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -588,6 +657,91 @@ mod tests {
             .expect("stream stalled")
             .expect("stream ended without a notice");
         assert!(matches!(item, StreamItem::Revoked { reason: "credential_invalid" }), "{item:?}");
+        let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
+        assert!(after.is_none(), "items after the revocation");
+    }
+
+    /// A state whose policy file is `dir/policy.yaml`, holding `text`.
+    fn state_with_policy(dir: &std::path::Path, text: &str) -> (AppState, std::path::PathBuf) {
+        let path = dir.join("policy.yaml");
+        std::fs::write(&path, text).unwrap();
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.policy_file = Some(path.clone());
+        let hub = Hub::in_memory(cfg).unwrap();
+        (AppState { hub, registry: Arc::new(builtin_registry()) }, path)
+    }
+
+    /// A private directory under the system temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("ua-events-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const DENY_STREAM: &str = "version: 1\nrules:\n  - name: no-stream\n    type: tool\n    tool: event_log_query\n    action: deny\n";
+
+    /// A burst of auth events shares a few re-checks instead of one each,
+    /// and the change at the end of the burst still ends the stream.
+    #[tokio::test]
+    async fn a_burst_of_auth_events_is_rechecked_once_and_the_last_state_wins() {
+        let dir = TempDir::new();
+        let (state, path) = state_with_policy(&dir.0, "version: 1\n");
+        let c = cursor(&state, 0);
+        let consumer = tokio::spawn(c.next());
+        const BURST: usize = 40;
+        for _ in 0..BURST {
+            append(&state, "agent.config.revision");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(&path, DENY_STREAM).unwrap();
+        ua_tools::policy::invalidate(&path);
+        append(&state, "agent.config.revision");
+
+        let (item, c) = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("stream stalled")
+            .unwrap()
+            .expect("stream ended without a notice");
+        assert!(matches!(item, StreamItem::Revoked { reason: "policy_denied" }), "{item:?}");
+        assert!(c.rechecks < 10, "{} re-checks for {} auth events", c.rechecks, BURST + 1);
+        let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
+        assert!(after.is_none(), "items after the revocation");
+    }
+
+    /// Rows that arrive after an auth event wait for its re-check: they are
+    /// delivered when it passes, and dropped with the revocation when not.
+    #[tokio::test]
+    async fn rows_after_an_auth_event_wait_for_the_recheck() {
+        let dir = TempDir::new();
+        let (state, path) = state_with_policy(&dir.0, "version: 1\n");
+        let c = cursor(&state, 0);
+        append(&state, "agent.profile.changed");
+        let keep = append(&state, "test.keep");
+        let started = tokio::time::Instant::now();
+        let (item, c) =
+            tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled").unwrap();
+        assert!(matches!(&item, StreamItem::Event(e) if e.seq == keep), "{item:?}");
+        assert!(started.elapsed() >= RECHECK_COALESCE, "delivered before the re-check");
+        assert_eq!(c.rechecks, 1);
+
+        // The next change revokes: the row held behind it is never sent.
+        std::fs::write(&path, DENY_STREAM).unwrap();
+        ua_tools::policy::invalidate(&path);
+        append(&state, "agent.config.revision");
+        append(&state, "test.keep");
+        let (item, c) =
+            tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled").unwrap();
+        assert!(matches!(item, StreamItem::Revoked { reason: "policy_denied" }), "{item:?}");
         let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
         assert!(after.is_none(), "items after the revocation");
     }

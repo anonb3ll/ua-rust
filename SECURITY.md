@@ -25,9 +25,11 @@ and steps to reproduce. You will get an acknowledgement within a week.
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
   so a profile or policy that refuses the tool refuses the stream. An open
-  stream re-checks its caller every 60 seconds, and at once when a token
-  revocation or rotation, logout, session end, profile change or config
-  revision is recorded: the credential must still resolve to the same
+  stream re-checks its caller every 60 seconds, and within a quarter
+  second when a token revocation or rotation, logout, session end, profile
+  change or config revision is recorded (a burst of such events shares one
+  re-check per stream, and rows recorded after the event are held back
+  until it passes): the credential must still resolve to the same
   identity, and the admission the stream opened with (profile after any
   policy overlay, then the policy rules, with the stream's scope as the
   arguments) must still let it in without a new approval. Per-call
