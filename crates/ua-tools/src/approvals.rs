@@ -261,23 +261,31 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
 
 fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
-    let cfg = ctx.hub.cfg().clone();
     ctx.hub.db().write(|tx| {
         let row = get(tx, args.id)?;
-        let resolver = if caller.kind == ua_core::ActorKind::Anonymous {
-            args.resolved_by.clone().unwrap_or_else(|| caller.label.clone())
-        } else {
-            caller.label.clone()
-        };
+        // The resolver is always the caller. `resolved_by` is accepted for
+        // contract compatibility but never trusted: an unverified caller
+        // naming a human must not be able to approve as that human.
+        let resolver = caller.label.clone();
+        if let Some(claimed) = args.resolved_by.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && claimed != resolver
+        {
+            return Err(UaError::denied(
+                "resolver_mismatch",
+                format!("resolved_by {claimed:?} does not match the caller {resolver:?}"),
+            ));
+        }
         let now = ua_core::time::now();
         let new_status = match args.decision.as_str() {
             "approve" => {
                 if row.status != "pending" {
                     return Err(UaError::conflict(format!("approval {} is {}, not pending", row.id, row.status)));
                 }
-                let human = caller.is_human() || cfg.is_human(&resolver);
-                if !human {
-                    return Err(UaError::denied("not_human", "only a human operator can approve"));
+                if !caller.is_human() {
+                    return Err(UaError::denied(
+                        "not_human",
+                        "only a verified human operator can approve (a human bearer token, or `ua call --label <human>` on the hub host)",
+                    ));
                 }
                 if row.requested_by.as_deref() == Some(resolver.as_str()) {
                     return Err(UaError::denied("self_approval", "the approver must differ from the requester"));
@@ -301,7 +309,7 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             }
             other => return Err(UaError::invalid(format!("decision must be approve, deny or revoke, not {other:?}"))),
         };
-        if new_status != "approved" && !caller.is_human() && !cfg.is_human(&resolver) {
+        if new_status != "approved" && !caller.is_human() {
             // Deny and revoke stay open to the requester.
             if row.requested_by.as_deref() != Some(resolver.as_str()) {
                 return Err(UaError::denied("not_human", "only a human or the requester can deny or revoke"));

@@ -3254,7 +3254,6 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
- "tracing",
  "ua-core",
  "ulid",
 ]
