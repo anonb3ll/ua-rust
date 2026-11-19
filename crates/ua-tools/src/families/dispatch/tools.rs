@@ -348,12 +348,15 @@ const BOUND_KEYS: [&str; 9] = [
     "prompt_source",
     "prompt_sha256",
     "prompt_bytes",
-    "prompt_preview",
+    "prompt_text",
     "passes_token_of",
 ];
 
-/// How much of a prompt the hub built from the task the approver is shown.
-const PROMPT_PREVIEW_CHARS: usize = 2000;
+/// The longest prompt built from a task that may be approved. The approver
+/// is shown the whole text, never a preview: task notes are agent-writable,
+/// so anything cut from view could carry instructions nobody read. Longer
+/// prompts must be passed explicitly in `prompt`.
+const PROMPT_SHOW_MAX_CHARS: usize = 16_000;
 
 /// How many recent passes [`stale_pass`] looks at.
 const STALE_PASS_SCAN: i64 = 50;
@@ -511,12 +514,18 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             });
             match &a.prompt {
                 Some(p) => payload["prompt"] = json!(p),
-                // The approver sees what the hub built from the task, as
-                // they see a prompt passed in the arguments.
+                // The approver sees the whole prompt the hub built from the
+                // task, as they see a prompt passed in the arguments.
                 None => {
+                    if prompt.chars().count() > PROMPT_SHOW_MAX_CHARS {
+                        return Err(UaError::invalid(format!(
+                            "the prompt built from task {} is longer than {PROMPT_SHOW_MAX_CHARS} characters, \
+                             too long to show the approver in full; pass `prompt` explicitly",
+                            a.task_id
+                        )));
+                    }
                     payload["prompt_bytes"] = json!(prompt.len());
-                    payload["prompt_preview"] =
-                        json!(prompt.chars().take(PROMPT_PREVIEW_CHARS).collect::<String>());
+                    payload["prompt_text"] = json!(prompt);
                 }
             }
             if h2.as_ref().is_some_and(|(_, h)| h.pass_agent_token) {

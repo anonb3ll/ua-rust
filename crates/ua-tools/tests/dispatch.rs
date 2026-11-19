@@ -495,7 +495,7 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
     assert_eq!(p["prompt_source"], "task");
     assert_eq!(p["prompt_sha256"].as_str().unwrap().len(), 64);
     // The approver sees the prompt the hub built from the task.
-    let preview = p["prompt_preview"].as_str().unwrap();
+    let preview = p["prompt_text"].as_str().unwrap();
     assert!(preview.starts_with(&format!("Task #{tid}: Port the widget")), "{p}");
     assert!(preview.contains("dispatch_report_self"), "{p}");
     assert_eq!(p["prompt_bytes"], json!(preview.len()), "a short prompt is shown whole");
@@ -550,7 +550,7 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
 }
 
 #[tokio::test]
-async fn a_long_task_prompt_is_previewed_and_an_args_prompt_shown_whole() {
+async fn a_task_prompt_and_an_args_prompt_are_both_shown_whole() {
     let h = H::new();
     let me = agent("agent-1");
     let tid = h.task().await;
@@ -560,8 +560,9 @@ async fn a_long_task_prompt_is_previewed_and_an_args_prompt_shown_whole() {
         panic!()
     };
     let p = h.approval_payload(approval_id);
-    assert_eq!(p["prompt_preview"].as_str().unwrap().chars().count(), 2000, "{p}");
-    assert!(p["prompt_bytes"].as_u64().unwrap() > 6000, "the byte length counts the whole prompt: {p}");
+    let text = p["prompt_text"].as_str().unwrap();
+    assert!(text.contains(&"\u{e9}".repeat(3000)), "nothing is cut from the approver's view: {p}");
+    assert_eq!(p["prompt_bytes"], json!(text.len()), "{p}");
     assert!(p.get("prompt").is_none());
 
     let tid2 = h.task().await;
@@ -572,7 +573,7 @@ async fn a_long_task_prompt_is_previewed_and_an_args_prompt_shown_whole() {
     let p = h.approval_payload(approval_id);
     assert_eq!(p["prompt"], "do the thing");
     assert_eq!(p["prompt_source"], "args");
-    assert!(p.get("prompt_preview").is_none() && p.get("prompt_bytes").is_none(), "{p}");
+    assert!(p.get("prompt_text").is_none() && p.get("prompt_bytes").is_none(), "{p}");
 }
 
 /// The stale-pass check reads only unexpired passes, and only the latest
