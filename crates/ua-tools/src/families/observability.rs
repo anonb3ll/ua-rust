@@ -25,6 +25,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
+use crate::families::nodes;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -737,6 +738,8 @@ struct DbFacts {
     active_tokens: i64,
     last_delivery: Option<(String, Option<String>)>,
     quick_check: Option<String>,
+    /// Registered nodes, or why they could not be read.
+    fleet: Result<nodes::Fleet, String>,
 }
 
 fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
@@ -770,6 +773,7 @@ fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
         active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
         last_delivery,
         quick_check,
+        fleet: nodes::fleet(c, Timestamp::now()).map_err(|e| e.to_string()),
     })
 }
 
@@ -1109,6 +1113,78 @@ fn policy_check(cfg: &Config) -> Value {
     }
 }
 
+/// `90s`, `12m`, `3h`, `2d`.
+fn human_age(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// Registered remote nodes: LIVE when every node in service is live,
+/// DEGRADED naming the ones that are not, DORMANT when none is registered.
+/// Retired nodes are not hosts; they are named once and never change the status.
+fn fleet_nodes_check(facts: &DbFacts) -> Value {
+    let gate = "node_register / node_heartbeat (POST /api/node/*)";
+    let fleet = match &facts.fleet {
+        Ok(f) => f,
+        Err(e) => {
+            return finding("fleet_nodes", UNKNOWN, format!("cannot read the node registry: {e}"), gate);
+        }
+    };
+    let now = Timestamp::now().as_second();
+    let describe = |n: &nodes::FleetNode| match n.last_heartbeat.as_deref().and_then(parse_ts) {
+        Some(beat) if beat.as_second() > now => {
+            format!(
+                "{} {} (heartbeat stamped {} in the future)",
+                n.node,
+                n.status,
+                human_age(beat.as_second() - now)
+            )
+        }
+        Some(beat) => {
+            format!("{} {} (last heartbeat {} ago)", n.node, n.status, human_age(now - beat.as_second()))
+        }
+        None => format!("{} {} (no readable heartbeat)", n.node, n.status),
+    };
+    let live: Vec<&str> =
+        fleet.active.iter().filter(|n| n.status == "live").map(|n| n.node.as_str()).collect();
+    let down: Vec<String> = fleet.active.iter().filter(|n| n.status != "live").map(describe).collect();
+    let mut parts = Vec::new();
+    let status = if fleet.active.is_empty() {
+        parts.push("no node registered".to_string());
+        DORMANT
+    } else if down.is_empty() {
+        parts.push(format!("{} node(s) live: {}", live.len(), live.join(", ")));
+        LIVE
+    } else {
+        parts.extend(down);
+        if !live.is_empty() {
+            parts.push(format!("live: {}", live.join(", ")));
+        }
+        DEGRADED
+    };
+    if !fleet.retired.is_empty() {
+        parts.push(format!(
+            "{} retired node row(s) excluded: {}",
+            fleet.retired.len(),
+            fleet.retired.join(", ")
+        ));
+    }
+    let mut row = finding("fleet_nodes", status, parts.join("; "), gate);
+    row["hosts"] = fleet
+        .active
+        .iter()
+        .map(|n| json!({ "node": n.node, "state": n.status, "last_heartbeat": n.last_heartbeat }))
+        .collect();
+    if !fleet.retired.is_empty() {
+        row["retired"] = json!(fleet.retired);
+    }
+    row
+}
+
 fn host_name() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
@@ -1138,6 +1214,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         schema_check(&facts),
         notify_check(cfg, &facts),
         policy_check(cfg),
+        fleet_nodes_check(&facts),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
     let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]
