@@ -1317,7 +1317,7 @@ async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     // own persistent caches.
     let scratch_home = ScratchHome::new()?;
     let ua_home = &ctx.hub.cfg().home;
-    let host = HostRust::get(ua_home).await;
+    let host = HostRust::get(&vetted.program, ua_home).await;
     let mut env = command_env(ua_home, &ctx.caller.label, &scratch_home.path, &host);
     if vetted.program == "git" {
         // Never discover a bare repository an agent laid out with fs_write.
@@ -1506,51 +1506,108 @@ struct HostRust {
     toolchain: Option<PathBuf>,
 }
 
-/// The last resolution and when it was made. A successful one is kept until
-/// its toolchain is gone; a failed one (no toolchain found) is kept for
+/// The last resolution and when it was made, plus a lock that lets only one
+/// resolution run at a time. A successful one is kept until its toolchain
+/// is gone; a failed one (no toolchain found) is kept for
 /// [`HOST_RUST_RETRY`], so a host without a working default toolchain does
 /// not run `rustc` on every `run_cmd` call.
-type HostRustSlot = tokio::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>;
-static HOST_RUST: HostRustSlot = tokio::sync::Mutex::const_new(None);
+///
+/// The cached value sits behind a plain mutex that is never held across an
+/// await; the lookup runs under `flight` instead, which only programs that
+/// need the toolchain wait on.
+struct HostRustSlot {
+    last: std::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>,
+    flight: tokio::sync::Mutex<()>,
+}
+
+impl HostRustSlot {
+    const fn new() -> Self {
+        Self { last: std::sync::Mutex::new(None), flight: tokio::sync::Mutex::const_new(()) }
+    }
+
+    /// The cached resolution while it is still usable.
+    fn fresh(&self) -> Option<Arc<HostRust>> {
+        let (host, at) = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let usable = match &host.toolchain {
+            Some(bin) => is_executable(&bin.join("rustc")),
+            None => at.elapsed() < HOST_RUST_RETRY,
+        };
+        usable.then_some(host)
+    }
+
+    fn store(&self, host: Arc<HostRust>) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, std::time::Instant::now()));
+    }
+}
+
+static HOST_RUST: HostRustSlot = HostRustSlot::new();
 
 /// How long a failed toolchain lookup is reused before trying again.
 const HOST_RUST_RETRY: Duration = Duration::from_secs(60);
 
+/// Whether `program` is part of the Rust toolchain, so `run_cmd` must look
+/// the toolchain up before running it.
+fn needs_rust_toolchain(program: &str) -> bool {
+    let name = program_name(program);
+    name.starts_with("cargo") || name.starts_with("rust") || matches!(name, "clippy-driver" | "miri")
+}
+
 impl HostRust {
-    async fn get(ua_home: &Path) -> Arc<HostRust> {
+    /// The environment for running `program`. Only Rust toolchain programs
+    /// wait for the toolchain lookup; any other program takes the last
+    /// usable lookup, else PATH without a toolchain, and never runs
+    /// `rustc` or waits on a lookup in progress. Cargo started indirectly
+    /// (by an interpreter or build tool) therefore finds the toolchain only
+    /// once a toolchain program has run.
+    async fn get(program: &str, ua_home: &Path) -> Arc<HostRust> {
         let vars: Vec<(String, String)> = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
-        Self::cached(&HOST_RUST, &vars, ua_home).await
+        Self::for_program(&HOST_RUST, program, &vars, ua_home).await
     }
 
-    /// `slot`'s resolution while its toolchain still holds a `rustc`, else
-    /// a fresh one, kept only when it found a toolchain.
+    async fn for_program(
+        slot: &HostRustSlot,
+        program: &str,
+        vars: &[(String, String)],
+        ua_home: &Path,
+    ) -> Arc<HostRust> {
+        if needs_rust_toolchain(program) {
+            Self::cached(slot, vars, ua_home).await
+        } else {
+            slot.fresh().unwrap_or_else(|| Arc::new(Self::with_toolchain(vars, None)))
+        }
+    }
+
+    /// `slot`'s resolution while it is usable, else a fresh one. Only one
+    /// lookup runs at a time; callers that waited for it take its result.
     async fn cached(slot: &HostRustSlot, vars: &[(String, String)], ua_home: &Path) -> Arc<HostRust> {
-        let mut slot = slot.lock().await;
-        if let Some((host, at)) = slot.as_ref() {
-            let fresh = match &host.toolchain {
-                Some(bin) => is_executable(&bin.join("rustc")),
-                None => at.elapsed() < HOST_RUST_RETRY,
-            };
-            if fresh {
-                return host.clone();
-            }
+        if let Some(host) = slot.fresh() {
+            return host;
+        }
+        let _flight = slot.flight.lock().await;
+        if let Some(host) = slot.fresh() {
+            return host;
         }
         let host = Arc::new(HostRust::resolve(vars, ua_home).await);
-        *slot = Some((host.clone(), std::time::Instant::now()));
+        slot.store(host.clone());
         host
     }
 
     /// Resolve from `vars` (the hub's environment). The default toolchain
     /// is asked for with `ua_home` as the working directory, a hub-owned
-    /// directory, so no override file an agent wrote can pick it. The hub
-    /// user's cargo `bin` directories (`$CARGO_HOME/bin`, `~/.cargo/bin`:
-    /// `cargo install` binaries, `cargo-*` subcommands, rustup proxies) are
-    /// dropped from PATH; the toolchain's own `bin` goes first instead.
+    /// directory, so no override file an agent wrote can pick it.
     async fn resolve(vars: &[(String, String)], ua_home: &Path) -> HostRust {
         let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
         let toolchain = toolchain_bin(vars, &path, ua_home).await;
+        Self::with_toolchain(vars, toolchain)
+    }
+
+    /// The hub's PATH with `toolchain` first. The hub user's cargo `bin`
+    /// directories (`$CARGO_HOME/bin`, `~/.cargo/bin`: `cargo install`
+    /// binaries, `cargo-*` subcommands, rustup proxies) are dropped.
+    fn with_toolchain(vars: &[(String, String)], toolchain: Option<PathBuf>) -> HostRust {
+        let path = var(vars, "PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/local/bin".into());
         let dropped = operator_cargo_bins(vars);
         let same = |a: &Path, b: &Path| {
             a == b || a.canonicalize().ok().is_some_and(|c| b.canonicalize().ok() == Some(c))
@@ -1956,7 +2013,7 @@ mod run_env_tests {
     async fn a_failed_lookup_is_retried_only_after_a_while() {
         let op = fake_operator();
         let ua_home = tempfile::tempdir().unwrap();
-        let slot: HostRustSlot = tokio::sync::Mutex::new(None);
+        let slot = HostRustSlot::new();
         let expire = |slot: &mut Option<(Arc<HostRust>, std::time::Instant)>| {
             let entry = slot.as_mut().unwrap();
             entry.1 = std::time::Instant::now().checked_sub(HOST_RUST_RETRY * 2).unwrap();
@@ -1972,7 +2029,7 @@ mod run_env_tests {
         let still = HostRust::cached(&slot, &vars, ua_home.path()).await;
         assert!(Arc::ptr_eq(&failed, &still), "a recent failure is reused, not re-run");
         // Once it is old, the next call resolves again and keeps the result.
-        expire(&mut *slot.lock().await);
+        expire(&mut slot.last.lock().unwrap());
         let host = HostRust::cached(&slot, &vars, ua_home.path()).await;
         assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
         let again = HostRust::cached(&slot, &none, ua_home.path()).await;
@@ -1981,6 +2038,92 @@ mod run_env_tests {
         std::fs::remove_file(op.toolchain_bin.join("rustc")).unwrap();
         let after = HostRust::cached(&slot, &none, ua_home.path()).await;
         assert!(after.toolchain.is_none());
+    }
+
+    /// A fake operator whose `rustc` proxy appends a line to the returned
+    /// log each time it runs.
+    #[cfg(unix)]
+    fn counting_operator() -> (FakeOperator, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let op = fake_operator();
+        let log = op.cargo_home.parent().unwrap().join("rustc-runs");
+        let sysroot = op.toolchain_bin.parent().unwrap().display().to_string();
+        let proxy = op.cargo_home.join("bin/rustc");
+        std::fs::write(&proxy, format!("#!/bin/sh\necho run >> '{}'\necho '{sysroot}'\n", log.display()))
+            .unwrap();
+        std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (op, log)
+    }
+
+    fn runs(log: &Path) -> usize {
+        std::fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// Only Rust toolchain programs look the toolchain up; other programs
+    /// reuse a lookup that was already made, and still never get the
+    /// operator's cargo `bin` on PATH.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_toolchain_programs_run_the_toolchain_lookup() {
+        let (op, log) = counting_operator();
+        let path = format!("{}:/usr/bin:/bin", op.cargo_home.join("bin").display());
+        let vars =
+            vec![("PATH".to_string(), path), ("CARGO_HOME".to_string(), op.cargo_home.display().to_string())];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot = HostRustSlot::new();
+        for program in ["git", "ls", "python3", "/usr/bin/git"] {
+            let host = HostRust::for_program(&slot, program, &vars, ua_home.path()).await;
+            assert!(host.toolchain.is_none(), "{program}");
+            assert_eq!(host.path, "/usr/bin:/bin", "{program}");
+        }
+        assert_eq!(runs(&log), 0, "a non-Rust program ran the toolchain lookup");
+
+        let host = HostRust::for_program(&slot, "cargo", &vars, ua_home.path()).await;
+        assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
+        assert_eq!(runs(&log), 1);
+        // Later programs of either kind reuse it.
+        for program in ["rustc", "cargo-clippy", "git"] {
+            let again = HostRust::for_program(&slot, program, &vars, ua_home.path()).await;
+            assert!(Arc::ptr_eq(&host, &again), "{program}");
+        }
+        assert_eq!(runs(&log), 1);
+        for (program, rust) in [("cargo", true), ("rustfmt", true), ("clippy-driver", true), ("git", false)] {
+            assert_eq!(needs_rust_toolchain(program), rust, "{program}");
+        }
+    }
+
+    /// A lookup in progress makes other toolchain programs wait for its
+    /// result, but never a program that does not need the toolchain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_lookup_never_blocks_other_programs() {
+        let (op, log) = counting_operator();
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot = HostRustSlot::new();
+        // A lookup is running (it holds the flight lock).
+        let flight = slot.flight.lock().await;
+        let ls = tokio::time::timeout(
+            Duration::from_secs(5),
+            HostRust::for_program(&slot, "ls", &vars, ua_home.path()),
+        )
+        .await
+        .expect("ls waited for the toolchain lookup");
+        assert!(ls.toolchain.is_none());
+        let cargo = tokio::time::timeout(
+            Duration::from_millis(200),
+            HostRust::for_program(&slot, "cargo", &vars, ua_home.path()),
+        )
+        .await;
+        assert!(cargo.is_err(), "a second lookup ran beside the first");
+        assert_eq!(runs(&log), 0);
+        drop(flight);
+        let cargo = HostRust::for_program(&slot, "cargo", &vars, ua_home.path()).await;
+        assert!(cargo.toolchain.is_some());
+        assert_eq!(runs(&log), 1);
     }
 
     /// With the real toolchain, when there is one: cargo run with the
