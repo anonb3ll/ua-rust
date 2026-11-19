@@ -45,6 +45,17 @@ pub struct Config {
     /// Vault directories (relative to the vault) agents may write to.
     #[serde(deserialize_with = "string_or_list")]
     pub vault_write_dirs: Vec<String>,
+    /// Vault directory holding raw captures (the steward inbox).
+    pub vault_inbox_dir: String,
+    /// Refuse a `vault_write` overwrite of an existing note without `expected_revision`.
+    pub vault_require_revision: bool,
+    /// Lowest memory-note confidence `memory_promote` accepts.
+    pub promote_min_confidence: f64,
+    /// Obsidian Local REST API base URL (loopback only), e.g. `https://127.0.0.1:27124`.
+    pub obsidian_api_url: Option<String>,
+    /// Obsidian Local REST API key (`UA_OBSIDIAN_API_KEY`).
+    #[serde(skip_serializing)]
+    pub obsidian_api_key: Option<SecretString>,
     /// HTTP listen address. Keep it on loopback and put a proxy in front.
     pub bind: SocketAddr,
     /// Require a verified credential on every HTTP request.
@@ -68,6 +79,12 @@ pub struct Config {
     pub approval_pass_ttl_hours: f64,
     /// Policy rules file (YAML).
     pub policy_file: Option<PathBuf>,
+    /// Agents revoked from every always-gated (prod) action, whatever approvals they hold.
+    #[serde(deserialize_with = "string_or_list")]
+    pub revoked_agents: Vec<String>,
+    /// Prod-action scopes: label → `merge|delete|...` (actions or tool names).
+    /// Empty means nobody is restricted; once set, an unlisted agent has no scope.
+    pub agent_scopes: BTreeMap<String, String>,
     /// Identity label → default profile name. Unlisted identities get `developer`.
     pub profiles: BTreeMap<String, String>,
     /// Per-agent workspace overrides: label → root (or `"deny"`).
@@ -76,6 +93,39 @@ pub struct Config {
     pub embed_model: String,
     /// Edition: `full` (default) or `core`, which hides ledger features.
     pub edition: String,
+    /// `web_search` provider: `auto` (an API provider whose key is set, else
+    /// `ddg`), `ddg` (keyless DuckDuckGo), `brave` or `tavily`.
+    pub search_provider: String,
+    /// Brave Search API key. `BRAVE_API_KEY` is also read when this is unset.
+    #[serde(skip_serializing)]
+    pub brave_api_key: Option<SecretString>,
+    /// Tavily API key. `TAVILY_API_KEY` is also read when this is unset.
+    #[serde(skip_serializing)]
+    pub tavily_api_key: Option<SecretString>,
+    /// Minutes a cached `web_search` answer stays fresh; 0 turns the cache off.
+    pub search_cache_ttl_min: f64,
+    /// Directories holding Dash/Zeal `.docset` bundles, as a list or a
+    /// colon-separated string. The `dash_*` tools are off when empty.
+    #[serde(deserialize_with = "colon_or_list")]
+    pub dash_docsets: Vec<PathBuf>,
+    /// Test hook: lets `web_fetch` and `web_search` reach loopback addresses
+    /// (and only those). It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub fetch_allow_loopback: bool,
+    /// Test hook: replaces the DuckDuckGo endpoint `web_search` queries. It
+    /// cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub search_endpoint: Option<String>,
+    /// Outbound notification webhook (`notify`, `flush_digest`). Unset keeps
+    /// notifications in the outbox with status `not_configured`.
+    pub notify_webhook_url: Option<String>,
+    /// Header name that carries `notify_webhook_secret`.
+    pub notify_webhook_header: String,
+    /// Header value sent with every webhook delivery (e.g. `Bearer ...`).
+    #[serde(skip_serializing)]
+    pub notify_webhook_secret: Option<SecretString>,
+    /// Delivery attempts per notification (1-10) before it is marked failed.
+    pub notify_max_attempts: u32,
 }
 
 impl Default for Config {
@@ -87,6 +137,11 @@ impl Default for Config {
             read_roots: Vec::new(),
             vault_path: None,
             vault_write_dirs: DEFAULT_VAULT_WRITE_DIRS.iter().map(|s| s.to_string()).collect(),
+            vault_inbox_dir: "Inbox".into(),
+            vault_require_revision: false,
+            promote_min_confidence: 0.7,
+            obsidian_api_url: None,
+            obsidian_api_key: None,
             bind: SocketAddr::from(([127, 0, 0, 1], 8765)),
             enforce_auth: true,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
@@ -96,10 +151,23 @@ impl Default for Config {
             approval_tools: Vec::new(),
             approval_pass_ttl_hours: 24.0,
             policy_file: None,
+            revoked_agents: Vec::new(),
+            agent_scopes: BTreeMap::new(),
             profiles: BTreeMap::new(),
             agent_workspaces: BTreeMap::new(),
             embed_model: "BAAI/bge-small-en-v1.5".into(),
             edition: "full".into(),
+            search_provider: "auto".into(),
+            brave_api_key: None,
+            tavily_api_key: None,
+            search_cache_ttl_min: 60.0,
+            dash_docsets: Vec::new(),
+            fetch_allow_loopback: false,
+            search_endpoint: None,
+            notify_webhook_url: None,
+            notify_webhook_header: "Authorization".into(),
+            notify_webhook_secret: None,
+            notify_max_attempts: 3,
         }
     }
 }
@@ -158,6 +226,8 @@ impl Config {
         self.workspace = self.workspace.map(|p| expand_tilde(&p));
         self.vault_path = self.vault_path.map(|p| expand_tilde(&p));
         self.read_roots = self.read_roots.iter().map(|p| expand_tilde(p)).collect();
+        self.policy_file = self.policy_file.map(|p| expand_tilde(&p));
+        self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
         self
     }
 
@@ -180,6 +250,20 @@ impl Config {
         } else {
             self.shell_allowlist.clone()
         }
+    }
+
+    /// Prod-action scopes of `label`, lower-cased. `None` when scopes are not configured.
+    pub fn prod_scopes(&self, label: &str) -> Option<Vec<String>> {
+        if self.agent_scopes.is_empty() {
+            return None;
+        }
+        let raw = self.agent_scopes.get(label).map(String::as_str).unwrap_or("");
+        Some(
+            raw.split(['|', ',', ' '])
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
     }
 
     pub fn is_human(&self, label: &str) -> bool {
@@ -236,6 +320,28 @@ where
     let items = match OneOrMany::deserialize(d)? {
         OneOrMany::One(s) => {
             s.split([',', ' ', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+        }
+        OneOrMany::Many(v) => v,
+    };
+    Ok(items.into_iter().map(T::from).collect())
+}
+
+/// Deserialize either a list or a colon/newline separated string. Paths can
+/// hold spaces, so unlike [`string_or_list`] a space does not split.
+fn colon_or_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: From<String>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let items = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => {
+            s.split([':', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
         }
         OneOrMany::Many(v) => v,
     };
