@@ -120,7 +120,9 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
             None if public => anonymous(),
             None => return unauthorized(&state, Some("invalid_token"), "invalid token"),
         }
-    } else if let Some(session) = cookie_scope.then(|| login::session_from_headers(&state, req.headers())).flatten() {
+    } else if let Some(session) =
+        cookie_scope.then(|| login::session_from_headers(&state, req.headers())).flatten()
+    {
         if login::is_unsafe(req.method()) {
             let provided = req.headers().get(CSRF_HEADER).and_then(|v| v.to_str().ok());
             if !login::csrf_matches(&session, provided) {

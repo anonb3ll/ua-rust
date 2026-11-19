@@ -83,7 +83,8 @@ pub fn validate_client_id_url(client_id: &str, allow: &[String]) -> Result<Strin
     if client_id.contains('\\') || client_id.contains('%') {
         return err("client_id URL may not contain backslashes or percent-encoding");
     }
-    let url = url::Url::parse(client_id).map_err(|e| CimdError(format!("client_id URL is malformed: {e}")))?;
+    let url =
+        url::Url::parse(client_id).map_err(|e| CimdError(format!("client_id URL is malformed: {e}")))?;
     if url.scheme() != "https" {
         return err("client_id URL must use https");
     }
@@ -188,7 +189,8 @@ pub fn parse_document(client_id: &str, host: &str, body: &[u8]) -> Result<CimdCl
     if body.len() > MAX_DOCUMENT_BYTES {
         return err("client metadata document is too large");
     }
-    let doc: Value = serde_json::from_slice(body).map_err(|_| CimdError("client metadata document is not JSON".into()))?;
+    let doc: Value =
+        serde_json::from_slice(body).map_err(|_| CimdError("client metadata document is not JSON".into()))?;
     let Some(obj) = doc.as_object() else { return err("client metadata document must be a JSON object") };
     if obj.get("client_id").and_then(Value::as_str) != Some(client_id) {
         return err("client metadata document client_id does not match its URL");
@@ -202,9 +204,10 @@ pub fn parse_document(client_id: &str, host: &str, body: &[u8]) -> Result<CimdCl
     }
     let redirect_uris: Vec<String> = match obj.get("redirect_uris").and_then(Value::as_array) {
         Some(a) if !a.is_empty() => {
-            a.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<_>>().ok_or_else(|| {
-                CimdError("client metadata document redirect_uris must be strings".into())
-            })?
+            a.iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<_>>()
+                .ok_or_else(|| CimdError("client metadata document redirect_uris must be strings".into()))?
         }
         _ => return err("client metadata document must list redirect_uris"),
     };
@@ -244,7 +247,8 @@ struct Entry {
 }
 
 static CACHE: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static INFLIGHT: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(MAX_INFLIGHT));
+static INFLIGHT: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_INFLIGHT));
 
 fn cached(client_id: &str) -> Option<Result<CimdClient, CimdError>> {
     let cache = CACHE.lock().ok()?;
@@ -407,12 +411,16 @@ mod tests {
 
     #[test]
     fn document_rules() {
-        let ok = format!(r#"{{"client_id":"{ID}","client_name":"Editor","redirect_uris":["http://127.0.0.1:3000/cb"]}}"#);
+        let ok = format!(
+            r#"{{"client_id":"{ID}","client_name":"Editor","redirect_uris":["http://127.0.0.1:3000/cb"]}}"#
+        );
         let c = parse_document(ID, "app.example.com", ok.as_bytes()).unwrap();
         assert_eq!(c.client_name, "Editor (app.example.com)");
         let wrong_id = r#"{"client_id":"https://other.example.com/c.json","redirect_uris":["https://a.example.com/cb"]}"#;
         assert!(parse_document(ID, "app.example.com", wrong_id.as_bytes()).is_err());
-        let secret = format!(r#"{{"client_id":"{ID}","client_secret":"x","redirect_uris":["https://a.example.com/cb"]}}"#);
+        let secret = format!(
+            r#"{{"client_id":"{ID}","client_secret":"x","redirect_uris":["https://a.example.com/cb"]}}"#
+        );
         assert!(parse_document(ID, "app.example.com", secret.as_bytes()).is_err());
         let confidential = format!(
             r#"{{"client_id":"{ID}","token_endpoint_auth_method":"client_secret_basic","redirect_uris":["https://a.example.com/cb"]}}"#

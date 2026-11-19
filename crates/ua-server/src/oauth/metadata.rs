@@ -13,10 +13,7 @@ use super::{SCOPE, issuer, mcp_resource, not_enabled};
 use crate::AppState;
 
 fn cors_json(v: Value) -> Response {
-    (
-        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, "public, max-age=300")],
-        Json(v),
-    )
+    ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, "public, max-age=300")], Json(v))
         .into_response()
 }
 

@@ -198,7 +198,10 @@ mod tests {
             accepted_resource(&c, Some("https://HUB.example.com/mcp")).as_deref(),
             Some("https://hub.example.com/mcp")
         );
-        assert_eq!(accepted_resource(&c, Some("https://hub.example.com/")).as_deref(), Some("https://hub.example.com"));
+        assert_eq!(
+            accepted_resource(&c, Some("https://hub.example.com/")).as_deref(),
+            Some("https://hub.example.com")
+        );
         assert_eq!(accepted_resource(&c, Some("https://other.example.com/mcp")), None);
         assert_eq!(accepted_resource(&c, Some("https://hub.example.com/mcp#x")), None);
     }
@@ -209,7 +212,9 @@ mod tests {
         assert_eq!(www_authenticate(&c, None), "Bearer realm=\"ua\"");
         c.oauth_enabled = true;
         let h = www_authenticate(&c, Some("invalid_token"));
-        assert!(h.contains("resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource/mcp\""));
+        assert!(h.contains(
+            "resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource/mcp\""
+        ));
         assert!(h.contains("error=\"invalid_token\""));
     }
 }

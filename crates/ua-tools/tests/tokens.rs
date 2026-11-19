@@ -37,13 +37,23 @@ fn no_raw_value(v: &Value, raw: &str) {
 async fn issue_is_human_only_and_never_returns_the_value() {
     let (hub, reg) = (hub(), builtin_registry());
     let err = reg
-        .call(&hub, &agent("builder-1"), "agent_token_issue", json!({ "agent_label": "builder-1", "value": VALUE_A }))
+        .call(
+            &hub,
+            &agent("builder-1"),
+            "agent_token_issue",
+            json!({ "agent_label": "builder-1", "value": VALUE_A }),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code(), "denied");
 
     let out = reg
-        .call(&hub, &human(), "agent_token_issue", json!({ "agent_label": "builder-1", "value": VALUE_A, "ttl_days": 7 }))
+        .call(
+            &hub,
+            &human(),
+            "agent_token_issue",
+            json!({ "agent_label": "builder-1", "value": VALUE_A, "ttl_days": 7 }),
+        )
         .await
         .unwrap();
     no_raw_value(&out, VALUE_A);
@@ -58,7 +68,9 @@ async fn issue_is_human_only_and_never_returns_the_value() {
     assert_eq!(dup.code(), "conflict");
 
     // Short values and OAuth-shaped values are refused.
-    for bad in ["short", "uao_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "has space aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
+    for bad in
+        ["short", "uao_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "has space aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    {
         let e = reg
             .call(&hub, &human(), "agent_token_issue", json!({ "agent_label": "builder-1", "value": bad }))
             .await
@@ -74,26 +86,39 @@ async fn rotate_links_rows_and_list_shows_metadata() {
         .await
         .unwrap();
     let err = reg
-        .call(&hub, &agent("builder-1"), "agent_token_rotate", json!({ "agent_label": "builder-1", "new_value": VALUE_B }))
+        .call(
+            &hub,
+            &agent("builder-1"),
+            "agent_token_rotate",
+            json!({ "agent_label": "builder-1", "new_value": VALUE_B }),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code(), "denied");
 
     let rot = reg
-        .call(&hub, &human(), "agent_token_rotate", json!({ "agent_label": "builder-1", "new_value": VALUE_B }))
+        .call(
+            &hub,
+            &human(),
+            "agent_token_rotate",
+            json!({ "agent_label": "builder-1", "new_value": VALUE_B }),
+        )
         .await
         .unwrap();
     no_raw_value(&rot, VALUE_B);
     assert!(rot["previous_token_id"].is_i64());
 
-    let all = reg.call(&hub, &agent("x"), "agent_token_list", json!({ "agent_label": "builder-1" })).await.unwrap();
+    let all =
+        reg.call(&hub, &agent("x"), "agent_token_list", json!({ "agent_label": "builder-1" })).await.unwrap();
     no_raw_value(&all, VALUE_A);
     no_raw_value(&all, VALUE_B);
     assert_eq!(all["count"], 2);
-    let active = reg.call(&hub, &agent("x"), "agent_token_list", json!({ "status": "active" })).await.unwrap();
+    let active =
+        reg.call(&hub, &agent("x"), "agent_token_list", json!({ "status": "active" })).await.unwrap();
     assert_eq!(active["count"], 1);
     assert_eq!(active["tokens"][0]["rotated_from"], rot["previous_token_id"]);
-    let bad = reg.call(&hub, &agent("x"), "agent_token_list", json!({ "status": "bogus" })).await.unwrap_err();
+    let bad =
+        reg.call(&hub, &agent("x"), "agent_token_list", json!({ "status": "bogus" })).await.unwrap_err();
     assert_eq!(bad.code(), "invalid_argument");
 }
 
@@ -131,19 +156,28 @@ async fn device_revoke_needs_approval() {
     assert_eq!(listed["session_count"], 2);
 
     let bad = reg
-        .call(&hub, &me, "oauth_device_manage", json!({ "action": "revoke", "session_id": "fam1", "identity": "x" }))
+        .call(
+            &hub,
+            &me,
+            "oauth_device_manage",
+            json!({ "action": "revoke", "session_id": "fam1", "identity": "x" }),
+        )
         .await
         .unwrap_err();
     assert_eq!(bad.code(), "invalid_argument");
 
     let args = json!({ "action": "revoke", "session_id": "fam1" });
     let pending = reg.call(&hub, &me, "oauth_device_manage", args.clone()).await.unwrap_err();
-    let ua_core::UaError::ApprovalRequired { approval_id, .. } = pending else { panic!("expected approval_required") };
+    let ua_core::UaError::ApprovalRequired { approval_id, .. } = pending else {
+        panic!("expected approval_required")
+    };
     // Nothing is revoked before approval.
     let still = reg.call(&hub, &me, "oauth_device_manage", json!({})).await.unwrap();
     assert_eq!(still["session_count"], 2);
 
-    reg.call(&hub, &human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await.unwrap();
+    reg.call(&hub, &human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" }))
+        .await
+        .unwrap();
     let done = reg.call(&hub, &me, "oauth_device_manage", args).await.unwrap();
     assert_eq!(done["revoked_sessions"], 1);
     assert_eq!(done["revoked_tokens"], 2);

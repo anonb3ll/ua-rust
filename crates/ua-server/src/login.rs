@@ -36,8 +36,8 @@ use ua_store::{EventInput, ledger};
 use ua_tools::Hub;
 use ua_tools::families::tokens::digest;
 use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential, Url,
-    Uuid, Webauthn, WebauthnBuilder,
+    Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    Url, Uuid, Webauthn, WebauthnBuilder,
 };
 
 use crate::AppState;
@@ -88,8 +88,10 @@ pub fn routes() -> Router<AppState> {
 fn cookie_key(hub: &Hub) -> UaResult<Key> {
     let read = |hub: &Hub| {
         hub.db().read(|c| {
-            Ok(c.query_row("SELECT key_hex FROM ui_keys WHERE name = 'cookie'", [], |r| r.get::<_, String>(0))
-                .optional()?)
+            Ok(c.query_row("SELECT key_hex FROM ui_keys WHERE name = 'cookie'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?)
         })
     };
     if let Some(hexkey) = read(hub)? {
@@ -219,7 +221,12 @@ pub fn create_login_link(hub: &Hub, label: &str, created_by: &str) -> UaResult<S
 /// Keep post-login redirects on this site.
 fn safe_next(next: Option<&str>) -> String {
     match next {
-        Some(n) if n.starts_with('/') && !n.starts_with("//") && !n.starts_with("/\\") && !n.contains(['\r', '\n']) => {
+        Some(n)
+            if n.starts_with('/')
+                && !n.starts_with("//")
+                && !n.starts_with("/\\")
+                && !n.contains(['\r', '\n']) =>
+        {
             n.to_string()
         }
         _ => "/ui".into(),
@@ -232,7 +239,11 @@ fn server_error(e: UaError) -> Response {
 }
 
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (status, [(header::CACHE_CONTROL, "no-store")], Json(json!({ "ok": false, "error": code, "message": message })))
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "ok": false, "error": code, "message": message })),
+    )
         .into_response()
 }
 
@@ -260,7 +271,8 @@ fn user_uuid(label: &str) -> Uuid {
 
 fn load_passkeys(hub: &Hub, label: &str) -> UaResult<Vec<(String, Passkey)>> {
     hub.db().read(|c| {
-        let mut stmt = c.prepare("SELECT cred_id, passkey FROM passkeys WHERE label = ?1 ORDER BY created_at")?;
+        let mut stmt =
+            c.prepare("SELECT cred_id, passkey FROM passkeys WHERE label = ?1 ORDER BY created_at")?;
         let rows: Vec<(String, String)> =
             stmt.query_map([label], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
         Ok(rows
@@ -298,7 +310,12 @@ fn save_state(
 }
 
 /// Consume a ceremony state (single use). Returns `(label, state_json)`.
-fn take_state(hub: &Hub, id: &str, kind: &str, session_hash: Option<&str>) -> UaResult<Option<(String, String)>> {
+fn take_state(
+    hub: &Hub,
+    id: &str,
+    kind: &str,
+    session_hash: Option<&str>,
+) -> UaResult<Option<(String, String)>> {
     let (hash, kind, session_hash) = (digest(id), kind.to_string(), session_hash.map(str::to_string));
     hub.db().write(|tx| {
         let row: Option<(String, String, Option<String>, String)> = tx
@@ -322,7 +339,8 @@ struct LoginStart {
 
 async fn passkey_login_start(State(state): State<AppState>, Json(body): Json<LoginStart>) -> Response {
     let label = body.label.trim().to_string();
-    let generic = || json_error(StatusCode::BAD_REQUEST, "no_passkey", "no passkey is registered for that identity");
+    let generic =
+        || json_error(StatusCode::BAD_REQUEST, "no_passkey", "no passkey is registered for that identity");
     if !state.hub.cfg().is_human(&label) {
         return generic();
     }
@@ -358,7 +376,8 @@ async fn passkey_login_finish(
     headers: HeaderMap,
     Json(body): Json<LoginFinish>,
 ) -> Response {
-    let refused = || json_error(StatusCode::UNAUTHORIZED, "passkey_refused", "the passkey sign-in was not accepted");
+    let refused =
+        || json_error(StatusCode::UNAUTHORIZED, "passkey_refused", "the passkey sign-in was not accepted");
     let wa = match webauthn(&state) {
         Ok(w) => w,
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "passkeys_unavailable", &e),
@@ -397,7 +416,11 @@ async fn passkey_login_finish(
     match create_session(&state, &label, "passkey", &headers) {
         Ok(raw) => {
             let next = safe_next(body.next.as_deref());
-            with_session(&state, raw, Json(json!({ "ok": true, "identity": label, "next": next })).into_response())
+            with_session(
+                &state,
+                raw,
+                Json(json!({ "ok": true, "identity": label, "next": next })).into_response(),
+            )
         }
         Err(e) => server_error(e),
     }
@@ -417,11 +440,15 @@ async fn passkey_register_start(State(state): State<AppState>, headers: HeaderMa
     let exclude = load_passkeys(&state.hub, &sess.label)
         .map(|k| k.into_iter().map(|(_, p)| p.cred_id().clone()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let (options, reg_state) =
-        match wa.start_passkey_registration(user_uuid(&sess.label), &sess.label, &sess.label, Some(exclude)) {
-            Ok(v) => v,
-            Err(e) => return json_error(StatusCode::BAD_REQUEST, "passkey_error", &e.to_string()),
-        };
+    let (options, reg_state) = match wa.start_passkey_registration(
+        user_uuid(&sess.label),
+        &sess.label,
+        &sess.label,
+        Some(exclude),
+    ) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "passkey_error", &e.to_string()),
+    };
     match save_state(&state.hub, "register", &sess.label, Some(&sess.id_hash), &reg_state) {
         Ok(id) => Json(json!({ "ok": true, "state_id": id, "options": options })).into_response(),
         Err(e) => server_error(e),
@@ -463,18 +490,24 @@ async fn passkey_register_finish(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "passkey_refused", &e.to_string()),
     };
     let name: String = body.name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(60).collect();
-    let (id, json, label) = (cred_key(&passkey), serde_json::to_string(&passkey).unwrap_or_default(), sess.label);
+    let (id, json, label) =
+        (cred_key(&passkey), serde_json::to_string(&passkey).unwrap_or_default(), sess.label);
     let res = state.hub.db().write(|tx| {
         tx.execute(
             "INSERT INTO passkeys (cred_id, label, name, passkey, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, label, (!name.trim().is_empty()).then_some(name.trim()), json, ua_core::time::now()],
         )?;
-        ledger::append(tx, EventInput::new("agent.ui.passkey_registered", json!({ "identity": label })).by(label.clone()))?;
+        ledger::append(
+            tx,
+            EventInput::new("agent.ui.passkey_registered", json!({ "identity": label })).by(label.clone()),
+        )?;
         Ok(())
     });
     match res {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(UaError::Conflict(_)) => json_error(StatusCode::CONFLICT, "duplicate", "that passkey is already registered"),
+        Err(UaError::Conflict(_)) => {
+            json_error(StatusCode::CONFLICT, "duplicate", "that passkey is already registered")
+        }
         Err(e) => server_error(e),
     }
 }
@@ -504,7 +537,11 @@ struct LinkForm {
     token: String,
 }
 
-async fn link_consume(State(state): State<AppState>, headers: HeaderMap, Form(f): Form<LinkForm>) -> Response {
+async fn link_consume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<LinkForm>,
+) -> Response {
     let hash = digest(f.token.trim());
     let consumed = state.hub.db().write(|tx| {
         let now = ua_core::time::now();
@@ -557,7 +594,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap, Form(f): Form
                 "UPDATE ui_sessions SET revoked_at = ?2 WHERE id_hash = ?1 AND revoked_at IS NULL",
                 params![hash, ua_core::time::now()],
             )?;
-            ledger::append(tx, EventInput::new("agent.ui.logout", json!({ "identity": label })).by(label.clone()))?;
+            ledger::append(
+                tx,
+                EventInput::new("agent.ui.logout", json!({ "identity": label })).by(label.clone()),
+            )?;
             Ok(())
         });
         if let Err(e) = res {
@@ -569,7 +609,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap, Form(f): Form
 
 /// `GET /api/session`: the caller's identity and, for a cookie session, its
 /// CSRF token and the header to send it in.
-async fn api_session(Extension(id): Extension<AuthIdentity>, session: Option<Extension<UiSession>>) -> Json<Value> {
+async fn api_session(
+    Extension(id): Extension<AuthIdentity>,
+    session: Option<Extension<UiSession>>,
+) -> Json<Value> {
     let mut v = json!({
         "identity": id.label,
         "kind": id.kind,
@@ -595,7 +638,11 @@ struct LoginQuery {
     next: Option<String>,
 }
 
-async fn login_page(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<LoginQuery>) -> Response {
+async fn login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
     let next = safe_next(q.next.as_deref());
     if session_from_headers(&state, &headers).is_some() {
         return Redirect::to(&next).into_response();

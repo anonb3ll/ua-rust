@@ -28,7 +28,9 @@ pub enum ClientKind {
     Registered,
     MetadataDocument,
     /// A `client_credentials` client pinned to one identity in configuration.
-    Configured { identity: String },
+    Configured {
+        identity: String,
+    },
 }
 
 #[derive(Clone)]
@@ -71,16 +73,16 @@ pub enum ClientLookup {
 }
 
 fn configured(cfg: &Config, client_id: &str) -> Option<Client> {
-    cfg.oauth_client_credentials().into_iter().find(|(id, _, _)| id == client_id).map(|(id, secret, identity)| {
-        Client {
+    cfg.oauth_client_credentials().into_iter().find(|(id, _, _)| id == client_id).map(
+        |(id, secret, identity)| Client {
             client_name: format!("{id} (configured)"),
             client_id: id,
             redirect_uris: Vec::new(),
             grant_types: vec!["client_credentials".into()],
             secret: ClientSecret::Configured(secret),
             kind: ClientKind::Configured { identity },
-        }
-    })
+        },
+    )
 }
 
 fn json_list(raw: &str) -> Vec<String> {
@@ -207,7 +209,12 @@ pub fn insert_grant(
 }
 
 /// Mint an access token (and optionally a refresh token) in a grant family.
-pub fn issue_tokens(tx: &mut WriteTx<'_>, cfg: &Config, g: &GrantInfo<'_>, with_refresh: bool) -> UaResult<Issued> {
+pub fn issue_tokens(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    g: &GrantInfo<'_>,
+    with_refresh: bool,
+) -> UaResult<Issued> {
     let now = ua_core::time::now();
     let ttl = cfg.oauth_access_ttl_secs.clamp(60, 30 * 24 * 3600);
     let access = random_token(ACCESS_PREFIX);
@@ -265,7 +272,14 @@ pub fn lookup_access(state: &AppState, token: &str) -> Option<AccessInfo> {
                  WHERE t.token_hash = ?1 AND t.kind = 'access' AND t.status = 'active' AND t.expires_at > ?2 \
                  AND g.revoked_at IS NULL",
                 params![hash, ua_core::time::now()],
-                |r| Ok(AccessInfo { subject: r.get(0)?, client_id: r.get(1)?, resource: r.get(2)?, scope: r.get(3)? }),
+                |r| {
+                    Ok(AccessInfo {
+                        subject: r.get(0)?,
+                        client_id: r.get(1)?,
+                        resource: r.get(2)?,
+                        scope: r.get(3)?,
+                    })
+                },
             )
             .optional()?)
         })

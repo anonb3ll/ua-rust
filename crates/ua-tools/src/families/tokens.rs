@@ -304,7 +304,8 @@ async fn issue(ctx: ToolCtx, a: IssueArgs) -> UaResult<Value> {
                 insert_token(tx, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), None)?;
             ledger::append(
                 tx,
-                EventInput::new("agent.token.issued", json!({ "agent": label, "token_id": id })).by(by.clone()),
+                EventInput::new("agent.token.issued", json!({ "agent": label, "token_id": id }))
+                    .by(by.clone()),
             )?;
             Ok(json!({
                 "ok": true,
@@ -436,7 +437,7 @@ pub fn revoke_family(tx: &rusqlite::Transaction<'_>, family_id: &str, reason: &s
 async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
     match a.action.trim() {
         "list" => {
-            let sessions = ctx.hub.db().read_async(|c| list_oauth_sessions(c)).await?;
+            let sessions = ctx.hub.db().read_async(list_oauth_sessions).await?;
             Ok(json!({
                 "oauth_enabled": ctx.hub.cfg().oauth_enabled,
                 "session_count": sessions.len(),
@@ -454,12 +455,17 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
             let outcome = ctx
                 .hub
                 .db()
-                .write_async(move |tx| approvals::gate(tx, hub.cfg(), &caller, "oauth_device_manage", &payload))
+                .write_async(move |tx| {
+                    approvals::gate(tx, hub.cfg(), &caller, "oauth_device_manage", &payload)
+                })
                 .await?;
             match outcome {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => {
-                    return Err(UaError::ApprovalRequired { tool: "oauth_device_manage".into(), approval_id });
+                    return Err(UaError::ApprovalRequired {
+                        tool: "oauth_device_manage".into(),
+                        approval_id,
+                    });
                 }
                 GateOutcome::Denied { approval_id, reason } => {
                     return Err(UaError::denied(

@@ -63,7 +63,9 @@ fn string_list(v: Option<&Value>, field: &str) -> Result<Option<Vec<String>>, St
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(a)) => a
             .iter()
-            .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("{field} must be a list of strings")))
+            .map(|x| {
+                x.as_str().map(str::to_string).ok_or_else(|| format!("{field} must be a list of strings"))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
         Some(_) => Err(format!("{field} must be a list of strings")),
@@ -95,7 +97,8 @@ pub async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(v) => v.unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]),
         Err(e) => return reg_error("invalid_client_metadata", &e),
     };
-    if grant_types.is_empty() || grant_types.iter().any(|g| g != "authorization_code" && g != "refresh_token") {
+    if grant_types.is_empty() || grant_types.iter().any(|g| g != "authorization_code" && g != "refresh_token")
+    {
         return reg_error(
             "invalid_client_metadata",
             "grant_types may contain only authorization_code and refresh_token",
@@ -165,7 +168,8 @@ pub async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(false) => return reg_error("invalid_client_metadata", "the client registry is full"),
         Err(e) => {
             tracing::warn!(error = %e, "client registration failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "server_error" }))).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "server_error" })))
+                .into_response();
         }
     }
 

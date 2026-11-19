@@ -8,10 +8,10 @@
 //! `state` and `iss` (RFC 9207). Errors that cannot be trusted to a redirect
 //! (unknown client, bad redirect URI) are shown as a page instead.
 
+use axum::Form;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::Form;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -77,7 +77,12 @@ fn redirect_with(redirect_uri: &str, iss: &str, pairs: &[(&str, &str)], state: O
 }
 
 fn redirect_error(p: &Pending, iss: &str, error: &str, description: &str) -> Response {
-    redirect_with(&p.redirect_uri, iss, &[("error", error), ("error_description", description)], p.state.as_deref())
+    redirect_with(
+        &p.redirect_uri,
+        iss,
+        &[("error", error), ("error_description", description)],
+        p.state.as_deref(),
+    )
 }
 
 /// PKCE values are 43-128 unreserved characters (RFC 7636 §4.1-4.2).
@@ -91,8 +96,13 @@ pub fn redirect_matches(registered: &str, presented: &str) -> bool {
     if registered == presented {
         return true;
     }
-    let (Ok(mut a), Ok(mut b)) = (url::Url::parse(registered), url::Url::parse(presented)) else { return false };
-    if a.scheme() != "http" || !super::register::is_loopback_host(&a) || !super::register::is_loopback_host(&b) {
+    let (Ok(mut a), Ok(mut b)) = (url::Url::parse(registered), url::Url::parse(presented)) else {
+        return false;
+    };
+    if a.scheme() != "http"
+        || !super::register::is_loopback_host(&a)
+        || !super::register::is_loopback_host(&b)
+    {
         return false;
     }
     let _ = a.set_port(None);
@@ -117,7 +127,10 @@ pub async fn show(
     let client = match load_client(&state, client_id).await {
         Ok(ClientLookup::Found(c)) => c,
         Ok(ClientLookup::Rejected(reason)) => {
-            return error_page(StatusCode::BAD_REQUEST, &format!("client metadata document refused: {reason}"));
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                &format!("client metadata document refused: {reason}"),
+            );
         }
         Ok(ClientLookup::Unknown) => return error_page(StatusCode::BAD_REQUEST, "unknown client_id"),
         Err(e) => {
@@ -149,11 +162,23 @@ pub async fn show(
         return redirect_error(&p, &iss, "unsupported_response_type", "only response_type=code is supported");
     }
     if !client.allows_grant("authorization_code") {
-        return redirect_error(&p, &iss, "unauthorized_client", "client is not registered for authorization_code");
+        return redirect_error(
+            &p,
+            &iss,
+            "unauthorized_client",
+            "client is not registered for authorization_code",
+        );
     }
     match (q.code_challenge.as_deref(), q.code_challenge_method.as_deref()) {
         (Some(c), Some("S256")) if pkce_shaped(c) => p.code_challenge = c.to_string(),
-        _ => return redirect_error(&p, &iss, "invalid_request", "PKCE with code_challenge_method=S256 is required"),
+        _ => {
+            return redirect_error(
+                &p,
+                &iss,
+                "invalid_request",
+                "PKCE with code_challenge_method=S256 is required",
+            );
+        }
     }
     match accepted_resource(cfg, q.resource.as_deref()) {
         Some(r) => p.resource = r,
@@ -169,7 +194,10 @@ pub async fn show(
     };
     let identities: Vec<&String> = cfg.oauth_identities.iter().filter(|l| !cfg.is_human(l)).collect();
     if identities.is_empty() {
-        return error_page(StatusCode::SERVICE_UNAVAILABLE, "no OAuth identities are configured (oauth_identities)");
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no OAuth identities are configured (oauth_identities)",
+        );
     }
 
     let request_id = random_token("uaq_");
@@ -198,8 +226,10 @@ pub async fn show(
         return error_page(StatusCode::INTERNAL_SERVER_ERROR, "could not start the authorization");
     }
 
-    let redirect_host =
-        url::Url::parse(&p.redirect_uri).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let redirect_host = url::Url::parse(&p.redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
     let options: String = identities
         .iter()
         .map(|l| format!("<option value=\"{0}\">{0}</option>", html_escape(l)))
@@ -236,7 +266,11 @@ pub struct DecisionForm {
     identity: Option<String>,
 }
 
-pub async fn decide(State(state): State<AppState>, headers: HeaderMap, Form(f): Form<DecisionForm>) -> Response {
+pub async fn decide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<DecisionForm>,
+) -> Response {
     let cfg = state.hub.cfg();
     if !cfg.oauth_enabled {
         return not_enabled();
@@ -269,7 +303,12 @@ pub async fn decide(State(state): State<AppState>, headers: HeaderMap, Form(f): 
             Ok(p) => p,
             Err(_) => return error_page(StatusCode::BAD_REQUEST, "the authorization request is corrupt"),
         },
-        Ok(None) => return error_page(StatusCode::BAD_REQUEST, "this authorization request expired or was already used"),
+        Ok(None) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "this authorization request expired or was already used",
+            );
+        }
         Err(e) => {
             tracing::warn!(error = %e, "consent lookup failed");
             return error_page(StatusCode::INTERNAL_SERVER_ERROR, "could not complete the authorization");
@@ -279,7 +318,7 @@ pub async fn decide(State(state): State<AppState>, headers: HeaderMap, Form(f): 
         return redirect_error(&p, &iss, "access_denied", "the operator denied the request");
     }
     let identity = f.identity.unwrap_or_default();
-    if !cfg.oauth_identities.iter().any(|l| *l == identity) || cfg.is_human(&identity) {
+    if !cfg.oauth_identities.contains(&identity) || cfg.is_human(&identity) {
         return error_page(StatusCode::BAD_REQUEST, "that identity may not be used for OAuth grants");
     }
 

@@ -22,7 +22,10 @@ use ua_store::{EventInput, ledger};
 use ua_tools::families::tokens::{digest, revoke_family};
 
 use super::authorize::pkce_shaped;
-use super::store::{Client, ClientKind, ClientLookup, GrantInfo, Issued, insert_grant, issue_tokens, load_client, new_family_id};
+use super::store::{
+    Client, ClientKind, ClientLookup, GrantInfo, Issued, insert_grant, issue_tokens, load_client,
+    new_family_id,
+};
 use super::{SCOPE, accepted_resource, not_enabled};
 use crate::AppState;
 
@@ -45,6 +48,7 @@ fn token_error(error: &str, description: &str) -> Response {
 
 /// Parse an `application/x-www-form-urlencoded` body. Repeated parameters
 /// are refused (RFC 6749 §3.1).
+#[allow(clippy::result_large_err)] // the error is the finished HTTP response
 fn parse_form(headers: &HeaderMap, body: &[u8]) -> Result<HashMap<String, String>, Response> {
     let ctype = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     if !ctype.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded") {
@@ -64,6 +68,7 @@ fn parse_form(headers: &HeaderMap, body: &[u8]) -> Result<HashMap<String, String
 
 /// Authenticate the client: `client_secret_basic`, `client_secret_post`, or
 /// `none` for public clients.
+#[allow(clippy::result_large_err)]
 async fn authenticate_client(
     state: &AppState,
     headers: &HeaderMap,
@@ -83,7 +88,9 @@ async fn authenticate_client(
             let Some((id, secret)) = decoded.as_deref().and_then(|d| d.split_once(':')) else {
                 return Err(token_error("invalid_client", "malformed Basic credentials"));
             };
-            let dec = |s: &str| url::form_urlencoded::parse(format!("x={s}").as_bytes()).next().map(|(_, v)| v.to_string());
+            let dec = |s: &str| {
+                url::form_urlencoded::parse(format!("x={s}").as_bytes()).next().map(|(_, v)| v.to_string())
+            };
             let (Some(id), Some(secret)) = (dec(id), dec(secret)) else {
                 return Err(token_error("invalid_client", "malformed Basic credentials"));
             };
@@ -313,7 +320,13 @@ async fn client_credentials(state: &AppState, client: Client, form: &HashMap<Str
         .db()
         .write_async(move |tx| {
             let family = new_family_id();
-            let g = GrantInfo { family_id: &family, client_id: &client.client_id, subject: &identity, scope: SCOPE, resource: &resource };
+            let g = GrantInfo {
+                family_id: &family,
+                client_id: &client.client_id,
+                subject: &identity,
+                scope: SCOPE,
+                resource: &resource,
+            };
             insert_grant(tx, &g, &client.client_name, "configuration", "client_credentials")?;
             Ok(Outcome::Issued(issue_tokens(tx, &cfg, &g, false)?))
         })
@@ -364,8 +377,11 @@ pub async fn revoke(State(state): State<AppState>, headers: HeaderMap, body: Byt
             }
             ledger::append(
                 tx,
-                EventInput::new("agent.oauth.token_revoked", json!({ "client_id": owner, "kind": kind, "session_id": family }))
-                    .by("oauth"),
+                EventInput::new(
+                    "agent.oauth.token_revoked",
+                    json!({ "client_id": owner, "kind": kind, "session_id": family }),
+                )
+                .by("oauth"),
             )?;
             Ok(())
         })
