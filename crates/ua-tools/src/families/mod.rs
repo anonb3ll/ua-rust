@@ -8,6 +8,7 @@ pub mod agents;
 pub mod code;
 pub mod core_schema;
 pub mod delegation;
+pub mod dispatch;
 pub mod events;
 pub mod evidence;
 pub mod export;
@@ -30,6 +31,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
+    parts.extend(dispatch::schema_parts());
     parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());
     parts.extend(tokens::schema_parts());
@@ -47,6 +49,7 @@ pub fn register(r: &mut Registry) {
     agents::register(r);
     code::register(r);
     delegation::register(r);
+    dispatch::register(r);
     events::register(r);
     evidence::register(r);
     export::register(r);

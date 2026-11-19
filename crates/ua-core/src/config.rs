@@ -164,6 +164,54 @@ pub struct Config {
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.
     pub notify_max_attempts: u32,
+    /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
+    /// Empty means dispatch only records runs and spawns nothing.
+    pub harnesses: BTreeMap<String, HarnessConfig>,
+    /// Seconds a dispatch run's lease lasts; a live supervisor renews it.
+    pub dispatch_lease_seconds: u64,
+    /// Seconds between lease-reaper sweeps under `ua serve`; 0 (default) keeps
+    /// the background loop off.
+    pub dispatch_reaper_interval_s: u64,
+}
+
+/// One agent harness: a CLI coding agent dispatch runs as a child process.
+///
+/// The program runs without a shell. Each `argv` element may carry the
+/// placeholders `{run_id}`, `{task_id}`, `{agent}`, `{fence}`, `{worktree}`
+/// and `{prompt}`, substituted literally. The child environment starts empty:
+/// only the process plumbing (`PATH`, `HOME`, locale, ...), the names in
+/// `env_allowlist` and the dispatch binding (`UA_DISPATCH_*`) are passed, and
+/// hub secrets such as `UA_AGENT_TOKENS` never are.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HarnessConfig {
+    /// Program and arguments, e.g. `["agent-cli", "--print", "{prompt}"]`.
+    pub argv: Vec<String>,
+    /// Extra parent environment names the child may inherit.
+    pub env_allowlist: Vec<String>,
+    /// Wall-clock limit in seconds; the whole process group is killed after it.
+    pub timeout_s: u64,
+    /// Bytes of combined output kept in the run log; the rest is discarded.
+    pub output_cap_bytes: u64,
+    /// Working directory when the task records no worktree.
+    pub workdir: Option<PathBuf>,
+    /// Pass the dispatched agent's own hub bearer (from `agent_tokens`) as
+    /// `UA_AGENT_BEARER_TOKEN`, so the child can call `dispatch_report_self`.
+    /// Off by default; no other agent's token is ever passed.
+    pub pass_agent_token: bool,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            argv: Vec::new(),
+            env_allowlist: Vec::new(),
+            timeout_s: 3600,
+            output_cap_bytes: 1024 * 1024,
+            workdir: None,
+            pass_agent_token: false,
+        }
+    }
 }
 
 impl Default for Config {
@@ -220,6 +268,9 @@ impl Default for Config {
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
             notify_max_attempts: 3,
+            harnesses: BTreeMap::new(),
+            dispatch_lease_seconds: 300,
+            dispatch_reaper_interval_s: 0,
         }
     }
 }
@@ -282,6 +333,9 @@ impl Config {
         self.apply_oauth_profiles();
         self.policy_file = self.policy_file.map(|p| expand_tilde(&p));
         self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
+        for h in self.harnesses.values_mut() {
+            h.workdir = h.workdir.as_deref().map(expand_tilde);
+        }
         self
     }
 
@@ -460,5 +514,23 @@ mod tests {
         assert_eq!(toks.len(), 1);
         assert_eq!(toks[0].0, "beta");
         assert!(!format!("{cfg:?}").contains("t2"), "secrets must not leak through Debug");
+    }
+
+    #[test]
+    fn harness_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "dispatch_lease_seconds = 60\n[harnesses.echo]\nargv = [\"echo\", \"{prompt}\"]\ntimeout_s = 5\n",
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        let h = &cfg.harnesses["echo"];
+        assert_eq!(h.argv, vec!["echo", "{prompt}"]);
+        assert_eq!(h.timeout_s, 5);
+        assert_eq!(h.output_cap_bytes, 1024 * 1024, "unset fields keep their defaults");
+        assert_eq!(cfg.dispatch_lease_seconds, 60);
+        assert_eq!(cfg.dispatch_reaper_interval_s, 0, "the reaper loop is off by default");
     }
 }

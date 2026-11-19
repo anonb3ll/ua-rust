@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
     let state = AppState { hub: hub.clone(), registry: registry.clone() };
+    let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
 
     match cli.cmd {
         Cmd::Serve => {
