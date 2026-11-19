@@ -28,3 +28,13 @@ jobs:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --no-tests=pass
       - run: cargo test --workspace --doc
+
+  # The hub also runs on macOS, where orphan recovery reads process
+  # identity through proc_pidinfo instead of /proc.
+  dispatch-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ua-tools --test dispatch
