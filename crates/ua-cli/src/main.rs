@@ -61,6 +61,26 @@ enum Cmd {
     },
     /// Print the effective configuration (secrets redacted).
     Config,
+    /// Import data from another hub into this hub's database.
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// Import a Python hub database (opened read-only). Re-running resumes
+    /// and skips rows already copied. Prints a JSON report.
+    PythonHub {
+        /// Path to the Python hub's SQLite database.
+        #[arg(long = "from")]
+        from: std::path::PathBuf,
+        /// Report counts, unmapped tables and columns and the source ledger
+        /// check without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,6 +161,17 @@ async fn main() -> anyhow::Result<()> {
 
     if let Cmd::Config = cli.cmd {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
+        return Ok(());
+    }
+
+    if let Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run } } = &cli.cmd {
+        let report = if *dry_run {
+            ua_import::dry_run(from)?
+        } else {
+            let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
+            ua_import::import(&db, from, &ua_import::Options::default())?
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -257,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("{url}");
         }
-        Cmd::Config => unreachable!(),
+        Cmd::Config | Cmd::Import { .. } => unreachable!(),
     }
     Ok(())
 }
