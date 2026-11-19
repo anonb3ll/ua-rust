@@ -28,8 +28,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::safety::{canonicalize_lenient, containing_root};
 use ua_core::{UaError, UaResult};
+use ua_store::{EventInput, ledger};
 
 use self::rules::{Finding, SEVERITIES, SUPPRESS_MARKER, severity_rank};
+use crate::approvals::{self, GateOutcome};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 pub const MAX_FILES: usize = 5000;
@@ -249,6 +251,19 @@ fn grade(summary: &Value, truncated: bool) -> &'static str {
 
 /// Audit `root` (a directory or one file) and return the report.
 pub fn run_audit(root: &Path, opts: &AuditOptions) -> UaResult<Value> {
+    if opts.remediate {
+        return Err(UaError::invalid("remediation must go through run_audit_with and the approval gate"));
+    }
+    run_audit_with(root, opts, None).map(|(report, _)| report)
+}
+
+/// Like [`run_audit`], optionally remediating: `Plan` writes nothing and
+/// reports the files it would change; `Apply` writes only what was approved.
+pub fn run_audit_with(
+    root: &Path,
+    opts: &AuditOptions,
+    mode: Option<remediate::Mode<'_>>,
+) -> UaResult<(Value, Vec<remediate::Change>)> {
     let root =
         root.canonicalize().map_err(|e| UaError::invalid(format!("cannot resolve the audit root: {e}")))?;
     let single_file = root.is_file();
@@ -308,9 +323,10 @@ pub fn run_audit(root: &Path, opts: &AuditOptions) -> UaResult<Value> {
         _ => true,
     });
 
-    if opts.remediate {
-        remediate::remediate_findings(&root, &mut findings);
-    }
+    let changes = match mode {
+        Some(mode) => remediate::remediate_findings(&root, &mut findings, mode),
+        None => Vec::new(),
+    };
 
     // Drop byte-identical findings so overlapping rules cannot inflate counts.
     let mut seen = std::collections::BTreeSet::new();
@@ -343,7 +359,7 @@ pub fn run_audit(root: &Path, opts: &AuditOptions) -> UaResult<Value> {
     let summary = Value::Object(summary);
     let as_json: Vec<Value> = findings.iter().map(Finding::to_json).collect();
     let truncated = !truncated_by.is_empty();
-    Ok(json!({
+    let report = json!({
         "root": root.to_string_lossy(),
         "files_scanned": scanned,
         "status": status_of(&as_json.iter().filter(|f| f["fixed"] != true).cloned().collect::<Vec<_>>()),
@@ -353,7 +369,8 @@ pub fn run_audit(root: &Path, opts: &AuditOptions) -> UaResult<Value> {
         "findings_total": findings_total,
         "truncated": truncated,
         "truncated_by": truncated_by,
-    }))
+    });
+    Ok((report, changes))
 }
 
 // --- path resolution -----------------------------------------------------------------------
@@ -484,32 +501,114 @@ async fn security_audit(ctx: ToolCtx, a: AuditArgs) -> UaResult<Value> {
         return Err(UaError::invalid("remediate is not supported for vault-scoped audits (vault=true)"));
     }
     let path = a.path.unwrap_or_else(|| ".".into());
-    blocking(move || {
-        let target = resolve_target(&ctx, &path, a.vault, a.remediate)?;
-        if a.remediate && target.path.is_file() {
-            return Err(UaError::invalid("remediate requires a directory path, not a single file"));
-        }
-        let opts = AuditOptions {
-            excludes: effective_excludes(&ctx, a.vault, a.excludes),
-            include_repo_rules: !a.vault && !target.under_vault,
-            remediate: a.remediate,
-            inbox_dir: target.inbox_dir.clone(),
-        };
-        let mut report = run_audit(&target.path, &opts)?;
+    let remediate = a.remediate;
+    let (excludes_arg, vault) = (a.excludes, a.vault);
+    let prep = {
+        let ctx = ctx.clone();
+        blocking(move || {
+            let target = resolve_target(&ctx, &path, vault, remediate)?;
+            if remediate && target.path.is_file() {
+                return Err(UaError::invalid("remediate requires a directory path, not a single file"));
+            }
+            let opts = AuditOptions {
+                excludes: effective_excludes(&ctx, vault, excludes_arg),
+                include_repo_rules: !vault && !target.under_vault,
+                remediate: false,
+                inbox_dir: target.inbox_dir.clone(),
+            };
+            let plan = if remediate {
+                run_audit_with(&target.path, &opts, Some(remediate::Mode::Plan))?.1
+            } else {
+                Vec::new()
+            };
+            Ok((target, opts, plan))
+        })
+        .await?
+    };
+    let (target, opts, plan) = prep;
+
+    // Writing files is a state change: park the exact planned list for a human.
+    let root = target.path.canonicalize().unwrap_or_else(|_| target.path.clone());
+    let mut approval_id = None;
+    if !plan.is_empty() {
+        let payload = json!({
+            "remediate": true,
+            "root": root.to_string_lossy(),
+            "changes": plan.iter().map(remediate::Change::to_json).collect::<Vec<_>>(),
+        });
+        approval_id = Some(gate_remediation(&ctx, payload).await?);
+    }
+
+    let events_ctx = ctx.clone();
+    let (report, changes) = blocking(move || {
+        let mode = if remediate { Some(remediate::Mode::Apply(&plan)) } else { None };
+        let (mut report, changes) = run_audit_with(&target.path, &opts, mode)?;
         let cutoff = severity_rank(&min);
         if let Some(list) = report["findings"].as_array_mut() {
             list.retain(|f| severity_rank(f["severity"].as_str().unwrap_or("info")) <= cutoff);
         }
-        Ok(report)
+        Ok((report, changes))
     })
-    .await
+    .await?;
+
+    let mut report = report;
+    report["remediated_files"] = json!(changes.iter().map(remediate::Change::to_json).collect::<Vec<_>>());
+    if !changes.is_empty() {
+        let files: Vec<Value> = changes.iter().map(remediate::Change::to_json).collect();
+        let by = events_ctx.caller.label.clone();
+        let root = root.to_string_lossy().into_owned();
+        let appended = events_ctx
+            .hub
+            .db()
+            .write_async(move |tx| {
+                ledger::append(
+                    tx,
+                    EventInput::new(
+                        "agent.audit.remediated",
+                        json!({ "approval_id": approval_id, "root": root, "files": files }),
+                    )
+                    .by(by),
+                )?;
+                Ok(())
+            })
+            .await;
+        // The files are already written: report a failed record, never hide it.
+        if let Err(e) = appended {
+            tracing::warn!(error = %e, "security_audit remediation applied but its ledger event failed");
+            report["ledger_error"] = json!(format!("remediation applied but the ledger event failed: {e}"));
+        }
+    }
+    Ok(report)
+}
+
+/// Park or consume an approval bound to the exact planned file changes.
+/// `security_audit` is not `always_gated` (a read-only audit needs none), so
+/// the gate is forced here for `remediate=true`; the payload carries the plan,
+/// so an approval never covers a different set of files.
+async fn gate_remediation(ctx: &ToolCtx, payload: Value) -> UaResult<i64> {
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    let outcome = ctx
+        .hub
+        .db()
+        .write_async(move |tx| approvals::gate(tx, hub.cfg(), &caller, "security_audit", &payload))
+        .await?;
+    match outcome {
+        GateOutcome::Pass { approval_id } => Ok(approval_id),
+        GateOutcome::Pending { approval_id } => {
+            Err(UaError::ApprovalRequired { tool: "security_audit".into(), approval_id })
+        }
+        GateOutcome::Denied { approval_id, reason } => Err(UaError::denied(
+            "approval_denied",
+            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+        )),
+    }
 }
 
 pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "security_audit",
-            "Audit a project (or, with vault=true, a vault note or directory) for AI-development security problems: committed secrets and private keys, .env exposure, permissive agent settings and risky hooks, MCP configs with literal secrets or unpinned packages, hidden Unicode and bypass directives in instruction files, eval/shell use near LLM SDKs, lockfile and .gitignore hygiene, and injection phrases, hidden Unicode and base64 blobs in documents. A finding never contains a secret value, only file, line, rule and a redacted preview. Lines with `ua:allow` are exempt. Scans at most 5000 files of 1 MB; remediate=true applies safe fixes inside the workspace. Returns {root, files_scanned, status, grade, summary, findings, findings_total, truncated, truncated_by}; status is fail (any high), warn (any medium) or pass.",
+            "Audit a project (or, with vault=true, a vault note or directory) for AI-development security problems: committed secrets and private keys, .env exposure, permissive agent settings and risky hooks, MCP configs with literal secrets or unpinned packages, hidden Unicode and bypass directives in instruction files, eval/shell use near LLM SDKs, lockfile and .gitignore hygiene, and injection phrases, hidden Unicode and base64 blobs in documents. A finding never contains a secret value, only file, line, rule and a redacted preview. Lines with `ua:allow` are exempt. Scans at most 5000 files of 1 MB; remediate=true applies safe fixes inside the workspace, but only after a human approves the exact list of files it would change (the call parks as approval_required first), and records each changed file's SHA-256 before and after in the ledger. Returns {root, files_scanned, status, grade, summary, findings, findings_total, truncated, truncated_by}; status is fail (any high), warn (any medium) or pass.",
             security_audit,
         )
         .family("audit"),

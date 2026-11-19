@@ -178,6 +178,33 @@ pub struct Config {
     /// `dispatch_lease_seconds`; 0 turns the background loop off (the one
     /// sweep at startup still runs).
     pub dispatch_reaper_interval_s: Option<u64>,
+    /// Directory of reviewed YAML workflow definitions read by `workflow_list`
+    /// and `workflow_run`. Defaults to `$home/workflows`. Definitions are
+    /// executable: review a change to this directory like code.
+    pub workflow_dir: Option<PathBuf>,
+    /// Allow `routine_fire`, and run due cron routines once a minute from
+    /// `ua serve` (`UA_ROUTINES_ENABLED`). Off by default.
+    pub routines_enabled: bool,
+    /// Default wall-clock budget of an autonomous cycle, in seconds.
+    pub autonomy_max_time_s: f64,
+    /// Default token budget of an autonomous cycle.
+    pub autonomy_max_tokens: i64,
+    /// Default retry budget of an autonomous cycle.
+    pub autonomy_max_retries: i64,
+    /// Default cost budget of an autonomous cycle, in cents.
+    pub autonomy_max_cost_cents: f64,
+    /// Validation gates for the autonomous-cycle green path: a program and its
+    /// arguments, run in the task worktree, that must exit 0. Empty (the
+    /// default) means no cycle is ever green-path eligible, so every merge and
+    /// PR transition waits for a human approval.
+    #[serde(deserialize_with = "string_or_list")]
+    pub cycle_validation_command: Vec<String>,
+    /// Extra hub environment variable names passed through to the validation
+    /// command (for example a toolchain location). The command otherwise
+    /// gets a cleared environment with a fresh, empty HOME. `UA_*` names and
+    /// credential-looking names are never passed, even when listed.
+    #[serde(deserialize_with = "string_or_list")]
+    pub cycle_validation_env: Vec<String>,
 }
 
 /// One agent harness: a CLI coding agent dispatch runs as a child process.
@@ -279,6 +306,14 @@ impl Default for Config {
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,
+            workflow_dir: None,
+            routines_enabled: false,
+            autonomy_max_time_s: 3600.0,
+            autonomy_max_tokens: 100_000,
+            autonomy_max_retries: 3,
+            autonomy_max_cost_cents: 1000.0,
+            cycle_validation_command: Vec::new(),
+            cycle_validation_env: Vec::new(),
         }
     }
 }
@@ -344,6 +379,7 @@ impl Config {
         for h in self.harnesses.values_mut() {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
         }
+        self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
         self
     }
 
@@ -400,6 +436,11 @@ impl Config {
 
     pub fn workspace_root(&self) -> PathBuf {
         self.workspace.clone().unwrap_or_else(|| self.home.join("workspace"))
+    }
+
+    /// Where reviewed workflow definitions live.
+    pub fn workflow_dir(&self) -> PathBuf {
+        self.workflow_dir.clone().unwrap_or_else(|| self.home.join("workflows"))
     }
 
     pub fn shell_allowlist(&self) -> Vec<String> {

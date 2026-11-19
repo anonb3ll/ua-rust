@@ -35,7 +35,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn new(
+    pub(super) fn new(
         rule: &str,
         severity: &'static str,
         path: Option<&str>,

@@ -58,21 +58,155 @@ pub fn read_regular_text(path: &Path) -> Option<String> {
     read_regular_file(path, Some(8 << 20)).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Write `text` into a regular file (created when missing). A FIFO, device,
-/// directory or symlink at the path is refused and left untouched.
-pub fn write_regular_text(path: &Path, text: &str) -> std::io::Result<()> {
-    let refuse = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if !m.is_file() => return Err(refuse()),
-        Ok(_) | Err(_) => {}
+fn nofollow_flags(opts: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW);
     }
+    #[cfg(not(unix))]
+    let _ = opts;
+}
+
+fn refuse() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
+const REPLACE_LIMIT: u64 = 8 << 20;
+
+/// Create `path` with `text`; it must not exist. `create_new` never truncates
+/// a file that appeared after the scan, and `O_NOFOLLOW` plus the exclusive
+/// create refuse a symlink at the path.
+pub fn create_regular_text(path: &Path, text: &str) -> std::io::Result<()> {
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(false);
-    open_flags(&mut opts);
+    opts.write(true).create_new(true);
+    nofollow_flags(&mut opts);
     let mut file = opts.open(path)?;
-    if !file.metadata()?.is_file() {
+    file.write_all(text.as_bytes())
+}
+
+/// Read `path` (a regular file, never followed through a symlink) from ONE
+/// open descriptor, let `decide` turn those bytes into the new text, and
+/// replace the file with a temp file renamed over it. `decide` returning
+/// `None` leaves the file alone (`Ok(false)`). Nothing is written when
+/// `decide` fails, so the check and the write act on the same file.
+pub fn replace_regular_text(
+    path: &Path,
+    decide: impl FnOnce(&[u8]) -> std::io::Result<Option<String>>,
+) -> std::io::Result<bool> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    nofollow_flags(&mut opts);
+    let mut file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > REPLACE_LIMIT {
         return Err(refuse());
     }
-    file.set_len(0)?;
-    file.write_all(text.as_bytes())
+    let mut buf = Vec::new();
+    (&mut file).take(REPLACE_LIMIT + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > REPLACE_LIMIT {
+        return Err(refuse());
+    }
+    let Some(new) = decide(&buf)? else { return Ok(false) };
+
+    let dir = path.parent().ok_or_else(refuse)?;
+    let name = path.file_name().ok_or_else(refuse)?.to_string_lossy();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.ua-tmp-{}-{nanos}", std::process::id()));
+    let result = (|| {
+        let mut topts = OpenOptions::new();
+        topts.write(true).create_new(true);
+        nofollow_flags(&mut topts);
+        let mut t = topts.open(&tmp)?;
+        t.write_all(new.as_bytes())?;
+        t.set_permissions(meta.permissions())?;
+        t.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let now = std::fs::symlink_metadata(path)?;
+            if now.dev() != meta.dev() || now.ino() != meta.ino() {
+                return Err(std::io::Error::other("file was replaced during the update"));
+            }
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map(|()| true)
+}
+
+/// The whole file as strictly valid UTF-8, read from one descriptor that never
+/// follows a symlink. A file that is not UTF-8 is an error, never decoded
+/// lossily.
+pub fn read_regular_text_strict(path: &Path) -> std::io::Result<(String, Vec<u8>)> {
+    let mut seen = None;
+    replace_regular_text(path, |b| {
+        seen = Some(b.to_vec());
+        Ok(None)
+    })?;
+    let bytes = seen.unwrap_or_default();
+    let text = String::from_utf8(bytes.clone())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+    Ok((text, bytes))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_never_truncates_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        create_regular_text(&f, "one").unwrap();
+        let err = create_regular_text(&f, "two").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one");
+    }
+
+    #[test]
+    fn symlinks_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(replace_regular_text(&link, |_| Ok(Some("x".into()))).is_err());
+        assert!(create_regular_text(&link, "x").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("missing"), &dangling).unwrap();
+        assert!(create_regular_text(&dangling, "x").is_err());
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn replace_checks_and_writes_the_same_bytes_and_keeps_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // A refusing decide writes nothing.
+        let err = replace_regular_text(&f, |_| Err(std::io::Error::other("no"))).unwrap_err();
+        assert_eq!(err.to_string(), "no");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "old");
+        assert!(replace_regular_text(&f, |b| Ok(Some(format!("{}!", String::from_utf8_lossy(b))))).unwrap());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "old!");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file is left");
+    }
+
+    #[test]
+    fn strict_read_rejects_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"ok \xff").unwrap();
+        assert_eq!(read_regular_text_strict(&f).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
 }
