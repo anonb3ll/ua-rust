@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
-use ua_core::{Caller, Config, identity::Transport};
+use ua_core::{ActorKind, Caller, Config, Profile, identity::Transport};
 use ua_tools::{Hub, builtin_registry};
 
 const FAKE_OPENAI: &str = "sk-test-00000000000000000000000000000000";
@@ -200,14 +200,67 @@ async fn paths_outside_the_roots_and_missing_paths_are_refused() {
     assert!(has(&one, "INJECTION-KEYWORD", "one.md"));
 }
 
+fn human() -> Caller {
+    Caller {
+        label: "operator".into(),
+        kind: ActorKind::Human,
+        profile: Profile::Operator,
+        enforce_profile: true,
+        session_key: None,
+        transport: Transport::Cli,
+    }
+}
+
+impl Env {
+    async fn as_human(&self, tool: &str, args: Value) -> Value {
+        builtin_registry().call(&self.hub, &human(), tool, args).await.unwrap()
+    }
+
+    /// Approve the newest pending approval for `security_audit`.
+    async fn approve(&self) -> Value {
+        let pending = self.as_human("approval_pending", json!({ "tool": "security_audit" })).await;
+        let row = pending["pending"][0].clone();
+        let id = row["id"].as_i64().expect("a pending approval");
+        self.as_human("approval_resolve", json!({ "id": id, "decision": "approve" })).await;
+        row
+    }
+
+    async fn remediate(&self) -> Value {
+        match self.audit(json!({ "remediate": true })).await {
+            Err(e) => {
+                assert_eq!(e.code(), "approval_required");
+                self.approve().await;
+                self.ok(json!({ "remediate": true })).await
+            }
+            Ok(v) => v,
+        }
+    }
+}
+
 #[tokio::test]
-async fn remediate_applies_only_the_safe_fixes() {
+async fn remediate_parks_until_approved_then_writes_and_records() {
     let e = Env::new();
     e.put(".git/HEAD", "ref: refs/heads/main\n");
     e.put(".env", "TOKEN=abc\n");
     e.put("CLAUDE.md", "# x\nhidden\u{200b}text\n");
     let before = e.ok(json!({})).await;
     assert!(has(&before, "SECRETS-ENV-EXPOSED", ".env"));
+
+    // A read-only audit never parks.
+    assert!(e.audit(json!({ "remediate": false })).await.is_ok());
+
+    // Unapproved: parked, nothing written.
+    let err = e.audit(json!({ "remediate": true })).await.unwrap_err();
+    assert_eq!(err.code(), "approval_required");
+    assert!(!e.ws.path().join(".gitignore").exists());
+    assert_eq!(std::fs::read_to_string(e.ws.path().join("CLAUDE.md")).unwrap(), "# x\nhidden\u{200b}text\n");
+
+    // The parked payload lists the exact planned files, hashes only.
+    let row = e.approve().await;
+    let changes = row["payload"]["changes"].as_array().unwrap();
+    let paths: Vec<&str> = changes.iter().map(|c| c["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, [".gitignore", "CLAUDE.md"]);
+    assert!(!row["payload"].to_string().contains("hidden"));
 
     let after = e.ok(json!({ "remediate": true })).await;
     let fixed: Vec<&Value> =
@@ -221,9 +274,64 @@ async fn remediate_applies_only_the_safe_fixes() {
     // The .env itself is never touched.
     assert_eq!(std::fs::read_to_string(e.ws.path().join(".env")).unwrap(), "TOKEN=abc\n");
 
+    // One ledger event lists each changed file by hash.
+    let log = e.as_human("event_log_query", json!({ "channels": ["agent.audit.remediated"] })).await;
+    let events = log["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{log}");
+    let files = events[0]["payload"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let claude_ev = files.iter().find(|f| f["path"] == "CLAUDE.md").unwrap();
+    assert_eq!(claude_ev["action"], "modify");
+    assert_ne!(claude_ev["sha256_before"], claude_ev["sha256_after"]);
+    assert_eq!(claude_ev["sha256_after"].as_str().unwrap().len(), 64);
+    assert!(!events[0].to_string().contains("hiddentext"));
+
     let again = e.ok(json!({})).await;
     assert!(!has(&again, "SECRETS-ENV-EXPOSED", ".env"));
     assert!(!has(&again, "AGENT-HIDDEN-UNICODE", "CLAUDE.md"));
+}
+
+#[tokio::test]
+async fn an_approval_does_not_cover_a_changed_plan() {
+    let e = Env::new();
+    e.put(".git/HEAD", "ref: refs/heads/main\n");
+    e.put("CLAUDE.md", "# x\n");
+    let err = e.audit(json!({ "remediate": true })).await.unwrap_err();
+    assert_eq!(err.code(), "approval_required");
+    e.approve().await;
+    // The tree changes before the retry: the plan differs, so it parks again.
+    e.put("CLAUDE.md", "# x\nhidden\u{200b}text\n");
+    let err = e.audit(json!({ "remediate": true })).await.unwrap_err();
+    assert_eq!(err.code(), "approval_required");
+    assert!(!e.ws.path().join(".gitignore").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remediate_refuses_a_symlinked_target() {
+    let e = Env::new();
+    e.put(".git/HEAD", "ref: refs/heads/main\n");
+    e.put(".env", "TOKEN=abc\n");
+    e.put("CLAUDE.md", "# x\n");
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("real-ignore");
+    std::fs::write(&target, "keep\n").unwrap();
+    std::os::unix::fs::symlink(&target, e.ws.path().join(".gitignore")).unwrap();
+
+    let report = e.remediate().await;
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+    let f =
+        report["findings"].as_array().unwrap().iter().find(|f| f["rule"] == "SECRETS-ENV-EXPOSED").unwrap();
+    assert_eq!(f["fixed"], false);
+    assert!(f["message"].as_str().unwrap().contains("AUTO-FIX-FAILED"), "{f}");
+
+    // A dangling link is refused too, and its target is not created.
+    std::fs::remove_file(e.ws.path().join(".gitignore")).unwrap();
+    let missing = outside.path().join("missing");
+    std::os::unix::fs::symlink(&missing, e.ws.path().join(".gitignore")).unwrap();
+    let report = e.remediate().await;
+    assert!(!missing.exists());
+    assert!(report["findings"].as_array().unwrap().iter().all(|f| f["fixed"] != true), "{report}");
 }
 
 #[tokio::test]
