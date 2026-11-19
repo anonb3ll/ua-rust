@@ -35,6 +35,13 @@ and steps to reproduce. You will get an acknowledgement within a week.
   the re-check. When the caller is no longer let in, the stream sends a
   final `auth_revoked` event with a short reason code and ends, so
   clients can stop reconnecting.
+- **Remote nodes answer to one agent.** A node name belongs to the agent
+  label whose token first registered it; registration and heartbeats need
+  that agent's credential, and humans and unauthenticated callers are
+  refused. A node's facts are self-reported: the hub bounds them on write
+  (unknown keys dropped, lists and strings capped, 64000 bytes at most) but
+  cannot verify them. Retiring a node is a lifecycle operator action
+  (`lifecycle_operators`, default `human_identities`).
 - **Dynamic client registration is bounded.** Clients that never receive a
   grant are pruned after `oauth_dcr_unused_ttl_hours`, unused clients are
   capped (the oldest is evicted), and each address may register
