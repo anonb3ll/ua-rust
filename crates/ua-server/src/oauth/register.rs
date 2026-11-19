@@ -120,7 +120,7 @@ pub async fn register(State(state): State<AppState>, body: Bytes) -> Response {
         .collect();
     let client_name = client_name.trim().to_string();
 
-    let client_id = format!("ua-client-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let client_id = format!("ua-client-{}", ulid::Ulid::generate().to_string().to_lowercase());
     let secret = (method != "none").then(|| random_token("uas_"));
     let secret_hash = secret.as_deref().map(digest);
     let now = ua_core::time::now();

@@ -275,5 +275,5 @@ pub fn lookup_access(state: &AppState, token: &str) -> Option<AccessInfo> {
 
 /// A new grant family id (shown to operators as the session id).
 pub fn new_family_id() -> String {
-    ulid::Ulid::new().to_string().to_lowercase()
+    ulid::Ulid::generate().to_string().to_lowercase()
 }
