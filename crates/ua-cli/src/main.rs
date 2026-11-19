@@ -245,6 +245,11 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Cmd::LoginLink { label } => {
+            // A login link signs a browser in as a human; same bar as acting
+            // as a human from the CLI.
+            if std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label) {
+                anyhow::bail!("a sign-in link for {label:?} needs an operator at an interactive terminal");
+            }
             let url = ua_server::login::create_login_link(&hub, &label, "cli")?;
             eprintln!(
                 "Sign-in link for {label} (single use, expires in {} s; open it in the browser you will use):",
