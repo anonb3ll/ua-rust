@@ -83,14 +83,49 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     }
 }
 
+/// The caller for a local CLI invocation.
+///
+/// Acting as a human (who may approve gated calls) needs all of:
+/// - an explicit `--label` naming a configured human identity (never a
+///   default, and never a label that only came from `UA_AGENT_LABEL`, which
+///   is how agent processes are launched);
+/// - no `UA_AGENT_LABEL` in the environment at all;
+/// - the operator typing the label back on an interactive terminal.
+///
+/// These are speed bumps, not a security boundary. Anything running as the
+/// hub's OS user can read the database file directly, so the real boundary
+/// is the OS account: run agents under a different user than the hub (see
+/// SECURITY.md).
 fn local_caller(cfg: &Config, label: Option<String>) -> Caller {
-    let label =
-        label.unwrap_or_else(|| cfg.human_identities.first().cloned().unwrap_or_else(|| "local".into()));
-    let mut c = Caller::local(label, Transport::Cli);
-    if cfg.is_human(&c.label) {
+    let from_env = std::env::var("UA_AGENT_LABEL").ok();
+    local_caller_with(cfg, label, from_env.as_deref(), confirm_on_tty)
+}
+
+fn local_caller_with(
+    cfg: &Config,
+    label: Option<String>,
+    agent_env: Option<&str>,
+    confirm: impl FnOnce(&str) -> bool,
+) -> Caller {
+    let explicit = label.is_some() && agent_env.is_none();
+    let mut c = Caller::local(label.unwrap_or_else(|| "local".into()), Transport::Cli);
+    if explicit && cfg.is_human(&c.label) && confirm(&c.label) {
         c.kind = ActorKind::Human;
     }
     c
+}
+
+/// Ask the operator to type `label` on an interactive terminal.
+fn confirm_on_tty(label: &str) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("note: acting as human {label:?} needs an interactive terminal; continuing as non-human");
+        return false;
+    }
+    eprint!("Act as human {label:?}? Type the label to confirm: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim() == label
 }
 
 #[tokio::main]
@@ -115,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Serve => {
+            warn_if_locked_out(&state).await;
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {
@@ -154,6 +190,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Issue { label, note } => {
+                // A token for a human identity grants approval rights over HTTP;
+                // mint one only on an operator's explicit confirmation.
+                if cfg.is_human(&label)
+                    && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label))
+                {
+                    anyhow::bail!(
+                        "issuing a token for human {label:?} needs an operator at an interactive terminal"
+                    );
+                }
                 let mut raw = [0u8; 32];
                 rand::rng().fill_bytes(&mut raw);
                 let token = format!("ua_{}", hex::encode(raw));
@@ -210,4 +255,69 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Config => unreachable!(),
     }
     Ok(())
+}
+
+/// With auth enforced and no credential configured, every non-public request
+/// gets a 401. Say so at startup instead of leaving a bare 401 to puzzle over.
+async fn warn_if_locked_out(state: &ua_server::AppState) {
+    let cfg = state.hub.cfg();
+    if !cfg.enforce_auth || !cfg.static_tokens().is_empty() {
+        return;
+    }
+    let issued: i64 = state
+        .hub
+        .db()
+        .read_async(|conn| {
+            Ok(conn
+                .query_row("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'", [], |r| r.get(0))?)
+        })
+        .await
+        .unwrap_or(0);
+    if issued == 0 {
+        tracing::warn!(
+            "enforce_auth is on and no tokens are configured, so every request except /healthz will get 401; \
+             run `ua token issue <label>`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        let mut c = Config::for_home(std::env::temp_dir());
+        c.human_identities = vec!["operator".into()];
+        c
+    }
+
+    #[test]
+    fn no_label_is_never_human() {
+        let c = local_caller_with(&cfg(), None, None, |_| true);
+        assert_eq!(c.kind, ActorKind::Anonymous);
+        assert_eq!(c.label, "local");
+    }
+
+    #[test]
+    fn explicit_human_label_is_human_only_when_confirmed() {
+        let c = local_caller_with(&cfg(), Some("operator".into()), None, |l| l == "operator");
+        assert_eq!(c.kind, ActorKind::Human);
+        let c = local_caller_with(&cfg(), Some("operator".into()), None, |_| false);
+        assert_eq!(c.kind, ActorKind::Anonymous, "no terminal confirmation, no human");
+    }
+
+    #[test]
+    fn an_agent_environment_cannot_claim_a_human_label() {
+        // UA_AGENT_LABEL=agent-1 and an explicit --label operator: still not human.
+        let c = local_caller_with(&cfg(), Some("operator".into()), Some("agent-1"), |_| true);
+        assert_eq!(c.kind, ActorKind::Anonymous);
+    }
+
+    #[test]
+    fn agent_env_label_is_never_human() {
+        // `--label` falls back to UA_AGENT_LABEL; a label from there is not
+        // an operator's explicit choice.
+        let c = local_caller_with(&cfg(), Some("operator".into()), Some("operator"), |_| true);
+        assert_eq!(c.kind, ActorKind::Anonymous);
+    }
 }
