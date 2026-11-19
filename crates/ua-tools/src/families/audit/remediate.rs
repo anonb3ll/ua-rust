@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::rules::Finding;
-use super::safe_io::{read_regular_file, read_regular_text, write_regular_text};
+use super::safe_io::{create_regular_text, read_regular_text_strict, replace_regular_text};
 use crate::families::injection::hidden_char_regex;
 
 const DEFAULT_GITIGNORE: &str = "# Default .gitignore created by audit auto-remediation
@@ -58,13 +58,20 @@ fn sha(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// One file a remediation creates or rewrites. Hashes only, never content.
+fn io_err(msg: &str) -> std::io::Error {
+    std::io::Error::other(msg.to_string())
+}
+
+/// One file a remediation creates or rewrites. Hashes and a fixed-phrase
+/// description only, never file content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub path: String,
     /// `None` when the file is created.
     pub sha256_before: Option<String>,
     pub sha256_after: String,
+    /// Short human-readable summary: fixed phrases and line numbers only.
+    pub description: String,
 }
 
 impl Change {
@@ -72,6 +79,7 @@ impl Change {
         json!({
             "path": self.path,
             "action": if self.sha256_before.is_some() { "modify" } else { "create" },
+            "description": self.description,
             "sha256_before": self.sha256_before,
             "sha256_after": self.sha256_after,
         })
@@ -97,47 +105,123 @@ impl Fixer<'_> {
         self.overlay.contains_key(rel) || std::fs::symlink_metadata(self.root.join(rel)).is_ok()
     }
 
-    fn read(&self, rel: &str) -> Option<String> {
-        match self.overlay.get(rel) {
-            Some(t) => Some(t.clone()),
-            None => read_regular_text(&self.root.join(rel)),
-        }
-    }
-
-    /// Create (`create_only`) or replace `rel` with `text`.
-    fn put(&mut self, rel: &str, text: &str, create_only: bool) -> std::io::Result<()> {
-        let path = self.root.join(rel);
-        let ours = self.overlay.contains_key(rel);
-        let before = if create_only || ours {
-            None
-        } else {
-            match read_regular_file(&path, Some(8 << 20)) {
-                Some(b) => Some(sha(&b)),
-                None => return Err(std::io::Error::other("not a readable regular file")),
-            }
+    fn record(&mut self, rel: &str, before: Option<String>, new: &str, description: String) {
+        let before = match self.changes.get(rel) {
+            Some(first) => first.sha256_before.clone(),
+            None => before,
         };
-        let first = self.changes.get(rel).map(|c| c.sha256_before.clone());
-        let before_for_change = first.unwrap_or_else(|| before.clone());
-        if let Mode::Apply(expected) = &self.mode
-            && !ours
-            && !expected.iter().any(|c| c.path == rel && c.sha256_before == before)
-        {
-            return Err(std::io::Error::other("file changed since the plan was approved"));
-        }
-        if matches!(self.mode, Mode::Apply(_)) {
-            write_regular_text(&path, text, create_only && !ours)?;
-        }
-        self.overlay.insert(rel.to_string(), text.to_string());
+        self.overlay.insert(rel.to_string(), new.to_string());
         self.changes.insert(
             rel.to_string(),
             Change {
                 path: rel.to_string(),
-                sha256_before: before_for_change,
-                sha256_after: sha(text.as_bytes()),
+                sha256_before: before,
+                sha256_after: sha(new.as_bytes()),
+                description,
             },
         );
+    }
+
+    /// Create `rel` with `text`; it must not exist.
+    fn create(&mut self, rel: &str, text: &str, description: &str) -> std::io::Result<()> {
+        if self.overlay.contains_key(rel) {
+            return Ok(()); // an earlier fix in this run already created it
+        }
+        if self.exists(rel) {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "file already exists"));
+        }
+        if let Mode::Apply(expected) = &self.mode {
+            let after = sha(text.as_bytes());
+            if !expected.iter().any(|c| c.path == rel && c.sha256_before.is_none() && c.sha256_after == after)
+            {
+                return Err(io_err("the change differs from the approved plan"));
+            }
+            create_regular_text(&self.root.join(rel), text)?;
+        }
+        self.record(rel, None, text, description.to_string());
         Ok(())
     }
+
+    /// Replace `rel` with what `f` makes of its current text (`None` = leave
+    /// it alone). The file is read once, strictly as UTF-8; in apply mode the
+    /// same bytes are checked against the approved plan before the temp file
+    /// is renamed over it.
+    fn modify(&mut self, rel: &str, f: impl FnOnce(&str) -> Option<(String, String)>) -> std::io::Result<()> {
+        let path = self.root.join(rel);
+        let ours = self.overlay.get(rel).cloned();
+        let planned = match (&self.mode, ours) {
+            (Mode::Apply(_), None) => None,
+            (_, ours) => Some(ours),
+        };
+        if let Some(ours) = planned {
+            // Plan mode, or a file this run already produced: no disk write
+            // except, in apply mode, re-writing our own earlier output.
+            let (cur, before) = match ours {
+                Some(t) => (t, None),
+                None => {
+                    let (t, bytes) = read_regular_text_strict(&path).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            e
+                        } else {
+                            io_err("not a readable regular file")
+                        }
+                    })?;
+                    (t, Some(sha(&bytes)))
+                }
+            };
+            if let Some((new, desc)) = f(&cur) {
+                if matches!(self.mode, Mode::Apply(_)) {
+                    replace_regular_text(&path, |_| Ok(Some(new.clone())))?;
+                }
+                self.record(rel, before, &new, desc);
+            }
+            return Ok(());
+        }
+        let Mode::Apply(expected) = self.mode else { return Ok(()) };
+        let mut done: Option<(Option<String>, String, String)> = None;
+        replace_regular_text(&path, |bytes| {
+            let before = sha(bytes);
+            let cur = std::str::from_utf8(bytes)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+            let Some((new, desc)) = f(cur) else { return Ok(None) };
+            let Some(approved) =
+                expected.iter().find(|c| c.path == rel && c.sha256_before.as_deref() == Some(&before))
+            else {
+                return Err(io_err("file changed since the plan was approved"));
+            };
+            if approved.sha256_after != sha(new.as_bytes()) {
+                return Err(io_err("the change differs from the approved plan"));
+            }
+            done = Some((Some(before), new.clone(), desc));
+            Ok(Some(new))
+        })
+        .map_err(|e| {
+            if matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound)
+                || e.raw_os_error().is_some()
+            {
+                io_err("not a readable regular file")
+            } else {
+                e
+            }
+        })?;
+        if let Some((before, new, desc)) = done {
+            self.record(rel, before, &new, desc);
+        }
+        Ok(())
+    }
+}
+
+/// "strip 3 hidden chars on lines 2, 9": counts and line numbers only.
+fn strip_description(original: &str) -> String {
+    let re = hidden_char_regex();
+    let count = re.find_iter(original).count();
+    let lines: Vec<usize> =
+        original.lines().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, _)| i + 1).collect();
+    let mut shown: Vec<String> = lines.iter().take(10).map(usize::to_string).collect();
+    if lines.len() > 10 {
+        shown.push("...".into());
+    }
+    format!("strip {count} hidden chars on lines {}", shown.join(", "))
 }
 
 /// Apply (or, in `Mode::Plan`, only plan) the safe fixes. Returns the files
@@ -149,26 +233,28 @@ pub fn remediate_findings(root: &Path, findings: &mut [Finding], mode: Mode<'_>)
             continue;
         }
         match fd.rule.as_str() {
-            "HYGIENE-NO-GITIGNORE" => match fx.put(".gitignore", DEFAULT_GITIGNORE, true) {
-                Ok(()) => {
-                    fd.fixed = true;
-                    fd.message = format!("[AUTO-FIXED] Created default .gitignore: {}", fd.message);
+            "HYGIENE-NO-GITIGNORE" => {
+                match fx.create(".gitignore", DEFAULT_GITIGNORE, "create default .gitignore") {
+                    Ok(()) => {
+                        fd.fixed = true;
+                        fd.message = format!("[AUTO-FIXED] Created default .gitignore: {}", fd.message);
+                    }
+                    Err(e) => fail(fd, "Failed to create .gitignore", e),
                 }
-                Err(e) => fail(fd, "Failed to create .gitignore", e),
-            },
+            }
             "SECRETS-ENV-EXPOSED" => {
                 let result = if fx.exists(".gitignore") {
-                    match fx.read(".gitignore") {
-                        None => Err(std::io::Error::other("not a readable regular file")),
-                        Some(cur) if [".env*", "*.env", ".env"].iter().any(|p| cur.contains(p)) => Ok(()),
-                        Some(cur) => fx.put(
-                            ".gitignore",
-                            &format!("{cur}\n# Added by audit auto-remediation\n.env*\n"),
-                            false,
-                        ),
-                    }
+                    fx.modify(".gitignore", |cur| {
+                        if [".env*", "*.env", ".env"].iter().any(|p| cur.contains(p)) {
+                            return None;
+                        }
+                        Some((
+                            format!("{cur}\n# Added by audit auto-remediation\n.env*\n"),
+                            "append `.env*` to .gitignore".to_string(),
+                        ))
+                    })
                 } else {
-                    fx.put(".gitignore", DEFAULT_GITIGNORE, true)
+                    fx.create(".gitignore", DEFAULT_GITIGNORE, "create default .gitignore")
                 };
                 match result {
                     Ok(()) => {
@@ -180,29 +266,29 @@ pub fn remediate_findings(root: &Path, findings: &mut [Finding], mode: Mode<'_>)
             }
             "AGENT-HIDDEN-UNICODE" => {
                 let Some(rel) = fd.path.clone().filter(|p| inside(p)) else { continue };
-                let Some(original) = fx.read(&rel) else {
-                    fail(fd, "Failed to clean hidden Unicode", "not a readable regular file");
-                    continue;
-                };
-                let cleaned = hidden_char_regex().replace_all(&original, "").into_owned();
-                if cleaned != original {
-                    match fx.put(&rel, &cleaned, false) {
-                        Ok(()) => {
-                            fd.fixed = true;
-                            fd.message = format!(
-                                "[AUTO-FIXED] Stripped hidden/bidi Unicode characters: {}",
-                                fd.message
-                            );
-                        }
-                        Err(e) => fail(fd, "Failed to clean hidden Unicode", e),
+                let mut changed = false;
+                let result = fx.modify(&rel, |original| {
+                    let cleaned = hidden_char_regex().replace_all(original, "").into_owned();
+                    (cleaned != original).then(|| {
+                        changed = true;
+                        (cleaned, strip_description(original))
+                    })
+                });
+                match result {
+                    Ok(()) if changed => {
+                        fd.fixed = true;
+                        fd.message =
+                            format!("[AUTO-FIXED] Stripped hidden/bidi Unicode characters: {}", fd.message);
                     }
+                    Ok(()) => {}
+                    Err(e) => fail(fd, "Failed to clean hidden Unicode", e),
                 }
             }
             "AGENT-NO-INSTRUCTIONS" => {
                 if INSTRUCTION_NAMES.iter().any(|f| fx.overlay.contains_key(*f) || root.join(f).is_file()) {
                     continue;
                 }
-                match fx.put("CLAUDE.md", DEFAULT_INSTRUCTIONS, true) {
+                match fx.create("CLAUDE.md", DEFAULT_INSTRUCTIONS, "create default CLAUDE.md") {
                     Ok(()) => {
                         fd.fixed = true;
                         fd.message = format!(
@@ -243,5 +329,48 @@ mod tests {
         assert!(!findings[0].fixed);
         assert!(findings[0].message.contains("AUTO-FIX-FAILED"));
         assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn apply_refuses_a_plan_whose_after_hash_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fs = [finding("HYGIENE-NO-GITIGNORE")];
+        let mut plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+        plan[0].sha256_after = "0".repeat(64);
+        let mut fs = [finding("HYGIENE-NO-GITIGNORE")];
+        let done = remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan));
+        assert!(done.is_empty());
+        assert!(fs[0].message.contains("differs from the approved plan"), "{}", fs[0].message);
+        assert!(!dir.path().join(".gitignore").exists());
+
+        // A modification with a tampered after-hash leaves the file as it was.
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        let mut plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+        assert_eq!(plan[0].description, "append `.env*` to .gitignore");
+        plan[0].sha256_after = "0".repeat(64);
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        let done = remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan));
+        assert!(done.is_empty());
+        assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "target/\n");
+    }
+
+    #[test]
+    fn apply_refuses_a_file_edited_after_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        let plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+        std::fs::write(dir.path().join(".gitignore"), "edited\n").unwrap();
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        assert!(remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan)).is_empty());
+        assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "edited\n");
+
+        // And the happy path applies exactly the plan, atomically.
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        let mut fs = [finding("SECRETS-ENV-EXPOSED")];
+        let done = remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan));
+        assert_eq!(done, plan);
+        assert!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap().ends_with(".env*\n"));
     }
 }
