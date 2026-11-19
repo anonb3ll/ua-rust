@@ -1346,12 +1346,12 @@ fn toolchain_and_cache_env(ua_home: &Path) -> Vec<(String, String)> {
 }
 
 /// A per-call HOME directory under [`run_home_parent`], deleted on drop.
-struct ScratchHome {
-    path: PathBuf,
+pub(crate) struct ScratchHome {
+    pub(crate) path: PathBuf,
 }
 
 impl ScratchHome {
-    fn new() -> UaResult<Self> {
+    pub(crate) fn new() -> UaResult<Self> {
         let fail = |e: std::io::Error| UaError::internal(format!("cannot prepare the command HOME: {e}"));
         let parent = run_home_parent();
         private_dir(&parent).map_err(fail)?;

@@ -193,6 +193,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve => {
             warn_if_locked_out(&state).await;
+            if cfg.routines_enabled {
+                tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone()));
+            }
             if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
                 tracing::warn!("{w}");
             }
