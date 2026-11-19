@@ -551,3 +551,36 @@ async fn run_cmd_git_commit_works_in_a_fresh_workspace() {
     let author = git(&env.ws, &["log", "-1", "--format=%an <%ae> / %cn <%ce>"]);
     assert_eq!(author, "builder-1 <builder-1@agents.invalid> / builder-1 <builder-1@agents.invalid>");
 }
+
+/// Each caller gets its own persistent caches, and no command sees the hub
+/// user's cargo or rustup home.
+#[tokio::test]
+async fn run_cmd_caches_are_per_caller_and_cargo_home_is_the_hubs() {
+    let env = setup_with(|c| c.shell_allowlist = vec!["env".into()]);
+    let vars = async |label: &str| -> std::collections::HashMap<String, String> {
+        let r = env
+            .reg
+            .call(&env.hub, &agent(label, Profile::ChiefOfStaff), "run_cmd", json!({ "command": "env" }))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(r["exit_code"], 0, "{r}");
+        r["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let a = vars("builder-1").await;
+    let b = vars("builder-2").await;
+    let cache_root = env.hub.cfg().home.join("run-cache");
+    for key in ["CARGO_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR"] {
+        assert_ne!(a[key], b[key], "{key} is shared between callers");
+        assert!(Path::new(&a[key]).starts_with(&cache_root), "{key}={}", a[key]);
+    }
+    assert!(!a.contains_key("RUSTUP_HOME"));
+    if let Some(real) = std::env::var_os("CARGO_HOME") {
+        assert_ne!(Path::new(&a["CARGO_HOME"]), Path::new(&real));
+    }
+}
