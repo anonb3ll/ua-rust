@@ -68,6 +68,12 @@ pub struct Config {
     pub approval_pass_ttl_hours: f64,
     /// Policy rules file (YAML).
     pub policy_file: Option<PathBuf>,
+    /// Agents revoked from every always-gated (prod) action, whatever approvals they hold.
+    #[serde(deserialize_with = "string_or_list")]
+    pub revoked_agents: Vec<String>,
+    /// Prod-action scopes: label → `merge|delete|...` (actions or tool names).
+    /// Empty means nobody is restricted; once set, an unlisted agent has no scope.
+    pub agent_scopes: BTreeMap<String, String>,
     /// Identity label → default profile name. Unlisted identities get `developer`.
     pub profiles: BTreeMap<String, String>,
     /// Per-agent workspace overrides: label → root (or `"deny"`).
@@ -96,6 +102,8 @@ impl Default for Config {
             approval_tools: Vec::new(),
             approval_pass_ttl_hours: 24.0,
             policy_file: None,
+            revoked_agents: Vec::new(),
+            agent_scopes: BTreeMap::new(),
             profiles: BTreeMap::new(),
             agent_workspaces: BTreeMap::new(),
             embed_model: "BAAI/bge-small-en-v1.5".into(),
@@ -158,6 +166,7 @@ impl Config {
         self.workspace = self.workspace.map(|p| expand_tilde(&p));
         self.vault_path = self.vault_path.map(|p| expand_tilde(&p));
         self.read_roots = self.read_roots.iter().map(|p| expand_tilde(p)).collect();
+        self.policy_file = self.policy_file.map(|p| expand_tilde(&p));
         self
     }
 
@@ -180,6 +189,20 @@ impl Config {
         } else {
             self.shell_allowlist.clone()
         }
+    }
+
+    /// Prod-action scopes of `label`, lower-cased. `None` when scopes are not configured.
+    pub fn prod_scopes(&self, label: &str) -> Option<Vec<String>> {
+        if self.agent_scopes.is_empty() {
+            return None;
+        }
+        let raw = self.agent_scopes.get(label).map(String::as_str).unwrap_or("");
+        Some(
+            raw.split(['|', ',', ' '])
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
     }
 
     pub fn is_human(&self, label: &str) -> bool {

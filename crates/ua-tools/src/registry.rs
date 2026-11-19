@@ -8,11 +8,12 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use ua_core::{Caller, UaError, UaResult};
+use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
+use crate::policy::{self, Verdict};
 
 /// What a tool receives besides its arguments.
 #[derive(Clone)]
@@ -149,6 +150,26 @@ impl Registry {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
 
+        // The policy file is read once per call (cached by mtime). A file that
+        // cannot be loaded refuses the call below, after the profile check.
+        let loaded = hub.cfg().policy_file.as_deref().map(policy::load);
+
+        // A policy overlay may lower an agent's profile below its default.
+        let clamped;
+        let caller = match &loaded {
+            Some(Ok(p)) if caller.enforce_profile && caller.kind != ActorKind::Human => {
+                let code_default = crate::sessions::default_profile(hub, &caller.label);
+                match policy::overlay_profile(p, &caller.label, code_default, self.tools.keys().copied()) {
+                    Some(overlay) if caller.profile.rank() > overlay.rank() => {
+                        clamped = Caller { profile: overlay, ..caller.clone() };
+                        &clamped
+                    }
+                    _ => caller,
+                }
+            }
+            _ => caller,
+        };
+
         if caller.enforce_profile {
             if !caller.profile.allows_tool(name) {
                 let err = UaError::denied(
@@ -170,7 +191,49 @@ impl Registry {
             }
         }
 
-        let gated = def.always_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
+        let mut policy_gated = false;
+        match loaded {
+            None => {}
+            Some(Err(reason)) => {
+                let err =
+                    UaError::denied("policy_unavailable", format!("policy gate failed closed: {reason}"));
+                record_decision_rule(hub, caller, name, &err, "").await;
+                return Err(err);
+            }
+            Some(Ok(p)) => {
+                let (c, n, a) = (caller.clone(), name.to_string(), args.clone());
+                let verdict = hub
+                    .db()
+                    .read_async(move |conn| Ok(policy::evaluate(conn, &p, &c, &n, &a)))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(policy::Refusal {
+                            error: UaError::denied(
+                                "policy_unavailable",
+                                format!("policy gate failed closed: {e}"),
+                            ),
+                            rule: String::new(),
+                        })
+                    });
+                match verdict {
+                    Ok(Verdict::Allow) => {}
+                    Ok(Verdict::RequireApproval(_)) => policy_gated = true,
+                    Err(refusal) => {
+                        record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
+                        return Err(refusal.error);
+                    }
+                }
+            }
+        }
+
+        if def.always_gated
+            && let Err(refusal) = policy::check_prod_action(hub.cfg(), caller, name)
+        {
+            record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
+            return Err(refusal.error);
+        }
+
+        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
         if gated {
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), args.clone());
             let outcome = hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await?;
@@ -241,17 +304,26 @@ async fn record_call(
 }
 
 async fn record_decision(hub: &Hub, caller: &Caller, tool: &str, err: &UaError) {
+    record_decision_rule(hub, caller, tool, err, "").await
+}
+
+/// Append an `agent.gateway.decision` deny event. `rule` names the policy
+/// rule that fired; it is empty for profile and approval refusals.
+async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
     let reason_code = match err {
         UaError::Denied { reason_code, .. } => reason_code.clone(),
         other => other.code().to_string(),
     };
-    let payload = json!({
+    let mut payload = json!({
         "tool": tool,
         "decision": "deny",
         "reason_code": reason_code,
         "reason": err.to_string(),
         "profile": caller.profile.as_str(),
     });
+    if !rule.is_empty() {
+        payload["rule"] = json!(rule);
+    }
     let originator = caller.label.clone();
     let res = hub
         .db()

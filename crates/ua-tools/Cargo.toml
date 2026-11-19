@@ -29,6 +29,9 @@ tracing.workspace = true
 globset = "0.4"
 ignore = "0.4"
 regex = "1.12"
+# Policy file (YAML) and config revision diffs.
+serde-saphyr = "2.2"
+similar = "3.2"
 ulid.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 fastembed = { version = "7.7", optional = true, default-features = false, features = [
