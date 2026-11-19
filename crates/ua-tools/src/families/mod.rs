@@ -5,7 +5,9 @@
 //! line to each list below. Keep the lists alphabetical to make merges easy.
 
 pub mod core_schema;
+pub mod delegation;
 pub mod events;
+pub mod plans;
 
 use ua_store::SchemaPart;
 
@@ -14,11 +16,14 @@ use crate::registry::Registry;
 pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts = vec![core_schema::SCHEMA];
     // family schema parts (alphabetical)
-    let _ = &mut parts;
+    parts.push(delegation::SCHEMA);
+    parts.push(plans::SCHEMA);
     parts
 }
 
 pub fn register(r: &mut Registry) {
     // family registrations (alphabetical)
+    delegation::register(r);
     events::register(r);
+    plans::register(r);
 }
