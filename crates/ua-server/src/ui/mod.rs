@@ -31,10 +31,10 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 use ua_core::identity::Transport;
-use ua_core::{ActorKind, Caller, UaError, UaResult};
+use ua_core::{Caller, UaError, UaResult};
 
 use crate::AppState;
-use crate::auth::{AuthIdentity, LOCAL_LABEL, caller_for, session_key};
+use crate::auth::{AuthIdentity, caller_for, session_key};
 
 /// Every `/ui` route, with the CSRF middleware and the embedded assets.
 pub fn routes() -> Router<AppState> {
@@ -92,11 +92,11 @@ impl FromRequestParts<AppState> for Ui {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let id = parts.extensions.get::<AuthIdentity>().cloned().unwrap_or(AuthIdentity {
-            label: LOCAL_LABEL.into(),
-            kind: ActorKind::Anonymous,
-            verified: false,
-        });
+        // Fail closed: the auth layer always sets the identity. If a router
+        // change ever drops that layer, refuse rather than run as anonymous.
+        let Some(id) = parts.extensions.get::<AuthIdentity>().cloned() else {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "identity layer missing").into_response());
+        };
         let csrf = parts
             .extensions
             .get::<csrf::CsrfToken>()

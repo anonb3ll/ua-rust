@@ -6,6 +6,7 @@
 pub mod api;
 pub mod auth;
 pub mod compat_api;
+pub mod guard;
 pub mod mcp;
 pub mod ui;
 
@@ -36,6 +37,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(compat_api::routes())
         .merge(ui::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard::protect))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
