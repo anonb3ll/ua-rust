@@ -121,15 +121,15 @@ fn caller(state: &AppState, id: &AuthIdentity, headers: &HeaderMap) -> Caller {
 }
 
 /// Parse a JSON object body the way the Python routes do.
-fn object_body(body: &Bytes) -> Result<Map<String, Value>, Response> {
+fn object_body(body: &Bytes) -> Result<Map<String, Value>, Box<Response>> {
     let v: Value = if body.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(body).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid JSON"))?
+        serde_json::from_slice(body).map_err(|_| Box::new(err(StatusCode::BAD_REQUEST, "invalid JSON")))?
     };
     match v {
         Value::Object(m) => Ok(m),
-        _ => Err(err(StatusCode::BAD_REQUEST, "request body must be a JSON object")),
+        _ => Err(Box::new(err(StatusCode::BAD_REQUEST, "request body must be a JSON object"))),
     }
 }
 
@@ -292,7 +292,7 @@ async fn task_create(
 ) -> Response {
     let body = match object_body(&body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let mut unknown: Vec<&String> = body.keys().filter(|k| !CREATE_FIELDS.contains(&k.as_str())).collect();
     if !unknown.is_empty() {
@@ -346,7 +346,7 @@ async fn action_task(
 ) -> Response {
     let mut body = match object_body(&body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let task_id = match body.remove("id") {
         None | Some(Value::Null) => return err(StatusCode::BAD_REQUEST, "missing task id"),
@@ -374,14 +374,11 @@ async fn action_task(
     }
     // Worktree creation on `doing` is not part of this hub's task_update; an
     // explicit `false` asks for what already happens, `true` cannot be honoured.
-    match body.remove("worktree") {
-        Some(Value::Bool(true)) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "worktree=true is not supported by this hub; create worktrees with git_worktree_add",
-            );
-        }
-        _ => {}
+    if let Some(Value::Bool(true)) = body.remove("worktree") {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "worktree=true is not supported by this hub; create worktrees with git_worktree_add",
+        );
     }
     if let Some(note) = body.get("append_note")
         && !note.as_str().is_some_and(|s| !s.trim().is_empty() && s.chars().count() <= 2000)
@@ -418,7 +415,7 @@ async fn action_approval(
 ) -> Response {
     let body = match object_body(&body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let mut unknown: Vec<&str> =
         body.keys().map(String::as_str).filter(|k| !["id", "decision", "reason"].contains(k)).collect();
@@ -581,7 +578,7 @@ async fn approval_detail(
     } else {
         ("yes", "you may approve this request".to_string())
     };
-    let gated_by_config = cfg.approval_tools.iter().any(|t| *t == row.tool);
+    let gated_by_config = cfg.approval_tools.contains(&row.tool);
     let gate = if gated_by_config {
         json!({ "kind": "global_allowlist", "label": "Global allowlist (approval_tools)" })
     } else {
@@ -632,7 +629,7 @@ async fn approval_request(
     }
     let body = match object_body(&body) {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let mut unknown: Vec<&str> =
         body.keys().map(String::as_str).filter(|k| !["tool", "payload"].contains(k)).collect();
@@ -659,7 +656,7 @@ async fn approval_request(
     if !may(&caller, "approval_pending") {
         return err(StatusCode::FORBIDDEN, "approval requests are not exposed by the active profile");
     }
-    let gated = def.always_gated || state.hub.cfg().approval_tools.iter().any(|t| *t == tool);
+    let gated = def.always_gated || state.hub.cfg().approval_tools.contains(&tool);
     if !gated {
         return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
     }

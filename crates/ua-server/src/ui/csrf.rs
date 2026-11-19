@@ -70,15 +70,15 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 /// Refuse cross-site requests by `Sec-Fetch-Site` and `Origin`.
-fn check_origin(h: &HeaderMap) -> Result<(), Response> {
+fn check_origin(h: &HeaderMap) -> Result<(), &'static str> {
     if header_str(h, "sec-fetch-site") == Some("cross-site") {
-        return Err(refuse("cross-site request"));
+        return Err("cross-site request");
     }
     let Some(origin) = header_str(h, header::ORIGIN.as_str()) else { return Ok(()) };
     let host = header_str(h, "x-forwarded-host").or_else(|| header_str(h, header::HOST.as_str()));
     let ok =
         host.is_some_and(|host| origin == format!("http://{host}") || origin == format!("https://{host}"));
-    if ok { Ok(()) } else { Err(refuse("origin does not match this host")) }
+    if ok { Ok(()) } else { Err("origin does not match this host") }
 }
 
 fn is_form(h: &HeaderMap) -> bool {
@@ -97,8 +97,8 @@ pub async fn protect(req: Request, next: Next) -> Response {
     let secure = is_https(&req);
     let mut req = req;
     if !safe {
-        if let Err(r) = check_origin(req.headers()) {
-            return r;
+        if let Err(why) = check_origin(req.headers()) {
+            return refuse(why);
         }
         let Some(expected) = existing.clone() else { return refuse("missing CSRF cookie") };
         let mut presented = header_str(req.headers(), HEADER).map(str::to_string);
