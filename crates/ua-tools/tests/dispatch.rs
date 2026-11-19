@@ -296,7 +296,7 @@ async fn illegal_transitions_are_refused() {
     let me = agent("agent-1");
 
     // A live run cannot be resumed.
-    let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_resume", json!({ "run_id": rid })).await;
     assert!(e.to_string().contains("already_active"), "{e}");
 
     h.ok(
@@ -314,7 +314,7 @@ async fn illegal_transitions_are_refused() {
     assert_eq!(c["ok"], false);
     assert_eq!(c["reason"], "already_terminal");
     // ...and not resumable.
-    let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_resume", json!({ "run_id": rid })).await;
     assert!(e.to_string().contains("unresumable_state_blocked"), "{e}");
 
     // A finished run never moves again.
@@ -322,7 +322,7 @@ async fn illegal_transitions_are_refused() {
     let rid2 = h.dispatch(tid2, None).await["run_id"].as_str().unwrap().to_string();
     h.ok(&me, "dispatch_report_self", json!({ "state": "finished", "run_id": rid2, "evidence": "pr/1" }))
         .await;
-    let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid2 })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_resume", json!({ "run_id": rid2 })).await;
     assert!(e.to_string().contains("terminal_finished"), "{e}");
     assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid2}'")), "finished");
 
@@ -354,7 +354,7 @@ async fn cancel_confirm_and_resume_under_a_new_fence() {
     assert_eq!(c["cessation"], "unknown");
 
     // Unconfirmed cessation keeps the slot and blocks a resume.
-    let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_resume", json!({ "run_id": rid })).await;
     assert!(e.to_string().contains("cessation_unconfirmed"), "{e}");
     let e = h.err(&me, "dispatch_task", json!({ "task_id": tid, "agent": "agent-1" })).await;
     assert!(e.to_string().contains("already_claimed"), "{e}");
@@ -457,7 +457,7 @@ async fn lease_expiry_hands_a_run_back() {
     ));
     let swept = reap_expired_leases(&h.hub).unwrap();
     assert_eq!(swept["failed"][0]["run_id"], json!(rid2), "{swept}");
-    let e = h.gated(&me, "dispatch_resume", json!({ "run_id": rid2 })).await.unwrap_err();
+    let e = h.err(&me, "dispatch_resume", json!({ "run_id": rid2 })).await;
     assert!(e.to_string().contains("outcome_unknown"), "{e}");
 
     // An unfinished cancellation is reconciled first, never reclaimed.
@@ -494,6 +494,8 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
     assert_eq!(p["argv"][0], "/bin/sh");
     assert_eq!(p["prompt_source"], "task");
     assert_eq!(p["prompt_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(p["timeout_s"], 20, "the wall-clock limit is bound: {p}");
+    assert_eq!(p["output_cap_bytes"], 1024 * 1024, "{p}");
     // The approver sees the prompt the hub built from the task.
     let preview = p["prompt_text"].as_str().unwrap();
     assert!(preview.starts_with(&format!("Task #{tid}: Port the widget")), "{p}");
@@ -817,6 +819,96 @@ mod spawn {
         let c = h.ok(&me, "dispatch_cancel", json!({ "run_id": rid })).await;
         assert_eq!(c["cessation"], "confirmed");
         h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
+    /// A failed `exit3` run, then a resume of it under the same database with
+    /// the harness edited by `edit` (a restart with a new config file). The
+    /// refusal must come before any resume approval is requested.
+    async fn resume_after_edit(edit: impl FnOnce(&mut HarnessConfig)) -> (H, String, UaError) {
+        let h = H::new();
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, Some("exit3")).await["run_id"].as_str().unwrap().to_string();
+        assert_eq!(h.wait_for(&rid, |r| r["terminal"] == true).await["run_state"], "failed");
+        let mut cfg = h.hub.cfg().clone();
+        edit(cfg.harnesses.get_mut("exit3").unwrap());
+        let changed = Hub::new(cfg, h.hub.db().clone());
+        let e = h
+            .reg
+            .call(&changed, &agent("agent-1"), "dispatch_resume", json!({ "run_id": rid }))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&e), "approval_binding_changed", "refused, not parked: {e}");
+        assert_eq!(
+            h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'dispatch_resume'"),
+            json!(0),
+            "no approval is requested for a resume bound to fail"
+        );
+        assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid}'")), "failed");
+        assert_eq!(h.scalar(&format!("SELECT fence FROM dispatch_runs WHERE run_id = '{rid}'")), json!(1));
+        (h, rid, e)
+    }
+
+    /// A resume relaunches under the hub's current config, so it must not run
+    /// a harness whose argv or env allowlist differ from what the run's
+    /// approval bound, and its own approval shows what will run.
+    #[tokio::test]
+    async fn a_resume_refuses_a_harness_changed_since_the_approval() {
+        let (h, rid, e) = resume_after_edit(|hc| {
+            hc.argv = vec!["/bin/sh".into(), "-c".into(), "echo something else".into()];
+            hc.env_allowlist = vec!["EXTRA_SECRET".into()];
+        })
+        .await;
+        assert!(e.to_string().contains("argv") && e.to_string().contains("env_allowlist"), "{e}");
+
+        // Under the config the run was approved for, the approval shows the
+        // binding and the attempt it resumes, and the resume goes ahead.
+        let me = agent("agent-1");
+        let parked = h.err(&me, "dispatch_resume", json!({ "run_id": rid })).await;
+        let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked}") };
+        let p = h.approval_payload(approval_id);
+        assert_eq!(p["run_id"], json!(rid), "{p}");
+        assert_eq!(p["from_fence"], 1, "{p}");
+        assert_eq!(p["harness"], "exit3", "{p}");
+        assert_eq!(p["argv"][0], "/bin/sh", "{p}");
+        assert_eq!(p["env_allowlist"], json!([]), "{p}");
+        assert_eq!(p["timeout_s"], 20, "{p}");
+        assert_eq!(p["output_cap_bytes"], 1024 * 1024, "{p}");
+        assert!(p["workdir"].is_string(), "{p}");
+        assert_eq!(p["prompt_sha256"].as_str().unwrap().len(), 64, "{p}");
+        h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+        let resumed = h.ok(&me, "dispatch_resume", json!({ "run_id": rid })).await;
+        assert_eq!(resumed["fence"], 2, "{resumed}");
+        assert_eq!(
+            h.scalar(&format!("SELECT run_id FROM approvals WHERE id = {approval_id}")),
+            json!(rid),
+            "the consumed pass is linked to the run"
+        );
+        h.wait_for(&rid, |r| r["terminal"] == true).await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_refuses_a_raised_timeout() {
+        let (_h, _rid, e) = resume_after_edit(|hc| hc.timeout_s = 86_400).await;
+        assert!(e.to_string().contains("timeout_s") && !e.to_string().contains("argv"), "{e}");
+        let (_h, _rid, e) = resume_after_edit(|hc| hc.output_cap_bytes = 1 << 30).await;
+        assert!(e.to_string().contains("output_cap_bytes"), "{e}");
+    }
+
+    /// A run approved before the limits were bound has no `timeout_s` in its
+    /// approval: the approver never saw it, so the resume is refused.
+    #[tokio::test]
+    async fn a_resume_refuses_an_approval_without_the_limits() {
+        let h = H::new();
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, Some("exit3")).await["run_id"].as_str().unwrap().to_string();
+        h.wait_for(&rid, |r| r["terminal"] == true).await;
+        h.sql(&format!(
+            "UPDATE approvals SET payload = json_remove(payload, '$.timeout_s', '$.output_cap_bytes') \
+             WHERE tool = 'dispatch_task' AND run_id = '{rid}'"
+        ));
+        let e = h.err(&agent("agent-1"), "dispatch_resume", json!({ "run_id": rid })).await;
+        assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+        assert!(e.to_string().contains("timeout_s, output_cap_bytes"), "{e}");
     }
 
     #[tokio::test]

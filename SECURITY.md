@@ -25,9 +25,11 @@ and steps to reproduce. You will get an acknowledgement within a week.
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
   so a profile or policy that refuses the tool refuses the stream. An open
-  stream re-checks its caller every 60 seconds, and at once when a token
-  revocation or rotation, logout, session end, profile change or config
-  revision is recorded: the credential must still resolve to the same
+  stream re-checks its caller every 60 seconds, and within a quarter
+  second when a token revocation or rotation, logout, session end, profile
+  change or config revision is recorded (a burst of such events shares one
+  re-check per stream, and rows recorded after the event are held back
+  until it passes): the credential must still resolve to the same
   identity, and the admission the stream opened with (profile after any
   policy overlay, then the policy rules, with the stream's scope as the
   arguments) must still let it in without a new approval. Per-call
@@ -46,7 +48,12 @@ and steps to reproduce. You will get an acknowledgement within a week.
   explicitly: a git identity `<label> <label@agents.invalid>`, the `bin`
   directory of the hub's default Rust toolchain first on `PATH` (with the
   hub user's `$CARGO_HOME/bin` and `~/.cargo/bin` removed from `PATH`; the
-  toolchain is re-resolved after a failed lookup or when it disappears), and
+  toolchain is looked up once in the background when `ua serve` starts,
+  then only for Rust toolchain programs such as `cargo` and `rustc`, one
+  lookup at a time, and re-resolved after a failed lookup or when it
+  disappears; other programs reuse the last lookup and never wait on one,
+  so a build tool or script that starts cargo before the startup lookup
+  finishes runs without the toolchain on `PATH`), and
   `CARGO_HOME`, `XDG_CACHE_HOME` and `UV_CACHE_DIR` in a cache of the
   caller's own under `$UA_HOME/run-cache/<label>-<digest>/`. Commands never
   get the hub user's `CARGO_HOME` (credentials, config, installed binaries)
@@ -66,10 +73,22 @@ and steps to reproduce. You will get an acknowledgement within a week.
   `[env]`, `build.rustc-wrapper`, source replacement and credential
   providers would apply inside `run_cmd`. So `run_cmd` (and
   `run_cmd_check`) refuse `cargo` and `cargo-*` with the advisory
-  `cargo-config`, naming the file, whenever such a file exists above the
-  workspace root, and `ua serve` warns at startup. Fix it by moving the
-  workspace outside that directory tree (`workspace = "/srv/ua-workspace"`
-  or similar), or by removing the file. Configs inside the workspace are
-  the workspace's own and are not refused. Cargo started indirectly (by
+  `cargo-config`, naming the file and the SHA-256 of its content, whenever
+  such a file exists above the workspace root, and `ua serve` warns at
+  startup. Fix it by moving the workspace outside that directory tree
+  (`workspace = "/srv/ua-workspace"` or similar), by removing the file, or
+  by trusting it: after reviewing the file, pin its path and current hash
+  in the hub config,
+  `trusted_cargo_configs = [{ path = "~/.cargo/config.toml", sha256 = "<hex>" }]`
+  (the refusal prints the line to copy). A pinned file is hashed again on
+  every call; when its content changes, or when another unpinned config
+  appears above the workspace, cargo is refused again until the new
+  content is pinned. Residual risks of a pin: the file is read and hashed
+  when `run_cmd` is called and cargo reads it again when it starts, so a
+  change made in between (by something that can already write outside the
+  workspace as the hub user) is not caught; and only the file's own bytes
+  are pinned, not what it points to (a `rustc-wrapper` or linker binary,
+  a credential provider, an `include`d file). Configs inside the workspace
+  are the workspace's own and are not refused. Cargo started indirectly (by
   an interpreter or build tool, which already needs approval) is not
   covered by this check.

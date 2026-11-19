@@ -38,6 +38,10 @@ pub struct ToolDef {
     /// True when the tool always needs a one-time human approval, whatever
     /// the configuration says (merges, deletes, restarts).
     pub always_gated: bool,
+    /// True when the handler evaluates the approval gate itself, on a payload
+    /// bound to values it resolves (config, task, run), so the registry does
+    /// not gate on the bare arguments.
+    pub gates_in_handler: bool,
     handler: Handler,
 }
 
@@ -60,6 +64,13 @@ impl ToolDef {
 
     pub fn always_gated(mut self) -> Self {
         self.always_gated = true;
+        self
+    }
+
+    /// The handler calls `approvals::gate` itself with a resolved payload.
+    /// It can then refuse a call bound to fail before a human is asked.
+    pub fn gates_in_handler(mut self) -> Self {
+        self.gates_in_handler = true;
         self
     }
 }
@@ -94,6 +105,7 @@ where
         input_schema: schema,
         read_only: false,
         always_gated: false,
+        gates_in_handler: false,
         handler,
     }
 }
@@ -248,7 +260,7 @@ impl Registry {
         }
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if gated {
+        if gated && !def.gates_in_handler {
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), args.clone());
             let outcome = match hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await
             {
