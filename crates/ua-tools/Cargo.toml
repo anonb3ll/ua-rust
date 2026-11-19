@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Local semantic memory search with fastembed. Off by default: without it,
+# memory search is lexical (FTS5) only.
+embeddings = ["dep:fastembed"]
+
 [dependencies]
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
@@ -20,6 +26,12 @@ hex.workspace = true
 jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+fastembed = { version = "7.7", optional = true, default-features = false, features = [
+    "onnx",
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true
