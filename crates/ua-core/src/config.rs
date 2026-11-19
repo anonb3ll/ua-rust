@@ -80,6 +80,12 @@ pub struct Config {
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
+    /// Cargo config files above a workspace root that `run_cmd` lets cargo
+    /// read, each pinned to the SHA-256 of its content. Cargo is refused
+    /// under any other ancestor cargo config, and under a listed one whose
+    /// content no longer matches. TOML only:
+    /// `trusted_cargo_configs = [{ path = "~/.cargo/config.toml", sha256 = "..." }]`.
+    pub trusted_cargo_configs: Vec<TrustedCargoConfig>,
     /// Tools that always need a one-time human approval.
     #[serde(deserialize_with = "string_or_list")]
     pub approval_tools: Vec<String>,
@@ -215,6 +221,17 @@ pub struct Config {
     pub cycle_validation_env: Vec<String>,
 }
 
+/// A cargo config file above a workspace root that the operator reviewed
+/// and lets `run_cmd`'s cargo read, as long as its content is unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedCargoConfig {
+    /// The file, e.g. `~/.cargo/config.toml`.
+    pub path: PathBuf,
+    /// Hex SHA-256 of the file's bytes.
+    pub sha256: String,
+}
+
 /// One agent harness: a CLI coding agent dispatch runs as a child process.
 ///
 /// The program runs without a shell. Each `argv` element may carry the
@@ -277,6 +294,7 @@ impl Default for Config {
             lifecycle_operators: None,
             node_max_per_agent: 8,
             shell_allowlist: Vec::new(),
+            trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
             approval_pass_ttl_hours: 24.0,
             policy_file: None,
@@ -390,6 +408,10 @@ impl Config {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
         }
         self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
+        for t in &mut self.trusted_cargo_configs {
+            t.path = expand_tilde(&t.path);
+            t.sha256 = t.sha256.trim().to_ascii_lowercase();
+        }
         self
     }
 
@@ -640,5 +662,25 @@ mod tests {
 
         let cfg = load("empty.toml", "human_identities = [\"operator\"]\nlifecycle_operators = []\n");
         assert!(!cfg.is_lifecycle_operator("operator"), "an empty list means nobody");
+    }
+
+    #[test]
+    fn trusted_cargo_configs_are_path_and_hash_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "trusted_cargo_configs = [{ path = \"/opt/ws/.cargo/config.toml\", sha256 = \" ABCDEF \" }]\n",
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert_eq!(
+            cfg.trusted_cargo_configs,
+            vec![TrustedCargoConfig { path: "/opt/ws/.cargo/config.toml".into(), sha256: "abcdef".into() }]
+        );
+        assert!(Config::default().trusted_cargo_configs.is_empty(), "nothing is trusted by default");
+        // A misspelled key is an error, not a silently ignored entry.
+        std::fs::write(&file, "trusted_cargo_configs = [{ path = \"/x\", sha = \"ab\" }]\n").unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_err());
     }
 }

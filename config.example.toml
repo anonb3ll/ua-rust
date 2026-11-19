@@ -33,6 +33,15 @@ approval_tools = ["git_merge_task"]
 # Programs run_cmd may start. Setting this replaces the built-in list.
 # shell_allowlist = ["git", "ls", "cat", "grep", "cargo"]
 
+# Cargo config files above the workspace root that run_cmd's cargo may read
+# (cargo reads every ancestor .cargo/config.toml of its cwd). Unlisted ones,
+# and listed ones whose content no longer matches the hash, make run_cmd
+# refuse cargo; the refusal prints the path and current sha256 to copy here.
+# See SECURITY.md.
+# trusted_cargo_configs = [
+#   { path = "~/.cargo/config.toml", sha256 = "<sha256 of the file>" },
+# ]
+
 # Reviewed YAML workflow definitions (workflow_run). Treat this directory as code.
 # workflow_dir = "~/.ua-rust/workflows"
 
