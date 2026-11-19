@@ -20,6 +20,12 @@ hex.workspace = true
 jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+regex = "1.12"
+ignore = "0.4"
+globset = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -6,6 +6,7 @@
 
 pub mod core_schema;
 pub mod events;
+pub mod workspace;
 
 use ua_store::SchemaPart;
 
@@ -21,4 +22,5 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 pub fn register(r: &mut Registry) {
     // family registrations (alphabetical)
     events::register(r);
+    workspace::register(r);
 }
