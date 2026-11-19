@@ -533,7 +533,7 @@ async fn run_cmd_git_commit_works_in_a_fresh_workspace() {
         return;
     }
     let env = setup();
-    let mut run = async |command: &str| -> Value {
+    let run = async |command: &str| -> Value {
         let args = json!({ "command": command });
         match env.call("run_cmd", args.clone()).await {
             Ok(v) => v,
