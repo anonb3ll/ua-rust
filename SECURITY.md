@@ -48,10 +48,12 @@ and steps to reproduce. You will get an acknowledgement within a week.
   explicitly: a git identity `<label> <label@agents.invalid>`, the `bin`
   directory of the hub's default Rust toolchain first on `PATH` (with the
   hub user's `$CARGO_HOME/bin` and `~/.cargo/bin` removed from `PATH`; the
-  toolchain is looked up only for Rust toolchain programs such as `cargo`
-  and `rustc`, one lookup at a time, and re-resolved after a failed lookup
-  or when it disappears; other programs reuse the last lookup and never
-  wait on one), and
+  toolchain is looked up once in the background when `ua serve` starts,
+  then only for Rust toolchain programs such as `cargo` and `rustc`, one
+  lookup at a time, and re-resolved after a failed lookup or when it
+  disappears; other programs reuse the last lookup and never wait on one,
+  so a build tool or script that starts cargo before the startup lookup
+  finishes runs without the toolchain on `PATH`), and
   `CARGO_HOME`, `XDG_CACHE_HOME` and `UV_CACHE_DIR` in a cache of the
   caller's own under `$UA_HOME/run-cache/<label>-<digest>/`. Commands never
   get the hub user's `CARGO_HOME` (credentials, config, installed binaries)

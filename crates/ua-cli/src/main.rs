@@ -209,6 +209,9 @@ async fn main() -> anyhow::Result<()> {
             if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
                 tracing::warn!("{w}");
             }
+            // One toolchain lookup in the background, so cargo started by a
+            // build tool or script finds the toolchain on a fresh hub.
+            ua_tools::families::workspace::warm_host_rust(&cfg.home);
             let pruned = ua_tools::families::workspace::prune_run_caches(
                 &cfg.home,
                 ua_tools::families::workspace::RUN_CACHE_MAX_AGE,

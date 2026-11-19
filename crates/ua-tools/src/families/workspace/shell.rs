@@ -1552,18 +1552,42 @@ fn needs_rust_toolchain(program: &str) -> bool {
     name.starts_with("cargo") || name.starts_with("rust") || matches!(name, "clippy-driver" | "miri")
 }
 
+/// Start one toolchain lookup in the background and return at once. `ua
+/// serve` calls it at startup, so a program that only starts cargo
+/// indirectly (`make`, `just`, a script) finds the toolchain on a fresh hub
+/// without a direct `cargo` or `rustc` call first. Nothing waits on it: a
+/// toolchain program that runs meanwhile joins the same lookup, and any
+/// other program runs without the toolchain until the lookup is done. Must
+/// be called inside a Tokio runtime.
+pub fn warm_host_rust(ua_home: &Path) {
+    drop(HostRust::warm(&HOST_RUST, hub_vars(), ua_home.to_path_buf()));
+}
+
+/// The hub's own environment, as UTF-8 pairs.
+fn hub_vars() -> Vec<(String, String)> {
+    std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
+}
+
 impl HostRust {
     /// The environment for running `program`. Only Rust toolchain programs
     /// wait for the toolchain lookup; any other program takes the last
     /// usable lookup, else PATH without a toolchain, and never runs
-    /// `rustc` or waits on a lookup in progress. Cargo started indirectly
-    /// (by an interpreter or build tool) therefore finds the toolchain only
-    /// once a toolchain program has run.
+    /// `rustc` or waits on a lookup in progress. [`warm_host_rust`] runs a
+    /// lookup at startup, so cargo started indirectly (by an interpreter or
+    /// build tool) finds the toolchain once that lookup is done.
     async fn get(program: &str, ua_home: &Path) -> Arc<HostRust> {
-        let vars: Vec<(String, String)> = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect();
-        Self::for_program(&HOST_RUST, program, &vars, ua_home).await
+        Self::for_program(&HOST_RUST, program, &hub_vars(), ua_home).await
+    }
+
+    /// Fill `slot` in a spawned task, unless it is already usable.
+    fn warm(
+        slot: &'static HostRustSlot,
+        vars: Vec<(String, String)>,
+        ua_home: PathBuf,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            Self::cached(slot, &vars, &ua_home).await;
+        })
     }
 
     async fn for_program(
@@ -2124,6 +2148,33 @@ mod run_env_tests {
         let cargo = HostRust::for_program(&slot, "cargo", &vars, ua_home.path()).await;
         assert!(cargo.toolchain.is_some());
         assert_eq!(runs(&log), 1);
+    }
+
+    /// The startup warm-up returns at once, even while another lookup holds
+    /// the slot, and then fills it, so a build tool that runs cargo
+    /// indirectly gets the toolchain without any direct cargo call first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_warm_up_fills_the_slot_without_blocking() {
+        let (op, log) = counting_operator();
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
+        ];
+        let ua_home = tempfile::tempdir().unwrap();
+        let slot: &'static HostRustSlot = Box::leak(Box::new(HostRustSlot::new()));
+        let flight = slot.flight.lock().await;
+        let started = std::time::Instant::now();
+        let warm = HostRust::warm(slot, vars.clone(), ua_home.path().to_path_buf());
+        assert!(started.elapsed() < Duration::from_secs(1), "the warm-up blocked its caller");
+        let make = HostRust::for_program(slot, "make", &vars, ua_home.path()).await;
+        assert!(make.toolchain.is_none(), "nothing waits on the warm-up");
+        drop(flight);
+        tokio::time::timeout(Duration::from_secs(10), warm).await.unwrap().unwrap();
+        assert_eq!(runs(&log), 1);
+        let make = HostRust::for_program(slot, "make", &vars, ua_home.path()).await;
+        assert_eq!(make.toolchain.as_deref(), Some(op.toolchain_bin.as_path()), "{}", make.path);
+        assert_eq!(runs(&log), 1, "the build tool reused the warm-up's lookup");
     }
 
     /// With the real toolchain, when there is one: cargo run with the
