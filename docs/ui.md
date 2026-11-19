@@ -30,6 +30,18 @@ that section rather than failing the page. Approve, deny and revoke run
 `approval_resolve`, which agent profiles do not expose and which refuses
 self-approval, so an agent token cannot clear its own gate through the UI.
 
+The live feeds (`/ui/activity/stream`, and `/api/events/stream` for JSON
+clients) open with one `event_log_query` call as the caller, so a profile or
+policy that refuses that tool refuses the stream with the same status. Every
+row, live or replayed, passes the same channel filter the tool applies. A
+reconnect sends `Last-Event-ID` (the ledger seq) and gets the rows it missed
+from the ledger; `/api/events/stream` also takes `?after_seq=`. A client too
+slow for the live broadcast is caught up from the ledger the same way. When
+a catch-up cannot be complete (more than 1000 matching rows, or a failed
+read), the stream sends a `gap` event (`{"gap": true, "after_seq",
+"until_seq", "reason"}`; the Activity page shows it as a row) instead of
+skipping rows silently.
+
 Values under secret-shaped keys (`token`, `secret`, `password`, `api_key`,
 `authorization`, `cookie` and similar) are shown as `[redacted]` wherever the
 UI prints JSON.

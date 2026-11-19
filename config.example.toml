@@ -10,7 +10,14 @@ vault_write_dirs = ["Inbox", "Logs", "Wiki"]
 
 bind = "127.0.0.1:8765"
 enforce_auth = true
-allowed_hosts = ["localhost", "127.0.0.1"]
+# Host headers /api and /ui answer (DNS-rebinding guard). The host of
+# public_url is always allowed too. List any other name the hub is reached
+# by, e.g. a tailnet name in front of `tailscale serve`:
+allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+# allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.example-tailnet.ts.net"]
+# Public base URL. Use https:// for anything but loopback: browsers drop the
+# Secure session cookie and refuse passkeys on plain http to other hosts.
+# public_url = "https://hub.example-tailnet.ts.net"
 
 # Who counts as a human operator. Only humans resolve approvals.
 human_identities = ["operator"]
