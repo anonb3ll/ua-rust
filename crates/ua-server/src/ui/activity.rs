@@ -163,7 +163,8 @@ pub async fn stream(ui: Ui, headers: HeaderMap, Query(q): Query<ActivityQuery>) 
     let prefix = clean_prefix(&q.channel_prefix);
     let scope = EventScope { channels: None, channel_prefix: (!prefix.is_empty()).then_some(prefix) };
     let resume = events::resume_point(&headers, None);
-    match events::open(&ui.state, &ui.caller, scope, resume).await {
+    let auth = events::StreamAuth::from_request(&headers, &ui.caller, "/ui/activity/stream");
+    match events::open(&ui.state, &ui.caller, auth, scope, resume).await {
         Ok(stream) => Sse::new(stream.map(sse_row)).keep_alive(KeepAlive::default()).into_response(),
         Err(e) => (crate::api::status_for(&e), super::describe("event_log_query", &e)).into_response(),
     }

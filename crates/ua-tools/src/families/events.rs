@@ -67,8 +67,8 @@ impl EventScope {
         }
     }
 
-    /// Scoped rows after `after_seq`, at most `limit` (the newest ones when
-    /// more match; see [`ledger::query`]).
+    /// Scoped rows after `after_seq`, at most `limit`: the oldest ones after
+    /// the cursor, so repeated calls page forward (see [`ledger::query`]).
     pub fn read_after(&self, conn: &Connection, after_seq: i64, limit: usize) -> UaResult<Vec<Event>> {
         ledger::query(conn, &self.query(Some(after_seq), None, Some(limit.clamp(1, MAX_LIMIT))))
     }
