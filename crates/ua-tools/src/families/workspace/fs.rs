@@ -9,7 +9,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::safety::{
-    DEPENDENCY_DIRS, HOOK_DIRS, canonicalize_lenient, readable_entry, resolve_for_read, resolve_in_root,
+    DEPENDENCY_DIRS, HOOK_DIRS, canonicalize_lenient, guard_secret_filename, readable_entry,
+    resolve_for_read, resolve_in_root,
 };
 use ua_core::{UaError, UaResult};
 
@@ -221,6 +222,7 @@ async fn fs_write(ctx: ToolCtx, a: WriteArgs) -> UaResult<Value> {
     if p.is_dir() {
         return Err(UaError::invalid(format!("{} is a directory", a.path)));
     }
+    guard_secret_filename(&p)?;
     guard_configured_hooks(&p, &sb.root, &a.path).await?;
     let sha = sha256_hex(a.content.as_bytes());
     let append = a.append;

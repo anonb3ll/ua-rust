@@ -88,7 +88,7 @@ impl Default for Config {
             vault_path: None,
             vault_write_dirs: DEFAULT_VAULT_WRITE_DIRS.iter().map(|s| s.to_string()).collect(),
             bind: SocketAddr::from(([127, 0, 0, 1], 8765)),
-            enforce_auth: false,
+            enforce_auth: true,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
             agent_tokens: None,
             human_identities: Vec::new(),
