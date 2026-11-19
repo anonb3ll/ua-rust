@@ -6,7 +6,12 @@
 //! and, unless skipped or suppressed, creates a task. A routine may also name
 //! a reviewed workflow: each created fire then runs that workflow as the
 //! routine's owner (the identity that added it), under the owner's default
-//! profile, through the same governed path as any call.
+//! profile, through the same governed path as any call. An unattended fire
+//! (the scheduler, or someone other than a human owner firing by hand) runs
+//! as an agent, never with human authority.
+//!
+//! Only the routine's owner, verified, or a verified human may fire or pause
+//! a routine.
 //!
 //! Cron fires happen only in [`tick`], one transaction per tick, and the
 //! unique `(routine_id, fire_key)` makes a repeated or racing tick harmless.
@@ -344,10 +349,31 @@ fn routine_by_id(c: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>
     Ok(c.query_row("SELECT * FROM routines WHERE id = ?1", [id], row_map).optional()?)
 }
 
+/// Whether `caller` may fire or pause a routine owned by `owner`: the owner
+/// itself, verified, or a verified human.
+fn may_operate(caller: &Caller, owner: &str) -> bool {
+    caller.is_human() || (caller.kind == ActorKind::Agent && caller.label == owner)
+}
+
+fn require_operator(caller: &Caller, routine: &Map<String, Value>) -> UaResult<()> {
+    let owner = routine["owner"].as_str().unwrap_or_default();
+    if may_operate(caller, owner) {
+        Ok(())
+    } else {
+        Err(UaError::denied(
+            "not_owner",
+            format!("only the routine's owner ({owner:?}), verified, or a verified human may do this"),
+        ))
+    }
+}
+
 /// The caller a routine's workflow runs as: its owner, never wider than the
-/// owner's configured default profile, always profile-enforced.
-fn owner_caller(hub: &Hub, owner: &str) -> Caller {
-    let kind = if hub.cfg().is_human(owner) { ActorKind::Human } else { ActorKind::Agent };
+/// owner's configured default profile, always profile-enforced. Human
+/// authority is carried only when `attended` (the human owner fired it in
+/// person); an unattended run is an agent under the owner's label, so policy
+/// overlays clamp it like any agent.
+fn owner_caller(hub: &Hub, owner: &str, attended: bool) -> Caller {
+    let kind = if attended && hub.cfg().is_human(owner) { ActorKind::Human } else { ActorKind::Agent };
     Caller {
         label: owner.to_string(),
         kind,
@@ -359,7 +385,7 @@ fn owner_caller(hub: &Hub, owner: &str) -> Caller {
 }
 
 /// Run the routine's workflow for one created fire and record the outcome.
-async fn run_fire_workflow(hub: &Hub, run_row: i64) -> Option<Value> {
+async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Value> {
     let loaded = hub
         .db()
         .read_async(move |c| {
@@ -381,7 +407,8 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64) -> Option<Value> {
         .and_then(Value::as_str)
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    let caller = owner_caller(hub, &owner);
+    let caller = owner_caller(hub, &owner, attended);
+    let actor_kind = caller.kind;
     let (status, run_id, error) = match workflows::run_as(hub, &caller, &workflow, inputs).await {
         Ok(report) => (report.status.clone(), Some(report.run_id.clone()), report.error.clone()),
         Err(e) => ("error".to_string(), None, Some(e.to_string())),
@@ -403,6 +430,7 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64) -> Option<Value> {
         "run_id": run_id,
         "status": status,
         "error": error,
+        "actor_kind": actor_kind,
     }))
 }
 
@@ -527,7 +555,7 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
     let mut result = result;
     let mut runs = Vec::new();
     for row in to_run {
-        if let Some(r) = run_fire_workflow(hub, row).await {
+        if let Some(r) = run_fire_workflow(hub, row, false).await {
             runs.push(r);
         }
     }
@@ -751,28 +779,29 @@ pub struct PauseArgs {
 }
 
 async fn routine_pause(ctx: ToolCtx, a: PauseArgs) -> UaResult<Value> {
-    let by = ctx.caller.label.clone();
+    let caller = ctx.caller.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            let routine =
+                routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
+            require_operator(&caller, &routine)?;
+            let previous = routine["paused"].as_i64().unwrap_or(0) != 0;
             let now = ua_core::time::now();
-            let n = tx.execute(
+            tx.execute(
                 "UPDATE routines SET paused = ?2, updated_at = ?3, \
                  cursor_at = CASE WHEN paused = 1 AND ?2 = 0 THEN ?3 ELSE cursor_at END WHERE id = ?1",
                 params![a.routine_id, a.paused, now],
             )?;
-            if n == 0 {
-                return Err(UaError::not_found("unknown routine"));
-            }
             ledger::append(
                 tx,
                 EventInput::new(
                     "agent.routine.paused",
-                    json!({ "routine_id": a.routine_id, "paused": a.paused }),
+                    json!({ "routine_id": a.routine_id, "paused": a.paused, "previous_paused": previous }),
                 )
-                .by(by),
+                .by(caller.label.clone()),
             )?;
-            Ok(json!({ "id": a.routine_id, "paused": i64::from(a.paused) }))
+            Ok(json!({ "id": a.routine_id, "paused": i64::from(a.paused), "previous_paused": i64::from(previous) }))
         })
         .await
 }
@@ -792,13 +821,17 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
     if a.idempotency_key.is_empty() || a.idempotency_key.len() > 200 {
         return Err(UaError::invalid("idempotency_key must be 1-200 characters"));
     }
-    let by = ctx.caller.label.clone();
+    let caller = ctx.caller.clone();
+    let by = caller.label.clone();
     let fire = ctx
         .hub
         .db()
         .write_async(move |tx| {
             let routine =
                 routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
+            require_operator(&caller, &routine)?;
+            // Human authority only when the human owner fires in person.
+            let attended = caller.is_human() && routine["owner"].as_str() == Some(caller.label.as_str());
             let key = format!("event:{}", a.idempotency_key);
             let previous: Option<(String, Option<i64>)> = tx
                 .query_row(
@@ -808,7 +841,11 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
                 )
                 .optional()?;
             if let Some((status, task_id)) = previous {
-                return Ok((json!({ "status": status, "task_id": task_id, "replayed": true }), None));
+                return Ok((
+                    json!({ "status": status, "task_id": task_id, "replayed": true }),
+                    None,
+                    attended,
+                ));
             }
             if routine["paused"].as_i64() == Some(1) {
                 return Err(UaError::conflict("routine is paused"));
@@ -818,12 +855,12 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
             }
             let fire = create_fire(tx, &routine, &key, jiff::Timestamp::now(), &by)?;
             let run = (fire.status == "created").then_some(fire.run_row).flatten();
-            Ok((json!({ "status": fire.status, "task_id": fire.task_id }), run))
+            Ok((json!({ "status": fire.status, "task_id": fire.task_id }), run, attended))
         })
         .await?;
-    let (mut out, run) = fire;
+    let (mut out, run, attended) = fire;
     if let Some(row) = run
-        && let Some(r) = run_fire_workflow(&ctx.hub, row).await
+        && let Some(r) = run_fire_workflow(&ctx.hub, row, attended).await
     {
         out["workflow"] = r;
     }
@@ -852,12 +889,22 @@ pub fn register(r: &mut Registry) {
         .family("routines")
         .read_only(),
     );
-    r.add(tool("routine_pause", "Pause or resume a routine.", routine_pause).family("routines"));
+    r.add(
+        tool(
+            "routine_pause",
+            "Pause or resume a routine. Only its owner (verified) or a verified human may. Returns {id, paused, \
+             previous_paused}.",
+            routine_pause,
+        )
+        .family("routines"),
+    );
     r.add(
         tool(
             "routine_fire",
-            "Fire an api/webhook routine with a stable source event id; a replay returns the same task. Cron \
-             routines are fired only by the scheduler. Needs routines_enabled.",
+            "Fire an api/webhook routine with a stable source event id; a replay returns the same task. Only \
+             the routine's owner (verified) or a verified human may fire it; its workflow runs as the owner, \
+             with human authority only when a human owner fires it in person. Cron routines are fired only by \
+             the scheduler. Needs routines_enabled.",
             routine_fire,
         )
         .family("routines"),

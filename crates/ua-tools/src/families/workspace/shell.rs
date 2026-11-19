@@ -1215,12 +1215,12 @@ pub fn register(r: &mut Registry) {
 }
 
 /// A per-call HOME directory under `$UA_HOME/run-home/`, deleted on drop.
-struct ScratchHome {
-    path: std::path::PathBuf,
+pub(crate) struct ScratchHome {
+    pub(crate) path: std::path::PathBuf,
 }
 
 impl ScratchHome {
-    fn new(ua_home: &std::path::Path) -> UaResult<Self> {
+    pub(crate) fn new(ua_home: &std::path::Path) -> UaResult<Self> {
         let path = ua_home.join("run-home").join(ulid::Ulid::generate().to_string());
         std::fs::create_dir_all(&path)
             .map_err(|e| UaError::internal(format!("cannot prepare the command HOME: {e}")))?;

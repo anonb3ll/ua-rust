@@ -16,6 +16,8 @@ mod fs;
 mod git;
 mod shell;
 
+pub(crate) use shell::ScratchHome;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};

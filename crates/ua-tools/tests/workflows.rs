@@ -165,7 +165,6 @@ steps:
   - name: tell
     tool: notify
     args: { message: "hello" }
-    retries: 3
 "#,
     );
     // Developer profiles do not see `notify`; the workflow must not either.
@@ -174,8 +173,43 @@ steps:
     assert_eq!(out["code"], "profile_denied");
     let tell = &out["steps"][1];
     assert_eq!(tell["status"], "denied");
-    assert_eq!(tell["attempts"], 1, "a refusal is never retried");
+    assert_eq!(tell["attempts"], 1);
     assert_eq!(out["steps"][0]["status"], "done");
+}
+
+#[tokio::test]
+async fn only_read_only_steps_are_retried() {
+    let vault = tempfile::tempdir().unwrap();
+    let path = vault.path().to_path_buf();
+    let h = H::with(|c| c.vault_path = Some(path));
+    let b = agent("builder-1");
+    // A definition may not ask to retry a mutating tool.
+    h.def(
+        "retry-write",
+        "steps:\n  - name: make\n    tool: task_add\n    args: { title: x }\n    retries: 2\n",
+    );
+    let e = h.err(&b, "workflow_run", json!({ "name": "retry-write" })).await;
+    assert!(e.to_string().contains("read-only"), "{e}");
+    assert_eq!(h.task_count().await, 0);
+
+    // A failing read-only step is retried up to `retries`, then fails.
+    h.def(
+        "retry-read",
+        "steps:\n  - name: look\n    tool: vault_read\n    args: { path: missing.md }\n    retries: 2\n",
+    );
+    let out = h.ok(&b, "workflow_run", json!({ "name": "retry-read" })).await;
+    assert_eq!(out["status"], "failed", "{out}");
+    assert_eq!(out["steps"][0]["attempts"], 3, "{out}");
+
+    // A failing mutating step runs once and is left for an operator.
+    h.def(
+        "write-once",
+        "steps:\n  - name: note\n    tool: task_update\n    args: { id: 999, append_note: x }\n",
+    );
+    let out = h.ok(&b, "workflow_run", json!({ "name": "write-once" })).await;
+    assert_eq!(out["status"], "indeterminate", "{out}");
+    assert_eq!(out["steps"][0]["status"], "indeterminate", "{out}");
+    assert_eq!(out["steps"][0]["attempts"], 1, "{out}");
 }
 
 #[tokio::test]
@@ -191,7 +225,10 @@ async fn resume_continues_after_a_failed_step_without_replaying() {
             json!({ "name": "make-and-note", "inputs": { "title": "First", "target": 2 } }),
         )
         .await;
-    assert_eq!(out["status"], "failed", "{out}");
+    // task_update changes state, so its failure needs an operator: never
+    // retried, the run stops as indeterminate.
+    assert_eq!(out["status"], "indeterminate", "{out}");
+    assert_eq!(out["steps"][1]["attempts"], 1, "{out}");
     let run_id = out["run_id"].as_str().unwrap().to_string();
     assert_eq!(h.task_count().await, 1);
 
@@ -521,4 +558,83 @@ async fn api_routines_fire_once_per_key_and_run_their_workflow_as_owner() {
         .unwrap();
     let e = h.err(&l, "routine_fire", json!({ "routine_id": cron, "idempotency_key": "k" })).await;
     assert!(e.to_string().contains("scheduler"), "{e}");
+}
+
+fn paused_events(h: &H) -> Vec<Value> {
+    h.hub
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT payload FROM event_log WHERE channel = 'agent.routine.paused' ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap()).collect())
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn only_the_owner_or_a_human_fires_or_pauses_a_routine() {
+    let h = H::with(|c| c.routines_enabled = true);
+    h.def("list-open", "steps:\n  - name: list\n    tool: task_list\n    args: { status: open }\n");
+    let owner = lead("lead-1");
+    let other = lead("lead-3");
+    let id = h
+        .ok(&owner, "routine_add", json!({ "title": "On event", "trigger": "api", "workflow": "list-open" }))
+        .await["id"]
+        .as_i64()
+        .unwrap();
+
+    // Another agent, even one allowed the tool, may not fire or pause it.
+    let e = h.err(&other, "routine_fire", json!({ "routine_id": id, "idempotency_key": "evt-1" })).await;
+    assert_eq!(e.code(), "denied", "{e}");
+    assert!(e.to_string().contains("owner"), "{e}");
+    assert_eq!(h.task_count().await, 0, "a refused fire creates nothing");
+    let e = h.err(&other, "routine_pause", json!({ "routine_id": id })).await;
+    assert_eq!(e.code(), "denied", "{e}");
+    assert!(paused_events(&h).is_empty());
+
+    // A verified human may fire it; the workflow still runs as the agent owner.
+    let fired = h.ok(&human(), "routine_fire", json!({ "routine_id": id, "idempotency_key": "evt-2" })).await;
+    assert_eq!(fired["status"], "created", "{fired}");
+    assert_eq!(fired["workflow"]["actor_kind"], "agent", "{fired}");
+
+    // Pause and resume record the previous state.
+    let out = h.ok(&owner, "routine_pause", json!({ "routine_id": id })).await;
+    assert_eq!(out["previous_paused"], 0);
+    let out = h.ok(&human(), "routine_pause", json!({ "routine_id": id, "paused": false })).await;
+    assert_eq!(out["previous_paused"], 1);
+    let events = paused_events(&h);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["paused"], true);
+    assert_eq!(events[0]["previous_paused"], false);
+    assert_eq!(events[1]["paused"], false);
+    assert_eq!(events[1]["previous_paused"], true);
+}
+
+#[tokio::test]
+async fn a_humans_routine_never_runs_unattended_with_human_authority() {
+    let h = H::with(|c| c.routines_enabled = true);
+    h.def("list-open", "steps:\n  - name: list\n    tool: task_list\n    args: { status: open }\n");
+    let op = human();
+    h.ok(
+        &op,
+        "routine_add",
+        json!({ "title": "Hourly", "schedule": "0 * * * *", "start_at": "2026-01-01T00:30:00+00:00", "workflow": "list-open" }),
+    )
+    .await;
+    let out = routines::tick(&h.hub, ts("2026-01-01T01:00:30Z"), true).await.unwrap();
+    assert_eq!(out["created"], 1, "{out}");
+    let run = &out["workflows"][0];
+    assert_eq!(run["status"], "done", "{out}");
+    assert_eq!(run["actor_kind"], "agent", "a scheduled fire is never human: {out}");
+
+    // The human owner firing in person keeps human authority.
+    let api = h
+        .ok(&op, "routine_add", json!({ "title": "Now", "trigger": "api", "workflow": "list-open" }))
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let fired = h.ok(&op, "routine_fire", json!({ "routine_id": api, "idempotency_key": "evt-1" })).await;
+    assert_eq!(fired["workflow"]["actor_kind"], "human", "{fired}");
 }
