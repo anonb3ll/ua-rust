@@ -151,6 +151,17 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve => {
             warn_if_locked_out(&state).await;
+            if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
+                tracing::warn!("{w}");
+            }
+            match ua_server::oauth::register::prune_unused_clients(&hub).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(pruned = n, "removed registered OAuth clients that never got a grant")
+                }
+                Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
+            }
+            ua_tools::families::workspace::sweep_run_homes();
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {
