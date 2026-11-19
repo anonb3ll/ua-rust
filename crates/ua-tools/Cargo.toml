@@ -32,6 +32,9 @@ regex = "1.12"
 # Policy file (YAML) and config revision diffs.
 serde-saphyr = "2.2"
 similar = "3.2"
+# Routines: cron schedules (five-field, UTC).
+croner = "4.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 ulid.workspace = true
 secrecy.workspace = true
 # Vault family: Markdown AST (wikilinks, front matter) and YAML front matter.

@@ -8,6 +8,7 @@ pub mod agents;
 pub mod audit;
 pub mod code;
 pub mod core_schema;
+pub mod cycles;
 pub mod delegation;
 pub mod dispatch;
 pub mod events;
@@ -19,12 +20,14 @@ pub mod messaging;
 pub mod notify;
 pub mod observability;
 pub mod plans;
+pub mod routines;
 pub mod sessions_lifecycle;
 pub mod skills;
 pub mod tasks;
 pub mod tokens;
 pub mod vault;
 pub mod web;
+pub mod workflows;
 pub mod workspace;
 
 use ua_store::SchemaPart;
@@ -40,11 +43,14 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.extend(tasks::schema_parts());
     parts.extend(tokens::schema_parts());
     parts.extend(vault::schema_parts());
+    parts.push(cycles::SCHEMA);
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
     parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
+    parts.push(routines::SCHEMA);
     parts.push(web::SCHEMA);
+    parts.push(workflows::SCHEMA);
     parts
 }
 
@@ -53,6 +59,7 @@ pub fn register(r: &mut Registry) {
     agents::register(r);
     audit::register(r);
     code::register(r);
+    cycles::register(r);
     delegation::register(r);
     dispatch::register(r);
     events::register(r);
@@ -64,11 +71,13 @@ pub fn register(r: &mut Registry) {
     notify::register(r);
     observability::register(r);
     plans::register(r);
+    routines::register(r);
     sessions_lifecycle::register(r);
     skills::register(r);
     tasks::register(r);
     tokens::register(r);
     vault::register(r);
     web::register(r);
+    workflows::register(r);
     workspace::register(r);
 }
