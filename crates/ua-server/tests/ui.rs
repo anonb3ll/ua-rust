@@ -18,8 +18,16 @@ use ua_tools::{Hub, builtin_registry};
 const OPERATOR_TOKEN: &str = "operator-test-token-0001";
 const BUILDER_TOKEN: &str = "builder-test-token-0002";
 
-fn config() -> Config {
+/// The suite covers both token and local (unauthenticated) callers, so auth
+/// enforcement is switched off explicitly.
+fn local_config() -> Config {
     let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.enforce_auth = false;
+    cfg
+}
+
+fn config() -> Config {
+    let mut cfg = local_config();
     cfg.agent_tokens =
         Some(SecretString::from(format!("operator:{OPERATOR_TOKEN},builder-1:{BUILDER_TOKEN}")));
     cfg.human_identities = vec!["operator".into()];
@@ -129,7 +137,7 @@ fn gated_config() -> Config {
 
 #[tokio::test]
 async fn every_page_renders_with_its_key_elements() {
-    let (app, state) = app(Config::for_home(std::env::temp_dir()));
+    let (app, state) = app(local_config());
     let me = local();
     let t1 = call(
         &state,
@@ -353,7 +361,7 @@ async fn state_changes_without_a_valid_csrf_token_are_refused() {
 
 #[tokio::test]
 async fn task_forms_create_update_comment_and_link() {
-    let (app, state) = app(Config::for_home(std::env::temp_dir()));
+    let (app, state) = app(local_config());
     let csrf = csrf_cookie(&app, None).await;
     let post = |uri: &str, body: &str| form(uri, None, Some(&csrf), Some(&csrf), body);
 
@@ -406,7 +414,7 @@ async fn task_forms_create_update_comment_and_link() {
 
 #[tokio::test]
 async fn a_gated_ui_write_parks_and_says_so() {
-    let mut cfg = Config::for_home(std::env::temp_dir());
+    let mut cfg = local_config();
     cfg.approval_tools = vec!["task_add".into()];
     let (app, _state) = app(cfg);
     let csrf = csrf_cookie(&app, None).await;
@@ -433,7 +441,7 @@ async fn profile_limits_show_as_section_errors() {
 
 #[tokio::test]
 async fn api_tasks_has_the_sdk_shape() {
-    let (app, state) = app(Config::for_home(std::env::temp_dir()));
+    let (app, state) = app(local_config());
     let me = local();
     call(&state, &me, "task_add", json!({ "title": "Open one", "project": "alpha" })).await.unwrap();
     let blocked =
@@ -465,7 +473,7 @@ async fn api_tasks_has_the_sdk_shape() {
 
 #[tokio::test]
 async fn api_task_create_and_update_match_the_python_contract() {
-    let (app, _state) = app(Config::for_home(std::env::temp_dir()));
+    let (app, _state) = app(local_config());
     let resp =
         send(&app, post_json("/api/tasks", None, json!({ "title": "From the SDK", "priority": "high" })))
             .await;
@@ -512,7 +520,7 @@ async fn api_task_create_and_update_match_the_python_contract() {
 
 #[tokio::test]
 async fn gated_api_writes_return_the_pending_approval_shape() {
-    let mut cfg = Config::for_home(std::env::temp_dir());
+    let mut cfg = local_config();
     cfg.approval_tools = vec!["task_update".into()];
     let (app, state) = app(cfg);
     let id = call(&state, &local(), "task_add", json!({ "title": "Gate me" })).await.unwrap()["id"]
@@ -601,7 +609,7 @@ async fn api_approvals_resolve_detail_and_request() {
 
 #[tokio::test]
 async fn api_sessions_catalog_board_and_unbuilt_routes() {
-    let (app, state) = app(Config::for_home(std::env::temp_dir()));
+    let (app, state) = app(local_config());
     call(&state, &local(), "session_start", json!({ "kind": "interactive", "agent": "builder-1" }))
         .await
         .unwrap();
