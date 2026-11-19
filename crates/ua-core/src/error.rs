@@ -89,6 +89,20 @@ impl From<anyhow::Error> for UaError {
     }
 }
 
+#[cfg(feature = "rusqlite")]
+impl From<rusqlite::Error> for UaError {
+    fn from(e: rusqlite::Error) -> Self {
+        use rusqlite::ErrorCode;
+        match &e {
+            rusqlite::Error::QueryReturnedNoRows => Self::NotFound("no such row".into()),
+            rusqlite::Error::SqliteFailure(f, msg) if f.code == ErrorCode::ConstraintViolation => {
+                Self::Conflict(msg.clone().unwrap_or_else(|| "constraint violation".into()))
+            }
+            _ => Self::Internal(e.to_string()),
+        }
+    }
+}
+
 /// Wire shape of an error, for documentation and schema generation.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {

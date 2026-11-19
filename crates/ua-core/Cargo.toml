@@ -16,5 +16,10 @@ jiff.workspace = true
 figment.workspace = true
 secrecy.workspace = true
 
+rusqlite = { workspace = true, optional = true }
+
+[features]
+rusqlite = ["dep:rusqlite"]
+
 [dev-dependencies]
 tempfile.workspace = true
