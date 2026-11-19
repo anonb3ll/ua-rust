@@ -1,0 +1,695 @@
+//! Import a small Python-shaped hub database.
+//!
+//! The fixture's CREATE TABLE statements are copied from the Python hub's
+//! schema (including columns ua-rust does not store, such as `org_id`), and
+//! its three-event ledger is hashed with the shared hash function, the first
+//! entry against the reference value computed by the Python implementation.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use ua_core::{ActorKind, Caller, Config, Profile, identity::Transport};
+use ua_import::{Options, Report};
+use ua_store::Db;
+use ua_store::ledger::{self, EventInput};
+use ua_tools::{Hub, builtin_registry};
+
+const PY_SCHEMA: &str = "
+CREATE TABLE agents (
+  label TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'unknown',
+  host TEXT,
+  known INTEGER NOT NULL DEFAULT 0,
+  first_seen TEXT,
+  last_seen TEXT,
+  last_seen_via TEXT,
+  pid INTEGER,
+  version TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  meta TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE agent_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_label TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  hash_algo TEXT NOT NULL DEFAULT 'sha256',
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'rotated', 'revoked', 'expired')),
+  issued_at TEXT NOT NULL,
+  expires_at TEXT,
+  rotated_from INTEGER REFERENCES agent_tokens(id) ON DELETE SET NULL,
+  rotated_at TEXT,
+  revoked_at TEXT,
+  issued_by TEXT,
+  note TEXT,
+  org_id TEXT,
+  agent_kind TEXT
+);
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  notes TEXT,
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','doing','waiting_review','blocked','done','cancelled')),
+  priority TEXT NOT NULL DEFAULT 'med' CHECK (priority IN ('high','med','low')),
+  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  archived_at TEXT,
+  source_host TEXT,
+  claimed_by TEXT,
+  claimed_at TEXT,
+  lock_expires_at TEXT,
+  untrusted INTEGER NOT NULL DEFAULT 0,
+  worktree_path TEXT,
+  branch TEXT,
+  project TEXT NOT NULL DEFAULT 'unified-agent',
+  domain TEXT NOT NULL DEFAULT 'hobby',
+  due_at TEXT,
+  evidence_ref TEXT,
+  lane TEXT NOT NULL DEFAULT 'default' CHECK (length(lane) >= 1 AND length(lane) <= 64),
+  org_id TEXT,
+  current_run_id TEXT,
+  current_run_agent TEXT,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  next_owner TEXT,
+  waiting_on TEXT,
+  terminal_predicate TEXT,
+  ownership_generation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE task_dependencies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id, depends_on_task_id),
+  CHECK(task_id != depends_on_task_id)
+);
+CREATE TABLE task_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  parent_comment_id INTEGER,
+  author TEXT NOT NULL,
+  body TEXT NOT NULL,
+  mentions TEXT NOT NULL DEFAULT '[]',
+  refs TEXT NOT NULL DEFAULT '{}',
+  idempotency_key TEXT,
+  thread_revision INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE task_comment_threads (
+  task_id INTEGER PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE goals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  statement TEXT NOT NULL DEFAULT '',
+  parent_goal_id INTEGER,
+  project TEXT NOT NULL DEFAULT 'unified-agent',
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','achieved','abandoned')),
+  created_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  org_id TEXT,
+  revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE task_goal_links (
+  task_id INTEGER PRIMARY KEY,
+  goal_id INTEGER NOT NULL,
+  linked_by TEXT,
+  linked_at TEXT NOT NULL
+);
+CREATE TABLE plans (
+  id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'default',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','done','blocked','abandoned')),
+  author TEXT,
+  escalated INTEGER NOT NULL DEFAULT 0,
+  escalation_note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  org_id TEXT,
+  revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE plan_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  step_idx INTEGER NOT NULL,
+  description TEXT NOT NULL,
+  owner TEXT,
+  depends_on TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','doing','done','failed','blocked')),
+  note TEXT,
+  retries INTEGER NOT NULL DEFAULT 0,
+  done_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  outputs TEXT NOT NULL DEFAULT '{}',
+  UNIQUE (plan_id, step_idx)
+);
+CREATE TABLE plan_checkpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  context TEXT NOT NULL DEFAULT '{}',
+  note TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (plan_id, seq)
+);
+CREATE TABLE delegations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_agent TEXT NOT NULL,
+  to_agent TEXT NOT NULL,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_spec TEXT NOT NULL,
+  deadline TEXT,
+  callback TEXT NOT NULL DEFAULT 'notify' CHECK (callback IN ('notify','memory','none')),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','in_flight','completed','cancelled','failed')),
+  memory_id TEXT,
+  callback_result TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  claim_generation INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  org_id TEXT
+);
+CREATE TABLE memory (
+  id TEXT PRIMARY KEY,
+  title TEXT,
+  content TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '[]',
+  author TEXT,
+  updated_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  salience REAL NOT NULL DEFAULT 0.5,
+  confidence REAL,
+  last_accessed TEXT,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  source_host TEXT,
+  superseded_by TEXT,
+  expires_at TEXT,
+  feedback_helpful INTEGER NOT NULL DEFAULT 0,
+  feedback_not_helpful INTEGER NOT NULL DEFAULT 0,
+  feedback_stale INTEGER NOT NULL DEFAULT 0,
+  feedback_wrong INTEGER NOT NULL DEFAULT 0,
+  org_id TEXT,
+  epistemic TEXT,
+  evidence TEXT,
+  valid_from TEXT,
+  contradicts TEXT,
+  valid_to TEXT
+);
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+  title, content, content='memory', content_rowid='rowid'
+);
+CREATE TABLE memory_versions (
+  note_id TEXT NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  content TEXT NOT NULL,
+  tags TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  actor TEXT,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (note_id, version)
+);
+CREATE TABLE memory_embeddings (
+  note_id TEXT PRIMARY KEY NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+  embedding BLOB NOT NULL,
+  model TEXT
+);
+CREATE TABLE approvals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tool TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  requested_by TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','denied','consumed','revoked','expired')),
+  reason TEXT,
+  resolved_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  org_id TEXT,
+  run_id TEXT
+);
+CREATE TABLE event_log (
+  ulid TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  originator TEXT,
+  episode_id TEXT,
+  causal_parent_id TEXT,
+  created_at TEXT NOT NULL,
+  dedupe_key TEXT,
+  prev_hash TEXT,
+  entry_hash TEXT,
+  org_id TEXT
+);
+CREATE TABLE message_index (
+  message_id TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  act TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  reply_to TEXT,
+  expects_reply INTEGER NOT NULL DEFAULT 0,
+  task_id INTEGER,
+  delegation_id INTEGER,
+  event_ulid TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  read_at TEXT,
+  acked_at TEXT,
+  target_session TEXT,
+  sender_session TEXT,
+  event_seq INTEGER,
+  org_id TEXT
+);
+CREATE TABLE message_reads (
+  message_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  read_at TEXT NOT NULL,
+  acked_at TEXT,
+  PRIMARY KEY (message_id, session_id)
+);
+CREATE TABLE zulip_cursors (
+  bot TEXT NOT NULL,
+  last_message_id INTEGER NOT NULL
+);
+";
+
+const T0: &str = "2026-01-01T00:00:00+00:00";
+
+fn sha_hex(s: &str) -> String {
+    hex::encode(Sha256::digest(s.as_bytes()))
+}
+
+/// One ledger row as the Python hub stores it.
+struct PyEvent {
+    rowid: i64,
+    ulid: &'static str,
+    channel: &'static str,
+    payload: &'static str,
+    originator: Option<&'static str>,
+    episode_id: Option<&'static str>,
+    created_at: &'static str,
+    dedupe_key: Option<&'static str>,
+}
+
+const EVENTS: [PyEvent; 3] = [
+    // Exactly the inputs of the reference hash in ua-store's fixture.
+    PyEvent {
+        rowid: 5,
+        ulid: "01J0000000000000000000000",
+        channel: "agent.task.updated",
+        payload: "{\"id\": 1, \"t\": \"café\"}",
+        originator: Some("builder-1"),
+        episode_id: None,
+        created_at: T0,
+        dedupe_key: None,
+    },
+    PyEvent {
+        rowid: 6,
+        ulid: "01J0000000000000000000001",
+        channel: "agent.message.inform",
+        payload: "{\"message_id\": \"m1\", \"body\": \"hello\", \"hop\": 0}",
+        originator: Some("agent-1"),
+        episode_id: Some("ep-1"),
+        created_at: "2026-01-01T00:00:01+00:00",
+        dedupe_key: None,
+    },
+    PyEvent {
+        rowid: 7,
+        ulid: "01J0000000000000000000002",
+        channel: "agent.task.created",
+        payload: "{\"id\": 4}",
+        originator: None,
+        episode_id: None,
+        created_at: "2026-01-01T00:00:02+00:00",
+        dedupe_key: Some("task-4-created"),
+    },
+];
+
+fn insert_event(c: &Connection, e: &PyEvent, prev: Option<&str>) -> String {
+    let hash = ledger::compute_entry_hash(
+        prev,
+        e.ulid,
+        e.channel,
+        e.payload,
+        e.originator,
+        e.episode_id,
+        None,
+        e.created_at,
+        e.dedupe_key,
+    );
+    c.execute(
+        "INSERT INTO event_log (rowid, ulid, channel, payload, originator, episode_id, created_at, dedupe_key, \
+         prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            e.rowid,
+            e.ulid,
+            e.channel,
+            e.payload,
+            e.originator,
+            e.episode_id,
+            e.created_at,
+            e.dedupe_key,
+            prev.unwrap_or(ledger::GENESIS_HASH),
+            hash
+        ],
+    )
+    .unwrap();
+    hash
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    hashes: Vec<String>,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let c = Connection::open(&path).unwrap();
+    // Dangling references below stand in for rows an older hub left behind.
+    c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    c.execute_batch(PY_SCHEMA).unwrap();
+    c.execute_batch(&format!(
+        "
+INSERT INTO agents (label, kind, known, created_at, updated_at) VALUES
+  ('agent-1', 'claude', 1, '{T0}', '{T0}'), ('agent-2', 'codex', 1, '{T0}', '{T0}');
+INSERT INTO agent_tokens (id, agent_label, token_hash, hash_algo, status, issued_at, rotated_from) VALUES
+  (1, 'agent-1', '{h1}', 'sha256', 'rotated', '{T0}', NULL),
+  (2, 'agent-1', '{h2}', 'sha256', 'active', '{T0}', 1),
+  (3, 'agent-2', 'pbkdf2$abc', 'pbkdf2', 'active', '{T0}', NULL);
+INSERT INTO tasks (id, title, notes, status, parent_id, created_at, updated_at, org_id) VALUES
+  (1, 'Root task', 'the quokka plan', 'doing', NULL, '{T0}', '{T0}', 'org-a'),
+  (2, 'Child of a later task', NULL, 'open', 4, '{T0}', '{T0}', NULL),
+  (3, 'Orphan', NULL, 'open', 99, '{T0}', '{T0}', NULL),
+  (4, 'Later parent', NULL, 'open', NULL, '{T0}', '{T0}', NULL);
+INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at) VALUES
+  (2, 1, 'agent-1', '{T0}'), (3, 77, 'agent-1', '{T0}');
+INSERT INTO task_comment_threads (task_id, revision, updated_at) VALUES (1, 1, '{T0}');
+INSERT INTO task_comments (task_id, author, body, thread_revision, created_at) VALUES
+  (1, 'agent-1', 'first comment', 1, '{T0}');
+INSERT INTO goals (id, title, created_at, updated_at) VALUES (1, 'Ship it', '{T0}', '{T0}');
+INSERT INTO task_goal_links (task_id, goal_id, linked_at) VALUES (1, 1, '{T0}');
+INSERT INTO plans (id, goal, created_at, updated_at) VALUES ('p1', 'Plan the work', '{T0}', '{T0}');
+INSERT INTO plan_steps (plan_id, step_idx, description, created_at, updated_at) VALUES
+  ('p1', 0, 'step zero', '{T0}', '{T0}'), ('p1', 1, 'step one', '{T0}', '{T0}');
+INSERT INTO plan_checkpoints (plan_id, seq, created_at) VALUES ('p1', 1, '{T0}');
+INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, created_at, updated_at) VALUES
+  ('agent-1', 'agent-2', 1, '{{}}', '{T0}', '{T0}');
+INSERT INTO memory (id, title, content, tags, author, created_at, updated_at) VALUES
+  ('note-a', 'Wombat facts', 'wombats have cube shaped droppings', '[\"zoo\"]', 'agent-1', '{T0}', '{T0}'),
+  ('note-b', 'Other', 'nothing to see', '[]', 'agent-2', '{T0}', '{T0}');
+INSERT INTO memory_versions (note_id, version, content, tags, updated_at, recorded_at) VALUES
+  ('note-a', 1, 'old text', '[]', '{T0}', '{T0}');
+INSERT INTO memory_embeddings (note_id, embedding, model) VALUES ('note-a', x'00000000', 'm');
+INSERT INTO approvals (id, tool, requested_by, status, created_at, updated_at) VALUES
+  (1, 'fs_write', 'agent-1', 'consumed', '{T0}', '{T0}'),
+  (2, 'fs_write', 'agent-1', 'denied', '{T0}', '{T0}'),
+  (3, 'fs_write', 'agent-1', 'pending', '{T0}', '{T0}'),
+  (4, 'fs_write', 'agent-1', 'approved', '{T0}', '{T0}');
+INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, event_ulid, created_at, event_seq)
+  VALUES ('m1', 'agent-2', 'agent-1', 'inform', 'c1', '{u2}', '{T0}', NULL);
+INSERT INTO message_reads (message_id, session_id, read_at) VALUES ('m1', 's1', '{T0}');
+INSERT INTO zulip_cursors (bot, last_message_id) VALUES ('bot', 1);
+",
+        h1 = sha_hex("token-one"),
+        h2 = sha_hex("token-two"),
+        u2 = EVENTS[1].ulid,
+    ))
+    .unwrap();
+    let mut hashes = Vec::new();
+    let mut prev: Option<String> = None;
+    for e in &EVENTS {
+        let h = insert_event(&c, e, prev.as_deref());
+        prev = Some(h.clone());
+        hashes.push(h);
+    }
+    drop(c);
+    Fixture { _dir: dir, path, hashes }
+}
+
+fn file_sha(p: &Path) -> String {
+    hex::encode(Sha256::digest(std::fs::read(p).unwrap()))
+}
+
+fn target() -> Db {
+    Db::open_in_memory(&ua_import::schema_parts()).unwrap()
+}
+
+fn n(db: &Db, sql: &str) -> i64 {
+    db.read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?)).unwrap()
+}
+
+fn table<'r>(r: &'r Report, name: &str) -> &'r ua_import::TableReport {
+    r.tables.iter().find(|t| t.table == name).unwrap()
+}
+
+fn operator() -> Caller {
+    Caller {
+        label: "operator".into(),
+        kind: ActorKind::Human,
+        profile: Profile::Operator,
+        enforce_profile: false,
+        session_key: Some("s1".into()),
+        transport: Transport::Mcp,
+    }
+}
+
+#[test]
+fn fixture_ledger_matches_the_python_reference_hash() {
+    let f = fixture();
+    assert_eq!(f.hashes[0], include_str!("../../ua-store/tests/fixtures/py_hash.txt").trim());
+}
+
+#[tokio::test]
+async fn import_copies_mapped_tables_and_the_chain_verifies() {
+    let f = fixture();
+    let before = file_sha(&f.path);
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &Options::default()).unwrap();
+    assert_eq!(file_sha(&f.path), before, "the source is never written");
+
+    // Counts.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM agents"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 4);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_dependencies"), 1);
+    assert_eq!(table(&r, "task_dependencies").skipped.get("missing_depends_on_task_id"), Some(&1));
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comments"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comment_threads"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM goals"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_goal_links"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM plans"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_steps"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_checkpoints"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM message_reads"), 1);
+    assert_eq!(table(&r, "tasks").copied, 4);
+
+    // Self references: a forward parent is restored, a dangling one is NULL.
+    assert_eq!(n(&db, "SELECT parent_id FROM tasks WHERE id = 2"), 4);
+    assert_eq!(n(&db, "SELECT parent_id IS NULL FROM tasks WHERE id = 3"), 1);
+    assert_eq!(table(&r, "tasks").dangling_refs_nulled, 1);
+
+    // Tokens: hashes in the verified scheme only.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM agent_tokens"), 2);
+    assert_eq!(n(&db, "SELECT rotated_from FROM agent_tokens WHERE id = 2"), 1);
+    assert_eq!(table(&r, "agent_tokens").skipped.get("unsupported_token_hash"), Some(&1));
+    let stored: String = db
+        .read(|c| Ok(c.query_row("SELECT token_hash FROM agent_tokens WHERE id = 2", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(stored, sha_hex("token-two"));
+
+    // Approvals: settled history only, never a live request or pass.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals WHERE status IN ('pending','approved')"), 0);
+    assert_eq!(table(&r, "approvals").skipped.get("live_approval"), Some(&2));
+
+    // Memory keeps ids, and the rebuilt index finds the note.
+    let hit: String = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT m.id FROM memory_fts f JOIN memory m ON m.seq = f.rowid WHERE memory_fts MATCH 'wombats'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(hit, "note-a");
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_fts WHERE task_fts MATCH 'quokka'"), 1);
+
+    // Message index: the missing event_seq is filled from the imported ledger.
+    assert_eq!(n(&db, "SELECT event_seq FROM message_index WHERE message_id = 'm1'"), 6);
+
+    // Ledger: seq, ids and hashes preserved.
+    let rows: Vec<(i64, String, String)> = db
+        .read(|c| {
+            let mut s = c.prepare("SELECT seq, ulid, entry_hash FROM event_log ORDER BY seq")?;
+            let v = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+            Ok(v)
+        })
+        .unwrap();
+    let want: Vec<(i64, String, String)> =
+        EVENTS.iter().zip(&f.hashes).map(|(e, h)| (e.rowid, e.ulid.to_string(), h.clone())).collect();
+    assert_eq!(rows, want);
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3, "{tl:?}");
+
+    // Through the governed tool path as well.
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
+    let v: Value = builtin_registry().call(&hub, &operator(), "event_log_verify", json!({})).await.unwrap();
+    assert_eq!(v["ok"], json!(true), "{v}");
+    assert_eq!(v["checked"], json!(3));
+
+    // New native events chain onto the imported head.
+    db.write(|tx| ledger::append(tx, EventInput::new("agent.test.after_import", json!({})).by("tester")))
+        .unwrap();
+    let after = db.read(ledger::verify).unwrap();
+    assert!(after.ok && after.checked == 4, "{after:?}");
+
+    // Unmapped columns are reported, with how many values they held.
+    assert_eq!(r.unmapped_columns["tasks"]["org_id"], 1);
+    assert!(r.unmapped_tables.contains(&"zulip_cursors".to_string()));
+    assert!(r.unmapped_tables.contains(&"memory_embeddings".to_string()));
+    assert!(r.derived_tables.contains(&"memory_fts".to_string()));
+}
+
+#[test]
+fn rerun_is_idempotent_and_resumes_from_the_last_key() {
+    let f = fixture();
+    let db = target();
+    // Batches of one row exercise the per-batch progress records.
+    let opts = Options { batch_size: 1 };
+    ua_import::import(&db, &f.path, &opts).unwrap();
+    let snapshot = |db: &Db| {
+        ["tasks", "memory", "event_log", "approvals", "agent_tokens", "message_index"]
+            .map(|t| n(db, &format!("SELECT COUNT(*) FROM {t}")))
+    };
+    let first = snapshot(&db);
+
+    let again = ua_import::import(&db, &f.path, &opts).unwrap();
+    assert_eq!(snapshot(&db), first);
+    assert!(again.tables.iter().all(|t| t.copied == 0), "{:?}", again.tables);
+    let ev = table(&again, "event_log");
+    assert_eq!((ev.already_imported, ev.total_copied, ev.last_key), (3, 3, 7));
+    assert_eq!(table(&again, "approvals").total_skipped, 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM import_runs WHERE table_name = 'event_log' AND last_key = 7"), 1);
+
+    // The source grows (the Python hub kept running): only new rows move.
+    let c = Connection::open(&f.path).unwrap();
+    c.execute(
+        "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (5, 'Added later', ?1, ?1)",
+        [T0],
+    )
+    .unwrap();
+    let e4 = PyEvent {
+        rowid: 8,
+        ulid: "01J0000000000000000000003",
+        channel: "agent.task.created",
+        payload: "{\"id\": 5}",
+        originator: Some("agent-2"),
+        episode_id: None,
+        created_at: "2026-01-01T00:00:03+00:00",
+        dedupe_key: None,
+    };
+    insert_event(&c, &e4, Some(&f.hashes[2]));
+    drop(c);
+
+    let third = ua_import::import(&db, &f.path, &opts).unwrap();
+    assert_eq!(table(&third, "tasks").copied, 1);
+    assert_eq!(table(&third, "event_log").copied, 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 5);
+    let tl = third.target_ledger.unwrap();
+    assert!(tl.ok && tl.checked == 4, "{tl:?}");
+}
+
+#[test]
+fn a_target_with_its_own_events_refuses_the_ledger() {
+    let f = fixture();
+    let db = target();
+    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("interleave"), "{err:#}");
+}
+
+#[test]
+fn dry_run_reports_without_writing() {
+    let f = fixture();
+    let before = file_sha(&f.path);
+    let r = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(file_sha(&f.path), before);
+    assert!(r.dry_run && r.target_ledger.is_none());
+    assert_eq!(table(&r, "tasks").source_rows, 4);
+    assert_eq!(table(&r, "tasks").copied, 4);
+    assert_eq!(table(&r, "approvals").copied, 2);
+    assert_eq!(table(&r, "approvals").skipped.get("live_approval"), Some(&2));
+    assert_eq!(table(&r, "agent_tokens").skipped.get("unsupported_token_hash"), Some(&1));
+    assert_eq!(table(&r, "event_log").copied, 3);
+    assert!(r.source_ledger.ok && r.source_ledger.checked == 3, "{:?}", r.source_ledger);
+    assert_eq!(r.unmapped_tables, ["memory_embeddings", "zulip_cursors"]);
+    assert!(r.derived_tables.iter().all(|t| t.starts_with("memory_fts")), "{:?}", r.derived_tables);
+    assert_eq!(r.unmapped_columns["agent_tokens"].keys().collect::<Vec<_>>(), ["agent_kind", "org_id"]);
+    assert_eq!(r.unmapped_columns["tasks"]["org_id"], 1);
+}
+
+#[test]
+fn a_tampered_ledger_row_stops_the_import_before_any_write() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute(
+        "UPDATE event_log SET payload = '{\"message_id\": \"m1\", \"body\": \"forged\"}' WHERE rowid = 6",
+        [],
+    )
+    .unwrap();
+    drop(c);
+
+    let dry = ua_import::dry_run(&f.path).unwrap();
+    assert!(!dry.source_ledger.ok);
+    assert_eq!(dry.source_ledger.first_bad_seq, Some(6));
+
+    let db = target();
+    let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("seq 6") && msg.contains("entry_hash"), "{msg}");
+    for t in ["tasks", "memory", "event_log", "import_runs"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t}")), 0, "{t} must stay empty");
+    }
+}
+
+#[test]
+fn a_hashed_value_that_is_not_text_is_refused() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    // A BLOB keeps its storage class even in a TEXT column. Its hash input is
+    // not defined by the text encoding, so the importer refuses to guess.
+    c.execute("UPDATE event_log SET channel = CAST(channel AS BLOB) WHERE rowid = 7", []).unwrap();
+    drop(c);
+    let err = ua_import::import(&target(), &f.path, &Options::default()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("seq 7") && msg.contains("byte-exactly"), "{msg}");
+}
+
+#[test]
+fn a_missing_source_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = ua_import::dry_run(&dir.path().join("absent.db")).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
+}
