@@ -185,11 +185,11 @@ fn digest(v: &Vault, a: DigestArgs, conn: &rusqlite::Connection) -> UaResult<Val
         counts.insert(source.clone(), json!(entries.len()));
         for mut e in entries {
             e["source"] = json!(source);
-            if let Some(k) = dedup_key(e["text"].as_str().unwrap_or("")) {
-                if !seen.insert(k) {
-                    deduped += 1;
-                    continue;
-                }
+            if let Some(k) = dedup_key(e["text"].as_str().unwrap_or(""))
+                && !seen.insert(k)
+            {
+                deduped += 1;
+                continue;
             }
             merged.push(e);
         }

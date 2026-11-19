@@ -247,6 +247,7 @@ impl Written {
 
 /// The shared write path: lock guard, revision check and the write, all
 /// under the note lock. `mode` is `overwrite`, `append` or `create`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_note(
     v: &Vault,
     shown: &str,
