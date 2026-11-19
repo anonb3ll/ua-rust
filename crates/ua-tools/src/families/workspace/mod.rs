@@ -16,6 +16,8 @@ mod fs;
 mod git;
 mod shell;
 
+pub use shell::sweep_run_homes;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};

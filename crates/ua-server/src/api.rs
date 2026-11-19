@@ -4,7 +4,7 @@
 //! - `GET  /api/whoami`              the verified caller and profile
 //! - `GET  /api/tools`               tools visible to the caller
 //! - `POST /api/tools/{name}`        call a tool with a JSON arguments body
-//! - `GET  /api/events/stream`       ledger events as server-sent events
+//! - `GET  /api/events/stream`       ledger events as server-sent events (scoped, resumable)
 
 use std::convert::Infallible;
 
@@ -14,14 +14,16 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use futures::Stream;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::UaError;
 use ua_core::identity::Transport;
+use ua_tools::families::events::EventScope;
 
 use crate::AppState;
 use crate::auth::{AuthIdentity, caller_for, session_key};
+use crate::events::{self, StreamItem};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -103,27 +105,36 @@ async fn call_tool(
 #[derive(Deserialize)]
 struct StreamQuery {
     channel_prefix: Option<String>,
+    /// Resume after this seq when no `Last-Event-ID` header is sent.
+    after_seq: Option<i64>,
 }
 
+/// Ledger events as server-sent events: event name = channel, id = seq,
+/// data = the event as JSON. A `gap` event names a range that may be
+/// missing. Scoped and resumable as described in [`crate::events`].
 async fn event_stream(
     State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
     Query(q): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let rx = state.hub.db().subscribe();
-    let prefix = q.channel_prefix.unwrap_or_default();
-    let stream = futures::stream::unfold((rx, prefix), |(mut rx, prefix)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) if ev.channel.starts_with(&prefix) => {
-                    let data = serde_json::to_string(&ev).unwrap_or_default();
-                    let sse = SseEvent::default().event(ev.channel.clone()).id(ev.seq.to_string()).data(data);
-                    return Some((Ok(sse), (rx, prefix)));
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return None,
-            }
+) -> Response {
+    let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
+    let scope = EventScope { channels: None, channel_prefix: q.channel_prefix.filter(|p| !p.is_empty()) };
+    let resume = events::resume_point(&headers, q.after_seq);
+    match events::open(&state, &caller, scope, resume).await {
+        Ok(stream) => Sse::new(stream.map(sse_json)).keep_alive(KeepAlive::default()).into_response(),
+        Err(e) => (status_for(&e), Json(e.to_json())).into_response(),
+    }
+}
+
+fn sse_json(item: StreamItem) -> Result<SseEvent, Infallible> {
+    Ok(match item {
+        StreamItem::Event(ev) => {
+            let data = serde_json::to_string(&ev).unwrap_or_default();
+            SseEvent::default().event(ev.channel.clone()).id(ev.seq.to_string()).data(data)
         }
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+        StreamItem::Gap { after_seq, until_seq, reason } => SseEvent::default()
+            .event("gap")
+            .data(StreamItem::gap_json(after_seq, until_seq, reason).to_string()),
+    })
 }

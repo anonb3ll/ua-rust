@@ -137,6 +137,9 @@ fn may(caller: &Caller, tool: &str) -> bool {
     !caller.enforce_profile || caller.profile.allows_tool(tool)
 }
 
+/// The one "is this a human approver" rule for the compatibility API: a
+/// verified identity of kind human. `approval_detail` reports what
+/// `action_approval` will actually allow, so both use this.
 fn is_human(id: &AuthIdentity) -> bool {
     id.verified && id.kind == ActorKind::Human
 }
@@ -566,7 +569,7 @@ async fn approval_detail(
         "revoked" => "revoked",
         _ => "none",
     };
-    let human = caller.kind == ActorKind::Human || cfg.is_human(&caller.label);
+    let human = is_human(&id);
     let (may_approve, why) = if row.status != "pending" {
         ("no", format!("approval is {}", row.status))
     } else if !human {
