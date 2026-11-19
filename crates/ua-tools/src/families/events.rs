@@ -49,7 +49,7 @@ impl EventScope {
     /// [`ledger::query`]: an empty channel list does not filter.
     pub fn matches(&self, ev: &Event) -> bool {
         let listed = match self.channels.as_ref().filter(|c| !c.is_empty()) {
-            Some(chs) => chs.iter().any(|c| *c == ev.channel),
+            Some(chs) => chs.contains(&ev.channel),
             None => true,
         };
         listed && self.channel_prefix.as_deref().is_none_or(|p| ev.channel.starts_with(p))
