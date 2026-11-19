@@ -5,7 +5,9 @@
 
 pub mod api;
 pub mod auth;
+pub mod login;
 pub mod mcp;
+pub mod oauth;
 
 use std::sync::Arc;
 
@@ -31,6 +33,8 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
     Router::new()
         .nest_service("/mcp", mcp)
         .merge(api::routes())
+        .merge(oauth::routes())
+        .merge(login::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

@@ -76,6 +76,44 @@ pub struct Config {
     pub embed_model: String,
     /// Edition: `full` (default) or `core`, which hides ledger features.
     pub edition: String,
+    /// Public base URL of the hub, e.g. `https://hub.example.com`. It is the
+    /// OAuth issuer, the passkey origin and the base of login links. Defaults
+    /// to `http://<bind>`.
+    pub public_url: Option<String>,
+    /// Run the OAuth 2.1 authorization server for remote MCP clients.
+    pub oauth_enabled: bool,
+    /// Accept RFC 7591 dynamic client registration at `/oauth/register`.
+    pub oauth_dcr_enabled: bool,
+    /// Accept URL client ids (Client ID Metadata Documents). The hub then
+    /// fetches public HTTPS URLs on behalf of unauthenticated `/oauth/authorize` calls.
+    pub oauth_cimd_enabled: bool,
+    /// Hosts whose client metadata documents may be fetched (a leading `.`
+    /// admits subdomains). Empty admits any public host.
+    #[serde(deserialize_with = "string_or_list")]
+    pub oauth_cimd_allow: Vec<String>,
+    /// Identities a human may bind an OAuth grant to on the consent page.
+    /// The first one is preselected. Human identities are never allowed.
+    #[serde(deserialize_with = "string_or_list")]
+    pub oauth_identities: Vec<String>,
+    /// Default profile for OAuth identities without an entry in `profiles`.
+    pub oauth_profile: String,
+    /// Access token lifetime in seconds.
+    pub oauth_access_ttl_secs: u64,
+    /// Refresh token lifetime in days.
+    pub oauth_refresh_ttl_days: u64,
+    /// Confidential clients for the `client_credentials` grant:
+    /// `client_id|secret|identity` entries separated by commas or newlines.
+    #[serde(skip_serializing)]
+    pub oauth_client_credentials: Option<SecretString>,
+    /// Send the browser session cookie with `Secure`. Turn off only for plain
+    /// `http://localhost` development.
+    pub ui_cookie_secure: bool,
+    /// Browser session lifetime in hours.
+    pub ui_session_ttl_hours: u64,
+    /// Lifetime of a `ua login-link` URL in seconds.
+    pub login_link_ttl_secs: u64,
+    /// WebAuthn relying-party id. Defaults to the host of `public_url`.
+    pub webauthn_rp_id: Option<String>,
 }
 
 impl Default for Config {
@@ -100,6 +138,20 @@ impl Default for Config {
             agent_workspaces: BTreeMap::new(),
             embed_model: "BAAI/bge-small-en-v1.5".into(),
             edition: "full".into(),
+            public_url: None,
+            oauth_enabled: false,
+            oauth_dcr_enabled: true,
+            oauth_cimd_enabled: false,
+            oauth_cimd_allow: Vec::new(),
+            oauth_identities: vec!["remote-agent".into()],
+            oauth_profile: "public".into(),
+            oauth_access_ttl_secs: 3600,
+            oauth_refresh_ttl_days: 30,
+            oauth_client_credentials: None,
+            ui_cookie_secure: true,
+            ui_session_ttl_hours: 12,
+            login_link_ttl_secs: 600,
+            webauthn_rp_id: None,
         }
     }
 }
@@ -158,7 +210,45 @@ impl Config {
         self.workspace = self.workspace.map(|p| expand_tilde(&p));
         self.vault_path = self.vault_path.map(|p| expand_tilde(&p));
         self.read_roots = self.read_roots.iter().map(|p| expand_tilde(p)).collect();
+        self.public_url = self.public_url.map(|u| u.trim().trim_end_matches('/').to_string());
+        self.apply_oauth_profiles();
         self
+    }
+
+    /// Give every OAuth identity without an explicit `profiles` entry the
+    /// `oauth_profile`, so a remote grant never falls back to the broad default.
+    pub fn apply_oauth_profiles(&mut self) {
+        for label in &self.oauth_identities {
+            self.profiles.entry(label.clone()).or_insert_with(|| self.oauth_profile.clone());
+        }
+    }
+
+    /// The hub's public base URL, without a trailing slash.
+    pub fn public_base_url(&self) -> String {
+        match &self.public_url {
+            Some(u) if !u.trim().is_empty() => u.trim().trim_end_matches('/').to_string(),
+            _ => format!("http://{}", self.bind),
+        }
+    }
+
+    /// Parse `oauth_client_credentials` into `(client_id, secret, identity)`.
+    /// A client id listed twice is dropped entirely (fail closed).
+    pub fn oauth_client_credentials(&self) -> Vec<(String, SecretString, String)> {
+        let Some(raw) = &self.oauth_client_credentials else { return Vec::new() };
+        let rows: Vec<(String, String, String)> = raw
+            .expose_secret()
+            .split([',', '\n'])
+            .filter_map(|e| {
+                let mut it = e.trim().splitn(3, '|');
+                let (id, secret, label) = (it.next()?.trim(), it.next()?.trim(), it.next()?.trim());
+                (!id.is_empty() && !secret.is_empty() && !label.is_empty())
+                    .then(|| (id.to_string(), secret.to_string(), label.to_string()))
+            })
+            .collect();
+        rows.iter()
+            .filter(|(id, _, _)| rows.iter().filter(|(other, _, _)| other == id).count() == 1)
+            .map(|(id, secret, label)| (id.clone(), SecretString::from(secret.clone()), label.clone()))
+            .collect()
     }
 
     /// A config rooted in `home`, for tests and embedded use.

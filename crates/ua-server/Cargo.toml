@@ -26,3 +26,16 @@ subtle.workspace = true
 secrecy.workspace = true
 rusqlite.workspace = true
 rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+jiff.workspace = true
+rand.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+url = "2.5"
+axum-extra = { version = "0.12", features = ["cookie-private"] }
+webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
