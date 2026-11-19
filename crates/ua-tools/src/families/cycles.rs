@@ -1074,7 +1074,7 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
     let Some((program, args)) = cfg.cycle_validation_command.split_first() else {
         return no(reasons, "no validation gates configured (cycle_validation_command)");
     };
-    let home = match crate::families::workspace::ScratchHome::new(&cfg.home) {
+    let home = match crate::families::workspace::ScratchHome::new() {
         Ok(h) => h,
         Err(e) => return no(reasons, format!("validation gates could not start: {e}")),
     };

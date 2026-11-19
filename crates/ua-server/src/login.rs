@@ -249,6 +249,51 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response {
 
 // ---------------------------------------------------------------- passkeys
 
+/// Whether `url` is an origin browsers treat as potentially trustworthy
+/// without TLS: `http://localhost` (and `*.localhost`) or a loopback address.
+fn is_loopback_origin(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// A startup warning when browser sign-in cannot work at the effective
+/// public origin: plain `http://` on a non-loopback host while the session
+/// cookie is `Secure` (browsers drop it) or passkeys are usable (WebAuthn
+/// needs a secure context). `None` when the origin is fine.
+///
+/// `ua serve` warns rather than refuses: bearer-token clients on `/mcp` and
+/// `/api` still work over plain HTTP on a trusted network.
+pub fn insecure_origin_warning(cfg: &ua_core::Config) -> Option<String> {
+    let origin = url::Url::parse(&cfg.public_base_url()).ok()?;
+    if origin.scheme() != "http" || is_loopback_origin(&origin) {
+        return None;
+    }
+    let mut broken = Vec::new();
+    if cfg.ui_cookie_secure {
+        broken.push("browsers drop the Secure session cookie on http://, so sign-in bounces back to /login");
+    }
+    if !cfg.human_identities.is_empty() {
+        broken.push("passkeys need a secure context (https:// or localhost)");
+    }
+    if broken.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the public origin {} is plain http on a non-loopback host: {}. Serve the hub over HTTPS \
+         (for example `tailscale serve`, which is tailnet-only, or another TLS terminator) and set \
+         public_url to the https:// address; see docs/auth.md",
+        origin.origin().ascii_serialization(),
+        broken.join("; ")
+    ))
+}
+
 fn webauthn(state: &AppState) -> Result<Webauthn, String> {
     let cfg = state.hub.cfg();
     let origin = Url::parse(&cfg.public_base_url()).map_err(|e| format!("public_url is not a URL: {e}"))?;
@@ -738,5 +783,28 @@ mod tests {
         assert_eq!(safe_next(Some("https://evil.example.com")), "/ui");
         assert_eq!(safe_next(Some("/\\evil.example.com")), "/ui");
         assert_eq!(safe_next(None), "/ui");
+    }
+
+    #[test]
+    fn plain_http_remote_origin_is_flagged() {
+        let mut cfg = ua_core::Config::for_home(std::env::temp_dir());
+        cfg.human_identities = vec!["operator".into()];
+        // Default: http://127.0.0.1:8765 is loopback, a secure context.
+        assert!(insecure_origin_warning(&cfg).is_none());
+        for ok in ["http://localhost:8765", "http://[::1]:8765", "https://hub.example.com"] {
+            cfg.public_url = Some(ok.into());
+            assert!(insecure_origin_warning(&cfg).is_none(), "{ok}");
+        }
+        cfg.public_url = Some("http://hub.example.com".into());
+        let w = insecure_origin_warning(&cfg).expect("warns");
+        assert!(w.contains("Secure session cookie") && w.contains("passkeys"), "{w}");
+        // Bound to every interface without a public_url: http://0.0.0.0:8765.
+        cfg.public_url = None;
+        cfg.bind = "0.0.0.0:8765".parse().unwrap();
+        assert!(insecure_origin_warning(&cfg).is_some());
+        // Nothing browser-facing is on: no warning.
+        cfg.ui_cookie_secure = false;
+        cfg.human_identities.clear();
+        assert!(insecure_origin_warning(&cfg).is_none());
     }
 }

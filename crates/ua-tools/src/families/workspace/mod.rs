@@ -17,6 +17,7 @@ mod git;
 mod shell;
 
 pub(crate) use shell::ScratchHome;
+pub use shell::sweep_run_homes;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
