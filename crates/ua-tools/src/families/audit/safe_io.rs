@@ -68,6 +68,9 @@ fn nofollow_flags(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
+/// The message of the hard-link refusal, so callers can name the cause.
+pub const HARDLINK_MSG: &str = "file has more than one hard link";
+
 fn refuse() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
 }
@@ -107,10 +110,7 @@ pub fn replace_regular_text(
     {
         use std::os::unix::fs::MetadataExt;
         if meta.nlink() > 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file has more than one hard link",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, HARDLINK_MSG));
         }
     }
     let mut buf = Vec::new();
@@ -162,14 +162,19 @@ pub fn replace_regular_text(
             }
         }
         std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        File::open(dir)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result.map(|()| true);
     }
-    result.map(|()| true)
+    // The file is already replaced: a failing directory sync must not report
+    // the change as not applied (the caller would leave it out of the ledger).
+    #[cfg(unix)]
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(kind = ?e.kind(), "audit: replaced file but the directory sync failed");
+    }
+    Ok(true)
 }
 
 /// The whole file as strictly valid UTF-8, read from one descriptor that never

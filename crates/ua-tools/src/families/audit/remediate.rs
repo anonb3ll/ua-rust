@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::rules::Finding;
-use super::safe_io::{create_regular_text, read_regular_text_strict, replace_regular_text};
+use super::safe_io::{HARDLINK_MSG, create_regular_text, read_regular_text_strict, replace_regular_text};
 use crate::families::injection::hidden_char_regex;
 
 const DEFAULT_GITIGNORE: &str = "# Default .gitignore created by audit auto-remediation
@@ -92,34 +92,55 @@ pub enum Mode<'a> {
     Apply(&'a [Change]),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Read,
+    Write,
+}
+
+/// Turn an I/O error into one with a fixed phrase that names the cause and
+/// carries no path or content.
+fn cause(e: std::io::Error, phase: Phase) -> std::io::Error {
+    use std::io::ErrorKind as K;
+    if e.kind() == K::InvalidInput && e.to_string() == HARDLINK_MSG {
+        return io_err("file has more than one hard link");
+    }
+    let os = e.raw_os_error();
+    match e.kind() {
+        K::InvalidData => e,
+        K::AlreadyExists => io_err("file already exists"),
+        K::StorageFull | K::QuotaExceeded => io_err("no space left on the device"),
+        K::PermissionDenied | K::ReadOnlyFilesystem => io_err("permission denied"),
+        K::InvalidInput | K::NotFound => io_err("not a readable regular file"),
+        _ if os.is_some() => match phase {
+            Phase::Read => io_err("not a readable regular file"),
+            Phase::Write => io_err("could not write the file"),
+        },
+        _ => e,
+    }
+}
+
+/// A file this run creates or rewrites, held in memory until the commit.
+struct Entry {
+    text: String,
+    /// Hash of the file as first read; `None` when it is created.
+    before: Option<String>,
+    descriptions: Vec<String>,
+}
+
 struct Fixer<'a> {
     root: &'a Path,
-    mode: Mode<'a>,
-    /// Content of files this run has already planned or written.
-    overlay: BTreeMap<String, String>,
-    changes: BTreeMap<String, Change>,
+    /// Final content of every file the fixers changed or created.
+    overlay: BTreeMap<String, Entry>,
 }
 
 impl Fixer<'_> {
-    fn exists(&self, rel: &str) -> bool {
-        self.overlay.contains_key(rel) || std::fs::symlink_metadata(self.root.join(rel)).is_ok()
+    fn new(root: &Path) -> Fixer<'_> {
+        Fixer { root, overlay: BTreeMap::new() }
     }
 
-    fn record(&mut self, rel: &str, before: Option<String>, new: &str, description: String) {
-        let before = match self.changes.get(rel) {
-            Some(first) => first.sha256_before.clone(),
-            None => before,
-        };
-        self.overlay.insert(rel.to_string(), new.to_string());
-        self.changes.insert(
-            rel.to_string(),
-            Change {
-                path: rel.to_string(),
-                sha256_before: before,
-                sha256_after: sha(new.as_bytes()),
-                description,
-            },
-        );
+    fn exists(&self, rel: &str) -> bool {
+        self.overlay.contains_key(rel) || std::fs::symlink_metadata(self.root.join(rel)).is_ok()
     }
 
     /// Create `rel` with `text`; it must not exist.
@@ -128,111 +149,75 @@ impl Fixer<'_> {
             return Ok(()); // an earlier fix in this run already created it
         }
         if self.exists(rel) {
-            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "file already exists"));
+            return Err(io_err("file already exists"));
         }
-        if let Mode::Apply(expected) = &self.mode {
-            let after = sha(text.as_bytes());
-            if !expected.iter().any(|c| c.path == rel && c.sha256_before.is_none() && c.sha256_after == after)
-            {
-                return Err(io_err("the change differs from the approved plan"));
-            }
-            create_regular_text(&self.root.join(rel), text)?;
-        }
-        self.record(rel, None, text, description.to_string());
+        self.overlay.insert(
+            rel.to_string(),
+            Entry { text: text.to_string(), before: None, descriptions: vec![description.to_string()] },
+        );
         Ok(())
     }
 
     /// Replace `rel` with what `f` makes of its current text (`None` = leave
-    /// it alone). The file is read once, strictly as UTF-8; in apply mode the
-    /// same bytes are checked against the approved plan before the temp file
-    /// is renamed over it.
+    /// it alone). The file is read once, strictly as UTF-8, on first touch;
+    /// later fixes work on the in-memory text.
     fn modify(&mut self, rel: &str, f: impl FnOnce(&str) -> Option<(String, String)>) -> std::io::Result<()> {
-        let path = self.root.join(rel);
-        let ours = self.overlay.get(rel).cloned();
-        if let (Mode::Apply(expected), Some(ours)) = (&self.mode, ours.as_ref()) {
-            // A file this run already wrote: the disk must still hold our
-            // output, and the final bytes must match the approved plan.
-            let first_before = self.changes.get(rel).and_then(|c| c.sha256_before.clone());
-            let our_hash = sha(ours.as_bytes());
-            let mut done: Option<(String, String)> = None;
-            replace_regular_text(&path, |bytes| {
-                if sha(bytes) != our_hash {
-                    return Err(io_err("file changed since the plan was approved"));
-                }
-                let Some((new, desc)) = f(ours) else { return Ok(None) };
-                let after = sha(new.as_bytes());
-                if !expected
-                    .iter()
-                    .any(|c| c.path == rel && c.sha256_before == first_before && c.sha256_after == after)
-                {
-                    return Err(io_err("the change differs from the approved plan"));
-                }
-                done = Some((new.clone(), desc));
-                Ok(Some(new))
-            })
-            .map_err(|e| {
-                if e.raw_os_error().is_some() || e.kind() == std::io::ErrorKind::NotFound {
-                    io_err("not a readable regular file")
-                } else {
-                    e
-                }
-            })?;
-            if let Some((new, desc)) = done {
-                self.record(rel, None, &new, desc);
+        let (cur, before) = match self.overlay.get(rel) {
+            Some(e) => (e.text.clone(), e.before.clone()),
+            None => {
+                let (t, bytes) =
+                    read_regular_text_strict(&self.root.join(rel)).map_err(|e| cause(e, Phase::Read))?;
+                (t, Some(sha(&bytes)))
             }
-            return Ok(());
+        };
+        let Some((new, desc)) = f(&cur) else { return Ok(()) };
+        let entry = self.overlay.entry(rel.to_string()).or_insert_with(|| Entry {
+            text: String::new(),
+            before,
+            descriptions: Vec::new(),
+        });
+        entry.text = new;
+        entry.descriptions.push(desc);
+        Ok(())
+    }
+
+    fn change(rel: &str, e: &Entry) -> Change {
+        Change {
+            path: rel.to_string(),
+            sha256_before: e.before.clone(),
+            sha256_after: sha(e.text.as_bytes()),
+            description: e.descriptions.join("; "),
         }
-        if matches!(self.mode, Mode::Plan) {
-            // Plan mode: nothing is written.
-            let (cur, before) = match ours {
-                Some(t) => (t, None),
-                None => {
-                    let (t, bytes) = read_regular_text_strict(&path).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::InvalidData {
-                            e
-                        } else {
-                            io_err("not a readable regular file")
-                        }
-                    })?;
-                    (t, Some(sha(&bytes)))
-                }
-            };
-            if let Some((new, desc)) = f(&cur) {
-                self.record(rel, before, &new, desc);
-            }
-            return Ok(());
+    }
+
+    /// The path's (first before, final after) must be exactly an approved change.
+    fn check_plan(rel: &str, e: &Entry, expected: &[Change]) -> std::io::Result<()> {
+        let after = sha(e.text.as_bytes());
+        let same_before = |c: &&Change| c.path == rel && c.sha256_before == e.before;
+        if e.before.is_some() && !expected.iter().any(|c| same_before(&c)) {
+            return Err(io_err("file changed since the plan was approved"));
         }
-        let Mode::Apply(expected) = self.mode else { return Ok(()) };
-        let mut done: Option<(Option<String>, String, String)> = None;
-        replace_regular_text(&path, |bytes| {
-            let before = sha(bytes);
-            let cur = std::str::from_utf8(bytes)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
-            let Some((new, desc)) = f(cur) else { return Ok(None) };
-            let Some(approved) =
-                expected.iter().find(|c| c.path == rel && c.sha256_before.as_deref() == Some(&before))
-            else {
-                return Err(io_err("file changed since the plan was approved"));
-            };
-            if approved.sha256_after != sha(new.as_bytes()) {
-                return Err(io_err("the change differs from the approved plan"));
-            }
-            done = Some((Some(before), new.clone(), desc));
-            Ok(Some(new))
-        })
-        .map_err(|e| {
-            if matches!(e.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound)
-                || e.raw_os_error().is_some()
-            {
-                io_err("not a readable regular file")
-            } else {
-                e
-            }
-        })?;
-        if let Some((before, new, desc)) = done {
-            self.record(rel, before, &new, desc);
+        if !expected.iter().any(|c| same_before(&c) && c.sha256_after == after) {
+            return Err(io_err("the change differs from the approved plan"));
         }
         Ok(())
+    }
+
+    /// One create or one replace for `rel`, checked against the plan.
+    fn commit(&self, rel: &str, e: &Entry, expected: &[Change]) -> std::io::Result<()> {
+        Self::check_plan(rel, e, expected)?;
+        let path = self.root.join(rel);
+        match &e.before {
+            None => create_regular_text(&path, &e.text).map_err(|e| cause(e, Phase::Write)),
+            Some(before) => replace_regular_text(&path, |bytes| {
+                if &sha(bytes) != before {
+                    return Err(io_err("file changed since the plan was approved"));
+                }
+                Ok(Some(e.text.clone()))
+            })
+            .map(|_| ())
+            .map_err(|e| cause(e, Phase::Write)),
+        }
     }
 }
 
@@ -252,11 +237,19 @@ fn strip_description(original: &str) -> String {
 /// Apply (or, in `Mode::Plan`, only plan) the safe fixes. Returns the files
 /// changed, sorted by path.
 pub fn remediate_findings(root: &Path, findings: &mut [Finding], mode: Mode<'_>) -> Vec<Change> {
-    let mut fx = Fixer { root, mode, overlay: BTreeMap::new(), changes: BTreeMap::new() };
-    for fd in findings.iter_mut() {
+    let mut fx = Fixer::new(root);
+    // (finding index, file it depends on, message before the fix note)
+    let mut fixed_by: Vec<(usize, String, String)> = Vec::new();
+    for (idx, fd) in findings.iter_mut().enumerate() {
         if fd.fixed {
             continue;
         }
+        let orig = fd.message.clone();
+        let target: &str = match fd.rule.as_str() {
+            "HYGIENE-NO-GITIGNORE" | "SECRETS-ENV-EXPOSED" => ".gitignore",
+            "AGENT-NO-INSTRUCTIONS" => "CLAUDE.md",
+            _ => "",
+        };
         match fd.rule.as_str() {
             "HYGIENE-NO-GITIGNORE" => {
                 match fx.create(".gitignore", DEFAULT_GITIGNORE, "create default .gitignore") {
@@ -326,8 +319,44 @@ pub fn remediate_findings(root: &Path, findings: &mut [Finding], mode: Mode<'_>)
             }
             _ => {}
         }
+        if fd.fixed {
+            let rel =
+                if target.is_empty() { fd.path.clone().unwrap_or_default() } else { target.to_string() };
+            fixed_by.push((idx, rel, orig));
+        }
     }
-    fx.changes.into_values().collect()
+    let Mode::Apply(expected) = mode else {
+        return fx.overlay.iter().map(|(rel, e)| Fixer::change(rel, e)).collect();
+    };
+    // Every approved change is checked before the first write, then each file
+    // is created or replaced exactly once.
+    let mut failed: BTreeMap<String, std::io::Error> = BTreeMap::new();
+    for (rel, e) in &fx.overlay {
+        if let Err(err) = Fixer::check_plan(rel, e, expected) {
+            failed.insert(rel.clone(), err);
+        }
+    }
+    let mut done = Vec::new();
+    for (rel, e) in &fx.overlay {
+        if failed.contains_key(rel) {
+            continue;
+        }
+        match fx.commit(rel, e, expected) {
+            Ok(()) => done.push(Fixer::change(rel, e)),
+            Err(err) => {
+                failed.insert(rel.clone(), err);
+            }
+        }
+    }
+    for (idx, rel, orig) in fixed_by {
+        if let Some(err) = failed.get(&rel) {
+            let fd = &mut findings[idx];
+            fd.fixed = false;
+            fd.message = orig;
+            fail(fd, "Failed to apply the fix", err);
+        }
+    }
+    done
 }
 
 #[cfg(test)]
@@ -399,25 +428,94 @@ mod tests {
         let mut fs = [mk("AGENTS.md"), mk("AGENTS.md")];
         assert_eq!(remediate_findings(dir.path(), &mut fs, Mode::Apply(&plan)).len(), 1);
         assert_eq!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "ab\n");
+    }
 
-        // Overlay with a tampered plan: the second write must not slip through.
-        let mut fx = Fixer {
-            root: dir.path(),
-            mode: Mode::Apply(&plan),
-            overlay: BTreeMap::new(),
-            changes: BTreeMap::new(),
+    /// Two distinct edits to one file in one run: one write, checked against
+    /// (first before, final after).
+    #[test]
+    fn two_edits_to_one_file_plan_and_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        std::fs::write(&gi, "target/\n").unwrap();
+        let edits = |fx: &mut Fixer<'_>| {
+            fx.modify(".gitignore", |c| Some((format!("{c}one\n"), "add one".into()))).unwrap();
+            fx.modify(".gitignore", |c| Some((format!("{c}two\n"), "add two".into()))).unwrap();
         };
-        std::fs::write(&gi, "x\n").unwrap();
-        fx.record(".gitignore", None, "x\n", "d".into());
-        // Disk drifted from our output.
-        std::fs::write(&gi, "drift\n").unwrap();
-        let err = fx.modify(".gitignore", |c| Some((format!("{c}y"), "d".into()))).unwrap_err();
-        assert!(err.to_string().contains("changed"), "{err}");
-        // Disk matches, but the result is not in the plan.
-        std::fs::write(&gi, "x\n").unwrap();
-        let err = fx.modify(".gitignore", |c| Some((format!("{c}y"), "d".into()))).unwrap_err();
+        let mut fx = Fixer::new(dir.path());
+        edits(&mut fx);
+        let plan: Vec<Change> = fx.overlay.iter().map(|(r, e)| Fixer::change(r, e)).collect();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].description, "add one; add two");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "target/\n", "planning writes nothing");
+
+        let mut fx = Fixer::new(dir.path());
+        edits(&mut fx);
+        for (rel, e) in &fx.overlay {
+            fx.commit(rel, e, &plan).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "target/\none\ntwo\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // A plan for only the first edit does not cover the combined result.
+        std::fs::write(&gi, "target/\n").unwrap();
+        let mut fx = Fixer::new(dir.path());
+        edits(&mut fx);
+        let mut partial = plan.clone();
+        partial[0].sha256_after = sha(b"target/\none\n");
+        let (rel, e) = fx.overlay.iter().next().unwrap();
+        let err = fx.commit(rel, e, &partial).unwrap_err();
         assert!(err.to_string().contains("approved plan"), "{err}");
-        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "x\n");
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "target/\n");
+    }
+
+    #[test]
+    fn create_then_append_in_one_run_is_one_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |mode: Mode<'_>| {
+            let mut fx = Fixer::new(dir.path());
+            fx.create(".gitignore", "a\n", "create").unwrap();
+            fx.modify(".gitignore", |c| Some((format!("{c}b\n"), "append".into()))).unwrap();
+            let plan: Vec<Change> = fx.overlay.iter().map(|(r, e)| Fixer::change(r, e)).collect();
+            if let Mode::Apply(exp) = mode {
+                for (rel, e) in &fx.overlay {
+                    fx.commit(rel, e, exp).unwrap();
+                }
+            }
+            plan
+        };
+        let plan = run(Mode::Plan);
+        assert_eq!(plan[0].sha256_before, None);
+        run(Mode::Apply(&plan));
+        assert_eq!(std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(), "a\nb\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_target_names_its_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("AGENTS.md");
+        std::fs::write(&f, "a\u{200b}b\n").unwrap();
+        std::fs::hard_link(&f, dir.path().join("other.md")).unwrap();
+        let mk = || {
+            let mut fd = finding("AGENT-HIDDEN-UNICODE");
+            fd.path = Some("AGENTS.md".into());
+            fd
+        };
+        let mut fs = [mk()];
+        let plan = remediate_findings(dir.path(), &mut fs, Mode::Plan);
+        assert!(plan.is_empty(), "a hardlinked file cannot be planned");
+        assert!(fs[0].message.contains("more than one hard link"), "{}", fs[0].message);
+    }
+
+    #[test]
+    fn io_causes_have_fixed_phrases() {
+        use std::io::{Error, ErrorKind as K};
+        let msg = |e: Error, p| cause(e, p).to_string();
+        assert_eq!(msg(Error::from_raw_os_error(28), Phase::Write), "no space left on the device");
+        assert_eq!(msg(Error::from_raw_os_error(13), Phase::Write), "permission denied");
+        assert_eq!(msg(Error::from_raw_os_error(5), Phase::Write), "could not write the file");
+        assert_eq!(msg(Error::from_raw_os_error(5), Phase::Read), "not a readable regular file");
+        assert_eq!(msg(Error::from(K::NotFound), Phase::Read), "not a readable regular file");
     }
 
     #[test]
