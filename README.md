@@ -96,7 +96,7 @@ vulnerability.
 | Memory and vault | Memory notes (FTS5, optional embeddings), Obsidian vault read/write, graph query, journal | |
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
-| Remote nodes | Node registry: `POST /api/node/register` and `/api/node/heartbeat` under the node's agent token, `GET /api/nodes` with derived liveness, bounded host facts, operator retire and un-retire, a `fleet_nodes` doctor row | |
+| Remote nodes | Node registry: `POST /api/node/register` and `/api/node/heartbeat` under the node's agent token (at most `node_max_per_agent` nodes each), `GET /api/nodes` with derived liveness (full facts for the owner and operators, a summary for others), bounded host facts, operator retire, un-retire, reassign and forget, a `fleet_nodes` doctor row | |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
