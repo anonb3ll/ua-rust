@@ -129,3 +129,54 @@ async fn profile_activation_rules() {
     assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s1")), Profile::Research);
     assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("other")), Profile::ChiefOfStaff);
 }
+
+#[tokio::test]
+async fn unverified_callers_cannot_approve_by_naming_a_human() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let cto = agent("reviewer-1", Profile::Cto);
+    let id = match reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err() {
+        ua_core::UaError::ApprovalRequired { approval_id, .. } => approval_id,
+        other => panic!("expected a pending approval, got {other:?}"),
+    };
+
+    // A local (stdio or unauthenticated HTTP) caller claims to be the operator.
+    let local = Caller::local("local", Transport::Stdio);
+    let err = reg
+        .call(
+            &hub,
+            &local,
+            "approval_resolve",
+            json!({"id": id, "decision": "approve", "resolved_by": "operator"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "denied", "{err}");
+    let err = reg
+        .call(&hub, &local, "approval_resolve", json!({"id": id, "decision": "approve"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("verified human"), "{err}");
+
+    // Nor may it deny or revoke someone else's request.
+    let err =
+        reg.call(&hub, &local, "approval_resolve", json!({"id": id, "decision": "deny"})).await.unwrap_err();
+    assert_eq!(err.code(), "denied", "{err}");
+
+    // A verified agent cannot pass a human name either.
+    let other = agent("builder-1", Profile::ChiefOfStaff);
+    let err = reg
+        .call(
+            &hub,
+            &other,
+            "approval_resolve",
+            json!({"id": id, "decision": "approve", "resolved_by": "operator"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "denied", "{err}");
+
+    // The request is still pending and the gated call still parks.
+    let again = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
+    assert_eq!(again.code(), "approval_required");
+}
