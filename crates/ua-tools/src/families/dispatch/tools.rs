@@ -105,7 +105,8 @@ pub fn register(r: &mut Registry) {
              for the agent, and start the configured harness as a child process in the task's worktree with an \
              allowlisted environment. The caller must be the agent or an operator. Always needs a one-time \
              human approval, bound to what will run: the approval shows the run id, resolved workdir, harness \
-             argv template, env allowlist, prompt_sha256 and whether the agent's token is passed, and a pass \
+             argv template, env allowlist, timeout_s, output_cap_bytes, prompt_sha256 and whether the agent's \
+             token is passed, and a pass \
              is refused (approval_binding_changed) if any of them changed since. Returns {ok, run_id, state, \
              fence, pid, log_path, spawned, stub}.",
             |ctx: ToolCtx, a: TaskArgs| async move { dispatch_task(ctx, a).await },
@@ -141,13 +142,17 @@ pub fn register(r: &mut Registry) {
             "dispatch_resume",
             "Resume the caller's cancelled (with confirmed cessation), failed or retryable dispatch run under a \
              new fence and relaunch its harness. Fails closed when the run or task is terminal, another run holds \
-             the task, or cessation is unconfirmed, and is refused (approval_binding_changed) when the harness, \
-             argv, env allowlist, token passing, workdir or prompt differ from what the run's dispatch_task \
-             approval bound. Always needs a one-time human approval.",
+             the task, or cessation is unconfirmed, and is refused (approval_binding_changed) before any \
+             approval is requested when the harness, argv, env allowlist, timeout_s, output_cap_bytes, token \
+             passing, workdir or prompt differ from what the run's dispatch_task approval bound. Always needs a \
+             one-time human approval, which shows those fields and the attempt (from_fence) it resumes.",
             |ctx: ToolCtx, a: RunArgs| async move { resume(ctx, a).await },
         )
+        // Gated in the handler, like dispatch_task: the approval shows the
+        // resolved binding, and a resume bound to fail is refused unparked.
         .family("dispatch")
-        .always_gated(),
+        .always_gated()
+        .gates_in_handler(),
     );
     r.add(
         tool(
@@ -299,24 +304,6 @@ fn bind_task(
     Ok(())
 }
 
-/// Attach the approval pass the registry just consumed for this call. Exactly
-/// one row must be linked; anything else fails the caller's transaction.
-fn link_approval(
-    tx: &rusqlite::Connection,
-    tool: &str,
-    requester: &str,
-    payload: &str,
-    run_id: &str,
-) -> UaResult<()> {
-    let n = tx.execute(
-        "UPDATE approvals SET run_id = ?1 WHERE id = (SELECT id FROM approvals WHERE tool = ?2 \
-         AND status = 'consumed' AND requested_by = ?3 AND payload = ?4 AND run_id IS NULL \
-         ORDER BY consumed_at DESC, id DESC LIMIT 1)",
-        params![run_id, tool, requester, payload],
-    )?;
-    expect_one_link(n, run_id)
-}
-
 /// Attach approval `approval_id` (just consumed) to the run.
 fn link_approval_id(tx: &rusqlite::Connection, approval_id: i64, run_id: &str) -> UaResult<()> {
     let n = tx.execute(
@@ -342,17 +329,40 @@ fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
 /// Argument keys of a `dispatch_task` approval payload; the rest of the
 /// payload is the binding resolved from them.
 const ARG_KEYS: [&str; 5] = ["task_id", "agent", "harness", "prompt", "lease_seconds"];
-const BOUND_KEYS: [&str; 9] = [
+const BOUND_KEYS: [&str; 11] = [
     "run_id",
     "workdir",
     "argv",
     "env_allowlist",
+    "timeout_s",
+    "output_cap_bytes",
     "prompt_source",
     "prompt_sha256",
     "prompt_bytes",
     "prompt_text",
     "passes_token_of",
 ];
+
+/// What a harness launch is bound to, as approval payload fields: the
+/// harness, resolved workdir, argv template, env allowlist, wall-clock
+/// limit, output cap and, when it is passed, whose token the child gets.
+fn harness_binding(
+    harness: Option<&(String, ua_core::config::HarnessConfig)>,
+    workdir: Option<&Path>,
+    agent: &str,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("harness".into(), json!(harness.map(|(n, _)| n.clone())));
+    m.insert("workdir".into(), json!(workdir.map(|p| p.display().to_string())));
+    m.insert("argv".into(), json!(harness.map(|(_, h)| h.argv.clone())));
+    m.insert("env_allowlist".into(), json!(harness.map(|(_, h)| h.env_allowlist.clone())));
+    m.insert("timeout_s".into(), json!(harness.map(|(_, h)| h.timeout_s)));
+    m.insert("output_cap_bytes".into(), json!(harness.map(|(_, h)| h.output_cap_bytes)));
+    if harness.is_some_and(|(_, h)| h.pass_agent_token) {
+        m.insert("passes_token_of".into(), json!(agent));
+    }
+    m
+}
 
 /// The longest prompt built from a task that may be approved. The approver
 /// is shown the whole text, never a preview: task notes are agent-writable,
@@ -505,15 +515,14 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let mut payload = json!({
                 "task_id": tid,
                 "agent": ag,
-                "harness": h2.as_ref().map(|(n, _)| n.clone()),
                 "lease_seconds": lease,
                 "run_id": run_id,
-                "workdir": workdir.as_ref().map(|p| p.display().to_string()),
-                "argv": h2.as_ref().map(|(_, h)| h.argv.clone()),
-                "env_allowlist": h2.as_ref().map(|(_, h)| h.env_allowlist.clone()),
                 "prompt_source": source,
                 "prompt_sha256": prompt_sha,
             });
+            if let Some(o) = payload.as_object_mut() {
+                o.extend(harness_binding(h2.as_ref(), workdir.as_deref(), &ag));
+            }
             match &a.prompt {
                 Some(p) => payload["prompt"] = json!(p),
                 // The approver sees the whole prompt the hub built from the
@@ -529,9 +538,6 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     payload["prompt_bytes"] = json!(prompt.len());
                     payload["prompt_text"] = json!(prompt);
                 }
-            }
-            if h2.as_ref().is_some_and(|(_, h)| h.pass_agent_token) {
-                payload["passes_token_of"] = json!(ag);
             }
             let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_task", &payload)? {
                 GateOutcome::Pass { approval_id } => approval_id,
@@ -847,19 +853,31 @@ fn resume_refusal(run: &super::Run) -> Option<String> {
 }
 
 /// Keys of the run's `dispatch_task` approval a resume must still match.
-const RESUME_BOUND_KEYS: [&str; 6] =
-    ["harness", "workdir", "argv", "env_allowlist", "passes_token_of", "prompt_sha256"];
+/// An approval recorded before `timeout_s` and `output_cap_bytes` were bound
+/// lacks them, so it counts as changed and such a run must be dispatched
+/// again: the approver never saw those limits.
+const RESUME_BOUND_KEYS: [&str; 8] = [
+    "harness",
+    "workdir",
+    "argv",
+    "env_allowlist",
+    "timeout_s",
+    "output_cap_bytes",
+    "passes_token_of",
+    "prompt_sha256",
+];
 
-/// A resume relaunches under the hub's current config, and its own approval
-/// names only the run. Refuse it (`approval_binding_changed`) unless what it
-/// would run is what the run's `dispatch_task` approval bound: the same
-/// harness, argv, env allowlist, token passing, resolved workdir and prompt.
+/// A resume relaunches under the hub's current config. Refuse it
+/// (`approval_binding_changed`) unless what it would run is what the run's
+/// `dispatch_task` approval bound: the same harness, argv, env allowlist,
+/// limits, token passing, resolved workdir and prompt. Returns those fields
+/// for the resume's own approval payload.
 fn check_resume_binding(
     tx: &rusqlite::Connection,
     run: &super::Run,
     harness: Option<&(String, ua_core::config::HarnessConfig)>,
     workdir: Option<&Path>,
-) -> UaResult<()> {
+) -> UaResult<Map<String, Value>> {
     let bound: Option<String> = tx
         .query_row(
             "SELECT payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
@@ -874,16 +892,8 @@ fn check_resume_binding(
             format!("run {} has no dispatch_task approval to resume under", run.run_id),
         ));
     };
-    let mut current = json!({
-        "harness": harness.map(|(n, _)| n.clone()),
-        "workdir": workdir.map(|p| p.display().to_string()),
-        "argv": harness.map(|(_, h)| h.argv.clone()),
-        "env_allowlist": harness.map(|(_, h)| h.env_allowlist.clone()),
-        "prompt_sha256": sha256_hex(run.prompt.as_deref().unwrap_or_default()),
-    });
-    if harness.is_some_and(|(_, h)| h.pass_agent_token) {
-        current["passes_token_of"] = json!(run.agent_label);
-    }
+    let mut current = harness_binding(harness, workdir, &run.agent_label);
+    current.insert("prompt_sha256".into(), json!(sha256_hex(run.prompt.as_deref().unwrap_or_default())));
     let changed: Vec<&str> =
         RESUME_BOUND_KEYS.iter().copied().filter(|k| bound.get(*k) != current.get(*k)).collect();
     if !changed.is_empty() {
@@ -896,7 +906,13 @@ fn check_resume_binding(
             ),
         ));
     }
-    Ok(())
+    Ok(current)
+}
+
+enum ResumeGate {
+    Run { fence: i64 },
+    Pending { approval_id: i64 },
+    Denied { approval_id: i64, reason: Option<String> },
 }
 
 async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
@@ -924,12 +940,15 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         }
         (None, _) => None,
     };
-    let payload = crate::approvals::canonical_payload(&serde_json::to_value(&a)?);
     let lease_at = after_seconds(cfg.dispatch_lease_seconds.max(1));
     let actor = ctx.caller.label.clone();
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let (rid2, actor2) = (rid.clone(), actor.clone());
     let (h2, w2) = (harness.clone(), workdir.clone());
-    let fence = ctx
+    // Check, gate and transition in one write transaction: a resume bound to
+    // fail is refused before a human is asked, and nothing the approval
+    // shows can change between the check and the relaunch.
+    let gated = ctx
         .hub
         .db()
         .write_async(move |tx| {
@@ -939,9 +958,27 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Some(why) = resume_refusal(&run) {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
+            let binding = check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
+            // The approver sees what will run, and the attempt it replaces:
+            // a pass resumes this attempt only.
+            let mut payload = json!({
+                "run_id": rid2,
+                "task_id": run.task_id,
+                "agent": run.agent_label,
+                "from_fence": run.fence,
+            });
+            if let Some(o) = payload.as_object_mut() {
+                o.extend(binding);
+            }
+            let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_resume", &payload)? {
+                GateOutcome::Pass { approval_id } => approval_id,
+                GateOutcome::Pending { approval_id } => return Ok(ResumeGate::Pending { approval_id }),
+                GateOutcome::Denied { approval_id, reason } => {
+                    return Ok(ResumeGate::Denied { approval_id, reason });
+                }
+            };
             let fence = run.fence + 1;
             let edge = Edge::to("claimed")
                 .locked_ok()
@@ -971,11 +1008,29 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
             bind_task(tx, run.task_id, &rid2, &run.agent_label, &lease_at)?;
-            link_approval(tx, "dispatch_resume", &actor2, &payload, &rid2)?;
-            record_transition(tx, &rid2, "resumed", &actor2, json!({ "previous_fence": run.fence }))?;
-            Ok(fence)
+            link_approval_id(tx, approval_id, &rid2)?;
+            record_transition(
+                tx,
+                &rid2,
+                "resumed",
+                &actor2,
+                json!({ "previous_fence": run.fence, "approval_id": approval_id }),
+            )?;
+            Ok(ResumeGate::Run { fence })
         })
         .await?;
+    let fence = match gated {
+        ResumeGate::Run { fence } => fence,
+        ResumeGate::Pending { approval_id } => {
+            return Err(UaError::ApprovalRequired { tool: "dispatch_resume".into(), approval_id });
+        }
+        ResumeGate::Denied { approval_id, reason } => {
+            return Err(UaError::denied(
+                "approval_denied",
+                format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+            ));
+        }
+    };
 
     let mut out = match harness {
         None => executor::launch_stub(&ctx.hub, rid.clone(), actor.clone()).await?,
