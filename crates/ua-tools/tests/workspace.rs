@@ -523,3 +523,31 @@ async fn git_merge_task_parks_for_approval_then_merges() {
     env.approve_pending("git_merge_task").await;
     assert_eq!(env.call("git_merge_task", missing).await.unwrap_err().code(), "not_found");
 }
+
+/// `run_cmd` runs with an empty per-call HOME. git still needs an identity
+/// to commit; the hub supplies one from the caller's label.
+#[tokio::test]
+async fn run_cmd_git_commit_works_in_a_fresh_workspace() {
+    if !have_git() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let env = setup();
+    let run = async |command: &str| -> Value {
+        let args = json!({ "command": command });
+        match env.call("run_cmd", args.clone()).await {
+            Ok(v) => v,
+            Err(e) if e.code() == "approval_required" => {
+                env.approve_pending("run_cmd").await;
+                env.ok("run_cmd", args).await
+            }
+            Err(e) => panic!("{command}: {e}"),
+        }
+    };
+    let r = run("git init -q -b main").await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    let r = run("git commit --allow-empty -q -m x").await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    let author = git(&env.ws, &["log", "-1", "--format=%an <%ae> / %cn <%ce>"]);
+    assert_eq!(author, "builder-1 <builder-1@agents.invalid> / builder-1 <builder-1@agents.invalid>");
+}

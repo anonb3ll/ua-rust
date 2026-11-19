@@ -2,23 +2,25 @@
 //!
 //! The page backfills recent events through `event_log_query`, then the
 //! htmx SSE extension appends rendered rows from `/ui/activity/stream`, which
-//! subscribes to the same broadcast as `/api/events/stream` but sends HTML
-//! fragments (event name `ledger`) instead of JSON.
+//! uses the same scoped stream as `/api/events/stream` ([`crate::events`])
+//! but sends HTML fragments (event name `ledger`) instead of JSON.
 
 use std::convert::Infallible;
 
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures::Stream;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_store::ledger::Event;
+use ua_tools::families::events::EventScope;
 
 use super::{PageCtx, Ui, clip, int, list, non_empty, redact, text};
+use crate::events::{self, StreamItem};
 
 /// Backfill window and page size.
 const BACKFILL_SCAN: i64 = 500;
@@ -154,34 +156,35 @@ async fn backfill(ui: &Ui, prefix: &str) -> Result<Vec<EventRow>, String> {
     Ok(rows)
 }
 
-/// Rendered ledger rows as server-sent events named `ledger`.
-pub async fn stream(ui: Ui, Query(q): Query<ActivityQuery>) -> Response {
-    if !ui.may("event_log_query") {
-        return (StatusCode::FORBIDDEN, "event_log_query is not available to your profile").into_response();
-    }
+/// Rendered ledger rows as server-sent events named `ledger`, through the
+/// same scoped, resumable stream as `/api/events/stream`
+/// ([`crate::events`]). A gap renders as its own row.
+pub async fn stream(ui: Ui, headers: HeaderMap, Query(q): Query<ActivityQuery>) -> Response {
     let prefix = clean_prefix(&q.channel_prefix);
-    let rx = ui.state.hub.db().subscribe();
-    Sse::new(rows(rx, prefix)).keep_alive(KeepAlive::default()).into_response()
+    let scope = EventScope { channels: None, channel_prefix: (!prefix.is_empty()).then_some(prefix) };
+    let resume = events::resume_point(&headers, None);
+    match events::open(&ui.state, &ui.caller, scope, resume).await {
+        Ok(stream) => Sse::new(stream.map(sse_row)).keep_alive(KeepAlive::default()).into_response(),
+        Err(e) => (crate::api::status_for(&e), super::describe("event_log_query", &e)).into_response(),
+    }
 }
 
-fn rows(
-    rx: tokio::sync::broadcast::Receiver<Event>,
-    prefix: String,
-) -> impl Stream<Item = Result<SseEvent, Infallible>> {
-    futures::stream::unfold((rx, prefix), |(mut rx, prefix)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) if ev.channel.starts_with(&prefix) => {
-                    let row = EventRow::from_event(&ev);
-                    let html =
-                        EventRowTpl { e: &row }.render().unwrap_or_default().replace(['\n', '\r'], " ");
-                    let sse = SseEvent::default().event("ledger").id(ev.seq.to_string()).data(html);
-                    return Some((Ok(sse), (rx, prefix)));
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return None,
-            }
+fn sse_row(item: StreamItem) -> Result<SseEvent, Infallible> {
+    Ok(match item {
+        StreamItem::Event(ev) => {
+            let row = EventRow::from_event(&ev);
+            let html = EventRowTpl { e: &row }.render().unwrap_or_default().replace(['\n', '\r'], " ");
+            SseEvent::default().event("ledger").id(ev.seq.to_string()).data(html)
+        }
+        StreamItem::Gap { after_seq, until_seq, .. } => {
+            let range = match until_seq {
+                Some(u) => format!("#{} to #{}", after_seq + 1, u - 1),
+                None => format!("after #{after_seq}"),
+            };
+            let html = format!(
+                "<li class=\"gap\"><span class=\"chip\">gap</span> Some events {range} could not be loaded; reload the page to see them.</li>"
+            );
+            SseEvent::default().event("ledger").data(html)
         }
     })
 }
