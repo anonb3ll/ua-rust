@@ -33,9 +33,15 @@ and steps to reproduce. You will get an acknowledgement within a week.
   build tools park for human approval. Each call gets a fresh, empty `HOME`
   (under `$XDG_RUNTIME_DIR/ua-run/`, else `<temp>/ua-run-<uid>/`, mode
   0700) that is deleted afterwards. What common work needs is set
-  explicitly: a git identity `<label> <label@agents.invalid>`, `RUSTUP_HOME`
-  and `CARGO_HOME` from the hub's own home, and `XDG_CACHE_HOME` and
-  `UV_CACHE_DIR` in one cache under `$UA_HOME/run-cache/` shared by every
-  agent. That cache and the cargo home are writable by every command, so
-  one agent can affect another agent's builds through them; give agents
-  that must not share a cache their own hub.
+  explicitly: a git identity `<label> <label@agents.invalid>`, the `bin`
+  directory of the hub's default Rust toolchain first on `PATH`, and
+  `CARGO_HOME`, `XDG_CACHE_HOME` and `UV_CACHE_DIR` in a cache of the
+  caller's own under `$UA_HOME/run-cache/<label>-<digest>/`. Commands never
+  get the hub user's `CARGO_HOME` (credentials, config, installed binaries)
+  or `RUSTUP_HOME`; cargo config and credential files are removed from the
+  caller's cargo cache before every call. The trade-off: without
+  `RUSTUP_HOME` the rustup proxies do not work, so `rustup`,
+  `cargo +toolchain` and a workspace `rust-toolchain.toml` are not honored
+  inside `run_cmd`. A caller's cache persists between its calls, so an
+  agent can affect its own later builds through it, but not another
+  agent's.
