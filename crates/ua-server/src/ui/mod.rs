@@ -160,7 +160,9 @@ fn flash_text(code: &str, approval: Option<i64>) -> Option<String> {
         "dependency_removed" => "Dependency removed.",
         "parked" => {
             return Some(match approval {
-                Some(id) => format!("This change needs a human approval: approval #{id} is pending in the Inbox."),
+                Some(id) => {
+                    format!("This change needs a human approval: approval #{id} is pending in the Inbox.")
+                }
                 None => "This change needs a human approval; it is pending in the Inbox.".into(),
             });
         }

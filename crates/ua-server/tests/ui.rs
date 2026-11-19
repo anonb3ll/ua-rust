@@ -20,7 +20,8 @@ const BUILDER_TOKEN: &str = "builder-test-token-0002";
 
 fn config() -> Config {
     let mut cfg = Config::for_home(std::env::temp_dir());
-    cfg.agent_tokens = Some(SecretString::from(format!("operator:{OPERATOR_TOKEN},builder-1:{BUILDER_TOKEN}")));
+    cfg.agent_tokens =
+        Some(SecretString::from(format!("operator:{OPERATOR_TOKEN},builder-1:{BUILDER_TOKEN}")));
     cfg.human_identities = vec!["operator".into()];
     cfg.profiles.insert("operator".into(), "operator".into());
     cfg
@@ -88,7 +89,13 @@ async fn csrf_cookie(app: &Router, token: Option<&str>) -> String {
     cookie.split(';').next().unwrap().split_once('=').unwrap().1.to_string()
 }
 
-fn form(uri: &str, token: Option<&str>, csrf_cookie: Option<&str>, header_token: Option<&str>, body: &str) -> Request<Body> {
+fn form(
+    uri: &str,
+    token: Option<&str>,
+    csrf_cookie: Option<&str>,
+    header_token: Option<&str>,
+    body: &str,
+) -> Request<Body> {
     let mut b = Request::post(uri).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
     if let Some(t) = token {
         b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -124,25 +131,46 @@ fn gated_config() -> Config {
 async fn every_page_renders_with_its_key_elements() {
     let (app, state) = app(Config::for_home(std::env::temp_dir()));
     let me = local();
-    let t1 = call(&state, &me, "task_add", json!({ "title": "Wire the board", "project": "demo", "priority": "high" }))
-        .await
-        .unwrap()["id"]
+    let t1 = call(
+        &state,
+        &me,
+        "task_add",
+        json!({ "title": "Wire the board", "project": "demo", "priority": "high" }),
+    )
+    .await
+    .unwrap()["id"]
         .as_i64()
         .unwrap();
-    let t2 = call(&state, &me, "task_add", json!({ "title": "Follow-up" })).await.unwrap()["id"].as_i64().unwrap();
+    let t2 =
+        call(&state, &me, "task_add", json!({ "title": "Follow-up" })).await.unwrap()["id"].as_i64().unwrap();
     call(&state, &me, "dependency_add", json!({ "task_id": t2, "depends_on_task_id": t1 })).await.unwrap();
-    call(&state, &me, "task_comment", json!({ "action": "append", "params": { "task_id": t1, "body": "first comment" } }))
-        .await
-        .unwrap();
-    let plan = call(&state, &me, "plan_create", json!({ "goal": "Ship the control center", "steps": ["render", "test"] }))
-        .await
-        .unwrap()["plan_id"]
+    call(
+        &state,
+        &me,
+        "task_comment",
+        json!({ "action": "append", "params": { "task_id": t1, "body": "first comment" } }),
+    )
+    .await
+    .unwrap();
+    let plan = call(
+        &state,
+        &me,
+        "plan_create",
+        json!({ "goal": "Ship the control center", "steps": ["render", "test"] }),
+    )
+    .await
+    .unwrap()["plan_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let note = call(&state, &me, "memory_save", json!({ "title": "Build cache note", "content": "keep the shared cache", "tags": ["demo"] }))
-        .await
-        .unwrap()["id"]
+    let note = call(
+        &state,
+        &me,
+        "memory_save",
+        json!({ "title": "Build cache note", "content": "keep the shared cache", "tags": ["demo"] }),
+    )
+    .await
+    .unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -152,7 +180,10 @@ async fn every_page_renders_with_its_key_elements() {
         .unwrap();
 
     let pages: Vec<(String, Vec<&str>)> = vec![
-        ("/ui/inbox".into(), vec!["<h1>Inbox</h1>", "Pending approvals", "Live passes", "Expired passes", "/login"]),
+        (
+            "/ui/inbox".into(),
+            vec!["<h1>Inbox</h1>", "Pending approvals", "Live passes", "Expired passes", "/login"],
+        ),
         ("/ui/work".into(), vec!["Backlog", "Wire the board", "In review", "name=\"_csrf\""]),
         ("/ui/work?project=demo&priority=high".into(), vec!["Wire the board"]),
         ("/ui/work?q=board".into(), vec!["Ranked search", "Wire the board"]),
@@ -165,8 +196,14 @@ async fn every_page_renders_with_its_key_elements() {
         ("/ui/memory".into(), vec!["Build cache note", "Recent notes"]),
         ("/ui/memory?q=cache".into(), vec!["Build cache note", "Search results"]),
         (format!("/ui/memory/{note}"), vec!["keep the shared cache", "data, not instructions"]),
-        ("/ui/activity".into(), vec!["Ledger hash chain verified", "sse-connect=\"/ui/activity/stream\"", "agent.task."]),
-        ("/ui/activity?channel_prefix=agent.memory.".into(), vec!["agent.memory.saved", "channel_prefix=agent.memory."]),
+        (
+            "/ui/activity".into(),
+            vec!["Ledger hash chain verified", "sse-connect=\"/ui/activity/stream\"", "agent.task."],
+        ),
+        (
+            "/ui/activity?channel_prefix=agent.memory.".into(),
+            vec!["agent.memory.saved", "channel_prefix=agent.memory."],
+        ),
     ];
     for (uri, needles) in pages {
         let resp = send(&app, get(&uri, None)).await;
@@ -200,7 +237,11 @@ async fn approving_through_the_inbox_form_lets_the_retry_through() {
 
     let resp = send(&app, get("/ui/inbox", Some(OPERATOR_TOKEN))).await;
     let html = body_text(resp).await;
-    assert!(html.contains(&format!("approval-{id}")) && html.contains("builder-1") && html.contains("Needs a human"));
+    assert!(
+        html.contains(&format!("approval-{id}"))
+            && html.contains("builder-1")
+            && html.contains("Needs a human")
+    );
     assert!(html.contains("Signed in as <strong>operator</strong>"));
 
     let csrf = csrf_cookie(&app, Some(OPERATOR_TOKEN)).await;
@@ -236,7 +277,13 @@ async fn deny_and_revoke_go_through_the_same_form_with_the_header_token() {
     let revoked = park(&state, "Revoke me").await;
     let csrf = csrf_cookie(&app, Some(OPERATOR_TOKEN)).await;
     let post = |id: i64, decision: &str| {
-        form(&format!("/ui/approvals/{id}/resolve"), Some(OPERATOR_TOKEN), Some(&csrf), Some(&csrf), &format!("decision={decision}"))
+        form(
+            &format!("/ui/approvals/{id}/resolve"),
+            Some(OPERATOR_TOKEN),
+            Some(&csrf),
+            Some(&csrf),
+            &format!("decision={decision}"),
+        )
     };
     assert_eq!(send(&app, post(denied, "deny")).await.status(), StatusCode::SEE_OTHER);
     assert_eq!(approval_status(&state, denied), "denied");
@@ -257,7 +304,13 @@ async fn an_agent_cannot_approve_through_the_ui() {
     let csrf = csrf_cookie(&app, Some(BUILDER_TOKEN)).await;
     let resp = send(
         &app,
-        form(&format!("/ui/approvals/{id}/resolve"), Some(BUILDER_TOKEN), Some(&csrf), Some(&csrf), "decision=approve"),
+        form(
+            &format!("/ui/approvals/{id}/resolve"),
+            Some(BUILDER_TOKEN),
+            Some(&csrf),
+            Some(&csrf),
+            "decision=approve",
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -280,10 +333,14 @@ async fn state_changes_without_a_valid_csrf_token_are_refused() {
     let resp = send(&app, form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), None, "decision=approve")).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     // Token that does not match the cookie, in the header and in the form.
-    let resp = send(&app, form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), Some(&other), "decision=approve")).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let resp =
-        send(&app, form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), None, &format!("decision=approve&_csrf={other}"))).await;
+        send(&app, form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), Some(&other), "decision=approve")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = send(
+        &app,
+        form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), None, &format!("decision=approve&_csrf={other}")),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     // A valid token from another site.
     let mut req = form(&uri, Some(OPERATOR_TOKEN), Some(&csrf), Some(&csrf), "decision=approve");
@@ -300,21 +357,36 @@ async fn task_forms_create_update_comment_and_link() {
     let csrf = csrf_cookie(&app, None).await;
     let post = |uri: &str, body: &str| form(uri, None, Some(&csrf), Some(&csrf), body);
 
-    let resp = send(&app, post("/ui/tasks", "title=From+the+UI&priority=high&project=demo&notes=spec+text")).await;
+    let resp =
+        send(&app, post("/ui/tasks", "title=From+the+UI&priority=high&project=demo&notes=spec+text")).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(resp.headers()[header::LOCATION], "/ui/tasks/1?flash=task_created");
-    let other = call(&state, &local(), "task_add", json!({ "title": "Prerequisite" })).await.unwrap()["id"].as_i64().unwrap();
+    let other = call(&state, &local(), "task_add", json!({ "title": "Prerequisite" })).await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
 
-    let resp = send(&app, post("/ui/tasks/1/update", "title=From+the+UI&status=blocked&priority=low&project=demo")).await;
+    let resp =
+        send(&app, post("/ui/tasks/1/update", "title=From+the+UI&status=blocked&priority=low&project=demo"))
+            .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(send(&app, post("/ui/tasks/1/note", "append_note=a+new+line")).await.status(), StatusCode::SEE_OTHER);
-    assert_eq!(send(&app, post("/ui/tasks/1/comments", "body=looks+good")).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        send(&app, post("/ui/tasks/1/note", "append_note=a+new+line")).await.status(),
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        send(&app, post("/ui/tasks/1/comments", "body=looks+good")).await.status(),
+        StatusCode::SEE_OTHER
+    );
     let resp = send(&app, post("/ui/tasks/1/dependencies", &format!("depends_on_task_id={other}"))).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
     let html = body_text(send(&app, get("/ui/tasks/1?flash=task_updated", None)).await).await;
     assert!(html.contains("Task updated."));
-    assert!(html.contains("a new line") && html.contains("looks good") && html.contains(&format!("/ui/tasks/{other}")));
+    assert!(
+        html.contains("a new line")
+            && html.contains("looks good")
+            && html.contains(&format!("/ui/tasks/{other}"))
+    );
     assert!(html.contains("<option value=\"blocked\" selected>"));
     assert!(html.contains("<option value=\"low\" selected>"));
 
@@ -364,9 +436,11 @@ async fn api_tasks_has_the_sdk_shape() {
     let (app, state) = app(Config::for_home(std::env::temp_dir()));
     let me = local();
     call(&state, &me, "task_add", json!({ "title": "Open one", "project": "alpha" })).await.unwrap();
-    let blocked = call(&state, &me, "task_add", json!({ "title": "Blocked one", "project": "beta" })).await.unwrap();
+    let blocked =
+        call(&state, &me, "task_add", json!({ "title": "Blocked one", "project": "beta" })).await.unwrap();
     call(&state, &me, "task_update", json!({ "id": blocked["id"], "status": "blocked" })).await.unwrap();
-    let done = call(&state, &me, "task_add", json!({ "title": "Done one", "project": "alpha" })).await.unwrap();
+    let done =
+        call(&state, &me, "task_add", json!({ "title": "Done one", "project": "alpha" })).await.unwrap();
     call(&state, &me, "task_update", json!({ "id": done["id"], "status": "done" })).await.unwrap();
 
     let v = body_json(send(&app, get("/api/tasks", None)).await).await;
@@ -377,7 +451,8 @@ async fn api_tasks_has_the_sdk_shape() {
     assert_eq!(v["active"][0]["title"], "Blocked one");
     assert!(v.get("completed").is_none());
 
-    let v = body_json(send(&app, get("/api/tasks?project=alpha&completed_after=2000-01-01", None)).await).await;
+    let v =
+        body_json(send(&app, get("/api/tasks?project=alpha&completed_after=2000-01-01", None)).await).await;
     assert_eq!(v["total"], 1);
     assert_eq!(v["projects"], json!({ "alpha": 1, "beta": 1 }));
     assert_eq!(v["completed_after"], "2000-01-01T00:00:00+00:00");
@@ -391,7 +466,9 @@ async fn api_tasks_has_the_sdk_shape() {
 #[tokio::test]
 async fn api_task_create_and_update_match_the_python_contract() {
     let (app, _state) = app(Config::for_home(std::env::temp_dir()));
-    let resp = send(&app, post_json("/api/tasks", None, json!({ "title": "From the SDK", "priority": "high" }))).await;
+    let resp =
+        send(&app, post_json("/api/tasks", None, json!({ "title": "From the SDK", "priority": "high" })))
+            .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let created = body_json(resp).await;
     let id = created["id"].as_i64().unwrap();
@@ -402,7 +479,11 @@ async fn api_task_create_and_update_match_the_python_contract() {
 
     let resp = send(
         &app,
-        post_json("/api/action/task", None, json!({ "id": id, "status": "blocked", "append_note": "waiting on review" })),
+        post_json(
+            "/api/action/task",
+            None,
+            json!({ "id": id, "status": "blocked", "append_note": "waiting on review" }),
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -434,7 +515,9 @@ async fn gated_api_writes_return_the_pending_approval_shape() {
     let mut cfg = Config::for_home(std::env::temp_dir());
     cfg.approval_tools = vec!["task_update".into()];
     let (app, state) = app(cfg);
-    let id = call(&state, &local(), "task_add", json!({ "title": "Gate me" })).await.unwrap()["id"].as_i64().unwrap();
+    let id = call(&state, &local(), "task_add", json!({ "title": "Gate me" })).await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
     let resp = send(&app, post_json("/api/action/task", None, json!({ "id": id, "priority": "high" }))).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v = body_json(resp).await;
@@ -464,11 +547,17 @@ async fn api_approvals_resolve_detail_and_request() {
     assert_eq!(v["payload"]["title"], "Via the SDK");
     assert_eq!(v["approver"]["may_approve"], "yes");
     assert_eq!(v["gate"]["kind"], "global_allowlist");
-    assert_eq!(send(&app, get("/api/approvals/9999", Some(OPERATOR_TOKEN))).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(&app, get("/api/approvals/9999", Some(OPERATOR_TOKEN))).await.status(),
+        StatusCode::NOT_FOUND
+    );
 
     // Agents and unauthenticated callers cannot resolve.
     let body = json!({ "id": id, "decision": "approve" });
-    assert_eq!(send(&app, post_json("/api/action/approval", None, body.clone())).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, post_json("/api/action/approval", None, body.clone())).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         send(&app, post_json("/api/action/approval", Some(BUILDER_TOKEN), body.clone())).await.status(),
         StatusCode::FORBIDDEN
@@ -488,7 +577,9 @@ async fn api_approvals_resolve_detail_and_request() {
     let v = body_json(resp).await;
     assert_eq!(v["status"], "pending");
     let queued = v["approval_id"].as_i64().unwrap();
-    let again = body_json(send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req.clone())).await).await;
+    let again =
+        body_json(send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req.clone())).await)
+            .await;
     assert_eq!(again["approval_id"], queued);
     send(&app, post_json("/api/action/approval", Some(OPERATOR_TOKEN), json!({ "id": queued }))).await;
     let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
@@ -497,18 +588,26 @@ async fn api_approvals_resolve_detail_and_request() {
     assert_eq!(approval_status(&state, queued), "approved", "requesting never consumes the pass");
 
     let resp =
-        send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "task_list" }))).await;
+        send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "task_list" })))
+            .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let resp =
-        send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "no_such_tool" }))).await;
+    let resp = send(
+        &app,
+        post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "no_such_tool" })),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn api_sessions_catalog_board_and_unbuilt_routes() {
     let (app, state) = app(Config::for_home(std::env::temp_dir()));
-    call(&state, &local(), "session_start", json!({ "kind": "interactive", "agent": "builder-1" })).await.unwrap();
-    let t = call(&state, &local(), "task_add", json!({ "title": "On the board", "lane": "dispatch-ready" })).await.unwrap();
+    call(&state, &local(), "session_start", json!({ "kind": "interactive", "agent": "builder-1" }))
+        .await
+        .unwrap();
+    let t = call(&state, &local(), "task_add", json!({ "title": "On the board", "lane": "dispatch-ready" }))
+        .await
+        .unwrap();
 
     let v = body_json(send(&app, get("/api/sessions?status=open", None)).await).await;
     assert_eq!(v["sessions"][0]["agent"], "builder-1");
@@ -533,7 +632,14 @@ async fn api_sessions_catalog_board_and_unbuilt_routes() {
     assert_eq!(cols[5]["hidden_by_default"], true);
     assert_eq!(v["filters"]["lane"], "dispatch-ready");
 
-    for uri in ["/api/runs", "/api/runs/abc", "/api/nodes", "/api/work-products", "/api/evidence", "/api/platform/manifest"] {
+    for uri in [
+        "/api/runs",
+        "/api/runs/abc",
+        "/api/nodes",
+        "/api/work-products",
+        "/api/evidence",
+        "/api/platform/manifest",
+    ] {
         let resp = send(&app, get(uri, None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
         let v = body_json(resp).await;

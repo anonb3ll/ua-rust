@@ -76,7 +76,8 @@ fn check_origin(h: &HeaderMap) -> Result<(), Response> {
     }
     let Some(origin) = header_str(h, header::ORIGIN.as_str()) else { return Ok(()) };
     let host = header_str(h, "x-forwarded-host").or_else(|| header_str(h, header::HOST.as_str()));
-    let ok = host.is_some_and(|host| origin == format!("http://{host}") || origin == format!("https://{host}"));
+    let ok =
+        host.is_some_and(|host| origin == format!("http://{host}") || origin == format!("https://{host}"));
     if ok { Ok(()) } else { Err(refuse("origin does not match this host")) }
 }
 
@@ -112,8 +113,9 @@ pub async fn protect(req: Request, next: Next) -> Response {
                 .and_then(|pairs| pairs.into_iter().find(|(k, _)| k == FIELD).map(|(_, v)| v));
             req = Request::from_parts(parts, Body::from(bytes));
         }
-        let matches =
-            presented.is_some_and(|p| p.len() == expected.len() && bool::from(p.as_bytes().ct_eq(expected.as_bytes())));
+        let matches = presented.is_some_and(|p| {
+            p.len() == expected.len() && bool::from(p.as_bytes().ct_eq(expected.as_bytes()))
+        });
         if !matches {
             return refuse("missing or invalid CSRF token");
         }

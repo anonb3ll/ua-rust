@@ -62,7 +62,10 @@ async fn build(ui: &Ui, error: Option<String>) -> InboxPage {
             pending: rows("pending"),
             live: rows("approved_unconsumed"),
             expired,
-            gated_tools: list(&v, "gated_tools").iter().filter_map(|t| t.as_str().map(str::to_string)).collect(),
+            gated_tools: list(&v, "gated_tools")
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect(),
             ttl_hours: text(&v, "pass_ttl_hours"),
         }
     });

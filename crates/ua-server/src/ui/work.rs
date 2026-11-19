@@ -165,7 +165,8 @@ pub struct CreateForm {
 
 pub async fn create(ui: Ui, Form(f): Form<CreateForm>) -> Response {
     let mut args = json!({ "title": f.title.trim() });
-    for (k, v) in [("notes", &f.notes), ("priority", &f.priority), ("project", &f.project), ("lane", &f.lane)] {
+    for (k, v) in [("notes", &f.notes), ("priority", &f.priority), ("project", &f.project), ("lane", &f.lane)]
+    {
         if let Some(v) = non_empty(v) {
             args[k] = json!(v);
         }
@@ -174,7 +175,8 @@ pub async fn create(ui: Ui, Form(f): Form<CreateForm>) -> Response {
         match p.parse::<i64>() {
             Ok(id) => args["parent_id"] = json!(id),
             Err(_) => {
-                let page = build_board(&ui, &BoardQuery::default(), Some("parent id must be a number".into())).await;
+                let page =
+                    build_board(&ui, &BoardQuery::default(), Some("parent id must be a number".into())).await;
                 return render(StatusCode::BAD_REQUEST, page);
             }
         }
@@ -182,7 +184,9 @@ pub async fn create(ui: Ui, Form(f): Form<CreateForm>) -> Response {
     match outcome("task_add", ui.call("task_add", args).await) {
         Outcome::Done(v) => redirect(&format!("/ui/tasks/{}", int(&v, "id")), "task_created", None),
         Outcome::Parked(a) => redirect("/ui/work", "parked", Some(a)),
-        Outcome::Failed(status, msg) => render(status, build_board(&ui, &BoardQuery::default(), Some(msg)).await),
+        Outcome::Failed(status, msg) => {
+            render(status, build_board(&ui, &BoardQuery::default(), Some(msg)).await)
+        }
     }
 }
 
@@ -275,7 +279,10 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 /// read-only query gated on the caller's `task_list` access.
 async fn load_task(ui: &Ui, id: i64) -> UaResult<Option<Value>> {
     if !ui.may("task_list") {
-        return Err(UaError::denied("profile_denied", format!("task_list is not available to profile {}", ui.caller.profile)));
+        return Err(UaError::denied(
+            "profile_denied",
+            format!("task_list is not available to profile {}", ui.caller.profile),
+        ));
     }
     ui.state
         .hub
@@ -317,7 +324,11 @@ async fn build_detail(ui: &Ui, id: i64, error: Option<String>) -> Response {
     let row = match load_task(ui, id).await {
         Ok(Some(v)) => v,
         Ok(None) => {
-            let page = MissingPage { page: ui.page("work", "Not found", error), what: format!("task {id}"), back: "/ui/work" };
+            let page = MissingPage {
+                page: ui.page("work", "Not found", error),
+                what: format!("task {id}"),
+                back: "/ui/work",
+            };
             return render(StatusCode::NOT_FOUND, page);
         }
         Err(e) => {
@@ -329,10 +340,8 @@ async fn build_detail(ui: &Ui, id: i64, error: Option<String>) -> Response {
             return render(crate::api::status_for(&e), page);
         }
     };
-    let comments = ui
-        .read("task_comment", json!({ "action": "list", "params": { "task_id": id } }))
-        .await
-        .map(|v| {
+    let comments =
+        ui.read("task_comment", json!({ "action": "list", "params": { "task_id": id } })).await.map(|v| {
             list(&v, "comments")
                 .iter()
                 .map(|c| CommentView {
@@ -350,19 +359,33 @@ async fn build_detail(ui: &Ui, id: i64, error: Option<String>) -> Response {
             waits_on: edges
                 .iter()
                 .filter(|e| int(e, "task_id") == id)
-                .map(|e| DepView { id: int(e, "id"), other: int(e, "depends_on_task_id"), created_by: text(e, "created_by") })
+                .map(|e| DepView {
+                    id: int(e, "id"),
+                    other: int(e, "depends_on_task_id"),
+                    created_by: text(e, "created_by"),
+                })
                 .collect(),
             blocks: edges
                 .iter()
                 .filter(|e| int(e, "depends_on_task_id") == id)
-                .map(|e| DepView { id: int(e, "id"), other: int(e, "task_id"), created_by: text(e, "created_by") })
+                .map(|e| DepView {
+                    id: int(e, "id"),
+                    other: int(e, "task_id"),
+                    created_by: text(e, "created_by"),
+                })
                 .collect(),
         }
     });
     let task = detail_of(&row);
     let title = format!("#{} {}", task.id, clip(&task.title, 60));
-    let page =
-        TaskPage { page: ui.page("work", title, error), task, comments, deps, statuses: STATUSES, priorities: PRIORITIES };
+    let page = TaskPage {
+        page: ui.page("work", title, error),
+        task,
+        comments,
+        deps,
+        statuses: STATUSES,
+        priorities: PRIORITIES,
+    };
     render(if page.page.error.is_some() { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK }, page)
 }
 
@@ -443,7 +466,9 @@ pub struct CommentForm {
 }
 
 pub async fn comment(ui: Ui, Path(id): Path<i64>, Form(f): Form<CommentForm>) -> Response {
-    let r = ui.call("task_comment", json!({ "action": "append", "params": { "task_id": id, "body": f.body } })).await;
+    let r = ui
+        .call("task_comment", json!({ "action": "append", "params": { "task_id": id, "body": f.body } }))
+        .await;
     finish(&ui, id, "task_comment", r, "comment_added").await
 }
 
@@ -454,7 +479,8 @@ pub struct DepForm {
 
 pub async fn dependency_add(ui: Ui, Path(id): Path<i64>, Form(f): Form<DepForm>) -> Response {
     let Ok(other) = f.depends_on_task_id.trim().trim_start_matches('#').parse::<i64>() else {
-        return finish(&ui, id, "dependency_add", Err(UaError::invalid("task id must be a number")), "").await;
+        return finish(&ui, id, "dependency_add", Err(UaError::invalid("task id must be a number")), "")
+            .await;
     };
     let r = ui.call("dependency_add", json!({ "task_id": id, "depends_on_task_id": other })).await;
     finish(&ui, id, "dependency_add", r, "dependency_added").await

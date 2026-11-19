@@ -55,18 +55,30 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sessions", get(sessions))
         .route("/api/capability-catalog", get(capability_catalog))
         .route("/api/board", get(board))
-        .route("/api/runs", any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }))
-        .route("/api/runs/{*rest}", any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }))
+        .route(
+            "/api/runs",
+            any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
+        )
+        .route(
+            "/api/runs/{*rest}",
+            any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
+        )
         .route("/api/nodes", any(|| async { not_built("nodes", "ua-node device registry") }))
         .route("/api/nodes/{*rest}", any(|| async { not_built("nodes", "ua-node device registry") }))
-        .route("/api/work-products", any(|| async { not_built("work_products", "work product review and release") }))
+        .route(
+            "/api/work-products",
+            any(|| async { not_built("work_products", "work product review and release") }),
+        )
         .route(
             "/api/work-products/{*rest}",
             any(|| async { not_built("work_products", "work product review and release") }),
         )
         .route("/api/evidence", any(|| async { not_built("evidence", "evidence report and append") }))
         .route("/api/evidence/{*rest}", any(|| async { not_built("evidence", "evidence report and append") }))
-        .route("/api/platform/{*rest}", any(|| async { not_built("platform", "platform object model and manifest") }))
+        .route(
+            "/api/platform/{*rest}",
+            any(|| async { not_built("platform", "platform object model and manifest") }),
+        )
 }
 
 fn not_built(capability: &str, what: &str) -> Response {
@@ -203,7 +215,9 @@ async fn tasks(
     let completed_after = match q.get("completed_after") {
         Some(raw) => match normalize_ts(raw) {
             Some(ts) => Some(ts),
-            None => return err(StatusCode::BAD_REQUEST, "completed_after must be an ISO 8601 date or datetime"),
+            None => {
+                return err(StatusCode::BAD_REQUEST, "completed_after must be an ISO 8601 date or datetime");
+            }
         },
         None => None,
     };
@@ -337,7 +351,9 @@ async fn action_task(
     let task_id = match body.remove("id") {
         None | Some(Value::Null) => return err(StatusCode::BAD_REQUEST, "missing task id"),
         Some(Value::Number(n)) if n.as_i64().is_some() => n.as_i64().unwrap_or_default(),
-        Some(Value::String(s)) if s.trim().parse::<i64>().is_ok() => s.trim().parse::<i64>().unwrap_or_default(),
+        Some(Value::String(s)) if s.trim().parse::<i64>().is_ok() => {
+            s.trim().parse::<i64>().unwrap_or_default()
+        }
         Some(_) => return err(StatusCode::BAD_REQUEST, "invalid task id; expected integer"),
     };
     let mut unknown: Vec<&str> =
@@ -360,7 +376,10 @@ async fn action_task(
     // explicit `false` asks for what already happens, `true` cannot be honoured.
     match body.remove("worktree") {
         Some(Value::Bool(true)) => {
-            return err(StatusCode::BAD_REQUEST, "worktree=true is not supported by this hub; create worktrees with git_worktree_add");
+            return err(
+                StatusCode::BAD_REQUEST,
+                "worktree=true is not supported by this hub; create worktrees with git_worktree_add",
+            );
         }
         _ => {}
     }
@@ -455,7 +474,9 @@ fn conditional_json(headers: &HeaderMap, v: &Value) -> Response {
     let body = serde_json::to_vec(v).unwrap_or_default();
     let etag = format!("W/\"{}\"", &hex::encode(Sha256::digest(&body))[..32]);
     let matched = headers.get(header::IF_NONE_MATCH).and_then(|h| h.to_str().ok()).is_some_and(|inm| {
-        inm.split(',').map(str::trim).any(|c| c == "*" || c.trim_start_matches("W/") == etag.trim_start_matches("W/"))
+        inm.split(',')
+            .map(str::trim)
+            .any(|c| c == "*" || c.trim_start_matches("W/") == etag.trim_start_matches("W/"))
     });
     let mut resp = if matched {
         StatusCode::NOT_MODIFIED.into_response()
@@ -478,7 +499,11 @@ async fn approvals_list(
     headers: HeaderMap,
 ) -> Response {
     let caller = caller(&state, &id, &headers);
-    let v = match state.registry.call(&state.hub, &caller, "approval_pending", json!({ "newest_expired": true })).await {
+    let v = match state
+        .registry
+        .call(&state.hub, &caller, "approval_pending", json!({ "newest_expired": true }))
+        .await
+    {
         Ok(v) => v,
         Err(e) => return tool_err(&e),
     };
@@ -513,12 +538,22 @@ async fn approval_detail(
     };
     let caller = caller(&state, &id, &headers);
     if !may(&caller, "approval_pending") {
-        return err(StatusCode::FORBIDDEN, format!("approval_pending is not available to profile {}", caller.profile));
+        return err(
+            StatusCode::FORBIDDEN,
+            format!("approval_pending is not available to profile {}", caller.profile),
+        );
     }
-    let row = match state.hub.db().read_async(move |c| approvals::get(c, approval_id).map(Some).or_else(|e| match e {
-        UaError::NotFound(_) => Ok(None),
-        other => Err(other),
-    })).await {
+    let row = match state
+        .hub
+        .db()
+        .read_async(move |c| {
+            approvals::get(c, approval_id).map(Some).or_else(|e| match e {
+                UaError::NotFound(_) => Ok(None),
+                other => Err(other),
+            })
+        })
+        .await
+    {
         Ok(Some(r)) => r,
         Ok(None) => return err(StatusCode::NOT_FOUND, format!("no approval request with id {approval_id}")),
         Err(e) => return tool_err(&e),
@@ -603,7 +638,10 @@ async fn approval_request(
         body.keys().map(String::as_str).filter(|k| !["tool", "payload"].contains(k)).collect();
     if !unknown.is_empty() {
         unknown.sort();
-        return err(StatusCode::BAD_REQUEST, format!("unknown approval request field(s): {}", unknown.join(", ")));
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("unknown approval request field(s): {}", unknown.join(", ")),
+        );
     }
     let Some(tool) = body.get("tool").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) else {
         return err(StatusCode::BAD_REQUEST, "tool is required");
@@ -689,7 +727,8 @@ async fn sessions(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let caller = caller(&state, &id, &headers);
-    let mut args = json!({ "limit": q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500) });
+    let mut args =
+        json!({ "limit": q.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500) });
     if let Some(a) = q.get("agent").filter(|a| !a.is_empty()) {
         args["agent"] = json!(a);
     }
@@ -876,8 +915,9 @@ async fn board(
     let caller = caller(&state, &id, &headers);
     let now = now_s();
     let get = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
-    let include_cancelled =
-        q.get("include_cancelled").is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let include_cancelled = q
+        .get("include_cancelled")
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let swimlane_by = if get("swimlane_by").as_deref() == Some("project") { "project" } else { "lane" };
     let filters = BoardFilters {
         project: get("project"),
@@ -915,7 +955,8 @@ async fn board(
         }
         Err(e) => errors.push(e.to_string()),
     }
-    let mut columns: BTreeMap<&str, Vec<Value>> = BOARD_LABELS.iter().map(|(s, _)| (*s, Vec::new())).collect();
+    let mut columns: BTreeMap<&str, Vec<Value>> =
+        BOARD_LABELS.iter().map(|(s, _)| (*s, Vec::new())).collect();
     let by_id: HashMap<i64, &Value> = tasks.iter().filter_map(|t| t["id"].as_i64().map(|i| (i, t))).collect();
     for t in &tasks {
         let card = task_card(t, now, &dep_counts, swimlane_by);
@@ -927,13 +968,18 @@ async fn board(
             col.push(card);
         }
     }
-    match state.registry.call(&state.hub, &caller, "delegate_list", json!({ "status": "pending", "limit": 200 })).await {
+    match state
+        .registry
+        .call(&state.hub, &caller, "delegate_list", json!({ "status": "pending", "limit": 200 }))
+        .await
+    {
         Ok(v) => {
             for d in v["delegations"].as_array().into_iter().flatten() {
                 let deadline = ts_s(d["deadline"].as_str());
                 let remaining = deadline.map(|dl| dl - now);
                 let linked = d["task_id"].as_i64().and_then(|t| by_id.get(&t));
-                let summary: String = d["task_spec"].as_str().unwrap_or("Delegation").chars().take(120).collect();
+                let summary: String =
+                    d["task_spec"].as_str().unwrap_or("Delegation").chars().take(120).collect();
                 let card = json!({
                     "kind": "delegation",
                     "id": format!("delegation:{}", d["id"]),
@@ -983,8 +1029,10 @@ async fn board(
         .into_iter()
         .map(|(l, c)| (l, json!({ "count": c, "cap": null, "mode": null, "over": false })))
         .collect();
-    let wip_agents: Map<String, Value> =
-        agent_counts.into_iter().map(|(a, c)| (a, json!({ "count": c, "cap": null, "over": false }))).collect();
+    let wip_agents: Map<String, Value> = agent_counts
+        .into_iter()
+        .map(|(a, c)| (a, json!({ "count": c, "cap": null, "over": false })))
+        .collect();
     let column_rows: Vec<Value> = BOARD_LABELS
         .iter()
         .map(|(status, label)| {

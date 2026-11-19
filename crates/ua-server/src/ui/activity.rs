@@ -88,8 +88,15 @@ pub struct ActivityPage {
     pub presets: [&'static str; 7],
 }
 
-const PRESETS: [&str; 7] =
-    ["agent.task.", "agent.approval.", "agent.message.", "agent.memory.", "agent.plan.", "agent.delegation.", "agent.gateway."];
+const PRESETS: [&str; 7] = [
+    "agent.task.",
+    "agent.approval.",
+    "agent.message.",
+    "agent.memory.",
+    "agent.plan.",
+    "agent.delegation.",
+    "agent.gateway.",
+];
 
 fn clean_prefix(p: &Option<String>) -> String {
     non_empty(p).map(|s| s.chars().filter(|c| !c.is_control()).take(120).collect()).unwrap_or_default()
@@ -109,7 +116,14 @@ pub async fn page(ui: Ui, Query(q): Query<ActivityQuery>) -> ActivityPage {
     } else {
         format!("/ui/activity/stream?channel_prefix={}", urlencode(&prefix))
     };
-    ActivityPage { page: ui.page("activity", "Activity", None), prefix, stream_url, events, chain, presets: PRESETS }
+    ActivityPage {
+        page: ui.page("activity", "Activity", None),
+        prefix,
+        stream_url,
+        events,
+        chain,
+        presets: PRESETS,
+    }
 }
 
 fn urlencode(s: &str) -> String {
@@ -159,7 +173,8 @@ fn rows(
             match rx.recv().await {
                 Ok(ev) if ev.channel.starts_with(&prefix) => {
                     let row = EventRow::from_event(&ev);
-                    let html = EventRowTpl { e: &row }.render().unwrap_or_default().replace(['\n', '\r'], " ");
+                    let html =
+                        EventRowTpl { e: &row }.render().unwrap_or_default().replace(['\n', '\r'], " ");
                     let sse = SseEvent::default().event("ledger").id(ev.seq.to_string()).data(html);
                     return Some((Ok(sse), (rx, prefix)));
                 }

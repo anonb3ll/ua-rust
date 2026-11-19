@@ -68,9 +68,11 @@ fn truthy(v: &Value, k: &str) -> bool {
 }
 
 pub async fn plans(ui: Ui, Query(q): Query<PlansQuery>) -> PlansPage {
-    let status = non_empty(&q.status).filter(|s| PLAN_STATUSES.contains(&s.as_str())).unwrap_or("active".into());
-    let dstatus =
-        non_empty(&q.delegations).filter(|s| DELEGATION_STATUSES.contains(&s.as_str())).unwrap_or("all".into());
+    let status =
+        non_empty(&q.status).filter(|s| PLAN_STATUSES.contains(&s.as_str())).unwrap_or("active".into());
+    let dstatus = non_empty(&q.delegations)
+        .filter(|s| DELEGATION_STATUSES.contains(&s.as_str()))
+        .unwrap_or("all".into());
     let plans = ui.read("plan_list", json!({ "status": status, "limit": 200 })).await.map(|v| {
         list(&v, "plans")
             .iter()
@@ -94,7 +96,13 @@ pub async fn plans(ui: Ui, Query(q): Query<PlansQuery>) -> PlansPage {
                 to_agent: text(d, "to_agent"),
                 status: text(d, "status"),
                 task_id: text(d, "task_id"),
-                summary: clip(text(d, "task_spec").lines().find(|l| !l.trim().is_empty() && !l.starts_with('#')).unwrap_or(""), 120),
+                summary: clip(
+                    text(d, "task_spec")
+                        .lines()
+                        .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                        .unwrap_or(""),
+                    120,
+                ),
                 deadline: text(d, "deadline"),
                 overdue: truthy(d, "overdue"),
             })
@@ -197,7 +205,11 @@ pub async fn delegation(ui: Ui, Path(id): Path<i64>) -> Response {
         Err(e) => {
             let status = crate::api::status_for(&e);
             let page = MissingPage {
-                page: ui.page("plans", "Delegation unavailable", Some(super::describe("delegation_manage", &e))),
+                page: ui.page(
+                    "plans",
+                    "Delegation unavailable",
+                    Some(super::describe("delegation_manage", &e)),
+                ),
                 what: format!("delegation {id}"),
                 back: "/ui/plans",
             };
