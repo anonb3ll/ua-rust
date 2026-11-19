@@ -10,10 +10,14 @@
 //! - Combined stdout/stderr go to `$UA_HOME/runs/<run_id>.log`, capped at the
 //!   harness's `output_cap_bytes`; the rest is read and discarded so the
 //!   child never blocks on a full pipe.
+//! - The run log directory is created 0700 and each log 0600.
 //! - Children this process started are kept in an in-process registry keyed
-//!   by run id. Only those are ever signalled: a pid recorded by an earlier
-//!   hub process may have been reused, so a stop against it is reported as
-//!   `not_ours` (cessation unknown) rather than attempted.
+//!   by run id and are signalled directly. A pid recorded by an earlier hub
+//!   process is signalled only when it is proven to be that run's orphan
+//!   ([`orphan_proof`]): on Linux the recorded process start time and group
+//!   must still match, and the hub process that started it must be gone.
+//!   Anything short of that proof is reported as `not_ours` (cessation
+//!   unknown) and nothing is signalled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,7 +32,9 @@ use tokio::sync::Notify;
 use ua_core::config::HarnessConfig;
 use ua_core::{Config, UaError, UaResult};
 
-use super::{Edge, ExitInfo, Outcome, after_seconds, load_run, now, record_transition, refusal, transition};
+use super::{
+    Edge, ExitInfo, Outcome, Run, after_seconds, load_run, now, record_transition, refusal, transition,
+};
 use crate::hub::Hub;
 
 /// Parent environment names any child may inherit.
@@ -190,10 +196,24 @@ fn live_insert(run_id: &str, fence: i64, pgid: Option<u32>, kill: Arc<Notify>) {
     }
 }
 
-fn live_remove(run_id: &str, fence: i64) {
+/// Drop this process's registration of `run_id` at `fence`. Returns false
+/// when it was already gone (replaced by a newer fence, or forgotten).
+fn live_remove(run_id: &str, fence: i64) -> bool {
     if let Ok(mut m) = LIVE.lock()
         && m.get(run_id).is_some_and(|c| c.fence == fence)
     {
+        m.remove(run_id);
+        return true;
+    }
+    false
+}
+
+/// Test hook: forget that this process supervises `run_id`, as a restart
+/// would. The supervisor task keeps waiting on the child but no longer
+/// reports its outcome; the run is then the reaper's to reconcile.
+#[doc(hidden)]
+pub fn forget_supervision(run_id: &str) {
+    if let Ok(mut m) = LIVE.lock() {
         m.remove(run_id);
     }
 }
@@ -240,20 +260,143 @@ pub fn pid_is_alive(pid: Option<i64>) -> bool {
     pid.is_some_and(pid_alive)
 }
 
-/// Attempt to stop a run's process. Returns `killed` (a child of this
-/// process, signalled), `already_gone` (no process recorded, or the recorded
-/// pid no longer exists) or `not_ours` (a pid this process cannot vouch for
-/// is alive; nothing is signalled).
-pub fn terminate(run_id: &str, pid: Option<i64>) -> &'static str {
-    let ours = LIVE.lock().ok().and_then(|m| m.get(run_id).map(|c| (c.pgid, c.kill.clone())));
+/// What `/proc/<pid>/stat` says about a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcIdentity {
+    /// Process state letter (`R`, `S`, `Z`, ...).
+    pub state: char,
+    /// Process group id (field 5).
+    pub pgrp: i64,
+    /// Start time in clock ticks after boot (field 22).
+    pub start_time: i64,
+}
+
+impl ProcIdentity {
+    fn exited(&self) -> bool {
+        matches!(self.state, 'Z' | 'X' | 'x')
+    }
+}
+
+/// Read a process's identity. `None` when the process does not exist, or
+/// always on platforms without `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+pub fn proc_identity(pid: i64) -> Option<ProcIdentity> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may hold spaces and parentheses; fields resume after
+    // the last `)`, starting with field 3 (state).
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    Some(ProcIdentity {
+        state: f.first()?.chars().next()?,
+        pgrp: f.get(2)?.parse().ok()?,
+        start_time: f.get(19)?.parse().ok()?,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn proc_identity(_pid: i64) -> Option<ProcIdentity> {
+    None
+}
+
+/// This hub process's pid and start time, when the platform reports it.
+pub fn own_identity() -> Option<(i64, i64)> {
+    static OWN: LazyLock<Option<(i64, i64)>> = LazyLock::new(|| {
+        let pid = i64::from(std::process::id());
+        proc_identity(pid).map(|p| (pid, p.start_time))
+    });
+    *OWN
+}
+
+/// What a recorded pid turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proof {
+    /// The recorded process no longer exists (exited, or its pid now names
+    /// a different process).
+    Gone,
+    /// The recorded child is still running, its group is intact and the hub
+    /// process that started it is gone (or is this process, which no longer
+    /// supervises it): its group may be signalled.
+    Orphan { pgid: i64 },
+    /// Not enough evidence to touch it.
+    Unproven,
+}
+
+/// Decide whether a run's recorded pid is this hub's orphan. Needs the
+/// start times recorded at launch, so it only ever proves anything on Linux.
+pub(crate) fn orphan_proof(run: &Run) -> Proof {
+    let (Some(pid), Some(start), Some(pgid)) = (run.pid, run.pid_start_time, run.pgid) else {
+        return Proof::Unproven;
+    };
+    let Some(own) = own_identity() else { return Proof::Unproven };
+    let Some(now) = proc_identity(pid) else {
+        // /proc works here (we read our own entry): the pid is gone.
+        return Proof::Gone;
+    };
+    if now.start_time != start || now.exited() {
+        return Proof::Gone;
+    }
+    // Never the hub's own group.
+    let own_group = proc_identity(own.0).map(|p| p.pgrp);
+    if now.pgrp != pgid || pgid <= 1 || own_group == Some(pgid) {
+        return Proof::Unproven;
+    }
+    let (Some(spid), Some(sstart)) = (run.supervisor_pid, run.supervisor_start_time) else {
+        return Proof::Unproven;
+    };
+    if (spid, sstart) == own {
+        // We started it and no longer supervise it (the caller checked).
+        return Proof::Orphan { pgid };
+    }
+    match proc_identity(spid) {
+        Some(sup) if sup.start_time == sstart && !sup.exited() => Proof::Unproven,
+        _ => Proof::Orphan { pgid },
+    }
+}
+
+/// Wait up to two seconds for a proven orphan to disappear.
+fn wait_gone(pid: i64, start: i64) -> bool {
+    for _ in 0..40 {
+        match proc_identity(pid) {
+            None => return true,
+            Some(p) if p.start_time != start || p.exited() => return true,
+            Some(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    false
+}
+
+/// Attempt to stop a run's process. Blocking (it may wait briefly for an
+/// orphan to exit). Returns `killed` (a child this process supervises,
+/// signalled), `killed_orphan` (a proven orphan, signalled and gone),
+/// `kill_unconfirmed` (a proven orphan, signalled, still present),
+/// `already_gone` (no process recorded, or the recorded one no longer
+/// exists) or `not_ours` (a live pid this process cannot vouch for; nothing
+/// is signalled).
+pub(crate) fn terminate(run: &Run) -> &'static str {
+    let ours = LIVE.lock().ok().and_then(|m| m.get(&run.run_id).map(|c| (c.pgid, c.kill.clone())));
     if let Some((pgid, kill)) = ours {
         kill_group(pgid);
         kill.notify_one();
         return "killed";
     }
-    match pid {
-        Some(p) if pid_alive(p) => "not_ours",
-        _ => "already_gone",
+    let Some(pid) = run.pid else { return "already_gone" };
+    if !pid_alive(pid) {
+        return "already_gone";
+    }
+    match orphan_proof(run) {
+        Proof::Gone => "already_gone",
+        Proof::Unproven => "not_ours",
+        Proof::Orphan { pgid } => {
+            kill_group(u32::try_from(pgid).ok());
+            if wait_gone(pid, run.pid_start_time.unwrap_or_default()) {
+                "killed_orphan"
+            } else {
+                "kill_unconfirmed"
+            }
+        }
     }
 }
 
@@ -362,6 +505,10 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         Ok(v) => v,
         Err(e) => {
             let reason = format!("spawn_failed: {}", e.kind());
+            // A missing or unexecutable program, or an argument list the OS
+            // refuses, will fail the same way on every retry.
+            let (state, class) =
+                if spawn_error_is_config(&e) { ("failed", "config") } else { ("retryable", "launch") };
             let (rid, actor) = (spec.run_id.clone(), spec.actor.clone());
             let res = hub
                 .db()
@@ -371,12 +518,12 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
                         Outcome {
                             run_id: &rid,
                             fence: Some(fence),
-                            state: "retryable",
+                            state,
                             actor: &actor,
                             source: "launcher",
                             evidence: None,
                             failure_reason: Some(reason),
-                            failure_class: Some("launch".into()),
+                            failure_class: Some(class.into()),
                             usage: None,
                         },
                     )
@@ -392,6 +539,13 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
     let pid = child.id();
     let kill = Arc::new(Notify::new());
     live_insert(&spec.run_id, spec.fence, pid, kill.clone());
+    // The child leads its own group (unix), so its pgid is its pid. The start
+    // time (read while the child is certainly ours) proves later that a pid
+    // was not reused.
+    let pid_i = pid.map(i64::from);
+    let pgid = if cfg!(unix) { pid_i } else { None };
+    let start_time = pid_i.and_then(proc_identity).map(|p| p.start_time);
+    let (sup_pid, sup_start) = own_identity().unzip();
 
     // launched -> running, recording the pid. A cancel that landed first
     // refuses this write; the launcher then stops its own child.
@@ -405,7 +559,11 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
                 return Ok(false);
             }
             let edge = Edge::to("running")
-                .set("pid", pid.map(i64::from))
+                .set("pid", pid_i)
+                .set("pgid", pgid)
+                .set("pid_start_time", start_time)
+                .set("supervisor_pid", sup_pid)
+                .set("supervisor_start_time", sup_start)
                 .set("started_at", now())
                 .set("log_path", log_s)
                 .set("lease_expires_at", after_seconds(lease));
@@ -468,11 +626,39 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
     Ok(reply)
 }
 
+fn spawn_error_is_config(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::E2BIG) {
+        return true;
+    }
+    matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied)
+}
+
+/// Open (append) a run log: the directory 0700, the file 0600, both
+/// tightened if they already existed.
 async fn open_log(path: &Path, spec: &LaunchSpec) -> std::io::Result<tokio::fs::File> {
     if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir).await?;
+        let mut b = tokio::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        b.mode(0o700);
+        b.create(dir).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+        }
     }
-    let mut f = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await?;
+    let mut o = tokio::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    let mut f = o.open(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600)).await?;
+    }
     let header = format!(
         "== run {} fence {} harness {} started {} ==\n",
         spec.run_id,
@@ -590,7 +776,10 @@ async fn supervise(
             }
         }
     }
-    live_remove(&spec.run_id, spec.fence);
+    // A supervisor whose registration is gone (superseded, or forgotten as
+    // after a restart) records the exit but leaves the outcome to whoever
+    // owns the run now.
+    let still_ours = live_remove(&spec.run_id, spec.fence);
 
     let (written, total) = {
         let mut s = sink.lock().await;
@@ -630,6 +819,9 @@ async fn supervise(
         .db()
         .write_async(move |tx| {
             super::record_exit(tx, &rid, fence, &exit)?;
+            if !still_ours {
+                return Ok(json!({ "ok": false, "reason": "not_supervised" }));
+            }
             super::record_outcome(
                 tx,
                 Outcome {
