@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent, status);
 
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    tool TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+",
+};
+
+/// Per-call telemetry written by the registry wrapper.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "core.v2",
+    sql: "
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tool TEXT NOT NULL,
@@ -105,12 +118,5 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool, started_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_caller ON tool_calls(caller, started_at);
-
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key TEXT PRIMARY KEY,
-    tool TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
 ",
 };
