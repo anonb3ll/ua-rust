@@ -494,6 +494,11 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
     assert_eq!(p["argv"][0], "/bin/sh");
     assert_eq!(p["prompt_source"], "task");
     assert_eq!(p["prompt_sha256"].as_str().unwrap().len(), 64);
+    // The approver sees the prompt the hub built from the task.
+    let preview = p["prompt_text"].as_str().unwrap();
+    assert!(preview.starts_with(&format!("Task #{tid}: Port the widget")), "{p}");
+    assert!(preview.contains("dispatch_report_self"), "{p}");
+    assert_eq!(p["prompt_bytes"], json!(preview.len()), "a short prompt is shown whole");
     assert!(p["run_id"].as_str().unwrap().starts_with(&format!("run-{tid}-")));
     assert!(p.get("passes_token_of").is_none(), "no token is passed: {p}");
     h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
@@ -542,6 +547,76 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
         h.scalar(&format!("SELECT prompt_sha256 FROM dispatch_runs WHERE run_id = '{rid}'")),
         h.approval_payload(linked)["prompt_sha256"]
     );
+}
+
+#[tokio::test]
+async fn a_task_prompt_and_an_args_prompt_are_both_shown_whole() {
+    let h = H::new();
+    let me = agent("agent-1");
+    let tid = h.task().await;
+    h.sql(&format!("UPDATE tasks SET notes = '{}' WHERE id = {tid}", "\u{e9}".repeat(3000)));
+    let args = json!({ "task_id": tid, "agent": "agent-1" });
+    let UaError::ApprovalRequired { approval_id, .. } = h.err(&me, "dispatch_task", args).await else {
+        panic!()
+    };
+    let p = h.approval_payload(approval_id);
+    let text = p["prompt_text"].as_str().unwrap();
+    assert!(text.contains(&"\u{e9}".repeat(3000)), "nothing is cut from the approver's view: {p}");
+    assert_eq!(p["prompt_bytes"], json!(text.len()), "{p}");
+    assert!(p.get("prompt").is_none());
+
+    let tid2 = h.task().await;
+    let args = json!({ "task_id": tid2, "agent": "agent-1", "prompt": "do the thing" });
+    let UaError::ApprovalRequired { approval_id, .. } = h.err(&me, "dispatch_task", args).await else {
+        panic!()
+    };
+    let p = h.approval_payload(approval_id);
+    assert_eq!(p["prompt"], "do the thing");
+    assert_eq!(p["prompt_source"], "args");
+    assert!(p.get("prompt_text").is_none() && p.get("prompt_bytes").is_none(), "{p}");
+}
+
+/// The stale-pass check reads only unexpired passes, and only the latest
+/// few, inside the write transaction.
+#[tokio::test]
+async fn stale_pass_detection_is_bounded() {
+    let h = H::new();
+    let me = agent("agent-1");
+    let tid = h.task().await;
+    let args = json!({ "task_id": tid, "agent": "agent-1" });
+    let UaError::ApprovalRequired { approval_id, .. } = h.err(&me, "dispatch_task", args.clone()).await
+    else {
+        panic!()
+    };
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    h.sql(&format!("UPDATE tasks SET notes = 'changed' WHERE id = {tid}"));
+    let e = h.err(&me, "dispatch_task", args.clone()).await;
+    assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+
+    // Fifty newer passes for other calls push it out of the scan.
+    let now = ua_core::time::now();
+    let rows: Vec<String> = (0..50)
+        .map(|i| {
+            format!(
+                "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at, resolved_at) \
+                 VALUES ('dispatch_task', '{{\"task_id\":{}}}', 'agent-1', 'approved', '{now}', '{now}', '{now}');",
+                10_000 + i
+            )
+        })
+        .collect();
+    h.sql(&rows.join("\n"));
+    let e = h.err(&me, "dispatch_task", args.clone()).await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e}");
+    h.sql("DELETE FROM approvals WHERE json_extract(payload, '$.task_id') >= 10000");
+    let e = h.err(&me, "dispatch_task", args.clone()).await;
+    assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+
+    // An expired pass is not reported either.
+    h.sql(&format!(
+        "UPDATE approvals SET resolved_at = '2000-01-01T00:00:00+00:00' WHERE id = {approval_id}"
+    ));
+    let e = h.err(&me, "dispatch_task", args).await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e}");
 }
 
 #[tokio::test]
@@ -804,30 +879,98 @@ mod spawn {
         );
     }
 
+    /// A process group standing in for a harness an earlier hub process
+    /// launched: `/bin/sh -c script` leads a new group. A thread reaps the
+    /// leader when it exits, as init does once that hub is gone. Returns the
+    /// leader's pid and start time, its stdin, and its stdout lines.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_group(
+        script: &str,
+    ) -> (i64, i64, std::process::ChildStdin, std::io::Lines<std::io::BufReader<std::process::ChildStdout>>)
+    {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        let start = executor::proc_identity(pid).expect("the leader is running").start_time;
+        let stdin = child.stdin.take().unwrap();
+        let lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (pid, start, stdin, lines)
+    }
+
+    /// Point a stub run at a recorded child and its supervising hub process,
+    /// and let its lease run out.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn record_child(h: &H, rid: &str, pid: i64, start: i64, supervisor: (i64, i64)) {
+        h.sql(&format!(
+            "UPDATE dispatch_runs SET pid = {pid}, pgid = {pid}, pid_start_time = {start}, \
+             supervisor_pid = {}, supervisor_start_time = {}, \
+             lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE run_id = '{rid}'",
+            supervisor.0, supervisor.1
+        ));
+    }
+
+    /// A supervisor identity that is proven gone: this process's pid with a
+    /// start time it never had (the pid was reused).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn gone_supervisor() -> (i64, i64) {
+        (i64::from(std::process::id()), 1)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn wait_dead(pid: i64) -> bool {
+        for _ in 0..50 {
+            if !executor::pid_is_alive(Some(pid)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// The launch records what the orphan proof needs: the child's pid,
+    /// group and start time, and the supervising hub process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_launch_records_the_child_identity() {
+        let h = H::new();
+        let tid = h.task().await;
+        let run = h.dispatch(tid, Some("sleep")).await;
+        let rid = run["run_id"].as_str().unwrap().to_string();
+        let pid = run["pid"].as_i64().unwrap();
+        let col = |c: &str| h.scalar(&format!("SELECT {c} FROM dispatch_runs WHERE run_id = '{rid}'"));
+        assert_eq!(col("pgid"), json!(pid));
+        assert_eq!(col("pid_start_time"), json!(executor::proc_identity(pid).unwrap().start_time));
+        assert_eq!(col("supervisor_pid"), json!(std::process::id()));
+        assert_eq!(col("supervisor_start_time"), json!(executor::own_identity().unwrap().1));
+        let c = h.ok(&agent("agent-1"), "dispatch_cancel", json!({ "run_id": rid })).await;
+        assert_eq!(c["termination"], "killed");
+        h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
     /// A restarted hub finds a run whose child is still running: it proves
-    /// the pid is its orphan (start time and group match, the supervisor no
-    /// longer holds it), kills the group and hands the run back.
-    #[cfg(target_os = "linux")]
+    /// the pid is its orphan (start time and group match, the supervisor is
+    /// gone), kills the group and hands the run back.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn the_restart_sweep_kills_a_proven_orphan() {
         let h = H::new();
         let tid = h.task().await;
-        let run = h.dispatch(tid, Some("sleep")).await;
-        assert_eq!(run["state"], "running", "{run}");
-        let rid = run["run_id"].as_str().unwrap().to_string();
-        let pid = run["pid"].as_i64().unwrap();
-        assert_eq!(h.scalar(&format!("SELECT pgid FROM dispatch_runs WHERE run_id = '{rid}'")), json!(pid));
-        assert!(
-            h.scalar(&format!("SELECT pid_start_time FROM dispatch_runs WHERE run_id = '{rid}'")).is_i64()
-        );
-
-        // The restart: this process no longer supervises the child, and the
-        // lease ran out while nobody renewed it.
-        executor::forget_supervision(&rid);
+        let rid = h.dispatch(tid, None).await["run_id"].as_str().unwrap().to_string();
+        let (pid, start, _stdin, _out) = spawn_group("exec sleep 30");
+        record_child(&h, &rid, pid, start, gone_supervisor());
         assert!(!executor::supervises(&rid, 1));
-        h.sql(&format!(
-            "UPDATE dispatch_runs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE run_id = '{rid}'"
-        ));
+
         let swept = reap_expired_leases(&h.hub).unwrap();
         assert_eq!(swept["reclaimed"][0]["run_id"], json!(rid), "{swept}");
         assert_eq!(swept["reclaimed"][0]["termination"], "killed_orphan");
@@ -836,27 +979,62 @@ mod spawn {
             h.scalar(&format!("SELECT failure_reason FROM dispatch_runs WHERE run_id = '{rid}'")),
             "lease_expired_orphan_killed"
         );
-        let mut alive = true;
-        for _ in 0..50 {
-            alive = executor::proc_identity(pid).is_some_and(|p| p.state != 'Z');
-            if !alive {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(!alive, "the orphan {pid} survived the sweep");
+        assert!(wait_dead(pid).await, "the orphan {pid} survived the sweep");
 
         // Cessation is proven, so the run can be resumed.
         let resumed = h.gated(&agent("agent-1"), "dispatch_resume", json!({ "run_id": rid })).await.unwrap();
         assert_eq!(resumed["fence"], 2, "{resumed}");
-        let c = h.ok(&agent("agent-1"), "dispatch_cancel", json!({ "run_id": rid })).await;
-        assert_eq!(c["cessation"], "confirmed");
-        h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
+    }
+
+    /// The recorded leader exited but a child it forked still holds the
+    /// group: the run is not reported stopped. Without proof that the
+    /// supervising hub is gone nothing is signalled and the outcome is
+    /// unknown; with it, the group is killed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_group_outliving_its_leader_is_not_already_gone() {
+        let h = H::new();
+        let (pid, start, stdin, mut out) =
+            spawn_group("sleep 30 </dev/null >/dev/null 2>&1 & echo $!; read x; exit 0");
+        let member: i64 = out.next().unwrap().unwrap().trim().parse().unwrap();
+        drop(stdin);
+        assert!(wait_dead(pid).await, "the leader {pid} did not exit");
+        assert!(executor::pid_is_alive(Some(member)));
+
+        // The supervisor is still alive (here: the group member itself).
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, None).await["run_id"].as_str().unwrap().to_string();
+        let live_sup = (member, executor::proc_identity(member).unwrap().start_time);
+        record_child(&h, &rid, pid, start, live_sup);
+        let swept = reap_expired_leases(&h.hub).unwrap();
+        assert_eq!(swept["failed"][0]["run_id"], json!(rid), "{swept}");
+        assert_eq!(swept["failed"][0]["termination"], "not_ours");
+        assert_eq!(
+            h.scalar(&format!("SELECT failure_reason FROM dispatch_runs WHERE run_id = '{rid}'")),
+            "lease_expired_outcome_unknown"
+        );
+        assert!(executor::pid_is_alive(Some(member)), "nothing was signalled");
+
+        // The supervisor is proven gone: the group is killed.
+        let tid2 = h.task().await;
+        let rid2 = h.dispatch(tid2, None).await["run_id"].as_str().unwrap().to_string();
+        record_child(&h, &rid2, pid, start, gone_supervisor());
+        let swept = reap_expired_leases(&h.hub).unwrap();
+        assert_eq!(swept["reclaimed"][0]["run_id"], json!(rid2), "{swept}");
+        assert_eq!(swept["reclaimed"][0]["termination"], "killed_orphan");
+        assert!(wait_dead(member).await, "the group member {member} survived the sweep");
+
+        // Once the group is empty the run is already gone.
+        let tid3 = h.task().await;
+        let rid3 = h.dispatch(tid3, None).await["run_id"].as_str().unwrap().to_string();
+        record_child(&h, &rid3, pid, start, gone_supervisor());
+        let swept = reap_expired_leases(&h.hub).unwrap();
+        assert_eq!(swept["reclaimed"][0]["termination"], "already_gone", "{swept}");
     }
 
     /// A pid whose start time does not match the record was reused: the
     /// recorded child is gone, and nothing is signalled.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_reused_pid_is_gone_not_ours() {
         let h = H::new();

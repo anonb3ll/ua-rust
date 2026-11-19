@@ -340,8 +340,26 @@ fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
 /// Argument keys of a `dispatch_task` approval payload; the rest of the
 /// payload is the binding resolved from them.
 const ARG_KEYS: [&str; 5] = ["task_id", "agent", "harness", "prompt", "lease_seconds"];
-const BOUND_KEYS: [&str; 7] =
-    ["run_id", "workdir", "argv", "env_allowlist", "prompt_source", "prompt_sha256", "passes_token_of"];
+const BOUND_KEYS: [&str; 9] = [
+    "run_id",
+    "workdir",
+    "argv",
+    "env_allowlist",
+    "prompt_source",
+    "prompt_sha256",
+    "prompt_bytes",
+    "prompt_text",
+    "passes_token_of",
+];
+
+/// The longest prompt built from a task that may be approved. The approver
+/// is shown the whole text, never a preview: task notes are agent-writable,
+/// so anything cut from view could carry instructions nobody read. Longer
+/// prompts must be passed explicitly in `prompt`.
+const PROMPT_SHOW_MAX_CHARS: usize = 16_000;
+
+/// How many recent passes [`stale_pass`] looks at.
+const STALE_PASS_SCAN: i64 = 50;
 
 /// A run id that is stable between the call that requests the approval and
 /// the call that consumes it: derived from a random per-database salt, the
@@ -375,19 +393,25 @@ fn default_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str) -> Stri
     )
 }
 
-/// An approved, unconsumed pass for the same arguments whose binding no
-/// longer matches: its id and the bound fields that changed.
+/// An approved, unconsumed, unexpired pass for the same arguments whose
+/// binding no longer matches: its id and the bound fields that changed. Only
+/// the latest [`STALE_PASS_SCAN`] passes within the pass TTL are read.
 fn stale_pass(
     tx: &rusqlite::Connection,
+    cfg: &ua_core::Config,
     requester: &str,
     payload: &Value,
 ) -> UaResult<Option<(i64, Vec<String>)>> {
+    let ttl = jiff::SignedDuration::from_secs((cfg.approval_pass_ttl_hours.max(0.0) * 3600.0) as i64);
+    let cutoff =
+        ua_core::time::format_ts(jiff::Timestamp::now().checked_sub(ttl).unwrap_or(jiff::Timestamp::MIN));
     let mut stmt = tx.prepare(
         "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND requested_by = ?1 \
-         AND status = 'approved' ORDER BY id DESC",
+         AND status = 'approved' AND resolved_at >= ?2 ORDER BY id DESC LIMIT ?3",
     )?;
-    let rows: Vec<(i64, String)> =
-        stmt.query_map([requester], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(params![requester, cutoff, STALE_PASS_SCAN], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
     for (id, text) in rows {
         let Ok(old) = serde_json::from_str::<Value>(&text) else { continue };
         if ARG_KEYS.iter().any(|k| old.get(k) != payload.get(k)) {
@@ -488,8 +512,21 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 "prompt_source": source,
                 "prompt_sha256": prompt_sha,
             });
-            if let Some(p) = &a.prompt {
-                payload["prompt"] = json!(p);
+            match &a.prompt {
+                Some(p) => payload["prompt"] = json!(p),
+                // The approver sees the whole prompt the hub built from the
+                // task, as they see a prompt passed in the arguments.
+                None => {
+                    if prompt.chars().count() > PROMPT_SHOW_MAX_CHARS {
+                        return Err(UaError::invalid(format!(
+                            "the prompt built from task {} is longer than {PROMPT_SHOW_MAX_CHARS} characters, \
+                             too long to show the approver in full; pass `prompt` explicitly",
+                            a.task_id
+                        )));
+                    }
+                    payload["prompt_bytes"] = json!(prompt.len());
+                    payload["prompt_text"] = json!(prompt);
+                }
             }
             if h2.as_ref().is_some_and(|(_, h)| h.pass_agent_token) {
                 payload["passes_token_of"] = json!(ag);
@@ -497,7 +534,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_task", &payload)? {
                 GateOutcome::Pass { approval_id } => approval_id,
                 GateOutcome::Pending { approval_id } => {
-                    let stale = stale_pass(tx, &caller.label, &payload)?;
+                    let stale = stale_pass(tx, hub.cfg(), &caller.label, &payload)?;
                     return Ok(Gated::Pending { approval_id, stale });
                 }
                 GateOutcome::Denied { approval_id, reason } => return Ok(Gated::Denied { approval_id, reason }),

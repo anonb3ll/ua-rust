@@ -52,6 +52,7 @@ call's arguments. The approval payload holds:
 | `workdir` | The resolved, canonical directory the harness will run in. |
 | `argv`, `env_allowlist` | The harness's argv template and environment allowlist. |
 | `prompt_source`, `prompt_sha256` | Where the prompt came from (`args` or `task`) and the SHA-256 of the exact prompt text. |
+| `prompt_preview`, `prompt_bytes` | For a prompt the hub built from the task: its first 2,000 characters and its full length in bytes, so the approver sees what will run. |
 | `passes_token_of` | Present when the harness passes the agent's own hub bearer token to the child. |
 
 The approved call is consumed only when every field still matches. If the
@@ -61,6 +62,10 @@ changed after the approval, the call is refused with
 requests a new approval for the current values. The consumed approval is
 linked to the run in the same transaction. A receipt reports `approved` only
 when such a linked row exists, and `unlinked` when it does not.
+
+A pass that no longer matches what would run is reported as
+`approval_binding_changed` only when it is within the pass TTL and among the
+requester's 50 latest approved `dispatch_task` passes.
 
 Because the tool gates itself, adding `dispatch_task` to `approval_tools` or
 to a policy `require_approval` rule adds a second approval of the raw
@@ -76,19 +81,25 @@ passed. `ua serve` runs one reaper sweep at startup, then one every
 process's children.
 
 At launch the hub records the child's pid, process group and start time,
-and its own pid and start time. The start times come from field 22 of
-`/proc/<pid>/stat` and are recorded on Linux only. A later hub process treats
-a still-running pid as its own orphan only when all of these hold:
+and its own pid and start time. On Linux the start times come from field 22
+of `/proc/<pid>/stat`; on macOS from `proc_pidinfo(PROC_PIDTBSDINFO)`. The
+child leads its own group, so the group id is its pid. A later hub process
+judges a recorded run like this:
 
-- the start time and process group still match the recorded ones, so the
-  pid was not reused;
-- the hub process that started the child is gone.
+- If the pid now names a process with another start time, the pid was
+  reused, which the OS allows only after the old group emptied: the run is
+  `already_gone`.
+- If the recorded child exited, or is still running in its group, the hub
+  probes the group (`killpg(pgid, 0)`). An empty group is `already_gone`.
+- If anything in the group still runs, the hub kills the whole group only
+  when the hub process that started the child is gone. The run is then
+  handed back as `retryable` (`lease_expired_orphan_killed`) or its
+  cancellation is confirmed, once the group is empty.
 
-When they hold, the hub kills the whole group, and the run is handed back as
-`retryable` (`lease_expired_orphan_killed`) or its cancellation is confirmed.
-Without that proof, for example on other platforms, a live pid is reported
-as `not_ours`. Nothing is signalled, the expired run fails with
-`lease_expired_outcome_unknown`, and an operator must confirm cessation.
+Without that proof, for example when the starting hub is still alive or on
+other platforms, the run is reported as `not_ours`. Nothing is signalled,
+the expired run fails with `lease_expired_outcome_unknown`, and an operator
+must confirm cessation.
 
 ## The child's boundary
 

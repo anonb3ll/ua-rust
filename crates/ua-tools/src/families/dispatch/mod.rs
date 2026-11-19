@@ -20,6 +20,7 @@
 //! resumed until an operator retries or confirms the cancellation.
 
 pub mod executor;
+mod procinfo;
 pub mod reaper;
 pub mod states;
 mod tools;

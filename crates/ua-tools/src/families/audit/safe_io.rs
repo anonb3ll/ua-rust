@@ -68,6 +68,22 @@ fn nofollow_flags(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
+/// Payload of the hard-link refusal, so callers can name the cause.
+#[derive(Debug)]
+pub struct HardLink;
+
+impl std::fmt::Display for HardLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("file has more than one hard link")
+    }
+}
+
+impl std::error::Error for HardLink {}
+
+pub fn is_hardlink(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|x| x.downcast_ref::<HardLink>().is_some())
+}
+
 fn refuse() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
 }
@@ -78,11 +94,29 @@ const REPLACE_LIMIT: u64 = 8 << 20;
 /// a file that appeared after the scan, and `O_NOFOLLOW` plus the exclusive
 /// create refuse a symlink at the path.
 pub fn create_regular_text(path: &Path, text: &str) -> std::io::Result<()> {
+    create_with(path, |f| f.write_all(text.as_bytes()))
+}
+
+/// Create `path` exclusively and fill it with `write`. We created the file,
+/// so any failure after the create removes it again: a partial file would
+/// block every later run with "already exists".
+fn create_with(path: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     nofollow_flags(&mut opts);
     let mut file = opts.open(path)?;
-    file.write_all(text.as_bytes())
+    if let Err(e) = write(&mut file).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Err(e) = File::open(dir).and_then(|d| d.sync_all())
+    {
+        tracing::warn!(kind = ?e.kind(), "audit: created file but the directory sync failed");
+    }
+    Ok(())
 }
 
 /// Read `path` (a regular file, never followed through a symlink) from ONE
@@ -102,6 +136,14 @@ pub fn replace_regular_text(
     if !meta.is_file() || meta.len() > REPLACE_LIMIT {
         return Err(refuse());
     }
+    // A rename over a hardlinked file would split the link.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::other(HardLink));
+        }
+    }
     let mut buf = Vec::new();
     (&mut file).take(REPLACE_LIMIT + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > REPLACE_LIMIT {
@@ -120,6 +162,12 @@ pub fn replace_regular_text(
         let mut topts = OpenOptions::new();
         topts.write(true).create_new(true);
         nofollow_flags(&mut topts);
+        // Never wider than the original, even before the final chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            topts.mode(meta.mode() & 0o7777);
+        }
         let mut t = topts.open(&tmp)?;
         t.write_all(new.as_bytes())?;
         t.set_permissions(meta.permissions())?;
@@ -131,13 +179,33 @@ pub fn replace_regular_text(
             if now.dev() != meta.dev() || now.ino() != meta.ino() {
                 return Err(std::io::Error::other("file was replaced during the update"));
             }
+            // The same descriptor must still show what was read: an in-place
+            // edit since then would be silently overwritten.
+            let cur = file.metadata()?;
+            if cur.len() != meta.len()
+                || cur.mtime() != meta.mtime()
+                || cur.mtime_nsec() != meta.mtime_nsec()
+                || cur.ctime() != meta.ctime()
+                || cur.ctime_nsec() != meta.ctime_nsec()
+                || cur.nlink() != 1
+            {
+                return Err(std::io::Error::other("file was modified during the update"));
+            }
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return result.map(|()| true);
     }
-    result.map(|()| true)
+    // The file is already replaced: a failing directory sync must not report
+    // the change as not applied (the caller would leave it out of the ledger).
+    #[cfg(unix)]
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(kind = ?e.kind(), "audit: replaced file but the directory sync failed");
+    }
+    Ok(true)
 }
 
 /// The whole file as strictly valid UTF-8, read from one descriptor that never
@@ -170,6 +238,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_create_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        let err = create_with(&f, |w| {
+            w.write_all(b"par")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(!f.exists(), "partial file removed");
+        create_regular_text(&f, "ok").unwrap();
+        // An existing file we did not create is never removed on refusal.
+        assert!(create_with(&f, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "ok");
+    }
+
+    #[test]
     fn symlinks_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.txt");
@@ -199,6 +284,35 @@ mod tests {
         assert!(replace_regular_text(&f, |b| Ok(Some(format!("{}!", String::from_utf8_lossy(b))))).unwrap());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "old!");
         assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file is left");
+    }
+
+    #[test]
+    fn hardlinked_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::hard_link(&f, dir.path().join("b.txt")).unwrap();
+        assert!(replace_regular_text(&f, |_| Ok(Some("new".into()))).is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn an_in_place_edit_between_read_and_commit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        let err = replace_regular_text(&f, |_| {
+            // Same length, different bytes, edited in place.
+            let w = OpenOptions::new().write(true).open(&f)?;
+            (&w).write_all(b"mid")?;
+            w.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))?;
+            Ok(Some("new".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("modified"), "{err}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "mid");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp file is left");
     }
 
