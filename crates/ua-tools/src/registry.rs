@@ -191,7 +191,52 @@ impl Registry {
         }
 
         let ctx = ToolCtx { hub: hub.clone(), caller: caller.clone() };
-        (def.handler)(ctx, args).await
+        let started_at = ua_core::time::now();
+        let clock = std::time::Instant::now();
+        let result = (def.handler)(ctx, args).await;
+        record_call(hub, caller, name, started_at, clock.elapsed(), &result).await;
+        result
+    }
+}
+
+/// One row per completed call in `tool_calls` (no arguments, no results).
+async fn record_call(
+    hub: &Hub,
+    caller: &Caller,
+    tool: &str,
+    started_at: String,
+    elapsed: std::time::Duration,
+    result: &UaResult<Value>,
+) {
+    let outcome = match result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.code().to_string(),
+    };
+    let row = (
+        tool.to_string(),
+        caller.label.clone(),
+        caller.profile.as_str().to_string(),
+        serde_json::to_value(caller.transport)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        started_at,
+        elapsed.as_millis() as i64,
+        outcome,
+    );
+    let res = hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute(
+                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "could not record tool call");
     }
 }
 

@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent ON agent_sessions(agent, status);
 
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool TEXT NOT NULL,
+    caller TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    transport TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    outcome TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool, started_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_caller ON tool_calls(caller, started_at);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key TEXT PRIMARY KEY,
     tool TEXT NOT NULL,
