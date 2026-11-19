@@ -1,0 +1,63 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<h1>Work</h1>
+<form class="filters" method="get" action="/ui/work" role="search" aria-label="Filter tasks">
+  <label>Project
+    <select name="project">
+      <option value="">All projects</option>
+      {% for p in projects %}<option value="{{ p }}"{% if *p == project %} selected{% endif %}>{{ p }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Priority
+    <select name="priority">
+      <option value="">Any</option>
+      {% for p in priorities %}<option value="{{ p }}"{% if *p == priority.as_str() %} selected{% endif %}>{{ p }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Search <input type="search" name="q" value="{{ q }}" placeholder="title or notes"></label>
+  <button type="submit">Apply</button>
+  {% if search %}<a href="/ui/work">Clear search</a>{% endif %}
+</form>
+
+<details class="panel">
+  <summary>New task</summary>
+  <form class="stack" method="post" action="/ui/tasks">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>Title <input type="text" name="title" required maxlength="300"></label>
+    <label>Notes <textarea name="notes" rows="4"></textarea></label>
+    <div class="grid2">
+      <label>Priority
+        <select name="priority">{% for p in priorities %}<option value="{{ p }}"{% if *p == "med" %} selected{% endif %}>{{ p }}</option>{% endfor %}</select>
+      </label>
+      <label>Project <input type="text" name="project" value="{{ project }}" placeholder="default"></label>
+      <label>Lane <input type="text" name="lane" placeholder="default"></label>
+      <label>Parent task id <input type="text" name="parent_id" inputmode="numeric"></label>
+    </div>
+    <div><button class="primary" type="submit">Create task</button></div>
+  </form>
+</details>
+
+{% if search %}<p class="muted">Ranked search results for “{{ q }}”.</p>{% endif %}
+<div class="board">
+{% for c in columns %}
+  <section class="column" aria-labelledby="col-{{ c.status }}">
+    <h2 id="col-{{ c.status }}"><span>{{ c.label }}</span> <span class="chip">{{ c.cards.len() }}{% if c.truncated %}+{% endif %}</span></h2>
+    {% if let Some(e) = c.error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
+    <ul class="cards">
+    {% for t in c.cards %}
+      <li class="card">
+        <a class="title" href="/ui/tasks/{{ t.id }}">#{{ t.id }} {{ t.title }}</a>
+        <div class="meta">
+          <span class="chip {{ t.priority }}">{{ t.priority }}</span>
+          <span class="chip">{{ t.project }}</span>
+          {% if t.lane != "default" %}<span class="chip">lane {{ t.lane }}</span>{% endif %}
+          {% if !t.claimed_by.is_empty() %}<span class="chip">@{{ t.claimed_by }}</span>{% endif %}
+          {% if !t.urgency.is_empty() %}<span class="chip bad">{{ t.urgency }}</span>{% endif %}
+        </div>
+      </li>
+    {% endfor %}
+    </ul>
+  </section>
+{% endfor %}
+</div>
+{% endblock %}
