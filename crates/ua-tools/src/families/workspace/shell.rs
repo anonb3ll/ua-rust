@@ -1386,9 +1386,15 @@ struct HostRust {
     toolchain: Option<PathBuf>,
 }
 
-/// The last successful resolution. A failed one is not kept, so the next
-/// call tries again; a kept one is dropped once its toolchain is gone.
-static HOST_RUST: tokio::sync::Mutex<Option<Arc<HostRust>>> = tokio::sync::Mutex::const_new(None);
+/// The last resolution and when it was made. A successful one is kept until
+/// its toolchain is gone; a failed one (no toolchain found) is kept for
+/// [`HOST_RUST_RETRY`], so a host without a working default toolchain does
+/// not run `rustc` on every `run_cmd` call.
+type HostRustSlot = tokio::sync::Mutex<Option<(Arc<HostRust>, std::time::Instant)>>;
+static HOST_RUST: HostRustSlot = tokio::sync::Mutex::const_new(None);
+
+/// How long a failed toolchain lookup is reused before trying again.
+const HOST_RUST_RETRY: Duration = Duration::from_secs(60);
 
 impl HostRust {
     async fn get(ua_home: &Path) -> Arc<HostRust> {
@@ -1400,19 +1406,19 @@ impl HostRust {
 
     /// `slot`'s resolution while its toolchain still holds a `rustc`, else
     /// a fresh one, kept only when it found a toolchain.
-    async fn cached(
-        slot: &tokio::sync::Mutex<Option<Arc<HostRust>>>,
-        vars: &[(String, String)],
-        ua_home: &Path,
-    ) -> Arc<HostRust> {
+    async fn cached(slot: &HostRustSlot, vars: &[(String, String)], ua_home: &Path) -> Arc<HostRust> {
         let mut slot = slot.lock().await;
-        if let Some(host) = slot.as_ref()
-            && host.toolchain.as_ref().is_some_and(|bin| is_executable(&bin.join("rustc")))
-        {
-            return host.clone();
+        if let Some((host, at)) = slot.as_ref() {
+            let fresh = match &host.toolchain {
+                Some(bin) => is_executable(&bin.join("rustc")),
+                None => at.elapsed() < HOST_RUST_RETRY,
+            };
+            if fresh {
+                return host.clone();
+            }
         }
         let host = Arc::new(HostRust::resolve(vars, ua_home).await);
-        *slot = host.toolchain.is_some().then(|| host.clone());
+        *slot = Some((host.clone(), std::time::Instant::now()));
         host
     }
 
@@ -1823,34 +1829,38 @@ mod run_env_tests {
         );
     }
 
-    /// Only a resolution that found a toolchain is kept, and a kept one is
-    /// redone once its toolchain is gone.
+    /// A working toolchain is kept until it disappears; a failed lookup is
+    /// reused for `HOST_RUST_RETRY`, then tried again.
     #[cfg(unix)]
     #[tokio::test]
-    async fn only_a_working_toolchain_is_cached() {
+    async fn a_failed_lookup_is_retried_only_after_a_while() {
         let op = fake_operator();
         let ua_home = tempfile::tempdir().unwrap();
-        let slot = tokio::sync::Mutex::new(None);
-        // No rustc anywhere: nothing is cached.
+        let slot: HostRustSlot = tokio::sync::Mutex::new(None);
+        let expire = |slot: &mut Option<(Arc<HostRust>, std::time::Instant)>| {
+            let entry = slot.as_mut().unwrap();
+            entry.1 = std::time::Instant::now().checked_sub(HOST_RUST_RETRY * 2).unwrap();
+        };
+        // No rustc anywhere: the failure is kept for a while.
         let none = vec![("PATH".to_string(), "/nonexistent".to_string())];
-        let host = HostRust::cached(&slot, &none, ua_home.path()).await;
-        assert!(host.toolchain.is_none());
-        assert!(slot.lock().await.is_none(), "a failed resolution was kept");
-        // The next call resolves again and keeps the result.
+        let failed = HostRust::cached(&slot, &none, ua_home.path()).await;
+        assert!(failed.toolchain.is_none());
         let vars = vec![
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
             ("CARGO_HOME".to_string(), op.cargo_home.display().to_string()),
         ];
+        let still = HostRust::cached(&slot, &vars, ua_home.path()).await;
+        assert!(Arc::ptr_eq(&failed, &still), "a recent failure is reused, not re-run");
+        // Once it is old, the next call resolves again and keeps the result.
+        expire(&mut *slot.lock().await);
         let host = HostRust::cached(&slot, &vars, ua_home.path()).await;
         assert_eq!(host.toolchain.as_deref(), Some(op.toolchain_bin.as_path()));
         let again = HostRust::cached(&slot, &none, ua_home.path()).await;
         assert!(Arc::ptr_eq(&host, &again), "a working toolchain is reused");
-        // The toolchain disappears: resolved again (and, with nothing
-        // found, not kept).
+        // The toolchain disappears: resolved again at once.
         std::fs::remove_file(op.toolchain_bin.join("rustc")).unwrap();
         let after = HostRust::cached(&slot, &none, ua_home.path()).await;
         assert!(after.toolchain.is_none());
-        assert!(slot.lock().await.is_none());
     }
 
     /// With the real toolchain, when there is one: cargo run with the
