@@ -1846,6 +1846,7 @@ dependencies = [
  "tracing",
  "ua-core",
  "ua-store",
+ "ulid",
 ]
 
 [[package]]

@@ -4,9 +4,11 @@
 //! (if it has tables) and `pub fn register(r: &mut Registry)`, then add one
 //! line to each list below. Keep the lists alphabetical to make merges easy.
 
+pub mod agents;
 pub mod core_schema;
 pub mod delegation;
 pub mod events;
+pub mod messaging;
 pub mod plans;
 pub mod tasks;
 
@@ -19,14 +21,17 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     // family schema parts (alphabetical)
     parts.extend(tasks::schema_parts());
     parts.push(delegation::SCHEMA);
+    parts.push(messaging::SCHEMA);
     parts.push(plans::SCHEMA);
     parts
 }
 
 pub fn register(r: &mut Registry) {
     // family registrations (alphabetical)
+    agents::register(r);
     delegation::register(r);
     events::register(r);
+    messaging::register(r);
     plans::register(r);
     tasks::register(r);
 }
