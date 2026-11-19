@@ -36,9 +36,12 @@ UI prints JSON.
 
 ## Signing in
 
-The header links to `/login` and `/logout`. Without a browser session the UI
-runs as the local anonymous caller, which suits a hub bound to `127.0.0.1`.
-Do not expose `/ui` beyond localhost without browser sign-in.
+The header links to `/login` and `/logout`. The UI uses the same
+authentication as the rest of the hub: with `enforce_auth` on (the default)
+every `/ui` request needs a signed-in identity; with it off, a request without
+credentials runs as the local anonymous caller, which suits a hub bound to
+`127.0.0.1`. Do not turn `enforce_auth` off on a hub reachable from other
+machines.
 
 ## Security
 
