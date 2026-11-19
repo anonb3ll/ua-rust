@@ -819,6 +819,43 @@ mod spawn {
         h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
     }
 
+    /// A resume relaunches under the hub's current config. The approval for
+    /// it names only the run, so it must not run a harness whose argv, env
+    /// allowlist or token passing differ from what the run's approval bound.
+    #[tokio::test]
+    async fn a_resume_refuses_a_harness_changed_since_the_approval() {
+        let h = H::new();
+        let me = agent("agent-1");
+        let tid = h.task().await;
+        let rid = h.dispatch(tid, Some("exit3")).await["run_id"].as_str().unwrap().to_string();
+        assert_eq!(h.wait_for(&rid, |r| r["terminal"] == true).await["run_state"], "failed");
+
+        // The same database under an edited harness definition (a restart
+        // with a new config file).
+        let mut cfg = h.hub.cfg().clone();
+        let edited = cfg.harnesses.get_mut("exit3").unwrap();
+        edited.argv = vec!["/bin/sh".into(), "-c".into(), "echo something else".into()];
+        edited.env_allowlist = vec!["EXTRA_SECRET".into()];
+        let changed = Hub::new(cfg, h.hub.db().clone());
+        let args = json!({ "run_id": rid });
+        let parked = h.reg.call(&changed, &me, "dispatch_resume", args.clone()).await.unwrap_err();
+        let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked}") };
+        h.reg
+            .call(&changed, &human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" }))
+            .await
+            .unwrap();
+        let e = h.reg.call(&changed, &me, "dispatch_resume", args).await.unwrap_err();
+        assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+        assert!(e.to_string().contains("argv") && e.to_string().contains("env_allowlist"), "{e}");
+        assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid}'")), "failed");
+        assert_eq!(h.scalar(&format!("SELECT fence FROM dispatch_runs WHERE run_id = '{rid}'")), json!(1));
+
+        // Under the config the run was approved for, the resume goes ahead.
+        let resumed = h.gated(&me, "dispatch_resume", json!({ "run_id": rid })).await.unwrap();
+        assert_eq!(resumed["fence"], 2, "{resumed}");
+        h.wait_for(&rid, |r| r["terminal"] == true).await;
+    }
+
     #[tokio::test]
     async fn an_operator_cancels_another_agents_running_harness() {
         let h = H::new();

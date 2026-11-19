@@ -141,7 +141,9 @@ pub fn register(r: &mut Registry) {
             "dispatch_resume",
             "Resume the caller's cancelled (with confirmed cessation), failed or retryable dispatch run under a \
              new fence and relaunch its harness. Fails closed when the run or task is terminal, another run holds \
-             the task, or cessation is unconfirmed. Always needs a one-time human approval.",
+             the task, or cessation is unconfirmed, and is refused (approval_binding_changed) when the harness, \
+             argv, env allowlist, token passing, workdir or prompt differ from what the run's dispatch_task \
+             approval bound. Always needs a one-time human approval.",
             |ctx: ToolCtx, a: RunArgs| async move { resume(ctx, a).await },
         )
         .family("dispatch")
@@ -844,6 +846,59 @@ fn resume_refusal(run: &super::Run) -> Option<String> {
     None
 }
 
+/// Keys of the run's `dispatch_task` approval a resume must still match.
+const RESUME_BOUND_KEYS: [&str; 6] =
+    ["harness", "workdir", "argv", "env_allowlist", "passes_token_of", "prompt_sha256"];
+
+/// A resume relaunches under the hub's current config, and its own approval
+/// names only the run. Refuse it (`approval_binding_changed`) unless what it
+/// would run is what the run's `dispatch_task` approval bound: the same
+/// harness, argv, env allowlist, token passing, resolved workdir and prompt.
+fn check_resume_binding(
+    tx: &rusqlite::Connection,
+    run: &super::Run,
+    harness: Option<&(String, ua_core::config::HarnessConfig)>,
+    workdir: Option<&Path>,
+) -> UaResult<()> {
+    let bound: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
+             AND status = 'consumed' ORDER BY id LIMIT 1",
+            [&run.run_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(bound) = bound.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+        return Err(UaError::denied(
+            "approval_binding_changed",
+            format!("run {} has no dispatch_task approval to resume under", run.run_id),
+        ));
+    };
+    let mut current = json!({
+        "harness": harness.map(|(n, _)| n.clone()),
+        "workdir": workdir.map(|p| p.display().to_string()),
+        "argv": harness.map(|(_, h)| h.argv.clone()),
+        "env_allowlist": harness.map(|(_, h)| h.env_allowlist.clone()),
+        "prompt_sha256": sha256_hex(run.prompt.as_deref().unwrap_or_default()),
+    });
+    if harness.is_some_and(|(_, h)| h.pass_agent_token) {
+        current["passes_token_of"] = json!(run.agent_label);
+    }
+    let changed: Vec<&str> =
+        RESUME_BOUND_KEYS.iter().copied().filter(|k| bound.get(*k) != current.get(*k)).collect();
+    if !changed.is_empty() {
+        return Err(UaError::denied(
+            "approval_binding_changed",
+            format!(
+                "run {} no longer matches its dispatch_task approval (changed: {}); dispatch the task again",
+                run.run_id,
+                changed.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     verified(&ctx.caller, "dispatch_resume")?;
     let rid = trimmed("run_id", &a.run_id)?;
@@ -873,6 +928,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let lease_at = after_seconds(cfg.dispatch_lease_seconds.max(1));
     let actor = ctx.caller.label.clone();
     let (rid2, actor2) = (rid.clone(), actor.clone());
+    let (h2, w2) = (harness.clone(), workdir.clone());
     let fence = ctx
         .hub
         .db()
@@ -883,6 +939,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Some(why) = resume_refusal(&run) {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
+            check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
             let fence = run.fence + 1;
