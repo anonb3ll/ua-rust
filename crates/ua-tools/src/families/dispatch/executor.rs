@@ -12,12 +12,14 @@
 //!   child never blocks on a full pipe.
 //! - The run log directory is created 0700 and each log 0600.
 //! - Children this process started are kept in an in-process registry keyed
-//!   by run id and are signalled directly. A pid recorded by an earlier hub
-//!   process is signalled only when it is proven to be that run's orphan
-//!   ([`orphan_proof`]): on Linux the recorded process start time and group
-//!   must still match, and the hub process that started it must be gone.
-//!   Anything short of that proof is reported as `not_ours` (cessation
-//!   unknown) and nothing is signalled.
+//!   by run id and are signalled directly. A process group recorded by an
+//!   earlier hub process is signalled only when it is proven to be that
+//!   run's orphan ([`orphan_proof`]): on Linux and macOS the recorded child
+//!   must still be the same process (start time) in the same group, or have
+//!   exited while a member of its group lives on, and the hub process that
+//!   started it must be gone. A run is reported stopped only when its whole
+//!   group is empty. Anything short of that proof is reported as `not_ours`
+//!   (cessation unknown) and nothing is signalled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -32,6 +34,8 @@ use tokio::sync::Notify;
 use ua_core::config::HarnessConfig;
 use ua_core::{Config, UaError, UaResult};
 
+pub use super::procinfo::{ProcIdentity, proc_identity};
+use super::procinfo::{group_alive, kill_group, pid_alive};
 use super::{
     Edge, ExitInfo, Outcome, Run, after_seconds, load_run, now, record_transition, refusal, transition,
 };
@@ -208,97 +212,14 @@ fn live_remove(run_id: &str, fence: i64) -> bool {
     false
 }
 
-/// Test hook: forget that this process supervises `run_id`, as a restart
-/// would. The supervisor task keeps waiting on the child but no longer
-/// reports its outcome; the run is then the reaper's to reconcile.
-#[doc(hidden)]
-pub fn forget_supervision(run_id: &str) {
-    if let Ok(mut m) = LIVE.lock() {
-        m.remove(run_id);
-    }
-}
-
 /// Whether this process supervises `run_id` at `fence`.
 pub fn supervises(run_id: &str, fence: i64) -> bool {
     LIVE.lock().map(|m| m.get(run_id).is_some_and(|c| c.fence == fence)).unwrap_or(false)
 }
 
-#[cfg(unix)]
-fn kill_group(pgid: Option<u32>) {
-    if let Some(pid) = pgid.and_then(|p| libc::pid_t::try_from(p).ok())
-        && pid > 0
-    {
-        // SAFETY: killpg only sends a signal. The group id is the pid of a
-        // child this process spawned as group leader and has not reaped.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pgid: Option<u32>) {}
-
-#[cfg(unix)]
-fn pid_alive(pid: i64) -> bool {
-    let Ok(p) = libc::pid_t::try_from(pid) else { return false };
-    if p <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs only the existence and permission check.
-    let rc = unsafe { libc::kill(p, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_alive(_pid: i64) -> bool {
-    true
-}
-
 /// Whether a recorded pid names a live process (any owner).
 pub fn pid_is_alive(pid: Option<i64>) -> bool {
     pid.is_some_and(pid_alive)
-}
-
-/// What `/proc/<pid>/stat` says about a process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcIdentity {
-    /// Process state letter (`R`, `S`, `Z`, ...).
-    pub state: char,
-    /// Process group id (field 5).
-    pub pgrp: i64,
-    /// Start time in clock ticks after boot (field 22).
-    pub start_time: i64,
-}
-
-impl ProcIdentity {
-    fn exited(&self) -> bool {
-        matches!(self.state, 'Z' | 'X' | 'x')
-    }
-}
-
-/// Read a process's identity. `None` when the process does not exist, or
-/// always on platforms without `/proc/<pid>/stat`.
-#[cfg(target_os = "linux")]
-pub fn proc_identity(pid: i64) -> Option<ProcIdentity> {
-    if pid <= 0 {
-        return None;
-    }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `comm` (field 2) may hold spaces and parentheses; fields resume after
-    // the last `)`, starting with field 3 (state).
-    let rest = stat.get(stat.rfind(')')? + 1..)?;
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    Some(ProcIdentity {
-        state: f.first()?.chars().next()?,
-        pgrp: f.get(2)?.parse().ok()?,
-        start_time: f.get(19)?.parse().ok()?,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn proc_identity(_pid: i64) -> Option<ProcIdentity> {
-    None
 }
 
 /// This hub process's pid and start time, when the platform reports it.
@@ -313,34 +234,65 @@ pub fn own_identity() -> Option<(i64, i64)> {
 /// What a recorded pid turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proof {
-    /// The recorded process no longer exists (exited, or its pid now names
-    /// a different process).
+    /// The recorded child and every member of its process group are gone.
     Gone,
-    /// The recorded child is still running, its group is intact and the hub
-    /// process that started it is gone (or is this process, which no longer
-    /// supervises it): its group may be signalled.
+    /// The recorded child or a member of its group is still running and the
+    /// hub process that started it is gone (or is this process, which no
+    /// longer supervises it): the group may be signalled.
     Orphan { pgid: i64 },
-    /// Not enough evidence to touch it.
+    /// Not enough evidence to touch it, or to claim it stopped.
     Unproven,
 }
 
-/// Decide whether a run's recorded pid is this hub's orphan. Needs the
-/// start times recorded at launch, so it only ever proves anything on Linux.
+/// What a pid lookup found.
+enum Seen {
+    /// No such process.
+    Gone,
+    /// A live process this platform cannot inspect.
+    Unknown,
+    Is(ProcIdentity),
+}
+
+fn look(pid: i64) -> Seen {
+    match proc_identity(pid) {
+        Some(p) => Seen::Is(p),
+        None if pid_alive(pid) => Seen::Unknown,
+        None => Seen::Gone,
+    }
+}
+
+/// Decide whether a run's recorded child (and its process group) is this
+/// hub's orphan. The child led its own group, so the recorded group id is
+/// its pid; the OS does not hand that number to a new process while the
+/// group still has a member.
 pub(crate) fn orphan_proof(run: &Run) -> Proof {
-    let (Some(pid), Some(start), Some(pgid)) = (run.pid, run.pid_start_time, run.pgid) else {
+    let (Some(pid), Some(pgid)) = (run.pid, run.pgid) else {
         return Proof::Unproven;
     };
-    let Some(own) = own_identity() else { return Proof::Unproven };
-    let Some(now) = proc_identity(pid) else {
-        // /proc works here (we read our own entry): the pid is gone.
-        return Proof::Gone;
-    };
-    if now.start_time != start || now.exited() {
+    if pgid != pid || pgid <= 1 {
+        return Proof::Unproven;
+    }
+    match look(pid) {
+        Seen::Unknown => return Proof::Unproven,
+        Seen::Is(now) => match run.pid_start_time {
+            None => return Proof::Unproven,
+            // The pid names another process: it could only be reused after
+            // the recorded group emptied.
+            Some(start) if now.start_time != start => return Proof::Gone,
+            // Still running, but it left its group.
+            Some(_) if !now.exited() && now.pgrp != pgid => return Proof::Unproven,
+            Some(_) => {}
+        },
+        // The leader exited; members it forked may still hold the group.
+        Seen::Gone => {}
+    }
+    if !group_alive(pgid) {
         return Proof::Gone;
     }
-    // Never the hub's own group.
-    let own_group = proc_identity(own.0).map(|p| p.pgrp);
-    if now.pgrp != pgid || pgid <= 1 || own_group == Some(pgid) {
+    // Something in the group lives. Signal it only when the hub process
+    // that started it is proven gone, and never the hub's own group.
+    let Some(own) = own_identity() else { return Proof::Unproven };
+    if proc_identity(own.0).map(|p| p.pgrp) == Some(pgid) {
         return Proof::Unproven;
     }
     let (Some(spid), Some(sstart)) = (run.supervisor_pid, run.supervisor_start_time) else {
@@ -350,31 +302,32 @@ pub(crate) fn orphan_proof(run: &Run) -> Proof {
         // We started it and no longer supervise it (the caller checked).
         return Proof::Orphan { pgid };
     }
-    match proc_identity(spid) {
-        Some(sup) if sup.start_time == sstart && !sup.exited() => Proof::Unproven,
-        _ => Proof::Orphan { pgid },
+    match look(spid) {
+        Seen::Gone => Proof::Orphan { pgid },
+        Seen::Is(sup) if sup.start_time != sstart || sup.exited() => Proof::Orphan { pgid },
+        Seen::Is(_) | Seen::Unknown => Proof::Unproven,
     }
 }
 
-/// Wait up to two seconds for a proven orphan to disappear.
-fn wait_gone(pid: i64, start: i64) -> bool {
+/// Wait up to two seconds for a signalled group to empty.
+fn wait_group_gone(pgid: i64) -> bool {
     for _ in 0..40 {
-        match proc_identity(pid) {
-            None => return true,
-            Some(p) if p.start_time != start || p.exited() => return true,
-            Some(_) => std::thread::sleep(Duration::from_millis(50)),
+        if !group_alive(pgid) {
+            return true;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    false
+    !group_alive(pgid)
 }
 
 /// Attempt to stop a run's process. Blocking (it may wait briefly for an
-/// orphan to exit). Returns `killed` (a child this process supervises,
-/// signalled), `killed_orphan` (a proven orphan, signalled and gone),
-/// `kill_unconfirmed` (a proven orphan, signalled, still present),
-/// `already_gone` (no process recorded, or the recorded one no longer
-/// exists) or `not_ours` (a live pid this process cannot vouch for; nothing
-/// is signalled).
+/// orphan group to exit). Returns `killed` (a child this process
+/// supervises, signalled), `killed_orphan` (a proven orphan group,
+/// signalled and empty), `kill_unconfirmed` (a proven orphan group,
+/// signalled, a member still present), `already_gone` (no process recorded,
+/// or the recorded child and its whole group no longer exist) or `not_ours`
+/// (something may still run that this process cannot vouch for; nothing is
+/// signalled).
 pub(crate) fn terminate(run: &Run) -> &'static str {
     let ours = LIVE.lock().ok().and_then(|m| m.get(&run.run_id).map(|c| (c.pgid, c.kill.clone())));
     if let Some((pgid, kill)) = ours {
@@ -383,19 +336,16 @@ pub(crate) fn terminate(run: &Run) -> &'static str {
         return "killed";
     }
     let Some(pid) = run.pid else { return "already_gone" };
-    if !pid_alive(pid) {
-        return "already_gone";
+    if run.pgid.is_none() {
+        // No group recorded: the pid is all there is to check.
+        return if pid_alive(pid) { "not_ours" } else { "already_gone" };
     }
     match orphan_proof(run) {
         Proof::Gone => "already_gone",
         Proof::Unproven => "not_ours",
         Proof::Orphan { pgid } => {
             kill_group(u32::try_from(pgid).ok());
-            if wait_gone(pid, run.pid_start_time.unwrap_or_default()) {
-                "killed_orphan"
-            } else {
-                "kill_unconfirmed"
-            }
+            if wait_group_gone(pgid) { "killed_orphan" } else { "kill_unconfirmed" }
         }
     }
 }
