@@ -260,7 +260,13 @@ async fn remediate_parks_until_approved_then_writes_and_records() {
     let changes = row["payload"]["changes"].as_array().unwrap();
     let paths: Vec<&str> = changes.iter().map(|c| c["path"].as_str().unwrap()).collect();
     assert_eq!(paths, [".gitignore", "CLAUDE.md"]);
-    assert!(!row["payload"].to_string().contains("hidden"));
+    assert!(!row["payload"].to_string().contains("hiddentext"));
+    let desc = |p: &str| {
+        changes.iter().find(|c| c["path"] == p).unwrap()["description"].as_str().unwrap().to_string()
+    };
+    assert_eq!(desc(".gitignore"), "create default .gitignore");
+    assert_eq!(desc("CLAUDE.md"), "strip 1 hidden chars on lines 2");
+    let approval_id = row["id"].as_i64().unwrap();
 
     let after = e.ok(json!({ "remediate": true })).await;
     let fixed: Vec<&Value> =
@@ -278,6 +284,12 @@ async fn remediate_parks_until_approved_then_writes_and_records() {
     let log = e.as_human("event_log_query", json!({ "channels": ["agent.audit.remediated"] })).await;
     let events = log["events"].as_array().unwrap();
     assert_eq!(events.len(), 1, "{log}");
+    assert_eq!(events[0]["payload"]["approval_id"], approval_id);
+    assert_eq!(
+        events[0]["payload"]["root"].as_str().unwrap(),
+        e.ws.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(after.get("ledger_error").is_none());
     let files = events[0]["payload"]["files"].as_array().unwrap();
     assert_eq!(files.len(), 2);
     let claude_ev = files.iter().find(|f| f["path"] == "CLAUDE.md").unwrap();
@@ -304,6 +316,30 @@ async fn an_approval_does_not_cover_a_changed_plan() {
     let err = e.audit(json!({ "remediate": true })).await.unwrap_err();
     assert_eq!(err.code(), "approval_required");
     assert!(!e.ws.path().join(".gitignore").exists());
+}
+
+#[tokio::test]
+async fn remediate_never_rewrites_a_non_utf8_file() {
+    let e = Env::new();
+    e.put(".git/HEAD", "ref: refs/heads/main\n");
+    e.put(".gitignore", "target/\n");
+    let mut bytes = b"# x\nhidden\xe2\x80\x8btext \xff\xfe\n".to_vec();
+    bytes.push(b'\n');
+    std::fs::write(e.ws.path().join("CLAUDE.md"), &bytes).unwrap();
+    let report = e.ok(json!({ "remediate": true })).await;
+    assert_eq!(std::fs::read(e.ws.path().join("CLAUDE.md")).unwrap(), bytes);
+    let f = report["findings"].as_array().unwrap().iter().find(|f| f["rule"] == "AGENT-HIDDEN-UNICODE");
+    if let Some(f) = f {
+        assert_eq!(f["fixed"], false);
+        assert!(f["message"].as_str().unwrap().contains("AUTO-FIX-FAILED"), "{f}");
+    }
+
+    // The same for the .gitignore append.
+    e.put(".env", "TOKEN=abc\n");
+    std::fs::write(e.ws.path().join(".gitignore"), b"\xff\xfe\n").unwrap();
+    let report = e.ok(json!({ "remediate": true })).await;
+    assert_eq!(std::fs::read(e.ws.path().join(".gitignore")).unwrap(), b"\xff\xfe\n");
+    assert!(report["findings"].as_array().unwrap().iter().all(|f| f["fixed"] != true), "{report}");
 }
 
 #[cfg(unix)]

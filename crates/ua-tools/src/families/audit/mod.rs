@@ -528,14 +528,15 @@ async fn security_audit(ctx: ToolCtx, a: AuditArgs) -> UaResult<Value> {
     let (target, opts, plan) = prep;
 
     // Writing files is a state change: park the exact planned list for a human.
+    let root = target.path.canonicalize().unwrap_or_else(|_| target.path.clone());
+    let mut approval_id = None;
     if !plan.is_empty() {
-        let root = target.path.canonicalize().unwrap_or_else(|_| target.path.clone());
         let payload = json!({
             "remediate": true,
             "root": root.to_string_lossy(),
             "changes": plan.iter().map(remediate::Change::to_json).collect::<Vec<_>>(),
         });
-        gate_remediation(&ctx, payload).await?;
+        approval_id = Some(gate_remediation(&ctx, payload).await?);
     }
 
     let events_ctx = ctx.clone();
@@ -550,23 +551,33 @@ async fn security_audit(ctx: ToolCtx, a: AuditArgs) -> UaResult<Value> {
     })
     .await?;
 
+    let mut report = report;
+    report["remediated_files"] = json!(changes.iter().map(remediate::Change::to_json).collect::<Vec<_>>());
     if !changes.is_empty() {
         let files: Vec<Value> = changes.iter().map(remediate::Change::to_json).collect();
         let by = events_ctx.caller.label.clone();
-        events_ctx
+        let root = root.to_string_lossy().into_owned();
+        let appended = events_ctx
             .hub
             .db()
             .write_async(move |tx| {
                 ledger::append(
                     tx,
-                    EventInput::new("agent.audit.remediated", json!({ "files": files })).by(by),
+                    EventInput::new(
+                        "agent.audit.remediated",
+                        json!({ "approval_id": approval_id, "root": root, "files": files }),
+                    )
+                    .by(by),
                 )?;
                 Ok(())
             })
-            .await?;
+            .await;
+        // The files are already written: report a failed record, never hide it.
+        if let Err(e) = appended {
+            tracing::warn!(error = %e, "security_audit remediation applied but its ledger event failed");
+            report["ledger_error"] = json!(format!("remediation applied but the ledger event failed: {e}"));
+        }
     }
-    let mut report = report;
-    report["remediated_files"] = json!(changes.iter().map(remediate::Change::to_json).collect::<Vec<_>>());
     Ok(report)
 }
 
@@ -574,7 +585,7 @@ async fn security_audit(ctx: ToolCtx, a: AuditArgs) -> UaResult<Value> {
 /// `security_audit` is not `always_gated` (a read-only audit needs none), so
 /// the gate is forced here for `remediate=true`; the payload carries the plan,
 /// so an approval never covers a different set of files.
-async fn gate_remediation(ctx: &ToolCtx, payload: Value) -> UaResult<()> {
+async fn gate_remediation(ctx: &ToolCtx, payload: Value) -> UaResult<i64> {
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let outcome = ctx
         .hub
@@ -582,7 +593,7 @@ async fn gate_remediation(ctx: &ToolCtx, payload: Value) -> UaResult<()> {
         .write_async(move |tx| approvals::gate(tx, hub.cfg(), &caller, "security_audit", &payload))
         .await?;
     match outcome {
-        GateOutcome::Pass { .. } => Ok(()),
+        GateOutcome::Pass { approval_id } => Ok(approval_id),
         GateOutcome::Pending { approval_id } => {
             Err(UaError::ApprovalRequired { tool: "security_audit".into(), approval_id })
         }
