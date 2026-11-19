@@ -109,6 +109,12 @@ async fn read_write_list_search() {
         .unwrap_err();
     assert_eq!(bad.code(), "conflict");
 
+    // Credential-looking files are refused for writes as well as reads.
+    for name in [".env", "deploy.pem", "credentials.json", "secrets/id_ed25519"] {
+        let err = env.call("fs_write", json!({ "path": name, "content": "x" })).await.unwrap_err();
+        assert_eq!(err.code(), "denied", "{name}: {err}");
+    }
+
     std::fs::write(env.ws.join("src/lib.rs"), "fn main() {}\n").unwrap();
     std::fs::write(env.ws.join(".env"), "SECRET=placeholder\n").unwrap();
     let list = env.ok("fs_list", json!({})).await;
