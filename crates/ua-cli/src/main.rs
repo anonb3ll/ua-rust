@@ -182,12 +182,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // `ua serve` owns its database for its lifetime; an import refuses while it runs.
-    let _hub_lock = if matches!(cli.cmd, Cmd::Serve) {
-        Some(ua_import::HubLock::acquire(&cfg.db_path(), "serve")?)
-    } else {
-        None
-    };
+    // Every command that opens the hub holds a shared lock while it runs, so an
+    // import (which takes it exclusively) refuses while any of them is live.
+    let _hub_lock = ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?;
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
     let state = AppState { hub: hub.clone(), registry: registry.clone() };
