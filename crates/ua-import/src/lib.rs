@@ -21,7 +21,10 @@
 //! the last source `rowid` copied. Each batch and its progress row commit
 //! together, so a re-run continues after the last committed batch.
 
+mod lock;
 mod map;
+
+pub use lock::{HubLock, lock_path};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -66,11 +69,15 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 pub struct Options {
     /// Rows per write transaction.
     pub batch_size: usize,
+    /// Import even though some source rows carry an `org_id`. ua-rust has no
+    /// tenant scope, so those rows lose their boundary. Without this flag a
+    /// real import refuses.
+    pub drop_org_scope: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { batch_size: 500 }
+        Self { batch_size: 500, drop_org_scope: false }
     }
 }
 
@@ -124,6 +131,9 @@ pub struct Report {
     /// number of non-NULL values in each.
     pub unmapped_columns: BTreeMap<String, BTreeMap<String, u64>>,
     pub source_ledger: SourceLedgerReport,
+    /// Rows per table whose source `org_id` is non-NULL. ua-rust has no tenant
+    /// scope: a real import refuses unless `drop_org_scope` is set.
+    pub org_scoped_rows: BTreeMap<String, u64>,
     /// Verification of the target chain after the import (not in a dry run).
     pub target_ledger: Option<VerifyReport>,
     pub notes: Vec<String>,
@@ -198,6 +208,10 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             l.first_bad_seq.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
             l.reason.as_deref().unwrap_or("unknown")
         );
+    }
+    check_target(&src, db, &report, opts)?;
+    if !report.org_scoped_rows.is_empty() {
+        report.notes.push("org_id dropped (--drop-org-scope): tenant boundaries are not kept".into());
     }
     let mut copied_any = false;
     for map in MAPS {
@@ -322,6 +336,10 @@ fn survey(src: &Connection, target: &Db, source_hash: String, dry_run: bool) -> 
         tables.push(rep);
     }
     let source_ledger = verify_source_ledger(src, present.contains("event_log"))?;
+    let org_scoped_rows: BTreeMap<String, u64> = unmapped_columns
+        .iter()
+        .filter_map(|(t, cols)| cols.get("org_id").filter(|n| **n > 0).map(|n| (t.clone(), *n)))
+        .collect();
     Ok(Report {
         source_hash,
         dry_run,
@@ -330,6 +348,7 @@ fn survey(src: &Connection, target: &Db, source_hash: String, dry_run: bool) -> 
         derived_tables,
         unmapped_columns,
         source_ledger,
+        org_scoped_rows,
         target_ledger: None,
         notes: Vec::new(),
     })
@@ -457,6 +476,145 @@ fn exists(conn: &Connection, table: &str, key: &str, v: &SqlValue) -> rusqlite::
 
 fn bump(map: &mut BTreeMap<String, u64>, reason: impl Into<String>) {
     *map.entry(reason.into()).or_default() += 1;
+}
+
+/// Every refusal that depends only on the source and the target as they are
+/// now. It runs before the first write, so a refused import leaves the target
+/// untouched.
+fn check_target(src: &Connection, db: &Db, report: &Report, opts: &Options) -> anyhow::Result<()> {
+    if !report.org_scoped_rows.is_empty() && !opts.drop_org_scope {
+        let per_table: Vec<String> =
+            report.org_scoped_rows.iter().map(|(t, n)| format!("{t}: {n}")).collect();
+        bail!(
+            "source rows carry an org_id ({}), and ua-rust has no tenant scope, so importing would silently \
+             drop that boundary; refusing (nothing was written). Pass --drop-org-scope to import anyway",
+            per_table.join(", ")
+        );
+    }
+    for map in MAPS {
+        let Some(rep) = report.tables.iter().find(|t| t.table == map.source).filter(|t| t.present) else {
+            continue;
+        };
+        if map.kind == Kind::Ledger {
+            check_ledger_target(src, db, rep.last_key)?;
+        } else {
+            check_key_overlap(src, db, map, rep.last_key)?;
+        }
+    }
+    Ok(())
+}
+
+/// The target ledger must hold exactly the rows this importer wrote so far.
+fn check_ledger_target(src: &Connection, db: &Db, last: i64) -> anyhow::Result<()> {
+    let target_max: Option<i64> =
+        db.read(|c| Ok(c.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?))?;
+    if target_max.unwrap_or(0) > last {
+        bail!(
+            "target ledger already holds events this import did not write (max seq {} > imported {last}); \
+             importing the Python ledger would interleave two histories. Import into a fresh database. \
+             Catch-up imports only work before the Rust hub writes its own events (nothing was written)",
+            target_max.unwrap_or(0)
+        );
+    }
+    if last > 0 {
+        let at_target: Option<(String, Option<String>)> = db.read(|c| {
+            Ok(c.query_row("SELECT ulid, entry_hash FROM event_log WHERE seq = ?1", [last], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+        })?;
+        let at_source: Option<(String, Option<String>)> = src
+            .query_row("SELECT ulid, entry_hash FROM event_log WHERE rowid = ?1", [last], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if at_target.is_none() || at_target != at_source {
+            bail!(
+                "the source ledger no longer matches the imported prefix at seq {last}; refusing to continue \
+                 (nothing was written)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when a source row still to be copied has the key of a row already in
+/// the target. Rows at or below the resume key are this importer's own.
+fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> anyhow::Result<()> {
+    let plan = plan_table(src, db, map)?;
+    // Target primary key columns, and the source column that feeds each.
+    let pk: Vec<String> = db.read(|c| {
+        let mut stmt = c.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;
+        let rows = stmt.query_map([map.target], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })?;
+    // A key made only of copied columns, or the `rowid` mapped to a column.
+    let mut keys: Vec<Vec<String>> = Vec::new();
+    if !pk.is_empty() && pk.iter().all(|c| plan.cols.contains(c)) {
+        keys.push(pk);
+    }
+    if let Some(r) = map.rowid_to {
+        keys.push(vec![r.to_string()]);
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let sel = format!(
+        "SELECT rowid, {} FROM {} WHERE rowid > ?1 ORDER BY rowid",
+        select_list(&plan.cols),
+        q(map.source)
+    );
+    let probes: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            let cond = key
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{} = ?{}", q(c), i + 1))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!("SELECT 1 FROM {} WHERE {cond} LIMIT 1", q(map.target))
+        })
+        .collect();
+    let mut stmt = src.prepare(&sel)?;
+    let mut rows = stmt.query([last])?;
+    let mut clash: Option<(String, Vec<SqlValue>)> = None;
+    db.read(|c| {
+        let mut prepared = probes.iter().map(|p| c.prepare(p)).collect::<Result<Vec<_>, _>>()?;
+        'rows: while let Some(r) = rows.next()? {
+            let rowid: i64 = r.get(0)?;
+            let vals = row_values(r, 1, plan.cols.len())?;
+            if filter(map.kind, &plan.cols, &vals).is_some() {
+                continue;
+            }
+            for (key, probe) in keys.iter().zip(prepared.iter_mut()) {
+                let kv: Vec<SqlValue> = if map.rowid_to == Some(key[0].as_str()) {
+                    vec![SqlValue::Integer(rowid)]
+                } else {
+                    key.iter()
+                        .map(|k| col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null))
+                        .collect()
+                };
+                // A NULL key part never collides.
+                if kv.contains(&SqlValue::Null) {
+                    continue;
+                }
+                if probe.exists(params_from_iter(kv.iter()))? {
+                    clash = Some((key.join(", "), kv));
+                    break 'rows;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if let Some((key, vals)) = clash {
+        bail!(
+            "{} already holds a row with key ({key}) = {vals:?} that this import would copy; the target must not \
+             hold rows with imported keys. Import into a fresh database (nothing was written)",
+            map.target
+        );
+    }
+    Ok(())
 }
 
 fn copy_table(
@@ -722,43 +880,16 @@ fn copy_ledger(
     if pending == 0 {
         return Ok(());
     }
-    // The target ledger must hold exactly the rows this import wrote so far.
-    let (target_max, target_head) = db.read(|c| {
-        let max: Option<i64> = c.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?;
-        let head: Option<String> = c
-            .query_row(
-                "SELECT entry_hash FROM event_log WHERE entry_hash IS NOT NULL ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok((max, head))
+    // `check_target` already proved the target ledger is exactly the imported
+    // prefix; only its chain head is needed to continue.
+    let target_head: Option<String> = db.read(|c| {
+        Ok(c.query_row(
+            "SELECT entry_hash FROM event_log WHERE entry_hash IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
     })?;
-    if target_max.unwrap_or(0) > last {
-        bail!(
-            "target ledger already holds events this import did not write (max seq {} > imported {last}); \
-             importing the Python ledger would interleave two histories. Import into a fresh database",
-            target_max.unwrap_or(0)
-        );
-    }
-    if last > 0 {
-        let at_target: Option<(String, Option<String>)> = db.read(|c| {
-            Ok(c.query_row("SELECT ulid, entry_hash FROM event_log WHERE seq = ?1", [last], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?)
-        })?;
-        let at_source: Option<(String, Option<String>)> = src
-            .query_row("SELECT ulid, entry_hash FROM event_log WHERE rowid = ?1", [last], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        if at_target.is_none() || at_target != at_source {
-            bail!(
-                "the source ledger no longer matches the imported prefix at seq {last}; refusing to continue"
-            );
-        }
-    }
     let mut chain = Chain { head: target_head };
     let select = ledger_select(true);
     let insert = format!(

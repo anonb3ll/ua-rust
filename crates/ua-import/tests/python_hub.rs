@@ -452,6 +452,10 @@ fn target() -> Db {
     Db::open_in_memory(&ua_import::schema_parts()).unwrap()
 }
 
+fn opts() -> Options {
+    Options { drop_org_scope: true, ..Options::default() }
+}
+
 fn n(db: &Db, sql: &str) -> i64 {
     db.read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?)).unwrap()
 }
@@ -482,7 +486,7 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     let f = fixture();
     let before = file_sha(&f.path);
     let db = target();
-    let r = ua_import::import(&db, &f.path, &Options::default()).unwrap();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
     assert_eq!(file_sha(&f.path), before, "the source is never written");
 
     // Counts.
@@ -577,7 +581,7 @@ fn rerun_is_idempotent_and_resumes_from_the_last_key() {
     let f = fixture();
     let db = target();
     // Batches of one row exercise the per-batch progress records.
-    let opts = Options { batch_size: 1 };
+    let opts = Options { batch_size: 1, ..opts() };
     ua_import::import(&db, &f.path, &opts).unwrap();
     let snapshot = |db: &Db| {
         ["tasks", "memory", "event_log", "approvals", "agent_tokens", "message_index"]
@@ -621,13 +625,80 @@ fn rerun_is_idempotent_and_resumes_from_the_last_key() {
     assert!(tl.ok && tl.checked == 4, "{tl:?}");
 }
 
+const DATA_TABLES: [&str; 6] = ["tasks", "memory", "event_log", "agents", "approvals", "import_runs"];
+
+fn counts(db: &Db) -> Vec<i64> {
+    DATA_TABLES.iter().map(|t| n(db, &format!("SELECT COUNT(*) FROM {t}"))).collect()
+}
+
 #[test]
-fn a_target_with_its_own_events_refuses_the_ledger() {
+fn a_target_with_its_own_events_refuses_before_any_write() {
     let f = fixture();
     let db = target();
     db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    let before = counts(&db);
+    let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("interleave") && msg.contains("Catch-up imports"), "{msg}");
+    assert_eq!(counts(&db), before, "earlier tables must not be written");
+}
+
+#[test]
+fn a_catch_up_after_the_target_wrote_its_own_events_is_refused_up_front() {
+    let f = fixture();
+    let db = target();
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute("INSERT INTO tasks (id, title, created_at, updated_at) VALUES (5, 'Later', ?1, ?1)", [T0])
+        .unwrap();
+    drop(c);
+    let before = counts(&db);
+    let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
+    assert!(format!("{err:#}").contains("Catch-up imports"), "{err:#}");
+    assert_eq!(counts(&db), before);
+}
+
+#[test]
+fn an_id_collision_refuses_before_any_write() {
+    let f = fixture();
+    let db = target();
+    // A row the target already owns, with the key of a source task.
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (3, 'Native', 'open', ?1, ?1)",
+            [T0],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let before = counts(&db);
+    let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("tasks already holds a row") && msg.contains("nothing was written"), "{msg}");
+    assert_eq!(counts(&db), before, "agents (copied before tasks) must not be written");
+}
+
+#[test]
+fn org_scoped_rows_refuse_unless_the_scope_is_dropped() {
+    let f = fixture();
+    let db = target();
     let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
-    assert!(format!("{err:#}").contains("interleave"), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("tasks: 1") && msg.contains("--drop-org-scope"), "{msg}");
+    assert_eq!(counts(&db), vec![0; DATA_TABLES.len()]);
+
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(r.org_scoped_rows.get("tasks"), Some(&1));
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 4);
+}
+
+#[test]
+fn the_dry_run_reports_org_scope_either_way() {
+    let f = fixture();
+    let r = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(r.org_scoped_rows.get("tasks"), Some(&1));
+    assert_eq!(r.org_scoped_rows.len(), 1);
 }
 
 #[test]
@@ -666,7 +737,7 @@ fn a_tampered_ledger_row_stops_the_import_before_any_write() {
     assert_eq!(dry.source_ledger.first_bad_seq, Some(6));
 
     let db = target();
-    let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
+    let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("seq 6") && msg.contains("entry_hash"), "{msg}");
     for t in ["tasks", "memory", "event_log", "import_runs"] {
@@ -682,7 +753,7 @@ fn a_hashed_value_that_is_not_text_is_refused() {
     // not defined by the text encoding, so the importer refuses to guess.
     c.execute("UPDATE event_log SET channel = CAST(channel AS BLOB) WHERE rowid = 7", []).unwrap();
     drop(c);
-    let err = ua_import::import(&target(), &f.path, &Options::default()).unwrap_err();
+    let err = ua_import::import(&target(), &f.path, &opts()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("seq 7") && msg.contains("byte-exactly"), "{msg}");
 }
