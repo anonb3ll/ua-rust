@@ -100,6 +100,37 @@ reviewer-1 = "reviewer"
 [agent_workspaces]
 # researcher-1 = "deny"
 
+# Agent harnesses dispatch_task may start (see docs/dispatch.md). A harness
+# may name the provider account it bills (provider_account_register); dispatch
+# refuses it while that account is disabled or rate-limited, or, with
+# provider_fallback, runs another harness whose account has the same provider
+# and billing type (provider_fallback_cross_billing = true allows any billing).
+# Secrets never go in `env` (credential-looking values are refused at load):
+# list their names in env_allowlist and the hub's environment passes them.
+# quota_patterns are phrases on the child's stderr that mark a usage limit.
+# [harnesses.coder]
+# argv = ["agent-cli", "--print", "{prompt}"]
+# env_allowlist = ["PROVIDER_API_KEY"]
+# timeout_s = 3600
+# provider_account = "anthropic-team"
+# provider_fallback = false
+# quota_patterns = ["usage limit reached", "insufficient_quota"]
+
+# Pi (pi.dev) in print mode on a subscription account. The provider and model
+# are pinned in argv so Pi never falls back to a settings default; metered keys
+# are denied even if the hub's environment holds them (dispatch refuses a
+# subscription harness that passes an *_API_KEY name it does not deny).
+# [harnesses.pi]
+# argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex",
+#         "--model", "gpt-5.5", "--no-session", "{prompt}"]
+# env_denylist = ["OPENAI_API_KEY", "PI_API_KEY", "OPENROUTER_API_KEY",
+#                 "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+# quota_patterns = ["usage limit", "insufficient_quota", "rate_limit"]
+# quota_json_errors = true
+# path_prepend = ["~/.local/bin"]
+# timeout_s = 3600
+# provider_account = "pi-subscription"
+
 # Downstream MCP servers for mcp_gateway, declared by the operator. Same
 # fields as mcp_server_register's spec, plus review_expires_at. Secrets are
 # managed secret names bound to consumer "mcp:<server>". An empty

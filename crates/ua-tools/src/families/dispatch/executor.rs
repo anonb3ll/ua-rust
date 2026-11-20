@@ -9,7 +9,12 @@
 //!   group.
 //! - Combined stdout/stderr go to `$UA_HOME/runs/<run_id>.log`, capped at the
 //!   harness's `output_cap_bytes`; the rest is read and discarded so the
-//!   child never blocks on a full pipe.
+//!   child never blocks on a full pipe. The tail of standard error (and, for
+//!   a harness with `quota_json_errors`, of standard output) is also kept
+//!   apart in memory, so a quota signal is read from the stream the harness
+//!   declared, never from the model's text ([`quota_line`]).
+//! - The program is the absolute path the approval bound
+//!   ([`resolve_program`]), not a name looked up again at launch.
 //! - The run log directory is created 0700 and each log 0600.
 //! - Children this process started are kept in an in-process registry keyed
 //!   by run id and are signalled directly. A process group recorded by an
@@ -91,22 +96,7 @@ pub const BINDING_ENV: &[&str] = &[
 
 /// Whether a name reads like a credential.
 pub fn looks_secret(name: &str) -> bool {
-    let up = name.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "APIKEY",
-        "API_KEY",
-        "API-KEY",
-        "PRIVATE_KEY",
-        "BEARER",
-        "CREDENTIAL",
-    ]
-    .iter()
-    .any(|m| up.contains(m))
-        || up.split('_').any(|part| part == "KEY" || part == "KEYS")
+    ua_core::config::env_name_looks_secret(name)
 }
 
 /// Whether a harness may list `name` in its `env_allowlist`. Everything in
@@ -133,11 +123,14 @@ pub struct Binding {
 }
 
 /// The child environment: [`SAFE_ENV`] names from `parent` (unless they look
-/// secret), the harness's allowlisted names, then the binding.
+/// secret), the harness's allowlisted names, its fixed `env` values (rendered
+/// with `vars`), its `path_prepend` in front of `PATH`, minus its
+/// `env_denylist`, then the binding.
 pub fn child_env(
     parent: impl IntoIterator<Item = (String, String)>,
     harness: &HarnessConfig,
     binding: &Binding,
+    vars: &[(&str, String)],
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for (k, v) in parent {
@@ -146,6 +139,23 @@ pub fn child_env(
         if safe || listed {
             env.insert(k, v);
         }
+    }
+    for (k, v) in &harness.env {
+        if harness_may_pass(k) {
+            env.insert(k.clone(), render_one(v, vars));
+        }
+    }
+    if !harness.path_prepend.is_empty() {
+        let mut parts: Vec<String> = harness.path_prepend.iter().map(|p| p.display().to_string()).collect();
+        if let Some(path) = env.get("PATH").filter(|p| !p.is_empty()) {
+            let inherited: Vec<String> =
+                path.split(':').filter(|p| !parts.iter().any(|q| q == p)).map(str::to_string).collect();
+            parts.extend(inherited);
+        }
+        env.insert("PATH".into(), parts.join(":"));
+    }
+    for name in &harness.env_denylist {
+        env.remove(name);
     }
     env.insert("UA_DISPATCH_RUN_ID".into(), binding.run_id.clone());
     env.insert("UA_DISPATCH_TASK_ID".into(), binding.task_id.to_string());
@@ -161,16 +171,46 @@ pub fn child_env(
 /// Substitute placeholders in each argument. One template argument stays one
 /// argument whatever the values contain.
 pub fn render_argv(template: &[String], vars: &[(&str, String)]) -> Vec<String> {
-    template
-        .iter()
-        .map(|arg| {
-            let mut out = arg.clone();
-            for (k, v) in vars {
-                out = out.replace(&format!("{{{k}}}"), v);
+    template.iter().map(|arg| render_one(arg, vars)).collect()
+}
+
+/// Substitute `{name}` placeholders in one pass: a value is never scanned
+/// again, so a prompt that contains `{run_id}` stays as written.
+pub fn render_one(template: &str, vars: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let hit = vars.iter().find(|(k, _)| {
+            tail.len() > k.len() + 1 && tail[1..].starts_with(k) && tail.as_bytes()[k.len() + 1] == b'}'
+        });
+        match hit {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &tail[k.len() + 2..];
             }
-            out
-        })
-        .collect()
+            None => {
+                out.push('{');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The placeholder values of a launch.
+pub(crate) fn launch_vars(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
+    vec![
+        ("run_id", spec.run_id.clone()),
+        ("task_id", spec.task_id.to_string()),
+        ("agent", spec.agent.clone()),
+        ("fence", spec.fence.to_string()),
+        ("worktree", spec.workdir.display().to_string()),
+        ("prompt_json", serde_json::to_string(&spec.prompt).unwrap_or_default()),
+        ("prompt", spec.prompt.clone()),
+    ]
 }
 
 /// The configured hub bearer of `agent`, if any.
@@ -367,6 +407,43 @@ pub(crate) struct LaunchSpec {
     pub workdir: PathBuf,
     pub prompt: String,
     pub actor: String,
+    /// The absolute program the approval bound; `None` when `argv[0]` was
+    /// found nowhere, which fails the launch as a missing program.
+    pub program: Option<PathBuf>,
+}
+
+/// The absolute program a launch of `h` in `workdir` executes: `argv[0]`
+/// itself when it holds a `/` (joined to `workdir` when relative), else the
+/// first executable file of that name on the child's `PATH` (its
+/// `path_prepend` in front of the hub's own). `None` when nothing is found.
+pub fn resolve_program(h: &HarnessConfig, workdir: Option<&Path>) -> Option<PathBuf> {
+    let argv0 = h.argv.first()?.trim();
+    if argv0.is_empty() {
+        return None;
+    }
+    if argv0.contains('/') {
+        let p = Path::new(argv0);
+        return if p.is_absolute() { Some(p.to_path_buf()) } else { workdir.map(|w| w.join(p)) };
+    }
+    let probe =
+        Binding { run_id: String::new(), task_id: 0, agent: String::new(), fence: 0, agent_token: None };
+    let path = child_env(std::env::vars(), h, &probe, &[]).remove("PATH")?;
+    path.split(':')
+        .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
+        .map(|d| Path::new(d).join(argv0))
+        .find(|c| {
+            std::fs::metadata(c).is_ok_and(|m| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.is_file() && m.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    m.is_file()
+                }
+            })
+        })
 }
 
 /// Move a claimed run to `launched` without a process (no harness).
@@ -425,26 +502,23 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         fence: spec.fence,
         agent_token: if spec.harness.pass_agent_token { agent_token(cfg, &spec.agent) } else { None },
     };
-    let env = child_env(std::env::vars(), &spec.harness, &binding);
-    let argv = render_argv(
-        &spec.harness.argv,
-        &[
-            ("run_id", spec.run_id.clone()),
-            ("task_id", spec.task_id.to_string()),
-            ("agent", spec.agent.clone()),
-            ("fence", spec.fence.to_string()),
-            ("worktree", spec.workdir.display().to_string()),
-            ("prompt", spec.prompt.clone()),
-        ],
-    );
+    let vars = launch_vars(&spec);
+    let env = child_env(std::env::vars(), &spec.harness, &binding, &vars);
+    let argv = render_argv(&spec.harness.argv, &vars);
+    let stdin_text = spec.harness.stdin.as_deref().map(|t| render_one(t, &vars));
 
     let spawned = open_log(&log, &spec).await.and_then(|file| {
-        let mut cmd = tokio::process::Command::new(&argv[0]);
+        // Run the bound program; a name found nowhere fails as missing.
+        let program =
+            spec.program.clone().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let mut cmd = tokio::process::Command::new(&program);
+        #[cfg(unix)]
+        cmd.arg0(&argv[0]);
         cmd.args(&argv[1..])
             .current_dir(&spec.workdir)
             .env_clear()
             .envs(&env)
-            .stdin(Stdio::null())
+            .stdin(if stdin_text.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -476,6 +550,7 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
                             failure_reason: Some(reason),
                             failure_class: Some(class.into()),
                             usage: None,
+                            quota_signal: None,
                         },
                     )
                 })
@@ -558,6 +633,14 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         ));
     }
 
+    if let (Some(text), Some(mut input)) = (stdin_text, child.stdin.take()) {
+        // Written from its own task so a child that never reads cannot
+        // stall the launch; dropping the handle closes the pipe.
+        tokio::spawn(async move {
+            let _ = input.write_all(text.as_bytes()).await;
+            let _ = input.shutdown().await;
+        });
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let reply = json!({
@@ -631,12 +714,45 @@ struct LogSink {
 
 type Sink = Arc<tokio::sync::Mutex<LogSink>>;
 
-async fn drain<R: AsyncRead + Unpin>(mut r: R, sink: Sink) {
+/// The last bytes of one stream, kept apart from the combined log.
+struct Tail {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl Tail {
+    fn shared(cap: usize) -> Arc<Mutex<Tail>> {
+        Arc::new(Mutex::new(Tail { buf: Vec::new(), cap }))
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() > self.cap {
+            let cut = self.buf.len() - self.cap;
+            self.buf.drain(..cut);
+        }
+    }
+
+    fn text(t: &Arc<Mutex<Tail>>) -> String {
+        let t = t.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&t.buf).into_owned()
+    }
+}
+
+/// Bytes of standard error, and of standard output for JSON error events,
+/// kept for the quota check.
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+const STDOUT_TAIL_BYTES: usize = 64 * 1024;
+
+async fn drain<R: AsyncRead + Unpin>(mut r: R, sink: Sink, tail: Option<Arc<Mutex<Tail>>>) {
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if let Some(t) = &tail {
+                    t.lock().unwrap_or_else(|e| e.into_inner()).push(&chunk[..n]);
+                }
                 let mut s = sink.lock().await;
                 s.total += n as u64;
                 if s.written < s.cap {
@@ -668,12 +784,14 @@ async fn supervise(
         total: 0,
         cap: spec.harness.output_cap_bytes,
     }));
+    let err_tail = Tail::shared(STDERR_TAIL_BYTES);
+    let out_tail = spec.harness.quota_json_errors.then(|| Tail::shared(STDOUT_TAIL_BYTES));
     let mut readers = Vec::new();
     if let Some(o) = stdout {
-        readers.push(tokio::spawn(drain(o, sink.clone())));
+        readers.push(tokio::spawn(drain(o, sink.clone(), out_tail.clone())));
     }
     if let Some(e) = stderr {
-        readers.push(tokio::spawn(drain(e, sink.clone())));
+        readers.push(tokio::spawn(drain(e, sink.clone(), Some(err_tail.clone()))));
     }
 
     let lease = hub.cfg().dispatch_lease_seconds.max(1);
@@ -748,6 +866,7 @@ async fn supervise(
         output_bytes: i64::try_from(total).unwrap_or(i64::MAX),
         output_truncated: total > written,
     };
+    let mut quota_signal = None;
     let (state, reason, class, evidence) = if timed_out {
         (
             "failed",
@@ -763,7 +882,22 @@ async fn supervise(
             (None, Some(s)) => format!("signal:{s}"),
             _ => "exit_code:not observed".into(),
         };
-        ("failed", Some(why), Some("exit".to_string()), None)
+        // Only the harness's declared signal is quota evidence: one of its
+        // quota_patterns on stderr, or in a structured JSON error event.
+        let stderr_text = Tail::text(&err_tail);
+        let stdout_text = out_tail.as_ref().map(Tail::text);
+        match quota_line(&spec.harness.quota_patterns, &stderr_text, stdout_text.as_deref()) {
+            Some((source, line)) => {
+                quota_signal = Some(json!({ "source": source, "line": line }));
+                (
+                    "failed",
+                    Some(format!("{why} (provider quota exhausted)")),
+                    Some(QUOTA_CLASS.to_string()),
+                    None,
+                )
+            }
+            None => ("failed", Some(why), Some("exit".to_string()), None),
+        }
     };
     let (rid, fence) = (spec.run_id.clone(), spec.fence);
     let res = hub
@@ -785,6 +919,7 @@ async fn supervise(
                     failure_reason: reason,
                     failure_class: class,
                     usage: None,
+                    quota_signal,
                 },
             )
         })
@@ -793,6 +928,9 @@ async fn supervise(
         tracing::warn!(error = %e, run_id = %spec.run_id, "could not record a dispatch exit");
     }
 }
+
+const QUOTA_CLASS: &str = crate::families::provider_accounts::QUOTA_CLASS;
+use crate::families::provider_accounts::quota_line;
 
 fn split_status(st: std::process::ExitStatus) -> (Option<i64>, Option<i64>) {
     if let Some(c) = st.code() {
@@ -822,6 +960,35 @@ mod tests {
         }
     }
 
+    /// Review finding: the approval did not bind which program argv[0]
+    /// resolves to. It now binds an absolute path, found on the child's PATH
+    /// (its path_prepend first) or joined to the workdir.
+    #[cfg(unix)]
+    #[test]
+    fn the_program_resolves_to_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("agent-cli");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let h = |argv0: &str, prepend: Vec<PathBuf>| HarnessConfig {
+            argv: vec![argv0.into()],
+            path_prepend: prepend,
+            ..HarnessConfig::default()
+        };
+        // Not executable: not a match.
+        assert_eq!(resolve_program(&h("agent-cli", vec![bin.clone()]), None), None);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_program(&h("agent-cli", vec![bin.clone()]), None), Some(tool.clone()));
+        assert_eq!(resolve_program(&h("agent-cli-missing", vec![bin.clone()]), None), None);
+        assert_eq!(resolve_program(&h("/opt/x/agent", vec![]), None), Some(PathBuf::from("/opt/x/agent")));
+        assert_eq!(
+            resolve_program(&h("./bin/agent-cli", vec![]), Some(dir.path())),
+            Some(dir.path().join("./bin/agent-cli"))
+        );
+    }
+
     #[test]
     fn env_is_an_allowlist() {
         let parent = vec![
@@ -833,7 +1000,7 @@ mod tests {
             ("UA_DISPATCH_RUN_ID".to_string(), "forged".to_string()),
         ];
         let mut h = HarnessConfig::default();
-        let env = child_env(parent.clone(), &h, &binding());
+        let env = child_env(parent.clone(), &h, &binding(), &[]);
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
         for denied in ["UA_AGENT_TOKENS", "UA_HOME", "OPENAI_API_KEY", "RANDOM_VAR"] {
             assert!(!env.contains_key(denied), "{denied} leaked");
@@ -843,10 +1010,28 @@ mod tests {
 
         // A harness may scope a provider key to itself, never a hub secret.
         h.env_allowlist = vec!["OPENAI_API_KEY".into(), "UA_AGENT_TOKENS".into(), "UA_HOME".into()];
-        let env = child_env(parent, &h, &binding());
+        let env = child_env(parent.clone(), &h, &binding(), &[]);
         assert_eq!(env.get("OPENAI_API_KEY").map(String::as_str), Some("k"));
         assert!(!env.contains_key("UA_AGENT_TOKENS"));
         assert!(!env.contains_key("UA_HOME"));
+
+        // Fixed values, a denylist that beats every other source, and PATH
+        // entries in front.
+        h.env = [
+            ("FIXED".to_string(), "run={run_id}".to_string()),
+            ("UA_HOME".to_string(), "/elsewhere".to_string()),
+            ("UA_DISPATCH_FENCE".to_string(), "9".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        h.env_denylist = vec!["OPENAI_API_KEY".into(), "FIXED_GONE".into()];
+        h.path_prepend = vec!["/opt/pi/bin".into(), "/usr/bin".into()];
+        let env = child_env(parent, &h, &binding(), &[("run_id", "run-1-ab".into())]);
+        assert_eq!(env["FIXED"], "run=run-1-ab");
+        assert!(!env.contains_key("OPENAI_API_KEY"), "denied even when allowlisted");
+        assert!(!env.contains_key("UA_HOME"), "no fixed value in the hub's namespace");
+        assert_eq!(env["UA_DISPATCH_FENCE"], "2", "the binding wins");
+        assert_eq!(env["PATH"], "/opt/pi/bin:/usr/bin");
     }
 
     #[test]
@@ -856,6 +1041,9 @@ mod tests {
             &[("prompt", "a; rm -rf / && b".into()), ("run_id", "run-9".into())],
         );
         assert_eq!(argv, vec!["agent", "--print", "a; rm -rf / && b", "--run=run-9"]);
+        // One pass: a value that looks like a placeholder is not expanded.
+        let vars = [("run_id", "run-9".to_string()), ("prompt", "say {run_id} {nope".to_string())];
+        assert_eq!(render_one("{prompt}|{run_id}|{other}", &vars), "say {run_id} {nope|run-9|{other}");
     }
 
     #[test]

@@ -123,7 +123,15 @@ const SHED_ORDER: [&str; 4] = ["native_sessions", "repos", "worktree_roots", "ha
 /// `node_code_sha`: heartbeats may carry a `code_sha` fact.
 /// `acp_session_mcp`: the hub mints session credentials for ACP items (code
 /// support; whether it is switched on is checked per call).
-const HUB_FEATURES: [&str; 2] = ["node_code_sha", super::node_queue::credentials::FEATURE];
+/// `node_wake_v3`: the hub serves the idle-session wake long-poll
+/// (`/api/node/wake`, offer version 3); `node_wake_live_sessions`: it reads
+/// `live_sessions` on that poll.
+const HUB_FEATURES: [&str; 4] = [
+    "node_code_sha",
+    super::node_queue::credentials::FEATURE,
+    super::wake::FEATURE,
+    super::wake::LIVE_SESSIONS_FEATURE,
+];
 
 /// Lists the ids of queued or claimed work items assigned to a node.
 pub(crate) type OpenWork = fn(&Connection, &str) -> UaResult<Vec<String>>;
