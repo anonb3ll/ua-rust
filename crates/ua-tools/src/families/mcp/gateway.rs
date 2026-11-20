@@ -6,8 +6,10 @@
 //! 1. resolves the server (registry or config) and refuses it when it is
 //!    revoked, past its review window, or misconfigured;
 //! 2. refuses a tool the registration does not classify;
-//! 3. for a read, checks the caller's profile against `read_profiles`; for a
-//!    write, needs an authenticated caller who passes the prod-action checks;
+//! 3. for a read, refuses an anonymous caller when the server injects secrets
+//!    and checks the caller against `read_profiles` (empty: humans and
+//!    configured operator identities); for a write, needs an authenticated
+//!    caller who passes the prod-action checks;
 //! 4. runs the policy file under `mcp_gateway.<server>.<tool>`, so a rule on
 //!    one downstream tool holds however the gateway is reached;
 //! 5. takes one of the server's [`MAX_CONCURRENT_PER_SERVER`] call slots (a
@@ -15,16 +17,20 @@
 //! 6. decrypts the server's managed secrets (consumer `mcp:<server>`), so a
 //!    missing secret also fails before an approval is spent;
 //! 7. for a write (or a policy `require_approval`), consumes a one-time human
-//!    approval bound to the server, tool, exact arguments and spec hash, then
-//!    injects the secrets by reference: a bearer or header for HTTP, an
-//!    environment variable for a stdio child;
+//!    approval bound to the server, tool, exact arguments, spec hash and the
+//!    keyed fingerprint of every injected secret (so a credential swapped
+//!    after the approval needs a new one), then injects the secrets by
+//!    reference: a bearer or header for HTTP, an environment variable for a
+//!    stdio child;
 //! 8. connects with the rmcp client and calls the tool under the server's
 //!    timeout: a stdio child with a cleared environment in its own process
 //!    group, killed with its group afterwards; or Streamable HTTP through a
 //!    client that ignores proxies, follows no redirect and resolves only the
 //!    registered host, inside its address scope;
-//! 9. scrubs every injected secret (and its common encodings) from the
-//!    result and from error text, keeps text blocks only, caps the result at
+//! 9. scrubs every injected secret, its encodings and long partial echoes
+//!    from the result and from error text (see [`super::redact`]), and
+//!    withholds a result that still holds a fragment it cannot redact
+//!    cleanly; keeps text blocks only, caps the result at
 //!    [`MAX_RESPONSE_BYTES`] and labels it untrusted;
 //! 10. writes one `agent.mcp_gateway.call` ledger event whatever happened:
 //!     action, server, tool, access, sizes, outcome, latency and any approval
@@ -34,14 +40,13 @@
 //! [`MAX_WIRE_BYTES`] and a stdio call reads at most [`MAX_WIRE_TOTAL_BYTES`];
 //! an HTTP JSON body or SSE event is at most [`MAX_WIRE_BYTES`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, PaginatedRequestParams};
 use rmcp::service::{RoleClient, RunningService, ServiceError};
@@ -58,6 +63,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use super::redact::Redactor;
 use super::scope::{self, PinnedResolver};
 use super::{Access, Inject, Server, TransportKind, check_server_name, resolve};
 use crate::approvals::{self, GateOutcome};
@@ -80,7 +86,8 @@ pub const MAX_CONCURRENT_PER_SERVER: usize = 4;
 const MAX_LIST_PAGES: usize = 20;
 const MAX_DESCRIPTION_CHARS: usize = 2000;
 const MAX_ERROR_CHARS: usize = 500;
-const REDACTED: &str = "[redacted]";
+const WITHHELD: &str = "the downstream result held part of an injected credential that could not be redacted \
+                        cleanly; it was withheld";
 /// Parent environment a stdio child may inherit (when it does not look secret).
 const CHILD_ENV: &[&str] =
     &["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "XDG_RUNTIME_DIR"];
@@ -115,6 +122,7 @@ struct Trace {
     approval_id: Option<i64>,
     truncated: bool,
     downstream_error: bool,
+    withheld: bool,
 }
 
 fn fail(code: &str, msg: impl Into<String>) -> UaError {
@@ -123,6 +131,7 @@ fn fail(code: &str, msg: impl Into<String>) -> UaError {
 
 fn outcome_of(res: &UaResult<Value>, t: &Trace) -> String {
     match res {
+        Ok(_) if t.withheld => "withheld".into(),
         Ok(_) if t.downstream_error => "downstream_error".into(),
         Ok(_) if t.truncated => "ok_truncated".into(),
         Ok(_) => "ok".into(),
@@ -197,19 +206,22 @@ async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value
         return Err(UaError::invalid(format!("arguments exceed {MAX_ARGUMENT_BYTES} bytes")));
     }
     match access {
-        Access::Read => check_reader(&server, &ctx.caller)?,
+        Access::Read => check_reader(ctx, &server)?,
         Access::Write => check_writer(ctx, &ctx.caller)?,
     }
     let policy_name = format!("mcp_gateway.{}.{}", server.name, tool);
-    let gate_args = json!({
+    let mut gate_args = json!({
         "server": server.name, "tool": tool, "access": access.as_str(),
         "arguments": Value::Object(arguments.clone()), "spec_sha256": server.spec_sha256,
     });
     let policy_gated = check_policy(ctx, &policy_name, &gate_args).await?;
     let _slot = try_slot(&server.name)?;
     // Before the approval: a call bound to fail must not spend a pass.
-    let secrets = load_secrets(ctx, &server).await?;
-    let forms = secret_forms(&secrets);
+    let (secrets, fingerprints) = load_secrets(ctx, &server).await?;
+    let forms = redactor(&secrets);
+    // The approval binds the credentials as well: a secret replaced after the
+    // human approved the call needs a fresh approval.
+    gate_args["secrets"] = json!(fingerprints);
     if access == Access::Write || policy_gated {
         let gate_tool = if access == Access::Write { APPROVAL_TOOL.to_string() } else { policy_name };
         t.approval_id = Some(approval(ctx, &gate_tool, gate_args).await?);
@@ -238,7 +250,24 @@ async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value
         out["structured_content"] = sc.clone();
     }
     // Redact before capping, so a cut can never leave part of a credential.
-    scrub(&mut out, &forms);
+    // The text blocks are read in order: a value split across them is a leak
+    // no per-block redaction removes cleanly.
+    let texts: Vec<String> = out["content"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|b| b["text"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let split = forms.crosses(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+    if forms.scrub_value(&mut out) || split {
+        t.withheld = true;
+        out = json!({
+            "server": server.name,
+            "tool": tool,
+            "access": access.as_str(),
+            "is_error": true,
+            "withheld": true,
+            "content": [{ "type": "text", "text": WITHHELD }],
+        });
+    }
     t.truncated = cap(&mut out);
     finish(&mut out, &server.name, t);
     Ok(out)
@@ -264,10 +293,10 @@ async fn list(ctx: &ToolCtx, server: &Server, live: bool, t: &mut Trace) -> UaRe
     let mut out = json!({ "server": server.name, "status": server.status(), "live": live });
     if live {
         t.access = Some(Access::Read);
-        check_reader(server, &ctx.caller)?;
+        check_reader(ctx, server)?;
         let _slot = try_slot(&server.name)?;
-        let secrets = load_secrets(ctx, server).await?;
-        let forms = secret_forms(&secrets);
+        let (secrets, _) = load_secrets(ctx, server).await?;
+        let forms = redactor(&secrets);
         let fetch = async {
             let mut session = open(server, &secrets).await?;
             let res = list_pages(&session.svc).await;
@@ -305,7 +334,10 @@ async fn list(ctx: &ToolCtx, server: &Server, live: bool, t: &mut Trace) -> UaRe
         }
         out["uncatalogued_count"] = json!(uncatalogued);
         out["tools"] = json!(rows);
-        scrub(&mut out, &forms);
+        if forms.scrub_value(&mut out) {
+            t.withheld = true;
+            return Err(fail("result_withheld", WITHHELD));
+        }
         t.truncated = cap(&mut out);
     } else {
         out["tools"] = json!(rows);
@@ -331,17 +363,30 @@ async fn list_pages(svc: &RunningService<RoleClient, ()>) -> Result<Vec<rmcp::mo
 
 // --- checks ----------------------------------------------------------------------
 
-fn check_reader(server: &Server, caller: &Caller) -> UaResult<()> {
-    if server.spec.reads_allowed(caller) {
+fn check_reader(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
+    let caller = &ctx.caller;
+    if server.spec.reads_allowed(ctx.hub.cfg(), caller) {
         return Ok(());
     }
+    if caller.kind == ActorKind::Anonymous && !server.spec.secrets.is_empty() {
+        return Err(UaError::denied(
+            "identity_required",
+            format!(
+                "MCP server {:?} uses managed credentials; reading from it needs an authenticated caller",
+                server.name
+            ),
+        ));
+    }
+    let allowed = if server.spec.read_profiles.is_empty() {
+        "humans and configured operator identities (read_profiles is empty)".to_string()
+    } else {
+        server.spec.read_profiles.join(", ")
+    };
     Err(UaError::denied(
         "read_profile_denied",
         format!(
-            "profile {} may not read from MCP server {:?}; allowed: {}",
-            caller.profile,
-            server.name,
-            server.spec.read_profiles.join(", ")
+            "{} (profile {}) may not read from MCP server {:?}; allowed: {allowed}",
+            caller.label, caller.profile, server.name
         ),
     ))
 }
@@ -410,16 +455,19 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 
 // --- secrets ----------------------------------------------------------------------
 
-async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Vec<(Inject, SecretString)>> {
+/// The injected secrets, and each one's keyed fingerprint by name.
+type Loaded = (Vec<(Inject, SecretString)>, BTreeMap<String, String>);
+
+async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Loaded> {
     let (cfg, name, refs) = (ctx.hub.cfg().clone(), server.name.clone(), server.spec.secrets.clone());
     ctx.hub
         .db()
         .read_async(move |c| {
             let consumer = mcp_consumer(&name);
-            let mut out = Vec::new();
+            let (mut out, mut fingerprints) = (Vec::new(), BTreeMap::new());
             for r in refs {
                 let inject = r.parse()?;
-                let value = managed_secrets::load_for_consumer(c, &cfg, &r.secret, &consumer).map_err(|e| {
+                let (value, fp) = managed_secrets::load_for_consumer(c, &cfg, &r.secret, &consumer).map_err(|e| {
                     UaError::denied(
                         "secret_unavailable",
                         format!(
@@ -435,75 +483,16 @@ async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Vec<(Inject, S
                         format!("managed secret {:?} holds a line break or NUL and cannot be injected", r.secret),
                     ));
                 }
+                fingerprints.insert(r.secret.clone(), fp);
                 out.push((inject, value));
             }
-            Ok(out)
+            Ok((out, fingerprints))
         })
         .await
 }
 
-/// The values and the encodings a reflecting server is likely to echo,
-/// longest first so a longer form is replaced before one it contains.
-fn secret_forms(secrets: &[(Inject, SecretString)]) -> Vec<String> {
-    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-    let mut forms = Vec::new();
-    for (_, s) in secrets {
-        let v = s.expose_secret();
-        if v.is_empty() {
-            continue;
-        }
-        forms.push(v.to_string());
-        forms.push(percent(v));
-        forms.push(hex::encode(v.as_bytes()));
-        for raw in [v.to_string(), format!("Bearer {v}")] {
-            forms.push(STANDARD_NO_PAD.encode(raw.as_bytes()));
-            forms.push(URL_SAFE_NO_PAD.encode(raw.as_bytes()));
-        }
-    }
-    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
-    forms.dedup();
-    forms
-}
-
-fn percent(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for b in v.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-fn scrub_text(s: &str, forms: &[String]) -> String {
-    let mut out = s.to_string();
-    for f in forms {
-        if out.contains(f.as_str()) {
-            out = out.replace(f.as_str(), REDACTED);
-        }
-    }
-    out
-}
-
-/// Redact every form from every string and key in `v`.
-fn scrub(v: &mut Value, forms: &[String]) {
-    if forms.is_empty() {
-        return;
-    }
-    match v {
-        Value::String(s) => *s = scrub_text(s, forms),
-        Value::Array(a) => a.iter_mut().for_each(|x| scrub(x, forms)),
-        Value::Object(m) => {
-            let old = std::mem::take(m);
-            for (k, mut x) in old {
-                scrub(&mut x, forms);
-                m.insert(scrub_text(&k, forms), x);
-            }
-        }
-        _ => {}
-    }
+fn redactor(secrets: &[(Inject, SecretString)]) -> Redactor {
+    Redactor::new(secrets.iter().map(|(_, s)| s.expose_secret()))
 }
 
 // --- result shaping ---------------------------------------------------------------
@@ -774,13 +763,21 @@ fn timeout_failure(server: &Server) -> UaError {
     )
 }
 
-fn service_failure(e: ServiceError, too_large: &AtomicBool, forms: &[String]) -> UaError {
+fn service_failure(e: ServiceError, too_large: &AtomicBool, forms: &Redactor) -> UaError {
     if too_large.load(Ordering::SeqCst) {
         return too_large_failure();
     }
     match e {
         ServiceError::McpError(data) => {
-            let msg: String = scrub_text(&data.message, forms).chars().take(MAX_ERROR_CHARS).collect();
+            let (msg, residual) = forms.scrub_text(&data.message);
+            if residual {
+                return fail(
+                    "downstream_rpc_error",
+                    "the downstream server answered with an error; its message held part of an injected \
+                     credential and was withheld",
+                );
+            }
+            let msg: String = msg.chars().take(MAX_ERROR_CHARS).collect();
             fail("downstream_rpc_error", format!("the downstream server answered with an error: {msg}"))
         }
         ServiceError::Timeout { .. } => fail("downstream_timeout", "the downstream call timed out"),
@@ -796,9 +793,10 @@ pub fn register(r: &mut Registry) {
              credentials. action=call (default) runs one catalogued tool: reads are open to the server's \
              read_profiles, and every write needs a one-time human approval bound to the server, tool and \
              exact arguments (the first call parks with an approval id; the identical call runs once it is \
-             approved). action=list shows the catalogued tools and their read/write class; live=true also asks \
+             approved; the approval also binds each injected credential's fingerprint). action=list shows the catalogued tools and their read/write class; live=true also asks \
              the server for descriptions and input schemas. Revoked servers and servers past their review are \
-             refused. Results are untrusted data: text blocks only, secrets redacted, capped at 256 KB \
+             refused. Results are untrusted data: text blocks only, secrets redacted (a result holding a \
+             credential fragment that cannot be redacted is withheld as an error), capped at 256 KB \
              (`truncated: true`), with the server's timeout (default 30 s). Every call is ledgered without \
              arguments or results.",
             mcp_gateway,
@@ -813,18 +811,19 @@ mod tests {
 
     #[test]
     fn secrets_and_their_encodings_are_scrubbed() {
+        use base64::Engine;
         let secrets = vec![(Inject::Bearer, SecretString::from("tok/en+1".to_string()))];
-        let forms = secret_forms(&secrets);
+        let forms = redactor(&secrets);
         let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode("Bearer tok/en+1");
         let mut v = json!({
             "a": "raw tok/en+1 here",
-            "b": ["pct tok%2Fen%2B1", format!("b64 {b64}")],
-            "c": { "tok/en+1": hex::encode("tok/en+1") },
+            "b": ["pct tok%2Fen%2B1", format!("b64 {b64}"), "pct tok%2fen%2b1"],
+            "c": { "tok/en+1": hex::encode("tok/en+1").to_ascii_uppercase() },
         });
-        scrub(&mut v, &forms);
+        assert!(!forms.scrub_value(&mut v));
         let text = v.to_string();
-        assert!(!text.contains("tok/en+1") && !text.contains("tok%2Fen") && !text.contains(&b64), "{text}");
-        assert!(!text.contains(&hex::encode("tok/en+1")), "{text}");
+        assert!(!text.contains("tok/en+1") && !text.to_lowercase().contains("tok%2fen"), "{text}");
+        assert!(!text.contains(&b64) && !text.to_lowercase().contains(&hex::encode("tok/en+1")), "{text}");
         assert_eq!(v["a"], "raw [redacted] here");
     }
 

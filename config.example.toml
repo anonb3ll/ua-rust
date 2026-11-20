@@ -86,7 +86,9 @@ reviewer-1 = "cto"
 
 # Downstream MCP servers for mcp_gateway, declared by the operator. Same
 # fields as mcp_server_register's spec, plus review_expires_at. Secrets are
-# managed secret names bound to consumer "mcp:<server>". See docs/mcp.md.
+# managed secret names bound to consumer "mcp:<server>". An empty
+# read_profiles admits humans and configured operator identities only; list
+# the agent profiles that may read. See docs/mcp.md.
 # [mcp_servers.docs]
 # transport = "streamable_http"
 # url = "https://docs.example.com/mcp"

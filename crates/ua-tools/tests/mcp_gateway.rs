@@ -47,7 +47,7 @@ impl ServerHandler for Fake {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let schema = Arc::new(serde_json::Map::from_iter([("type".to_string(), json!("object"))]));
-        let tools = ["echo", "reveal", "write_note", "big", "env", "secret_tool"]
+        let tools = ["echo", "reveal", "reflect", "split", "write_note", "big", "env", "secret_tool"]
             .iter()
             .map(|n| Tool::new(*n, format!("fake {n}"), schema.clone()))
             .collect();
@@ -77,6 +77,43 @@ impl ServerHandler for Fake {
                 r.structured_content = Some(json!({ "token": token }));
                 r
             }
+            // The credential in the shapes a careless or hostile server echoes it.
+            "reflect" => {
+                use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+                let pct: String = token
+                    .bytes()
+                    .map(|b| {
+                        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                            (b as char).to_string()
+                        } else {
+                            format!("%{b:02x}")
+                        }
+                    })
+                    .collect();
+                let spaced = format!("{} {} {}", &token[..9], &token[9..21], &token[21..]);
+                text(format!(
+                    "basic0=Basic {} basic1=Basic {} basic2=Basic {} url={} url_pad={} HEX={} pct={pct}                      part={} spaced={spaced} wrapped={}",
+                    STANDARD.encode(format!("ab:{token}")),
+                    STANDARD.encode(format!("abc:{token}")),
+                    STANDARD.encode(format!("a:{token}")),
+                    URL_SAFE_NO_PAD.encode(format!("x{token}")),
+                    URL_SAFE.encode(&token),
+                    hex::encode(&token).to_ascii_uppercase(),
+                    &token[..token.len() * 2 / 3],
+                    STANDARD
+                        .encode(&token)
+                        .as_bytes()
+                        .chunks(8)
+                        .map(|c| String::from_utf8_lossy(c))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+            // The credential split over two blocks, each part too short to redact cleanly alone.
+            "split" => CallToolResult::success(vec![
+                ContentBlock::text(format!("first {}", &token[..10])),
+                ContentBlock::text(format!("{} last", &token[10..])),
+            ]),
             "write_note" => text(format!("noted: {}", args["text"].as_str().unwrap_or(""))),
             "big" => text("x".repeat(300_000)),
             "env" => text(format!(
@@ -169,6 +206,8 @@ impl H {
     fn with(f: impl FnOnce(&mut Config)) -> Self {
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.human_identities = vec!["operator".into()];
+        // Secret and registry admin is by identity: ops-1 is a configured operator.
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-1".into()]);
         cfg.managed_secret_key = Some(KEY.to_string().into());
         f(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry() }
@@ -252,7 +291,11 @@ fn stdio_spec() -> Value {
         "command": std::env::current_exe().unwrap().to_string_lossy(),
         "args": [FAKE_FLAG],
         "secrets": [{ "secret": "fake-token", "inject": "env:FAKE_TOKEN" }],
-        "tools": { "echo": "read", "reveal": "read", "big": "read", "env": "read", "write_note": "write" },
+        "tools": {
+            "echo": "read", "reveal": "read", "reflect": "read", "split": "read", "big": "read", "env": "read",
+            "write_note": "write",
+        },
+        "read_profiles": ["developer"],
     })
 }
 
@@ -286,7 +329,7 @@ async fn secrets_are_write_only_encrypted_and_operator_only() {
     assert!(!h.all_text().contains(TOKEN), "no ledger event, approval or metadata holds the value");
     assert_eq!(
         h.events("managed_secret.set")[0],
-        json!({ "name": "fake-token", "consumer": "mcp:fake", "replaced": false })
+        json!({ "name": "fake-token", "consumer": "mcp:fake", "replaced": false, "approval_id": null })
     );
 
     // Who may write.
@@ -312,15 +355,17 @@ async fn secrets_are_write_only_encrypted_and_operator_only() {
         .await;
     assert_eq!(reason(&e), "secret_consumer_change");
 
-    // An operator agent may set; rotating replaces and changes the fingerprint.
+    // An operator identity may set; replacing needs a human approval bound to
+    // the new value's fingerprint, and changes the fingerprint.
     let again = h
-        .ok(
+        .approved(
             &ops(),
             "managed_secret_set",
             json!({ "name": "fake-token", "consumer": "mcp:fake", "value": "new" }),
         )
         .await;
     assert_eq!(again["replaced"], true);
+    assert!(again["approval_id"].is_i64());
     assert_ne!(again["fingerprint"], set["fingerprint"]);
 
     // Delete always needs a human approval, bound to the current value.
@@ -344,6 +389,55 @@ async fn an_approved_gate_on_managed_secret_set_binds_the_fingerprint_not_the_va
     let set = h.approved(&ops(), "managed_secret_set", args).await;
     assert_eq!(set["stored"], true);
     assert!(!h.all_text().contains(TOKEN), "the approval row holds no value");
+    // A replacement takes the registry's one approval, not a second one.
+    let args = json!({ "name": "gated", "consumer": "mcp:fake", "value": "rotated-value" });
+    assert_eq!(h.approved(&ops(), "managed_secret_set", args).await["replaced"], true);
+}
+
+async fn replacing_a_secret_needs_an_approval_bound_to_the_new_value() {
+    let h = H::new();
+    let set = |v: &str| json!({ "name": "fake-token", "consumer": "mcp:fake", "value": v });
+    let first = h.ok(&ops(), "managed_secret_set", set(TOKEN)).await;
+    assert_eq!(first["replaced"], false, "a first set needs no approval");
+    // A replacement parks; the approval shows the new fingerprint, never the value.
+    let parked = h.err(&ops(), "managed_secret_set", set("swapped-value-1")).await;
+    let UaError::ApprovalRequired { approval_id, tool } = parked else { panic!("expected an approval") };
+    assert_eq!(tool, "managed_secret_set");
+    let pending = h.ok(&human(), "approval_pending", json!({})).await.to_string();
+    assert!(pending.contains("fingerprint") && !pending.contains("swapped-value-1"), "{pending}");
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    // The pass is bound to that value: another value parks again.
+    let e = h.err(&ops(), "managed_secret_set", set("swapped-value-2")).await;
+    assert_eq!(reason(&e), "approval_required");
+    let replaced = h.ok(&ops(), "managed_secret_set", set("swapped-value-1")).await;
+    assert_eq!(replaced["replaced"], true);
+    assert_eq!(replaced["approval_id"], approval_id);
+    assert_ne!(replaced["fingerprint"], first["fingerprint"]);
+    // Nothing stored changed while parked.
+    let list = h.ok(&ops(), "managed_secret_list", json!({})).await;
+    assert_eq!(list["secrets"][0]["fingerprint"], replaced["fingerprint"]);
+}
+
+async fn secret_admin_is_an_identity_not_a_profile() {
+    // A coordinator agent may activate the operator profile (it ranks lower)...
+    let h = H::with(|c| {
+        c.profiles.insert("boss".into(), "chief-of-staff".into());
+    });
+    let boss = caller("boss", ActorKind::Agent, Profile::ChiefOfStaff);
+    let r = h.ok(&boss, "profile_activate", json!({ "profile": "operator" })).await;
+    assert_eq!(r["profile"], "operator");
+    // ...but that makes it neither a secret nor a registry admin.
+    let as_operator = caller("boss", ActorKind::Agent, Profile::Operator);
+    let e = h
+        .err(&as_operator, "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" }))
+        .await;
+    assert_eq!(reason(&e), "operator_only");
+    let e =
+        h.err(&as_operator, "mcp_server_register", json!({ "name": "fake", "server": stdio_spec() })).await;
+    assert_eq!(reason(&e), "operator_only");
+    // A configured operator identity is, whatever its profile.
+    let ops_dev = caller("ops-1", ActorKind::Agent, Profile::ChiefOfStaff);
+    h.ok(&ops_dev, "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" })).await;
 }
 
 async fn registration_needs_an_operator_and_a_human_approval() {
@@ -412,13 +506,72 @@ async fn reads_run_and_secrets_are_injected_and_redacted() {
     // Live listing: catalogued tools with their schemas, the rest only counted.
     let l = h.ok(&dev(), "mcp_gateway", json!({ "action": "list", "server": "fake", "live": true })).await;
     let tools = l["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 7);
     assert!(tools.iter().all(|t| t["present"] == true), "{l}");
     assert_eq!(l["uncatalogued_count"], 1);
     assert!(!l.to_string().contains("secret_tool"));
     let w = tools.iter().find(|t| t["name"] == "write_note").unwrap();
     assert_eq!(w["access"], "write");
     assert_eq!(w["description"], "fake write_note");
+}
+
+/// No 12-byte window of the token, nor of its hex, survives in `text`.
+fn assert_no_token(text: &str) {
+    let lower = text.to_ascii_lowercase();
+    for w in TOKEN.as_bytes().windows(12) {
+        let w = std::str::from_utf8(w).unwrap();
+        assert!(!text.contains(w), "{w:?} survived in {text}");
+    }
+    let hex = hex::encode(TOKEN);
+    for w in hex.as_bytes().windows(24) {
+        assert!(!lower.contains(std::str::from_utf8(w).unwrap()), "hex survived in {text}");
+    }
+}
+
+async fn encoded_partial_and_split_echoes_are_redacted_or_withheld() {
+    let h = H::new();
+    h.set_secret("fake-token", "mcp:fake", TOKEN).await;
+    h.register_stdio("fake", json!({})).await;
+    let r = h.ok(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "reflect" })).await;
+    assert_eq!(r["is_error"], false, "{r}");
+    let shown = content_text(&r);
+    assert_no_token(&shown);
+    let joined: String = shown.split_whitespace().collect();
+    assert_no_token(&joined);
+    // Each echo was replaced, not dropped with its label.
+    for label in [
+        "basic0=Basic",
+        "basic1=Basic",
+        "basic2=Basic",
+        "url=",
+        "url_pad=",
+        "HEX=",
+        "pct=",
+        "part=",
+        "spaced=",
+    ] {
+        assert!(shown.contains(label), "{label} missing in {shown}");
+    }
+    assert!(shown.matches("[redacted]").count() >= 9, "{shown}");
+    // Base64 cores: what is left around a redaction is a few characters, never the value.
+    for enc in [
+        base64::engine::general_purpose::STANDARD.encode(format!("ab:{TOKEN}")),
+        base64::engine::general_purpose::STANDARD.encode(format!("abc:{TOKEN}")),
+        base64::engine::general_purpose::STANDARD.encode(format!("a:{TOKEN}")),
+        base64::engine::general_purpose::URL_SAFE.encode(TOKEN),
+    ] {
+        assert!(!joined.contains(&enc[8..20]), "{enc} survived in {shown}");
+    }
+
+    // Split across two blocks, the parts cannot be redacted cleanly: withheld.
+    let r = h.ok(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "split" })).await;
+    assert_eq!(r["is_error"], true, "{r}");
+    assert_eq!(r["withheld"], true, "{r}");
+    assert!(content_text(&r).contains("withheld"), "{r}");
+    assert!(!r.to_string().contains(&TOKEN[..10]) && !r.to_string().contains(&TOKEN[10..]), "{r}");
+    let outcomes: Vec<Value> =
+        h.events("agent.mcp_gateway.call").iter().map(|e| e["outcome"].clone()).collect();
+    assert_eq!(outcomes, [json!("ok"), json!("withheld")]);
 }
 
 async fn writes_need_a_one_time_approval_bound_to_the_arguments() {
@@ -459,6 +612,48 @@ async fn writes_need_a_one_time_approval_bound_to_the_arguments() {
         )
         .await;
     assert_eq!(reason(&e), "identity_required");
+    // Nor read from a server that injects credentials, whatever read_profiles says.
+    let e = h.err(&anon, "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+    assert_eq!(reason(&e), "identity_required");
+    let e = h.err(&anon, "mcp_gateway", json!({ "action": "list", "server": "fake", "live": true })).await;
+    assert_eq!(reason(&e), "identity_required");
+}
+
+async fn empty_read_profiles_mean_humans_and_operators_only() {
+    let h = H::new();
+    h.set_secret("open-token", "mcp:open", TOKEN).await;
+    let secrets = json!([{ "secret": "open-token", "inject": "env:FAKE_TOKEN" }]);
+    h.register_stdio("open", json!({ "read_profiles": [], "secrets": secrets })).await;
+    let echo = json!({ "server": "open", "tool": "echo" });
+    assert_eq!(reason(&h.err(&dev(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
+    assert_eq!(reason(&h.err(&steward(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
+    let anon = Caller::local("someone", Transport::Stdio);
+    assert_eq!(reason(&h.err(&anon, "mcp_gateway", echo.clone()).await), "identity_required");
+    // The configured operator identity reads, in a profile that has the gateway.
+    h.ok(&caller("ops-1", ActorKind::Agent, Profile::Developer), "mcp_gateway", echo.clone()).await;
+    h.ok(&human(), "mcp_gateway", echo).await;
+}
+
+async fn a_write_approval_binds_the_injected_credential() {
+    let h = H::new();
+    h.set_secret("fake-token", "mcp:fake", TOKEN).await;
+    h.register_stdio("fake", json!({})).await;
+    let args = json!({ "server": "fake", "tool": "write_note", "arguments": { "text": "bound" } });
+    let UaError::ApprovalRequired { approval_id, .. } = h.err(&dev(), "mcp_gateway", args.clone()).await
+    else {
+        panic!("expected an approval")
+    };
+    // The approval shows the credential's fingerprint, never its value.
+    let fp = h.ok(&ops(), "managed_secret_list", json!({})).await["secrets"][0]["fingerprint"].clone();
+    let pending = h.ok(&human(), "approval_pending", json!({})).await.to_string();
+    assert!(pending.contains(fp.as_str().unwrap()) && !pending.contains(TOKEN), "{pending}");
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    // The credential is swapped after the approval: the pass no longer applies.
+    let swap =
+        json!({ "name": "fake-token", "consumer": "mcp:fake", "value": "attacker-chosen-token-value" });
+    h.approved(&ops(), "managed_secret_set", swap).await;
+    let e = h.err(&dev(), "mcp_gateway", args).await;
+    assert_eq!(reason(&e), "approval_required");
 }
 
 async fn uncatalogued_tools_and_unknown_servers_are_refused() {
@@ -470,7 +665,7 @@ async fn uncatalogued_tools_and_unknown_servers_are_refused() {
     let e = h.err(&dev(), "mcp_gateway", json!({ "server": "nope", "tool": "echo" })).await;
     assert_eq!(reason(&e), "not_found");
     let l = h.ok(&dev(), "mcp_gateway", json!({ "action": "list", "server": "fake" })).await;
-    assert_eq!(l["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(l["tools"].as_array().unwrap().len(), 7);
     assert_eq!(l["live"], false);
     let outcomes: Vec<Value> =
         h.events("agent.mcp_gateway.call").iter().map(|e| e["outcome"].clone()).collect();
@@ -508,6 +703,7 @@ async fn revoked_and_unreviewed_servers_are_refused() {
 
     let revoked = h.approved(&ops(), "mcp_server_revoke", json!({ "name": "fake" })).await;
     assert_eq!(revoked["server"]["status"], "revoked");
+    assert_eq!(revoked["orphaned_secrets"], json!(["fake-token"]));
     assert_eq!(reason(&h.err(&dev(), "mcp_gateway", echo("fake")).await), "server_revoked");
     let list = h.ok(&dev(), "mcp_server_list", json!({})).await;
     assert!(list["servers"].as_array().unwrap().iter().all(|s| s["name"] != "fake"));
@@ -534,6 +730,41 @@ async fn revoked_and_unreviewed_servers_are_refused() {
     assert_eq!(reason(&e), "server_in_config");
 }
 
+async fn revoking_a_server_orphans_its_secrets() {
+    let h = H::new();
+    h.set_secret("fake-token", "mcp:fake", TOKEN).await;
+    h.set_secret("unrelated", "mcp:other", "other-value").await;
+    h.register_stdio("fake", json!({})).await;
+    h.ok(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+    // The revocation's approval names the secrets it will delete.
+    let UaError::ApprovalRequired { approval_id, .. } =
+        h.err(&ops(), "mcp_server_revoke", json!({ "name": "fake" })).await
+    else {
+        panic!("expected an approval")
+    };
+    let pending = h.ok(&human(), "approval_pending", json!({})).await.to_string();
+    assert!(pending.contains("orphaned_secrets") && pending.contains("fake-token"), "{pending}");
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    let revoked = h.ok(&ops(), "mcp_server_revoke", json!({ "name": "fake" })).await;
+    assert_eq!(revoked["orphaned_secrets"], json!(["fake-token"]));
+    let list = h.ok(&ops(), "managed_secret_list", json!({})).await;
+    assert_eq!(list["count"], 1, "only the other consumer's secret is left: {list}");
+    assert_eq!(list["secrets"][0]["name"], "unrelated");
+    let deleted = h.events("managed_secret.deleted");
+    assert_eq!(deleted[0]["reason"], "mcp_server_revoked");
+    assert_eq!(deleted[0]["approval_id"], approval_id);
+
+    // The name registered again at another spec inherits no credential.
+    let mut other = stdio_spec();
+    other["args"] = json!([FAKE_FLAG, "--elsewhere"]);
+    h.approved(&ops(), "mcp_server_register", json!({ "name": "fake", "server": other })).await;
+    let e = h.err(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+    assert_eq!(reason(&e), "secret_unavailable");
+    // It works once the operator sets the credential for the new registration.
+    h.set_secret("fake-token", "mcp:fake", TOKEN).await;
+    h.ok(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+}
+
 async fn big_results_are_capped_and_marked() {
     let h = H::new();
     h.set_secret("fake-token", "mcp:fake", TOKEN).await;
@@ -555,6 +786,7 @@ async fn streamable_http_is_pinned_to_its_registered_loopback_origin() {
             "address_scope": scope,
             "secrets": [{ "secret": "http-token", "inject": "bearer" }],
             "tools": { "echo": "read", "reveal": "read" },
+            "read_profiles": ["developer"],
         })
     };
     // Loopback is refused unless it is registered as loopback.
@@ -596,6 +828,7 @@ async fn unreachable_servers_fail_with_fixed_messages() {
                 "transport": "stdio",
                 "command": "/nonexistent/mcp-server",
                 "tools": { "echo": "read" },
+                "read_profiles": ["developer"],
                 "review_expires_at": "2999-01-01",
             }),
         );
@@ -617,12 +850,18 @@ macro_rules! tests {
 const TESTS: &[(&str, Test)] = tests![
     secrets_are_write_only_encrypted_and_operator_only,
     an_approved_gate_on_managed_secret_set_binds_the_fingerprint_not_the_value,
+    replacing_a_secret_needs_an_approval_bound_to_the_new_value,
+    secret_admin_is_an_identity_not_a_profile,
     registration_needs_an_operator_and_a_human_approval,
     reads_run_and_secrets_are_injected_and_redacted,
+    encoded_partial_and_split_echoes_are_redacted_or_withheld,
     writes_need_a_one_time_approval_bound_to_the_arguments,
+    empty_read_profiles_mean_humans_and_operators_only,
+    a_write_approval_binds_the_injected_credential,
     uncatalogued_tools_and_unknown_servers_are_refused,
     read_profiles_and_missing_secrets_refuse_reads,
     revoked_and_unreviewed_servers_are_refused,
+    revoking_a_server_orphans_its_secrets,
     big_results_are_capped_and_marked,
     streamable_http_is_pinned_to_its_registered_loopback_origin,
     unreachable_servers_fail_with_fixed_messages,

@@ -139,6 +139,31 @@ fn local_caller_with(
     c
 }
 
+/// Whether rmcp at `level` is dropped. rmcp logs whole requests and
+/// responses at debug and trace: tool arguments (a managed_secret_set value)
+/// and downstream MCP results (a reflected credential).
+fn rmcp_capped(target: &str, level: &tracing::Level) -> bool {
+    (target == "rmcp" || target.starts_with("rmcp::"))
+        && matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE)
+}
+
+/// The log layer: `filter` (from UA_LOG), then a cap no directive can lift
+/// (not even a more specific one such as `rmcp::service=debug`): rmcp never
+/// logs below info.
+fn log_layer<S, W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::{FilterExt, filter_fn};
+    let cap = filter_fn(|meta| !rmcp_capped(meta.target(), meta.level()));
+    tracing_subscriber::fmt::layer().with_writer(writer).with_filter(filter.and(cap))
+}
+
 /// Ask the operator to type `label` on an interactive terminal.
 fn confirm_on_tty(label: &str) -> bool {
     use std::io::{BufRead, IsTerminal, Write};
@@ -156,14 +181,11 @@ fn confirm_on_tty(label: &str) -> bool {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
-    // rmcp logs whole requests and responses at debug level: tool arguments
-    // (a managed_secret_set value) and downstream MCP results (a reflected
-    // credential). Cap it at info whatever UA_LOG asks for.
-    let filter = match "rmcp=info".parse() {
-        Ok(cap) => filter.add_directive(cap),
-        Err(_) => filter,
-    };
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
+    }
     let cfg = load_config(&cli)?;
 
     if let Cmd::Config = cli.cmd {
@@ -395,6 +417,40 @@ mod tests {
         // UA_AGENT_LABEL=agent-1 and an explicit --label operator: still not human.
         let c = local_caller_with(&cfg(), Some("operator".into()), Some("agent-1"), |_| true);
         assert_eq!(c.kind, ActorKind::Anonymous);
+    }
+
+    #[test]
+    fn rmcp_debug_logs_stay_capped_whatever_ua_log_says() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let out = buf.clone();
+        let filter = tracing_subscriber::EnvFilter::new("debug,rmcp=trace,rmcp::service=debug");
+        let sub = tracing_subscriber::registry().with(log_layer(filter, move || buf.clone()));
+        tracing::subscriber::with_default(sub, || {
+            tracing::debug!(target: "rmcp::service", "SECRET-REQUEST-BODY");
+            tracing::trace!(target: "rmcp", "SECRET-TRACE");
+            tracing::info!(target: "rmcp::service", "rmcp-info-kept");
+            tracing::debug!(target: "ua_tools", "other-debug-kept");
+            tracing::debug!(target: "rmcpx", "lookalike-kept");
+        });
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(text.contains("rmcp-info-kept") && text.contains("other-debug-kept"), "{text}");
+        assert!(text.contains("lookalike-kept"), "{text}");
+        assert!(rmcp_capped("rmcp::transport::worker", &tracing::Level::TRACE));
+        assert!(!rmcp_capped("rmcp", &tracing::Level::WARN));
     }
 
     #[test]

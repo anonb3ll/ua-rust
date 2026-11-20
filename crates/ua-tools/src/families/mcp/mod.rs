@@ -17,8 +17,23 @@
 //! review window. A config entry's window is its `review_expires_at`, or a
 //! later `mcp_server_review` of the same spec. Revoking a config entry holds
 //! until its spec changes: an edited entry is a new declaration.
+//!
+//! Reads: `read_profiles` lists the profiles whose sessions may call the read
+//! tools. Left empty it means humans and configured operator identities
+//! (`human_identities`, `lifecycle_operators`) only; a registration that
+//! should serve agents names their profiles explicitly. An anonymous caller
+//! (a local stdio process, or HTTP without enforced auth) never reads from a
+//! server that injects secrets, whatever `read_profiles` says.
+//!
+//! Secrets and revocation: a server's secrets are bound to its name
+//! (`mcp:<name>`), and a revoked name may be registered again, perhaps at
+//! another endpoint. So revoking orphans them: the revocation's approval
+//! payload lists every secret bound to `mcp:<name>` (name and fingerprint),
+//! and the approved revocation deletes them. A re-registration starts with no
+//! credential; the operator sets it again for the new spec.
 
 pub mod gateway;
+pub mod redact;
 pub mod scope;
 
 use std::collections::BTreeMap;
@@ -152,8 +167,9 @@ pub struct ServerSpec {
     /// Every downstream tool the gateway may call, classified `read` or
     /// `write` (1-256). Any other tool is refused.
     pub tools: BTreeMap<String, Access>,
-    /// Profiles whose sessions may call the read tools. Empty: any profile
-    /// that can see `mcp_gateway`. Writes always need a human approval.
+    /// Profiles whose sessions may call the read tools. Empty: humans and
+    /// configured operator identities only. Anonymous callers never read from
+    /// a server with secrets. Writes always need a human approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_profiles: Vec<String>,
     /// Seconds one gateway call may take, connection included (1-120, default 30).
@@ -454,11 +470,20 @@ impl ServerSpec {
         std::time::Duration::from_secs(self.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S))
     }
 
-    /// Whether `caller` may call this server's read tools.
-    pub fn reads_allowed(&self, caller: &Caller) -> bool {
-        caller.is_human()
-            || self.read_profiles.is_empty()
-            || self.read_profiles.iter().any(|p| p == caller.profile.as_str())
+    /// Whether `caller` may call this server's read tools. An anonymous
+    /// caller never reads from a server that injects secrets; an empty
+    /// `read_profiles` admits humans and configured operator identities only.
+    pub fn reads_allowed(&self, cfg: &Config, caller: &Caller) -> bool {
+        if caller.kind == ua_core::ActorKind::Anonymous && !self.secrets.is_empty() {
+            return false;
+        }
+        if caller.is_human() {
+            return true;
+        }
+        if self.read_profiles.is_empty() {
+            return managed_secrets::is_secret_admin(cfg, caller);
+        }
+        self.read_profiles.iter().any(|p| p == caller.profile.as_str())
     }
 }
 
@@ -925,11 +950,22 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
             if server.revoked_at.is_some() {
                 return Ok(Ok(json!({ "server": server.public(tx), "already_revoked": true })));
             }
-            let payload = json!({ "op": "revoke", "name": name, "spec_sha256": server.spec_sha256 });
+            // The secrets this revocation orphans, bound into the approval: a
+            // secret set or rotated after the request needs a new approval.
+            let consumer = mcp_consumer(&name);
+            let orphans: Vec<Value> = managed_secrets::bound_secrets(tx, &consumer)?
+                .into_iter()
+                .map(|(secret, fingerprint)| json!({ "secret": secret, "fingerprint": fingerprint }))
+                .collect();
+            let payload = json!({
+                "op": "revoke", "name": name, "spec_sha256": server.spec_sha256, "orphaned_secrets": orphans,
+            });
             let approval_id = match gate(tx, hub.cfg(), &caller, "mcp_server_revoke", &payload)? {
                 Ok(id) => id,
                 Err(id) => return Ok(Err(id)),
             };
+            let orphaned =
+                managed_secrets::orphan_consumer(tx, &consumer, &caller.label, approval_id, "mcp_server_revoked")?;
             let now = ua_core::time::now();
             match server.source {
                 Source::Registry => {
@@ -953,12 +989,13 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
                 tx,
                 EventInput::new(
                     REGISTRY_CHANNEL,
-                    json!({ "op": "revoked", "name": name, "spec_sha256": server.spec_sha256, "approval_id": approval_id }),
+                    json!({ "op": "revoked", "name": name, "spec_sha256": server.spec_sha256, "approval_id": approval_id,
+                            "orphaned_secrets": orphaned }),
                 )
                 .by(caller.label.clone()),
             )?;
             let server = resolve(tx, hub.cfg(), &name)?;
-            Ok(Ok(json!({ "server": server.public(tx), "approval_id": approval_id })))
+            Ok(Ok(json!({ "server": server.public(tx), "approval_id": approval_id, "orphaned_secrets": orphaned })))
         })
         .await?;
     pending("mcp_server_revoke", out)
@@ -997,8 +1034,10 @@ pub fn register(r: &mut Registry) {
             "Register a downstream MCP server for mcp_gateway. For a human or an operator, and needs a one-time \
              human approval bound to the whole spec: transport (stdio command/args, or a streamable_http URL with \
              its address_scope), managed secrets injected by name (consumer mcp:<name>), the read/write \
-             classification of every downstream tool it may call, read_profiles and timeout. The review lasts \
-             review_days (default mcp_review_ttl_days). A revoked name may be registered again.",
+             classification of every downstream tool it may call, read_profiles (empty: humans and configured \
+             operator identities only) and timeout. The review lasts review_days (default mcp_review_ttl_days). \
+             A revoked name may be registered again; its old secrets were deleted at revocation and must be set \
+             again.",
             mcp_server_register,
         )
         .gates_in_handler()
@@ -1018,7 +1057,9 @@ pub fn register(r: &mut Registry) {
         tool(
             "mcp_server_revoke",
             "Revoke a downstream MCP server so mcp_gateway refuses it. For a human or an operator; needs a \
-             one-time human approval. A revoked config entry stays revoked until its spec changes.",
+             one-time human approval, whose payload lists the managed secrets bound to mcp:<name>: the approved \
+             revocation deletes them, so a later registration of the name never inherits a credential. A \
+             revoked config entry stays revoked until its spec changes.",
             mcp_server_revoke,
         )
         .always_gated()

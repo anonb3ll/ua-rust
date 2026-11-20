@@ -15,9 +15,22 @@ pieces make this work:
 
 | Tool | Who | What |
 |---|---|---|
-| `managed_secret_set` | A human, a configured human or lifecycle operator, or an agent whose profile is `operator` | Store a value for one consumer. Returns metadata and a fingerprint, never the value. |
+| `managed_secret_set` | A human, or an agent whose identity is in `human_identities` or `lifecycle_operators` | Store a value for one consumer. Returns metadata and a fingerprint, never the value. Replacing an existing value needs a one-time human approval. |
 | `managed_secret_list` | Profiles that see it (not `developer` or `steward`) | Name, consumer, fingerprint, size, key id, who set it. |
 | `managed_secret_delete` | As for `set`, plus a one-time human approval | The approval binds the name, consumer and current fingerprint. |
+
+- **Admin is an identity, not a profile.** Who may set, delete, register,
+  review or revoke is decided by the verified identity: a human, or an agent
+  listed in `human_identities` or `lifecycle_operators`. The `operator`
+  profile grants none of it, because an agent may activate any profile that
+  ranks no higher than its default.
+- **Replacing a value.** A first `managed_secret_set` of a name needs no
+  approval (unless `approval_tools` lists it). Setting a name that already
+  holds a value parks for a one-time human approval bound to the name,
+  consumer, size and the new value's fingerprint; the identical retry after
+  approval stores it. Swapping a credential is as consequential as deleting
+  it, and a gateway write approved earlier no longer applies (see
+  [Calling a tool](#calling-a-tool)).
 
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
   secret's name and consumer as associated data, so a row copied under another
@@ -74,13 +87,19 @@ the approval queue.
 | `url`, `address_scope` | streamable_http only. See [Address scope](#address-scope). |
 | `secrets` | Managed secrets injected by name: `bearer` (HTTP `Authorization`), `header:<Name>` (another HTTP header) or `env:<NAME>` (a stdio child's environment). Each must be bound to consumer `mcp:<name>`. At most 8. |
 | `tools` | Every downstream tool the gateway may call, classified `read` or `write` by the reviewer. 1-256 entries. Nothing the server says about its own tools (annotations, its tool list) changes this. |
-| `read_profiles` | Profiles whose sessions may call the read tools. Empty: any profile that can see `mcp_gateway`. |
+| `read_profiles` | Profiles whose sessions may call the read tools. Empty: humans and configured operator identities (`human_identities`, `lifecycle_operators`) only, so a server meant for agents names their profiles. An anonymous caller never reads from a server with `secrets`. |
 | `timeout_s` | One call's budget, connection included: 1-120, default 30. |
 
 `mcp_server_review` renews the review window for `review_days` from now
 (default `mcp_review_ttl_days`, 90) and needs a one-time human approval bound
 to the server's current spec. `mcp_server_revoke` (always gated) makes the
-gateway refuse the server. A revoked name can be registered again with a new
+gateway refuse the server and orphans its credentials: the approval payload
+lists every managed secret bound to `mcp:<name>` (`orphaned_secrets`, names
+and fingerprints), and the approved revocation deletes them, each with a
+`managed_secret.deleted` event. A revoked name can be registered again with a
+new approval, perhaps at another endpoint, so it starts with no credential:
+the operator sets the secrets again for the new registration. A secret set
+after the revocation was requested changes the payload and needs a new
 approval. `mcp_server_list` shows every server with its status (`active`,
 `review_expired`, `review_required`, `revoked` or `misconfigured`), its
 secret names and whether each is stored. It never shows a secret value.
@@ -127,8 +146,11 @@ name cannot be both declared in config and registered.
 1. The server exists, is not revoked, and is inside its review window.
 2. The tool is in the server's `tools`. Any other tool is refused
    (`tool_not_catalogued`), even if the server offers it.
-3. A read needs the caller's profile in `read_profiles`, when it is set. A
-   write needs an authenticated caller who is not in `revoked_agents` and, when
+3. A read from a server with `secrets` needs an authenticated caller
+   (`identity_required`): a local stdio process or HTTP without enforced auth
+   is anonymous. Then a human may read; anyone else needs a profile in
+   `read_profiles`, or, when it is empty, an identity in `human_identities` or
+   `lifecycle_operators`. A write needs an authenticated caller who is not in `revoked_agents` and, when
    `agent_scopes` is set, is scoped for `mcp_gateway_write`.
 4. The policy file runs under the name `mcp_gateway.<server>.<tool>`, so a
    rule such as `tool: "mcp_gateway.docs.*"` holds however the call is made.
@@ -137,7 +159,9 @@ name cannot be both declared in config and registered.
 6. The server's secrets decrypt for consumer `mcp:<server>`.
 7. A write, or a call a policy rule sends to approval, needs a one-time human
    approval. A write's approval binds the server, the tool, the exact
-   arguments and the spec hash under the queue name `mcp_gateway_write`. The
+   arguments, the spec hash and each injected secret's keyed fingerprint
+   (`secrets: {name: fingerprint}`) under the queue name `mcp_gateway_write`,
+   so a credential replaced after the approval needs a new one. The
    first call parks with an `approval_id`, and the identical call runs once a
    human approves it. Steps 5 and 6 come first, so a call that would fail
    anyway does not spend the approval.
@@ -177,15 +201,26 @@ with `is_error: true`.
   discarded. It runs in its own process group, and the whole group is killed
   after every call, on success, error or timeout.
 - **Redaction.** Every injected secret is removed from the result and from
-  any error text, in raw, percent-encoded, hex and base64 forms (including
-  `Bearer <token>` in base64). Redaction happens before the size cap, so a cut
-  can never leave part of a credential.
+  any error text: the raw value; its percent-encoding and hex in either case;
+  its base64 (standard or URL-safe, padded or not) at all three byte offsets,
+  so it is found inside a larger blob such as `Basic base64("user:" + v)`;
+  each of these with whitespace ignored, so a value split by spaces or line
+  breaks is found; and any substring of one of these forms at least
+  `max(12, len/2)` long (a partial echo). A shorter fragment (at least
+  `max(8, len/3)`) that remains, or a value split across text blocks or
+  string values, cannot be redacted cleanly: the result is withheld and comes
+  back as `is_error: true, withheld: true` with a fixed message (ledger
+  outcome `withheld`); an error message is replaced the same way. Redaction
+  happens before the size cap, so a cut can never leave part of a credential.
 - **Bounds.** Arguments are at most 64 KB. A stdio message (one line) is at
   most 1 MiB and a stdio call reads at most 4 MiB. An HTTP JSON body or SSE
   event is at most 1 MiB. The returned content is capped at 256 KB
   (`truncated: true`). Every call has the server's timeout.
 - **Untrusted output.** Downstream text is data written by someone else. The
   result carries the hub's `trust` marker.
+- **Logs.** rmcp logs whole requests and responses at debug and trace. The
+  `ua` binary drops rmcp events below info after `UA_LOG` is parsed, so no
+  directive (not even `rmcp::service=debug`) brings them back.
 - **Evidence.** Every gateway call, refused or not, appends exactly one
   `agent.mcp_gateway.call` event: action, server, tool, access, caller,
   argument and result sizes, outcome, latency and any approval id. The event

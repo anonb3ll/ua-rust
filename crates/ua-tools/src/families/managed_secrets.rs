@@ -1,9 +1,21 @@
 //! Managed secrets: a write-only store for credentials the hub hands to a
 //! consumer (today, a downstream MCP server) without any agent seeing them.
 //!
-//! Tools: `managed_secret_set` (a human or operator stores a value),
-//! `managed_secret_list` (metadata only) and `managed_secret_delete` (always
-//! needs a one-time human approval).
+//! Tools: `managed_secret_set` (a human or operator stores a value; replacing
+//! an existing value needs a one-time human approval bound to the new
+//! fingerprint), `managed_secret_list` (metadata only) and
+//! `managed_secret_delete` (always needs a one-time human approval).
+//!
+//! Who is an admin is decided by identity, never by profile: a verified human,
+//! or an authenticated agent listed in `human_identities` or
+//! `lifecycle_operators`. Any agent can activate the `operator` profile (the
+//! profile check is by rank only), so that profile grants nothing here.
+//!
+//! A secret for a downstream MCP server is bound to the server's name
+//! (`mcp:<server>`). Revoking the server orphans it: every secret bound to
+//! that consumer is deleted under the revocation's approval, which lists them.
+//! A name registered again (possibly at another endpoint) never inherits a
+//! credential confirmed for the old registration; the operator sets it again.
 //!
 //! What holds the boundary:
 //!
@@ -39,7 +51,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ua_core::{ActorKind, Caller, Config, Profile, UaError, UaResult};
+use ua_core::{ActorKind, Caller, Config, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, ledger};
 
 use crate::approvals::{self, GateOutcome};
@@ -202,22 +214,24 @@ fn unseal(key: &Key, name: &str, consumer: &str, nonce: &[u8], ct: &[u8]) -> UaR
 
 // --- the consumer path -------------------------------------------------------------
 
-/// Decrypt one secret for its bound consumer. In-process only: no tool
-/// returns the value. Refuses a secret bound to any other consumer.
+/// Decrypt one secret for its bound consumer, with its stored keyed
+/// fingerprint (what an approval binds). In-process only: no tool returns the
+/// value. Refuses a secret bound to any other consumer.
 pub(crate) fn load_for_consumer(
     conn: &Connection,
     cfg: &Config,
     name: &str,
     consumer: &str,
-) -> UaResult<SecretString> {
-    let row: Option<(String, String, Vec<u8>, Vec<u8>)> = conn
+) -> UaResult<(SecretString, String)> {
+    type Sealed = (String, String, Vec<u8>, Vec<u8>, String);
+    let row: Option<Sealed> = conn
         .query_row(
-            "SELECT consumer, key_id, nonce, ciphertext FROM managed_secrets WHERE name = ?1",
+            "SELECT consumer, key_id, nonce, ciphertext, fingerprint FROM managed_secrets WHERE name = ?1",
             [name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((bound, key_id, nonce, ct)) = row else {
+    let Some((bound, key_id, nonce, ct, fp)) = row else {
         return Err(UaError::not_found(format!("managed secret {name:?} is not set")));
     };
     if bound != consumer {
@@ -238,7 +252,7 @@ pub(crate) fn load_for_consumer(
             format!("managed secret {name:?} was sealed with a key that is no longer configured"),
         )
     })?;
-    unseal(key, name, consumer, &nonce, &ct)
+    Ok((unseal(key, name, consumer, &nonce, &ct)?, fp))
 }
 
 /// Whether `name` is stored and bound to `consumer` (no decryption).
@@ -249,18 +263,47 @@ pub(crate) fn bound_to(conn: &Connection, name: &str, consumer: &str) -> UaResul
     Ok(bound.as_deref() == Some(consumer))
 }
 
+/// Name and keyed fingerprint of every secret bound to `consumer`, by name.
+pub(crate) fn bound_secrets(conn: &Connection, consumer: &str) -> UaResult<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT name, fingerprint FROM managed_secrets WHERE consumer = ?1 ORDER BY name")?;
+    let rows = stmt.query_map([consumer], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every secret bound to `consumer` (the caller holds the approval
+/// that listed them), one `managed_secret.deleted` event each. Returns the names.
+pub(crate) fn orphan_consumer(
+    tx: &mut ua_store::WriteTx<'_>,
+    consumer: &str,
+    by: &str,
+    approval_id: i64,
+    why: &str,
+) -> UaResult<Vec<String>> {
+    let names: Vec<String> = bound_secrets(tx, consumer)?.into_iter().map(|(n, _)| n).collect();
+    tx.execute("DELETE FROM managed_secrets WHERE consumer = ?1", [consumer])?;
+    for name in &names {
+        ledger::append(
+            tx,
+            EventInput::new(
+                "managed_secret.deleted",
+                json!({ "name": name, "consumer": consumer, "approval_id": approval_id, "reason": why }),
+            )
+            .by(by.to_string()),
+        )?;
+    }
+    Ok(names)
+}
+
 // --- who may write ------------------------------------------------------------------
 
-/// A verified human, a configured human or lifecycle operator, or an agent
-/// whose hub profile is `operator`.
+/// A verified human, or an authenticated agent whose identity is a configured
+/// human or lifecycle operator. Keyed on identity, never on profile: an agent
+/// can activate the `operator` profile itself, so the profile proves nothing.
 pub(crate) fn is_secret_admin(cfg: &Config, caller: &Caller) -> bool {
     match caller.kind {
         ActorKind::Human => true,
-        ActorKind::Agent => {
-            caller.profile == Profile::Operator
-                || cfg.is_human(&caller.label)
-                || cfg.is_lifecycle_operator(&caller.label)
-        }
+        ActorKind::Agent => cfg.is_human(&caller.label) || cfg.is_lifecycle_operator(&caller.label),
         ActorKind::System | ActorKind::Anonymous => false,
     }
 }
@@ -298,11 +341,15 @@ impl std::fmt::Debug for SetArgs {
 }
 
 /// What an approval of `managed_secret_set` binds: never the value.
+fn set_payload(name: &str, consumer: &str, fp: Option<&str>, value_bytes: usize) -> Value {
+    json!({ "name": name, "consumer": consumer, "fingerprint": fp, "value_bytes": value_bytes })
+}
+
 fn set_gate_payload(cfg: &Config, args: &Value) -> Value {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let value = s("value");
     let fp = write_key(cfg).ok().map(|k| fingerprint(&k, &value));
-    json!({ "name": s("name"), "consumer": s("consumer"), "fingerprint": fp, "value_bytes": value.len() })
+    set_payload(&s("name"), &s("consumer"), fp.as_deref(), value.len())
 }
 
 async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
@@ -317,9 +364,15 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
     let fp = fingerprint(&key, &a.value);
     let (nonce, ct) = seal(&key, &a.name, &a.consumer, &a.value)?;
     let (who, value_bytes) = (ctx.caller.label.clone(), a.value.len() as i64);
+    let gate_payload = set_payload(&a.name, &a.consumer, Some(&fp), a.value.len());
     drop(a.value);
     let (name, consumer, key_id) = (a.name, a.consumer, key.id);
-    ctx.hub
+    // With managed_secret_set in approval_tools the registry has already
+    // consumed a pass for this exact payload.
+    let registry_gated = cfg.approval_tools.iter().any(|t| t == "managed_secret_set");
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    let out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let prior: Option<String> = tx
@@ -335,6 +388,21 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
                     ),
                 ));
             }
+            // Replacing a credential is as consequential as deleting it: a
+            // one-time human approval bound to the new value's fingerprint.
+            let mut approval_id = None;
+            if prior.is_some() && !registry_gated {
+                match approvals::gate(tx, hub.cfg(), &caller, "managed_secret_set", &gate_payload)? {
+                    GateOutcome::Pass { approval_id: id } => approval_id = Some(id),
+                    GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
+                    GateOutcome::Denied { approval_id, reason } => {
+                        return Err(UaError::denied(
+                            "approval_denied",
+                            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+                        ));
+                    }
+                }
+            }
             let now = ua_core::time::now();
             tx.execute(
                 "INSERT INTO managed_secrets (name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
@@ -348,16 +416,18 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
                 tx,
                 EventInput::new(
                     "managed_secret.set",
-                    json!({ "name": name, "consumer": consumer, "replaced": replaced }),
+                    json!({ "name": name, "consumer": consumer, "replaced": replaced, "approval_id": approval_id }),
                 )
                 .by(who.clone()),
             )?;
-            Ok(json!({
+            Ok(Ok(json!({
                 "name": name, "consumer": consumer, "fingerprint": fp, "key_id": key_id,
                 "value_bytes": value_bytes, "replaced": replaced, "updated_at": now, "stored": true,
-            }))
+                "approval_id": approval_id,
+            })))
         })
-        .await
+        .await?;
+    out.map_err(|approval_id| UaError::ApprovalRequired { tool: "managed_secret_set".into(), approval_id })
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -463,9 +533,11 @@ pub fn register(r: &mut Registry) {
         tool(
             "managed_secret_set",
             "Store a credential for one consumer (e.g. `mcp:docs`, the MCP server docs), encrypted at rest. \
-             For a human or an operator. The value is never returned by any tool; the result and \
-             managed_secret_list show only metadata and a keyed fingerprint. Refused when the hub has no \
-             managed_secret_key. Rebinding a name to another consumer needs a delete first.",
+             For a human or a configured operator identity. The value is never returned by any tool; the \
+             result and managed_secret_list show only metadata and a keyed fingerprint. Replacing an existing \
+             value needs a one-time human approval bound to the new value's fingerprint (the identical retry \
+             after approval stores it). Refused when the hub has no managed_secret_key. Rebinding a name to \
+             another consumer needs a delete first.",
             managed_secret_set,
         )
         .gate_payload(set_gate_payload)
@@ -483,7 +555,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "managed_secret_delete",
-            "Delete one managed secret. For a human or an operator, and always needs a one-time human approval \
+            "Delete one managed secret. For a human or a configured operator identity, and always needs a one-time human approval \
              bound to the name, consumer and current fingerprint; the identical retry after approval deletes it.",
             managed_secret_delete,
         )
