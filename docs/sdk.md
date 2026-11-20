@@ -1,8 +1,9 @@
 # TypeScript SDK
 
-The TypeScript SDK in the Python repository (`packages/client`, package
-`@unified-agent/client` 0.2.1, with `@unified-agent/protocol` 0.2.1) runs
-against ua-rust. It has two halves:
+The TypeScript SDK lives in this repository under
+[`sdk/typescript`](../sdk/typescript/README.md): `@unified-agent/client`
+0.2.1, `@unified-agent/protocol` 0.2.1 and `@unified-agent/approval-client`
+0.1.0, an npm workspace that is not published. The client has two halves:
 
 - `UnifiedAgentClient` calls tools over MCP Streamable HTTP at `/mcp`.
 - `ControlCenterClient` calls the Control Center's HTTP/JSON routes under
@@ -193,8 +194,10 @@ never the value). An approved request is a one-time pass that the
 requester's next identical call consumes within `approval_pass_ttl_hours`;
 the requester cannot approve its own request.
 
-The SDK's live write suite is being changed (separately) to request
-approval for a gated tool. `crew_intervene` is one: always approval-gated
+The SDK's live write suite still requests approval for `task_update`, which
+nothing gates, so that case gets `409` (see
+[known gaps](../sdk/typescript/docs/known-gaps.md)); it is to be changed to
+request approval for a gated tool. `crew_intervene` is one: always approval-gated
 with no configuration, gated by the registry rather than its handler (so it
 is requestable here), and callable with a developer-profile token. Its
 payload is `{session_id, message}`.
@@ -206,11 +209,14 @@ payload is `{session_id, message}`.
 a running hub, the SDK's own live suite runs with:
 
 ```sh
-cd packages/client
+cd sdk/typescript
 UA_SDK_CONFORMANCE_URL=http://127.0.0.1:8765/mcp UA_SDK_CONFORMANCE_TOKEN=... \
 UA_SDK_WRITE_CONFORMANCE_URL=http://127.0.0.1:8765 UA_SDK_WRITE_CONFORMANCE_TOKEN=... \
 UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN=... npm run test:conformance:live
 ```
 
 Use a disposable hub: the write suite creates a task, queues an approval and
-appends evidence.
+appends evidence. The `sdk` workflow (`.github/workflows/sdk.yml`) runs the
+same suite against a `ua serve` it builds from the commit under test; the
+current results are in
+[sdk/typescript/docs/known-gaps.md](../sdk/typescript/docs/known-gaps.md).
