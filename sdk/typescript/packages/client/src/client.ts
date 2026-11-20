@@ -3,7 +3,7 @@
  *
  * Mutations (task_update, memory_save, delegate, approval_resolve, …) are
  * first-class. They still execute on the hub — this package does not
- * reimplement policy, approvals, or sandbox rules (ADR TypeScript Platform).
+ * reimplement policy, approvals, or sandbox rules.
  */
 
 import {

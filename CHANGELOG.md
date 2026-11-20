@@ -56,11 +56,10 @@ from its commit history.
 - Harness config bundles served at `/api/node/config`, and a skills registry.
 - A security contact in `SECURITY.md`, and `NOTICE`.
 - A Cloud Build runner that builds the pushed head.
-- The TypeScript SDK under `sdk/typescript` (`@unified-agent/protocol`,
-  `@unified-agent/client`, `@unified-agent/approval-client`; not published),
-  and an `sdk` workflow that typechecks, tests and checks codegen, then runs
-  the live conformance suite against a `ua serve` built from the commit. Known
-  gaps are listed in `sdk/typescript/docs/known-gaps.md`.
+- The TypeScript SDK under `sdk/typescript` (`@unified-agent/protocol` and
+  `@unified-agent/client`; not published), with workflows that typecheck,
+  test and check codegen, and run the live conformance suite against a
+  `ua serve` built from the commit.
 
 ### Changed
 

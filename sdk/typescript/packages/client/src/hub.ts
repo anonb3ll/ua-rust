@@ -98,11 +98,10 @@ export type HubClientCapabilities = {
    *
    * This transport does not yet *implement* receiving or answering one —
    * doing so needs a channel for server-initiated requests, which a single
-   * request/response HTTP exchange per tool call does not provide (the
-   * approval client package polls instead). Declaring this
-   * today is safe but inert: the hub's elicitation path already falls back
-   * to parking the request in the ``/ui`` approval queue on any client error
-   * or non-response, so a
+   * request/response HTTP exchange per tool call does not provide.
+   * Declaring this today is safe but inert: the hub's elicitation path
+   * already falls back to parking the request in the ``/ui`` approval queue
+   * on any client error or non-response, so a
    * client that declares support but never answers just pays one extra
    * round-trip before landing on the same fallback as declaring nothing.
    */

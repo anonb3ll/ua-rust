@@ -7,10 +7,9 @@ They are an npm workspace with one lockfile:
 |---|---|
 | [`@unified-agent/protocol`](packages/protocol/README.md) | The contract shapes as Zod schemas, exported to JSON Schema and to generated Pydantic v2 models. |
 | [`@unified-agent/client`](packages/client/README.md) | `UnifiedAgentClient` (tools over MCP Streamable HTTP at `/mcp`) and `ControlCenterClient` (the HTTP/JSON routes under `/api`). |
-| [`@unified-agent/approval-client`](packages/approval-client/README.md) | An approval client over `approval_pending` / `approval_resolve`, with a Telegram adapter. |
 
 The packages are a typed remote. Policy, approvals, sandboxing, identity and
-every write stay on the hub; there is no local fallback. All three are
+every write stay on the hub; there is no local fallback. Both are
 `"private": true` and are not published to npm.
 
 ## Build and test
@@ -20,7 +19,7 @@ Node 22 or newer. From this directory:
 ```sh
 npm ci
 npm run typecheck
-npm test                 # protocol, client (with the mock conformance suite) and approval-client
+npm test                 # protocol and client (with the mock conformance suite)
 npm run build            # emits packages/*/dist
 npm run codegen:check    # regenerates the schemas and fails if a committed file changes
 ```
@@ -34,7 +33,7 @@ cd packages/protocol
 uv run --no-project --python 3.12 --with 'pydantic>=2,<3' python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-`scripts/pack-candidates.mjs` packs the three packages into installable
+`scripts/pack-candidates.mjs` packs the two packages into installable
 tarballs under `dist/candidates/` (internal `file:` links rewritten to exact
 versions, nothing published), and `scripts/check-candidates.mjs` installs them
 into a temporary consumer and checks the imports and types.
@@ -75,12 +74,28 @@ unless it is configured:
 | `UA_SDK_CONFORMANCE_URL`, `UA_SDK_CONFORMANCE_TOKEN` | The hub's `/mcp` URL and an agent token. Enables the read-only suite. |
 | `UA_SDK_CONFORMANCE_AGENT` | Optional label printed in one case name. |
 | `UA_SDK_WRITE_CONFORMANCE_URL`, `UA_SDK_WRITE_CONFORMANCE_TOKEN` | The hub origin and an agent token. Enables the write suite, which creates a task, queues an approval and appends evidence; use a disposable hub. |
-| `UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN` | Optional token of a `human_identities` label, to check that a human can resolve the approval. |
-| `UA_SDK_CONFORMANCE_KNOWN_GAPS` | Case names, one per line, that run as `todo`: reported, but not failing the run. |
+| `UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN` | Optional token of a `human_identities` label, to check that a human can resolve the approval. The agent token is always checked to be refused (403). |
+| `UA_SDK_WRITE_CONFORMANCE_APPROVAL_TOOL`, `UA_SDK_WRITE_CONFORMANCE_APPROVAL_PAYLOAD` | The approval-gated tool to request, and its JSON payload. Default `crew_intervene`, which `ua serve` always gates. |
 
-Results against `ua serve` and the current known gaps are in
-[docs/known-gaps.md](docs/known-gaps.md). CI (`.github/workflows/sdk.yml`)
-runs both suites, the live one against a `ua serve` it builds and starts.
+Results against `ua serve` are in [docs/known-gaps.md](docs/known-gaps.md).
+CI runs both: `.github/workflows/sdk.yml` (typecheck, tests with the mock
+suite, codegen check) and `.github/workflows/sdk-live.yml` (the live suite,
+with agent and human tokens, against a `ua serve` built from the commit).
+
+## Not carried into this repository
+
+`ControlCenterClient.queueHealth` (`GET /api/queue-health`) and its
+`QueueHealth` schemas are legacy hub only: `ua serve` does not serve the route,
+and its bucket names described one deployment's machine layout. They were
+removed from the SDK here, together with a `Task` field that described the
+same layout.
+
+The old repository's `@unified-agent/approval-client` (a Telegram bot that
+resolved approvals with a human bearer token) is not part of this import: it
+encoded the old hub's resolution contract, and holding a human token in a
+long-running bot is not a design to carry forward. An approval notifier is
+planned as notify-only: it links to the hub's approval page, and the human
+signs in there to decide.
 
 ## Docs
 

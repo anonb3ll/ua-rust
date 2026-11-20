@@ -288,7 +288,6 @@ class Task(BaseModel):
     archived_at: constr(min_length=1) | None = None
     untrusted: bool | conint(ge=-9007199254740991, le=9007199254740991) | None = None
     waiting_for_review: bool | conint(ge=-9007199254740991, le=9007199254740991) | None = None
-    laptop_lane: bool | conint(ge=-9007199254740991, le=9007199254740991) | None = None
     notes_archived: bool | conint(ge=-9007199254740991, le=9007199254740991) | None = None
 
 

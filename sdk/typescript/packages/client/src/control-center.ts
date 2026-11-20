@@ -15,7 +15,6 @@ import {
   ApprovalResolveResult,
   EvidenceCreateRequest as EvidenceCreateRequestSchema,
   EvidenceCreateOutcome,
-  Task,
   TaskCreateRequest as TaskCreateRequestSchema,
   TaskUpdateRequest as TaskUpdateRequestSchema,
   TaskWriteOutcome,
@@ -40,81 +39,6 @@ const PlatformObjectRef = z.object({
 });
 
 export type PlatformObjectRef = z.infer<typeof PlatformObjectRef>;
-
-const QueueHealthTask = Task.pick({
-  id: true,
-  title: true,
-  project: true,
-  claimed_by: true,
-  claimed_at: true,
-  lock_expires_at: true,
-  completed_at: true,
-})
-  // The queue-health endpoint deliberately preserves unknown future statuses
-  // in `other`; the domain Task schema remains strict for task operations.
-  .extend({
-    status: z.string().min(1),
-    priority: z.enum(["high", "med", "low"]).optional(),
-    lane: z.string().nullable().optional(),
-    created_at: z.string().optional(),
-    urgency: z.enum(["now", "next", "later"]).nullable().optional(),
-    urgency_rank: z.number().int().min(0).max(2).optional(),
-    laptop_lane: z.boolean().optional(),
-    notes_archived: z.boolean().optional(),
-    waiting_for_review: z.boolean().optional(),
-    platform: PlatformObjectRef.optional(),
-    links: z
-      .object({
-        agent: PlatformObjectRef.nullable().optional(),
-        run: PlatformObjectRef.nullable().optional(),
-        approvals: z.array(PlatformObjectRef).optional(),
-      })
-      .passthrough()
-      .optional(),
-  })
-  .passthrough();
-
-export type QueueHealthTask = z.infer<typeof QueueHealthTask>;
-
-const QueueHealthCounts = z.object({
-  desktop_open: z.number().int().nonnegative(),
-  dispatch_ready: z.number().int().nonnegative().default(0),
-  interactive_only: z.number().int().nonnegative().default(0),
-  operator_only: z.number().int().nonnegative().default(0),
-  doing: z.number().int().nonnegative(),
-  waiting_review: z.number().int().nonnegative(),
-  stale_claims: z.number().int().nonnegative(),
-  laptop_lane: z.number().int().nonnegative(),
-  blocked_archived: z.number().int().nonnegative(),
-  inconsistent: z.number().int().nonnegative(),
-  other: z.number().int().nonnegative(),
-  total_active: z.number().int().nonnegative(),
-});
-
-export type QueueHealthCounts = z.infer<typeof QueueHealthCounts>;
-
-export const QueueHealth = z.object({
-  desktop_open: z.array(QueueHealthTask),
-  dispatch_ready: z.array(QueueHealthTask).default([]),
-  interactive_only: z.array(QueueHealthTask).default([]),
-  operator_only: z.array(QueueHealthTask).default([]),
-  doing: z.array(QueueHealthTask),
-  waiting_review: z.array(QueueHealthTask),
-  stale_claims: z.array(QueueHealthTask),
-  laptop_lane: z.array(QueueHealthTask),
-  blocked_archived: z.array(QueueHealthTask),
-  inconsistent: z.array(QueueHealthTask),
-  other: z.array(QueueHealthTask),
-  counts: QueueHealthCounts,
-  dispatch_wip: z.object({
-    cap: z.number().int().positive(),
-    in_flight: z.number().int().nonnegative().nullable(),
-    error: z.string().optional(),
-  }).optional(),
-  error: z.string().optional(),
-});
-
-export type QueueHealth = z.infer<typeof QueueHealth>;
 
 const NodeRow = z
   .object({
@@ -396,44 +320,6 @@ export class ControlCenterClient {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.bearerToken = options.bearerToken;
     this.fetchImpl = options.fetch ?? (globalThis.fetch as FetchLike);
-  }
-
-  /** Fetch the queue-health view without exposing any mutation method. */
-  async queueHealth(): Promise<QueueHealth> {
-    let response: Awaited<ReturnType<FetchLike>>;
-    try {
-      response = await this.fetchImpl(`${this.baseUrl}/api/queue-health`, {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${this.bearerToken}`,
-        },
-      });
-    } catch (cause) {
-      throw new HubTransportError("control center request failed", { cause });
-    }
-
-    if (response.status === 401 || response.status === 403) {
-      throw new HubAuthError(
-        response.status,
-        `control center rejected credentials (HTTP ${response.status})`,
-      );
-    }
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new HubTransportError(
-        `control center HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`,
-      );
-    }
-
-    const text = await response.text();
-    let payload: unknown;
-    try {
-      payload = JSON.parse(text);
-    } catch (cause) {
-      throw new HubTransportError("control center returned invalid JSON", { cause });
-    }
-    return QueueHealth.parse(payload);
   }
 
   /** Fetch the platform object registry; this never grants object access. */

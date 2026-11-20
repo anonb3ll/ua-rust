@@ -1007,18 +1007,6 @@
             }
           ]
         },
-        "laptop_lane": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            }
-          ]
-        },
         "notes_archived": {
           "anyOf": [
             {

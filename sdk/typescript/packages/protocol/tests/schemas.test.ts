@@ -37,7 +37,7 @@ const nonNullableDefaultFields = [
 ] as const;
 
 describe("@unified-agent/protocol schemas", () => {
-  it("exposes the ADR Phase 1 schema catalog", () => {
+  it("exposes the Phase 1 schema catalog", () => {
     const expected = [
       "Task",
       "TaskCreateRequest",
@@ -138,7 +138,7 @@ describe("@unified-agent/protocol schemas", () => {
     assert.equal(PROTOCOL_SCHEMAS.TaskCreateRequest.safeParse({ title: "x", actor: "operator" }).success, false);
     assert.equal(PROTOCOL_SCHEMAS.TaskUpdateRequest.safeParse({ id: 1, claimed_by: "builder-2" }).success, false);
     assert.equal(PROTOCOL_SCHEMAS.ApprovalRequest.safeParse({ tool: "task_update", decision: "approve" }).success, false);
-    assert.equal(PROTOCOL_SCHEMAS.WorkProductSubmitRequest.safeParse({ source_path: "/workspace/x", title: "Memo", template_pack: "legal", producing_agent: "operator" }).success, false);
+    assert.equal(PROTOCOL_SCHEMAS.WorkProductSubmitRequest.safeParse({ source_path: "/workspace/x", title: "Memo", template_pack: "example", producing_agent: "operator" }).success, false);
     assert.equal(PROTOCOL_SCHEMAS.WorkProductReleaseRequest.safeParse({ work_product_id: 27, title: "Changed" }).success, false);
     assert.equal(PROTOCOL_SCHEMAS.ApprovalResolveRequest.safeParse({ id: 1, decision: "approve", resolved_by: "operator" }).success, false);
     assert.equal(PROTOCOL_SCHEMAS.EvidenceCreateRequest.safeParse({ channel: "task", payload: {}, originator: "operator" }).success, false);
@@ -193,7 +193,7 @@ describe("@unified-agent/protocol schemas", () => {
       PROTOCOL_SCHEMAS.TaskUpdateRequest.safeParse({ id: 1, parent_id: 42 }).success,
       true,
     );
-    // 0 is the hub's own "detach from parent" sentinel (tasks.py task_update).
+    // 0 is the hub's own "detach from parent" sentinel (task_update).
     assert.equal(
       PROTOCOL_SCHEMAS.TaskUpdateRequest.safeParse({ id: 1, parent_id: 0 }).success,
       true,

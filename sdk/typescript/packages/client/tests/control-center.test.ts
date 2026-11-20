@@ -52,7 +52,7 @@ describe("ControlCenterClient", () => {
           consumer: "operator",
           connection_state: "unknown",
           entry_point: { kind: "mcp-tool", ref: "profile_status", note: "live check" },
-          evidence: [{ type: "code", ref: "src/tools/profiles.py" }],
+          evidence: [{ type: "code", ref: "src/tools/profiles" }],
         },
       ],
       queue_coverage: [],
@@ -113,124 +113,7 @@ describe("ControlCenterClient", () => {
     await assert.rejects(() => unavailable.capabilityCatalog(), /HTTP 503/);
   });
 
-  it("fetches and validates the read-only queue-health surface", async () => {
-    const calls: Array<{ url: string; headers?: Record<string, string> }> = [];
-    const fetchMock: FetchLike = async (url, init) => {
-      calls.push({ url, headers: init?.headers });
-      return jsonResponse(200, {
-        desktop_open: [
-          {
-            id: 1,
-            title: "open",
-            status: "open",
-            platform: { kind: "task", id: "1", uri: "unified-agent://tasks/1" },
-            links: {
-              agent: { kind: "agent", id: "builder-2", uri: "unified-agent://agents/builder-2" },
-              run: null,
-              approvals: [],
-            },
-          },
-        ],
-        doing: [],
-        waiting_review: [],
-        stale_claims: [],
-        laptop_lane: [],
-        blocked_archived: [],
-        inconsistent: [],
-        other: [{ id: 2, title: "future", status: "new_status" }],
-        counts: {
-          desktop_open: 1,
-          doing: 0,
-          waiting_review: 0,
-          stale_claims: 0,
-          laptop_lane: 0,
-          blocked_archived: 0,
-          inconsistent: 0,
-          other: 1,
-          total_active: 1,
-        },
-      });
-    };
-
-    const client = new ControlCenterClient({
-      baseUrl: "http://hub",
-      bearerToken: "tok",
-      fetch: fetchMock,
-    });
-    const health = await client.queueHealth();
-
-    assert.deepEqual(health.counts, {
-      desktop_open: 1,
-      dispatch_ready: 0,
-      interactive_only: 0,
-      operator_only: 0,
-      doing: 0,
-      waiting_review: 0,
-      stale_claims: 0,
-      laptop_lane: 0,
-      blocked_archived: 0,
-      inconsistent: 0,
-      other: 1,
-      total_active: 1,
-    });
-    assert.equal(health.other[0]?.status, "new_status");
-    assert.equal(health.desktop_open[0]?.platform?.uri, "unified-agent://tasks/1");
-    assert.equal(health.desktop_open[0]?.links?.agent?.id, "builder-2");
-    assert.deepEqual(calls, [
-      {
-        url: "http://hub/api/queue-health",
-        headers: {
-          Accept: "application/json",
-          Authorization: "Bearer tok",
-        },
-      },
-    ]);
-  });
-
-  it("parses the operator bucket and its count", async () => {
-    const client = new ControlCenterClient({
-      baseUrl: "http://hub", bearerToken: "tok",
-      fetch: async () => jsonResponse(200, {
-        desktop_open: [], doing: [], waiting_review: [], stale_claims: [],
-        laptop_lane: [], blocked_archived: [], inconsistent: [], other: [],
-        operator_only: [{ id: 72, title: "Operator decision", status: "open", lane: "operator-only" }],
-        counts: {
-          desktop_open: 0, doing: 0, waiting_review: 0, stale_claims: 0,
-          laptop_lane: 0, blocked_archived: 0, inconsistent: 0, other: 0,
-          total_active: 1, operator_only: 1,
-        },
-      }),
-    });
-    const health = await client.queueHealth();
-    assert.equal(health.operator_only[0]?.id, 72);
-    assert.equal(health.operator_only.length, 1);
-    assert.equal(health.counts.operator_only, 1);
-    assert.equal(health.counts.total_active, 1);
-  });
-
-  for (const [buckets, counts] of [
-    [{ operator_only: null }, { operator_only: 0 }],
-    [{ operator_only: [] }, { operator_only: -1 }],
-  ]) {
-    it("rejects invalid operator bucket data", async () => {
-      const client = new ControlCenterClient({
-        baseUrl: "http://hub", bearerToken: "tok",
-        fetch: async () => jsonResponse(200, {
-          desktop_open: [], doing: [], waiting_review: [], stale_claims: [],
-          laptop_lane: [], blocked_archived: [], inconsistent: [], other: [],
-          ...buckets,
-          counts: {
-            desktop_open: 0, doing: 0, waiting_review: 0, stale_claims: 0,
-            laptop_lane: 0, blocked_archived: 0, inconsistent: 0, other: 0,
-            total_active: 0, ...counts,
-          },
-        }),
-      });
-      await assert.rejects(() => client.queueHealth(), z.ZodError);
-    });
-  }
-
-  it("follows a queue task ref to its authenticated platform object", async () => {
+  it("follows a task ref to its authenticated platform object on the hub origin", async () => {
     const calls: Array<{ url: string; headers?: Record<string, string> }> = [];
     const taskEnvelope = z.object({
       uri: z.literal("unified-agent://tasks/41"),
@@ -238,26 +121,14 @@ describe("ControlCenterClient", () => {
     });
     const fetchMock: FetchLike = async (url, init) => {
       calls.push({ url, headers: init?.headers });
-      if (url.endsWith("/api/queue-health")) {
-        return jsonResponse(200, {
-          desktop_open: [
-            { id: 41, title: "open", status: "open", platform: { kind: "task", id: "41", uri: "https://attacker.example/object/41" } },
-          ],
-          doing: [], waiting_review: [], stale_claims: [], laptop_lane: [], blocked_archived: [], inconsistent: [], other: [],
-          counts: { desktop_open: 1, doing: 0, waiting_review: 0, stale_claims: 0, laptop_lane: 0, blocked_archived: 0, inconsistent: 0, other: 0, total_active: 1 },
-        });
-      }
       return jsonResponse(200, { uri: "unified-agent://tasks/41", task: { id: 41, title: "open" } });
     };
     const client = new ControlCenterClient({ baseUrl: "http://hub", bearerToken: "tok", fetch: fetchMock });
-    const health = await client.queueHealth();
-    const ref = health.desktop_open[0]?.platform;
-    assert.ok(ref);
+    const ref = { kind: "task", id: "41", uri: "https://attacker.example/object/41" };
     const detail = await client.platformObject(ref, taskEnvelope);
 
     assert.equal(detail.task.id, 41);
     assert.deepEqual(calls, [
-      { url: "http://hub/api/queue-health", headers: { Accept: "application/json", Authorization: "Bearer tok" } },
       { url: "http://hub/api/platform/objects/task/41", headers: { Accept: "application/json", Authorization: "Bearer tok" } },
     ]);
   });
@@ -297,24 +168,14 @@ describe("ControlCenterClient", () => {
     await assert.rejects(() => runtimeInvalid.platformObject({ kind: 1, id: "41", uri: "https://attacker.example/" } as never, z.unknown()), HubValidationError);
   });
 
-  it("fails closed when the read-only endpoint rejects the bearer token", async () => {
+  it("fails closed when a read-only endpoint rejects the bearer token", async () => {
     const client = new ControlCenterClient({
       baseUrl: "http://hub",
       bearerToken: "bad",
       fetch: async () => jsonResponse(401, { error: "authentication required" }),
     });
 
-    await assert.rejects(() => client.queueHealth(), HubAuthError);
-  });
-
-  it("rejects a malformed queue-health payload", async () => {
-    const client = new ControlCenterClient({
-      baseUrl: "http://hub",
-      bearerToken: "tok",
-      fetch: async () => jsonResponse(200, { counts: {} }),
-    });
-
-    await assert.rejects(() => client.queueHealth());
+    await assert.rejects(() => client.platformManifest(), HubAuthError);
   });
 
   it("writes tasks through authenticated routes without caller-supplied identity", async () => {
@@ -374,8 +235,8 @@ describe("ControlCenterClient", () => {
       mime_type: "text/markdown",
       producing_agent: "reviewer-1",
       producing_model: "synthetic-model",
-      template_pack: "legal",
-      tags: { matter: "M-synthetic", client: "Example Client" },
+      template_pack: "example",
+      tags: { topic: "example" },
       status: "released",
       previous_version_id: null,
       approval_id: 18,
@@ -400,8 +261,8 @@ describe("ControlCenterClient", () => {
     assert.deepEqual(await client.submitWorkProduct({
       source_path: "/workspace/drafts/memo.md",
       title: "Synthetic memo",
-      template_pack: "legal",
-      tags: { matter: "M-synthetic", client: "Example Client" },
+      template_pack: "example",
+      tags: { topic: "example" },
       model: "synthetic-model",
     }), pending);
     assert.deepEqual(await client.releaseWorkProduct(27), released);
@@ -427,7 +288,7 @@ describe("ControlCenterClient", () => {
         mime_type: "text/markdown",
         producing_agent: "reviewer-1",
         producing_model: null,
-        template_pack: "legal",
+        template_pack: "example",
         tags: {},
         status: "released",
         previous_version_id: null,
@@ -454,10 +315,10 @@ describe("ControlCenterClient", () => {
       fetch: async (url) => { calls.push(url); return jsonResponse(202, { status: "pending", approval_id: 18, work_product_id: 27 }); },
     });
     await assert.rejects(() => client.submitWorkProduct({
-      source_path: "/workspace/x", title: "Memo", template_pack: "legal", producing_agent: "operator",
+      source_path: "/workspace/x", title: "Memo", template_pack: "example", producing_agent: "operator",
     } as never), HubValidationError);
     await assert.rejects(() => client.submitWorkProduct({
-      source_path: "/workspace/x", title: " \t ", template_pack: "legal",
+      source_path: "/workspace/x", title: " \t ", template_pack: "example",
     }), HubValidationError);
     await assert.rejects(() => client.releaseWorkProduct(0), HubValidationError);
     assert.deepEqual(calls, []);
@@ -544,7 +405,7 @@ describe("ControlCenterClient", () => {
           return jsonResponse(200, {
             nodes: [
               {
-                node: "desk-01",
+                node: "node-1",
                 agent: "builder-3",
                 backends: ["codex"],
                 harnesses: {},
@@ -559,7 +420,7 @@ describe("ControlCenterClient", () => {
           if (body.action === "cancel") {
             return jsonResponse(200, { item_id: body.item_id, cancel_requested: true });
           }
-          return jsonResponse(201, { item_id: "nd-abc12345", node: "desk-01", status: "queued" });
+          return jsonResponse(201, { item_id: "nd-abc12345", node: "node-1", status: "queued" });
         }
         if (String(url).includes("/api/sessions")) {
           return jsonResponse(200, { sessions: [], open: 0, total: 0 });
@@ -569,9 +430,9 @@ describe("ControlCenterClient", () => {
     });
 
     const nodes = await client.listNodes();
-    assert.equal(nodes.nodes[0]?.node, "desk-01");
+    assert.equal(nodes.nodes[0]?.node, "node-1");
     const started = await client.startNodeSession({
-      node: "desk-01",
+      node: "node-1",
       prompt: "hi",
       cwd: "/tmp/repo",
       backend: "codex",
@@ -592,7 +453,7 @@ describe("ControlCenterClient", () => {
         {
           url: "http://hub/api/action/node-session",
           method: "POST",
-          body: { action: "start", node: "desk-01", prompt: "hi", cwd: "/tmp/repo", backend: "codex" },
+          body: { action: "start", node: "node-1", prompt: "hi", cwd: "/tmp/repo", backend: "codex" },
         },
         {
           url: "http://hub/api/action/node-session",

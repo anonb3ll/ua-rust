@@ -6,7 +6,6 @@
 |---|---|
 | `@unified-agent/protocol` | Zod source of truth, exported to JSON Schema and generated Pydantic models |
 | `@unified-agent/client` | Typed MCP Streamable HTTP client and Control Center HTTP/JSON client |
-| `@unified-agent/approval-client` | Approval forwarder over `approval_pending` / `approval_resolve`, with a Telegram adapter |
 
 ## Invariant
 

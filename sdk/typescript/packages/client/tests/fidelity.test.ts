@@ -90,7 +90,6 @@ describe("typed-surface fidelity", () => {
       updated_at: "2026-09-11T00:00:00Z",
       lineage: [927],
       waiting_for_review: 1,
-      laptop_lane: 0,
       notes_archived: false,
       untrusted: 0,
       notes_chars: 42,

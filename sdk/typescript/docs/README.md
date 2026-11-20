@@ -11,7 +11,6 @@ Package detail:
 
 - [`packages/protocol/README.md`](../packages/protocol/README.md)
 - [`packages/client/README.md`](../packages/client/README.md)
-- [`packages/approval-client/README.md`](../packages/approval-client/README.md)
 
 The hub side of the contract (routes, status codes, what is not served) is in
 the repository's [docs/sdk.md](../../../docs/sdk.md).

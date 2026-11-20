@@ -77,7 +77,6 @@ export const Task = z.object({
   untrusted: z.union([z.boolean(), z.number().int()]).optional(),
   /** Compact / queue-marker projections from `task_list(fields="compact")`. */
   waiting_for_review: z.union([z.boolean(), z.number().int()]).optional(),
-  laptop_lane: z.union([z.boolean(), z.number().int()]).optional(),
   notes_archived: z.union([z.boolean(), z.number().int()]).optional(),
 });
 export type Task = z.infer<typeof Task>;
@@ -108,12 +107,11 @@ export type TaskCreateRequest = z.input<typeof TaskCreateRequest>;
  * other positive id reparents it, and omitting the field leaves it unchanged.
  *
  * `untrusted` is deliberately NOT part of this contract. It is a
- * hub-computed provenance/audit flag (`config.is_agent_untrusted`, keyed off
- * the verified caller's agent label) consumed directly by the executor's
+ * hub-computed provenance/audit flag (keyed off the verified caller's
+ * agent label) consumed directly by the executor's
  * trust-ladder gate. Exposing it as a writable field would let a typed
  * client declare `untrusted: false` for its own work and launder that
- * signal — see the follow-up filed against `action_task`'s override
- * behavior (`tools/tasks.py`), which lets a caller-supplied value overwrite
+ * signal. The hub's `action_task` override behavior lets a caller-supplied value overwrite
  * the computed one in either direction, unlike task_add's OR-only merge.
  */
 export const TaskUpdateRequest = z.object({

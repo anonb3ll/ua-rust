@@ -10,8 +10,8 @@
     "claimed_by": "builder-2",
     "claimed_at": "2026-08-25T05:52:00Z",
     "lock_expires_at": null,
-    "worktree_path": "/workspace/project/.worktrees/task-572",
-    "branch": "agent/task-572-typescript-protocol",
+    "worktree_path": "/workspace/project/.worktrees/task-1",
+    "branch": "agent/task-1-typescript-protocol",
     "created_at": "2026-08-25T05:52:00Z",
     "updated_at": "2026-08-25T05:52:00Z",
     "completed_at": null
@@ -62,8 +62,8 @@
   "WorkProductSubmitRequest": {
     "source_path": "/workspace/drafts/memo.md",
     "title": "Synthetic memo",
-    "template_pack": "legal",
-    "tags": {"matter": "M-synthetic", "client": "Example Client"},
+    "template_pack": "example",
+    "tags": {"topic": "example"},
     "model": "synthetic-model"
   },
   "WorkProductReleaseRequest": {"work_product_id": 27},
@@ -76,8 +76,8 @@
     "mime_type": "text/markdown",
     "producing_agent": "reviewer-1",
     "producing_model": "synthetic-model",
-    "template_pack": "legal",
-    "tags": {"matter": "M-synthetic", "client": "Example Client"},
+    "template_pack": "example",
+    "tags": {"topic": "example"},
     "status": "released",
     "previous_version_id": null,
     "approval_id": 18,
@@ -198,9 +198,9 @@
   },
   "PathResolutionResult": {
     "requested": "packages/protocol/generated/python/models.py",
-    "resolved": "/workspace/project/.worktrees/task-572/packages/protocol/generated/python/models.py",
+    "resolved": "/workspace/project/.worktrees/task-1/packages/protocol/generated/python/models.py",
     "inside_root": true,
-    "root": "/workspace/project/.worktrees/task-572",
+    "root": "/workspace/project/.worktrees/task-1",
     "reason": "resolved under the task worktree"
   }
 }

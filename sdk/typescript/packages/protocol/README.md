@@ -29,7 +29,7 @@ npm run codegen:check       # regenerate and fail if committed artifacts drift
 npm run build               # emit dist/ for TS consumers
 ```
 
-## Schema catalog (ADR Phase 1 + v0.2 Task fields)
+## Schema catalog (Phase 1 + v0.2 Task fields)
 
 `Task`, `Tool`, `ToolInvocation`, `Capability`, `Approval`, `ApprovalToken`,
 `Principal`, `Profile`, `PolicyDecision`, `Execution`, `Event`, `Artifact`,
@@ -53,14 +53,13 @@ including mutations. It does not reimplement policy.
   fields. `TaskUpdateRequest.priority` remains unset when omitted, while
   `TaskCreateRequest.priority` uses the schema-owned `Priority.med` default.
 - `Task` models queue/review fields (`lineage`, `notes_chars`,
-  `waiting_for_review`, `laptop_lane`, `notes_archived`, `untrusted`). Unknown
+  `waiting_for_review`, `notes_archived`, `untrusted`). Unknown
   hub keys stay strip-mode on purpose (Zod 4 `$loose` widens `status` to
   `any`); extend the schema when the hub adds a stable field.
 - `Approval` accepts optional pass TTL fields from `approval_pending`.
 - Codegen pins: Zod `4.6.2`, `datamodel-code-generator==0.30.2`, `ruff==0.15.21`
-  (`ruff format --isolated --line-length=100`, matching hub `[tool.ruff]`) so
-  `npm run codegen:check` is reproducible in both the standalone SDK and the
-  hub mirror, and mirrored `models.py` also passes UA `ruff format --check`.
+  (`ruff format --isolated --line-length=100`) so `npm run codegen:check` is
+  reproducible on every host.
 
 ## Release notes — 0.2.0
 

@@ -11,11 +11,11 @@ been checked against. Update this whenever either side's contract moves.
   does not prove live compatibility; only `npm run test:conformance:live`
   against a real hub does.
 
-| SDK version | Sends protocol | Hub | Status | Notes |
+| SDK version | Sends protocol | Hub | What is proven | Notes |
 |---|---|---|---|---|
-| 0.2.0 – 0.2.1 | `2025-06-18` | original Python hub (handshake ceiling `2025-11-25`) | Compatible | The hub echoes `2025-06-18` back, since it is a handshake revision. |
-| 0.2.2+ | `2025-11-25` | original Python hub | Compatible | Newest revision reachable through the classic `initialize` handshake. |
-| 0.2.2+ | `2025-11-25` | `ua serve` (this repository) | Compatible, with the gaps in [known-gaps.md](known-gaps.md) | `ua serve` speaks the stateless `2026-07-28` revision and keeps a legacy session mode for `2025-11-25` clients; the SDK uses the legacy mode. |
+| 0.2.0 – 0.2.1 | `2025-06-18` | original Python hub | Not checked from this repository | Recorded from the SDK's earlier history. |
+| 0.2.2+ | `2025-11-25` | original Python hub | Not checked from this repository | Recorded from the SDK's earlier history. |
+| 0.2.2+ | `2025-11-25` | `ua serve` (this repository) | Live suite 13/13 ([results](known-gaps.md)) | The handshake negotiates `2025-11-25` (the legacy session mode). Proven only for what the live suite calls: the MCP read tools it lists, task create/update, approval request with agent-refused and human resolution, and evidence append. |
 
 The SDK fails closed (`HubNegotiationError`) if the hub answers `initialize`
 with a revision outside `KNOWN_HANDSHAKE_PROTOCOL_VERSIONS`.
@@ -31,10 +31,13 @@ shape of the first request. A classic `initialize` can never reach
 `MCP_PROTOCOL_VERSION`. Supporting it means implementing the per-request
 envelope transport.
 
-## What "compatible" does not mean
+## What a passing live suite does not mean
 
-It means the handshake succeeds and the tools this SDK wraps round-trip. It
-does not mean every legacy-era capability is used: elicitation, resource
+It proves the handshake and the calls the suite makes, nothing more. Methods
+the suite does not call (for example `listRuns`, `platformObject`,
+`memorySave`, dispatch control) are covered by the mock suite and by the
+hub's own route tests (`crates/ua-server/tests/platform.rs`), not live. Nor
+is every legacy-era capability used: elicitation, resource
 subscriptions and `roots/list` are typed for discovery
 (`HubTransport.serverCapabilities`) but not implemented end to end.
 

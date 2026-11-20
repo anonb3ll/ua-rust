@@ -58,8 +58,9 @@ try {
     uri: z.string(),
     task: z.object({ id: z.number(), title: z.string() }).passthrough(),
   });
-  const taskRef = (await controlCenter.queueHealth()).desktop_open[0]?.platform;
-  if (taskRef) {
+  const [open] = await client.taskList({ status: "open", limit: 1 });
+  if (open) {
+    const taskRef = { kind: "task", id: String(open.id), uri: `unified-agent://tasks/${open.id}` };
     const task = await controlCenter.platformObject(taskRef, taskEnvelopeSchema);
     console.log(task.task.title);
   }
@@ -88,7 +89,6 @@ try {
 | `profileStatus` | `profile_status` | Active profile + identity |
 | `systemDoctor` | `system_doctor` | `{as_of, checks, host, hosts, summary}` — no phantom `status` |
 | `mcpHealthTelemetry` | `mcp_health_telemetry` | Protocol negotiation health |
-| `ControlCenterClient.queueHealth` | `GET /api/queue-health` | Read-only typed queue view |
 | `ControlCenterClient.listRuns` | `GET /api/runs` | Read-only run projection. Query: `kind` (`dispatch`, `selfpickup`, `session`), `agent`, `task_id`, `limit`, `cursor`. Page: `{runs, next_cursor, count, truncated, limit}` |
 | `ControlCenterClient.getRun` | `GET /api/runs/{run_id}` | One run row. An unknown id raises `HubTransportError` with status 404 |
 | `ControlCenterClient.platformManifest` | `GET /api/platform/manifest` | Read-only object registry |
@@ -119,8 +119,8 @@ deliberately reconciled, one way each, when the typed contract was audited:
   reparents it, and omitting the field leaves the parent unchanged.
 - **`untrusted` stays out of both `TaskCreateRequest` and
   `TaskUpdateRequest`, and always will.** It is a hub-computed
-  provenance/audit signal (`config.is_agent_untrusted`, derived from the
-  verified caller's agent label) that the executor's trust-ladder gate reads
+  provenance/audit signal (derived from the verified caller's agent
+  label) that the executor's trust-ladder gate reads
   directly to decide whether to quarantine a task's work. Exposing it as a
   writable field would let a typed client declare `untrusted: false` for its
   own work and launder that signal. `task_add`'s hub-side merge is OR-only
@@ -147,7 +147,7 @@ arguments:
 
 ```bash
 export UA_AGENT_BEARER_TOKEN=... # obtain from the hub operator
-printf '%s' '{"source_path":"/hub/workspace/drafts/memo.md","title":"Synthetic memo","template_pack":"legal","tags":{"matter":"M-1","client":"Example"}}' \
+printf '%s' '{"source_path":"/hub/workspace/drafts/memo.md","title":"Synthetic memo","template_pack":"example","tags":{"topic":"example"}}' \
   | node packages/client/bin/work-product.mjs submit http://127.0.0.1:8765 UA_AGENT_BEARER_TOKEN
 printf '%s' '{"work_product_id":27}' \
   | node packages/client/bin/work-product.mjs release http://127.0.0.1:8765 UA_AGENT_BEARER_TOKEN
@@ -158,7 +158,13 @@ against a disposable hub by setting `UA_SDK_WRITE_CONFORMANCE_URL` and
 `UA_SDK_WRITE_CONFORMANCE_TOKEN`; optionally set
 `UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN` to verify successful human-only approval
 resolution. It creates a task, queues a denyable approval, and appends one
-deduplicated evidence event.
+deduplicated evidence event. `requestApproval` only queues a request for a tool
+the hub gates (an ungated tool is refused with 409), so the approval leg asks
+for `crew_intervene`, which ua-rust gates by default; on a hub that gates other
+tools, set `UA_SDK_WRITE_CONFORMANCE_APPROVAL_TOOL` and, if its arguments
+differ, `UA_SDK_WRITE_CONFORMANCE_APPROVAL_PAYLOAD` (a JSON object). The agent
+token must be refused (403) when it tries to resolve the request; with a human
+token, the human denies it.
 
 ## Reliability (v0.2)
 

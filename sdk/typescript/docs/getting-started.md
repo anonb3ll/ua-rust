@@ -51,7 +51,7 @@ A remote hub must be reached over TLS and its host listed in the hub's
 
 | Script | What it runs |
 |---|---|
-| `npm test` | Builds protocol, then the protocol, client and approval-client tests |
+| `npm test` | Builds protocol, then the protocol and client tests |
 | `npm run typecheck` | `tsc --noEmit` over every package |
 | `npm run build` | Emits `packages/*/dist` |
 | `npm run codegen` | Exports JSON Schema and regenerates the Pydantic models |

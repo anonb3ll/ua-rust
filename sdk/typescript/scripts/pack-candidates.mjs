@@ -40,9 +40,13 @@ try {
       cpSync(join(pkg.path, path), join(directory, path), { recursive: true });
     }
     writeFileSync(join(directory, "package.json"), JSON.stringify(manifest, null, 2) + "\n");
-    const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", output], {
+    // `npm pack --json` prints an array of results on older npm and an object
+    // keyed by package name on newer npm; accept both.
+    const packedJson = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", output], {
       cwd: directory, encoding: "utf8",
     }));
+    const [packed] = Array.isArray(packedJson) ? packedJson : Object.values(packedJson);
+    if (!packed?.filename) throw new Error(`npm pack returned no filename for ${manifest.name}`);
     provenance.packages.push({
       name: manifest.name,
       version: manifest.version,

@@ -2,8 +2,10 @@
 
 The TypeScript SDK lives in this repository under
 [`sdk/typescript`](../sdk/typescript/README.md): `@unified-agent/client`
-0.2.1, `@unified-agent/protocol` 0.2.1 and `@unified-agent/approval-client`
-0.1.0, an npm workspace that is not published. The client has two halves:
+0.2.1 and `@unified-agent/protocol` 0.2.1, an npm workspace that is not
+published. The old repository's approval bot (`@unified-agent/approval-client`)
+was not imported: an approval notifier is planned as notify-only, linking to
+the hub's approval page where the human signs in to decide. The client has two halves:
 
 - `UnifiedAgentClient` calls tools over MCP Streamable HTTP at `/mcp`.
 - `ControlCenterClient` calls the Control Center's HTTP/JSON routes under
@@ -160,7 +162,7 @@ events the same way.
 
 | SDK method or route | Status |
 |---|---|
-| `queueHealth` (`GET /api/queue-health`) | not served (404) |
+| `queueHealth` (`GET /api/queue-health`) | not served (404); legacy hub only, not carried into this repository's SDK |
 | `startNodeSession`, `cancelNodeSession`, `restartNodeSession` (`POST /api/action/node-session`) | not served; queue node work with the `node_dispatch` tool |
 | `submitWorkProduct`, `releaseWorkProduct` (`/api/work-products*`) | `501`: not ported (see below) |
 | `GET /api/evidence?format=csv\|markdown\|text\|pdf`, `cursor` | `400`: JSON only, no keyset paging |
@@ -194,10 +196,9 @@ never the value). An approved request is a one-time pass that the
 requester's next identical call consumes within `approval_pass_ttl_hours`;
 the requester cannot approve its own request.
 
-The SDK's live write suite still requests approval for `task_update`, which
-nothing gates, so that case gets `409` (see
-[known gaps](../sdk/typescript/docs/known-gaps.md)); it is to be changed to
-request approval for a gated tool. `crew_intervene` is one: always approval-gated
+The SDK's live write suite requests approval for `crew_intervene`, checks
+that the agent token is refused when it tries to resolve it (`403`), and, with
+a human token, denies it as the human. `crew_intervene` is always approval-gated
 with no configuration, gated by the registry rather than its handler (so it
 is requestable here), and callable with a developer-profile token. Its
 payload is `{session_id, message}`.
@@ -216,7 +217,10 @@ UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN=... npm run test:conformance:live
 ```
 
 Use a disposable hub: the write suite creates a task, queues an approval and
-appends evidence. The `sdk` workflow (`.github/workflows/sdk.yml`) runs the
-same suite against a `ua serve` it builds from the commit under test; the
-current results are in
+appends evidence. `ua token issue` for a `human_identities` label needs an
+interactive terminal, so on a throwaway hub give the human a static token
+instead: `agent_tokens` pointing at a file of `label:token` lines, with the
+label in `human_identities`. The `sdk-live` workflow
+(`.github/workflows/sdk-live.yml`) does exactly that against a `ua serve` it
+builds from the commit under test; the current results are in
 [sdk/typescript/docs/known-gaps.md](../sdk/typescript/docs/known-gaps.md).

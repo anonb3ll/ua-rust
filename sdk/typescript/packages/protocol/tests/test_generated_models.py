@@ -206,7 +206,7 @@ class GeneratedModelTests(unittest.TestCase):
                 {
                     "source_path": "/workspace/x",
                     "title": "Memo",
-                    "template_pack": "legal",
+                    "template_pack": "example",
                     "producing_agent": "operator",
                 },
             ),
