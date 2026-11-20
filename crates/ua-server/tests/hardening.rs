@@ -475,6 +475,55 @@ async fn the_public_url_host_is_allowed_without_listing_it() {
     }
 }
 
+/// An HTTP/2 request carries the host in `:authority` (the URI) and may send
+/// no `Host` header: the guard applies the same allowlist to it.
+#[tokio::test]
+async fn an_http2_authority_outside_the_allowlist_is_refused() {
+    let mut cfg = stream_config();
+    cfg.public_url = Some("https://hub.example.net".into());
+    let hub = TestHub::new(cfg);
+    for (uri, status) in [
+        ("https://hub.example.net/api/whoami", StatusCode::OK),
+        ("https://localhost:8765/api/whoami", StatusCode::OK),
+        ("https://rebound.example.com/api/whoami", StatusCode::FORBIDDEN),
+        ("https://rebound.example.com/ui/work", StatusCode::FORBIDDEN),
+    ] {
+        let req = Request::get(uri)
+            .version(axum::http::Version::HTTP_2)
+            .header(header::AUTHORIZATION, format!("Bearer {AGENT_A}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(req.headers().get(header::HOST).is_none());
+        assert_eq!(hub.send(req).await.status(), status, "{uri}");
+    }
+}
+
+/// A shutdown cancels the server's token, and an open event stream ends on
+/// it instead of holding the graceful shutdown open until its grace period.
+#[tokio::test]
+async fn open_event_streams_end_when_the_server_shuts_down() {
+    use tower::ServiceExt;
+    let hub = TestHub::new(stream_config());
+    for path in ["/api/events/stream", "/ui/activity/stream"] {
+        let ct = tokio_util::sync::CancellationToken::new();
+        let app = ua_server::router(hub.state.clone(), ct.clone());
+        let resp = app.clone().oneshot(get(path, None, Some(AGENT_A))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let mut body = resp.into_body();
+        // Open and idle: nothing to read yet.
+        assert!(tokio::time::timeout(Duration::from_millis(150), body.frame()).await.is_err(), "{path}");
+        let ct = ct.clone();
+        tokio::spawn(async move { ct.cancel() });
+        let ended = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(frame) = body.frame().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "{path} stayed open after the shutdown token was cancelled");
+    }
+}
+
 // ---------------------------------------------------------------- registration
 
 fn register_from(addr: &str, body: &Value) -> Request<Body> {

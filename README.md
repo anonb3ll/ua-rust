@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 207 tools are registered and the core families are ported.
+> **Status: alpha.** 209 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -60,6 +60,14 @@ ua token issue agent-1          # prints a token once; give it to that agent
 ua serve                        # http://127.0.0.1:8765 (/mcp, /api, /ui)
 ua login-link operator          # on the hub host, at a terminal: a browser sign-in link
 ```
+
+`ua serve` stops cleanly on Ctrl-C (SIGINT) or SIGTERM. Open requests, MCP
+tool calls, dispatch runs and the background loops share a 10-second grace
+period, and event streams end. Dispatch runs still going 3 seconds before
+the deadline are stopped (SIGTERM, then SIGKILL) and recorded `retryable`
+with a `hub_shutdown` receipt. The WAL is then checkpointed into the
+database file. A second signal exits at once, killing the run process
+groups. See [docs/dispatch.md](docs/dispatch.md#hub-shutdown).
 
 Auth is on by default. Agents connect over MCP with their bearer token, or
 over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
