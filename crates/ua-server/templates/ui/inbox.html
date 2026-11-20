@@ -17,8 +17,7 @@
 {% else %}
 {% for a in q.pending %}
 <article class="panel" id="approval-{{ a.id }}" aria-labelledby="approval-{{ a.id }}-h">
-  <h3 id="approval-{{ a.id }}-h">#{{ a.id }} <code>{{ a.tool }}</code>{% if a.ad_hoc %} <span class="chip">ad-hoc sign-off</span>{% endif %}</h3>
-  {% if a.ad_hoc %}<p class="muted">Nothing gates this tool: approving records a sign-off and authorizes no call.</p>{% endif %}
+  <h3 id="approval-{{ a.id }}-h">#{{ a.id }} <code>{{ a.tool }}</code></h3>
   <p class="muted">Requested by <strong>{{ a.requested_by }}</strong> at <time>{{ a.created_at }}</time></p>
   <details><summary>Arguments</summary><pre>{{ a.payload }}</pre></details>
   <form class="inline" method="post" action="/ui/approvals/{{ a.id }}/resolve">

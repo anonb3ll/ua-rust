@@ -171,40 +171,10 @@ pending an explicit product decision; hub task #2658 lists the options.
 Until that decision, `/api/work-products*` answers `501` and the manifest
 lists `work_product` with `served: false`.
 
-`requestApproval` (`POST /api/approvals/request`, body `{tool, payload}`)
-queues a request for any registered tool the caller's profile can call, and
-never runs it. It answers `202 {approval_id, status: "pending", tool,
-payload, ad_hoc}`, `200` with `status` `approved` or `denied` for an
-identical request already decided, and:
-
-| Status | When |
-|---|---|
-| `400` | Unknown tool, or a malformed body. |
-| `401` | No verified identity. |
-| `403` | The caller's profile could not call the tool (or `approval_pending`), the session grant or a policy rule refuses it, or the prod-action check fails. The same refusal a call would get, so a request cannot probe. |
-| `409` | The tool binds its approval to values it resolves when called (`managed_secret_delete`, dispatch and node work, MCP server registration): call the tool to park its approval. |
-| `429` | The caller already has 20 open requests, or 20 open ad-hoc ones. |
-
-The stored payload is the one the tool's own gate binds (its `gate_payload`
-projection), so a secret argument such as `managed_secret_set`'s `value` is
-never stored. `requested_by` is the verified caller, and the request is
-ledgered (`agent.approval.requested`). Resolution is human-only, and the
-requester cannot approve its own request.
-
-- **Gated tool** (always gated, `approval_tools`, or a policy
-  `require_approval` rule), `ad_hoc: false`: approval makes a one-time pass
-  that the next identical call by the requester consumes, within
-  `approval_pass_ttl_hours`.
-- **Any other tool**, `ad_hoc: true`: approval records a standalone human
-  sign-off. Nothing consumes it, it does not expire, and it authorizes no
-  call (the tool was never gated, so the call needs no pass). It is listed
-  under `ad_hoc_approved` in `approval_pending` and `GET /api/approvals`, and
-  `GET /api/approvals/{id}` shows `ad_hoc: true` with `pass.state:
-  "sign_off"`. A client that wants the sign-off before acting checks it
-  there.
-
-The SDK's live write suite's `requestApproval` step (`task_update` with
-`{id, append_note}`) therefore passes without any `approval_tools` setting.
+`requestApproval` queues a request only for a tool that is gated (always
+gated, `approval_tools`, or a policy rule); for any other tool it answers
+`409`, so the SDK's live write suite needs `approval_tools` to include
+`task_update`, which in turn parks its `updateTask` step.
 
 ## Verifying
 

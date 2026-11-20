@@ -21,9 +21,6 @@ pub struct ApprovalView {
     pub resolved_at: String,
     pub expires_at: String,
     pub payload: String,
-    /// An ad-hoc sign-off for a call nothing gates: approving it authorizes
-    /// nothing by itself.
-    pub ad_hoc: bool,
 }
 
 impl ApprovalView {
@@ -37,7 +34,6 @@ impl ApprovalView {
             resolved_at: text(v, "resolved_at"),
             expires_at: text(v, "expires_at"),
             payload: pretty(v.get("payload").unwrap_or(&Value::Null)),
-            ad_hoc: v.get("ad_hoc").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 }

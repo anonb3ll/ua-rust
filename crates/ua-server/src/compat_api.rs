@@ -10,7 +10,7 @@
 //! | `POST /api/action/approval` | `approval_resolve` (verified human only) |
 //! | `GET  /api/approvals` | `approval_pending` |
 //! | `GET  /api/approvals/{id}` | one approval row (read-only, gated on `approval_pending`) |
-//! | `POST /api/approvals/request` | the approval gate, request-only; an ad-hoc sign-off for an ungated tool |
+//! | `POST /api/approvals/request` | the approval gate, request-only |
 //! | `GET  /api/sessions` | `session_list` |
 //! | `GET  /api/capability-catalog` | the registry, grouped by family |
 //! | `GET  /api/board` | `task_list`, `dependency_list`, `delegate_list` |
@@ -22,11 +22,9 @@
 //!
 //! Writes go through [`ua_tools::Registry::call`] with the request's caller,
 //! except `/api/approvals/request`: it queues a request without running or
-//! consuming anything, which no tool does. It runs the call path's checks
-//! through [`ua_tools::Registry::approval_request`], then evaluates
-//! [`ua_tools::approvals::gate`] (a gated tool) or
-//! [`ua_tools::approvals::request_ad_hoc`] (anything else) in one write
-//! transaction.
+//! consuming anything, which no tool does, so it evaluates
+//! [`ua_tools::approvals::gate`] directly in one write transaction after the
+//! same profile check the Python route makes.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -502,7 +500,6 @@ async fn approvals_list(
         "expired_passes_truncated": (expired.len() as u64) < expired_total,
         "expired_passes": expired,
         "expired_passes_total": expired_total,
-        "ad_hoc_approved": rows("ad_hoc_approved"),
         "gated_tools": v.get("gated_tools").cloned().unwrap_or(json!([])),
         "pass_ttl_hours": v.get("pass_ttl_hours").cloned().unwrap_or(Value::Null),
     });
@@ -544,8 +541,6 @@ async fn approval_detail(
     let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
     let expires = ts_s(row.resolved_at.as_deref()).map(|t| t + ttl_s);
     let pass_state = match row.status.as_str() {
-        // An approved ad-hoc row is a sign-off: nothing consumes it.
-        "approved" if row.ad_hoc => "sign_off",
         "approved" if expires.is_some_and(|e| e < now_s()) => "expired",
         "approved" => "live",
         "consumed" => "consumed",
@@ -566,9 +561,7 @@ async fn approval_detail(
         ("yes", "you may approve this request".to_string())
     };
     let gated_by_config = cfg.approval_tools.contains(&row.tool);
-    let gate = if row.ad_hoc {
-        json!({ "kind": "ad_hoc", "label": "Ad-hoc sign-off; nothing consumes it" })
-    } else if gated_by_config {
+    let gate = if gated_by_config {
         json!({ "kind": "global_allowlist", "label": "Global allowlist (approval_tools)" })
     } else {
         json!({ "kind": "always_gated", "label": "Tool always needs a human approval" })
@@ -592,9 +585,8 @@ async fn approval_detail(
         "payload_omissions": [],
         "pass": {
             "state": pass_state,
-            "expires_at": if row.status == "approved" && !row.ad_hoc { expires.map(ts_from_s) } else { None },
+            "expires_at": if row.status == "approved" { expires.map(ts_from_s) } else { None },
         },
-        "ad_hoc": row.ad_hoc,
         "approver": { "may_approve": may_approve, "reason": why },
         "pr_url": pr_url,
         "commit_sha": commit_sha,
@@ -611,9 +603,6 @@ enum RequestOutcome {
 
 /// Open approval requests one requester may have queued at once.
 const MAX_PENDING_PER_REQUESTER: i64 = 20;
-/// Open ad-hoc sign-off requests (for calls nothing gates) one requester may
-/// have queued at once.
-const MAX_PENDING_AD_HOC_PER_REQUESTER: i64 = 20;
 
 async fn approval_request(
     State(state): State<AppState>,
@@ -656,11 +645,12 @@ async fn approval_request(
     // The checks a call of the tool would pass before its gate (grant,
     // profile, policy rules, prod-action identity), then the payload its gate
     // would bind: a `gate_payload` projection, never the raw arguments, so a
-    // secret value is not parked in the approvals table. A tool the caller's
-    // profile could not call is refused (403), so this cannot probe.
-    let (payload, ad_hoc) = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
-        Ok(ApprovalRequest::Gated(p)) => (p, false),
-        Ok(ApprovalRequest::AdHoc(p)) => (p, true),
+    // secret value is not parked in the approvals table.
+    let payload = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
+        Ok(ApprovalRequest::Payload(p)) => p,
+        Ok(ApprovalRequest::NotGated) => {
+            return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
+        }
         Ok(ApprovalRequest::GatesInHandler) => {
             return err(
                 StatusCode::CONFLICT,
@@ -679,61 +669,46 @@ async fn approval_request(
         .write_async(move |tx| {
             let cfg = hub.cfg();
             let canon = approvals::canonical_payload(&p);
-            let flag = i64::from(ad_hoc);
-            // An identical request already on record answers as it stands,
-            // whatever the caps say.
-            let latest: Option<(i64, String, Option<String>, Option<String>)> = tx
+            let denied: Option<(i64, Option<String>)> = tx
                 .query_row(
-                    "SELECT id, status, reason, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 \
-                     AND requested_by = ?3 AND ad_hoc = ?4 AND status IN ('pending', 'approved', 'denied') \
-                     ORDER BY CASE status WHEN 'denied' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, id ASC",
-                    params![t, canon, c.label, flag],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+                     AND status = 'denied' ORDER BY id DESC LIMIT 1",
+                    params![t, canon, c.label],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
-            match latest {
-                Some((id, status, reason, _)) if status == "denied" => {
-                    return Ok(RequestOutcome::Denied(id, reason));
-                }
-                // A live pass, or an ad-hoc sign-off (which does not
-                // expire), is reported and never consumed: this route runs
-                // nothing.
-                Some((id, status, _, at))
-                    if status == "approved"
-                        && (ad_hoc || ts_s(at.as_deref()).is_some_and(|s| s + ttl_s >= now_s())) =>
-                {
-                    return Ok(RequestOutcome::Approved(id));
-                }
-                Some((id, status, _, _)) if status == "pending" => return Ok(RequestOutcome::Pending(id)),
-                _ => {}
+            if let Some((id, reason)) = denied {
+                return Ok(RequestOutcome::Denied(id, reason));
             }
             // Bound the human inbox: one requester cannot queue more than
-            // MAX_PENDING_PER_REQUESTER open requests, of which at most
-            // MAX_PENDING_AD_HOC_PER_REQUESTER ad-hoc ones.
-            let (open, open_ad_hoc): (i64, i64) = tx.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(ad_hoc), 0) FROM approvals \
-                 WHERE requested_by = ?1 AND status = 'pending'",
+            // MAX_PENDING_PER_REQUESTER open requests.
+            let open: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM approvals WHERE requested_by = ?1 AND status = 'pending'",
                 params![c.label],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )?;
-            if open >= MAX_PENDING_PER_REQUESTER
-                || (ad_hoc && open_ad_hoc >= MAX_PENDING_AD_HOC_PER_REQUESTER)
-            {
+            if open >= MAX_PENDING_PER_REQUESTER {
                 return Ok(RequestOutcome::TooMany);
             }
-            let outcome = if ad_hoc {
-                approvals::request_ad_hoc(tx, &c, &t, &p)?
-            } else {
-                approvals::gate(tx, cfg, &c, &t, &p)?
+            // A live pass is reported, never consumed: this route runs nothing.
+            let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
+            let passes: Vec<(i64, Option<String>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+                     AND status = 'approved' ORDER BY id ASC",
+                )?;
+                stmt.query_map(params![t, canon, c.label], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?
             };
-            match outcome {
+            if let Some((id, _)) =
+                passes.iter().find(|(_, at)| ts_s(at.as_deref()).is_some_and(|s| s + ttl_s >= now_s()))
+            {
+                return Ok(RequestOutcome::Approved(*id));
+            }
+            match approvals::gate(tx, cfg, &c, &t, &p)? {
                 GateOutcome::Pending { approval_id } => Ok(RequestOutcome::Pending(approval_id)),
-                GateOutcome::Denied { approval_id, reason } => {
-                    Ok(RequestOutcome::Denied(approval_id, reason))
-                }
-                // Unreachable: live passes and sign-offs were handled above
-                // in this transaction.
+                GateOutcome::Denied { approval_id, reason } => Ok(RequestOutcome::Denied(approval_id, reason)),
+                // Unreachable: live passes were handled above in this transaction.
                 GateOutcome::Pass { approval_id } => Ok(RequestOutcome::Approved(approval_id)),
             }
         })
@@ -750,9 +725,7 @@ async fn approval_request(
         }
         Err(e) => return tool_err(&e),
     };
-    let mut out = json!({
-        "approval_id": approval_id, "status": decision, "tool": tool, "payload": payload, "ad_hoc": ad_hoc,
-    });
+    let mut out = json!({ "approval_id": approval_id, "status": decision, "tool": tool, "payload": payload });
     if let Some(r) = reason.filter(|r| !r.is_empty()) {
         out["reason"] = json!(r);
     }
