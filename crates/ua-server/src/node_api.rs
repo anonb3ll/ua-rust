@@ -14,6 +14,8 @@
 //! | `POST /api/node/wake`      | `node_wake` (long-poll, `offer_version` 3) |
 //! | `POST /api/node/wake/check` | `node_wake_check` |
 //! | `POST /api/node/wake/receipt` | `node_wake_receipt` (200; `duplicate: true` for a resend) |
+//! | `GET\|POST /api/node/config` | `node_config` (`get`, `report`, `applied`; 202 `approval_pending` while an apply pass is pending) |
+//! | `GET  /api/harness-config` | `harness_config_status` |
 //! | `GET  /api/nodes`          | `node_list`, plus `recent_items` from `node_items` |
 //! | `GET  /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` (`?node=`) |
 //!
@@ -26,14 +28,14 @@
 //! credential refusal also carries `reason` (the same code), which is what
 //! the node keys on there.
 //!
-//! The harness config bundle (`/api/node/config`) is not built yet and
-//! answers `501`.
+//! `GET /api/node/config` takes the node from the query (`?node=`), as the
+//! Python hub does; `POST` takes it from the body with an `action`.
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde_json::{Value, json};
 use ua_core::UaError;
@@ -42,7 +44,7 @@ use ua_core::identity::Transport;
 use crate::AppState;
 use crate::api::status_for;
 use crate::auth::{AuthIdentity, caller_for, session_key};
-use crate::compat_api::{not_built, object_body};
+use crate::compat_api::object_body;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -76,10 +78,8 @@ pub fn routes() -> Router<AppState> {
             "/api/node/wake/receipt",
             post(|s, i, h, b| tool_route(s, i, h, b, "node_wake_receipt", Created::Never)),
         )
-        .route(
-            "/api/node/{*rest}",
-            any(|| async { not_built("node_config", "the harness config bundle route") }),
-        )
+        .route("/api/node/config", get(config_get).post(config_post))
+        .route("/api/harness-config", get(harness_config_status))
         .route("/api/nodes", get(list))
         .route("/api/nodes/acceptance", get(acceptance))
 }
@@ -204,6 +204,67 @@ async fn session_credential(
     resp.headers_mut()
         .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
     resp
+}
+
+#[derive(serde::Deserialize)]
+struct NodeQuery {
+    node: Option<String>,
+}
+
+/// `GET /api/node/config?node=`: the bundle for the caller's node.
+async fn config_get(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<NodeQuery>,
+) -> Response {
+    let Some(node) = q.node.filter(|n| !n.trim().is_empty()) else {
+        return node_err(&UaError::invalid("node query parameter is required"));
+    };
+    let body = Bytes::from(json!({ "node": node, "action": "get" }).to_string());
+    config_call(&state, &id, &headers, &body).await
+}
+
+/// `POST /api/node/config`: `get`, `report` or `applied`.
+async fn config_post(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    config_call(&state, &id, &headers, &body).await
+}
+
+/// `node_config`, answering a pending apply pass the way the Python hub
+/// does: `202 {"status": "approval_pending", "approval_id", "code", "tool"}`.
+async fn config_call(state: &AppState, id: &AuthIdentity, headers: &HeaderMap, body: &Bytes) -> Response {
+    let args = match object_body(body) {
+        Ok(m) => Value::Object(m),
+        Err(r) => return *r,
+    };
+    let caller = caller_for(state, id, session_key(headers), Transport::Http);
+    match state.registry.call(&state.hub, &caller, "node_config", args).await {
+        Ok(v) => Json(v).into_response(),
+        Err(UaError::ApprovalRequired { tool, approval_id }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "approval_pending", "approval_id": approval_id, "code": "approval_required", "tool": tool })),
+        )
+            .into_response(),
+        Err(e) => node_err(&e),
+    }
+}
+
+/// `GET /api/harness-config`: the active bundle and recent drift proposals.
+async fn harness_config_status(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
+    match state.registry.call(&state.hub, &caller, "harness_config_status", json!({})).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => node_err(&e),
+    }
 }
 
 #[derive(serde::Deserialize)]

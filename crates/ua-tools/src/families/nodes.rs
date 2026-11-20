@@ -1261,6 +1261,7 @@ fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str)
         params![name, to, now],
     )?;
     super::node_queue::acceptance::void_tx(tx, name, "node_reassigned", false)?;
+    super::harness_config::close_for_node(tx, name, "node_reassigned", who)?;
     let event = ledger::append(
         tx,
         EventInput::new(
@@ -1307,6 +1308,7 @@ fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult
     }
     refuse_open_work(tx, name, "forgetting")?;
     super::node_queue::acceptance::void_tx(tx, name, "node_forgotten", true)?;
+    super::harness_config::close_for_node(tx, name, "node_forgotten", who)?;
     tx.execute("DELETE FROM nodes WHERE node = ?1", [name])?;
     let now = ua_core::time::now();
     let event = ledger::append(
