@@ -183,7 +183,7 @@ fn dev() -> Caller {
 }
 
 fn steward() -> Caller {
-    caller("steward-1", ActorKind::Agent, Profile::Steward)
+    caller("reviewer-1", ActorKind::Agent, Profile::Reviewer)
 }
 
 fn reason(e: &UaError) -> String {
@@ -336,7 +336,7 @@ async fn secrets_are_write_only_encrypted_and_operator_only() {
     let e =
         h.err(&dev(), "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" })).await;
     assert_eq!(reason(&e), "profile_denied");
-    let cos = caller("boss", ActorKind::Agent, Profile::ChiefOfStaff);
+    let cos = caller("boss", ActorKind::Agent, Profile::Coordinator);
     let e =
         h.err(&cos, "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" })).await;
     assert_eq!(reason(&e), "operator_only");
@@ -421,9 +421,9 @@ async fn replacing_a_secret_needs_an_approval_bound_to_the_new_value() {
 async fn secret_admin_is_an_identity_not_a_profile() {
     // A coordinator agent may activate the operator profile (it ranks lower)...
     let h = H::with(|c| {
-        c.profiles.insert("boss".into(), "chief-of-staff".into());
+        c.profiles.insert("boss".into(), "coordinator".into());
     });
-    let boss = caller("boss", ActorKind::Agent, Profile::ChiefOfStaff);
+    let boss = caller("boss", ActorKind::Agent, Profile::Coordinator);
     let r = h.ok(&boss, "profile_activate", json!({ "profile": "operator" })).await;
     assert_eq!(r["profile"], "operator");
     // ...but that makes it neither a secret nor a registry admin.
@@ -436,7 +436,7 @@ async fn secret_admin_is_an_identity_not_a_profile() {
         h.err(&as_operator, "mcp_server_register", json!({ "name": "fake", "server": stdio_spec() })).await;
     assert_eq!(reason(&e), "operator_only");
     // A configured operator identity is, whatever its profile.
-    let ops_dev = caller("ops-1", ActorKind::Agent, Profile::ChiefOfStaff);
+    let ops_dev = caller("ops-1", ActorKind::Agent, Profile::Coordinator);
     h.ok(&ops_dev, "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" })).await;
 }
 
@@ -674,7 +674,7 @@ async fn uncatalogued_tools_and_unknown_servers_are_refused() {
 
 async fn read_profiles_and_missing_secrets_refuse_reads() {
     let h = H::new();
-    h.register_stdio("fake", json!({ "read_profiles": ["steward"] })).await;
+    h.register_stdio("fake", json!({ "read_profiles": ["reviewer"] })).await;
     let e = h.err(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
     assert_eq!(reason(&e), "read_profile_denied");
     // The steward may read, but no secret is stored for the server yet.

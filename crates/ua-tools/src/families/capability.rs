@@ -20,7 +20,7 @@
 //!
 //! Visibility: the catalog's `boundaries`, `health` and agents' `host` are a
 //! map of the hub, shown only to operators (humans, lifecycle operators, the
-//! chief-of-staff and operator profiles). Everyone else gets them as null or
+//! coordinator and operator profiles). Everyone else gets them as null or
 //! absent, named in `redacted`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,7 +82,7 @@ fn known_label(c: &Connection, cfg: &Config, label: &str) -> UaResult<bool> {
 
 /// What one agent may call: `None` when its profile is unrestricted.
 fn allowed_tools(reg: &Registry, profile: Profile) -> Option<BTreeSet<String>> {
-    if profile == Profile::ChiefOfStaff {
+    if profile == Profile::Coordinator {
         return None;
     }
     Some(reg.all().filter(|t| profile.allows_tool(t.name)).map(|t| t.name.to_string()).collect())
@@ -172,7 +172,6 @@ fn mcp_surface() -> Value {
     let clients = [
         ("claude", "Claude Code / Claude Desktop", "Interactive developer CLI and desktop assistant"),
         ("codex", "Codex", "Autonomous coding and test automation worker"),
-        ("hermes", "Hermes", "Autonomous coordination and queue stewardship"),
         ("agy", "Google Antigravity", "Agentic IDE and terminal orchestration client"),
         ("cursor", "Cursor", "IDE pair programmer client"),
     ];
@@ -253,7 +252,7 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
 fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
-    if caller.is_human() || matches!(caller.profile, Profile::ChiefOfStaff | Profile::Operator) {
+    if caller.is_human() || matches!(caller.profile, Profile::Coordinator | Profile::Operator) {
         return true;
     }
     agents::verified(caller).is_some_and(|l| cfg.is_human(l) || cfg.is_lifecycle_operator(l))

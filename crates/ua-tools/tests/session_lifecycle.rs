@@ -417,11 +417,12 @@ async fn crew_intervene_guards() {
             .await;
     assert_eq!(r.unwrap()["from_agent"], "lead-1");
 
-    // The steward profile may watch a crew but not steer it.
-    let steward = Caller { profile: Profile::Steward, ..agent("steward-1") };
-    let denied = approved_call(&e, &steward, json!({ "session_id": s2, "message": "hi" })).await.unwrap_err();
+    // The reviewer profile may watch a crew but not steer it.
+    let reviewer = Caller { profile: Profile::Reviewer, ..agent("reviewer-1") };
+    let denied =
+        approved_call(&e, &reviewer, json!({ "session_id": s2, "message": "hi" })).await.unwrap_err();
     assert_eq!(denied.code(), "denied");
-    e.ok(&steward, "crew_view", json!({ "session_id": s2 })).await;
+    e.ok(&reviewer, "crew_view", json!({ "session_id": s2 })).await;
 }
 
 #[tokio::test]

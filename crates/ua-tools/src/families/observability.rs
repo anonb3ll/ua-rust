@@ -2,14 +2,14 @@
 //! doctor and MCP schema telemetry.
 //!
 //! Tools: `observability_manage` (actions `activity`, `metrics`, `anomalies`,
-//! `performance`, `agents`, `context`), the legacy standalone tools
+//! `performance`, `agents`, `context`, `delegation_stats`), the legacy standalone tools
 //! `agent_activity`, `metrics_snapshot`, `perf_summary` and `check_anomalies`,
 //! plus `system_doctor` and `mcp_health_telemetry`.
 //!
 //! Everything here reads existing rows and never writes: activity comes from
 //! the ledger (`event_log`), performance from `tool_calls` (one row per
 //! completed call, written by the registry wrapper), task health from `tasks`
-//! and `approvals`. The family owns no tables.
+//! and `approvals`, delegation stats from `delegations`. The family owns no tables.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -630,22 +630,167 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// delegation_stats
+
+const DELEGATION_WINDOW_DAYS_DEFAULT: f64 = 30.0;
+/// Delegation rows read for one report; older rows past this are ignored.
+const DELEGATION_ROW_CAP: usize = 100_000;
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationStatsArgs {
+    /// Only delegations this agent sent or received.
+    pub agent: Option<String>,
+    /// Window in days, counted back from now (default 30; non-positive values
+    /// use the default). Ignored when `since` is given.
+    pub window_days: Option<f64>,
+    /// ISO-8601 lower bound on the delegation's `created_at`.
+    pub since: Option<String>,
+}
+
+#[derive(Default)]
+struct DelegationBucket {
+    sent: i64,
+    received: i64,
+    by_state: BTreeMap<String, i64>,
+    completion_secs: Vec<i64>,
+    first_claim_secs: Vec<i64>,
+}
+
+fn secs_between(from: &str, to: Option<&str>) -> Option<i64> {
+    let (a, b) = (parse_ts(from)?, parse_ts(to?)?);
+    let d = b.as_second() - a.as_second();
+    (d >= 0).then_some(d)
+}
+
+fn latency(mut v: Vec<i64>) -> Value {
+    v.sort_unstable();
+    let avg = (!v.is_empty()).then(|| round(v.iter().sum::<i64>() as f64 / v.len() as f64, 1));
+    json!({
+        "count": v.len(),
+        "avg": avg,
+        "p50": percentile(&v, 50.0),
+        "p95": percentile(&v, 95.0),
+        "max": v.last(),
+    })
+}
+
+/// Per-agent delegation counts, states and latencies over a window, read
+/// from the `delegations` table. Latencies are in seconds: `completion` from
+/// creation to a terminal state (`completed_at`), `first_claim` from creation
+/// to the claim of delegations claimed exactly once.
+fn delegation_stats(c: &Connection, a: DelegationStatsArgs) -> UaResult<Value> {
+    let now = Timestamp::now();
+    let since = match a.since.as_deref() {
+        Some(raw) => normalize_since("since", raw)?,
+        None => {
+            let days =
+                a.window_days.filter(|d| d.is_finite() && *d > 0.0).unwrap_or(DELEGATION_WINDOW_DAYS_DEFAULT);
+            let secs = (days * 86_400.0) as i64;
+            format_ts(now.checked_sub(jiff::SignedDuration::from_secs(secs)).unwrap_or(now))
+        }
+    };
+    let agent = a.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let mut sql = String::from(
+        "SELECT from_agent, to_agent, status, created_at, completed_at, attempts, last_attempt_at \
+         FROM delegations WHERE created_at >= ?1",
+    );
+    let mut args = vec![since.clone()];
+    if let Some(ag) = &agent {
+        sql.push_str(" AND (from_agent = ?2 OR to_agent = ?2)");
+        args.push(ag.clone());
+    }
+    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", DELEGATION_ROW_CAP + 1));
+    let mut stmt = c.prepare(&sql)?;
+    type DelegationRow = (String, String, String, String, Option<String>, i64, Option<String>);
+    let mut rows: Vec<DelegationRow> = stmt
+        .query_map(params_from_iter(args.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let truncated = rows.len() > DELEGATION_ROW_CAP;
+    rows.truncate(DELEGATION_ROW_CAP);
+
+    let mut per_agent: BTreeMap<String, DelegationBucket> = BTreeMap::new();
+    let mut pairs: BTreeMap<(String, String), BTreeMap<String, i64>> = BTreeMap::new();
+    let mut states: BTreeMap<String, i64> =
+        crate::families::delegation::DELEGATION_STATUSES.iter().map(|s| (s.to_string(), 0)).collect();
+    for (from, to, status, created, completed, attempts, claimed) in &rows {
+        *states.entry(status.clone()).or_default() += 1;
+        per_agent.entry(from.clone()).or_default().sent += 1;
+        let recv = per_agent.entry(to.clone()).or_default();
+        recv.received += 1;
+        *recv.by_state.entry(status.clone()).or_default() += 1;
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled")
+            && let Some(d) = secs_between(created, completed.as_deref())
+        {
+            recv.completion_secs.push(d);
+        }
+        if *attempts == 1
+            && let Some(d) = secs_between(created, claimed.as_deref())
+        {
+            recv.first_claim_secs.push(d);
+        }
+        *pairs.entry((from.clone(), to.clone())).or_default().entry(status.clone()).or_default() += 1;
+    }
+    let agents: Vec<Value> = per_agent
+        .into_iter()
+        .filter(|(label, _)| agent.as_ref().is_none_or(|a| a == label))
+        .map(|(label, b)| {
+            let count = |s: &str| b.by_state.get(s).copied().unwrap_or(0);
+            let finished = count("completed") + count("failed") + count("cancelled");
+            let rate = (finished > 0).then(|| round(count("completed") as f64 / finished as f64, 4));
+            json!({
+                "agent": label,
+                "sent": b.sent,
+                "received": b.received,
+                "received_by_state": b.by_state,
+                "open": count("pending") + count("in_flight"),
+                "completion_rate": rate,
+                "latency_seconds": {
+                    "completion": latency(b.completion_secs),
+                    "first_claim": latency(b.first_claim_secs),
+                },
+            })
+        })
+        .collect();
+    let pairs: Vec<Value> = pairs
+        .into_iter()
+        .map(|((from, to), by_state)| {
+            let total: i64 = by_state.values().sum();
+            json!({ "from_agent": from, "to_agent": to, "total": total, "by_state": by_state })
+        })
+        .collect();
+    Ok(json!({
+        "window": { "since": since, "until": format_ts(now) },
+        "agent": agent,
+        "total": rows.len(),
+        "truncated": truncated,
+        "states": states,
+        "agents": agents,
+        "pairs": pairs,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // observability_manage
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManageArgs {
-    /// One of activity, metrics, anomalies, performance, agents, context. The
-    /// underlying function names (agent_activity, metrics_snapshot,
-    /// check_anomalies, perf_summary, agent_list, agent_context) are accepted too.
+    /// One of activity, metrics, anomalies, performance, agents, context,
+    /// delegation_stats. The underlying function names (agent_activity,
+    /// metrics_snapshot, check_anomalies, perf_summary, agent_list,
+    /// agent_context, delegation_ledger) are accepted too.
     pub action: String,
     /// The action's keyword arguments.
     pub params: Option<Value>,
 }
 
-const ACTIONS: [&str; 6] = ["activity", "metrics", "anomalies", "performance", "agents", "context"];
+const ACTIONS: [&str; 7] =
+    ["activity", "metrics", "anomalies", "performance", "agents", "context", "delegation_stats"];
 
-fn canonical_action(action: &str) -> UaResult<&'static str> {
+pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
     let a = action.trim().to_ascii_lowercase();
     let a = match a.as_str() {
         "agent_activity" => "activity",
@@ -654,6 +799,7 @@ fn canonical_action(action: &str) -> UaResult<&'static str> {
         "perf_summary" => "performance",
         "agent_list" => "agents",
         "agent_context" => "context",
+        "delegation_ledger" => "delegation_stats",
         other => other,
     };
     ACTIONS.iter().find(|x| **x == a).copied().ok_or_else(|| {
@@ -698,6 +844,10 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
         "context" => {
             let args: AgentContextArgs = parse_params("observability", act, p)?;
             agents::agent_context(ctx, args).await
+        }
+        "delegation_stats" => {
+            let args: DelegationStatsArgs = parse_params("observability", act, p)?;
+            read(&ctx, move |c| delegation_stats(c, args)).await
         }
         other => Err(UaError::invalid(format!("unknown observability action {other:?}"))),
     }
@@ -1386,7 +1536,9 @@ pub fn register(r: &mut Registry) {
             "Agent visibility, metrics, anomalies and performance in one tool. action: activity (ledger activity, \
              newest first), metrics (cluster snapshot), anomalies (deterministic health rules), performance \
              (p50/p95 latency and error rates per tool and caller from tool_calls), agents (agent_list), \
-             context (agent_context). `params` holds the action's arguments. Read-only.",
+             context (agent_context), delegation_stats (params agent, window_days, since: per-agent delegation \
+             counts sent and received, states, completion rate, and completion and first-claim latencies in \
+             seconds, plus per-pair state counts). `params` holds the action's arguments. Read-only.",
             manage,
         )
         .family("observability")

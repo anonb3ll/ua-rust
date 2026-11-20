@@ -5,7 +5,9 @@ use std::sync::Arc;
 use ua_core::Config;
 use ua_store::Db;
 
-/// Configuration plus the database. Cheap to clone.
+use crate::ci::{CiVerifier, GitHubCiVerifier};
+
+/// Configuration, the database and the pluggable outside lookups. Cheap to clone.
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<HubInner>,
@@ -14,6 +16,7 @@ pub struct Hub {
 struct HubInner {
     cfg: Config,
     db: Db,
+    ci: Arc<dyn CiVerifier>,
 }
 
 impl Hub {
@@ -30,7 +33,18 @@ impl Hub {
     }
 
     pub fn new(cfg: Config, db: Db) -> Self {
-        Self { inner: Arc::new(HubInner { cfg, db }) }
+        Self { inner: Arc::new(HubInner { cfg, db, ci: Arc::new(GitHubCiVerifier) }) }
+    }
+
+    /// The same hub with another CI verifier (tests, or a forge client).
+    pub fn with_ci_verifier(self, ci: Arc<dyn CiVerifier>) -> Self {
+        let (cfg, db) = (self.inner.cfg.clone(), self.inner.db.clone());
+        Self { inner: Arc::new(HubInner { cfg, db, ci }) }
+    }
+
+    /// The CI verifier task checks are graded with.
+    pub fn ci(&self) -> &dyn CiVerifier {
+        self.inner.ci.as_ref()
     }
 
     pub fn cfg(&self) -> &Config {

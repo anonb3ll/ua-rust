@@ -8,6 +8,7 @@ pub mod agents;
 pub mod audit;
 pub mod capability;
 pub mod code;
+pub mod continuity;
 pub mod core_schema;
 pub mod cycles;
 pub mod delegation;
@@ -15,6 +16,7 @@ pub mod dispatch;
 pub mod events;
 pub mod evidence;
 pub mod export;
+pub mod governance;
 pub mod graph;
 pub mod injection;
 pub mod managed_secrets;
@@ -44,6 +46,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
+    parts.extend(continuity::schema_parts());
     parts.extend(dispatch::schema_parts());
     parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());
@@ -51,6 +54,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.extend(vault::schema_parts());
     parts.push(cycles::SCHEMA);
     parts.push(delegation::SCHEMA);
+    parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
     parts.push(managed_secrets::SCHEMA);
     parts.push(mcp::SCHEMA);
@@ -77,6 +81,7 @@ pub fn register(r: &mut Registry) {
     events::register(r);
     evidence::register(r);
     export::register(r);
+    governance::register(r);
     graph::register(r);
     injection::register(r);
     managed_secrets::register(r);

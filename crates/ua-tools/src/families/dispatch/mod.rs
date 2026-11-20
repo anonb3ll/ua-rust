@@ -33,6 +33,7 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 pub use reaper::{reap_expired_leases, spawn_reaper, startup_sweep};
+pub(crate) use tools::cancel_run;
 
 use crate::registry::Registry;
 

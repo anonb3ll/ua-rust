@@ -103,6 +103,8 @@ const MAX_BACKENDS: usize = 32;
 const MAX_ARGV: usize = 16;
 const MAX_FEATURES: usize = 16;
 const MAX_FEATURE_LEN: usize = 40;
+const MAX_SURFACE_KEYS: usize = 16;
+const MAX_SURFACE_KEY_LEN: usize = 40;
 const MAX_SURFACE_NAMES: usize = 50;
 const MAX_NATIVE_SESSIONS: usize = 50;
 const MAX_STAMP: usize = 40;
@@ -112,7 +114,6 @@ const MAX_DROPPED_KEYS: usize = 32;
 const NATIVE_HARNESSES: [&str; 2] = ["claude", "codex"];
 const VAULT_SYNC_STATUSES: [&str; 4] = ["LIVE", "DORMANT", "MISCONFIGURED", "UNKNOWN"];
 const REPO_FIELDS: [&str; 5] = ["root", "root_realpath", "name", "path", "realpath"];
-const SURFACE_FIELDS: [&str; 2] = ["hermes_profiles", "kanban_assignees"];
 /// Keys a heartbeat may refresh without replacing the registration's facts.
 const HEARTBEAT_KEYS: [&str; 5] = ["code_sha", "harness_config", "native_sessions", "surfaces", "vault_sync"];
 /// When bounded facts are still too large, these lists lose their last
@@ -343,17 +344,32 @@ fn repos_fact(v: &Value) -> Option<Value> {
     Some(Value::Array(rows))
 }
 
+/// A surface key: 1-40 of `a-z 0-9 _`.
+fn surface_key_ok(k: &str) -> bool {
+    (1..=MAX_SURFACE_KEY_LEN).contains(&k.len())
+        && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Named surfaces the node exposes (profiles, queues, assignees, ...): a map
+/// of at most 16 keys of `[a-z0-9_]{1,40}`, each a list of at most 50 names of
+/// 1-64 chars. A bad key, or a value that is not a list, is dropped; names
+/// that are not short strings are skipped.
 fn surfaces_fact(v: &Value) -> Option<Value> {
     let m = v.as_object()?;
-    let mut out = Map::new();
-    for field in SURFACE_FIELDS {
-        let names: Vec<&str> = m
-            .get(field)
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|n| name_within(n, MAX_NAME)).take(MAX_SURFACE_NAMES).collect())
-            .unwrap_or_default();
-        out.insert(field.into(), json!(names));
-    }
+    let out: Map<String, Value> = m
+        .iter()
+        .filter(|(k, _)| surface_key_ok(k))
+        .filter_map(|(k, v)| {
+            let names: Vec<&str> = v
+                .as_array()?
+                .iter()
+                .filter_map(|n| name_within(n, MAX_NAME))
+                .take(MAX_SURFACE_NAMES)
+                .collect();
+            Some((k.clone(), json!(names)))
+        })
+        .take(MAX_SURFACE_KEYS)
+        .collect();
     Some(Value::Object(out))
 }
 
@@ -793,6 +809,8 @@ pub struct RegisterArgs {
     /// `harnesses`, `worktree_roots`, `repos`, `surfaces`, `node_features`,
     /// `native_sessions`, `harness_config`, `vault_sync`, `code_sha`. Values
     /// are bounded; other keys are dropped and named in `dropped_fact_keys`.
+    /// `surfaces` maps up to 16 keys of `[a-z0-9_]{1,40}` to lists of at most
+    /// 50 short names (the node's profiles, queues or assignees).
     pub facts: Option<Value>,
     /// The node software version, at most 64 characters.
     pub version: Option<String>,
