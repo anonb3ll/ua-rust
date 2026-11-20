@@ -565,13 +565,18 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
     Ok(result)
 }
 
-/// Tick once a minute, on the minute, forever. Spawned by `ua serve` when
-/// `routines_enabled` is set.
-pub async fn run_ticker(hub: Hub) {
+/// Tick once a minute, on the minute, until `ct` is cancelled. Spawned by
+/// `ua serve` when `routines_enabled` is set. Cancellation is honoured
+/// between ticks: a tick in progress runs to the end.
+pub async fn run_ticker(hub: Hub, ct: tokio_util::sync::CancellationToken) {
     loop {
         let now = jiff::Timestamp::now();
         let wait = 60 - now.as_second().rem_euclid(60);
-        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+        tokio::select! {
+            biased;
+            _ = ct.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait as u64)) => {}
+        }
         if let Err(e) = tick(&hub, jiff::Timestamp::now(), false).await {
             tracing::warn!(error = %e, "routine tick failed");
         }

@@ -30,11 +30,20 @@ pub struct AppState {
     /// The browser-session cookie key, cached so authenticated UI requests
     /// do not read `ui_keys` ([`login::CookieKeyCache`]).
     pub cookie_key: Arc<login::CookieKeyCache>,
+    /// Cancelled when the server shuts down: long-lived responses (event
+    /// streams) end on it so a graceful shutdown does not wait on them.
+    /// [`router`] sets it to the server's token.
+    pub shutdown: CancellationToken,
 }
 
 impl AppState {
     pub fn new(hub: Hub, registry: Arc<Registry>) -> Self {
-        Self { hub, registry, cookie_key: Arc::new(login::CookieKeyCache::new()) }
+        Self {
+            hub,
+            registry,
+            cookie_key: Arc::new(login::CookieKeyCache::new()),
+            shutdown: CancellationToken::new(),
+        }
     }
 }
 
@@ -43,8 +52,10 @@ delegation, messages, memory, vault and workspace tools behind identity, profile
 Search memory before asking the user to repeat themselves. Calls that need a human return approval_required with \
 an approval id; retry the identical call after it is approved.";
 
-/// Build the full HTTP router: `/mcp`, `/api`, health.
+/// Build the full HTTP router: `/mcp`, `/api`, health. Cancelling `ct`
+/// ends MCP sessions and open event streams.
 pub fn router(state: AppState, ct: CancellationToken) -> Router {
+    let state = AppState { shutdown: ct.clone(), ..state };
     let mcp = mcp::http_service(state.clone(), ct);
     Router::new()
         .nest_service("/mcp", mcp)

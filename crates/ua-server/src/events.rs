@@ -473,7 +473,11 @@ impl Cursor {
                 return None;
             }
             let due = self.recheck_due;
+            let shutdown = self.state.shutdown.clone();
             tokio::select! {
+                // The server is shutting down: end the stream (a client
+                // reconnects with Last-Event-ID to the next hub process).
+                _ = shutdown.cancelled() => self.closed = true,
                 _ = sleep_until_due(due), if due.is_some() => self.run_recheck().await,
                 _ = self.recheck.tick() => self.run_recheck().await,
                 recv = self.rx.recv() => match recv {

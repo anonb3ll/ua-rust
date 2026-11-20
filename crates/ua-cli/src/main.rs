@@ -177,6 +177,96 @@ fn confirm_on_tty(label: &str) -> bool {
     std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim() == label
 }
 
+/// How long a shutdown waits for open connections and background tasks.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for SIGINT (Ctrl-C) or, on Unix, SIGTERM (service managers,
+/// containers). Returns the signal's name.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops the hub gracefully");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term => "SIGTERM",
+    }
+}
+
+/// Serve until `ct` is cancelled (or the server stops on its own), then
+/// drain: in-flight requests and the background loops get
+/// [`SHUTDOWN_GRACE`] to finish (event streams and MCP sessions end on the
+/// token), and the WAL is checkpointed and truncated so the database file is
+/// complete on its own.
+async fn serve_until_shutdown(
+    state: AppState,
+    ct: CancellationToken,
+    background: Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let hub = state.hub.clone();
+    let server = ua_server::serve_http(state, ct.clone());
+    tokio::pin!(server);
+    let ended = tokio::select! {
+        r = &mut server => Some(r),
+        _ = ct.cancelled() => None,
+    };
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let served = match ended {
+        // The server stopped by itself (a bind error): stop the loops too.
+        Some(r) => {
+            ct.cancel();
+            r
+        }
+        None => match tokio::time::timeout_at(deadline, &mut server).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    grace_s = SHUTDOWN_GRACE.as_secs(),
+                    "connections still open after the grace period; closing them"
+                );
+                Ok(())
+            }
+        },
+    };
+    let mut abandoned = 0;
+    for task in background {
+        let abort = task.abort_handle();
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            abort.abort();
+            abandoned += 1;
+        }
+    }
+    if abandoned > 0 {
+        tracing::warn!(abandoned, "background tasks still running after the grace period were stopped");
+    }
+    match tokio::task::spawn_blocking(move || hub.db().checkpoint_truncate()).await {
+        Ok(Ok((false, _, done))) => {
+            tracing::info!(checkpointed_frames = done, "WAL checkpointed and truncated")
+        }
+        Ok(Ok((true, log, done))) => {
+            tracing::warn!(
+                wal_frames = log,
+                checkpointed_frames = done,
+                "WAL checkpoint incomplete: a reader was busy"
+            )
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "WAL checkpoint failed"),
+        Err(e) => tracing::warn!(error = %e, "WAL checkpoint task failed"),
+    }
+    tracing::info!("hub stopped");
+    served
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -217,8 +307,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve => {
             warn_if_locked_out(&state).await;
+            // One token for the server and every background loop: a signal
+            // cancels it, then `serve_until_shutdown` drains them.
+            let ct = CancellationToken::new();
+            let mut background = Vec::new();
             if cfg.routines_enabled {
-                tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone()));
+                background
+                    .push(tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone(), ct.clone())));
             }
             if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
                 tracing::warn!("{w}");
@@ -248,20 +343,20 @@ async fn main() -> anyhow::Result<()> {
             // sweeping. Only the server reaps: a short-lived `ua call` or a
             // stdio session must not judge another process's children.
             ua_tools::families::dispatch::startup_sweep(&hub).await;
-            let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
+            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
             // Expire waits and lapsed node leases, and retry owed command
             // notices, for every node.
-            let _node_sweeper = ua_tools::families::node_queue::spawn_sweeper(&hub);
+            background.extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
             // Poll the bound repositories' open pull requests when no webhook
             // can reach this hub (github_poll_interval_s; 0 = off).
-            let _github_poller = ua_tools::families::github::spawn_poller(&hub);
-            let ct = CancellationToken::new();
-            let ct2 = ct.clone();
+            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+            let signal_ct = ct.clone();
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                ct2.cancel();
+                let which = shutdown_signal().await;
+                tracing::info!(signal = which, "shutting down: draining connections and background tasks");
+                signal_ct.cancel();
             });
-            ua_server::serve_http(state, ct).await?;
+            serve_until_shutdown(state, ct, background).await?;
         }
         Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
         Cmd::Tools { names } => {

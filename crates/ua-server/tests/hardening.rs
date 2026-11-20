@@ -498,6 +498,32 @@ async fn an_http2_authority_outside_the_allowlist_is_refused() {
     }
 }
 
+/// A shutdown cancels the server's token, and an open event stream ends on
+/// it instead of holding the graceful shutdown open until its grace period.
+#[tokio::test]
+async fn open_event_streams_end_when_the_server_shuts_down() {
+    use tower::ServiceExt;
+    let hub = TestHub::new(stream_config());
+    for path in ["/api/events/stream", "/ui/activity/stream"] {
+        let ct = tokio_util::sync::CancellationToken::new();
+        let app = ua_server::router(hub.state.clone(), ct.clone());
+        let resp = app.clone().oneshot(get(path, None, Some(AGENT_A))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let mut body = resp.into_body();
+        // Open and idle: nothing to read yet.
+        assert!(tokio::time::timeout(Duration::from_millis(150), body.frame()).await.is_err(), "{path}");
+        let ct = ct.clone();
+        tokio::spawn(async move { ct.cancel() });
+        let ended = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(frame) = body.frame().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "{path} stayed open after the shutdown token was cancelled");
+    }
+}
+
 // ---------------------------------------------------------------- registration
 
 fn register_from(addr: &str, body: &Value) -> Request<Body> {
