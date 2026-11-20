@@ -34,15 +34,21 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// `host[:port]` or `[v6]:port` without the port, lower-cased.
+/// `host[:port]` or `[v6]:port` without the port, lower-cased, without the
+/// trailing dot of a fully qualified name (`hub.example.com.` names the same
+/// host as `hub.example.com`).
 fn host_only(raw: &str) -> String {
     let raw = raw.trim().to_ascii_lowercase();
     if let Some(rest) = raw.strip_prefix('[') {
         return rest.split(']').next().unwrap_or("").to_string();
     }
-    match raw.rsplit_once(':') {
+    let host = match raw.rsplit_once(':') {
         Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => h.to_string(),
         _ => raw,
+    };
+    match host.strip_suffix('.') {
+        Some(h) if !h.is_empty() && !h.ends_with('.') => h.to_string(),
+        _ => host,
     }
 }
 
@@ -221,6 +227,36 @@ mod tests {
         assert!(same_origin(&o, &good));
         o.insert(header::ORIGIN, "https://rebound.example.net".parse().unwrap());
         assert!(!same_origin(&o, &good));
+    }
+
+    /// Edge cases: a trailing dot names the same host (only one dot), case
+    /// does not matter in `:authority` either, and an allowed IPv6
+    /// `:authority` does not excuse a `Host` naming another host.
+    #[test]
+    fn host_edge_cases() {
+        let allowed = vec!["hub.example.com".to_string(), "::1".into()];
+        let none = HeaderMap::new();
+        for (uri, ok) in [
+            ("https://hub.example.com./api/whoami", true),
+            ("https://hub.example.com../api/whoami", false),
+            ("https://HUB.Example.COM:8443/api/whoami", true),
+            ("https://REBOUND.example.net/api/whoami", false),
+            ("http://[::1]:8765/api/whoami", true),
+            ("http://[::2]:8765/api/whoami", false),
+        ] {
+            assert_eq!(host_allowed(&allowed, &none, &uri.parse().unwrap()), ok, "{uri}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "HUB.EXAMPLE.COM.:443".parse().unwrap());
+        assert!(host_allowed(&allowed, &h, &Uri::from_static("/api/whoami")));
+        h.insert(header::HOST, "rebound.example.net".parse().unwrap());
+        let v6: Uri = "http://[::1]:8765/api/whoami".parse().unwrap();
+        assert!(!host_allowed(&allowed, &h, &v6), "an allowed IPv6 authority does not excuse the Host");
+        h.insert(header::HOST, "[::1]:8765".parse().unwrap());
+        assert!(host_allowed(&allowed, &h, &v6));
+        // An allowlist entry written with a trailing dot matches too.
+        let dotted = vec!["hub.example.com.".to_string()];
+        assert!(host_allowed(&dotted, &none, &"https://hub.example.com/".parse().unwrap()));
     }
 
     #[test]
