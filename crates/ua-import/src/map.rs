@@ -90,6 +90,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[Ref { col: "note_id", table: "memory", key: "id" }], ..plain("memory_versions") },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
     TableMap { kind: Kind::Nodes, ..plain("nodes") },
+    plain("graph_canvas_scenes"),
     TableMap { kind: Kind::Ledger, ..plain("event_log") },
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },
     TableMap {

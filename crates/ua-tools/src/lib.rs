@@ -49,3 +49,11 @@ pub fn builtin_registry() -> Registry {
     families::register(&mut r);
     r
 }
+
+/// The built-in registry, built once per process. For code that only reads
+/// the tool table (catalogs, doctors, name lists); a server that serves
+/// calls holds its own [`builtin_registry`].
+pub fn builtin_registry_shared() -> &'static Registry {
+    static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(builtin_registry)
+}

@@ -480,7 +480,7 @@ fn get_agent(conn: &Connection, label: &str) -> UaResult<Option<Value>> {
     Ok(conn.query_row("SELECT * FROM agents WHERE label = ?1", [label], |r| agent_json(r, now)).optional()?)
 }
 
-fn list_agents(conn: &Connection) -> UaResult<Vec<Value>> {
+pub(crate) fn list_agents(conn: &Connection) -> UaResult<Vec<Value>> {
     let now = now_s();
     let count_by = |sql: &str| -> UaResult<std::collections::BTreeMap<String, i64>> {
         let mut stmt = conn.prepare(sql)?;

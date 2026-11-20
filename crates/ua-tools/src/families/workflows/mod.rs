@@ -31,7 +31,7 @@
 //! a failure or an approval continues with `workflow_run(name, run_id=...,
 //! resume=true)` from the first step that has not completed.
 
-mod engine;
+pub(crate) mod engine;
 mod langgraph;
 
 use schemars::JsonSchema;
