@@ -25,6 +25,7 @@ mod search;
 pub use embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
+pub(crate) use note::mark_untrusted;
 
 use ua_store::SchemaPart;
 

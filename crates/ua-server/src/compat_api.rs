@@ -15,10 +15,10 @@
 //! | `GET  /api/capability-catalog` | the registry, grouped by family |
 //! | `GET  /api/board` | `task_list`, `dependency_list`, `delegate_list` |
 //!
-//! Routes whose families are not built yet (`/api/runs`, `/api/nodes/*`,
-//! `/api/work-products`, `/api/evidence`, `/api/platform/*`) answer `501`
-//! with `{"error": "not_implemented", "capability": ...}`. `GET /api/nodes`
-//! itself is served by [`crate::node_api`].
+//! `/api/nodes/*` (node acceptance and discovered sessions) is not built yet
+//! and answers `501` with `{"error": "not_implemented", "capability": ...}`.
+//! `GET /api/nodes` itself is served by [`crate::node_api`]; runs, platform
+//! objects, evidence and work products by [`crate::platform_api`].
 //!
 //! Writes go through [`ua_tools::Registry::call`] with the request's caller,
 //! except `/api/approvals/request`: it queues a request without running or
@@ -56,32 +56,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sessions", get(sessions))
         .route("/api/capability-catalog", get(capability_catalog))
         .route("/api/board", get(board))
-        .route(
-            "/api/runs",
-            any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
-        )
-        .route(
-            "/api/runs/{*rest}",
-            any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
-        )
-        .route(
-            "/api/nodes/{*rest}",
-            any(|| async { not_built("nodes", "node acceptance and discovered native sessions") }),
-        )
-        .route(
-            "/api/work-products",
-            any(|| async { not_built("work_products", "work product review and release") }),
-        )
-        .route(
-            "/api/work-products/{*rest}",
-            any(|| async { not_built("work_products", "work product review and release") }),
-        )
-        .route("/api/evidence", any(|| async { not_built("evidence", "evidence report and append") }))
-        .route("/api/evidence/{*rest}", any(|| async { not_built("evidence", "evidence report and append") }))
-        .route(
-            "/api/platform/{*rest}",
-            any(|| async { not_built("platform", "platform object model and manifest") }),
-        )
+        .route("/api/nodes/{*rest}", any(|| async { not_built("nodes", "discovered native sessions") }))
 }
 
 pub(crate) fn not_built(capability: &str, what: &str) -> Response {
@@ -97,7 +72,7 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({ "error": msg.into() }))).into_response()
 }
 
-fn tool_err(e: &UaError) -> Response {
+pub(crate) fn tool_err(e: &UaError) -> Response {
     let mut body = json!({ "error": e.to_string(), "code": e.code() });
     if let UaError::Denied { reason_code, .. } = e {
         body["reason_code"] = json!(reason_code);
@@ -108,7 +83,7 @@ fn tool_err(e: &UaError) -> Response {
     (status_for(e), Json(body)).into_response()
 }
 
-fn pending(approval_id: i64, tool: &str, payload: Value) -> Response {
+pub(crate) fn pending(approval_id: i64, tool: &str, payload: Value) -> Response {
     let body = json!({
         "approval_id": approval_id,
         "code": "approval_required",

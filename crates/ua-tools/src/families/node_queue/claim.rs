@@ -16,11 +16,11 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::{
-    CHANNEL, Item, LEASE_GRACE_S, after, before, cancel_item, check_item_id, clip, command, device_agent,
-    evidence_ref, items_where, load_item, now, owned_node, record, renew_run, run_gate, run_running,
-    sweep_tx,
+    CHANNEL, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip, command,
+    credentials, device_agent, evidence_ref, items_where, load_item, now, owned_node, record, renew_run,
+    run_gate, run_running, sweep_tx,
 };
-use crate::families::nodes;
+use crate::families::{governance, nodes};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -189,6 +189,9 @@ pub(crate) struct ClaimOutcome {
     pub disposition: Option<Value>,
     /// The operation is still pending: the node may ask again.
     pub pending: bool,
+    /// The node's owner may not take work now. Returned as a value, not an
+    /// error, so the sweep this claim ran still commits.
+    pub refused: Option<governance::Blocked>,
 }
 
 /// What the node is told to run.
@@ -238,6 +241,12 @@ fn claim_once(
             cancel_item(tx, &item.id, "node-queue-claim", "dispatch run is no longer live")?;
         }
     }
+    // A paused, terminated or retired owner claims nothing, whatever is
+    // queued. Checked after the sweep above, which commits despite the
+    // refusal; the queued items stay queued for a resume.
+    if let Some(refused) = governance::claim_block(tx, Some(agent), None, false)? {
+        return Ok(ClaimOutcome { item: None, disposition: None, pending: false, refused: Some(refused) });
+    }
 
     if let Some(op) = op {
         let existing = load_op(tx, &node, &op.id)?;
@@ -285,7 +294,12 @@ fn claim_once(
             }
             Some(e) if e.state != "pending" => {
                 let (disposition, item) = settled(tx, &op.id, &e)?;
-                return Ok(ClaimOutcome { item, disposition: Some(disposition), pending: false });
+                return Ok(ClaimOutcome {
+                    item,
+                    disposition: Some(disposition),
+                    pending: false,
+                    refused: None,
+                });
             }
             Some(e) => {
                 if unix_now() - e.issued_at > OP_MAX_AGE_S {
@@ -293,7 +307,12 @@ fn claim_once(
                     let e =
                         load_op(tx, &node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
                     let (disposition, item) = settled(tx, &op.id, &e)?;
-                    return Ok(ClaimOutcome { item, disposition: Some(disposition), pending: false });
+                    return Ok(ClaimOutcome {
+                        item,
+                        disposition: Some(disposition),
+                        pending: false,
+                        refused: None,
+                    });
                 }
             }
         }
@@ -302,16 +321,26 @@ fn claim_once(
     // The oldest runnable item.
     let candidates = items_where(
         tx,
-        "node = ?1 AND status = 'queued' AND cancel_requested = 0 AND backend != 'acceptance' \
-         ORDER BY created_at, rowid LIMIT 50",
+        "node = ?1 AND status = 'queued' AND cancel_requested = 0 ORDER BY created_at, rowid LIMIT 50",
         [&node],
     )?;
+    // Acceptance items run only for the node's live acceptance run; real
+    // work waits while acceptance is required and not yet passed.
+    let gate = acceptance::claim_gate(tx, hub.cfg(), &row)?;
     let mut chosen = None;
     for item in candidates {
-        if run_gate(tx, &item)?.is_none() {
-            chosen = Some(item);
-            break;
+        if !gate.admits(&item) || run_gate(tx, &item)?.is_some() {
+            continue;
         }
+        // A held task keeps its item queued: skipped now, claimable once the
+        // hold is released.
+        if let Some(task_id) = item.task_id
+            && governance::claim_block(tx, None, Some(task_id), false)?.is_some()
+        {
+            continue;
+        }
+        chosen = Some(item);
+        break;
     }
     let Some(item) = chosen else {
         let mut disposition = None;
@@ -326,7 +355,7 @@ fn claim_once(
             let e = load_op(tx, &node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
             disposition = Some(settled(tx, &op.id, &e)?.0);
         }
-        return Ok(ClaimOutcome { item: None, disposition, pending });
+        return Ok(ClaimOutcome { item: None, disposition, pending, refused: None });
     };
 
     let attempt = item.attempts + 1;
@@ -359,7 +388,7 @@ fn claim_once(
         }));
     }
     record(tx, "claim", ev, agent)?;
-    Ok(ClaimOutcome { item: Some(snapshot), disposition, pending: false })
+    Ok(ClaimOutcome { item: Some(snapshot), disposition, pending: false, refused: None })
 }
 
 fn reconciled(tx: &mut WriteTx<'_>, node: &str, op: &ClaimOp) -> UaResult<ClaimOutcome> {
@@ -374,7 +403,7 @@ fn reconciled(tx: &mut WriteTx<'_>, node: &str, op: &ClaimOp) -> UaResult<ClaimO
         }),
         &e.identity,
     )?;
-    Ok(ClaimOutcome { item, disposition: Some(disposition), pending: false })
+    Ok(ClaimOutcome { item, disposition: Some(disposition), pending: false, refused: None })
 }
 
 // --- heartbeat hook -------------------------------------------------------------
@@ -398,10 +427,12 @@ pub(crate) fn on_heartbeat(
             params![item.id, lease, now()],
         )?;
         renew_run(tx, &item, &lease)?;
+        credentials::slide_idle(tx, &item.id, node)?;
         if !item.cancel_requested
             && let Some(why) = run_gate(tx, &item)?
         {
             tx.execute("UPDATE node_dispatch SET cancel_requested = 1 WHERE id = ?1", [&item.id])?;
+            credentials::revoke_for_item(tx, &item.id, "cancelled", "node-queue")?;
             record(
                 tx,
                 "cancel_requested",
@@ -484,6 +515,9 @@ async fn node_claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             .db()
             .write_async(move |tx| claim_once(tx, &hub, &agent2, &node, op2.as_ref(), last))
             .await?;
+        if let Some(refused) = out.refused {
+            return Err(refused.error());
+        }
         let done = out.item.is_some() || !out.pending && op.is_some() || last;
         if done {
             if out.item.is_none() {

@@ -174,9 +174,10 @@ fn check_value(value: &str) -> UaResult<()> {
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(UaError::invalid("token value may not contain whitespace"));
     }
-    // OAuth tokens are recognized by prefix; a managed token must not look like one.
-    if value.starts_with("uao_") || value.starts_with("uar_") {
-        return Err(UaError::invalid("token value may not start with an OAuth token prefix"));
+    // OAuth tokens and session credentials are recognized by prefix; a
+    // managed token must not look like one.
+    if value.starts_with("uao_") || value.starts_with("uar_") || value.starts_with("uas_") {
+        return Err(UaError::invalid("token value may not start with an OAuth or session credential prefix"));
     }
     Ok(())
 }

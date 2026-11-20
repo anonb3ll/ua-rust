@@ -45,7 +45,7 @@ pub struct Config {
     /// Vault directories (relative to the vault) agents may write to.
     #[serde(deserialize_with = "string_or_list")]
     pub vault_write_dirs: Vec<String>,
-    /// Vault directory holding raw captures (the steward inbox).
+    /// Vault directory holding raw captures awaiting inbox ingest.
     pub vault_inbox_dir: String,
     /// Refuse a `vault_write` overwrite of an existing note without `expected_revision`.
     pub vault_require_revision: bool,
@@ -85,6 +85,13 @@ pub struct Config {
     /// lapsed leases, undelivered command notices). 0 turns the sweep off;
     /// claims still sweep their own node.
     pub node_wait_sweep_s: u64,
+    /// Mint session credentials (`uas_…`) for claimed ACP node items
+    /// (`POST /api/node/session_credential`). Read on every request, so
+    /// turning it off refuses every outstanding credential at once.
+    pub session_credentials_enabled: bool,
+    /// Hold real work from a node until its latest device acceptance run is
+    /// accepted (attested by an operator). Off by default.
+    pub node_require_acceptance: bool,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -95,6 +102,13 @@ pub struct Config {
     /// Prior scenes kept per board for `graph_canvas_history` and
     /// `graph_canvas_restore`; older revisions are dropped. 0 keeps none.
     pub graph_canvas_history_max: u32,
+    /// Client evidence events (`evidence_append`) one identity may append per
+    /// rolling hour. Past it the call is refused (`rate_limited`). Counted
+    /// from the ledger, so it holds across restarts.
+    pub evidence_append_max_per_hour: u32,
+    /// Serialized payload bytes one identity may append through
+    /// `evidence_append` per rolling hour (`rate_limited` past it).
+    pub evidence_append_max_bytes_per_hour: u64,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -118,6 +132,7 @@ pub struct Config {
     /// Empty means nobody is restricted; once set, an unlisted agent has no scope.
     pub agent_scopes: BTreeMap<String, String>,
     /// Identity label → default profile name. Unlisted identities get `developer`.
+    /// Legacy profile names are accepted and rewritten to the current name.
     pub profiles: BTreeMap<String, String>,
     /// Per-agent workspace overrides: label → root (or `"deny"`).
     pub agent_workspaces: BTreeMap<String, String>,
@@ -150,6 +165,7 @@ pub struct Config {
     #[serde(deserialize_with = "string_or_list")]
     pub oauth_identities: Vec<String>,
     /// Default profile for OAuth identities without an entry in `profiles`.
+    /// A legacy profile name is accepted and rewritten to the current name.
     pub oauth_profile: String,
     /// Access token lifetime in seconds.
     pub oauth_access_ttl_secs: u64,
@@ -360,9 +376,13 @@ impl Default for Config {
             node_max_per_agent: 8,
             node_queue_wait_s: 3600,
             node_wait_sweep_s: 60,
+            session_credentials_enabled: false,
+            node_require_acceptance: false,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
+            evidence_append_max_per_hour: 120,
+            evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
@@ -474,7 +494,28 @@ impl Config {
     }
 
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
-        Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized).map_err(Into::into)
+        let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
+        cfg.check_profiles()?;
+        Ok(cfg)
+    }
+
+    /// Refuse a profile no identity may be given (`acp-session`, which only a
+    /// verified session credential runs under) in `profiles` or
+    /// `oauth_profile`.
+    pub fn check_profiles(&self) -> anyhow::Result<()> {
+        let reserved = |name: &str| name.trim().parse::<crate::Profile>().is_ok_and(|p| !p.assignable());
+        if reserved(&self.oauth_profile) {
+            anyhow::bail!(
+                "oauth_profile = {:?}: that profile is reserved for session credentials and cannot be configured",
+                self.oauth_profile
+            );
+        }
+        if let Some((label, p)) = self.profiles.iter().find(|(_, p)| reserved(p)) {
+            anyhow::bail!(
+                "profiles.{label} = {p:?}: that profile is reserved for session credentials and cannot be configured"
+            );
+        }
+        Ok(())
     }
 
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {
@@ -504,6 +545,7 @@ impl Config {
         self.vault_path = self.vault_path.map(|p| expand_tilde(&p));
         self.read_roots = self.read_roots.iter().map(|p| expand_tilde(p)).collect();
         self.public_url = self.public_url.map(|u| u.trim().trim_end_matches('/').to_string());
+        self.canonicalize_profile_names();
         self.apply_oauth_profiles();
         self.policy_file = self.policy_file.map(|p| expand_tilde(&p));
         self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
@@ -522,6 +564,20 @@ impl Config {
     /// `dispatch_reaper_interval_s`.
     pub fn dispatch_reaper_interval(&self) -> u64 {
         self.dispatch_reaper_interval_s.unwrap_or_else(|| (self.dispatch_lease_seconds / 3).max(1))
+    }
+
+    /// Rewrite legacy profile names in `profiles` and `oauth_profile` to the
+    /// current names. Unknown names are left as written: they fall back to
+    /// `developer` wherever a profile is resolved, as before.
+    fn canonicalize_profile_names(&mut self) {
+        for p in self.profiles.values_mut() {
+            if let Some(name) = crate::Profile::canonical_name(p.trim()) {
+                *p = name.to_string();
+            }
+        }
+        if let Some(name) = crate::Profile::canonical_name(self.oauth_profile.trim()) {
+            self.oauth_profile = name.to_string();
+        }
     }
 
     /// Give every OAuth identity without an explicit `profiles` entry the
@@ -726,18 +782,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_session_credential_profile_cannot_be_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "[profiles]\nbuilder-1 = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("profiles.builder-1"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("oauth_profile"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"research\"\n[profiles]\nbuilder-1 = \"reviewer\"\n")
+            .unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_ok());
+    }
+
+    #[test]
     fn toml_layer_and_lists() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("c.toml");
         std::fs::write(
             &file,
-            "home = \"/data/ua\"\nvault_write_dirs = \"Inbox, Wiki\"\nagent_tokens = \"alpha:t1,beta:t2,gamma:t1\"\n[profiles]\nops = \"operator\"\n",
+            "home = \"/data/ua\"\nvault_write_dirs = \"Inbox, Wiki\"\nagent_tokens = \"alpha:t1,beta:t2,gamma:t1\"\noauth_profile = \"cloud-assistant\"\n[profiles]\nops = \"operator\"\nlead = \"chief-of-staff\"\n",
         )
         .unwrap();
         let cfg = Config::load_inner(Some(&file), false).unwrap();
         assert_eq!(cfg.home, PathBuf::from("/data/ua"));
         assert_eq!(cfg.vault_write_dirs, vec!["Inbox", "Wiki"]);
         assert_eq!(cfg.profiles.get("ops").map(String::as_str), Some("operator"));
+        assert_eq!(
+            cfg.profiles.get("lead").map(String::as_str),
+            Some("coordinator"),
+            "legacy name rewritten"
+        );
+        assert_eq!(cfg.oauth_profile, "remote-assistant", "legacy name rewritten");
         // t1 is shared by alpha and gamma: neither authenticates.
         let toks = cfg.static_tokens();
         assert_eq!(toks.len(), 1);

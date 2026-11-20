@@ -128,7 +128,7 @@ fn facts() -> Value {
         "harnesses": { "claude": { "bin": "claude", "path": "/usr/bin/claude", "version": "1.0", "env": "dropped" } },
         "worktree_roots": [{ "path": "/srv/work", "realpath": "/srv/work", "exists": true, "worktrees": 3 }],
         "repos": [{ "root": "/srv/work", "root_realpath": "/srv/work", "name": "app", "path": "/srv/work/app", "realpath": "/srv/work/app" }],
-        "surfaces": { "hermes_profiles": ["default"], "kanban_assignees": [] },
+        "surfaces": { "profiles": ["default"], "assignees": [], "Bad-Key": ["x"], "queues": "not-a-list" },
         "node_features": ["acp_followups"],
         "code_sha": SHA,
     })
@@ -150,7 +150,7 @@ async fn register_heartbeat_and_list() {
     assert_eq!(out["node"], "node-a");
     assert_eq!(out["agent"], "builder-1", "the owner is the verified caller");
     assert_eq!(out["first_registration"], true);
-    assert_eq!(out["hub_features"], json!(["node_code_sha"]));
+    assert_eq!(out["hub_features"], json!(["node_code_sha", "acp_session_mcp"]));
     assert_eq!(out["dropped_fact_keys"], json!([]));
     assert_eq!(count_events(&hub, "agent.node.register"), 1);
 
@@ -169,6 +169,11 @@ async fn register_heartbeat_and_list() {
     );
     assert!(row["harnesses"]["claude"].get("env").is_none(), "unknown harness fields are dropped");
     assert_eq!(row["repos"][0]["name"], "app");
+    assert_eq!(
+        row["surfaces"],
+        json!({ "profiles": ["default"], "assignees": [] }),
+        "a bad surface key or a non-list value is dropped"
+    );
 
     // Heartbeats move the row only: no ledger event.
     let beat = call(&reg, &hub, &me, "node_heartbeat", json!({ "node": "node-a", "running": null })).await;
@@ -178,10 +183,10 @@ async fn register_heartbeat_and_list() {
     assert_eq!(count_events(&hub, "agent.node.heartbeat"), 0);
 
     // A heartbeat of advisory keys refreshes them and keeps the rest.
-    let refresh = json!({ "surfaces": { "hermes_profiles": ["default", "ops"] }, "code_sha": "not-a-sha" });
+    let refresh = json!({ "surfaces": { "profiles": ["default", "ops"] }, "code_sha": "not-a-sha" });
     call(&reg, &hub, &me, "node_heartbeat", json!({ "node": "node-a", "facts": refresh })).await;
     let row = listed(&reg, &hub, "node-a").await;
-    assert_eq!(row["surfaces"]["hermes_profiles"], json!(["default", "ops"]));
+    assert_eq!(row["surfaces"], json!({ "profiles": ["default", "ops"] }));
     assert_eq!(row["backends"], json!(["claude", "codex"]), "registration facts are kept");
     assert_eq!(row["code_sha"], Value::Null, "a malformed code_sha clears the stored one");
 
@@ -194,7 +199,7 @@ async fn register_heartbeat_and_list() {
     let row = listed(&reg, &hub, "node-a").await;
     assert_eq!(row["backends"], json!(["claude", "codex"]));
     assert_eq!(row["worktree_roots"], json!(["/srv/work"]));
-    assert_eq!(row["surfaces"]["hermes_profiles"], json!([]), "the advisory key was applied");
+    assert_eq!(row["surfaces"], json!({}), "the advisory key was applied");
     assert_eq!(count_events(&hub, "agent.node.register"), 1);
 
     // An identical re-registration (a node restart) is not ledgered.
@@ -576,4 +581,26 @@ async fn other_viewers_see_a_summary() {
             assert!(!text.contains(leak), "{leak} leaked to {}: {text}", viewer.label);
         }
     }
+}
+
+#[tokio::test]
+async fn surfaces_are_a_bounded_map() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let me = agent("builder-1");
+    let mut surfaces = serde_json::Map::new();
+    for i in 0..20 {
+        surfaces.insert(format!("k{i:02}"), json!([format!("n{i}")]));
+    }
+    surfaces.insert("a".repeat(41), json!(["too-long-key"]));
+    let names: Vec<String> = (0..60).map(|i| format!("name-{i}")).collect();
+    surfaces.insert("k00".into(), json!(names));
+    surfaces.insert("k01".into(), json!(["ok", "x".repeat(65), 7]));
+    call(&reg, &hub, &me, "node_register", json!({ "node": "node-s", "facts": { "surfaces": surfaces } }))
+        .await;
+    let row = listed(&reg, &hub, "node-s").await;
+    let got = row["surfaces"].as_object().unwrap();
+    assert_eq!(got.len(), 16, "at most 16 keys");
+    assert!(got.keys().all(|k| k.len() <= 40));
+    assert_eq!(got["k00"].as_array().unwrap().len(), 50, "at most 50 names per key");
+    assert_eq!(got["k01"], json!(["ok"]), "long or non-string names are skipped");
 }

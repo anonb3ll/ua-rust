@@ -12,12 +12,12 @@ bind = "127.0.0.1:8765"
 enforce_auth = true
 # Host headers /api and /ui answer (DNS-rebinding guard). The host of
 # public_url is always allowed too. List any other name the hub is reached
-# by, e.g. a tailnet name in front of `tailscale serve`:
+# by, e.g. a private-network name in front of a TLS terminator:
 allowed_hosts = ["localhost", "127.0.0.1", "::1"]
-# allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.example-tailnet.ts.net"]
+# allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.example.com"]
 # Public base URL. Use https:// for anything but loopback: browsers drop the
 # Secure session cookie and refuse passkeys on plain http to other hosts.
-# public_url = "https://hub.example-tailnet.ts.net"
+# public_url = "https://hub.example.com"
 
 # Who counts as a human operator. Only humans resolve approvals.
 human_identities = ["operator"]
@@ -28,12 +28,25 @@ human_identities = ["operator"]
 node_max_per_agent = 8
 # node_queue_wait_s = 3600   # how long work waits for an offline node (60-604800)
 # node_wait_sweep_s = 60     # node queue sweep interval under `ua serve`; 0 = off
+# Mint short-lived session credentials (uas_...) for claimed ACP node items, so
+# the session reaches /mcp with a small read/report tool set. Off by default;
+# turning it off refuses every outstanding credential at once.
+# session_credentials_enabled = false
+# Hold real work from a node until an operator has attested its device
+# acceptance run (coordination_manage node_acceptance_start / _attest).
+# node_require_acceptance = false
 
 # Planning canvas (graph_canvas_write): new boards per agent, boards in all,
 # and prior scenes kept per board for graph_canvas_history/restore.
 # graph_canvas_max_boards_per_agent = 50
 # graph_canvas_max_boards = 1000
 # graph_canvas_history_max = 20
+
+# Client evidence (evidence_append, POST /api/evidence) per identity per
+# rolling hour: events and serialized payload bytes. Past either the append
+# is refused with rate_limited.
+# evidence_append_max_per_hour = 120
+# evidence_append_max_bytes_per_hour = 2097152
 
 # Tools that always need a one-time human approval.
 approval_tools = ["git_merge_task"]
@@ -94,10 +107,13 @@ autonomy_max_cost_cents = 1000.0
 # this file.
 # relay_denylist = ["project[- ]codename"]
 
-# Default profile per identity. Unlisted identities get "developer".
+# Default profile per identity. Unlisted identities get "developer". Profiles:
+# coordinator, lead, developer, reviewer, operator, research, acp-session,
+# remote-vault-curator, remote-assistant, public (see docs/policy.md).
 [profiles]
 operator = "operator"
-reviewer-1 = "cto"
+lead-1 = "lead"
+reviewer-1 = "reviewer"
 
 # Per-agent workspace roots, or "deny".
 [agent_workspaces]
@@ -113,7 +129,7 @@ reviewer-1 = "cto"
 # url = "https://docs.example.com/mcp"
 # address_scope = "public"            # public | private | loopback
 # secrets = [{ secret = "docs-token", inject = "bearer" }]
-# read_profiles = ["developer", "steward"]
+# read_profiles = ["developer", "reviewer"]
 # timeout_s = 30
 # review_expires_at = "2027-03-01"
 #

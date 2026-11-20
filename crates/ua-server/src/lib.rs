@@ -12,6 +12,7 @@ pub mod login;
 pub mod mcp;
 pub mod node_api;
 pub mod oauth;
+pub mod platform_api;
 pub mod ui;
 
 use std::sync::Arc;
@@ -42,6 +43,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(login::routes())
         .merge(compat_api::routes())
         .merge(node_api::routes())
+        .merge(platform_api::routes())
         .merge(ui::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), guard::protect))
