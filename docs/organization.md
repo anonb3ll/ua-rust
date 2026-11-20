@@ -127,17 +127,21 @@ of a label is not treated as confidential.
 **Reserved labels.** Every label named in hub configuration —
 `human_identities`, `lifecycle_operators`, static `UA_AGENT_TOKENS` labels and
 the `[profiles]` map — is **reserved**. A reserved label's row may be created
-only in `'default'`, and only by a hub owner or by that label's own verified
-credential resolving to `'default'` (so a static-token or `[profiles]` agent's
-first `session_start` or heartbeat still creates its own row, exactly as
-today). Every other writer — a tenant admin, an unverified named caller,
-`touch_agent` acting for anyone else — refuses it in any letter case. A tenant
+only in `'default'`, and only by a hub owner, by that label's own verified
+credential resolving to `'default'`, or by a local stdio or CLI caller on the
+hub host (which already carries hub-host trust, see Resolution). So a
+static-token, `[profiles]` or local agent's first `session_start` or heartbeat
+still creates its own row, exactly as today. Every other writer — a tenant
+admin, an unverified remote caller, `touch_agent` acting for anyone else —
+refuses it in any letter case. A tenant
 admin therefore cannot pre-create a row for a label the hub's own config will
 later trust, and the config's trust never lands in a tenant. Reservation is
-checked at write time, so a label added to the config after a tenant already
-holds it is reported `MISCONFIGURED` by `system_doctor` and refused at startup
-until the operator resolves it; the `'default'` binding of static tokens and
-`LifecycleOperator` already keeps such a label from carrying hub authority.
+checked at write time, so a label added to the config after an organization
+other than `'default'` already holds it is reported `MISCONFIGURED` by
+`system_doctor`, and the hub keeps starting but does not grant that label any
+configured authority (static token, lifecycle operator, hub owner) until the
+operator resolves it — the same treatment as Bootstrap's unadopted row. Rows in
+`'default'` are not a conflict; that is where reserved labels belong.
 
 ## People
 
@@ -632,7 +636,7 @@ ALTER TABLE approvals ADD COLUMN team_id TEXT;
 ALTER TABLE approvals ADD COLUMN routing_basis TEXT NOT NULL DEFAULT 'hub'
     CHECK (routing_basis IN ('hub','task_team','named_team','org'));
 ALTER TABLE approvals ADD COLUMN required_authority TEXT NOT NULL DEFAULT 'hub_owner'
-    CHECK (required_authority IN ('hub_owner','org_admin','team_lead'));
+    CHECK (required_authority IN ('hub_owner','org_admin','team_lead','agent_owner'));
 ALTER TABLE approvals ADD COLUMN two_person INTEGER NOT NULL DEFAULT 0
     CHECK (two_person IN (0,1));
 ALTER TABLE approvals ADD COLUMN escalated_at TEXT;
@@ -670,6 +674,7 @@ classification and the payload, and never lowered afterwards:
 | A hub-scoped tool | `hub_owner` |
 | A team-routable tool routed to a team (below) — and, for a spec commit or proposal apply, only when the change is narrowing | `team_lead` |
 | A grant of an approving role, or a credential for another human | `org_admin` with `two_person = 1` (`hub_owner` when [Credentials for people](#credentials-for-people) says so) |
+| A root credential for an agent with an `owner_user_id`, requested by anyone but that owner | `agent_owner` |
 | Every other tenant-scoped gated call | `org_admin` |
 
 **Routing team.** Only for team-routable tools; every other tool routes to
@@ -710,7 +715,11 @@ evaluated at resolution time against current rows:
        still holds `team_lead` or above in the same organization.
 
      If the re-check in (b) fails, only (a) applies.
-4. `auditor` and `member` never approve.
+   - `agent_owner`: the caller is the user in the target agent's current
+     `owner_user_id`, whatever their role. Nobody else qualifies, hub owners
+     included; if the owner link is cleared while the approval is pending, the
+     approval falls back to `org_admin`.
+4. Apart from `agent_owner`, `auditor` and `member` never approve.
 
 `deny` follows the same eligibility, plus the requester. `revoke` requires the
 same organization and either approve eligibility or being the requester.
@@ -810,10 +819,18 @@ Writer rules the schema cannot express, each with an acceptance test:
 - **An owned agent's credentials belong to its owner.** Claiming an agent
   revokes every live credential for it that someone other than the claiming
   user issued (agent tokens, managed tokens, OAuth grants, node session
-  credentials). While `owner_user_id` is set, issuing any new credential for
-  that agent needs the owner user's own approval; an `org_admin` cannot mint
-  one alone. Otherwise an admin could take over an agent its owner had
-  enabled for private consolidation and read that person's private notes.
+  credentials). While `owner_user_id` is set, a new **root** credential for
+  that agent — `agent_token_issue`, `agent_token_rotate`, a managed token, an
+  OAuth grant — is issued in one of two ways: the owner issues it themselves
+  (the owner may issue and rotate credentials for their own agent whatever
+  their role, with no second approval, since the owner is the person being
+  protected), or anyone else requests it and it parks with
+  `required_authority = 'agent_owner'`, which only that owner can approve. An
+  `org_admin` cannot mint one alone. Node session credentials are not root
+  credentials: the agent's own node mints them per dispatch from a credential
+  the agent already holds, so they need no extra approval. Otherwise an admin
+  could take over an agent its owner had enabled for private consolidation and
+  read that person's private notes.
 - `org_memberships.consolidate_private` is changed only by the member
   themselves (default off); see `docs/memory.md`.
 - `offices.profiles` and `agents.default_profile` must be within the
@@ -1191,11 +1208,15 @@ CREATE TABLE IF NOT EXISTS import_finalized (
 - `ua serve` refuses to start on a store with an import recorded but not
   finalized, so the hub cannot append `hash_v = 2` rows ahead of a catch-up.
 - **Stores imported before this design** already hold `import_runs` rows and
-  hub-written events. The `ua-import` part of `organization.v1` backfills
-  `import_finalized` with a legacy marker (`event_ulid` NULL) for every
+  hub-written events. `import_finalized` and `import_org_map` are created by a
+  `ua-store` procedure part, `organization.v1.import-marker`, which both
+  `ua serve` (`Hub::open`) and `ua import` apply, so the check `ua serve` makes
+  never depends on a part only the importer applies. When `import_runs` exists,
+  that part backfills a legacy marker (`event_ulid` NULL) for every
   `source_hash` already recorded, so those hubs keep starting and are treated
   as finalized; their chain is already `hash_v = 1` throughout and verifies as
-  today.
+  today. On a store never imported, `import_runs` does not exist and nothing is
+  checked.
 
 `verify()` therefore always sees the order it requires. The migration manifest
 compare records the mapping in its fingerprint.
@@ -1290,7 +1311,8 @@ People and authority
    `ua org adopt-owner` revokes that row's credentials before adopting it.
 10. **Authz guard.** The test fails on `is_human(`, `is_lifecycle_operator(`, a
     `fn is_human` or a profile match used as authority outside `authz`, in any
-    workspace crate other than `ua-org` (including `ua-memory`); for each row
+    workspace crate other than `ua-org` (including `ua-memory`), except the
+    `ua-core` primitive definitions and `ua-core`'s own unit tests; for each row
     of the authority table, a `member` and an `auditor` are refused, and a
     caller in B is refused on A's target (for example minting a token for A's
     agent); a lifecycle operator whose label is a `'default'` agent or a hub
@@ -1331,15 +1353,22 @@ People and authority
     label is in `human_identities`, `lifecycle_operators`, a static token or
     the `[profiles]` map, in any case; a hub owner can, only in `'default'`; a
     static-token agent's own first `session_start` creates its row in
-    `'default'` as today; a label added to the config while a tenant holds it
-    makes `system_doctor` report `MISCONFIGURED` and startup refuse.
+    `'default'` as today, and so does a local stdio caller's; a label added to
+    the config while a non-default organization holds it makes `system_doctor`
+    report `MISCONFIGURED`, the hub still starts, and the label gets none of
+    its configured authority until resolved; a reserved label already in
+    `'default'` raises nothing.
 17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` to
     another user, and can clear it; the named user can set it by claiming the
     agent or accepting a request; only the member can turn
     `consolidate_private` on or off; claiming an agent revokes credentials for
     it that another person issued, including one minted before the claim; with
-    an owner set, an `org_admin` cannot issue an agent token, managed token,
-    OAuth grant or node session credential for it without the owner's approval.
+    an owner set, an `org_admin` cannot issue or rotate an agent token, or
+    issue a managed token or OAuth grant for it, without the owner's approval;
+    such a request parks as `agent_owner`, the owner (a plain `member`) can
+    approve it, an `org_admin` and a hub owner cannot; the owner can issue and
+    rotate their own agent's credentials directly; the agent's node still mints
+    per-dispatch session credentials with no approval.
 18. **Resolution.** For each credential row of the resolution table, the caller
     gets the stated organization — including a static token, which resolves to
     `'default'` even if a same-named agent row exists elsewhere, and an
