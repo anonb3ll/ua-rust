@@ -4,6 +4,13 @@
 //! canonical arguments, same requester, approved by a different human within
 //! the pass TTL), fails with a recorded denial, or parks as `pending`. A retry
 //! of an identical pending request reuses the existing row.
+//!
+//! An **ad-hoc** request ([`request_ad_hoc`], `ad_hoc = 1`) asks a human to
+//! sign off on a call of a tool that nothing gates (`POST
+//! /api/approvals/request`). It is resolved like any request (a verified
+//! human other than the requester approves), but an approved ad-hoc row is a
+//! standalone sign-off, not a pass: [`gate`] never consumes, reuses or
+//! matches one, and it does not expire with the pass TTL.
 
 use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
@@ -33,6 +40,14 @@ CREATE TABLE IF NOT EXISTS approvals (
     run_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_lookup ON approvals(tool, status, requested_by);
+",
+};
+
+/// Ad-hoc sign-off requests: see the module docs.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "approvals.v2",
+    sql: "
+ALTER TABLE approvals ADD COLUMN ad_hoc INTEGER NOT NULL DEFAULT 0;
 ",
 };
 
@@ -75,7 +90,7 @@ pub fn gate(
     let denied: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'denied' ORDER BY id DESC LIMIT 1",
+             AND status = 'denied' AND ad_hoc = 0 ORDER BY id DESC LIMIT 1",
             params![tool, canon, caller.label],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -88,7 +103,7 @@ pub fn gate(
     let passes: Vec<(i64, Option<String>)> = {
         let mut stmt = tx.prepare(
             "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'approved' ORDER BY id ASC",
+             AND status = 'approved' AND ad_hoc = 0 ORDER BY id ASC",
         )?;
         stmt.query_map(params![tool, canon, caller.label], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?
@@ -117,7 +132,7 @@ pub fn gate(
     let pending: Option<i64> = tx
         .query_row(
             "SELECT id FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'pending' ORDER BY id ASC LIMIT 1",
+             AND status = 'pending' AND ad_hoc = 0 ORDER BY id ASC LIMIT 1",
             params![tool, canon, caller.label],
             |r| r.get(0),
         )
@@ -142,6 +157,55 @@ pub fn gate(
     Ok(GateOutcome::Pending { approval_id })
 }
 
+/// Queue an ad-hoc sign-off request for a call nothing gates, inside the
+/// caller's write transaction. Nothing runs and nothing is consumed: a
+/// recorded denial of the identical request answers `Denied`, an approved
+/// identical sign-off answers `Pass` (left as it is), an identical pending
+/// request is reused, and otherwise a new `pending` row with `ad_hoc = 1` is
+/// parked and ledgered.
+pub fn request_ad_hoc(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+) -> UaResult<GateOutcome> {
+    let canon = canonical_payload(args);
+    let latest: Option<(i64, String, Option<String>)> = tx
+        .query_row(
+            "SELECT id, status, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+             AND ad_hoc = 1 AND status IN ('pending', 'approved', 'denied') ORDER BY id DESC LIMIT 1",
+            params![tool, canon, caller.label],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match latest {
+        Some((approval_id, status, _)) if status == "pending" => {
+            return Ok(GateOutcome::Pending { approval_id });
+        }
+        Some((approval_id, status, _)) if status == "approved" => {
+            return Ok(GateOutcome::Pass { approval_id });
+        }
+        Some((approval_id, _, reason)) => return Ok(GateOutcome::Denied { approval_id, reason }),
+        None => {}
+    }
+    let now = ua_core::time::now();
+    tx.execute(
+        "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at, ad_hoc) \
+         VALUES (?1, ?2, ?3, 'pending', ?4, ?4, 1)",
+        params![tool, canon, caller.label, now],
+    )?;
+    let approval_id = tx.last_insert_rowid();
+    ledger::append(
+        tx,
+        EventInput::new(
+            "agent.approval.requested",
+            json!({ "approval_id": approval_id, "tool": tool, "requested_by": caller.label, "ad_hoc": true }),
+        )
+        .by(caller.label.clone()),
+    )?;
+    Ok(GateOutcome::Pending { approval_id })
+}
+
 /// One approval row as returned to clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalRow {
@@ -156,6 +220,8 @@ pub struct ApprovalRow {
     pub updated_at: String,
     pub resolved_at: Option<String>,
     pub run_id: Option<String>,
+    /// A standalone sign-off for a call nothing gates; never consumed.
+    pub ad_hoc: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
@@ -174,6 +240,7 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
         updated_at: r.get("updated_at")?,
         resolved_at: r.get("resolved_at")?,
         run_id: r.get("run_id")?,
+        ad_hoc: r.get::<_, i64>("ad_hoc")? != 0,
         expires_at: None,
     })
 }
@@ -227,8 +294,12 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
         };
         let mut pending = fetch("pending")?;
         pending.truncate(limit);
+        // Approved ad-hoc rows are sign-offs, not passes: listed apart, with
+        // no expiry.
+        let (mut ad_hoc, passes): (Vec<_>, Vec<_>) = fetch("approved")?.into_iter().partition(|a| a.ad_hoc);
+        ad_hoc.truncate(limit);
         let (mut live, mut expired): (Vec<_>, Vec<_>) =
-            fetch("approved")?.into_iter().partition(|a| !pass_expired(&cfg, a.resolved_at.as_deref()));
+            passes.into_iter().partition(|a| !pass_expired(&cfg, a.resolved_at.as_deref()));
         let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
         for a in live.iter_mut().chain(expired.iter_mut()) {
             a.expires_at = a
@@ -249,6 +320,7 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
             "pending": pending,
             "approved_unconsumed": live,
             "expired_passes": expired,
+            "ad_hoc_approved": ad_hoc,
             "gated_tools": cfg.approval_tools,
             "pass_ttl_hours": cfg.approval_pass_ttl_hours,
         });
@@ -324,7 +396,10 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             tx,
             EventInput::new(
                 "agent.approval.resolved",
-                json!({ "approval_id": row.id, "tool": row.tool, "decision": args.decision, "resolved_by": resolver }),
+                json!({
+                    "approval_id": row.id, "tool": row.tool, "decision": args.decision, "resolved_by": resolver,
+                    "ad_hoc": row.ad_hoc,
+                }),
             )
             .by(caller.label.clone()),
         )?;
@@ -336,7 +411,8 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "approval_pending",
-            "List queued approval requests oldest-first, split into pending, live one-shot passes and expired passes.",
+            "List queued approval requests oldest-first, split into pending, live one-shot passes, expired passes \
+             and approved ad-hoc sign-offs (ad_hoc: true rows for calls nothing gates; never consumed).",
             |ctx: ToolCtx, a: PendingArgs| blocking(move || list_pending(&ctx, a)),
         )
         .family("approvals")
@@ -350,4 +426,52 @@ pub fn register(r: &mut Registry) {
         )
         .family("approvals"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use ua_core::identity::Transport;
+    use ua_core::{ActorKind, Profile};
+
+    use super::*;
+
+    #[test]
+    fn the_gate_never_consumes_an_ad_hoc_sign_off() {
+        let cfg = Config::for_home(std::env::temp_dir());
+        let hub = crate::Hub::in_memory(cfg.clone()).unwrap();
+        let who = Caller {
+            label: "builder-1".into(),
+            kind: ActorKind::Agent,
+            profile: Profile::Developer,
+            enforce_profile: true,
+            session_key: None,
+            transport: Transport::Http,
+        };
+        let args = json!({ "id": 1, "append_note": "x" });
+        let (c, a) = (who.clone(), args.clone());
+        let ad_hoc = hub.db().write(move |tx| request_ad_hoc(tx, &c, "task_update", &a)).unwrap();
+        let GateOutcome::Pending { approval_id } = ad_hoc else { panic!("{ad_hoc:?}") };
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2 WHERE id = ?1",
+                    params![approval_id, ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // Were the tool gated later, the identical call parks its own request
+        // instead of consuming the sign-off.
+        let (c, a, cf) = (who.clone(), args.clone(), cfg.clone());
+        let out = hub.db().write(move |tx| gate(tx, &cf, &c, "task_update", &a)).unwrap();
+        let GateOutcome::Pending { approval_id: parked } = out else { panic!("{out:?}") };
+        assert_ne!(parked, approval_id);
+        let row = hub.db().read(|c| get(c, approval_id)).unwrap();
+        assert_eq!((row.status.as_str(), row.ad_hoc), ("approved", true));
+        assert!(!hub.db().read(|c| get(c, parked)).unwrap().ad_hoc);
+        // A repeated ad-hoc request reports the sign-off, unconsumed.
+        let out = hub.db().write(move |tx| request_ad_hoc(tx, &who, "task_update", &args)).unwrap();
+        assert_eq!(out, GateOutcome::Pass { approval_id });
+        assert_eq!(hub.db().read(|c| get(c, approval_id)).unwrap().status, "approved");
+    }
 }

@@ -11,7 +11,7 @@ disk).
 
 | Page | Path | What it shows and does |
 |---|---|---|
-| Inbox | `/ui/inbox` | Pending approvals with approve, deny and revoke; live one-shot passes; expired passes. |
+| Inbox | `/ui/inbox` | Pending approvals with approve, deny and revoke (an ad-hoc sign-off request is marked as such); live one-shot passes; expired passes. |
 | Work | `/ui/work` | Task board grouped by status, filtered by project, priority and search; a form to create a task. |
 | Task | `/ui/tasks/{id}` | Detail with notes, comments and dependencies; update fields, append a note, comment, add or remove a dependency. |
 | Plans | `/ui/plans`, `/ui/plans/{id}` | Plans and delegations filtered by status; a plan's steps, next actionable step and checkpoint count. |
@@ -82,7 +82,7 @@ routes with the same request and response shapes:
 | `POST /api/action/task` | `task_update` |
 | `POST /api/action/approval` | `approval_resolve` (verified human only) |
 | `GET /api/approvals`, `GET /api/approvals/{id}` | `approval_pending`, one approval row |
-| `POST /api/approvals/request` | the approval gate, request only: the same grant, profile, policy and prod-action checks as a call, and the payload the tool's own gate binds (a secret is never stored); `409` for a tool nothing gates and for one that binds its approval when called (`managed_secret_delete`, dispatch and node work, MCP registrations) |
+| `POST /api/approvals/request` | the approval gate, request only: the same grant, profile, policy and prod-action checks as a call, and the payload the tool's own gate binds (a secret is never stored). A gated tool gets a one-time pass; any other tool an ad-hoc sign-off that nothing consumes (see [sdk.md](sdk.md)); `409` for a tool that binds its approval when called (`managed_secret_delete`, dispatch and node work, MCP registrations) |
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
 | `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |

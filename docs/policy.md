@@ -32,6 +32,30 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+### Requesting an approval ahead of a call
+
+`POST /api/approvals/request` runs steps 1-3 above for the named tool and
+its arguments (a refusal there is the same `403` a call would get), then
+queues a request without running anything. It binds the payload the tool's
+own gate would bind (its `gate_payload` projection, so secrets are never
+stored), under the verified caller as `requested_by`, and is ledgered.
+
+- When step 4 would gate the call (always gated, `approval_tools`, or a
+  `require_approval` match), the approved request is an ordinary one-time
+  pass: the requester's next identical call consumes it.
+- Otherwise the request is **ad hoc** (`ad_hoc: true`): approval records a
+  standalone human sign-off that nothing consumes or expires. The approval
+  gate ignores ad-hoc rows, so a sign-off never becomes a pass, even if the
+  tool is gated later. Ad-hoc sign-offs are listed under `ad_hoc_approved`
+  by `approval_pending`.
+- A tool that evaluates its gate in its handler (dispatch, node work,
+  `managed_secret_delete`, MCP server registration) cannot be requested
+  ahead (`409`); call it.
+
+Resolution is the same for both kinds: a verified human other than the
+requester approves. One requester may hold at most 20 open requests, and at
+most 20 open ad-hoc ones (`429` past either).
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client

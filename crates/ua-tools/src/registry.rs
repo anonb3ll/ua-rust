@@ -234,10 +234,12 @@ impl Registry {
     /// call's own gate would bind (the tool's `gate_payload` projection, so a
     /// secret value is never parked). Nothing runs and no call is reserved.
     ///
-    /// A tool that evaluates its gate in its handler binds values only the
-    /// handler resolves, so it cannot be requested ahead and answers
-    /// [`ApprovalRequest::GatesInHandler`]; a call no rule gates answers
-    /// [`ApprovalRequest::NotGated`].
+    /// A call some rule gates answers [`ApprovalRequest::Gated`]: its later
+    /// identical call consumes the pass. A call nothing gates answers
+    /// [`ApprovalRequest::AdHoc`]: a standalone human sign-off that nothing
+    /// consumes. A tool that evaluates its gate in its handler binds values
+    /// only the handler resolves, so it cannot be requested ahead and
+    /// answers [`ApprovalRequest::GatesInHandler`].
     pub async fn approval_request(
         &self,
         hub: &Hub,
@@ -249,17 +251,15 @@ impl Registry {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
         let Admitted { args, policy_gated, .. } = self.admit(hub, caller, name, args, false).await?;
-        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if !gated {
-            return Ok(ApprovalRequest::NotGated);
-        }
         if def.gates_in_handler {
             return Ok(ApprovalRequest::GatesInHandler);
         }
-        Ok(ApprovalRequest::Payload(match def.gate_payload {
+        let payload = match def.gate_payload {
             Some(f) => f(hub.cfg(), &args),
             None => args,
-        }))
+        };
+        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
+        Ok(if gated { ApprovalRequest::Gated(payload) } else { ApprovalRequest::AdHoc(payload) })
     }
 
     /// Every check before the approval gate: the session grant, the profile
@@ -420,10 +420,12 @@ struct Admitted {
 /// What [`Registry::approval_request`] found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalRequest {
-    /// The approval would bind this payload.
-    Payload(Value),
-    /// No rule gates the call, so there is nothing to approve.
-    NotGated,
+    /// A rule gates the call; the approval binds this payload and the later
+    /// identical call consumes it.
+    Gated(Value),
+    /// Nothing gates the call; the approval is an ad-hoc sign-off on this
+    /// payload that nothing consumes.
+    AdHoc(Value),
     /// The tool evaluates its gate in its handler on values it resolves;
     /// call the tool itself to park its approval.
     GatesInHandler,
