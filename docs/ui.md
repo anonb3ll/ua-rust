@@ -19,7 +19,7 @@ disk).
 | Agents | `/ui/agents` | The roster with liveness and live sessions. |
 | Messages | `/ui/messages` | Messages, filtered by recipient and unread. |
 | Memory | `/ui/memory`, `/ui/memory/{id}` | Search memory notes and read one. |
-| Activity | `/ui/activity` | The event ledger as a live feed (server-sent events), filtered by channel prefix, plus the hash-chain check from `event_log_verify`. |
+| Activity | `/ui/activity` | The event ledger as a live feed (server-sent events), filtered by channel prefix. The hash-chain check (`event_log_verify`, which recomputes every entry) runs only when asked: the Verify the hash chain button (`?verify=1`). |
 
 Every read and write runs a registered tool through the same call wrapper as
 MCP and the JSON API, as the request's caller with transport `ui`. Profiles,
@@ -29,6 +29,17 @@ approval. A tool the caller's profile does not allow shows as an error in
 that section rather than failing the page. Approve, deny and revoke run
 `approval_resolve`, which agent profiles do not expose and which refuses
 self-approval, so an agent token cannot clear its own gate through the UI.
+
+A page is composed from several reads (the Work board makes six
+`task_list` calls). Those reads run inside `page_reads`
+(`ua_tools::registry`): every check applies as above, but a read-only tool
+that succeeds leaves no `tool_calls` row, so viewing a page writes nothing
+to the database. Refusals still reach the ledger, a failed read is still
+recorded, a policy file's rate-limit reservation is still taken, and any
+tool that is not read-only (a write, or a read with a side effect such as
+`session_list`, which reaps stale sessions) records as usual. `GET
+/api/board` composes its answer the same way. MCP and `/api/tools/{name}`
+calls are never inside this scope: each records one row.
 
 The live feeds (`/ui/activity/stream`, and `/api/events/stream` for JSON
 clients) open with one `event_log_query` call as the caller, so a profile or
@@ -65,7 +76,14 @@ machines.
   host is refused with `403`.
 - **Headers.** UI responses carry a Content-Security-Policy with no inline
   script or style and no framing, plus `X-Content-Type-Options: nosniff`
-  and `X-Frame-Options: DENY`.
+  and `X-Frame-Options: DENY`. The sign-in, passkey and OAuth consent pages
+  outside `/ui` have their own policy (`default-src 'none'`, script and
+  style from the hub only, no `'unsafe-inline'`); their script and style are
+  the files `/login/assets/login.js` and `/login/assets/page.css`.
+- **Host check.** `/ui` and `/api` refuse a request naming a host outside
+  `allowed_hosts` and the `public_url` host. The names checked are the
+  `Host` header and, for HTTP/2 (which may send no `Host`), the
+  `:authority`; every name present must be allowed.
 - htmx is configured with `allowEval` and `allowScriptTags` off and
   `selfRequestsOnly` on.
 
@@ -83,7 +101,7 @@ routes with the same request and response shapes:
 | `POST /api/approvals/request` | the approval gate, request only |
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
-| `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |
+| `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` (page reads: no `tool_calls` rows) |
 | `GET /api/nodes` | `node_list` |
 | `POST /api/node/register`, `POST /api/node/heartbeat` | `node_register`, `node_heartbeat` (agent token only) |
 | `GET /api/runs`, `GET /api/runs/{run_id}` | `run_list`, `run_get` |

@@ -61,6 +61,10 @@ ua serve                        # http://127.0.0.1:8765 (/mcp, /api, /ui)
 ua login-link operator          # on the hub host, at a terminal: a browser sign-in link
 ```
 
+`ua serve` stops cleanly on Ctrl-C (SIGINT) or SIGTERM: open requests and the
+background loops get 10 seconds to finish, event streams end, and the WAL is
+checkpointed into the database file.
+
 Auth is on by default. Agents connect over MCP with their bearer token, or
 over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
 2.1 when `oauth_enabled` is set; see [docs/auth.md](docs/auth.md).
