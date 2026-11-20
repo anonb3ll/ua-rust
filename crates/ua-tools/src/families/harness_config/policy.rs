@@ -13,8 +13,10 @@
 //! - MCP URLs: no user info, no fragment, no credential-looking query
 //!   parameter or path segment, and `https` unless the host is loopback;
 //! - hidden text: no invisible, bidi or tag code points in rules or skills,
-//!   and no permission-bearing front matter (`allowed-tools`, `hooks`,
-//!   `permissions`) in a skill body;
+//!   and no permission-bearing front matter (`allowed-tools`, `tools`,
+//!   `hooks`, `permissions`, `permissionMode`, ...: [`PERMISSION_KEYS`]) in a
+//!   skill body or in any rules text, since a rules surface may be a host's
+//!   command or subagent file (`.claude/commands/*.md`, `.claude/agents/*.md`);
 //! - surfaces: at most [`MAX_SURFACES`]; `kind` is `rules` or `mcp`, and a
 //!   default surface keeps its default kind; paths are relative with no empty,
 //!   `.` or `..` segment, never a git directory, hooks, `.mcp.json` or host
@@ -24,12 +26,11 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 use ua_core::{UaError, UaResult};
 
 use super::render::{self, Bundle, DEFAULT_SURFACES};
-use crate::families::skill_registry::frontmatter;
-use crate::families::skills::{hidden_chars, permission_keys};
+use crate::families::skills::{PERMISSION_KEYS, hidden_chars, permission_keys};
 
 /// Surfaces one bundle may declare.
 pub const MAX_SURFACES: usize = 16;
@@ -210,12 +211,43 @@ pub fn description_refusal(d: &str) -> Option<&'static str> {
     }
 }
 
+/// Permission-bearing keys ([`PERMISSION_KEYS`]) in the front matter at the
+/// top of `text`, read as leniently as a host might: a first line `---`
+/// (after an optional BOM, LF or CRLF) opens it, and a `---` or `...` line,
+/// or the end of the text, closes it. The block is parsed as YAML and also
+/// scanned line by line for top-level keys, so a block that does not parse,
+/// or that a strict reader would not take for front matter, is still checked.
+pub fn front_matter_permission_keys(text: &str) -> Vec<String> {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    if lines.next().map(str::trim_end) != Some("---") {
+        return Vec::new();
+    }
+    let block: Vec<&str> = lines.take_while(|l| !matches!(l.trim_end(), "---" | "...")).collect();
+    let mut keys = BTreeSet::new();
+    if let Ok(Value::Object(meta)) = serde_saphyr::from_str::<Value>(&block.join("\n")) {
+        keys.extend(permission_keys(&meta));
+    }
+    for line in &block {
+        // Nested values, list items and comments are not top-level keys.
+        if line.starts_with([' ', '\t', '-', '#']) {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once(':') {
+            let key = key.trim().trim_matches(['"', '\'']);
+            if PERMISSION_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys.into_iter().collect()
+}
+
 /// Security findings for one skill: permission-bearing front matter in its
 /// body and hidden code points in its description or body.
 pub fn skill_findings(description: &str, body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let meta: Map<String, Value> = frontmatter(body).unwrap_or_default();
-    for key in permission_keys(&meta) {
+    for key in front_matter_permission_keys(body) {
         out.push(format!("front matter key `{key}` grants tools, hooks or permissions"));
     }
     for (where_, text) in [("description", description), ("body", body)] {
@@ -237,6 +269,16 @@ fn check_text(b: &Bundle) -> UaResult<()> {
             return refuse(format!(
                 "rules.{surface} line {line} has a hidden code point U+{:04X}",
                 *c as u32
+            ));
+        }
+        // Any rules text may land in a host's command or subagent file,
+        // whose front matter grants tools.
+        let keys = front_matter_permission_keys(text);
+        if !keys.is_empty() {
+            let keys: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
+            return refuse(format!(
+                "rules.{surface} front matter {} grants tools, hooks or permissions on the host",
+                keys.join(", ")
             ));
         }
     }
@@ -285,7 +327,7 @@ pub fn validate(raw: &Value) -> UaResult<Bundle> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     use super::*;
 

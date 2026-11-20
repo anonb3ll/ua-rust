@@ -286,10 +286,22 @@ fn check_description(skill: &Skill, out: &mut Vec<Finding>) {
     }
 }
 
-/// Front-matter keys that grant a skill tools, hooks or permissions on the
-/// host. A distributed skill must not carry them.
-pub(crate) const PERMISSION_KEYS: [&str; 5] =
-    ["allowed-tools", "allowed_tools", "hooks", "permissions", "disallowed-tools"];
+/// Front-matter keys (lower case) that grant a skill, command or subagent
+/// tools, hooks or permissions on the host. A distributed skill or rules text
+/// must not carry them. `tools`, `disallowedTools`, `permissionMode` and
+/// `mcpServers` are a subagent's (`.claude/agents/*.md`); `allowed-tools` a
+/// skill's or a command's (`.claude/commands/*.md`).
+pub(crate) const PERMISSION_KEYS: [&str; 9] = [
+    "allowed-tools",
+    "allowed_tools",
+    "hooks",
+    "permissions",
+    "disallowed-tools",
+    "tools",
+    "disallowedtools",
+    "permissionmode",
+    "mcpservers",
+];
 
 /// Code points that hide or reorder text from a human reader: Unicode tag
 /// characters (U+E0000-E007F), zero-width characters and bidi controls.

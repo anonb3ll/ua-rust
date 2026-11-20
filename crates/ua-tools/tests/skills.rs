@@ -172,3 +172,24 @@ async fn at_most_one_hundred_skills_are_reviewed() {
     assert_eq!(r["skills_reviewed"].as_array().unwrap().len(), 100);
     assert_eq!(r["truncated"], true);
 }
+
+#[tokio::test]
+async fn front_matter_that_grants_tools_is_flagged() {
+    let e = Env::new();
+    let desc = "Reviews a pull request diff for correctness bugs. Use when the user asks for a code review.";
+    // A skill's own key, and the keys a subagent grants itself tools with.
+    for (dir, key) in [
+        ("allowed", "allowed-tools: Bash"),
+        ("tools", "tools: Bash, Edit"),
+        ("disallowed", "disallowedTools: Read"),
+        ("mode", "permissionMode: bypassPermissions"),
+        ("servers", "mcpServers: [hub]"),
+    ] {
+        e.skill(dir, &format!("---\nname: {dir}\ndescription: {desc}\n{key}\n---\n{BODY}"));
+    }
+    let r = e.review(json!({ "path": "skills" })).await.unwrap();
+    assert_eq!(r["status"], "fail", "{r}");
+    for dir in ["allowed", "tools", "disallowed", "mode", "servers"] {
+        assert!(has(&r, "SKILL-PERMISSIONS", &format!("{dir}/SKILL.md")), "{dir}: {r}");
+    }
+}

@@ -359,8 +359,14 @@ node unseen. The renderer is never changed; the bundle is refused instead.
   `http` to a host that is not loopback.
 - Hidden text: invisible, bidi or tag code points (U+E0000-E007F,
   zero-width characters, bidi overrides) in rules or skills, and
-  permission-bearing front matter (`allowed-tools`, `hooks`, `permissions`)
-  in a skill body.
+  permission-bearing front matter in a skill body or in any rules text: a
+  rules surface may be a host's command or subagent file
+  (`.claude/commands/*.md`, `.claude/agents/*.md`). The keys are
+  `allowed-tools` (skills and commands), `tools`, `disallowedTools`,
+  `permissionMode` and `mcpServers` (subagents), `hooks`, `permissions` and
+  `disallowed-tools`, in any case. Front matter is read leniently: a first
+  line `---` opens it whether or not a strict parser would accept the block
+  (CRLF, a block that is not valid YAML, no closing line).
 - Surfaces: more than 16; a `kind` other than `rules` or `mcp`, or a default
   surface with another kind than its default; a path that is absolute, has
   an empty, `.` or `..` segment, lies in a git or hooks directory, is

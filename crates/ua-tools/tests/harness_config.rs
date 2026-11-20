@@ -1073,3 +1073,90 @@ async fn an_apply_pass_does_not_depend_on_how_long_the_diff_took() {
     let applied = h.reg.call(&other, &dev, "node_config", args).await.unwrap();
     assert_eq!(applied["approval_id"], id, "{applied}");
 }
+
+// --- permission front matter in rules text (hub #2687) ------------------------------
+
+fn refusal(raw: Value) -> String {
+    match policy::validate(&raw) {
+        Ok(_) => panic!("{raw} should be refused"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn front_matter(key: &str) -> String {
+    format!("---\nname: helper\ndescription: Helps.\n{key}: Bash, Edit\n---\nDo the thing.\n")
+}
+
+#[test]
+fn permission_front_matter_is_refused_in_rules_text_on_the_default_surfaces() {
+    // claude, agents and cursor are rules surfaces; codex and opencode are
+    // mcp surfaces that carry rules text too.
+    for surface in ["claude", "agents", "cursor", "codex", "opencode"] {
+        let e = refusal(json!({ "version": "1", "rules": { surface: front_matter("allowed-tools") } }));
+        assert!(e.contains(&format!("rules.{surface}")) && e.contains("allowed-tools"), "{surface}: {e}");
+    }
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_a_commands_rules_surface() {
+    let surfaces = json!({ "deploy": { "path": ".claude/commands/deploy.md", "kind": "rules" } });
+    for key in ["allowed-tools", "Allowed-Tools", "hooks", "permissions", "disallowed-tools"] {
+        let e = refusal(
+            json!({ "version": "1", "surfaces": surfaces, "rules": { "deploy": front_matter(key) } }),
+        );
+        assert!(e.contains("rules.deploy") && e.contains(key), "{key}: {e}");
+    }
+    // A command's ordinary front matter is fine.
+    let ok = "---\ndescription: Deploy the site.\nargument-hint: [env]\n---\nDeploy to $ARGUMENTS.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "deploy": ok } })).unwrap();
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_an_agents_rules_surface() {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    // A subagent grants itself tools with `tools`, and widens what it may do
+    // with `disallowedTools`, `permissionMode` or `mcpServers`.
+    for key in ["tools", "disallowedTools", "permissionMode", "mcpServers"] {
+        let e = refusal(
+            json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": front_matter(key) } }),
+        );
+        assert!(e.contains("rules.helper") && e.contains(key), "{key}: {e}");
+    }
+    // Forms a strict parser would not read as front matter, but a host might.
+    for text in [
+        "---\ntools: Bash\n---",                  // no newline after the closing line
+        "---\r\ntools: Bash\r\n---\r\nbody\r\n",  // CRLF
+        "---\ntools: [Bash\n---\nbody\n",         // YAML that does not parse
+        "---\n\"tools\": Bash\n---\nbody\n",      // a quoted key
+        "---\nname: h\ntools: Bash\n...\nbody\n", // closed with `...`
+        "---\nname: h\ntools: Bash\n",            // never closed
+    ] {
+        let e = refusal(json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }));
+        assert!(e.contains("rules.helper") && e.contains("tools"), "{text:?}: {e}");
+    }
+    let ok = "---\nname: helper\ndescription: Reviews diffs. Use when asked.\nmodel: inherit\n---\nReview.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": ok } })).unwrap();
+    // `tools` below the front matter is just text.
+    let prose = "# Helper\n\ntools: none needed\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": prose } })).unwrap();
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_custom_rules_and_mcp_surfaces_and_in_skills() {
+    // A Cursor rules file: its own front matter keys pass, a permission key
+    // does not.
+    let mdc = json!({ "style": { "path": ".cursor/rules/style.mdc", "kind": "rules" } });
+    let ok = "---\ndescription: Style.\nglobs: \"*.rs\"\nalwaysApply: true\n---\nUse rustfmt.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": mdc, "rules": { "style": ok } })).unwrap();
+    let e = refusal(
+        json!({ "version": "1", "surfaces": mdc, "rules": { "style": front_matter("permissions") } }),
+    );
+    assert!(e.contains("rules.style"), "{e}");
+    // A custom mcp surface renders its rules text into JSON.
+    let zed = json!({ "zed": { "path": "zed/settings.json", "kind": "mcp" } });
+    let e = refusal(json!({ "version": "1", "surfaces": zed, "rules": { "zed": front_matter("tools") } }));
+    assert!(e.contains("rules.zed"), "{e}");
+    // A skill body: `tools` is refused there too.
+    let e = refusal(json!({ "version": "1", "skills": [{ "name": "s", "body": front_matter("tools") }] }));
+    assert!(e.contains("skill \"s\"") && e.contains("tools"), "{e}");
+}
