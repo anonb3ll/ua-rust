@@ -595,6 +595,30 @@ pub(crate) fn close_linked_run(
     let Some(run) = super::dispatch::load_run(tx, &run_id)? else {
         return Ok(Some(json!({ "ok": false, "reason": "unknown_run", "run_id": run_id })));
     };
+    // A cancel whose intent was recorded but never finalized (the cancelling
+    // call was interrupted) is finalized now: confirmed when the node
+    // reported or never claimed the item, unknown when a lease lapsed.
+    if run.termination_outcome.as_deref() == Some("requested")
+        && matches!(run.state.as_str(), "claimed" | "launched" | "running")
+    {
+        let confirmed = node_confirmed || item.attempts == 0;
+        let out = super::dispatch::finalize_cancellation(
+            tx,
+            &run_id,
+            actor,
+            "node_queue",
+            &format!("node item {status}: {}", reason.unwrap_or(status)),
+            if node_confirmed {
+                "node_receipt"
+            } else if confirmed {
+                "already_gone"
+            } else {
+                "lease_expired"
+            },
+            if confirmed { "confirmed" } else { "unknown" },
+        )?;
+        return Ok(Some(out));
+    }
     // A cancel the hub asked for is confirmed by the node's own receipt.
     if run.state == "cancelled" || run.termination_outcome.is_some() {
         if node_confirmed && matches!(run.termination_outcome.as_deref(), Some("requested" | "unknown")) {
@@ -957,21 +981,36 @@ pub(crate) fn insert_item(
     Ok(out)
 }
 
-fn replay(c: &Connection, key: &str) -> UaResult<Option<Value>> {
-    Ok(c.query_row(
-        "SELECT id, node, status, created_at FROM node_dispatch WHERE launch_key = ?1",
-        [key],
-        |r| {
-            Ok(json!({
-                "item_id": r.get::<_, String>(0)?,
-                "node": r.get::<_, String>(1)?,
-                "status": r.get::<_, String>(2)?,
-                "created_at": r.get::<_, String>(3)?,
-                "replayed": true,
-            }))
-        },
-    )
-    .optional()?)
+/// A retry under a used `launch_key`: the item it queued, when the same
+/// caller asks for the same thing. Another caller's key, or the same key
+/// with other arguments, is a conflict that reveals nothing about the item.
+fn replay(c: &Connection, key: &str, who: &str, n: &NewItem) -> UaResult<Option<Value>> {
+    let Some(item) = items_where(c, "launch_key = ?1", [key])?.into_iter().next() else { return Ok(None) };
+    let cmd = command::load(c, &item.id)?.map(|c| c.argv);
+    let same = item.created_by == who
+        && item.node == n.node
+        && item.backend == n.backend
+        && item.prompt == n.prompt
+        && item.cwd == n.cwd
+        && item.cwd_realpath == n.cwd_realpath
+        && item.model == n.model
+        && item.permission_mode == n.permission_mode
+        && item.timeout_s == n.timeout_s
+        && item.task_id == n.task_id
+        && cmd == n.command.as_ref().map(|c| c.argv.clone());
+    if !same {
+        return Err(UaError::conflict_code(
+            "launch_key_reused",
+            "launch_key was already used for another request",
+        ));
+    }
+    Ok(Some(json!({
+        "item_id": item.id,
+        "node": item.node,
+        "status": item.status,
+        "created_at": item.created_at,
+        "replayed": true,
+    })))
 }
 
 /// Gate `n` behind a one-time human approval and queue it, in one write
@@ -986,7 +1025,7 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
         .db()
         .write_async(move |tx| {
             if let Some(k) = &n.launch_key
-                && let Some(prev) = replay(tx, k)?
+                && let Some(prev) = replay(tx, k, &who, &n)?
             {
                 return Ok(Ok(prev));
             }
@@ -1127,6 +1166,75 @@ pub(crate) async fn node_item_cancel(ctx: ToolCtx, a: ItemArgs) -> UaResult<Valu
                 ));
             }
             cancel_item(tx, &id, &who, &reason)
+        })
+        .await
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileArgs {
+    /// An item the hub failed when its lease lapsed (`lease_expired_outcome_unknown`).
+    pub item_id: String,
+    /// What really happened on the node: finished, failed or killed.
+    pub status: String,
+    /// How you know, 1-500 characters (a log, the node's spool, a commit).
+    pub note: String,
+}
+
+/// `coordination_manage(action="node_item_reconcile")`: record the real
+/// outcome of an item whose lease lapsed, so it can be restarted. The
+/// node's agent or an operator; the hub's failure is kept as `prior`.
+pub(crate) async fn node_item_reconcile(ctx: ToolCtx, a: ReconcileArgs) -> UaResult<Value> {
+    let who = verified_caller(&ctx.caller, "reconciling node work")?;
+    let id = check_item_id(&a.item_id)?;
+    let status = a.status.trim().to_string();
+    if !receipt::RECEIPT_STATUSES.contains(&status.as_str()) {
+        return Err(UaError::invalid("status must be finished, failed or killed"));
+    }
+    let note = a.note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.is_empty() || note.chars().count() > 500 {
+        return Err(UaError::invalid("note must be 1-500 characters"));
+    }
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            let Some(item) = load_item(tx, &id)? else {
+                return Err(UaError::not_found(format!("node item {id} does not exist")));
+            };
+            if !(item.agent == who || is_operator(&hub, &caller, &who)) {
+                return Err(UaError::denied(
+                    "not_item_owner",
+                    format!("only the node's agent {:?} or an operator reconciles {id}", item.agent),
+                ));
+            }
+            if !item.outcome_unknown() {
+                return Err(UaError::conflict(format!(
+                    "node item {id} has a known outcome; nothing to reconcile"
+                )));
+            }
+            let ts = now();
+            let receipt = json!({
+                "status": status,
+                "reason": "reconciled",
+                "note": note,
+                "reconciled": true,
+                "reconciled_by": who,
+                "recorded_at": ts,
+                "hub_generated": false,
+                "prior": item.receipt(),
+            });
+            tx.execute(
+                "UPDATE node_dispatch SET status = ?2, receipt_json = ?3, updated_at = ?4 WHERE id = ?1",
+                params![id, status, receipt.to_string(), ts],
+            )?;
+            record(
+                tx,
+                "reconciled",
+                json!({ "node": item.node, "item_id": id, "status": status, "actor": who, "note": note }),
+                &who,
+            )?;
+            Ok(json!({ "item_id": id, "status": status, "reconciled": true, "restartable": true }))
         })
         .await
 }
@@ -1419,6 +1527,15 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
             }
             let mut clauses = vec!["1 = 1".to_string()];
             let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+            if !operator {
+                let Some(w) = who.clone() else { return Ok(json!({ "items": [], "count": 0 })) };
+                binds.push(w.into());
+                let i = binds.len();
+                clauses.push(format!(
+                    "(created_by = ?{i} OR agent = ?{i} OR EXISTS (SELECT 1 FROM node_command c \
+                     WHERE c.item_id = node_dispatch.id AND c.owner_agent = ?{i}))"
+                ));
+            }
             if let Some(n) = &a.node {
                 binds.push(nodes::validate_node_name(n)?.into());
                 clauses.push(format!("node = ?{}", binds.len()));
@@ -1436,16 +1553,11 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
                 clauses.push(format!("task_id = ?{}", binds.len()));
             }
             let filter =
-                format!("{} ORDER BY created_at DESC, rowid DESC LIMIT {}", clauses.join(" AND "), limit * 4);
-            let mut out = Vec::new();
-            for item in items_where(c, &filter, rusqlite::params_from_iter(binds))? {
-                if out.len() as i64 >= limit {
-                    break;
-                }
-                if visible(&item)? {
-                    out.push(item.public());
-                }
-            }
+                format!("{} ORDER BY created_at DESC, rowid DESC LIMIT {limit}", clauses.join(" AND "));
+            let out: Vec<Value> = items_where(c, &filter, rusqlite::params_from_iter(binds))?
+                .iter()
+                .map(Item::public)
+                .collect();
             Ok(json!({ "items": out, "count": out.len() }))
         })
         .await

@@ -199,15 +199,30 @@ pub(crate) fn deliver_pending(hub: &Hub, item: Option<&str>) -> UaResult<usize> 
     let mut sent = 0;
     for (item_id, attempt, terminal, owner, body, task_id) in owed {
         let mid = format!("node-command-{item_id}-{attempt}-{terminal}");
-        let res = hub.db().write(|tx| {
-            messaging::send_system(tx, NOTICE_SENDER, &owner, &mid, &body, task_id)?;
-            tx.execute(
-                "UPDATE node_command_notice SET sent_at = ?4, message_id = ?5, last_error = NULL \
-                 WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3",
-                params![item_id, attempt, terminal, now(), mid],
-            )?;
-            Ok(())
-        });
+        // The owner's chosen session (node_command_adopt) first; label mail
+        // when that session can no longer take it.
+        let session: Option<String> = hub.db().read(|c| {
+            Ok(c.query_row("SELECT owner_session FROM node_command WHERE item_id = ?1", [&item_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
+        })?;
+        let send = |to_session: Option<&str>| {
+            hub.db().write(|tx| {
+                messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                tx.execute(
+                    "UPDATE node_command_notice SET sent_at = ?4, message_id = ?5, last_error = NULL \
+                     WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3",
+                    params![item_id, attempt, terminal, now(), mid],
+                )?;
+                Ok(())
+            })
+        };
+        let res = match session.as_deref() {
+            Some(s) => send(Some(s)).or_else(|_| send(None)),
+            None => send(None),
+        };
         match res {
             Ok(()) => sent += 1,
             Err(e) => {

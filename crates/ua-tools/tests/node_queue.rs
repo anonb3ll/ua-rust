@@ -721,3 +721,198 @@ async fn a_waiting_claim_picks_up_work_queued_while_it_waits() {
     let got = waiter.await.unwrap();
     assert_eq!(got["item"]["item_id"], id);
 }
+
+// --- review regressions ---------------------------------------------------------
+
+async fn routed(h: &H) -> (String, String) {
+    let tid = routed_task(h).await;
+    let out = h
+        .gated(&device(), "dispatch_task", json!({ "task_id": tid, "agent": "builder-1", "node": NODE }))
+        .await;
+    (out["run_id"].as_str().unwrap().to_string(), out["item_id"].as_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn an_interrupted_cancel_of_a_routed_run_is_finished_by_the_queue() {
+    // The cancel recorded its intent and was cut off; the item's wait then ran out.
+    let h = H::new();
+    h.register_default().await;
+    h.sql("UPDATE nodes SET last_heartbeat = '2000-01-01T00:00:00+00:00'");
+    let (run, item) = routed(&h).await;
+    h.sql(&format!("UPDATE dispatch_runs SET termination_outcome = 'requested' WHERE run_id = '{run}'"));
+    h.sql(&format!(
+        "UPDATE node_dispatch SET wait_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = '{item}'"
+    ));
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{run}'")), "cancelled");
+    assert_eq!(
+        h.scalar(&format!("SELECT termination_outcome FROM dispatch_runs WHERE run_id = '{run}'")),
+        "confirmed"
+    );
+
+    // A claimed item whose lease lapsed: cancelled, cessation unknown.
+    let h = H::new();
+    h.register_default().await;
+    let (run, item) = routed(&h).await;
+    h.claim().await;
+    h.sql(&format!("UPDATE dispatch_runs SET termination_outcome = 'requested' WHERE run_id = '{run}'"));
+    h.sql(&format!(
+        "UPDATE node_dispatch SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = '{item}'"
+    ));
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{run}'")), "cancelled");
+    assert_eq!(
+        h.scalar(&format!("SELECT termination_outcome FROM dispatch_runs WHERE run_id = '{run}'")),
+        "unknown"
+    );
+
+    // The reaper finishes an interrupted cancel of a queued item.
+    let h = H::new();
+    h.register_default().await;
+    let (run, item) = routed(&h).await;
+    h.sql(&format!("UPDATE dispatch_runs SET termination_outcome = 'requested' WHERE run_id = '{run}'"));
+    ua_tools::families::dispatch::reap_expired_leases(&h.hub).unwrap();
+    assert_eq!(h.scalar(&format!("SELECT status FROM node_dispatch WHERE id = '{item}'")), "cancelled");
+    assert_eq!(
+        h.scalar(&format!("SELECT termination_outcome FROM dispatch_runs WHERE run_id = '{run}'")),
+        "confirmed"
+    );
+}
+
+#[tokio::test]
+async fn a_routed_run_is_reported_by_its_node_not_by_the_session() {
+    let h = H::new();
+    h.register_default().await;
+    let (run, item) = routed(&h).await;
+    let prompt = h.scalar(&format!("SELECT prompt FROM node_dispatch WHERE id = '{item}'"));
+    assert!(!prompt.as_str().unwrap().contains("dispatch_report_self"), "{prompt}");
+    h.claim().await;
+    let e = h
+        .err(
+            &device(),
+            "dispatch_report_self",
+            json!({ "run_id": run, "state": "finished", "evidence": "abc123" }),
+        )
+        .await;
+    assert!(matches!(e, UaError::Conflict(_)), "{e:?}");
+    let beat = h.ok(&device(), "node_heartbeat", json!({ "node": NODE, "running": item })).await;
+    assert_eq!(beat["cancel"], json!([]));
+}
+
+#[tokio::test]
+async fn an_unscoped_agent_gets_no_permission_or_follow_up() {
+    let h = H::with(|cfg| {
+        cfg.agent_scopes.insert("builder-1".into(), "none".into());
+        cfg.agent_scopes.insert("lead-1".into(), "dispatch".into());
+    });
+    h.register_default().await;
+    let id = h.queue(json!({ "backend": "acp:claude" })).await;
+    h.claim().await;
+    let ask = json!({ "node": NODE, "item_id": id, "session_id": "s", "tool_call": { "title": "x" } });
+    let e = h.err(&device(), "node_permission", ask).await;
+    assert!(!matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
+    // The node's agent may otherwise send follow-ups; not while unscoped.
+    let e = h
+        .err(
+            &device(),
+            "node_followup",
+            json!({ "item_id": id, "mode": "queue", "body": "x", "idempotency_key": "queue-0009" }),
+        )
+        .await;
+    assert!(!matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'acp_permission'"), json!(0));
+}
+
+#[tokio::test]
+async fn a_launch_key_belongs_to_its_caller_and_request() {
+    let h = H::new();
+    h.register_default().await;
+    h.queue(json!({ "launch_key": "launch-0002" })).await;
+    let mut args = json!({ "node": NODE, "backend": "codex", "prompt": "something else", "cwd": "/srv/work/repo", "launch_key": "launch-0002" });
+    let e = h.err(&lead(), "node_dispatch", args.clone()).await;
+    assert_eq!(reason(&e), "launch_key_reused");
+    args["prompt"] = json!("fix the build");
+    let e = h.err(&caller("snoop-1", ActorKind::Agent), "node_dispatch", args).await;
+    assert_eq!(reason(&e), "launch_key_reused");
+    assert!(!e.to_string().contains("nd-"), "nothing about the item leaks: {e}");
+}
+
+#[tokio::test]
+async fn the_listing_limit_counts_only_visible_items() {
+    let h = H::new();
+    h.register_default().await;
+    let mine = h.queue(json!({})).await;
+    let other = caller("other-1", ActorKind::Agent);
+    for i in 0..3 {
+        let args = json!({ "node": NODE, "backend": "codex", "prompt": format!("p{i}"), "cwd": "/srv/work" });
+        h.gated(&other, "node_dispatch", args).await;
+    }
+    let v = h.ok(&lead(), "node_items", json!({ "limit": 1 })).await;
+    assert_eq!(v["items"][0]["item_id"], mine);
+}
+
+#[tokio::test]
+async fn a_lapsed_item_is_reconciled_then_restartable() {
+    let h = H::new();
+    h.register_default().await;
+    let id = h.queue(json!({})).await;
+    h.claim().await;
+    // Cancel is relayed once on the ledger however many beats it takes.
+    h.manage(&lead(), "node_item_cancel", json!({ "item_id": id })).await.unwrap();
+    for _ in 0..3 {
+        h.ok(&device(), "node_heartbeat", json!({ "node": NODE, "running": id })).await;
+    }
+    assert_eq!(h.events("cancel_relayed"), 1);
+    h.sql(&format!(
+        "UPDATE node_dispatch SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = '{id}'"
+    ));
+    h.claim().await;
+    let e = h
+        .manage(
+            &lead(),
+            "node_item_reconcile",
+            json!({ "item_id": id, "status": "killed", "note": "log shows it stopped" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "not_item_owner");
+    let r = h
+        .manage(
+            &device(),
+            "node_item_reconcile",
+            json!({ "item_id": id, "status": "killed", "note": "node spool shows it stopped" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["restartable"], true);
+    let item = h.ok(&lead(), "node_items", json!({ "item_id": id })).await;
+    assert_eq!(item["item"]["status"], "killed");
+    assert_eq!(item["item"]["receipt"]["prior"]["reason"], "lease_expired_outcome_unknown");
+    let parked = h.manage(&lead(), "node_item_restart", json!({ "item_id": id })).await.unwrap_err();
+    assert!(matches!(parked, UaError::ApprovalRequired { .. }), "{parked:?}");
+}
+
+#[tokio::test]
+async fn an_adopted_command_notifies_the_chosen_session() {
+    let h = H::new();
+    h.register_default().await;
+    let session = h
+        .ok(&lead(), "session_start", json!({ "kind": "interactive", "external_session_id": "ext-1" }))
+        .await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let params = json!({ "node": NODE, "argv": ["make"], "cwd": "/srv/work" });
+    let parked = h.manage(&lead(), "node_command_start", params.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!() };
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    let id = h.manage(&lead(), "node_command_start", params).await.unwrap()["item_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.manage(&lead(), "node_command_adopt", json!({ "item_id": id, "session_id": session })).await.unwrap();
+    let token = h.claim().await["item"]["command"]["fence_token"].as_str().unwrap().to_string();
+    h.ok(&device(), "node_receipt", json!({ "node": NODE, "item_id": id, "receipt": { "status": "failed", "attempt": 1, "exit_code": 2, "fence_token": token } }))
+        .await;
+    assert_eq!(h.scalar("SELECT target_session FROM message_index WHERE sender = 'hub-node'"), session);
+}

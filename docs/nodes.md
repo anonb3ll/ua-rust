@@ -46,7 +46,9 @@ The request is checked before anyone is asked to approve it:
 - the node supports any feature the item needs, such as `cwd_realpath` or
   ACP session settings (`node_feature_missing`).
 
-A `launch_key` makes a retry return the item it queued.
+A `launch_key` makes a retry return the item it queued. The key belongs to
+the caller and the request: reusing it for other arguments, or from another
+identity, is refused (`launch_key_reused`) without revealing the item.
 
 When the node is not live, the item waits for it. The wait lasts up to
 `node_queue_wait_s` (default one hour). After that the item fails with
@@ -63,7 +65,9 @@ up to 30 seconds for work. Each claim:
 A heartbeat that names the running item (`running`) renews the lease and
 returns `cancel`, the ids the node must stop. A lease that lapses fails the
 item with `lease_expired_outcome_unknown`. The hub cannot tell whether the
-work ran, so the item cannot be restarted until someone reconciles it.
+work ran, so the item cannot be restarted until the node's agent or an
+operator records the real outcome with `node_item_reconcile` (params
+`item_id, status, note`). The hub's failure is kept as `prior`.
 
 A **claim operation** (`claim_op = {id, mode, issued_at}`) makes a claim
 durable. If the node loses the answer, it asks again under the same id and
@@ -106,7 +110,8 @@ message from `hub-node` with the status, exit code and log location. A
 message that could not be sent is retried by the sweep.
 
 `node_command_status` reads a command. `node_command_adopt` changes which of
-the owner's sessions is notified.
+the owner's sessions is notified. A notice for a session that has ended goes
+to the owner's label instead.
 
 ### ACP sessions: events, follow-ups, permissions
 

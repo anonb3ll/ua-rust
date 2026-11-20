@@ -414,6 +414,17 @@ fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResu
     Ok(format!("run-{task_id}-{}", &h[..8]))
 }
 
+/// The default prompt for a run routed to a node: the node's receipt
+/// reports the outcome, so the session is not asked to report it.
+fn node_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str, node: &str) -> String {
+    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+    format!(
+        "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id} on node {node}. The hub records the \
+         outcome from this session's end; do the work and leave a clear final summary.",
+        str_field(task, "title").unwrap_or_default()
+    )
+}
+
 /// The default prompt: the task title and notes, and the run to report on.
 fn default_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str) -> String {
     let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
@@ -667,7 +678,10 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let run_id = derive_run_id(tx, tid, &ag)?;
             let (prompt, source) = match &a.prompt {
                 Some(p) => (p.clone(), "args"),
-                None => (default_prompt(tid, &task, &run_id), "task"),
+                None => match &route {
+                    Some((row, _, _)) => (node_prompt(tid, &task, &run_id, &row.node), "task"),
+                    None => (default_prompt(tid, &task, &run_id), "task"),
+                },
             };
             if prompt.len() > PROMPT_CAP {
                 return Err(UaError::invalid(format!("prompt is longer than {PROMPT_CAP} bytes")));
@@ -815,6 +829,11 @@ async fn report_self(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
     };
     let run = require_run(&ctx, &rid).await?;
     check_run_owner(&ctx.caller, "dispatch_report_self", &run)?;
+    if run.evidence_ref.as_deref().is_some_and(|e| e.starts_with("node:")) {
+        return Err(UaError::conflict(
+            "run was routed to a node: its outcome comes from the node's receipt, not dispatch_report_self",
+        ));
+    }
     let evidence = a.evidence.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
     if state == "finished" && evidence.is_none() {
         return Err(UaError::invalid(
