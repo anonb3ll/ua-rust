@@ -231,8 +231,10 @@ pub struct Config {
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.
     pub notify_max_attempts: u32,
-    /// Slack signing secret (`UA_SLACK_SIGNING_SECRET`). `slack_verify_request`
-    /// is off until this is set. Never logged, never written to the database.
+    /// Slack signing secret, from the `UA_SLACK_SIGNING_SECRET` environment
+    /// variable; keep it out of the config file. Read by the future Slack
+    /// route (docs/slack.md); no tool reads it. Never logged, never written
+    /// to the database.
     #[serde(skip_serializing)]
     pub slack_signing_secret: Option<SecretString>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).

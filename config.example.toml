@@ -189,6 +189,6 @@ reviewer-1 = "reviewer"
 # get_page = "read"
 # put_page = "write"
 
-# Slack request signing. slack_verify_request stays off until this is set.
-# Prefer UA_SLACK_SIGNING_SECRET. The value is never logged.
-# slack_signing_secret = "set-me"
+# Slack request signing (no route serves Slack yet; see docs/slack.md). Set
+# the signing secret in the hub's environment as UA_SLACK_SIGNING_SECRET, not
+# in this file. The value is never logged or stored.
