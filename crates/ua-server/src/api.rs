@@ -81,7 +81,7 @@ pub fn status_for(e: &UaError) -> StatusCode {
         UaError::NotFound(_) => StatusCode::NOT_FOUND,
         UaError::Denied { .. } => StatusCode::FORBIDDEN,
         UaError::ApprovalRequired { .. } => StatusCode::ACCEPTED,
-        UaError::Conflict(_) => StatusCode::CONFLICT,
+        UaError::Conflict(_) | UaError::ConflictCode { .. } => StatusCode::CONFLICT,
         UaError::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
         UaError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

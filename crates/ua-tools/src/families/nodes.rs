@@ -127,14 +127,13 @@ pub(crate) type OpenWork = fn(&Connection, &str) -> UaResult<Vec<String>>;
 
 /// Every source of node work that must be settled before a node is retired.
 /// Retiring is refused (conflict) while any of them reports an item, so no
-/// work is stranded behind the `node_retired` refusal. This hub has no node
-/// work queue yet, so nothing is listed; the queue adds its probe here.
-pub(crate) const RETIRE_BLOCKERS: &[OpenWork] = &[];
+/// work is stranded behind the `node_retired` refusal.
+pub(crate) const RETIRE_BLOCKERS: &[OpenWork] = &[super::node_queue::open_work];
 
 // --- names and identity ---------------------------------------------------------
 
 /// 1-128 of `A-Z a-z 0-9 . _ -`, starting with a letter or digit.
-fn validate_node_name(raw: &str) -> UaResult<String> {
+pub(crate) fn validate_node_name(raw: &str) -> UaResult<String> {
     let name = raw.trim();
     let mut chars = name.chars();
     let ok = name.len() <= MAX_NODE_NAME
@@ -172,7 +171,7 @@ fn retired_message(node: &str) -> String {
 
 /// The stored owner and retirement of `node`, checked against `agent`:
 /// another label's node is refused before retirement is revealed.
-fn check_owner(owner: &str, retired: bool, node: &str, agent: &str) -> UaResult<()> {
+pub(crate) fn check_owner(owner: &str, retired: bool, node: &str, agent: &str) -> UaResult<()> {
     if owner != agent {
         return Err(UaError::denied(
             "node_owned_elsewhere",
@@ -804,17 +803,16 @@ pub struct RegisterArgs {
 pub struct HeartbeatArgs {
     /// Node name, as registered by the calling agent.
     pub node: String,
-    /// Id of the work item the node is running. Accepted for compatibility;
-    /// this hub has no node work queue yet, so there is no lease to renew and
-    /// `cancel` is always empty.
+    /// Id of the work item the node is running: its lease (and its dispatch
+    /// run's) is renewed for another `timeout_s` + 300 seconds.
     pub running: Option<Value>,
     /// Advisory facts: `surfaces`, `harness_config`, `vault_sync`,
     /// `native_sessions` and `code_sha` replace those keys and keep the rest.
     /// Any other key is dropped and named in `dropped_fact_keys`; host facts
     /// such as roots, repos and harnesses change only by registering again.
     pub facts: Option<Value>,
-    /// Progress note for the running item. Accepted for compatibility; with
-    /// no work queue there is no item to record it against.
+    /// Progress note for the running item, recorded on the ledger (at most
+    /// 2000 characters).
     pub progress: Option<Value>,
 }
 
@@ -951,6 +949,13 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
     let agent = node_agent(&ctx.caller)?;
     let name = validate_node_name(&a.node)?;
     let update = raw_facts(a.facts)?;
+    let running = match a.running {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s),
+        Some(Value::String(_)) => None,
+        Some(_) => return Err(UaError::invalid("running must be an item id or null")),
+    };
+    let progress = a.progress.as_ref().and_then(Value::as_str).map(str::to_string);
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -973,12 +978,14 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
                     params![name, Value::Object(facts).to_string()],
                 )?;
             }
-            // Liveness only: the ledger is not written for a heartbeat.
+            // Liveness itself is not ledgered.
             tx.execute(
                 "UPDATE nodes SET last_heartbeat = ?2, updated_at = ?2 WHERE node = ?1",
                 params![name, now],
             )?;
-            Ok(json!({ "node": name, "as_of": now, "cancel": [], "dropped_fact_keys": dropped }))
+            let cancel =
+                super::node_queue::on_heartbeat(tx, &name, &agent, running.as_deref(), progress.as_deref())?;
+            Ok(json!({ "node": name, "as_of": now, "cancel": cancel, "dropped_fact_keys": dropped }))
         })
         .await
 }

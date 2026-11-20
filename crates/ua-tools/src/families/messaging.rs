@@ -34,7 +34,7 @@ use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
-use super::nodes;
+use super::{node_queue, nodes};
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -112,7 +112,13 @@ pub const COORDINATION_ACTIONS: &[&str] = &[
     "agent_list",
     "message_ack",
     "message_inbox",
+    "node_command_adopt",
+    "node_command_start",
+    "node_command_status",
     "node_forget",
+    "node_item_cancel",
+    "node_item_reconcile",
+    "node_item_restart",
     "node_reassign",
     "node_retire",
     "node_unretire",
@@ -1342,6 +1348,49 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
 
 // --- tools ----------------------------------------------------------------------
 
+/// Send mail as a hub service (`from`, for example `hub-node`), in the
+/// caller's transaction: to one session of `to_agent` when `to_session` is
+/// given, else label mail. `message_id` makes a retry return the first result.
+pub(crate) fn send_system(
+    tx: &mut WriteTx<'_>,
+    from: &str,
+    to_agent: &str,
+    to_session: Option<&str>,
+    message_id: &str,
+    body: &str,
+    task_id: Option<i64>,
+) -> UaResult<Value> {
+    let v = Viewer {
+        identity: Some(from.to_string()),
+        unrestricted: true,
+        local_label: from.to_string(),
+        humans: Vec::new(),
+    };
+    send(
+        tx,
+        &v,
+        SendArgs {
+            act: "inform".into(),
+            to_agent: Some(to_agent.to_string()),
+            body: Some(body.to_string()),
+            from_agent: None,
+            conversation_id: None,
+            reply_to: None,
+            message_id: Some(message_id.to_string()),
+            hop: None,
+            task_id,
+            delegation_id: None,
+            event_id: None,
+            expects_reply: false,
+            to_office: None,
+            to_role: None,
+            handoff: None,
+            to_session: to_session.map(str::to_string),
+            from_session: None,
+        },
+    )
+}
+
 async fn message_send(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
     let v = Viewer::of(&ctx);
     ctx.hub.db().write_async(move |tx| send(tx, &v, a)).await
@@ -1432,6 +1481,12 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "node_unretire" => nodes::node_unretire(ctx, action_params(action, params)?).await,
         "node_reassign" => nodes::node_reassign(ctx, action_params(action, params)?).await,
         "node_forget" => nodes::node_forget(ctx, action_params(action, params)?).await,
+        "node_item_cancel" => node_queue::node_item_cancel(ctx, action_params(action, params)?).await,
+        "node_item_restart" => node_queue::node_item_restart(ctx, action_params(action, params)?).await,
+        "node_item_reconcile" => node_queue::node_item_reconcile(ctx, action_params(action, params)?).await,
+        "node_command_start" => node_queue::node_command_start(ctx, action_params(action, params)?).await,
+        "node_command_status" => node_queue::node_command_status(ctx, action_params(action, params)?).await,
+        "node_command_adopt" => node_queue::node_command_adopt(ctx, action_params(action, params)?).await,
         other => Err(UaError::invalid(format!(
             "unknown coordination_manage action {other:?}; supported actions: {}",
             COORDINATION_ACTIONS.join(", ")
@@ -1460,7 +1515,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "coordination_manage",
-            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). The node_* actions are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. Action arguments go in params.",
+            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Action arguments go in params.",
             coordination_manage,
         )
         .family("messaging"),

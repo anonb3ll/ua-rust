@@ -676,6 +676,11 @@ fn copy_table(
                         }
                         vals[i] = SqlValue::Null;
                     }
+                    if map.kind == Kind::Nodes
+                        && let Some(i) = plan.cols.iter().position(|c| c == "facts_json")
+                    {
+                        vals[i] = SqlValue::Text("{}".into());
+                    }
                     if map.rowid_to.is_some() {
                         vals.push(SqlValue::Integer(rowid));
                     }

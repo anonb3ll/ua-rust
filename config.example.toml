@@ -26,6 +26,8 @@ human_identities = ["operator"]
 # lifecycle_operators = ["operator"]
 # Remote nodes one agent may hold in service (registered, not retired).
 node_max_per_agent = 8
+# node_queue_wait_s = 3600   # how long work waits for an offline node (60-604800)
+# node_wait_sweep_s = 60     # node queue sweep interval under `ua serve`; 0 = off
 
 # Tools that always need a one-time human approval.
 approval_tools = ["git_merge_task"]

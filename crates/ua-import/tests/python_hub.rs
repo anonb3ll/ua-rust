@@ -283,6 +283,20 @@ CREATE TABLE message_reads (
   acked_at TEXT,
   PRIMARY KEY (message_id, session_id)
 );
+CREATE TABLE nodes (
+  node TEXT PRIMARY KEY,
+  agent TEXT NOT NULL,
+  device_node TEXT,
+  facts_json TEXT,
+  version TEXT,
+  registered_at TEXT NOT NULL,
+  last_heartbeat TEXT,
+  updated_at TEXT NOT NULL,
+  retired_at TEXT,
+  retired_by TEXT,
+  retired_reason TEXT,
+  heartbeat_floor TEXT
+);
 CREATE TABLE zulip_cursors (
   bot TEXT NOT NULL,
   last_message_id INTEGER NOT NULL
@@ -427,6 +441,11 @@ INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, 
   VALUES ('m1', 'agent-2', 'agent-1', 'inform', 'c1', '{u2}', '{T0}', NULL);
 INSERT INTO message_reads (message_id, session_id, read_at) VALUES ('m1', 's1', '{T0}');
 INSERT INTO zulip_cursors (bot, last_message_id) VALUES ('bot', 1);
+INSERT INTO nodes (node, agent, device_node, facts_json, version, registered_at, last_heartbeat, updated_at,
+  retired_at, retired_by, retired_reason, heartbeat_floor) VALUES
+  ('mac-1', 'agent-1', 'mac-1', '{{\"worktree_roots\": [\"/Users/someone/secret\"]}}', '0.9.1', '{T0}', '{T0}', '{T0}',
+   NULL, NULL, NULL, NULL),
+  ('old-box', 'agent-2', NULL, NULL, NULL, '{T0}', '{T0}', '{T0}', '{T0}', 'operator', 'decommissioned', '{T0}');
 ",
         h1 = sha_hex("token-one"),
         h2 = sha_hex("token-two"),
@@ -507,6 +526,14 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_reads"), 1);
     assert_eq!(table(&r, "tasks").copied, 4);
+
+    // Nodes: owner, version and retirement move across; host facts do not,
+    // since ua-rust stores only facts it bounded itself.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE facts_json = '{}'"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'old-box' AND retired_by = 'operator'"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
+    assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
 
     // Self references: a forward parent is restored, a dangling one is NULL.
     assert_eq!(n(&db, "SELECT parent_id FROM tasks WHERE id = 2"), 4);
