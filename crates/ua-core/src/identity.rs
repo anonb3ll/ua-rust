@@ -65,7 +65,7 @@ impl Caller {
         Self {
             label: "system".into(),
             kind: ActorKind::System,
-            profile: Profile::ChiefOfStaff,
+            profile: Profile::Coordinator,
             enforce_profile: false,
             session_key: None,
             transport: Transport::Internal,

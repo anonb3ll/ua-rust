@@ -158,5 +158,4 @@ These are not ported either:
 
 - device acceptance runs;
 - resuming or adopting native sessions;
-- Hermes profile binding (`acp:hermes`);
 - the agent lifecycle (pause and terminate) that the original queue consults.

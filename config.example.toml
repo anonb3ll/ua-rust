@@ -12,12 +12,12 @@ bind = "127.0.0.1:8765"
 enforce_auth = true
 # Host headers /api and /ui answer (DNS-rebinding guard). The host of
 # public_url is always allowed too. List any other name the hub is reached
-# by, e.g. a tailnet name in front of `tailscale serve`:
+# by, e.g. a private-network name in front of a TLS terminator:
 allowed_hosts = ["localhost", "127.0.0.1", "::1"]
-# allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.example-tailnet.ts.net"]
+# allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.example.com"]
 # Public base URL. Use https:// for anything but loopback: browsers drop the
 # Secure session cookie and refuse passkeys on plain http to other hosts.
-# public_url = "https://hub.example-tailnet.ts.net"
+# public_url = "https://hub.example.com"
 
 # Who counts as a human operator. Only humans resolve approvals.
 human_identities = ["operator"]
@@ -65,10 +65,13 @@ autonomy_max_cost_cents = 1000.0
 # cycle merge and PR transition waits for a human approval.
 # cycle_validation_command = ["cargo", "test", "--quiet"]
 
-# Default profile per identity. Unlisted identities get "developer".
+# Default profile per identity. Unlisted identities get "developer". Profiles:
+# coordinator, lead, developer, reviewer, operator, research, acp-session,
+# remote-vault-curator, remote-assistant, public (see docs/policy.md).
 [profiles]
 operator = "operator"
-reviewer-1 = "cto"
+lead-1 = "lead"
+reviewer-1 = "reviewer"
 
 # Per-agent workspace roots, or "deny".
 [agent_workspaces]

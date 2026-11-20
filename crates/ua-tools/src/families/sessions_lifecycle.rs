@@ -1046,12 +1046,12 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
-    // The steward profile may watch a crew but not steer it. The profile table
+    // The reviewer profile may watch a crew but not steer it. The profile table
     // does not list this tool, so the tool enforces it itself.
-    if ctx.caller.profile == ua_core::Profile::Steward {
+    if ctx.caller.profile == ua_core::Profile::Reviewer {
         return Err(UaError::denied(
             "profile_denied",
-            "crew_intervene is not available to the steward profile",
+            "crew_intervene is not available to the reviewer profile",
         ));
     }
     let sid = a.session_id.trim().to_string();

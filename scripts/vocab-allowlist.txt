@@ -1,0 +1,19 @@
+# Intended matches for scripts/vocab-check.sh: a path glob, then optionally
+# whitespace and an extended regex the matching line must also match.
+
+# Legacy profile names, accepted as aliases for compatibility with the Python
+# hub, and the tests and docs that pin that compatibility.
+crates/ua-core/src/profiles.rs           (alias = |\("[a-z-]+", Profile::)
+crates/ua-core/src/config.rs             oauth_profile = \\"cloud-assistant\\".*chief-of-staff
+crates/ua-tools/tests/config_revisions.rs  chief-of-staff|"steward"|contains\("steward"\)
+crates/ua-tools/tests/gateway.rs         "profile": "steward"
+crates/ua-tools/tests/policy.rs          Python hub|steward|chief-of-staff
+docs/policy.md                           ^\| `[a-z-]+` \| `[a-z-]+` \|$
+
+# Shared address space (100.64.0.0/10) in the SSRF guards and their tests.
+crates/ua-server/src/oauth/cimd.rs       100\.64\.0\.0/10|"100\.100\.100\.100"
+crates/ua-tools/src/families/web.rs      "100\.64\.0\.1"
+crates/ua-tools/tests/web.rs             "http://100\.64\.0\.1/"
+
+# A placeholder macOS path in the import test's fixture.
+crates/ua-import/tests/python_hub.rs     /Users/someone/secret

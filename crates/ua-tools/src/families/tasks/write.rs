@@ -363,11 +363,11 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                          expired claim may be released"
                     )));
                 }
-                if caller.profile == Profile::Steward && !(a.release_claim && claim_expired) {
+                if caller.profile == Profile::Reviewer && !(a.release_claim && claim_expired) {
                     return Err(UaError::denied(
-                        "steward_claimed_task",
+                        "reviewer_claimed_task",
                         format!(
-                            "task {id} is claimed by {holder:?}; steward may not update another agent's claimed \
+                            "task {id} is claimed by {holder:?}; the reviewer profile may not update another agent's claimed \
                              task. Groom unclaimed or self-claimed tasks, or ask the claimant"
                         ),
                     ));

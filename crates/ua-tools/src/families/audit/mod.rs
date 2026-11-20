@@ -451,7 +451,7 @@ pub fn resolve_target(ctx: &ToolCtx, path: &str, vault: bool, for_write: bool) -
     })
 }
 
-/// The caller's excludes, plus (for vault audits) the generated steward
+/// The caller's excludes, plus (for vault audits) the generated security audit
 /// reports, which quote prior findings and would bury new ones.
 pub fn effective_excludes(ctx: &ToolCtx, vault: bool, excludes: Option<Vec<String>>) -> Vec<String> {
     let mut out = Vec::new();

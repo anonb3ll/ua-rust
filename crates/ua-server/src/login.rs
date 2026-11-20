@@ -287,7 +287,7 @@ pub fn insecure_origin_warning(cfg: &ua_core::Config) -> Option<String> {
     }
     Some(format!(
         "the public origin {} is plain http on a non-loopback host: {}. Serve the hub over HTTPS \
-         (for example `tailscale serve`, which is tailnet-only, or another TLS terminator) and set \
+         (for example a private-network TLS terminator such as `tailscale serve`, or a reverse proxy) and set \
          public_url to the https:// address; see docs/auth.md",
         origin.origin().ascii_serialization(),
         broken.join("; ")
