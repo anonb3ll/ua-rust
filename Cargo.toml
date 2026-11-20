@@ -8,6 +8,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/anonb3ll/ua-rust"
+keywords = ["mcp", "agent", "sqlite", "ledger", "approvals"]
+categories = ["command-line-utilities", "development-tools", "database"]
+readme = "README.md"
 
 [workspace.dependencies]
 ua-core = { path = "crates/ua-core" }

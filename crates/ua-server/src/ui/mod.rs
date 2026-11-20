@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde_json::{Map, Value, json};
 use ua_core::identity::Transport;
-use ua_core::{Caller, UaError, UaResult};
+use ua_core::{ActorKind, Caller, UaError, UaResult};
 
 use crate::AppState;
 use crate::auth::{AuthIdentity, caller_for, session_key};
@@ -122,9 +122,28 @@ impl Ui {
         self.state.registry.call(&self.state.hub, &self.caller, tool, args).await
     }
 
-    /// Like [`Ui::call`], with the error flattened to display text.
+    /// Whether this request is a verified human's browser session, the only
+    /// caller whose page reads may leave no `tool_calls` rows.
+    fn human_session(&self) -> bool {
+        self.session_csrf.is_some() && self.verified && self.caller.kind == ActorKind::Human
+    }
+
+    /// A read that composes a page. For a verified human's browser session it
+    /// runs inside [`ua_tools::registry::page_reads`], so a successful
+    /// skip-eligible read leaves no `tool_calls` row. Any other caller (an
+    /// agent token on `/ui`, local anonymous use) records every call as
+    /// [`Ui::call`] does.
+    pub async fn call_read(&self, tool: &str, args: Value) -> UaResult<Value> {
+        if self.human_session() {
+            ua_tools::registry::page_reads(self.call(tool, args)).await
+        } else {
+            self.call(tool, args).await
+        }
+    }
+
+    /// Like [`Ui::call_read`], with the error flattened to display text.
     pub async fn read(&self, tool: &str, args: Value) -> Result<Value, String> {
-        self.call(tool, args).await.map_err(|e| describe(tool, &e))
+        self.call_read(tool, args).await.map_err(|e| describe(tool, &e))
     }
 
     /// Whether the caller's profile exposes `tool` (for direct reads).

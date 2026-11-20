@@ -253,7 +253,7 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
         }
     }
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1",
+        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
         [&week],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -340,7 +340,8 @@ fn perf_summary(c: &Connection, a: PerfArgs) -> UaResult<Value> {
     let hours = a.since_hours.filter(|h| h.is_finite() && *h > 0.0).unwrap_or(PERF_WINDOW_HOURS_DEFAULT);
     let cutoff = agents::ago((hours * 3600.0).min(1e12) as i64);
     let mut stmt = c.prepare(
-        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ?1 ORDER BY id DESC",
+        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
+         ORDER BY id DESC",
     )?;
     let rows = stmt.query_map([&cutoff], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
@@ -577,7 +578,7 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
     {
         let cutoff = agents::ago(86_400);
         let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 \
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
              GROUP BY tool HAVING COUNT(*) >= ?2 ORDER BY tool",
         )?;
         let rows = stmt.query_map(rusqlite::params![cutoff, TOOL_ERROR_MIN_CALLS], |r| {
@@ -1463,18 +1464,6 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // mcp_health_telemetry
 
-/// JSON with every object's keys sorted, so equal schemas hash equally.
-fn canonical(v: &Value) -> Value {
-    match v {
-        Value::Object(m) => {
-            let sorted: BTreeMap<&String, Value> = m.iter().map(|(k, v)| (k, canonical(v))).collect();
-            Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
-        }
-        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
-        other => other.clone(),
-    }
-}
-
 /// Version 1: tool names plus required and optional argument keys, 16 hex.
 pub(crate) fn schema_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::ToolDef>) -> String {
     let mut lines: Vec<String> = tools
@@ -1504,7 +1493,7 @@ pub(crate) fn schema_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::Tool
 /// Version 2: names plus the full canonical input schemas, full SHA-256.
 pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::ToolDef>) -> String {
     let mut entries: Vec<(String, String)> =
-        tools.map(|t| (t.name.to_string(), canonical(&t.input_schema).to_string())).collect();
+        tools.map(|t| (t.name.to_string(), ua_core::canonical::to_string(&t.input_schema))).collect();
     entries.sort();
     let mut h = Sha256::new();
     for (name, schema) in entries {
@@ -1519,16 +1508,18 @@ pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::To
 fn call_counts(c: &Connection) -> UaResult<Value> {
     let day = agents::ago(86_400);
     let (total, last_call): (i64, Option<String>) =
-        c.query_row("SELECT COUNT(*), MAX(started_at) FROM tool_calls", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        c.query_row("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1",
+        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
         [&day],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let mut by_transport = Map::new();
     {
         let mut stmt = c.prepare(
-            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 \
+            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
              GROUP BY transport ORDER BY transport",
         )?;
         let rows = stmt
@@ -1541,7 +1532,7 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
     let mut top = Vec::new();
     {
         let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 \
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
              GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20",
         )?;
         let rows = stmt

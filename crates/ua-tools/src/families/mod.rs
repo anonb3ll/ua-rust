@@ -52,7 +52,7 @@ use ua_store::SchemaPart;
 use crate::registry::Registry;
 
 pub fn schema_parts() -> Vec<SchemaPart> {
-    let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2];
+    let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2, core_schema::SCHEMA_V3];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
     parts.extend(continuity::schema_parts());

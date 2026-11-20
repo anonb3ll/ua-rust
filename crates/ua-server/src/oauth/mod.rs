@@ -152,21 +152,25 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
-/// A small, framing-proof, uncached HTML page.
+/// Content-Security-Policy of the sign-in, passkey and consent pages: no
+/// inline script or style, scripts and styles from this hub only, fetches
+/// back to this hub only. `form-action` is left open on purpose: the OAuth
+/// consent form's answer redirects to the client's `redirect_uri`, which
+/// browsers check against `form-action`.
+pub const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'";
+
+/// A small, framing-proof, uncached HTML page. Its style comes from
+/// [`crate::login::PAGE_CSS_PATH`]; a page needing script loads
+/// [`crate::login::LOGIN_JS_PATH`].
 pub fn html_page(status: StatusCode, title: &str, body: &str) -> Response {
     let page = format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{t}</title>\
-<style>body{{font:16px/1.45 system-ui,sans-serif;max-width:34rem;margin:3rem auto;padding:0 1rem;color:#1e293b}}\
-.card{{border:1px solid #cbd5e1;border-radius:8px;padding:1.25rem 1.5rem}}h1{{font-size:1.3rem;margin-top:0}}\
-label,select,input,button{{display:block;width:100%;box-sizing:border-box;margin:.4rem 0;font:inherit}}\
-select,input{{padding:.5rem;border:1px solid #cbd5e1;border-radius:6px}}\
-button{{padding:.6rem;border:0;border-radius:6px;background:#1d4ed8;color:#fff;cursor:pointer}}\
-button.secondary{{background:#e2e8f0;color:#0f172a}}.hint{{color:#64748b;font-size:.9rem}}code{{word-break:break-all}}\
-@media (prefers-color-scheme:dark){{body{{background:#0f172a;color:#e2e8f0}}.card{{border-color:#334155}}\
-select,input{{background:#1e293b;color:#e2e8f0;border-color:#334155}}}}</style></head>\
+<link rel=\"stylesheet\" href=\"{css}\"></head>\
 <body><div class=\"card\">{body}</div></body></html>",
         t = html_escape(title),
+        css = crate::login::PAGE_CSS_PATH,
     );
     (
         status,
@@ -174,7 +178,7 @@ select,input{{background:#1e293b;color:#e2e8f0;border-color:#334155}}}}</style><
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
             (header::X_FRAME_OPTIONS, "DENY"),
-            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
         page,

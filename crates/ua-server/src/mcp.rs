@@ -104,8 +104,18 @@ impl ServerHandler for UaMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let caller = self.caller(&ctx);
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
-        let call = self.state.registry.call(&self.state.hub, &caller, &request.name, args);
-        let result = grant::scope(self.grant(&ctx), call).await;
+        let (registry, hub, name) =
+            (self.state.registry.clone(), self.state.hub.clone(), request.name.to_string());
+        // Its own tracked task: a shutdown waits for the call to finish (up
+        // to its grace period) even if the session awaiting it is dropped.
+        let call =
+            grant::scope(self.grant(&ctx), async move { registry.call(&hub, &caller, &name, args).await });
+        let result = self
+            .state
+            .calls
+            .spawn(call)
+            .await
+            .unwrap_or_else(|e| Err(ua_core::UaError::internal(format!("tool call task failed: {e}"))));
         Ok(match result {
             Ok(v) => CallToolResult::structured(v),
             Err(e) => CallToolResult::structured_error(e.to_json()),
