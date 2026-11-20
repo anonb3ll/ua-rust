@@ -125,6 +125,11 @@ pub fn gate(
     if let Some(approval_id) = pending {
         return Ok(GateOutcome::Pending { approval_id });
     }
+    park(tx, caller, tool, &canon, &now).map(|approval_id| GateOutcome::Pending { approval_id })
+}
+
+/// Insert a pending request for `canon` and ledger it.
+fn park(tx: &mut WriteTx<'_>, caller: &Caller, tool: &str, canon: &str, now: &str) -> UaResult<i64> {
     tx.execute(
         "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
          VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
@@ -139,7 +144,103 @@ pub fn gate(
         )
         .by(caller.label.clone()),
     )?;
-    Ok(GateOutcome::Pending { approval_id })
+    Ok(approval_id)
+}
+
+/// Where an approval for one exact call stands, without consuming a pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestState {
+    /// A live, unconsumed pass: the call would run.
+    Approved {
+        approval_id: i64,
+    },
+    Pending {
+        approval_id: i64,
+    },
+    Denied {
+        approval_id: i64,
+        reason: Option<String>,
+    },
+}
+
+impl RequestState {
+    pub fn approval_id(&self) -> i64 {
+        match self {
+            RequestState::Approved { approval_id }
+            | RequestState::Pending { approval_id }
+            | RequestState::Denied { approval_id, .. } => *approval_id,
+        }
+    }
+
+    pub fn status(&self) -> &'static str {
+        match self {
+            RequestState::Approved { .. } => "approved",
+            RequestState::Pending { .. } => "pending",
+            RequestState::Denied { .. } => "denied",
+        }
+    }
+}
+
+/// The state of `requester`'s approval for this exact call, read-only: a
+/// denial wins (as in [`gate`]), then a live pass, then a pending request.
+/// `None` when nothing was asked yet.
+pub fn peek(
+    c: &rusqlite::Connection,
+    cfg: &Config,
+    requester: &str,
+    tool: &str,
+    args: &Value,
+) -> UaResult<Option<RequestState>> {
+    let canon = canonical_payload(args);
+    let denied: Option<(i64, Option<String>)> = c
+        .query_row(
+            "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+             AND status = 'denied' ORDER BY id DESC LIMIT 1",
+            params![tool, canon, requester],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((approval_id, reason)) = denied {
+        return Ok(Some(RequestState::Denied { approval_id, reason }));
+    }
+    let mut stmt = c.prepare(
+        "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+         AND status = 'approved' ORDER BY id ASC",
+    )?;
+    let passes: Vec<(i64, Option<String>)> = stmt
+        .query_map(params![tool, canon, requester], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    if let Some((approval_id, _)) = passes.into_iter().find(|(_, at)| !pass_expired(cfg, at.as_deref())) {
+        return Ok(Some(RequestState::Approved { approval_id }));
+    }
+    let pending: Option<i64> = c
+        .query_row(
+            "SELECT id FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+             AND status = 'pending' ORDER BY id ASC LIMIT 1",
+            params![tool, canon, requester],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(pending.map(|approval_id| RequestState::Pending { approval_id }))
+}
+
+/// Ask for an approval of this exact call without running it: report a
+/// pass, denial or pending request that already exists, else park a new
+/// pending request. Never consumes a pass; [`gate`] does that when the call
+/// runs.
+pub fn request(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+) -> UaResult<RequestState> {
+    if let Some(state) = peek(tx, cfg, &caller.label, tool, args)? {
+        return Ok(state);
+    }
+    let now = ua_core::time::now();
+    let approval_id = park(tx, caller, tool, &canonical_payload(args), &now)?;
+    Ok(RequestState::Pending { approval_id })
 }
 
 /// One approval row as returned to clients.

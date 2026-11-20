@@ -1,0 +1,153 @@
+{
+  "bundle": {
+    "mcp_servers": [
+      {
+        "auth": "oauth",
+        "name": "dup",
+        "url": "https://one.example.com/mcp"
+      },
+      {
+        "auth": "oauth",
+        "name": "dup",
+        "transport": "http",
+        "url": "https://two.example.com/mcp"
+      }
+    ],
+    "rules": {
+      "agents": "agents\n",
+      "notes": "custom notes\n",
+      "zed": "zed rules"
+    },
+    "skills": [
+      {
+        "body": "b1",
+        "description": "first",
+        "name": "s1"
+      }
+    ],
+    "surfaces": {
+      "claude": {
+        "kind": "mcp",
+        "path": "nested/dir/CLAUDE.md"
+      },
+      "codex": {
+        "kind": "rules",
+        "path": "codex/rules.md"
+      },
+      "empty-rules": {
+        "kind": "rules",
+        "path": "EMPTY.md"
+      },
+      "notes": {
+        "kind": "rules",
+        "path": "docs/NOTES.md"
+      },
+      "plain": {
+        "kind": "skills",
+        "path": ".plain"
+      },
+      "zed": {
+        "kind": "mcp",
+        "path": "zed/settings.json"
+      }
+    },
+    "version": "custom.2"
+  },
+  "bundle_json": "{\"mcp_servers\":[{\"auth\":\"oauth\",\"name\":\"dup\",\"url\":\"https://one.example.com/mcp\"},{\"auth\":\"oauth\",\"name\":\"dup\",\"transport\":\"http\",\"url\":\"https://two.example.com/mcp\"}],\"rules\":{\"agents\":\"agents\\n\",\"notes\":\"custom notes\\n\",\"zed\":\"zed rules\"},\"skills\":[{\"body\":\"b1\",\"description\":\"first\",\"name\":\"s1\"}],\"surfaces\":{\"claude\":{\"kind\":\"mcp\",\"path\":\"nested/dir/CLAUDE.md\"},\"codex\":{\"kind\":\"rules\",\"path\":\"codex/rules.md\"},\"empty-rules\":{\"kind\":\"rules\",\"path\":\"EMPTY.md\"},\"notes\":{\"kind\":\"rules\",\"path\":\"docs/NOTES.md\"},\"plain\":{\"kind\":\"skills\",\"path\":\".plain\"},\"zed\":{\"kind\":\"mcp\",\"path\":\"zed/settings.json\"}},\"version\":\"custom.2\"}",
+  "case": "custom_surfaces",
+  "raw": {
+    "mcp_servers": [
+      {
+        "name": "dup",
+        "url": "https://one.example.com/mcp"
+      },
+      {
+        "name": "dup",
+        "transport": "http",
+        "url": "https://two.example.com/mcp"
+      }
+    ],
+    "rules": {
+      "agents": "agents\n",
+      "notes": "custom notes\n",
+      "zed": "zed rules"
+    },
+    "skills": [
+      {
+        "body": "b1",
+        "description": "first",
+        "name": "s1"
+      }
+    ],
+    "surfaces": {
+      "Notes": {
+        "kind": "rules",
+        "path": "docs/NOTES.md"
+      },
+      "claude": {
+        "kind": "mcp",
+        "path": "nested/dir/CLAUDE.md"
+      },
+      "codex": {
+        "kind": "rules",
+        "path": "codex/rules.md"
+      },
+      "empty-rules": {
+        "path": "EMPTY.md"
+      },
+      "plain": {
+        "kind": "skills",
+        "path": ".plain"
+      },
+      "zed": {
+        "kind": "mcp",
+        "path": "zed/settings.json"
+      }
+    },
+    "version": "custom.2"
+  },
+  "rendered": {
+    "claude": {
+      "content": "# Hub-managed claude rules\n# bundle custom.2\n# (empty \u2014 publish rules.<surface> to fill)\n",
+      "diff_from_empty": "--- a/nested/dir/CLAUDE.md\n+++ b/nested/dir/CLAUDE.md\n@@ -0,0 +1,3 @@\n+# Hub-managed claude rules\n+# bundle custom.2\n+# (empty \u2014 publish rules.<surface> to fill)\n",
+      "hash": "cb4dda1e6f2be24a1c14857a80ea17458165f73e48a4f76a05808a7a8e3b7f2f",
+      "kind": "mcp",
+      "path": "nested/dir/CLAUDE.md"
+    },
+    "codex": {
+      "content": "# Hub-managed codex rules\n# bundle custom.2\n# (empty \u2014 publish rules.<surface> to fill)\n",
+      "diff_from_empty": "--- a/codex/rules.md\n+++ b/codex/rules.md\n@@ -0,0 +1,3 @@\n+# Hub-managed codex rules\n+# bundle custom.2\n+# (empty \u2014 publish rules.<surface> to fill)\n",
+      "hash": "dc8cdcb78ac14ee90ba366c072b57ac1791d9e689ae91efc9f6007849f636628",
+      "kind": "rules",
+      "path": "codex/rules.md"
+    },
+    "empty-rules": {
+      "content": "# Hub-managed empty-rules rules\n# bundle custom.2\n# (empty \u2014 publish rules.<surface> to fill)\n",
+      "diff_from_empty": "--- a/EMPTY.md\n+++ b/EMPTY.md\n@@ -0,0 +1,3 @@\n+# Hub-managed empty-rules rules\n+# bundle custom.2\n+# (empty \u2014 publish rules.<surface> to fill)\n",
+      "hash": "4ed459e6674ba183e5b9bd10860b6ccac6e9f9e6a12be9283c432c02edda7d18",
+      "kind": "rules",
+      "path": "EMPTY.md"
+    },
+    "notes": {
+      "content": "custom notes\n",
+      "diff_from_empty": "--- a/docs/NOTES.md\n+++ b/docs/NOTES.md\n@@ -0,0 +1 @@\n+custom notes\n",
+      "hash": "d285a66860c24340a79b7e27e915ed8df7172cb410dca013a1474b270267f701",
+      "kind": "rules",
+      "path": "docs/NOTES.md"
+    },
+    "plain": {
+      "content": "{\n  \"mcp\": {\n    \"dup\": {\n      \"auth\": \"oauth\",\n      \"type\": \"http\",\n      \"url\": \"https://two.example.com/mcp\"\n    }\n  },\n  \"rules\": \"agents\\n\",\n  \"skills\": [\n    {\n      \"body\": \"b1\",\n      \"description\": \"first\",\n      \"name\": \"s1\"\n    }\n  ],\n  \"ua_bundle_version\": \"custom.2\"\n}\n",
+      "diff_from_empty": "--- a/.plain\n+++ b/.plain\n@@ -0,0 +1,18 @@\n+{\n+  \"mcp\": {\n+    \"dup\": {\n+      \"auth\": \"oauth\",\n+      \"type\": \"http\",\n+      \"url\": \"https://two.example.com/mcp\"\n+    }\n+  },\n+  \"rules\": \"agents\\n\",\n+  \"skills\": [\n+    {\n+      \"body\": \"b1\",\n+      \"description\": \"first\",\n+      \"name\": \"s1\"\n+    }\n+  ],\n+  \"ua_bundle_version\": \"custom.2\"\n+}\n",
+      "hash": "7241d1e4f36ab841330b46675797e5a010feb8ca3a9d877e74be714b6d2f74d3",
+      "kind": "skills",
+      "path": ".plain"
+    },
+    "zed": {
+      "content": "{\n  \"mcp\": {\n    \"dup\": {\n      \"auth\": \"oauth\",\n      \"type\": \"http\",\n      \"url\": \"https://two.example.com/mcp\"\n    }\n  },\n  \"rules\": \"zed rules\",\n  \"skills\": [\n    {\n      \"body\": \"b1\",\n      \"description\": \"first\",\n      \"name\": \"s1\"\n    }\n  ],\n  \"ua_bundle_version\": \"custom.2\"\n}\n",
+      "diff_from_empty": "--- a/zed/settings.json\n+++ b/zed/settings.json\n@@ -0,0 +1,18 @@\n+{\n+  \"mcp\": {\n+    \"dup\": {\n+      \"auth\": \"oauth\",\n+      \"type\": \"http\",\n+      \"url\": \"https://two.example.com/mcp\"\n+    }\n+  },\n+  \"rules\": \"zed rules\",\n+  \"skills\": [\n+    {\n+      \"body\": \"b1\",\n+      \"description\": \"first\",\n+      \"name\": \"s1\"\n+    }\n+  ],\n+  \"ua_bundle_version\": \"custom.2\"\n+}\n",
+      "hash": "c5ae2bca7a7124ac9af6aa75a6361e7f44405a3a7b1016da7e21aad76a0c4210",
+      "kind": "mcp",
+      "path": "zed/settings.json"
+    }
+  }
+}

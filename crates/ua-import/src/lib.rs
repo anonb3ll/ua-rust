@@ -8,7 +8,8 @@
 //! What is copied (see [`map::MAPS`]): tasks with dependencies, comments and
 //! goals, plans, delegations, memory notes and their versions (ids kept, the
 //! full-text index rebuilt), the message index, agents, agent token hashes,
-//! approval history, and the event ledger.
+//! approval history, remote nodes, skill versions and assignments, harness
+//! config bundles, and the event ledger.
 //!
 //! The ledger is copied byte-exactly, keeping `seq` (the Python `ROWID`),
 //! ULIDs, `prev_hash` and `entry_hash`. The whole source chain is verified

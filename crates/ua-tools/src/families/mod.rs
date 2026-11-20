@@ -17,6 +17,7 @@ pub mod evidence;
 pub mod export;
 pub mod governance;
 pub mod graph;
+pub mod harness_config;
 pub mod injection;
 pub mod memory;
 pub mod messaging;
@@ -28,6 +29,7 @@ pub mod plans;
 pub mod provider_accounts;
 pub mod routines;
 pub mod sessions_lifecycle;
+pub mod skill_registry;
 pub mod skills;
 pub mod tasks;
 pub mod tokens;
@@ -54,6 +56,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(delegation::SCHEMA);
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
+    parts.push(harness_config::SCHEMA);
     parts.push(messaging::SCHEMA);
     parts.extend(node_queue::schema_parts());
     parts.push(nodes::SCHEMA);
@@ -61,6 +64,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(plans::SCHEMA);
     parts.push(provider_accounts::SCHEMA);
     parts.push(routines::SCHEMA);
+    parts.push(skill_registry::SCHEMA);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
@@ -82,6 +86,7 @@ pub fn register(r: &mut Registry) {
     export::register(r);
     governance::register(r);
     graph::register(r);
+    harness_config::register(r);
     injection::register(r);
     memory::register(r);
     messaging::register(r);
@@ -93,6 +98,7 @@ pub fn register(r: &mut Registry) {
     provider_accounts::register(r);
     routines::register(r);
     sessions_lifecycle::register(r);
+    skill_registry::register(r);
     skills::register(r);
     tasks::register(r);
     tokens::register(r);

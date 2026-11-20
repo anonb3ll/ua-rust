@@ -13,6 +13,8 @@ calls out to the hub and never listens, so a node needs no inbound port.
 | `GET /api/nodes` | `node_list` + `node_items` | Any verified caller |
 | `GET /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` | Any verified caller |
 | `POST /api/node/session_credential` | `node_session_credential` | The node's agent |
+| `GET\|POST /api/node/config` | `node_config` | The node's agent |
+| `GET /api/harness-config` | `harness_config_status` | Any verified caller |
 
 A node name belongs to the agent label that first registered it. One agent
 holds at most `node_max_per_agent` nodes in service. Host facts are bounded on
@@ -307,10 +309,87 @@ outcomes are ledgered on `agent.wake`.
 A client that hangs up mid-poll may leave an offer it never received; it
 lapses after 120 seconds and the session is offered again.
 
+## Harness config bundle
+
+One versioned bundle on the hub is the source of truth for the rules text,
+skills and MCP server lists of every node's harnesses. The node renders it
+into files under its harness-config root (by default
+`~/.unified_agent/harness-config`), reports what differs, and writes a file
+only after a human approved that exact change.
+
+A bundle has a `version`, `rules` (text per surface), `skills` (`name`,
+`description`, `body`), `mcp_servers` (`name`, `url`, `auth`, `transport`) and
+`surfaces` (surface name to `path` and `kind`). Without `surfaces` it renders
+the five default ones:
+
+| Surface | Path | Renders |
+|---|---|---|
+| `claude` | `CLAUDE.md` | `rules.claude` |
+| `agents` | `AGENTS.md` | `rules.agents`, else `rules.claude` |
+| `cursor` | `.cursorrules` | `rules.cursor` |
+| `codex` | `codex/config.toml` | MCP servers, skill descriptions, `rules.codex` or `rules.agents` |
+| `opencode` | `opencode/opencode.json` | MCP servers, skills, `rules.opencode` or `rules.agents` (JSON) |
+
+A rules surface without text gets a placeholder. Any other declared surface
+renders like `opencode`. MCP servers must use OAuth or `none`: bearer, token
+or header auth, and any embedded token, key or header, refuse the bundle.
+
+**Byte compatibility.** Python nodes render the served bundle themselves and
+compare each surface by SHA-256, and the hub accepts a drift report only for
+its own render. The Rust renderer therefore produces exactly the bytes of the
+Python hub's renderer: the same placeholders and fallbacks, the same TOML
+lines, and `json.dumps(indent=2, sort_keys=True)` with ASCII escapes for JSON
+surfaces. `crates/ua-tools/tests/fixtures/harness_config/` holds bundles
+rendered by the Python module; `crates/ua-tools/tests/harness_config.rs`
+asserts byte equality for every surface. To regenerate them, run
+`scripts/harness_config_fixtures.py` with the Python hub's interpreter and
+`--python-src` pointing at its source tree.
+
+**Publishing.** `harness_config_publish {bundle}` is an operator action (a
+human or a lifecycle operator). It always needs a one-time human approval,
+bound to the version and the SHA-256 of the canonical bundle, with the
+surfaces, skills and servers listed for the approver. A version is published
+once; publishing a new one makes it the active bundle.
+
+**Skills from the registry.** `skill_registry` keeps immutable skill versions
+keyed by content hash and assigns them to an agent label or a profile (an
+agent assignment wins over a profile one). The bundle a node is served is the
+active bundle plus the skills resolved for the node's agent and its default
+profile, appended after the bundle's own skills; a bundle skill of the same
+name wins. `assigned_skills` in the answer says what was included. Changing
+an assignment changes the rendered hashes, so nodes report drift again and a
+human approves the new content.
+
+**The node's calls** (`POST /api/node/config` with `node` and `action`;
+`GET /api/node/config?node=` is `get`):
+
+| Action | Body | Answer |
+|---|---|---|
+| `get` | | `{version, published_at, published_by, bundle, rendered: {surface: {path, hash, kind, content}}, surfaces, apply_grants, proposal_mode, config_root_hint, assigned_skills}`; `{bundle: null, version: null, rendered: {}, apply_grants: [], proposal_mode: true}` before any publish |
+| `report` | `bundle_version`, `proposals: [{surface, path, desired_hash, observed_hash?, diff?}]` | `{ok, bundle_version, proposals: [{proposal_id, surface, path, approval_id, status, inbox}], apply_grants}` |
+| `applied` | `surface`, `desired_hash` | `{ok, proposal_id, surface, bundle_version, approval_id}` |
+
+A report naming another version is refused with `409`, more than 32
+proposals with `400`, and a `desired_hash` that is not the hub's own render
+of that surface with `409`. Each accepted proposal parks (or reuses) one
+`harness_config_apply` approval bound to `{node, surface, path,
+bundle_version, desired_hash}`; its `status` is `pending`, `approved` or
+`denied`. `apply_grants` lists the surfaces whose pass is approved and whose
+hash is still the current render. `applied` consumes that pass and marks the
+proposal applied; while the approval is pending it answers `202
+{"status": "approval_pending", "approval_id", "code": "approval_required",
+"tool": "harness_config_apply"}`. Only the node's own agent may call: another
+label gets `403 node_owned_elsewhere`, an unregistered node `404`.
+
+Publish, report and applied are ledgered on `agent.harness_config`. The
+Python node keys on no hub feature for this route.
+
+Not ported: the vault inbox note the Python hub wrote per pending proposal
+(`inbox` is always `null`), multi-file skill packages, and the skill catalog.
+
 ## Not yet ported
 
-The harness config bundle route (`/api/node/config`) answers `501`.
-Resuming or adopting native sessions is not ported either.
+Resuming or adopting native sessions is not ported.
 
 ## Agent lifecycle and holds
 

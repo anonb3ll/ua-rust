@@ -407,7 +407,7 @@ fn collect_skill_dirs(root: &Path, shown: &str) -> UaResult<(Vec<PathBuf>, PathB
     Ok((children, root.to_path_buf()))
 }
 
-fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &str) -> Value {
+pub(crate) fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &str) -> Value {
     let truncated = skill_dirs.len() > MAX_SKILLS;
     let skill_dirs: Vec<PathBuf> = skill_dirs.into_iter().take(MAX_SKILLS).collect();
     let rel = |d: &Path| -> String {
