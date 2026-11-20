@@ -182,7 +182,7 @@ fn dev() -> Caller {
     caller("builder-1", ActorKind::Agent, Profile::Developer)
 }
 
-fn steward() -> Caller {
+fn reviewer() -> Caller {
     caller("reviewer-1", ActorKind::Agent, Profile::Reviewer)
 }
 
@@ -626,7 +626,7 @@ async fn empty_read_profiles_mean_humans_and_operators_only() {
     h.register_stdio("open", json!({ "read_profiles": [], "secrets": secrets })).await;
     let echo = json!({ "server": "open", "tool": "echo" });
     assert_eq!(reason(&h.err(&dev(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
-    assert_eq!(reason(&h.err(&steward(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
+    assert_eq!(reason(&h.err(&reviewer(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
     let anon = Caller::local("someone", Transport::Stdio);
     assert_eq!(reason(&h.err(&anon, "mcp_gateway", echo.clone()).await), "identity_required");
     // The configured operator identity reads, in a profile that has the gateway.
@@ -677,12 +677,12 @@ async fn read_profiles_and_missing_secrets_refuse_reads() {
     h.register_stdio("fake", json!({ "read_profiles": ["reviewer"] })).await;
     let e = h.err(&dev(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
     assert_eq!(reason(&e), "read_profile_denied");
-    // The steward may read, but no secret is stored for the server yet.
-    let e = h.err(&steward(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+    // The reviewer may read, but no secret is stored for the server yet.
+    let e = h.err(&reviewer(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
     assert_eq!(reason(&e), "secret_unavailable");
     // A secret bound to another consumer is not handed over.
     h.set_secret("fake-token", "mcp:other", TOKEN).await;
-    let e = h.err(&steward(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
+    let e = h.err(&reviewer(), "mcp_gateway", json!({ "server": "fake", "tool": "echo" })).await;
     assert_eq!(reason(&e), "secret_unavailable");
 }
 

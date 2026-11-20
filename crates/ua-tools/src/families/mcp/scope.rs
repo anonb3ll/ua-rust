@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(c("10.1.2.3"), Some(Private));
         assert_eq!(c("172.16.0.1"), Some(Private));
         assert_eq!(c("192.168.1.1"), Some(Private));
-        assert_eq!(c("100.101.102.103"), Some(Private), "tailnet / CGNAT");
+        assert_eq!(c("100.64.0.1"), Some(Private), "tailnet / CGNAT");
         assert_eq!(c("fd7a:115c:a1e0::1"), Some(Private), "tailnet ULA");
         assert_eq!(c("::ffff:10.0.0.1"), Some(Private));
         assert_eq!(c("8.8.8.8"), Some(Public));
