@@ -1,12 +1,26 @@
 //! Evidence reports and state consistency checks.
 //!
-//! Tools: `evidence_report` and `state_sync_verify`.
+//! Tools: `evidence_report`, `evidence_append` and `state_sync_verify`.
+//!
+//! `evidence_append` is the canonical writer for client evidence: one ledger
+//! event on an `sdk.` channel, attributed to the verified caller (never to a
+//! label in the body), deduplicated per caller by an optional key.
+//!
+//! Client evidence is budgeted per identity per rolling hour
+//! (`evidence_append_max_per_hour`, `evidence_append_max_bytes_per_hour`),
+//! counted from the ledger itself so a restart does not reset it.
 //!
 //! `evidence_report` assembles, per task, the ledger events that mention it
 //! (with their hashes), the task row, its approvals and delegations, and the
 //! tool calls its participants made inside the task's lifetime, plus the
 //! ledger's chain verification. Tool calls carry no task id, so they are
 //! attributed by window and caller, and labelled as such.
+//!
+//! An `sdk.` event is whatever its client wrote, `task_id` included, so it
+//! never attributes a task, makes a participant or counts as proof. Events
+//! that name a task are listed apart under the record's `client_asserted`
+//! section, flagged as client assertions, with their payloads marked
+//! untrusted.
 //!
 //! `state_sync_verify` compares every external-content FTS5 index with its
 //! base table, lists dangling references (`PRAGMA foreign_key_check` plus
@@ -25,8 +39,10 @@ use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use crate::families::injection::mark_untrusted;
 use crate::families::observability::{normalize_since, normalize_until};
 use crate::families::plans::row_map;
+use crate::families::platform::object_ref;
 use crate::registry::{Registry, ToolCtx, tool};
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -67,7 +83,8 @@ pub struct ReportArgs {
     pub since: Option<String>,
     /// ISO upper bound (a bare date means the end of that day).
     pub until: Option<String>,
-    /// Agent label: the claimant, a `claimed-by:` note, or a ledger originator on the task.
+    /// Agent label: the claimant, a `claimed-by:` note, or a ledger originator on the task
+    /// (client `sdk.` events do not count).
     pub agent: Option<String>,
     /// Project stream name.
     pub project: Option<String>,
@@ -234,6 +251,37 @@ fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, unt
     }))
 }
 
+/// The `client_asserted` section of one record: `sdk.` events whose
+/// payload names the task. Listed, never counted as attribution or proof.
+fn client_asserted(rows: &[Map<String, Value>]) -> Value {
+    let events: Vec<Value> = rows
+        .iter()
+        .take(CLIENT_EVENTS_CAP)
+        .map(|row| {
+            let mut e = row.clone();
+            let inline =
+                e.remove("payload").and_then(|p| p.as_str().and_then(|s| serde_json::from_str(s).ok()));
+            e.insert("payload_inline".into(), json!(inline.is_some()));
+            e.insert("payload".into(), inline.unwrap_or(Value::Null));
+            let ulid = e.get("ulid").and_then(Value::as_str).unwrap_or_default().to_string();
+            e.insert("platform".into(), json!(object_ref("evidence_event", &ulid)));
+            let originator = e.get("originator").and_then(Value::as_str).map(str::to_string);
+            let mut v = Value::Object(e);
+            mark_untrusted(&mut v, CLIENT_EVIDENCE_SOURCE, originator.as_deref());
+            v
+        })
+        .collect();
+    json!({
+        "asserted_by": "client",
+        "verified": false,
+        "counts_as_attribution": false,
+        "note": "sdk. events written through evidence_append; their task_id is the client's claim",
+        "total": rows.len(),
+        "truncated": rows.len() > CLIENT_EVENTS_CAP,
+        "events": events,
+    })
+}
+
 fn build_report(
     c: &Connection,
     a: &ReportArgs,
@@ -291,8 +339,8 @@ fn build_report(
     if let Some(agent) = a.agent.as_deref() {
         sql.push_str(
             " AND (tasks.claimed_by = ? OR instr(COALESCE(tasks.notes, ''), ?) > 0 OR EXISTS (\
-             SELECT 1 FROM event_log e WHERE e.originator = ? AND json_valid(e.payload) \
-             AND CAST(json_extract(e.payload, '$.task_id') AS INTEGER) = tasks.id))",
+             SELECT 1 FROM event_log e WHERE e.originator = ? AND NOT (e.channel >= 'sdk.' AND e.channel < 'sdk/') \
+             AND json_valid(e.payload) AND CAST(json_extract(e.payload, '$.task_id') AS INTEGER) = tasks.id))",
         );
         args.push(SqlValue::Text(agent.to_string()));
         args.push(SqlValue::Text(format!("claimed-by: {agent}")));
@@ -331,7 +379,7 @@ fn build_report(
     tasks.truncate(limit as usize);
     let ids: Vec<i64> = tasks.iter().filter_map(|t| t.get("id").and_then(Value::as_i64)).collect();
 
-    let (events, approvals, delegations) = if ids.is_empty() {
+    let (events, client_events, approvals, delegations) = if ids.is_empty() {
         Default::default()
     } else {
         (
@@ -339,7 +387,20 @@ fn build_report(
                 c,
                 "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
                  originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
+                 AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
                  AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({ids}) ORDER BY seq",
+                &ids,
+            )?,
+            grouped(
+                c,
+                &format!(
+                    "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
+                     originator, created_at, entry_hash, length(CAST(payload AS BLOB)) AS payload_bytes, \
+                     CASE WHEN length(CAST(payload AS BLOB)) <= {CLIENT_PAYLOAD_INLINE} THEN payload END \
+                     AS payload FROM event_log WHERE channel >= 'sdk.' AND channel < 'sdk/' \
+                     AND json_valid(payload) AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({{ids}}) \
+                     ORDER BY seq"
+                ),
                 &ids,
             )?,
             grouped(
@@ -367,6 +428,7 @@ fn build_report(
         let evs: Vec<Value> =
             events.get(&id).cloned().unwrap_or_default().into_iter().map(Value::Object).collect();
         let apps = approvals.get(&id).cloned().unwrap_or_default();
+        let asserted = client_asserted(client_events.get(&id).map(Vec::as_slice).unwrap_or_default());
         let dels = delegations.get(&id).cloned().unwrap_or_default();
 
         let claim_originator = evs
@@ -424,6 +486,7 @@ fn build_report(
             "delegations": dels,
             "proof": proof(task, &evs, chain_ok),
             "events": evs,
+            "client_asserted": asserted,
             "tool_calls": calls,
         }));
     }
@@ -651,6 +714,132 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Client evidence.
+
+/// Channels `evidence_append` may write: a client cannot forge hub events.
+pub const CLIENT_CHANNEL_PREFIX: &str = "sdk.";
+/// The `trust.source` of a client evidence payload.
+pub const CLIENT_EVIDENCE_SOURCE: &str = "sdk_evidence";
+/// Whether `channel` holds client-written evidence.
+pub fn is_client_channel(channel: &str) -> bool {
+    channel.starts_with(CLIENT_CHANNEL_PREFIX)
+}
+/// Client events listed per task in a report.
+const CLIENT_EVENTS_CAP: usize = 20;
+/// Largest client payload a report shows inline (bytes); larger ones are
+/// read through their `platform` reference.
+const CLIENT_PAYLOAD_INLINE: usize = 4096;
+const CHANNEL_MAX: usize = 120;
+const DEDUPE_MAX: usize = 256;
+/// Largest serialized payload `evidence_append` stores.
+const PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppendArgs {
+    /// Channel in the `sdk.` namespace, at most 120 characters.
+    pub channel: String,
+    /// The event body (a JSON object, at most 64 KiB serialized).
+    pub payload: Map<String, Value>,
+    /// Idempotency key (1-256 characters): a repeat with the same key from the
+    /// same caller appends nothing and returns the first event.
+    pub dedupe_key: Option<String>,
+}
+
+/// The stored dedupe key: namespaced by caller, so one identity can neither
+/// observe nor pre-empt another's keys.
+fn client_dedupe_key(label: &str, key: &str) -> String {
+    format!("sdk-evidence:{label}:{key}")
+}
+
+/// `sdk.` events and their stored payload bytes that `label` appended in the
+/// last hour, read from the ledger.
+fn client_usage(c: &Connection, label: &str) -> UaResult<(i64, i64)> {
+    let cutoff = jiff::Timestamp::from_millisecond(ua_core::time::now_ms() - 3_600_000)
+        .map(ua_core::time::format_ts)
+        .map_err(|e| UaError::internal(format!("clock: {e}")))?;
+    Ok(c.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM event_log \
+         WHERE channel >= 'sdk.' AND channel < 'sdk/' AND originator = ?1 AND created_at > ?2",
+        rusqlite::params![label, cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+async fn evidence_append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
+    if !matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human) {
+        return Err(UaError::denied(
+            "identity_required",
+            "evidence_append requires an authenticated identity; evidence is attributed to it",
+        ));
+    }
+    let channel = a.channel.trim().to_string();
+    if !channel.starts_with(CLIENT_CHANNEL_PREFIX)
+        || channel.len() <= CLIENT_CHANNEL_PREFIX.len()
+        || channel.chars().count() > CHANNEL_MAX
+        || channel.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(UaError::invalid(format!(
+            "channel must use the {CLIENT_CHANNEL_PREFIX} namespace (at most {CHANNEL_MAX} characters, no spaces)"
+        )));
+    }
+    let dedupe = match a.dedupe_key {
+        None => None,
+        Some(k) if !k.trim().is_empty() && k.chars().count() <= DEDUPE_MAX => Some(k.trim().to_string()),
+        Some(_) => {
+            return Err(UaError::invalid(format!(
+                "dedupe_key must be a non-empty string of at most {DEDUPE_MAX} characters"
+            )));
+        }
+    };
+    let payload = Value::Object(a.payload);
+    let size = serde_json::to_vec(&payload)?.len();
+    if size > PAYLOAD_MAX_BYTES {
+        return Err(UaError::invalid(format!("payload is larger than {PAYLOAD_MAX_BYTES} bytes")));
+    }
+    let label = ctx.caller.label.clone();
+    let stored_key = dedupe.as_deref().map(|k| client_dedupe_key(&label, k));
+    let max_events = i64::from(ctx.hub.cfg().evidence_append_max_per_hour);
+    let max_bytes = i64::try_from(ctx.hub.cfg().evidence_append_max_bytes_per_hour).unwrap_or(i64::MAX);
+    let (ulid, inserted) = ctx
+        .hub
+        .db()
+        .write_async(move |tx| {
+            // A repeat returns the first event and costs nothing.
+            if let Some(k) = &stored_key
+                && let Some(ulid) = tx
+                    .query_row("SELECT ulid FROM event_log WHERE dedupe_key = ?1", [k], |r| r.get(0))
+                    .optional()?
+            {
+                return Ok((ulid, false));
+            }
+            // Counted inside the write transaction: the single writer
+            // serializes appends, so concurrent calls cannot overshoot.
+            let (events, bytes) = client_usage(tx, &label)?;
+            if events + 1 > max_events || bytes.saturating_add(size as i64) > max_bytes {
+                return Err(UaError::denied(
+                    "rate_limited",
+                    format!(
+                        "evidence budget spent: {label} appended {events} events ({bytes} bytes) in the last hour; \
+                         the limit is {max_events} events and {max_bytes} bytes per hour \
+                         (evidence_append_max_per_hour, evidence_append_max_bytes_per_hour)"
+                    ),
+                ));
+            }
+            let mut input = EventInput::new(channel, payload).by(label);
+            if let Some(k) = &stored_key {
+                input = input.dedupe(k.clone());
+            }
+            match ledger::append(tx, input)? {
+                Some(ev) => Ok((ev.ulid, true)),
+                None => Err(UaError::internal("dedupe key appeared mid-transaction")),
+            }
+        })
+        .await?;
+    Ok(json!({ "event_ulid": ulid, "inserted": inserted }))
+}
+
+// ---------------------------------------------------------------------------
 // Registration.
 
 pub fn register(r: &mut Registry) {
@@ -660,12 +849,26 @@ pub fn register(r: &mut Registry) {
             "Read-only evidence for task completion: per task, the ledger events that mention it with their \
              hashes, the task row, approvals, delegations, PR/commit references, and tool-call counts by its \
              participants inside the task's lifetime (attributed by caller and window), plus the ledger chain \
-             verification. project_id (a [project-spec] root) reports its subtree with a project_chain. \
-             limit defaults to 50 (max 500).",
+             verification. Client sdk. events never attribute a task; those naming it are listed apart under \
+             client_asserted (payloads marked untrusted). project_id (a [project-spec] root) reports its \
+             subtree with a project_chain. limit defaults to 50 (max 500).",
             evidence_report,
         )
         .family("evidence")
         .read_only(),
+    );
+    r.add(
+        tool(
+            "evidence_append",
+            "Append one client evidence event to the tamper-evident ledger: channel in the sdk. namespace, a \
+             JSON object payload (at most 64 KiB), optional dedupe_key. The originator is always the verified \
+             caller. A repeat with the same dedupe_key from the same caller appends nothing. Each identity may \
+             append evidence_append_max_per_hour events and evidence_append_max_bytes_per_hour payload bytes \
+             per rolling hour (rate_limited past either). Client events never attribute a task in \
+             evidence_report; they are listed under client_asserted. Returns {event_ulid, inserted}.",
+            evidence_append,
+        )
+        .family("evidence"),
     );
     r.add(
         tool(
