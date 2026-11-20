@@ -237,6 +237,20 @@ pub struct Config {
     /// credential-looking names are never passed, even when listed.
     #[serde(deserialize_with = "string_or_list")]
     pub cycle_validation_env: Vec<String>,
+    /// Key(s) that encrypt managed secrets at rest (`UA_MANAGED_SECRET_KEY`):
+    /// 32 random bytes as base64 or 64 hex characters. A comma-separated list
+    /// rotates keys: the first encrypts new writes, every key decrypts.
+    /// Unset, `managed_secret_set` refuses and stored secrets cannot be used.
+    #[serde(skip_serializing)]
+    pub managed_secret_key: Option<SecretString>,
+    /// Downstream MCP servers declared by the operator, by name
+    /// (`[mcp_servers.<name>]`, TOML only). Each entry has the shape
+    /// `mcp_server_register` takes plus `review_expires_at`; see docs/mcp.md.
+    /// A bad entry refuses only itself.
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    /// Days an `mcp_server_register` or `mcp_server_review` approval keeps a
+    /// downstream MCP server usable before it must be reviewed again (1-365).
+    pub mcp_review_ttl_days: u32,
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -365,6 +379,9 @@ impl Default for Config {
             autonomy_max_cost_cents: 1000.0,
             cycle_validation_command: Vec::new(),
             cycle_validation_env: Vec::new(),
+            managed_secret_key: None,
+            mcp_servers: BTreeMap::new(),
+            mcp_review_ttl_days: 90,
         }
     }
 }
@@ -412,7 +429,8 @@ impl Config {
             fig = fig.merge(Toml::file(f));
         }
         if with_env {
-            fig = fig.merge(Env::prefixed("UA_").ignore(&["config"]));
+            // MCP servers come from TOML only: no JSON-in-an-environment-variable form.
+            fig = fig.merge(Env::prefixed("UA_").ignore(&["config", "mcp_servers"]));
         }
         fig
     }
@@ -705,5 +723,27 @@ mod tests {
         // A misspelled key is an error, not a silently ignored entry.
         std::fs::write(&file, "trusted_cargo_configs = [{ path = \"/x\", sha = \"ab\" }]\n").unwrap();
         assert!(Config::load_inner(Some(&file), false).is_err());
+    }
+
+    #[test]
+    fn mcp_server_tables_and_the_secret_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "managed_secret_key = \"k-one\"\n[mcp_servers.docs]\ntransport = \"streamable_http\"\n\
+             url = \"https://docs.example.com/mcp\"\n[mcp_servers.docs.tools]\nsearch = \"read\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        let docs = &cfg.mcp_servers["docs"];
+        assert_eq!(docs["url"], "https://docs.example.com/mcp");
+        assert_eq!(docs["tools"]["search"], "read");
+        assert_eq!(cfg.mcp_review_ttl_days, 90);
+        assert_eq!(
+            cfg.managed_secret_key.as_ref().map(|k| k.expose_secret().to_string()).as_deref(),
+            Some("k-one")
+        );
+        assert!(!format!("{cfg:?}").contains("k-one"), "the key must not leak through Debug");
     }
 }
