@@ -1,0 +1,69 @@
+# Exact-head CI on Cloud Build, submitted by scripts/cloud-ci.sh for one commit.
+#
+# The `vocab` and `check` steps run the jobs of the same name in
+# .github/workflows/ci.yml, in parallel. Both may fail without stopping the
+# build, so each reports its own result (the `CI / vocab` and `CI / check`
+# statuses); the final `full-verification` step then fails the build unless
+# both passed. There is no cargo cache: every build compiles from scratch, which
+# keeps the build free of state from earlier runs.
+substitutions:
+  # Pinned to the stable toolchain the GitHub workflow's dtolnay/rust-toolchain
+  # resolves to; bump it with that toolchain. The workspace needs >= 1.88.
+  _RUST_IMAGE: rust:1.100.0-trixie
+  _SOURCE_SHA: unknown
+steps:
+- id: vocab
+  waitFor: ['-']
+  allowFailure: true
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  env:
+  - UA_CI_SOURCE_SHA=${_SOURCE_SHA}
+  - CLOUDSDK_CORE_DISABLE_PROMPTS=1
+  args:
+  - -c
+  - |
+    bash ci-step.sh vocab
+    result=$$?
+    mkdir -p .ci && printf '%s\n' "$$result" > .ci/vocab.exit
+    exit "$$result"
+- id: check
+  waitFor: ['-']
+  allowFailure: true
+  name: ${_RUST_IMAGE}
+  entrypoint: bash
+  env:
+  - UA_CI_SOURCE_SHA=${_SOURCE_SHA}
+  args:
+  - -c
+  - |
+    bash ci-step.sh check
+    result=$$?
+    mkdir -p .ci && printf '%s\n' "$$result" > .ci/check.exit
+    exit "$$result"
+- id: full-verification
+  waitFor: [vocab, check]
+  name: ${_RUST_IMAGE}
+  entrypoint: bash
+  args:
+  - -c
+  - |
+    set -eu
+    for job in vocab check; do
+      test -f ".ci/$$job.exit"
+      test "$$(cat ".ci/$$job.exit")" = 0
+    done
+tags:
+- ua-rust-ci
+- sha-${_SOURCE_SHA}
+options:
+  # 8 vCPUs and 8 GB. A from-scratch workspace build, clippy and the test
+  # binaries finish in a fraction of the default machine's time; the
+  # per-minute price is several times the default's, so a run costs about the
+  # same or less overall. E2_HIGHCPU_32 would cut wall time further at about
+  # four times this rate.
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 3600s
+# A build may wait behind others in the project's queue.
+queueTtl: 7200s
