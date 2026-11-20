@@ -31,6 +31,7 @@ pub mod observability;
 pub mod plans;
 pub mod platform;
 pub mod provider_accounts;
+pub mod relay;
 pub mod routines;
 pub mod runs;
 pub mod sessions_lifecycle;
@@ -71,6 +72,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
     parts.push(provider_accounts::SCHEMA);
+    parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
@@ -106,6 +108,7 @@ pub fn register(r: &mut Registry) {
     plans::register(r);
     provider_accounts::register(r);
     platform::register(r);
+    relay::register(r);
     routines::register(r);
     runs::register(r);
     sessions_lifecycle::register(r);

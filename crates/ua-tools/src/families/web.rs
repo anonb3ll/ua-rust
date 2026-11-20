@@ -190,7 +190,7 @@ fn ssrf_denied(host: &str, why: String) -> UaError {
 }
 
 /// Check the scheme and every address the host resolves to.
-async fn vet_url(url: &Url, allow_loopback: bool) -> UaResult<()> {
+pub(crate) async fn vet_url(url: &Url, allow_loopback: bool) -> UaResult<()> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UaError::invalid("only http and https URLs are supported"));
     }
@@ -255,7 +255,7 @@ pub(crate) fn install_crypto_provider() {
     });
 }
 
-fn http_client(cfg: &Config) -> UaResult<reqwest::Client> {
+pub(crate) fn http_client(cfg: &Config) -> UaResult<reqwest::Client> {
     install_crypto_provider();
     reqwest::Client::builder()
         .user_agent(USER_AGENT)

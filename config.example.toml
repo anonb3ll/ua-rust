@@ -103,6 +103,25 @@ autonomy_max_cost_cents = 1000.0
 # Days an approved MCP server registration or review stays valid (1-365).
 # mcp_review_ttl_days = 90
 
+# Public relay (relay_manage): GitHub repositories it may comment on, and the
+# managed secret (consumer "relay:github") holding its token. See docs/relay.md.
+# relay_github_repos = ["acme/widgets"]
+# relay_github_secret = "relay-github"
+# relay_github_api_url = "https://api.github.com"
+# Host names the relay treats as internal, besides .internal, .local, .lan, ...
+# relay_internal_hosts = ["buildbox"]
+# relay_max_chars = 10000
+# Accounts and teams a relay message may @-mention; every other is refused.
+# relay_mention_allowlist = ["acme/maintainers"]
+# Link shorteners refused in relay messages (this replaces the default list).
+# relay_redirector_hosts = ["bit.ly", "t.co", "tinyurl.com"]
+# check/draft runs per caller per hour.
+# relay_checks_per_hour = 60
+# Private denylist (regular expressions, case-insensitive). Never echoed or
+# logged. Prefer UA_RELAY_DENYLIST (one pattern per line) to keep it out of
+# this file.
+# relay_denylist = ["project[- ]codename"]
+
 # Default profile per identity. Unlisted identities get "developer". Profiles:
 # coordinator, lead, developer, reviewer, operator, research, acp-session,
 # remote-vault-curator, remote-assistant, public (see docs/policy.md).
