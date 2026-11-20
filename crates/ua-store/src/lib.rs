@@ -9,6 +9,7 @@
 //! registration order, and recorded by name, so independent modules can add
 //! tables without coordinating version numbers.
 
+pub mod backup;
 pub mod db;
 pub mod ledger;
 pub mod schema;

@@ -5081,8 +5081,10 @@ dependencies = [
  "clap",
  "dotenvy",
  "hex",
+ "libc",
  "rand 0.9.5",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
@@ -5194,6 +5196,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

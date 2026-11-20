@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Forward local semantic search (fastembed) to ua-tools/ua-memory.
+embeddings = ["ua-tools/embeddings"]
+
 [[bin]]
 name = "ua"
 path = "src/main.rs"
@@ -19,6 +24,7 @@ ua-store.workspace = true
 ua-tools.workspace = true
 ua-server.workspace = true
 ua-import.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -32,3 +38,6 @@ dotenvy.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

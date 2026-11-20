@@ -1,0 +1,36 @@
+services:
+  ua-hub:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        UA_FEATURES: embeddings
+    init: true
+    ports:
+      # Bind loopback on the host and front with a TLS reverse proxy if remote.
+      - "127.0.0.1:8765:8765"
+    environment:
+      UA_HOME: /var/lib/ua-rust
+      UA_BIND: 0.0.0.0:8765
+      UA_ENFORCE_AUTH: "true"
+      # Set public_url / allowed_hosts when fronting behind a TLS reverse proxy:
+      # UA_PUBLIC_URL: https://hub.example.com
+      # UA_ALLOWED_HOSTS: localhost,127.0.0.1,::1,hub.example.com
+    # Supply secrets via an env file outside version control or a mounted config:
+    # env_file:
+    #   - ../../.env
+    volumes:
+      - ua_data:/var/lib/ua-rust
+      # - ./config.toml:/var/lib/ua-rust/config.toml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+volumes:
+  ua_data:

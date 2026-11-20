@@ -1,6 +1,9 @@
 //! The `ua` command.
 
+mod ops;
+
 use std::io::Read;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -66,6 +69,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
+    /// Initialize `$UA_HOME` with a starter config.toml, optional policy.yaml,
+    /// and local harness MCP setup snippets.
+    Init(ops::init::InitArgs),
+    /// Run read-only health, security, permission, database, and ledger checks.
+    Doctor(ops::doctor::DoctorArgs),
+    /// Take a verified, consistent SQLite snapshot of the hub database (safe while serving).
+    Backup(ops::backup::BackupArgs),
+    /// Verify and atomically restore a hub database snapshot (requires hub to be stopped).
+    Restore(ops::backup::RestoreArgs),
 }
 
 #[derive(Subcommand)]
@@ -99,12 +111,44 @@ enum TokenCmd {
     Revoke { label: String },
 }
 
-fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+pub(crate) fn load_config(explicit: Option<&std::path::Path>) -> anyhow::Result<Config> {
     let _ = dotenvy::dotenv();
-    match &cli.config {
+    match explicit {
         Some(p) => Config::load_from(p),
         None => Config::load(),
     }
+}
+
+pub(crate) fn issue_agent_token(
+    cfg: &Config,
+    hub: &Hub,
+    label: &str,
+    note: Option<&str>,
+    by: &str,
+) -> anyhow::Result<String> {
+    // A token for a human identity grants approval rights over HTTP;
+    // mint one only on an operator's explicit confirmation.
+    if cfg.is_human(label) && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(label)) {
+        anyhow::bail!("issuing a token for human {label:?} needs an operator at an interactive terminal");
+    }
+    let mut raw = [0u8; 32];
+    rand::rng().fill_bytes(&mut raw);
+    let token = format!("ua_{}", hex::encode(raw));
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let now = ua_core::time::now();
+    hub.db().write(|tx| {
+        tx.execute(
+            "INSERT INTO agent_tokens (agent_label, token_hash, issued_at, issued_by, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![label, hash, now, by, note],
+        )?;
+        ua_store::ledger::append(
+            tx,
+            ua_store::EventInput::new("agent.token.issued", serde_json::json!({ "agent": label })).by(by),
+        )?;
+        Ok(())
+    })?;
+    Ok(token)
 }
 
 /// The caller for a local CLI invocation.
@@ -302,16 +346,28 @@ async fn serve_until_shutdown(
 /// [`RUNTIME_SHUTDOWN`] for what is still running. The shared hub lock is
 /// released only after that, so an import cannot start while this process's
 /// tasks may still write.
-fn main() -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+fn main() -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return ExitCode::from(1);
+        }
+    };
     let mut hub_lock = None;
     let result = rt.block_on(run(&mut hub_lock));
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
     drop(hub_lock);
-    result
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
-async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
+async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
     {
@@ -319,212 +375,226 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
         use tracing_subscriber::util::SubscriberInitExt;
         tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
     }
-    let cfg = load_config(&cli)?;
 
-    if let Cmd::Config = cli.cmd {
-        println!("{}", serde_json::to_string_pretty(&cfg)?);
-        return Ok(());
-    }
-
-    if let Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } = &cli.cmd {
-        let report = if *dry_run {
-            ua_import::dry_run(from)?
-        } else {
-            // Held until the import ends: no hub may run on this database.
-            let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
-            let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
-            let opts = ua_import::Options { drop_org_scope: *drop_org_scope, ..Default::default() };
-            ua_import::import(&db, from, &opts)?
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-
-    // Every command that opens the hub holds a shared lock while it runs, so an
-    // import (which takes it exclusively) refuses while any of them is live.
-    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
-    let hub = Hub::open(cfg.clone())?;
-    let registry = Arc::new(builtin_registry());
-    let state = AppState::new(hub.clone(), registry.clone());
-
+    let explicit_config = cli.config.clone();
     match cli.cmd {
-        Cmd::Serve => {
-            warn_if_locked_out(&state).await;
-            // One token for the server and every background loop: a signal
-            // cancels it, then `serve_until_shutdown` drains them.
-            let ct = CancellationToken::new();
-            let mut background = Vec::new();
-            if cfg.routines_enabled {
-                background
-                    .push(tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone(), ct.clone())));
-            }
-            if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
-                tracing::warn!("{w}");
-            }
-            match ua_server::oauth::register::prune_unused_clients(&hub).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::info!(pruned = n, "removed registered OAuth clients that never got a grant")
+        Cmd::Init(args) => {
+            ops::init::run(args, explicit_config.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
+        cmd => {
+            let cfg = load_config(explicit_config.as_deref())?;
+
+            match cmd {
+                Cmd::Config => {
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
+                    Ok(ExitCode::SUCCESS)
                 }
-                Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
-            }
-            ua_tools::families::workspace::sweep_run_homes();
-            if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
-                tracing::warn!("{w}");
-            }
-            // One toolchain lookup in the background, so cargo started by a
-            // build tool or script finds the toolchain on a fresh hub.
-            ua_tools::families::workspace::warm_host_rust(&cfg.home);
-            let pruned = ua_tools::families::workspace::prune_run_caches(
-                &cfg.home,
-                ua_tools::families::workspace::RUN_CACHE_MAX_AGE,
-            );
-            if pruned > 0 {
-                tracing::info!(pruned, "removed run_cmd caches unused for 30 days");
-            }
-            // Reconcile runs a previous hub process left behind, then keep
-            // sweeping. Only the server reaps: a short-lived `ua call` or a
-            // stdio session must not judge another process's children.
-            ua_tools::families::dispatch::startup_sweep(&hub).await;
-            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
-            // Expire waits and lapsed node leases, and retry owed command
-            // notices, for every node.
-            background.extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
-            // Poll the bound repositories' open pull requests when no webhook
-            // can reach this hub (github_poll_interval_s; 0 = off).
-            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
-            // Routine fires a previous process left mid-workflow or unstarted.
-            let h = hub.clone();
-            background.push(tokio::spawn(async move {
-                match ua_tools::families::routines::reconcile_fires(&h).await {
-                    Ok(v) => {
-                        let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
-                        if n("interrupted") + n("not_run") + n("rerun") > 0 {
-                            tracing::info!(
-                                interrupted = n("interrupted"),
-                                not_run = n("not_run"),
-                                rerun = n("rerun"),
-                                "reconciled routine fires"
+                Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } => {
+                    let report = if dry_run {
+                        ua_import::dry_run(&from)?
+                    } else {
+                        // Held until the import ends: no hub may run on this database.
+                        let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
+                        let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
+                        let opts = ua_import::Options { drop_org_scope, ..Default::default() };
+                        ua_import::import(&db, &from, &opts)?
+                    };
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Backup(args) => {
+                    ops::backup::run_backup(&cfg, args)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Restore(args) => {
+                    ops::backup::run_restore(&cfg, args)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                cmd => {
+                    // Every command that opens the hub holds a shared lock while it runs, so an
+                    // import or restore (which takes it exclusively) refuses while any of them is live.
+                    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
+                    let hub = Hub::open(cfg.clone())?;
+                    let registry = Arc::new(builtin_registry());
+                    let state = AppState::new(hub.clone(), registry.clone());
+
+                    match cmd {
+                        Cmd::Serve => {
+                            warn_if_locked_out(&state).await;
+                            // One token for the server and every background loop: a signal
+                            // cancels it, then `serve_until_shutdown` drains them.
+                            let ct = CancellationToken::new();
+                            let mut background = Vec::new();
+                            if cfg.routines_enabled {
+                                background.push(tokio::spawn(ua_tools::families::routines::run_ticker(
+                                    hub.clone(),
+                                    ct.clone(),
+                                )));
+                            }
+                            if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
+                                tracing::warn!("{w}");
+                            }
+                            match ua_server::oauth::register::prune_unused_clients(&hub).await {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    tracing::info!(
+                                        pruned = n,
+                                        "removed registered OAuth clients that never got a grant"
+                                    )
+                                }
+                                Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
+                            }
+                            ua_tools::families::workspace::sweep_run_homes();
+                            if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
+                                tracing::warn!("{w}");
+                            }
+                            // One toolchain lookup in the background, so cargo started by a
+                            // build tool or script finds the toolchain on a fresh hub.
+                            ua_tools::families::workspace::warm_host_rust(&cfg.home);
+                            let pruned = ua_tools::families::workspace::prune_run_caches(
+                                &cfg.home,
+                                ua_tools::families::workspace::RUN_CACHE_MAX_AGE,
                             );
+                            if pruned > 0 {
+                                tracing::info!(pruned, "removed run_cmd caches unused for 30 days");
+                            }
+                            // Reconcile runs a previous hub process left behind, then keep
+                            // sweeping. Only the server reaps: a short-lived `ua call` or a
+                            // stdio session must not judge another process's children.
+                            ua_tools::families::dispatch::startup_sweep(&hub).await;
+                            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
+                            // Expire waits and lapsed node leases, and retry owed command
+                            // notices, for every node.
+                            background
+                                .extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
+                            // Poll the bound repositories' open pull requests when no webhook
+                            // can reach this hub (github_poll_interval_s; 0 = off).
+                            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+                            // Routine fires a previous process left mid-workflow or unstarted.
+                            let h = hub.clone();
+                            background.push(tokio::spawn(async move {
+                                match ua_tools::families::routines::reconcile_fires(&h).await {
+                                    Ok(v) => {
+                                        let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+                                        if n("interrupted") + n("not_run") + n("rerun") > 0 {
+                                            tracing::info!(
+                                                interrupted = n("interrupted"),
+                                                not_run = n("not_run"),
+                                                rerun = n("rerun"),
+                                                "reconciled routine fires"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "could not reconcile routine fires"),
+                                }
+                            }));
+                            let signal_ct = ct.clone();
+                            tokio::spawn(async move {
+                                let which = shutdown_signal().await;
+                                tracing::info!(
+                                    signal = which,
+                                    "shutting down: draining connections and background tasks"
+                                );
+                                signal_ct.cancel();
+                                // A second signal does not wait for the drain.
+                                let again = shutdown_signal().await;
+                                let killed = ua_tools::families::dispatch::executor::kill_live_groups();
+                                tracing::warn!(
+                                    signal = again,
+                                    killed_run_groups = killed,
+                                    "second signal: exiting now"
+                                );
+                                std::process::exit(if again == "SIGTERM" { 143 } else { 130 });
+                            });
+                            serve_until_shutdown(state, ct, background).await?;
                         }
+                        Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
+                        Cmd::Tools { names } => {
+                            for t in registry.all() {
+                                if names {
+                                    println!("{}", t.name);
+                                } else {
+                                    println!("{:<28} {:<14} {}", t.name, t.family, t.description);
+                                }
+                            }
+                        }
+                        Cmd::Call { tool, args, label } => {
+                            let args: Value = match args.as_deref() {
+                                None => Value::Null,
+                                Some("-") => {
+                                    let mut s = String::new();
+                                    std::io::stdin().read_to_string(&mut s)?;
+                                    serde_json::from_str(&s)?
+                                }
+                                Some(s) => serde_json::from_str(s)?,
+                            };
+                            let caller = local_caller(&cfg, label);
+                            match registry.call(&hub, &caller, &tool, args).await {
+                                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                                Err(e) => {
+                                    eprintln!("{}", serde_json::to_string_pretty(&e.to_json())?);
+                                    return Ok(ExitCode::from(1));
+                                }
+                            }
+                        }
+                        Cmd::Token { cmd } => match cmd {
+                            TokenCmd::Issue { label, note } => {
+                                let token = issue_agent_token(&cfg, &hub, &label, note.as_deref(), "cli")?;
+                                eprintln!(
+                                    "Token for {label} (shown once; store it in the agent's secret store):"
+                                );
+                                println!("{token}");
+                            }
+                            TokenCmd::Revoke { label } => {
+                                let now = ua_core::time::now();
+                                let n = hub.db().write(|tx| {
+                                    let n = tx.execute(
+                                        "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
+                                         WHERE agent_label = ?1 AND status = 'active'",
+                                        rusqlite::params![label, now],
+                                    )?;
+                                    ua_store::ledger::append(
+                                        tx,
+                                        ua_store::EventInput::new(
+                                            "agent.token.revoked",
+                                            serde_json::json!({ "agent": label }),
+                                        )
+                                        .by("cli"),
+                                    )?;
+                                    Ok(n)
+                                })?;
+                                println!("revoked {n} token(s) for {label}");
+                            }
+                        },
+                        Cmd::LoginLink { label } => {
+                            // A login link signs a browser in as a human; same bar as acting
+                            // as a human from the CLI.
+                            if std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label) {
+                                anyhow::bail!(
+                                    "a sign-in link for {label:?} needs an operator at an interactive terminal"
+                                );
+                            }
+                            let url = ua_server::login::create_login_link(&hub, &label, "cli")?;
+                            eprintln!(
+                                "Sign-in link for {label} (single use, expires in {} s; open it in the browser you will use):",
+                                cfg.login_link_ttl_secs
+                            );
+                            println!("{url}");
+                        }
+                        Cmd::Init(_)
+                        | Cmd::Doctor(_)
+                        | Cmd::Config
+                        | Cmd::Import { .. }
+                        | Cmd::Backup(_)
+                        | Cmd::Restore(_) => unreachable!(),
                     }
-                    Err(e) => tracing::warn!(error = %e, "could not reconcile routine fires"),
-                }
-            }));
-            let signal_ct = ct.clone();
-            tokio::spawn(async move {
-                let which = shutdown_signal().await;
-                tracing::info!(signal = which, "shutting down: draining connections and background tasks");
-                signal_ct.cancel();
-                // A second signal does not wait for the drain.
-                let again = shutdown_signal().await;
-                let killed = ua_tools::families::dispatch::executor::kill_live_groups();
-                tracing::warn!(signal = again, killed_run_groups = killed, "second signal: exiting now");
-                std::process::exit(if again == "SIGTERM" { 143 } else { 130 });
-            });
-            serve_until_shutdown(state, ct, background).await?;
-        }
-        Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
-        Cmd::Tools { names } => {
-            for t in registry.all() {
-                if names {
-                    println!("{}", t.name);
-                } else {
-                    println!("{:<28} {:<14} {}", t.name, t.family, t.description);
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
-        Cmd::Call { tool, args, label } => {
-            let args: Value = match args.as_deref() {
-                None => Value::Null,
-                Some("-") => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    serde_json::from_str(&s)?
-                }
-                Some(s) => serde_json::from_str(s)?,
-            };
-            let caller = local_caller(&cfg, label);
-            match registry.call(&hub, &caller, &tool, args).await {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
-                Err(e) => {
-                    eprintln!("{}", serde_json::to_string_pretty(&e.to_json())?);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Cmd::Token { cmd } => match cmd {
-            TokenCmd::Issue { label, note } => {
-                // A token for a human identity grants approval rights over HTTP;
-                // mint one only on an operator's explicit confirmation.
-                if cfg.is_human(&label)
-                    && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label))
-                {
-                    anyhow::bail!(
-                        "issuing a token for human {label:?} needs an operator at an interactive terminal"
-                    );
-                }
-                let mut raw = [0u8; 32];
-                rand::rng().fill_bytes(&mut raw);
-                let token = format!("ua_{}", hex::encode(raw));
-                let hash = hex::encode(Sha256::digest(token.as_bytes()));
-                let now = ua_core::time::now();
-                hub.db().write(|tx| {
-                    tx.execute(
-                        "INSERT INTO agent_tokens (agent_label, token_hash, issued_at, issued_by, note) \
-                         VALUES (?1, ?2, ?3, 'cli', ?4)",
-                        rusqlite::params![label, hash, now, note],
-                    )?;
-                    ua_store::ledger::append(
-                        tx,
-                        ua_store::EventInput::new(
-                            "agent.token.issued",
-                            serde_json::json!({ "agent": label }),
-                        )
-                        .by("cli"),
-                    )?;
-                    Ok(())
-                })?;
-                eprintln!("Token for {label} (shown once; store it in the agent's secret store):");
-                println!("{token}");
-            }
-            TokenCmd::Revoke { label } => {
-                let now = ua_core::time::now();
-                let n = hub.db().write(|tx| {
-                    let n = tx.execute(
-                        "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
-                         WHERE agent_label = ?1 AND status = 'active'",
-                        rusqlite::params![label, now],
-                    )?;
-                    ua_store::ledger::append(
-                        tx,
-                        ua_store::EventInput::new(
-                            "agent.token.revoked",
-                            serde_json::json!({ "agent": label }),
-                        )
-                        .by("cli"),
-                    )?;
-                    Ok(n)
-                })?;
-                println!("revoked {n} token(s) for {label}");
-            }
-        },
-        Cmd::LoginLink { label } => {
-            // A login link signs a browser in as a human; same bar as acting
-            // as a human from the CLI.
-            if std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label) {
-                anyhow::bail!("a sign-in link for {label:?} needs an operator at an interactive terminal");
-            }
-            let url = ua_server::login::create_login_link(&hub, &label, "cli")?;
-            eprintln!(
-                "Sign-in link for {label} (single use, expires in {} s; open it in the browser you will use):",
-                cfg.login_link_ttl_secs
-            );
-            println!("{url}");
-        }
-        Cmd::Config | Cmd::Import { .. } => unreachable!(),
     }
-    Ok(())
 }
 
 /// With auth enforced and no credential configured, every non-public request
