@@ -85,6 +85,16 @@ pub struct Config {
     /// lapsed leases, undelivered command notices). 0 turns the sweep off;
     /// claims still sweep their own node.
     pub node_wait_sweep_s: u64,
+    /// Planning canvas boards one agent may create (`graph_canvas_write`).
+    /// Creating a new board past it is refused (`canvas_limit`); updating a
+    /// board is never capped.
+    pub graph_canvas_max_boards_per_agent: u32,
+    /// Planning canvas boards the hub holds in all. Creating a new board past
+    /// it is refused (`canvas_limit`).
+    pub graph_canvas_max_boards: u32,
+    /// Prior scenes kept per board for `graph_canvas_history` and
+    /// `graph_canvas_restore`; older revisions are dropped. 0 keeps none.
+    pub graph_canvas_history_max: u32,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -303,6 +313,9 @@ impl Default for Config {
             node_max_per_agent: 8,
             node_queue_wait_s: 3600,
             node_wait_sweep_s: 60,
+            graph_canvas_max_boards_per_agent: 50,
+            graph_canvas_max_boards: 1000,
+            graph_canvas_history_max: 20,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),

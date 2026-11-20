@@ -8,9 +8,20 @@
 //! check). Neither writes, installs or opens an approval.
 //!
 //! A task states its needs as `[requires: tool_a, tool_b]` (or
-//! `[requires-tools: ...]`) in its notes. Nothing is inferred from prose.
-//! An agent's allowed tools are what its default profile exposes, the same
-//! rule the call wrapper enforces.
+//! `[requires-tools: ...]`) in its notes; names are case-folded. Nothing is
+//! inferred from prose. An agent's allowed tools are what its default profile
+//! exposes, the same rule the call wrapper enforces.
+//!
+//! Readiness (the catalog's `prerequisites`) adds what dispatch needs besides
+//! tools: an identity the hub can authenticate (an active token or a
+//! configured profile) and somewhere to run (a configured harness, or a live
+//! node the agent owns). Each gap is a `missing_config` entry
+//! `{gate, action, detail}`.
+//!
+//! Visibility: the catalog's `boundaries`, `health` and agents' `host` are a
+//! map of the hub, shown only to operators (humans, lifecycle operators, the
+//! chief-of-staff and operator profiles). Everyone else gets them as null or
+//! absent, named in `redacted`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -39,7 +50,7 @@ pub fn required_tools(notes: &str) -> BTreeSet<String> {
             let end = rest.find([']', '\n']).unwrap_or(rest.len());
             if rest[end..].starts_with(']') {
                 for name in rest[..end].split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                    out.insert(name.to_string());
+                    out.insert(name.to_ascii_lowercase());
                 }
             }
             from = start;
@@ -119,7 +130,7 @@ async fn check_agent_capability(ctx: ToolCtx, a: CheckArgs) -> UaResult<Value> {
     let hub = ctx.hub.clone();
     ctx.hub
         .db()
-        .read_async(move |c| check(c, &hub, &crate::builtin_registry(), a.task_id, &a.agent_label))
+        .read_async(move |c| check(c, &hub, crate::builtin_registry_shared(), a.task_id, &a.agent_label))
         .await
 }
 
@@ -194,6 +205,60 @@ fn health(cfg: &Config) -> Value {
     })
 }
 
+/// What dispatching work to `agent` needs besides tools, as
+/// `{gate, action, detail}` entries; empty when nothing is missing.
+fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Value>> {
+    let mut missing = Vec::new();
+    let token: Option<i64> = c
+        .query_row(
+            "SELECT 1 FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' \
+             AND (expires_at IS NULL OR expires_at > ?2) LIMIT 1",
+            rusqlite::params![agent, ua_core::time::now()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let static_token = cfg.static_tokens().iter().any(|(l, _)| l == agent);
+    if token.is_none() && !static_token && !cfg.profiles.contains_key(agent) {
+        missing.push(json!({
+            "gate": "agent_identity",
+            "action": format!("issue {agent} a token (`ua token issue` or agent_token_issue) or give it a profile in [profiles]"),
+            "detail": format!("{agent} has no active token and no configured profile, so it cannot authenticate"),
+        }));
+    }
+    if cfg.harnesses.is_empty() {
+        let now = jiff::Timestamp::now();
+        let mut stmt = c.prepare(
+            "SELECT last_heartbeat, heartbeat_floor FROM nodes WHERE agent = ?1 AND retired_at IS NULL",
+        )?;
+        let mut live = false;
+        for row in
+            stmt.query_map([agent], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?
+        {
+            let (last, floor) = row?;
+            if super::nodes::liveness(last.as_deref(), floor.as_deref(), false, now).live {
+                live = true;
+                break;
+            }
+        }
+        if !live {
+            missing.push(json!({
+                "gate": "executor",
+                "action": format!("configure a [harnesses.<name>] entry, or run a node registered by {agent}"),
+                "detail": format!("no harness is configured and {agent} has no live, non-retired node"),
+            }));
+        }
+    }
+    Ok(missing)
+}
+
+/// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
+fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
+    if caller.is_human() || matches!(caller.profile, Profile::ChiefOfStaff | Profile::Operator) {
+        return true;
+    }
+    agents::verified(caller).is_some_and(|l| cfg.is_human(l) || cfg.is_lifecycle_operator(l))
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogArgs {
@@ -215,7 +280,8 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
     };
     let hub = ctx.hub.clone();
     let cfg = ctx.hub.cfg().clone();
-    let reg = crate::builtin_registry();
+    let operator = is_operator(&ctx.caller, &cfg);
+    let reg = crate::builtin_registry_shared();
     let mut families: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for t in reg.all() {
         families.entry(t.family).or_default().push(t.name);
@@ -243,18 +309,22 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
             let agents: Vec<Value> = agents::list_agents(c)?
                 .into_iter()
                 .map(|a| {
-                    json!({
-                        "label": a["label"], "status": a["status"], "kind": a["kind"],
-                        "host": a["host"], "known": a["known"],
-                    })
+                    let mut row = json!({
+                        "label": a["label"], "status": a["status"], "kind": a["kind"], "known": a["known"],
+                    });
+                    if operator {
+                        row["host"] = a["host"].clone();
+                    }
+                    row
                 })
                 .collect();
             let pre = match check_pair {
                 None => None,
                 Some((t, l)) => {
-                    let mut m = check(c, &hub, &crate::builtin_registry(), t, &l)?;
-                    m["missing_config"] = json!([]);
-                    m["ready"] = m["capable"].clone();
+                    let mut m = check(c, &hub, crate::builtin_registry_shared(), t, &l)?;
+                    let missing = missing_config(c, hub.cfg(), &l)?;
+                    m["ready"] = json!(m["capable"] == json!(true) && missing.is_empty());
+                    m["missing_config"] = json!(missing);
                     Some(m)
                 }
             };
@@ -271,6 +341,17 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
     })
     .await?;
     let clis = cfg.shell_allowlist();
+    let (health, boundaries, redacted) = if operator {
+        let boundaries = json!({
+            "workspace": cfg.workspace_root().display().to_string(),
+            "vault_write_dirs": cfg.vault_write_dirs,
+            "approval_gated_tools": gated,
+            "shell_allowlist": clis,
+        });
+        (health(&cfg), boundaries, json!([]))
+    } else {
+        (Value::Null, Value::Null, json!(["boundaries", "health", "agents.host"]))
+    };
     Ok(json!({
         "read_only": true,
         "install_is_explicit": true,
@@ -284,13 +365,9 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         "skills": skills_found,
         "workflows": workflows,
         "harnesses": cfg.harnesses.keys().collect::<Vec<_>>(),
-        "health": health(&cfg),
-        "boundaries": {
-            "workspace": cfg.workspace_root().display().to_string(),
-            "vault_write_dirs": cfg.vault_write_dirs,
-            "approval_gated_tools": gated,
-            "shell_allowlist": clis,
-        },
+        "health": health,
+        "boundaries": boundaries,
+        "redacted": redacted,
         "prerequisites": prerequisites,
     }))
 }
@@ -313,8 +390,12 @@ pub fn register(r: &mut Registry) {
             "capability_catalog",
             "Read-only inventory of this hub: agents, every tool by family, allowlisted programs, harnesses, \
              workflows, workspace skills, configuration health, boundaries (workspace, vault write dirs, \
-             approval-gated tools) and what the MCP server supports per client. With task_id and agent_label it \
-             also reports whether that agent is ready for that task. Never installs, writes or opens an approval.",
+             approval-gated tools) and what the MCP server supports per client. Boundaries, health and agent \
+             hosts are shown to operators only; for everyone else they are null or absent and named in \
+             `redacted`. With task_id and agent_label it also reports whether that agent is ready for that task: \
+             prerequisites {capable, ready, missing_config: [{gate, action, detail}]}, where gate is \
+             agent_identity (no active token or profile) or executor (no harness and no live owned node). Never \
+             installs, writes or opens an approval.",
             capability_catalog,
         )
         .read_only()
@@ -329,7 +410,7 @@ mod tests {
     #[test]
     fn requirements_come_only_from_markers() {
         let notes =
-            "Port it. [requires: fs_read, run_cmd]\n[REQUIRES-TOOLS: git_diff_staged ]\n[requires: broken";
+            "Port it. [requires: FS_READ, run_cmd]\n[REQUIRES-TOOLS: Git_Diff_Staged ]\n[requires: broken";
         let got: Vec<String> = required_tools(notes).into_iter().collect();
         assert_eq!(got, ["fs_read", "git_diff_staged", "run_cmd"]);
         assert!(required_tools("needs fs_read").is_empty());

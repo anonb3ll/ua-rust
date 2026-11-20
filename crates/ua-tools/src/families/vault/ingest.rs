@@ -270,7 +270,7 @@ async fn to_memory(ctx: ToolCtx, a: ToMemoryArgs) -> UaResult<Value> {
     })
     .await?;
 
-    let reg = crate::builtin_registry();
+    let reg = crate::builtin_registry_shared();
     let (mut ingested, mut skipped, mut unchanged) = (0usize, 0usize, 0usize);
     let mut processed = Vec::new();
     for (sub, rel, title, content) in notes {
