@@ -94,6 +94,12 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[Ref { col: "note_id", table: "memory", key: "id" }], ..plain("memory_versions") },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
     TableMap { kind: Kind::Nodes, ..plain("nodes") },
+    // Skill versions are immutable (insert only) and keep their ids; drift
+    // proposals and reports are not copied, since their apply approvals are
+    // pending or unconsumed passes, which are never imported.
+    plain("skill_versions"),
+    plain("skill_assignments"),
+    plain("harness_config_bundles"),
     plain("graph_canvas_scenes"),
     TableMap { kind: Kind::Ledger, ..plain("event_log") },
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },

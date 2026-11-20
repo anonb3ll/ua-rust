@@ -9,7 +9,8 @@
 //! goals, workflow records and checks, session handoff notes, plans,
 //! delegations, memory notes and their versions (ids kept, the
 //! full-text index rebuilt), the message index, agents, agent token hashes,
-//! approval history, and the event ledger.
+//! approval history, remote nodes, skill versions and assignments, harness
+//! config bundles, and the event ledger.
 //!
 //! Parking: the Python hub parked a task by archiving it and appending a
 //! `[parked @ <ts> by <actor>] <reason>` (or `[folded-into: #<root> ...]`)

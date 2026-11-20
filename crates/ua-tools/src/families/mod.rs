@@ -19,6 +19,7 @@ pub mod export;
 pub mod github;
 pub mod governance;
 pub mod graph;
+pub mod harness_config;
 pub mod injection;
 pub mod managed_secrets;
 pub mod mcp;
@@ -35,6 +36,7 @@ pub mod relay;
 pub mod routines;
 pub mod runs;
 pub mod sessions_lifecycle;
+pub mod skill_registry;
 pub mod skills;
 pub mod tasks;
 pub mod tokens;
@@ -64,6 +66,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(github::HARDENING_SCHEMA);
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
+    parts.push(harness_config::SCHEMA);
     parts.push(managed_secrets::SCHEMA);
     parts.push(mcp::SCHEMA);
     parts.push(messaging::SCHEMA);
@@ -74,6 +77,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(provider_accounts::SCHEMA);
     parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
+    parts.push(skill_registry::SCHEMA);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
@@ -96,6 +100,7 @@ pub fn register(r: &mut Registry) {
     github::register(r);
     governance::register(r);
     graph::register(r);
+    harness_config::register(r);
     injection::register(r);
     managed_secrets::register(r);
     mcp::register(r);
@@ -112,6 +117,7 @@ pub fn register(r: &mut Registry) {
     routines::register(r);
     runs::register(r);
     sessions_lifecycle::register(r);
+    skill_registry::register(r);
     skills::register(r);
     tasks::register(r);
     tokens::register(r);
