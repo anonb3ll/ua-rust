@@ -199,6 +199,14 @@ mod tests {
     }
 
     #[test]
+    fn only_profiles_meant_to_speak_publicly_see_the_relay() {
+        for p in [Profile::Developer, Profile::Cto, Profile::Steward, Profile::Research, Profile::Public] {
+            assert!(!p.allows_tool("relay_manage"), "{p} must not see relay_manage");
+        }
+        assert!(Profile::ChiefOfStaff.allows_tool("relay_manage"));
+    }
+
+    #[test]
     fn names_round_trip() {
         for p in Profile::ALL {
             assert_eq!(p.as_str().parse::<Profile>().unwrap(), p);

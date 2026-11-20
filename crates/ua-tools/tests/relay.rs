@@ -126,6 +126,7 @@ impl H {
         cfg.relay_internal_hosts = vec!["atlas".into()];
         cfg.relay_denylist = vec![SecretString::from("project[- ]falcon")];
         cfg.relay_max_chars = 500;
+        cfg.relay_checks_per_hour = 1000;
         f(&mut cfg);
         let h = Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), mock };
         h.ok(
@@ -240,8 +241,10 @@ async fn secret_gate_refuses_credentials_and_lets_placeholders_through() {
     assert!(v.get("text").is_none(), "the gates never return rewritten text");
 
     expect(&h, "export GITHUB_TOKEN=${GITHUB_TOKEN} before running", &[]).await;
-    expect(&h, "set DEPLOY_TOKEN=<your-token> in CI", &[]).await;
-    expect(&h, "Authorization: Bearer <token>", &[]).await;
+    expect(&h, "set `DEPLOY_TOKEN=<your-token>` in CI", &[]).await;
+    // Outside code GitHub would take `<your-token>` for an HTML tag and drop it.
+    expect(&h, "set DEPLOY_TOKEN=<your-token> in CI", &["markup"]).await;
+    expect(&h, "`Authorization: Bearer <token>`", &[]).await;
     expect(&h, "-----BEGIN PUBLIC KEY-----", &[]).await;
     expect(&h, CLEAN, &[]).await;
 }
@@ -259,6 +262,19 @@ async fn hidden_unicode_gate_refuses_invisible_and_bidi_characters() {
         '\u{FE0F}',
         '\u{1B}',
         '\u{2028}',
+        // Invisible or blank characters outside the format category.
+        '\u{034F}',
+        '\u{180B}',
+        '\u{180F}',
+        '\u{2800}',
+        '\u{2000}',
+        '\u{200A}',
+        '\u{00A0}',
+        '\u{3164}',
+        // Private use, unassigned, noncharacter.
+        '\u{E000}',
+        '\u{FFF0}',
+        '\u{FDD0}',
     ] {
         let v = h.gate(&format!("looks fine{c} here")).await;
         assert_eq!(categories(&v), vec!["hidden_unicode"], "U+{:04X}: {v}", c as u32);
@@ -266,6 +282,7 @@ async fn hidden_unicode_gate_refuses_invisible_and_bidi_characters() {
         assert_eq!(v["findings"][0]["offset"], 10);
     }
     expect(&h, "line one\nline two\twith a tab, café, 日本語 and 🚀", &[]).await;
+    expect(&h, "windows line\r\nendings", &[]).await;
 }
 
 #[tokio::test]
@@ -419,6 +436,11 @@ async fn approved_text_is_sent_exactly_once() {
     assert!(h.mock.requests().is_empty());
 
     h.approve(approval_id).await;
+    // Decided: the approval keeps the hash and sizes, not the text.
+    let decided = h.ok(&human(), "approval_pending", json!({ "tool": "relay_manage" })).await;
+    let pass = &decided["approved_unconsumed"][0]["payload"];
+    assert_eq!((pass["text"].clone(), pass["text_escaped"].clone()), (Value::Null, Value::Null), "{pass}");
+    assert_eq!(pass["text_sha256"], hex_sha(CLEAN));
     let sent = h.relay(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
     assert_eq!(sent["status"], "sent", "{sent}");
     assert_eq!(sent["receipt"]["comment_id"], 1001);
@@ -549,6 +571,9 @@ async fn failures_are_recorded_and_an_uncertain_send_is_not_repeated() {
     h.approve(a).await;
     let e = h.refused(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
     assert_eq!(reason(&e), "invalid_argument", "{e}");
+    let msg = e.to_string();
+    assert!(msg.contains("rejected by GitHub or never reached it (HTTP 404)"), "{msg}");
+    assert!(!msg.contains("before reaching GitHub"), "{msg}");
     let st = h.relay(&agent(), "status", json!({ "draft_id": id })).await;
     assert_eq!(st["status"], "failed");
     assert_eq!(h.events("relay.send_failed")[0]["http_status"], 404);
@@ -623,6 +648,10 @@ async fn withdrawn_approvals_cannot_be_resolved_and_developers_do_not_see_the_re
     let dev = caller("builder-1", ActorKind::Agent, Profile::Developer);
     let e = h.refused(&dev, "check", json!({ "target": TARGET, "text": CLEAN })).await;
     assert_eq!(reason(&e), "profile_denied");
+    // The reviewer profile (steward) does not speak publicly either.
+    let reviewer = caller("reviewer-1", ActorKind::Agent, Profile::Steward);
+    let e = h.refused(&reviewer, "draft", json!({ "target": TARGET, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "profile_denied");
     let anon = Caller { enforce_profile: false, ..caller("anon", ActorKind::Anonymous, Profile::Public) };
     let e = h.refused(&anon, "draft", json!({ "target": TARGET, "text": CLEAN })).await;
     assert_eq!(reason(&e), "identity_required");
@@ -648,4 +677,204 @@ async fn a_token_swapped_after_approval_does_not_post() {
     let e = h.refused(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
     assert_eq!(reason(&e), "approval_mismatch", "{e:?}");
     assert!(h.mock.requests().is_empty(), "nothing was posted under the new token");
+}
+
+// --- review fixes ---------------------------------------------------------------------------------
+
+fn approval_payload(h: &H, approval_id: i64) -> Value {
+    h.hub
+        .db()
+        .read(move |c| {
+            let p: String =
+                c.query_row("SELECT payload FROM approvals WHERE id = ?1", [approval_id], |r| r.get(0))?;
+            Ok(serde_json::from_str(&p).unwrap())
+        })
+        .unwrap()
+}
+
+fn gh_token() -> String {
+    format!("ghp_{}", "a1B2".repeat(10))
+}
+
+#[tokio::test]
+async fn the_approver_sees_an_escaped_view_and_every_link_host() {
+    let h = H::new().await;
+    let text = "Café fix: see [the notes](https://docs.rs/serde) and https://github.com/acme/widgets";
+    let (_, approval_id) = h.requested(text).await;
+    let queue = h.ok(&human(), "approval_pending", json!({ "tool": "relay_manage" })).await;
+    let payload = &queue["pending"][0]["payload"];
+    assert_eq!(queue["pending"][0]["id"], approval_id);
+    assert_eq!(payload["text"], text);
+    let escaped = payload["text_escaped"].as_str().unwrap();
+    assert!(escaped.starts_with("Caf\\u{E9} fix"), "{escaped}");
+    assert!(escaped.is_ascii());
+    assert_eq!(payload["link_hosts"], json!(["docs.rs", "github.com"]));
+}
+
+#[tokio::test]
+async fn markup_and_entities_cannot_smuggle_secrets_or_personal_data() {
+    let h = H::new().await;
+    let gh = gh_token();
+    let entity_token = format!("try &#103;&#104;&#112;{} again", &gh[3..]);
+    expect(&h, &entity_token, &["markup", "secret"]).await;
+    let tagged = format!("try {}<b></b>{} again", &gh[..20], &gh[20..]);
+    expect(&h, &tagged, &["markup", "secret"]).await;
+    let commented = format!("try {}<!-- -->{} again", &gh[..20], &gh[20..]);
+    expect(&h, &commented, &["markup", "secret"]).await;
+    expect(&h, "the host 10&#46;0&#46;0&#46;1 answered", &["markup", "private_address"]).await;
+    expect(&h, "write to jane.doe&#64;mailhost.org", &["markup", "email"]).await;
+    expect(&h, "news on Project &#70;alcon", &["denylist", "markup"]).await;
+    expect(&h, "news on Proj<i></i>ect Falcon", &["denylist", "markup"]).await;
+    expect(&h, "news on Prоject Fаlcon", &["denylist"]).await; // Cyrillic о and а
+    expect(&h, "a hidden <!-- note --> comment", &["markup"]).await;
+    expect(&h, "returns Vec<String> now", &["markup"]).await;
+    expect(&h, "a &amp; b", &["markup"]).await;
+    // Code is shown literally, so markup inside it is fine.
+    expect(&h, "returns `Vec<String>` now", &[]).await;
+    expect(&h, "```\n<div>&amp;</div>\n```", &[]).await;
+    expect(&h, "R&D and Q&A, 1 < 2 > 0", &[]).await;
+
+    // A link must open what its text shows.
+    expect(&h, "see [https://github.com/acme/widgets](https://evil.example/x)", &["link"]).await;
+    expect(&h, "see [github.com/acme/widgets](https://github.com/other/thing)", &["link"]).await;
+    expect(&h, "see [the docs](https://docs.rs/serde) or [docs.rs](https://docs.rs/serde)", &[]).await;
+    expect(&h, "see https://github.com/acme/widgets and www.example.com", &[]).await;
+}
+
+#[tokio::test]
+async fn mentions_and_cross_references_are_refused_unless_allowed() {
+    let h = H::new().await;
+    expect(&h, "thanks @octocat for the report", &["mention"]).await;
+    expect(&h, "ping @acme/maintainers", &["mention"]).await;
+    expect(&h, "see other/repo#12", &["cross_reference"]).await;
+    expect(&h, "see https://github.com/other/repo/issues/3", &["cross_reference"]).await;
+    expect(&h, "see [this](https://github.com/other/repo/pull/3)", &["cross_reference"]).await;
+    for text in [
+        "fixed in acme/widgets#12 and #13",
+        "see https://github.com/acme/docs/pull/3",
+        "`@octocat` in code is not a mention",
+        "mail dev@example.com, pin react@18.3.1",
+    ] {
+        expect(&h, text, &[]).await;
+    }
+    let h = H::with(|c| c.relay_mention_allowlist = vec!["Octocat".into(), "@acme/maintainers".into()]).await;
+    expect(&h, "thanks @octocat, cc @acme/maintainers", &[]).await;
+    expect(&h, "thanks @someone-else", &["mention"]).await;
+}
+
+#[tokio::test]
+async fn secret_shapes_in_any_case_encoding_or_layout() {
+    use base64::Engine;
+    let h = H::new().await;
+    let gh = gh_token();
+    expect(&h, "set api_token = 'abc123def456' first", &["secret"]).await;
+    expect(&h, r#"config {"token": "abc123def456ghi"}"#, &["secret"]).await;
+    expect(&h, "password: hunter22", &["secret"]).await;
+    expect(&h, &format!("the token is {}\n{} now", &gh[..22], &gh[22..]), &["secret"]).await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("token={gh}"));
+    expect(&h, &format!("blob {b64} here"), &["secret"]).await;
+    let pct = format!("q=%67hp%5F{}", &gh[4..]);
+    expect(&h, &format!("url ?{pct} here"), &["secret"]).await;
+    for text in [
+        "the token: required",
+        "pass `a token = <your-token>`",
+        r#"set relay_github_secret = "relay-github""#,
+        "the password field is optional",
+    ] {
+        expect(&h, text, &[]).await;
+    }
+}
+
+#[tokio::test]
+async fn short_form_addresses_and_redirectors_are_refused() {
+    let h = H::new().await;
+    for text in [
+        "open http://10.1/ now",
+        "ping 127.1 now",
+        "ping 0177.0.0.1 now",
+        "open http://0x7f.1:8080/x now",
+        "open http://2130706433/ now",
+        "listen on 10.1:8080 now",
+        "open http://[::ffff:7f00:1]/ now",
+    ] {
+        expect(&h, text, &["private_address"]).await;
+    }
+    for text in ["version 10.0.1 is out", "the value 0xdeadbeef", "upgrade to 1.2.3", "at 10:30 today"] {
+        expect(&h, text, &[]).await;
+    }
+    expect(&h, "see https://bit.ly/abc123", &["redirector"]).await;
+    expect(&h, "see tinyurl.com/abc123", &["redirector"]).await;
+    let h = H::with(|c| c.relay_redirector_hosts = vec!["go.example.org".into()]).await;
+    expect(&h, "see https://bit.ly/abc123", &[]).await;
+    expect(&h, "see https://go.example.org/x", &["redirector"]).await;
+}
+
+#[tokio::test]
+async fn check_needs_an_identity_is_recorded_without_text_and_is_throttled() {
+    let h = H::with(|c| c.relay_checks_per_hour = 3).await;
+    let anon = Caller { enforce_profile: false, ..caller("anon", ActorKind::Anonymous, Profile::Public) };
+    let e = h.refused(&anon, "check", json!({ "target": TARGET, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "identity_required");
+
+    // A denylist hit leaves no offset or excerpt on any finding.
+    let v = h.gate("mail jane.doe@mailhost.org about project falcon").await;
+    assert_eq!(categories(&v), vec!["denylist", "email"], "{v}");
+    for f in v["findings"].as_array().unwrap() {
+        assert!(f.get("offset").is_none() && f.get("excerpt").is_none(), "{f}");
+    }
+    let ev = &h.events("relay.check")[0];
+    assert_eq!(ev["verdict"], "block");
+    assert_eq!(ev["categories"], json!({ "denylist": 1, "email": 1 }));
+    assert!(ev.get("text").is_none() && ev.get("text_sha256").is_none(), "{ev}");
+    let ledger = h.ledger().to_lowercase();
+    assert!(!ledger.contains("falcon") && !ledger.contains("jane.doe"), "{ledger}");
+
+    h.gate(CLEAN).await;
+    h.relay(&agent(), "draft", json!({ "target": TARGET, "text": CLEAN })).await;
+    let e = h.refused(&agent(), "check", json!({ "target": TARGET, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "rate_limited");
+    let e = h.refused(&agent(), "draft", json!({ "target": TARGET, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "rate_limited");
+    assert_eq!(h.events("relay.check").len(), 2, "a refused run is not recorded");
+    // The budget is per caller.
+    h.relay(&other_agent(), "check", json!({ "target": TARGET, "text": CLEAN })).await;
+}
+
+#[tokio::test]
+async fn a_denied_approval_drops_the_text_everywhere() {
+    let h = H::new().await;
+    let (id, approval_id) = h.requested(CLEAN).await;
+    assert_eq!(approval_payload(&h, approval_id)["text"], CLEAN, "kept while pending");
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "deny", "reason": "no" }))
+        .await;
+    let st = h.relay(&agent(), "status", json!({ "draft_id": id })).await;
+    assert_eq!((st["status"].as_str(), st["text"].as_str()), (Some("cancelled"), None), "{st}");
+    let p = approval_payload(&h, approval_id);
+    assert_eq!((p["text"].clone(), p["text_escaped"].clone()), (Value::Null, Value::Null), "{p}");
+    assert_eq!(p["text_sha256"], hex_sha(CLEAN));
+    assert_eq!(p["chars"], CLEAN.chars().count());
+    let e = h.refused(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "conflict");
+    assert!(h.mock.requests().is_empty());
+
+    // A denial recorded behind the relay's back is caught at send time.
+    let (id, approval_id) = h.requested(CLEAN).await;
+    h.hub
+        .db()
+        .write(move |tx| {
+            tx.execute("UPDATE approvals SET status = 'denied' WHERE id = ?1", [approval_id])?;
+            Ok(())
+        })
+        .unwrap();
+    let e = h.refused(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "approval_denied");
+    let st = h.relay(&agent(), "status", json!({ "draft_id": id })).await;
+    assert_eq!((st["status"].as_str(), st["text"].as_str()), (Some("cancelled"), None), "{st}");
+    assert_eq!(approval_payload(&h, approval_id)["text"], Value::Null);
+
+    // Cancelling drops it from the approval as well as the draft.
+    let (id, approval_id) = h.requested(CLEAN).await;
+    h.relay(&agent(), "cancel", json!({ "draft_id": id })).await;
+    assert_eq!(approval_payload(&h, approval_id)["text"], Value::Null);
+    assert!(h.mock.requests().is_empty());
 }

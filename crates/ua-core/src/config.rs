@@ -273,6 +273,17 @@ pub struct Config {
     pub relay_denylist: Vec<SecretString>,
     /// Longest relay message, in characters (1-65000).
     pub relay_max_chars: usize,
+    /// GitHub accounts and teams (`user` or `org/team`, case-insensitive) a
+    /// relay message may @-mention. Every other mention is refused.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_mention_allowlist: Vec<String>,
+    /// Link shorteners and redirectors the relay refuses to link to: a
+    /// shortened link hides where it leads from the human who approves it.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_redirector_hosts: Vec<String>,
+    /// Gate runs (`check` and `draft`) one caller may make per hour, so the
+    /// private denylist cannot be probed term by term. 0 refuses every run.
+    pub relay_checks_per_hour: u32,
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -410,9 +421,32 @@ impl Default for Config {
             relay_internal_hosts: Vec::new(),
             relay_denylist: Vec::new(),
             relay_max_chars: 10_000,
+            relay_mention_allowlist: Vec::new(),
+            relay_redirector_hosts: DEFAULT_REDIRECTOR_HOSTS.iter().map(|h| h.to_string()).collect(),
+            relay_checks_per_hour: 60,
         }
     }
 }
+
+/// Link shorteners and redirectors the relay refuses by default.
+pub const DEFAULT_REDIRECTOR_HOSTS: [&str; 16] = [
+    "bit.ly",
+    "buff.ly",
+    "cutt.ly",
+    "goo.gl",
+    "is.gd",
+    "lnkd.in",
+    "ow.ly",
+    "rb.gy",
+    "rebrand.ly",
+    "shorturl.at",
+    "t.co",
+    "t.ly",
+    "tiny.cc",
+    "tinyurl.com",
+    "v.gd",
+    "href.li",
+];
 
 fn default_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".ua-rust")
@@ -810,6 +844,9 @@ mod tests {
         assert_eq!(cfg.relay_github_secret.as_deref(), Some("relay-gh"));
         assert_eq!(cfg.relay_github_api_url, "https://api.github.com");
         assert_eq!(cfg.relay_max_chars, 500);
+        assert_eq!(cfg.relay_checks_per_hour, 60);
+        assert!(cfg.relay_redirector_hosts.iter().any(|h| h == "bit.ly"));
+        assert!(cfg.relay_mention_allowlist.is_empty());
         let deny: Vec<&str> = cfg.relay_denylist.iter().map(|p| p.expose_secret()).collect();
         assert_eq!(deny, vec!["project[- ]falcon", "a, b"], "list items are not split on commas");
         assert!(!format!("{cfg:?}").contains("falcon"), "the denylist must not leak through Debug");

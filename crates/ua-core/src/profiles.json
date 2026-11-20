@@ -86,6 +86,7 @@
   "plan_step_retry",
   "plan_update",
   "profile_activate",
+  "relay_manage",
   "review_and_notify",
   "rollback_migration_import",
   "routine_add",

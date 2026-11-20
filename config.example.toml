@@ -83,6 +83,12 @@ autonomy_max_cost_cents = 1000.0
 # Host names the relay treats as internal, besides .internal, .local, .lan, ...
 # relay_internal_hosts = ["buildbox"]
 # relay_max_chars = 10000
+# Accounts and teams a relay message may @-mention; every other is refused.
+# relay_mention_allowlist = ["acme/maintainers"]
+# Link shorteners refused in relay messages (this replaces the default list).
+# relay_redirector_hosts = ["bit.ly", "t.co", "tinyurl.com"]
+# check/draft runs per caller per hour.
+# relay_checks_per_hour = 60
 # Private denylist (regular expressions, case-insensitive). Never echoed or
 # logged. Prefer UA_RELAY_DENYLIST (one pattern per line) to keep it out of
 # this file.
