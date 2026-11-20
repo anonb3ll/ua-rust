@@ -33,7 +33,9 @@ mod worktrees;
 use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::SchemaPart;
 
-pub(crate) use bindings::{project_repo_bind, project_repo_get, project_repo_list, project_repo_unbind};
+pub(crate) use bindings::{
+    bound_repo, project_repo_bind, project_repo_get, project_repo_list, project_repo_unbind,
+};
 pub(crate) use block::{Blocked, check_claim, claim_block};
 pub(crate) use claim_release::task_claim_release;
 pub(crate) use holds::{task_hold, task_hold_get, task_holds};

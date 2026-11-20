@@ -5,16 +5,20 @@
 //! conversation by id. The transcript keeps one owner: no message body is
 //! copied into task notes or any other table.
 //!
-//! The link is recorded twice, both append-only: a
+//! The link is recorded twice: a
 //! `[conversation: <id>] handed off from the agent conversation` line in the
-//! task notes (the durable index `conversation_handoffs` reads), and one
-//! `agent.conversation.handoff` event (who handed off, and when).
+//! task notes, and one `agent.conversation.handoff` ledger event (who handed
+//! off, and when). The event is the audited record: `conversation_handoffs`
+//! lists a task under `handoffs` only when a handoff event links it, and a
+//! task whose notes merely carry the line (anyone who can write notes can
+//! type it) under `unaudited`, so a note line never passes for a handoff.
 //!
 //! Rules:
 //!
-//! - The caller is verified and can see the conversation: it sent or
-//!   received a message in it, or it may read every mailbox (a human, or the
-//!   coordinator profile). "Missing" and "not yours" read alike.
+//! - Both actions need a verified caller that can see the conversation: it
+//!   sent or received a message in it, or it may read every mailbox (a human,
+//!   or the coordinator profile). "Missing" and "not yours" read alike
+//!   (`not_found`).
 //! - Only an id-safe conversation id (1-200 letters, digits, `.`, `_`, `:`
 //!   or `-`) is written into notes, so an id cannot forge a note marker.
 //! - The task write is the registered `task_add` (create) or `task_update`
@@ -26,7 +30,9 @@
 //!   same task. Relinking appends nothing new (`task_update` suppresses a
 //!   verbatim repeat of a note line).
 
-use rusqlite::{Connection, params};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -75,15 +81,13 @@ fn is_id_safe(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
 }
 
-/// Whether the caller may read every mailbox (and so every conversation).
+/// Whether the verified caller may read every mailbox (and so every
+/// conversation). An unverified caller never is.
 fn unrestricted(ctx: &ToolCtx) -> bool {
     let cfg = ctx.hub.cfg();
-    match verified(&ctx.caller) {
-        None => true,
-        Some(label) => {
-            ctx.caller.is_human() || cfg.is_human(label) || ctx.caller.profile == Profile::Coordinator
-        }
-    }
+    verified(&ctx.caller).is_some_and(|label| {
+        ctx.caller.is_human() || cfg.is_human(label) || ctx.caller.profile == Profile::Coordinator
+    })
 }
 
 fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
@@ -199,27 +203,29 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
 }
 
 /// `coordination_manage(action="conversation_handoffs")`: the tasks a visible
-/// conversation was handed off to, oldest first. Read from the task-note
-/// reference, so a pruned event never hides a link; `by` and `at` come from
-/// the handoff event while it exists.
+/// conversation was handed off to, by task id. `handoffs` holds the links a
+/// handoff ledger event records (with `by`, `at` and whether the notes line
+/// is still there); `unaudited` holds tasks whose notes carry the line with
+/// no handoff event behind it. Same caller rule as `conversation_handoff`.
 pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaResult<Value> {
+    let actor = governance::verified_actor(&ctx.caller, "reading a conversation's handoffs")?;
     let cid = a.conversation_id.trim().to_string();
-    let viewer = match verified(&ctx.caller) {
-        Some(label) if !unrestricted(&ctx) => Some(label.to_string()),
-        _ => None,
-    };
+    if !is_id_safe(&cid) {
+        return Err(UaError::invalid("conversation_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
+    }
+    let viewer = (!unrestricted(&ctx)).then_some(actor);
     ctx.hub
         .db()
         .read_async(move |c| {
-            if !is_id_safe(&cid) || !visible(c, &cid, viewer.as_deref())? {
-                return Ok(json!({ "conversation_id": cid, "handoffs": [] }));
+            if !visible(c, &cid, viewer.as_deref())? {
+                return Err(UaError::not_found("conversation not found"));
             }
             let mut stmt =
-                c.prepare("SELECT id, title, status FROM tasks WHERE instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id")?;
-            let tasks: Vec<(i64, String, String)> = stmt
-                .query_map([reference(&cid)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<_, _>>()?;
-            let mut audit = std::collections::BTreeMap::new();
+                c.prepare("SELECT id FROM tasks WHERE instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id")?;
+            let noted: BTreeSet<i64> =
+                stmt.query_map([reference(&cid)], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            // The first event per task says who handed off and when.
+            let mut audit: BTreeMap<i64, (Option<String>, String)> = BTreeMap::new();
             let mut stmt = c.prepare(
                 "SELECT json_extract(payload, '$.task_id'), json_extract(payload, '$.by'), created_at \
                  FROM event_log WHERE channel = ?1 AND json_extract(payload, '$.conversation_id') = ?2 ORDER BY seq",
@@ -233,14 +239,25 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
                     audit.entry(t).or_insert((by, at));
                 }
             }
-            let handoffs: Vec<Value> = tasks
-                .into_iter()
-                .map(|(id, title, status)| {
-                    let (by, at) = audit.get(&id).cloned().map(|(b, t)| (b, Some(t))).unwrap_or((None, None));
-                    json!({ "task_id": id, "title": title, "status": status, "by": by, "at": at })
-                })
-                .collect();
-            Ok(json!({ "conversation_id": cid, "handoffs": handoffs }))
+            let task = |id: i64| -> UaResult<Option<(String, String)>> {
+                Ok(c.query_row("SELECT title, status FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?)
+            };
+            let mut handoffs = Vec::new();
+            for (id, (by, at)) in &audit {
+                let Some((title, status)) = task(*id)? else { continue };
+                handoffs.push(json!({
+                    "task_id": id, "title": title, "status": status, "by": by, "at": at,
+                    "note_reference": noted.contains(id),
+                }));
+            }
+            let mut unaudited = Vec::new();
+            for id in noted.iter().filter(|id| !audit.contains_key(id)) {
+                if let Some((title, status)) = task(*id)? {
+                    unaudited.push(json!({ "task_id": id, "title": title, "status": status }));
+                }
+            }
+            Ok(json!({ "conversation_id": cid, "handoffs": handoffs, "unaudited": unaudited }))
         })
         .await
 }

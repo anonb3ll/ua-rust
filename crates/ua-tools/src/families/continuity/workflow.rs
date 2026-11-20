@@ -28,6 +28,22 @@
 //! listed in `summary.contradicted`. Report mode: nothing here gates a claim
 //! or a merge.
 //!
+//! **What may be verified.** A caller cannot pick what the hub looks up:
+//!
+//! - The repository is the task's project's bound repository
+//!   (`project_repo_bind`). A `ref.repo` naming another is refused
+//!   (`repo_mismatch`); an omitted one is filled in from the binding. A
+//!   project with no binding keeps the reference, but the check cannot be
+//!   graded `verified` (the verdict says why).
+//! - A check with a reference needs the full 40-character `head_sha`: an
+//!   abbreviated SHA is ambiguous, so it is never graded `verified`.
+//! - `expected_checks` may bind a check name to one CI job
+//!   (`{name: "tests", job: "unit"}`, stored in `expected_jobs_json`). A
+//!   reference for that check naming another job is refused
+//!   (`job_mismatch`); one naming no job is graded on the expected job, so a
+//!   run-scope `tests` can never be verified by some other job. A binding set
+//!   after a check was recorded is applied again when it is verified.
+//!
 //! Writers are the task's claimant, its `next_owner`, a lifecycle operator or
 //! a human. Anyone who can call the action may read and re-verify.
 
@@ -42,6 +58,7 @@ use ua_core::{UaError, UaResult};
 
 use super::{bounded, is_operator_identity, now_micros, same_label};
 use crate::ci::{CiRun, Verdict};
+use crate::families::governance;
 use crate::families::tasks::{acting_identity, emit, require_task, str_field};
 use crate::registry::ToolCtx;
 
@@ -92,12 +109,31 @@ pub struct WorkflowSetArgs {
     pub focus: Option<String>,
     /// The commit (7-40 hex) the capsule describes; checks are graded here by default.
     pub head_sha: Option<String>,
-    /// Check names expected before the task is done (up to 12); a missing one reads `unknown`.
-    pub expected_checks: Option<Vec<String>>,
+    /// Checks expected before the task is done (up to 12); a missing one reads
+    /// `unknown`. Each is a name, or `{name, job}` binding the check to that CI
+    /// job: its reference must name that job (or none, and is graded on it).
+    pub expected_checks: Option<Vec<ExpectedCheck>>,
     /// Guard: refuse unless the record is still at this revision (0 when none exists).
     pub expected_revision: Option<i64>,
     /// Acting identity for an unverified caller; a verified caller acts as itself.
     pub actor: Option<String>,
+}
+
+/// An expected check: a bare name, or a name bound to one CI job.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ExpectedCheck {
+    Name(String),
+    Job(ExpectedCheckJob),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedCheckJob {
+    /// The check name.
+    pub name: String,
+    /// The CI job that alone may verify it.
+    pub job: Option<String>,
 }
 
 /// A CI run id: digits, as text or a number.
@@ -116,7 +152,8 @@ pub struct CheckRef {
     /// The CI run id (digits; a leading `#` is dropped).
     #[serde(rename = "ref")]
     pub reference: RunId,
-    /// `owner/name`. Without it the reference is kept but cannot be verified.
+    /// `owner/name`. Must be the task's project's bound repository; omitted,
+    /// the binding is used. Without a binding the check cannot be verified.
     pub repo: Option<String>,
     /// The CI job the check stands for. With it the grade is that job's;
     /// without it a verified grade covers the whole run only.
@@ -132,7 +169,7 @@ pub struct CheckRecordArgs {
     pub name: String,
     /// `pass` or `fail`.
     pub outcome: String,
-    /// The commit (7-40 hex) the result is for.
+    /// The commit the result is for: 7-40 hex, and the full 40 with a `ref`.
     pub head_sha: String,
     /// What the hub can look up to verify the claim: `{kind: "ci_run", ref, repo, job?}`.
     #[serde(rename = "ref")]
@@ -183,6 +220,18 @@ pub(crate) fn sha(raw: &str, field: &str) -> UaResult<String> {
     }
 }
 
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn job_name(raw: &str, field: &str) -> UaResult<String> {
+    let j = raw.trim();
+    if j.is_empty() || j.chars().count() > JOB_MAX {
+        return Err(UaError::invalid(format!("{field} must be the job's name, 1-{JOB_MAX} characters")));
+    }
+    Ok(j.to_string())
+}
+
 fn same_sha(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
@@ -226,12 +275,7 @@ fn parse_ref(r: Option<CheckRef>) -> UaResult<Option<ParsedRef>> {
     {
         return Err(UaError::invalid("ref.repo must be owner/name"));
     }
-    let job = match r.job.map(|j| j.trim().to_string()) {
-        Some(j) if j.is_empty() || j.chars().count() > JOB_MAX => {
-            return Err(UaError::invalid(format!("ref.job must be the job's name, 1-{JOB_MAX} characters")));
-        }
-        other => other,
-    };
+    let job = r.job.as_deref().map(|j| job_name(j, "ref.job")).transpose()?;
     Ok(Some(ParsedRef { kind: r.kind, run, repo, job }))
 }
 
@@ -252,6 +296,26 @@ fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) 
             ),
         ))
     }
+}
+
+/// The repository the task's project is bound to.
+fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
+    match str_field(task, "project") {
+        Some(project) => governance::bound_repo(conn, project),
+        None => Ok(None),
+    }
+}
+
+/// The CI job `expected_checks` binds check `name` to, if any.
+fn expected_job(conn: &Connection, task_id: i64, name: &str) -> UaResult<Option<String>> {
+    let raw: Option<String> = conn
+        .query_row("SELECT expected_jobs_json FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .optional()?;
+    Ok(job_map(raw).remove(name))
+}
+
+fn job_map(raw: Option<String>) -> BTreeMap<String, String> {
+    raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 // --- reads --------------------------------------------------------------------------
@@ -381,11 +445,12 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
         i64,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let record: Option<RecordRow> = conn
         .query_row(
-            "SELECT stage, goal, done_json, focus, head_sha, expected_json, revision, updated_by, updated_at \
-             FROM task_workflow WHERE task_id = ?1",
+            "SELECT stage, goal, done_json, focus, head_sha, expected_json, revision, updated_by, updated_at, \
+             expected_jobs_json FROM task_workflow WHERE task_id = ?1",
             [task_id],
             |r| {
                 Ok((
@@ -398,6 +463,7 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
@@ -407,9 +473,11 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
         "updated_by": null, "updated_at": null,
     });
     let mut expected = Vec::new();
+    let mut jobs = BTreeMap::new();
     let mut capsule_head = None;
-    if let Some((stage, goal, done, focus, head_sha, exp, revision, by, at)) = record {
+    if let Some((stage, goal, done, focus, head_sha, exp, revision, by, at, exp_jobs)) = record {
         expected = json_list(exp);
+        jobs = job_map(exp_jobs);
         capsule_head = head_sha.clone();
         out["stage"] = json!(stage);
         out["capsule"] = json!({ "goal": goal, "done": json_list(done), "focus": focus });
@@ -426,6 +494,7 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
         stmt.query_map(params![task_id, CHECKS_PER_TASK], check_row)?.collect::<Result<_, _>>()?;
     let (checks, summary) = graded(rows, judged.as_deref(), &expected);
     out["expected_checks"] = json!(expected);
+    out["expected_jobs"] = json!(jobs);
     out["judged_at_head"] = json!(judged);
     out["checks"] = json!(checks);
     out["summary"] = summary;
@@ -522,8 +591,28 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
                 "expected_checks must be a list of at most {EXPECTED_MAX} names"
             )));
         }
-        let names: BTreeSet<String> = exp.iter().map(|n| check_name(n)).collect::<UaResult<_>>()?;
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut jobs: BTreeMap<String, String> = BTreeMap::new();
+        for entry in &exp {
+            let (name, job) = match entry {
+                ExpectedCheck::Name(n) => (check_name(n)?, None),
+                ExpectedCheck::Job(j) => (
+                    check_name(&j.name)?,
+                    j.job.as_deref().map(|x| job_name(x, "expected_checks job")).transpose()?,
+                ),
+            };
+            if let Some(job) = job
+                && let Some(prior) = jobs.insert(name.clone(), job.clone())
+                && prior != job
+            {
+                return Err(UaError::invalid(format!(
+                    "expected check {name:?} names two jobs: {prior:?} and {job:?}"
+                )));
+            }
+            names.insert(name);
+        }
         fields.push(("expected_json", Sql::Text(json!(names).to_string())));
+        fields.push(("expected_jobs_json", Sql::Text(json!(jobs).to_string())));
     }
     if fields.is_empty() {
         return Err(UaError::invalid(
@@ -600,19 +689,54 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
     }
     let head = sha(&a.head_sha, "head_sha")?;
     let parsed = parse_ref(a.reference)?;
+    if parsed.is_some() && !is_full_sha(&head) {
+        return Err(UaError::invalid(
+            "a check with a ref needs the full 40-character head_sha: an abbreviated SHA is never graded verified",
+        ));
+    }
     let detail = a.detail.as_deref().map(|d| bounded(d, "detail", DETAIL_MAX)).transpose()?;
-    let verify = a.verify.unwrap_or(true) && parsed.as_ref().is_some_and(|p| p.repo.is_some());
+    let verify = a.verify.unwrap_or(true);
 
     let (ctx2, who2, name2, head2) = (ctx.clone(), who.clone(), name.clone(), head.clone());
-    ctx.hub
+    let has_repo = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let task = require_task(tx, id)?;
             require_writer(&ctx2, &task, &who2, id)?;
             let (kind, run, repo, job) = match parsed {
-                Some(p) => (Some(p.kind), Some(p.run), p.repo, p.job),
+                Some(p) => {
+                    let bound = task_repo(tx, &task)?;
+                    let repo = match (p.repo, bound) {
+                        (Some(given), Some(bound)) if !given.eq_ignore_ascii_case(&bound) => {
+                            return Err(UaError::denied(
+                                "repo_mismatch",
+                                format!(
+                                    "ref.repo {given:?} is not task {id}'s bound repository {bound:?}; a check is \
+                                     verified only against its project's repository"
+                                ),
+                            ));
+                        }
+                        (_, Some(bound)) => Some(bound),
+                        (given, None) => given,
+                    };
+                    let job = match (p.job, expected_job(tx, id, &name2)?) {
+                        (Some(given), Some(want)) if given != want => {
+                            return Err(UaError::denied(
+                                "job_mismatch",
+                                format!(
+                                    "check {name2:?} on task {id} is bound to job {want:?}; a ref naming job \
+                                     {given:?} cannot stand for it"
+                                ),
+                            ));
+                        }
+                        (given, want) => given.or(want),
+                    };
+                    (Some(p.kind), Some(p.run), repo, job)
+                }
                 None => (None, None, None, None),
             };
+            let has_repo = repo.is_some();
             tx.execute(
                 "INSERT INTO task_checks (task_id, name, head_sha, outcome, grade, ref_kind, ref, repo, ref_job, \
                  detail, verification_json, recorded_by, recorded_at, verified_at) \
@@ -629,10 +753,10 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
                 json!({ "kind": "check", "task_id": id, "name": name2, "head_sha": head2, "outcome": outcome, "grade": ATTESTED }),
                 &who2,
             )?;
-            Ok(())
+            Ok(has_repo)
         })
         .await?;
-    if verify {
+    if verify && has_repo {
         return verify_stored(&ctx, id, &name, &head, &who).await;
     }
     ctx.hub.db().read_async(move |c| view(c, id, Some(&head))).await
@@ -653,27 +777,68 @@ pub(crate) async fn task_check_verify(ctx: ToolCtx, a: CheckVerifyArgs) -> UaRes
 /// row's `recorded_at`, so a re-record meanwhile is not overwritten.
 async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str) -> UaResult<Value> {
     let (n, h) = (name.to_string(), head.to_string());
-    let row = ctx
+    let (row, bound, want_job) = ctx
         .hub
         .db()
         .read_async(move |c| {
-            require_task(c, id)?;
-            Ok(c.query_row(
-                &format!("SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = ?2 AND head_sha = ?3"),
-                params![id, n, h],
-                check_row,
-            )
-            .optional()?)
+            let task = require_task(c, id)?;
+            let row = c
+                .query_row(
+                    &format!(
+                        "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = ?2 AND head_sha = ?3"
+                    ),
+                    params![id, n, h],
+                    check_row,
+                )
+                .optional()?;
+            Ok((row, task_repo(c, &task)?, expected_job(c, id, &n)?))
         })
-        .await?
-        .ok_or_else(|| {
-            UaError::not_found(format!("no check {name:?} recorded for task {id} at {}", &head[..head.len().min(12)]))
-        })?;
+        .await?;
+    let row = row.ok_or_else(|| {
+        UaError::not_found(format!(
+            "no check {name:?} recorded for task {id} at {}",
+            &head[..head.len().min(12)]
+        ))
+    })?;
 
-    let (grade, verification) = match (&row.ref_kind, &row.reference, &row.repo) {
-        (Some(_), Some(run_id), Some(repo)) => {
+    let refused = |detail: String| {
+        (
+            ATTESTED,
+            Some(json!({ "verdict": Verdict::Unverifiable.as_str(), "detail": detail, "observed": {} })),
+        )
+    };
+    let (grade, verification) = match (&row.ref_kind, &row.reference) {
+        (Some(_), _) if !is_full_sha(&row.head_sha) => refused(
+            "a verified grade needs the full 40-character head SHA; this check names an abbreviated one"
+                .into(),
+        ),
+        (Some(_), _) if bound.is_none() => refused(format!(
+            "task {id}'s project has no bound repository (project_repo_bind): there is nothing to verify against"
+        )),
+        (Some(_), _)
+            if !row
+                .repo
+                .as_deref()
+                .is_none_or(|r| bound.as_deref().is_some_and(|b| r.eq_ignore_ascii_case(b))) =>
+        {
+            refused(format!(
+                "the reference names repository {:?}, not the project's bound repository {:?}",
+                row.repo.as_deref().unwrap_or_default(),
+                bound.as_deref().unwrap_or_default()
+            ))
+        }
+        (Some(_), _) if want_job.as_ref().is_some_and(|w| row.ref_job.as_ref().is_some_and(|j| j != w)) => {
+            refused(format!(
+                "check {name:?} is bound to job {:?}; the reference names job {:?}",
+                want_job.as_deref().unwrap_or_default(),
+                row.ref_job.as_deref().unwrap_or_default()
+            ))
+        }
+        (Some(_), Some(run_id)) => {
+            let repo = bound.clone().unwrap_or_default();
+            let job = row.ref_job.clone().or_else(|| want_job.clone());
             let run = CiRun {
-                repo: repo.clone(),
+                repo,
                 run_id: run_id.clone(),
                 head_sha: row.head_sha.clone(),
                 expect: if row.outcome == "pass" { "success" } else { "failure" }.into(),
@@ -685,7 +850,7 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
                 _ => Map::new(),
             };
             if outcome.verdict == Verdict::Verified {
-                if let Some(job) = &row.ref_job {
+                if let Some(job) = &job {
                     let job_outcome = ci.verify_job(&run, job).await;
                     if let Value::Object(seen) = job_outcome.observed {
                         observed.extend(seen);

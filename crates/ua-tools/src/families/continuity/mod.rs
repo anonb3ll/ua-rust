@@ -147,8 +147,18 @@ CREATE INDEX IF NOT EXISTS idx_tasks_folded_into ON tasks(folded_into) WHERE fol
 ",
 };
 
+/// The CI job each expected check is bound to, by check name (a JSON
+/// object). A separate column so `expected_json` keeps the Python hub's
+/// shape (a list of names) for import.
+pub const CHECK_JOBS_SCHEMA: SchemaPart = SchemaPart {
+    name: "continuity.check_jobs.v1",
+    sql: "
+ALTER TABLE task_workflow ADD COLUMN expected_jobs_json TEXT NOT NULL DEFAULT '{}';
+",
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA, PARKING_SCHEMA]
+    vec![SCHEMA, PARKING_SCHEMA, CHECK_JOBS_SCHEMA]
 }
 
 // --- shared helpers ---------------------------------------------------------------

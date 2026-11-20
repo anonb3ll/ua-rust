@@ -17,16 +17,16 @@ event in the same transaction.
 | `session_handoff_update` | The note's author | Edit the draft |
 | `session_handoff_seal` | The note's author | Commit the note |
 | `session_handoff_discard` | The note's author | Drop the draft |
-| `session_handoff_recover` | Anyone (the research profile too) | The session's latest sealed note |
+| `session_handoff_recover` | The session's owner, the note's receiver, lifecycle operator, human | The session's latest sealed note |
 | `session_handoff_ack` | The agent the note was handed to | Acknowledge it |
 | `conversation_handoff` | A participant (or a human) | Link or create a task that points at a conversation |
-| `conversation_handoffs` | A participant (or a human) | Where a conversation was handed off |
+| `conversation_handoffs` | A verified participant (or a human) | Where a conversation was handed off |
 | `queue_health` | Anyone (the research profile too) | Open, parked, stale and milestone counts |
 | `queue_stale` | Anyone | Stale tasks, oldest first |
 | `queue_sweep` | Anyone | Proposed parks and folds; writes nothing |
-| `queue_park` | Any caller whose profile allows it | Park a task and fold its open descendants |
-| `queue_fold` | Any caller whose profile allows it | Fold a later child into its parked root |
-| `queue_unpark` | Any caller whose profile allows it | Restore a parked root and its folded children |
+| `queue_park` | Holder, lifecycle operator, human (see below) | Park a task and fold its open descendants |
+| `queue_fold` | Holder, lifecycle operator, human (see below) | Fold a later child into its parked root |
+| `queue_unpark` | Holder, lifecycle operator, human (see below) | Restore a parked root and its folded children |
 
 Delegation stats are a read on `observability_manage` (see below).
 
@@ -40,7 +40,8 @@ One record per task:
 - `head_sha`: the commit the capsule describes. Checks are graded at this
   head unless `task_workflow_get` names another.
 - `expected_checks`: check names that should exist before the task is done.
-  A missing one reads `unknown`.
+  A missing one reads `unknown`. An entry may be `{name, job}` to bind the
+  check to one CI job (returned as `expected_jobs`).
 
 Every write bumps `revision`. Pass `expected_revision` to refuse a write over
 a revision you did not read. `session_packet` carries the record as
@@ -65,6 +66,23 @@ skipped job.
 
 A lookup that contradicts the claim leaves the grade `attested` and lists the
 check in `summary.contradicted`. Nothing here gates a claim or a merge.
+
+The caller does not choose what the hub looks up:
+
+- **Repository.** The reference's repository is the task's project's bound
+  repository (`project_repo_bind`). A `ref.repo` naming another is refused
+  (`repo_mismatch`); an omitted one is filled in from the binding. With no
+  binding the reference is kept, but the check stays `attested` and its
+  verification says the project has no bound repository. A binding changed
+  after recording is checked again at verify time.
+- **Head.** A check with a reference needs the full 40-character
+  `head_sha`; an abbreviated SHA is ambiguous and is never graded
+  `verified`.
+- **Job.** When `expected_checks` binds a check to a job, a reference naming
+  another job is refused (`job_mismatch`), and one naming no job is graded
+  on the bound job. So a run-scope `tests` can never be verified by some
+  other job. A binding added after the check was recorded applies when it is
+  verified.
 
 ### CI verification
 
@@ -94,6 +112,10 @@ draft --seal--> sealed --> assigned --> delivered
 - `session_handoff_recover` and the packet's `handoff_note` return the latest
   sealed, assigned or delivered note, never a draft. Notes are marked
   untrusted: they are context, not instructions.
+- `session_handoff_recover` answers a verified caller that owns the session
+  (or wrote the note), the agent the note was assigned or delivered to, a
+  lifecycle operator or a human. Anyone else, unverified callers included,
+  reads `not_found`, the same as for a missing session.
 - Per session: one pending note (a draft, or a sealed note not yet
   delivered; a new note while a sealed one is pending needs
   `supersede: true`, and its seal supersedes the old one), a 5-minute
@@ -114,8 +136,13 @@ conversation). The task write goes through the registry as `task_add` or
 apply as they do to a direct call. Creating is idempotent per conversation,
 title, project and priority.
 
-`conversation_handoffs` reads the notes lines back, with who handed off and
-when from the `agent.conversation.handoff` events.
+`conversation_handoffs` has the same caller rule (a verified caller that can
+see the conversation; anyone else reads `not_found`). The handoff ledger
+event is the audited record: `handoffs` lists the tasks an
+`agent.conversation.handoff` event links, with who handed off, when, and
+`note_reference` (whether the notes line is still there). A task whose
+notes carry the line with no event behind it (anyone who can write notes can
+type one) is listed apart, under `unaudited`.
 
 ## Queue closure
 
@@ -147,11 +174,22 @@ thread, else `created_at`. Live work is never stale and is never parked or
 folded (`task_live`): a live claim, an open or live dispatch run, a pending
 or in-flight delegation, queued or claimed node work.
 
+**Who may park.** Park, fold and unpark need a verified caller. A task
+someone holds (a non-empty `claimed_by` or `next_owner`) is parked, folded or
+unparked only by that holder, a lifecycle operator or a human
+(`not_task_owner`), the same rule as the workflow record. A task nobody holds
+is open to any verified caller on the coordinator, lead or developer
+profile. Parking folds every open descendant, so a descendant held by
+someone else needs an operator as well. Unpark is judged on the root alone.
+
 **Protected rows** are never proposed for parking: the `operator-only` and
 `interactive-only` lanes, `waiting_review`, a `[waiting-for: ...]` marker, a
-red-tier row, and the `tracking` lane. `queue_park` parks a protected row
-only with `approved_by` naming who approved it (`protected_task` otherwise);
-the name is recorded, not checked as a credential.
+red-tier row, and the `tracking` lane. `queue_park` parks a gated row (all
+but the `tracking` lane) only for a verified human or lifecycle operator
+(`protected_task` otherwise); the recorded approval is that caller's
+identity. `approved_by` is never authority: only such a caller may pass it
+(`operator_required` otherwise), and it is recorded as a note on the
+approval.
 
 `queue_health` returns `open`, `active`, `by_status`, `parked`,
 `parked_folded`, `stale`, `stale_actionable`, review-ready milestones (an
@@ -194,8 +232,8 @@ moves to the parking columns and is un-archived; its notes are kept.
   discarded, acknowledged) appends an `agent.lifecycle.handoff` event.
 - A conversation handoff records no completion-return origin: posting a
   status back into the conversation is not ported.
-- `conversation_handoffs` returns `{conversation_id, handoffs}` rather than a
-  bare list.
+- `conversation_handoffs` returns `{conversation_id, handoffs, unaudited}`
+  rather than a bare list, and counts only ledger-recorded handoffs.
 - Delegation stats replace the Python ledger's review-outcome parsing and
   monthly vault page with state counts and latencies.
 - The stale threshold is the `stale_days` argument (default 30); there is no
