@@ -46,6 +46,7 @@ pub mod wake;
 pub mod web;
 pub mod workflows;
 pub mod workspace;
+pub mod zulip;
 
 use ua_store::SchemaPart;
 
@@ -85,6 +86,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
     parts.push(workflows::SCHEMA);
+    parts.push(zulip::SCHEMA);
     parts
 }
 
@@ -130,4 +132,5 @@ pub fn register(r: &mut Registry) {
     web::register(r);
     workflows::register(r);
     workspace::register(r);
+    zulip::register(r);
 }
