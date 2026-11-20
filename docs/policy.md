@@ -273,7 +273,10 @@ stale only once idle) and, when a human or lifecycle operator asks with
 `dry_run=false`, removes only those with no uncommitted changes, no untracked
 files and no ignored files (`git worktree remove` would delete an ignored
 `.env` without asking) whose branch the base branch already contains, with
-`git worktree remove` and never `--force`.
+`git worktree remove` and never `--force`. A worktree a running process
+uses is never stale; the process table is read from `/proc` on Linux and
+through `proc_pidinfo` on macOS, and where it cannot be read every worktree
+is kept.
 `audit_triage_tasks` runs `security_audit` and files one deduplicated task
 per group of findings; a clean audit files nothing.
 
