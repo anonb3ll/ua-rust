@@ -90,7 +90,9 @@ async fn export_is_deterministic_and_compare_is_read_only() {
     assert!(first["manifest"].get("agent_events").is_none());
     assert!(first["manifest"].get("agent_events_withheld").is_none());
     // Every task column a migration needs; no machine-local worktree path.
-    for col in ["domain", "lane", "due_at", "evidence_ref", "next_owner", "waiting_on", "claimed_by", "project"] {
+    for col in
+        ["domain", "lane", "due_at", "evidence_ref", "next_owner", "waiting_on", "claimed_by", "project"]
+    {
         assert!(tasks[0].get(col).is_some(), "tasks.{col} missing: {}", tasks[0]);
     }
     assert!(tasks[0].get("worktree_path").is_none(), "{}", tasks[0]);
@@ -200,22 +202,25 @@ async fn compare_err(reg: &Registry, hub: &Hub, left: Value, right: Value) -> St
 async fn compare_refuses_other_origins_and_duplicate_ids() {
     let e = env();
     let reg = builtin_registry();
-    let m = |host: &str, tasks: Value, memory: Value| {
-        json!({"manifest_version": 1, "source_host": host, "tasks": tasks, "memory": memory})
-    };
+    let m = |host: &str, tasks: Value, memory: Value| json!({"manifest_version": 1, "source_host": host, "tasks": tasks, "memory": memory});
     let one = json!([{"id": 1, "title": "t", "notes": ""}]);
 
     // Ids from two hubs do not name the same rows.
-    let err = compare_err(&reg, &e.hub, m("hub-a", one.clone(), json!([])), m("hub-b", one.clone(), json!([]))).await;
+    let err =
+        compare_err(&reg, &e.hub, m("hub-a", one.clone(), json!([])), m("hub-b", one.clone(), json!([])))
+            .await;
     assert!(err.contains("different origins"), "{err}");
-    let err = compare_err(&reg, &e.hub, json!({"manifest_version": 1}), m("hub-a", one.clone(), json!([]))).await;
+    let err =
+        compare_err(&reg, &e.hub, json!({"manifest_version": 1}), m("hub-a", one.clone(), json!([]))).await;
     assert!(err.contains("no source_host"), "{err}");
 
     // A repeated id is refused in every table and on either side.
     let twice = json!([{"id": 1, "title": "t", "notes": ""}, {"id": 1, "title": "u", "notes": ""}]);
-    let err = compare_err(&reg, &e.hub, m("hub-a", one.clone(), json!([])), m("hub-a", twice, json!([]))).await;
+    let err =
+        compare_err(&reg, &e.hub, m("hub-a", one.clone(), json!([])), m("hub-a", twice, json!([]))).await;
     assert!(err.contains("right tasks contains duplicate id 1"), "{err}");
-    let notes = json!([{"id": "n1", "title": "a", "content": "x"}, {"id": "n1", "title": "b", "content": "y"}]);
+    let notes =
+        json!([{"id": "n1", "title": "a", "content": "x"}, {"id": "n1", "title": "b", "content": "y"}]);
     let err = compare_err(&reg, &e.hub, m("hub-a", json!([]), notes), m("hub-a", json!([]), json!([]))).await;
     assert!(err.contains("left memory contains duplicate id n1"), "{err}");
     let err = compare_err(
@@ -240,7 +245,8 @@ async fn compare_recomputes_fingerprints_and_checks_parents_on_both_sides() {
     let mut right = left.clone();
     right["tasks"][1]["title"] = json!("child, edited");
     let diff =
-        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left.clone(), "right": right})).await;
+        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left.clone(), "right": right}))
+            .await;
     assert_eq!(diff["same"], false, "{diff}");
     assert_ne!(diff["left_fingerprint"], diff["right_fingerprint"]);
     let conflicts = diff["conflicts"].as_array().unwrap();
@@ -251,13 +257,9 @@ async fn compare_recomputes_fingerprints_and_checks_parents_on_both_sides() {
     // fingerprints agree, but the mismatch is a conflict, so not `same`.
     let mut forged = left.clone();
     forged["fingerprint"] = json!("forged");
-    let diff = call(
-        &reg,
-        &e.hub,
-        "compare_migration_manifests",
-        json!({"left": forged.clone(), "right": forged}),
-    )
-    .await;
+    let diff =
+        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": forged.clone(), "right": forged}))
+            .await;
     assert_eq!(diff["left_fingerprint"], diff["right_fingerprint"]);
     assert_eq!(diff["same"], false, "{diff}");
 
@@ -267,8 +269,11 @@ async fn compare_recomputes_fingerprints_and_checks_parents_on_both_sides() {
     let diff =
         call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left, "right": orphaned})).await;
     let conflicts = diff["conflicts"].as_array().unwrap();
+    let parent_id = parent.to_string();
     assert!(
-        conflicts.iter().any(|c| c["type"] == "missing_parent" && c["side"] == "right" && c["parent_id"] == parent.to_string()),
+        conflicts.iter().any(|c| c["type"] == "missing_parent"
+            && c["side"] == "right"
+            && c["parent_id"] == parent_id.as_str()),
         "{diff}"
     );
     assert!(!conflicts.iter().any(|c| c["type"] == "missing_parent" && c["side"] == "left"), "{diff}");
@@ -296,7 +301,8 @@ async fn manifest_origin_comes_from_config_and_client_events_are_labelled() {
     assert!(events.iter().filter(|ev| ev["channel"] != "sdk.note").all(|ev| ev.get("trust").is_none()));
     // The label is part of the fingerprinted payload, so a round trip still compares equal.
     let diff =
-        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": m.clone(), "right": m.clone()})).await;
+        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": m.clone(), "right": m.clone()}))
+            .await;
     assert_eq!(diff["same"], true, "{diff}");
 }
 

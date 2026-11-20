@@ -748,7 +748,8 @@ fn index_rows<'r>(
             return Err(UaError::invalid(format!("{side} {kind} rows require an id")));
         }
         if index.insert(key.clone(), row).is_some() {
-            let what = if keys == ["id"] { format!("duplicate id {key}") } else { "duplicate graph keys".into() };
+            let what =
+                if keys == ["id"] { format!("duplicate id {key}") } else { "duplicate graph keys".into() };
             return Err(UaError::invalid(format!("{side} {kind} contains {what}")));
         }
     }
@@ -854,7 +855,8 @@ async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<
     {
         return Err(UaError::invalid("unsupported migration manifest version"));
     }
-    let (left_origin, right_origin) = (manifest_origin("left", &a.left)?, manifest_origin("right", &a.right)?);
+    let (left_origin, right_origin) =
+        (manifest_origin("left", &a.left)?, manifest_origin("right", &a.right)?);
     if left_origin != right_origin {
         return Err(UaError::invalid(format!(
             "the manifests come from different origins ({left_origin:?} and {right_origin:?}); rows are keyed by \
