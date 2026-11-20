@@ -12,6 +12,7 @@
 //! so concurrent exports never overwrite each other. Writes are recorded on
 //! `agent.export.written`. No redaction: review an export before sharing it.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +25,9 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::harness_config::render::py_dumps;
+use super::injection::mark_untrusted;
 
 use crate::families::observability::normalize_since;
 use crate::families::plans::{parse_params, row_map};
@@ -459,6 +462,8 @@ async fn export_journal(ctx: ToolCtx, a: JournalArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // Migration manifests. Read-only: nothing here imports or rolls back.
 
+/// Task columns a manifest carries. `worktree_path` is left out: it is an
+/// absolute path on the exporting machine and means nothing on another one.
 const MANIFEST_TASK_COLUMNS: &[&str] = &[
     "id",
     "title",
@@ -475,9 +480,14 @@ const MANIFEST_TASK_COLUMNS: &[&str] = &[
     "claimed_at",
     "lock_expires_at",
     "untrusted",
-    "worktree_path",
     "branch",
     "project",
+    "domain",
+    "lane",
+    "due_at",
+    "evidence_ref",
+    "next_owner",
+    "waiting_on",
 ];
 const MANIFEST_MEMORY_COLUMNS: &[&str] = &[
     "id",
@@ -510,9 +520,21 @@ const GRAPH_TABLES: &[(&str, &[&str], &[&str])] = &[
     ("memory_entities", &["note_id", "kind", "value"], &["note_id", "kind", "value"]),
     ("memory_links", &["src_id", "dst_id", "rel", "actor", "created_at"], &["src_id", "dst_id", "rel"]),
 ];
+/// Manifest fields outside the fingerprinted payload.
+const UNHASHED_FIELDS: [&str; 2] = ["generated_at", "fingerprint"];
 
 fn manifest_hash(payload: &Value) -> String {
     hex::encode(Sha256::digest(py_dumps(payload, None).as_bytes()))
+}
+
+/// The fingerprint of a manifest: SHA-256 of its payload without the fields
+/// in [`UNHASHED_FIELDS`]. Keys are sorted, so field order does not matter.
+fn manifest_fingerprint(manifest: &Map<String, Value>) -> String {
+    let mut payload = manifest.clone();
+    for field in UNHASHED_FIELDS {
+        payload.remove(field);
+    }
+    manifest_hash(&Value::Object(payload))
 }
 
 fn has_table(c: &Connection, table: &str) -> UaResult<bool> {
@@ -544,12 +566,10 @@ fn manifest_rows(c: &Connection, table: &str, want: &[&str], order_by: &str) -> 
     Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(Value::Object).collect())
 }
 
-fn source_host_label() -> String {
-    std::env::var("UA_SOURCE_HOST")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "local".into())
+/// The origin label stamped on a manifest: `source_host` from the config
+/// (`UA_SOURCE_HOST`), else `local`.
+fn source_host_label(cfg: &ua_core::Config) -> String {
+    cfg.source_host.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("local").to_string()
 }
 
 fn schema_version_label(c: &Connection) -> UaResult<String> {
@@ -559,9 +579,21 @@ fn schema_version_label(c: &Connection) -> UaResult<String> {
     Ok(names.join(","))
 }
 
-fn build_manifest(c: &Connection) -> UaResult<Value> {
-    let mut tasks = manifest_rows(c, "tasks", MANIFEST_TASK_COLUMNS, "id")?;
-    let memory: Vec<Value> = manifest_rows(c, "memory", MANIFEST_MEMORY_COLUMNS, "id")?
+/// Mark a client-written (`sdk.`) event's row untrusted, as `event_log_query` does.
+fn label_event_row(row: &mut Value) {
+    if !row.get("channel").and_then(Value::as_str).is_some_and(is_client_channel) {
+        return;
+    }
+    let originator = row.get("originator").and_then(Value::as_str).map(str::to_string);
+    mark_untrusted(row, CLIENT_EVIDENCE_SOURCE, originator.as_deref());
+}
+
+fn build_manifest(c: &Connection, source_host: &str) -> UaResult<Value> {
+    // One read transaction: every table comes from the same snapshot, so a
+    // write landing mid-export cannot leave a task without its events.
+    let tx = c.unchecked_transaction()?;
+    let tasks = manifest_rows(&tx, "tasks", MANIFEST_TASK_COLUMNS, "id")?;
+    let memory: Vec<Value> = manifest_rows(&tx, "memory", MANIFEST_MEMORY_COLUMNS, "id")?
         .into_iter()
         .filter(|row| row.get("id").and_then(Value::as_str).is_none_or(|id| !is_index_id(id)))
         .collect();
@@ -569,32 +601,23 @@ fn build_manifest(c: &Connection) -> UaResult<Value> {
         memory.iter().filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string)).collect();
     let mut payload = Map::new();
     payload.insert("manifest_version".into(), json!(1));
-    payload.insert("source_host".into(), json!(source_host_label()));
-    payload.insert("schema_version".into(), json!(schema_version_label(c)?));
-    payload.insert("tasks".into(), Value::Array(tasks.split_off(0)));
+    payload.insert("source_host".into(), json!(source_host));
+    payload.insert("schema_version".into(), json!(schema_version_label(&tx)?));
+    payload.insert("tasks".into(), Value::Array(tasks));
     payload.insert("memory".into(), Value::Array(memory));
     for (table, columns, _) in GRAPH_TABLES {
-        let mut rows = manifest_rows(c, table, columns, columns[0])?;
+        let mut rows = manifest_rows(&tx, table, columns, columns[0])?;
         rows.retain(|row| graph_row_in_notes(row, &note_ids));
         payload.insert((*table).into(), Value::Array(rows));
     }
-    let agent_total =
-        manifest_rows(c, "agent_events", &["id", "agent", "ts", "kind", "ref_id", "summary"], "id")?;
-    // This hub has no tenant column on agent events. A missing table exports
-    // nothing; a present table is included whole and nothing is withheld.
-    let withheld = 0;
-    payload.insert("agent_events".into(), Value::Array(agent_total));
-    payload.insert("agent_events_withheld".into(), json!(withheld));
-    payload.insert(
-        "event_log".into(),
-        Value::Array(manifest_rows(c, "event_log", MANIFEST_EVENT_COLUMNS, "ulid")?),
-    );
-    let payload = Value::Object(payload);
-    let fingerprint = manifest_hash(&payload);
-    let mut manifest = payload.as_object().cloned().unwrap_or_default();
-    manifest.insert("generated_at".into(), json!(ua_core::time::now()));
-    manifest.insert("fingerprint".into(), json!(fingerprint));
-    Ok(Value::Object(manifest))
+    let mut events = manifest_rows(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid")?;
+    events.iter_mut().for_each(label_event_row);
+    payload.insert("event_log".into(), Value::Array(events));
+    tx.finish()?;
+    let fingerprint = manifest_fingerprint(&payload);
+    payload.insert("generated_at".into(), json!(ua_core::time::now()));
+    payload.insert("fingerprint".into(), json!(fingerprint));
+    Ok(Value::Object(payload))
 }
 
 fn graph_row_in_notes(row: &Value, note_ids: &[String]) -> bool {
@@ -617,26 +640,28 @@ pub struct ManifestArgs {
 }
 
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
-    let manifest = ctx.hub.db().read_async(build_manifest).await?;
+    let source_host = source_host_label(ctx.hub.cfg());
+    let manifest = ctx.hub.db().read_async(move |c| build_manifest(c, &source_host)).await?;
     let tasks = manifest.get("tasks").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
     let memory = manifest.get("memory").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    let content = format!("{}\n", py_dumps(&manifest, Some(2)));
-    let mut out = deliver(
-        &ctx,
-        "migration-manifest",
-        "json",
-        content,
-        tasks + memory,
-        a.write_to_vault.unwrap_or(false),
-    )
-    .await?;
-    if let Some(obj) = out.as_object_mut() {
-        if let Some(fp) = manifest.get("fingerprint").cloned() {
-            obj.insert("fingerprint".into(), fp);
+    let rows = tasks + memory;
+    let fingerprint = manifest.get("fingerprint").cloned().unwrap_or(Value::Null);
+    if a.write_to_vault.unwrap_or(false) {
+        // The file holds the manifest; the result only points at it.
+        let content = format!("{}\n", py_dumps(&manifest, Some(2)));
+        let mut out = deliver(&ctx, "migration-manifest", "json", content, rows, true).await?;
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("fingerprint".into(), fingerprint);
         }
-        obj.insert("manifest".into(), manifest);
+        return Ok(out);
     }
-    Ok(out)
+    let bytes = py_dumps(&manifest, None).len();
+    if bytes > INLINE_MAX_BYTES {
+        return Err(UaError::invalid(format!(
+            "manifest is {bytes} bytes, over the {INLINE_MAX_BYTES} byte inline cap; pass write_to_vault=true"
+        )));
+    }
+    Ok(json!({ "manifest": manifest, "fingerprint": fingerprint, "rows": rows, "bytes": bytes }))
 }
 
 fn object_rows(value: Option<&Value>, what: &str) -> UaResult<Vec<Map<String, Value>>> {
@@ -687,15 +712,14 @@ fn non_empty_str(value: Option<&Value>) -> Option<&str> {
     value.and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
-fn validate_graph(payload: &Value) -> UaResult<()> {
-    for (table, columns, keys) in GRAPH_TABLES {
+fn validate_graph(side: &str, payload: &Value) -> UaResult<()> {
+    for (table, columns, _) in GRAPH_TABLES {
         let rows = object_rows(payload.get(*table), table)?;
-        let mut seen = Vec::new();
         for row in &rows {
             let required: Vec<&str> = columns.iter().copied().filter(|c| *c != "actor").collect();
             if required.iter().any(|c| !row.get(*c).is_some_and(Value::is_string)) {
                 return Err(UaError::invalid(format!(
-                    "{table} rows require string fields: {}",
+                    "{side} {table} rows require string fields: {}",
                     required.join(", ")
                 )));
             }
@@ -703,16 +727,42 @@ fn validate_graph(payload: &Value) -> UaResult<()> {
                 && !actor.is_null()
                 && !actor.is_string()
             {
-                return Err(UaError::invalid(format!("{table} actor must be a string or null")));
+                return Err(UaError::invalid(format!("{side} {table} actor must be a string or null")));
             }
-            let key = row_key(row, keys);
-            if seen.contains(&key) {
-                return Err(UaError::invalid(format!("{table} contains duplicate graph keys")));
-            }
-            seen.push(key);
         }
     }
     Ok(())
+}
+
+/// Index one side's rows by key, refusing a row without a key and a key seen twice.
+fn index_rows<'r>(
+    side: &str,
+    kind: &str,
+    keys: &[&str],
+    rows: &'r [Map<String, Value>],
+) -> UaResult<BTreeMap<String, &'r Map<String, Value>>> {
+    let mut index = BTreeMap::new();
+    for row in rows {
+        let key = row_key(row, keys);
+        if key.is_empty() {
+            return Err(UaError::invalid(format!("{side} {kind} rows require an id")));
+        }
+        if index.insert(key.clone(), row).is_some() {
+            let what = if keys == ["id"] { format!("duplicate id {key}") } else { "duplicate graph keys".into() };
+            return Err(UaError::invalid(format!("{side} {kind} contains {what}")));
+        }
+    }
+    Ok(index)
+}
+
+/// The origin a manifest names. Rows are keyed by id, which only identifies
+/// a row within one origin.
+fn manifest_origin<'m>(side: &str, m: &'m Value) -> UaResult<&'m str> {
+    m.get("source_host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| UaError::invalid(format!("{side} manifest has no source_host")))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -720,28 +770,18 @@ fn validate_graph(payload: &Value) -> UaResult<()> {
 pub struct CompareArgs {
     /// Manifest object from `export_migration_manifest` (the `manifest` field, not the wrapper).
     pub left: Value,
-    /// Manifest object to compare against `left`.
+    /// Manifest object to compare against `left`. It must come from the same origin (`source_host`).
     pub right: Value,
 }
 
 fn compare_kind(
     kind: &str,
     keys: &[&str],
-    left_rows: &[Map<String, Value>],
-    right_rows: &[Map<String, Value>],
+    left_index: &BTreeMap<String, &Map<String, Value>>,
+    right_index: &BTreeMap<String, &Map<String, Value>>,
     summary: &mut Map<String, Value>,
     conflicts: &mut Vec<Value>,
 ) {
-    let mut left_index: std::collections::BTreeMap<String, &Map<String, Value>> =
-        std::collections::BTreeMap::new();
-    let mut right_index: std::collections::BTreeMap<String, &Map<String, Value>> =
-        std::collections::BTreeMap::new();
-    for row in left_rows {
-        left_index.insert(row_key(row, keys), row);
-    }
-    for row in right_rows {
-        right_index.insert(row_key(row, keys), row);
-    }
     let only_left: Vec<&String> = left_index.keys().filter(|id| !right_index.contains_key(*id)).collect();
     let only_right: Vec<&String> = right_index.keys().filter(|id| !left_index.contains_key(*id)).collect();
     let changed: Vec<&String> = left_index
@@ -759,7 +799,7 @@ fn compare_kind(
             "same": same,
         }),
     );
-    let graph = GRAPH_TABLES.iter().any(|(name, _, _)| *name == kind);
+    let graph = keys != ["id"];
     for id in &changed {
         let mut conflict = json!({"kind": kind, "id": id, "type": "conflicting_edit"});
         if kind == "tasks" {
@@ -783,9 +823,9 @@ fn compare_kind(
         return;
     }
     let content_keys: &[&str] = if kind == "tasks" { &["title", "notes"] } else { &["title", "content"] };
-    let mut by_content: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut by_content: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, row) in left_index.iter().chain(right_index.iter()) {
-        by_content.entry(content_key(row, content_keys)).or_default().push((*id).clone());
+        by_content.entry(content_key(row, content_keys)).or_default().push(id.clone());
     }
     for mut ids in by_content.into_values() {
         ids.sort();
@@ -796,18 +836,47 @@ fn compare_kind(
     }
 }
 
-async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
-    if !a.left.is_object() || !a.right.is_object() {
-        return Err(UaError::invalid("left and right must be manifest objects"));
+/// Tasks whose `parent_id` names a task that is not in the same manifest.
+fn missing_parents(side: &str, tasks: &BTreeMap<String, &Map<String, Value>>, conflicts: &mut Vec<Value>) {
+    for (id, row) in tasks {
+        let parent = scalar_id(row.get("parent_id"));
+        if !parent.is_empty() && !tasks.contains_key(&parent) {
+            conflicts.push(json!({"kind": "tasks", "id": id, "side": side, "parent_id": parent, "type": "missing_parent"}));
+        }
     }
+}
+
+async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
+    let (Some(left), Some(right)) = (a.left.as_object(), a.right.as_object()) else {
+        return Err(UaError::invalid("left and right must be manifest objects"));
+    };
     if a.left.get("manifest_version") != Some(&json!(1)) || a.right.get("manifest_version") != Some(&json!(1))
     {
         return Err(UaError::invalid("unsupported migration manifest version"));
     }
-    validate_graph(&a.left)?;
-    validate_graph(&a.right)?;
-    let mut summary = Map::new();
+    let (left_origin, right_origin) = (manifest_origin("left", &a.left)?, manifest_origin("right", &a.right)?);
+    if left_origin != right_origin {
+        return Err(UaError::invalid(format!(
+            "the manifests come from different origins ({left_origin:?} and {right_origin:?}); rows are keyed by \
+             id, which only identifies a row within one origin"
+        )));
+    }
+    validate_graph("left", &a.left)?;
+    validate_graph("right", &a.right)?;
+
+    // The stated fingerprints are not trusted: recompute both from the payloads.
+    let left_fingerprint = manifest_fingerprint(left);
+    let right_fingerprint = manifest_fingerprint(right);
     let mut conflicts = Vec::new();
+    for (side, m, recomputed) in [("left", left, &left_fingerprint), ("right", right, &right_fingerprint)] {
+        if let Some(stated) = m.get("fingerprint")
+            && stated.as_str() != Some(recomputed.as_str())
+        {
+            conflicts.push(json!({"side": side, "stated": stated, "recomputed": recomputed, "type": "fingerprint_mismatch"}));
+        }
+    }
+
+    let mut summary = Map::new();
     let mut kinds = vec![("tasks", &["id"][..]), ("memory", &["id"][..])];
     for (name, _, keys) in GRAPH_TABLES {
         kinds.push((name, keys));
@@ -815,26 +884,23 @@ async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<
     for (kind, keys) in kinds {
         let left_rows = object_rows(a.left.get(kind), kind)?;
         let right_rows = object_rows(a.right.get(kind), kind)?;
-        compare_kind(kind, keys, &left_rows, &right_rows, &mut summary, &mut conflicts);
-    }
-    let task_ids: Vec<String> =
-        object_rows(a.left.get("tasks"), "tasks")?.iter().map(|row| scalar_id(row.get("id"))).collect();
-    for row in object_rows(a.left.get("tasks"), "tasks")? {
-        let parent = scalar_id(row.get("parent_id"));
-        if !parent.is_empty() && !task_ids.iter().any(|id| id == &parent) {
-            conflicts
-                .push(json!({"kind": "tasks", "id": scalar_id(row.get("id")), "type": "missing_parent"}));
+        let left_index = index_rows("left", kind, keys, &left_rows)?;
+        let right_index = index_rows("right", kind, keys, &right_rows)?;
+        compare_kind(kind, keys, &left_index, &right_index, &mut summary, &mut conflicts);
+        if kind == "tasks" {
+            missing_parents("left", &left_index, &mut conflicts);
+            missing_parents("right", &right_index, &mut conflicts);
         }
     }
+    let same = left_fingerprint == right_fingerprint && conflicts.is_empty();
     Ok(json!({
-        "left_source_host": a.left.get("source_host").cloned().unwrap_or(Value::Null),
-        "right_source_host": a.right.get("source_host").cloned().unwrap_or(Value::Null),
-        "left_fingerprint": a.left.get("fingerprint").cloned().unwrap_or(Value::Null),
-        "right_fingerprint": a.right.get("fingerprint").cloned().unwrap_or(Value::Null),
-        "same": a.left.get("fingerprint") == a.right.get("fingerprint"),
+        "source_host": left_origin,
+        "left_fingerprint": left_fingerprint,
+        "right_fingerprint": right_fingerprint,
+        "same": same,
         "summary": summary,
-        "conflicts": conflicts,
         "requires_human_disposition": !conflicts.is_empty(),
+        "conflicts": conflicts,
     }))
 }
 
@@ -916,10 +982,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "export_migration_manifest",
             "Read-only migration snapshot of tasks, memory notes, memory graph rows when those tables exist, \
-             and the event log. Stable ids, claims, source hosts and provenance are preserved. Does not import, \
-             rewrite or delete anything. write_to_vault (default false) writes exports/migration-manifest-<UTC>.json \
-             in the workspace; otherwise returns {manifest, content, rows}. Fingerprint is SHA-256 of the \
-             canonical payload and excludes generated_at.",
+             and the event log, read in one transaction. Stable ids, claims, source hosts and provenance are \
+             preserved; client evidence events (sdk. channels) carry a trust label. The manifest's origin is \
+             the `source_host` config value (default `local`). Does not import, rewrite or delete anything. \
+             write_to_vault (default false) writes exports/migration-manifest-<UTC>.json in the workspace and \
+             returns {path, rows, bytes, fingerprint}; otherwise returns {manifest, fingerprint, rows, bytes} \
+             (2 MB cap). Fingerprint is SHA-256 of the canonical payload and excludes generated_at.",
             export_migration_manifest,
         )
         .family("export"),
@@ -927,9 +995,12 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "compare_migration_manifests",
-            "Diff two migration manifests. Reports left-only, right-only and changed rows, claim conflicts, \
-             duplicate title/body candidates and tasks whose parent is missing. Does not change either source \
-             or the local database. Returns {same, summary, conflicts, requires_human_disposition}.",
+            "Diff two migration manifests from the same origin (`source_host`); rows are keyed by id. \
+             Reports left-only, right-only and changed rows, claim conflicts, duplicate title/body candidates, \
+             tasks whose parent is missing on either side and stated fingerprints that do not match the \
+             payload. Refuses duplicate ids. Fingerprints are recomputed; `same` needs equal fingerprints and \
+             no conflicts. Does not change either source or the local database. Returns {same, summary, \
+             conflicts, requires_human_disposition}.",
             compare_migration_manifests,
         )
         .family("export")
