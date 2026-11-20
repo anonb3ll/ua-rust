@@ -1,0 +1,100 @@
+name: sdk-live
+
+# The SDK's live conformance suite against a throwaway `ua serve` built from
+# this commit. Runs when the SDK, the hub crates or this workflow change, so a
+# hub change that breaks the SDK contract is caught.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdk/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/sdk-live.yml"
+  pull_request:
+    paths:
+      - "sdk/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/sdk-live.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-live-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sdk-live-conformance
+      - name: Build ua
+        run: cargo build -p ua-cli --bin ua
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
+        working-directory: sdk/typescript
+      # Static tokens for an agent and for a human identity. `ua token issue`
+      # refuses a human label without an interactive terminal, so the human
+      # gets an `agent_tokens` entry and is listed in `human_identities`.
+      - name: Start ua serve
+        run: |
+          ua_home="$RUNNER_TEMP/ua-home"
+          mkdir -p "$ua_home" "$RUNNER_TEMP/ua-workspace"
+          agent_token="sdk_$(openssl rand -hex 24)"
+          human_token="sdk_$(openssl rand -hex 24)"
+          echo "::add-mask::$agent_token"
+          echo "::add-mask::$human_token"
+          umask 077
+          printf 'sdk-agent:%s\noperator:%s\n' "$agent_token" "$human_token" >"$ua_home/tokens"
+          {
+            echo "UA_SDK_AGENT_TOKEN=$agent_token"
+            echo "UA_SDK_HUMAN_TOKEN=$human_token"
+          } >>"$GITHUB_ENV"
+          cat >"$ua_home/config.toml" <<EOF
+          home = "$ua_home"
+          workspace = "$RUNNER_TEMP/ua-workspace"
+          bind = "127.0.0.1:8765"
+          enforce_auth = true
+          allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+          human_identities = ["operator"]
+          agent_tokens = "$ua_home/tokens"
+          routines_enabled = false
+
+          [profiles]
+          operator = "operator"
+          EOF
+          UA_HOME="$ua_home" UA_CONFIG="$ua_home/config.toml" \
+            nohup target/debug/ua serve >"$RUNNER_TEMP/ua-serve.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8765/healthz; then exit 0; fi
+            sleep 1
+          done
+          echo "ua serve did not become healthy" >&2
+          cat "$RUNNER_TEMP/ua-serve.log" >&2
+          exit 1
+      - name: Live conformance
+        working-directory: sdk/typescript
+        env:
+          UA_SDK_CONFORMANCE_URL: http://127.0.0.1:8765/mcp
+          UA_SDK_CONFORMANCE_AGENT: sdk-agent
+          UA_SDK_WRITE_CONFORMANCE_URL: http://127.0.0.1:8765
+        run: |
+          UA_SDK_CONFORMANCE_TOKEN="$UA_SDK_AGENT_TOKEN" \
+          UA_SDK_WRITE_CONFORMANCE_TOKEN="$UA_SDK_AGENT_TOKEN" \
+          UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN="$UA_SDK_HUMAN_TOKEN" \
+            npm run test:conformance:live

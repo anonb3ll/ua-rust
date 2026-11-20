@@ -1,7 +1,8 @@
 name: sdk
 
-# The TypeScript SDK under sdk/typescript. Runs only when the SDK or this
-# workflow changes.
+# The TypeScript SDK under sdk/typescript: typecheck, tests (with the mock
+# conformance suite) and the codegen check. Runs only when the SDK or this
+# workflow changes. The live suite against `ua serve` is in sdk-live.yml.
 on:
   push:
     branches: [main]
@@ -44,67 +45,5 @@ jobs:
       # Regenerates the JSON Schema and Pydantic models (uvx, pinned emitters)
       # and fails if a committed generated file changes. No hub needed.
       - run: npm run codegen:check
-      - run: uv run --no-project --python 3.12 --with 'pydantic>=2,<3' python -m unittest discover -s tests -p 'test_*.py'
+      - run: uv run --no-project --python 3.12 --with 'pydantic==2.14.4' python -m unittest discover -s tests -p 'test_*.py'
         working-directory: sdk/typescript/packages/protocol
-
-  # The live conformance suite against a throwaway `ua serve` built from this
-  # commit. Cases listed in UA_SDK_CONFORMANCE_KNOWN_GAPS (one per line) still
-  # run but are reported as todo; see sdk/typescript/docs/known-gaps.md.
-  live-conformance:
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: sdk-live-conformance
-      - name: Build ua
-        working-directory: .
-        run: cargo build -p ua-cli --bin ua
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
-      - run: npm ci
-      - name: Start ua serve and issue a token
-        working-directory: .
-        run: |
-          ua_home="$RUNNER_TEMP/ua-home"
-          mkdir -p "$ua_home" "$RUNNER_TEMP/ua-workspace"
-          cat >"$ua_home/config.toml" <<EOF
-          home = "$ua_home"
-          workspace = "$RUNNER_TEMP/ua-workspace"
-          bind = "127.0.0.1:8765"
-          enforce_auth = true
-          allowed_hosts = ["localhost", "127.0.0.1", "::1"]
-          human_identities = ["operator"]
-          routines_enabled = false
-          EOF
-          export UA_HOME="$ua_home" UA_CONFIG="$ua_home/config.toml"
-          token=$(target/debug/ua token issue sdk-agent)
-          echo "::add-mask::$token"
-          echo "UA_SDK_TOKEN=$token" >>"$GITHUB_ENV"
-          nohup target/debug/ua serve >"$RUNNER_TEMP/ua-serve.log" 2>&1 &
-          for _ in $(seq 1 60); do
-            if curl -fsS -o /dev/null http://127.0.0.1:8765/healthz; then exit 0; fi
-            sleep 1
-          done
-          echo "ua serve did not become healthy" >&2
-          cat "$RUNNER_TEMP/ua-serve.log" >&2
-          exit 1
-      - name: Live conformance
-        env:
-          UA_SDK_CONFORMANCE_URL: http://127.0.0.1:8765/mcp
-          UA_SDK_CONFORMANCE_AGENT: sdk-agent
-          UA_SDK_WRITE_CONFORMANCE_URL: http://127.0.0.1:8765
-          UA_SDK_CONFORMANCE_KNOWN_GAPS: |
-            queues approvals without executing, and preserves human-only resolution
-        run: |
-          UA_SDK_CONFORMANCE_TOKEN="$UA_SDK_TOKEN" \
-          UA_SDK_WRITE_CONFORMANCE_TOKEN="$UA_SDK_TOKEN" \
-            npm run test:conformance:live
