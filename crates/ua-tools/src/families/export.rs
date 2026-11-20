@@ -18,7 +18,7 @@
 //! counted against its cap as it grows, and the event log is summarised
 //! (count, ulid range, rolling hash) rather than listed.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -546,6 +546,8 @@ const GRAPH_TABLES: &[(&str, &[&str], &[&str])] = &[
 ];
 /// Manifest fields outside the fingerprinted payload.
 const UNHASHED_FIELDS: [&str; 2] = ["generated_at", "fingerprint"];
+/// `event_log` fields outside it: the listing after a cursor, and the cursor.
+const UNHASHED_EVENT_LOG_FIELDS: [&str; 2] = ["rows", "since_ulid"];
 /// The manifest layout this hub writes and compares. Version 2 summarises the
 /// event log instead of listing it.
 pub const MANIFEST_VERSION: u64 = 2;
@@ -562,6 +564,11 @@ fn manifest_fingerprint(manifest: &Map<String, Value>) -> String {
     let mut payload = manifest.clone();
     for field in UNHASHED_FIELDS {
         payload.remove(field);
+    }
+    if let Some(Value::Object(log)) = payload.get_mut("event_log") {
+        for field in UNHASHED_EVENT_LOG_FIELDS {
+            log.remove(field);
+        }
     }
     manifest_hash(&Value::Object(payload))
 }
@@ -664,6 +671,8 @@ impl ManifestCaps {
 /// against the cap as it grows, so nothing larger than the cap is built.
 struct Emitter<'o> {
     hasher: Sha256,
+    /// Off while writing a part outside the fingerprinted payload.
+    hashing: bool,
     out: &'o mut dyn std::io::Write,
     bytes: usize,
     caps: ManifestCaps,
@@ -671,7 +680,7 @@ struct Emitter<'o> {
 
 impl Emitter<'_> {
     fn write(&mut self, s: &str, hashed: bool, written: bool) -> UaResult<()> {
-        if hashed {
+        if hashed && self.hashing {
             self.hasher.update(s.as_bytes());
         }
         if written {
@@ -724,15 +733,20 @@ pub struct ManifestStats {
     pub bytes: usize,
 }
 
-/// `{count, first_ulid, last_ulid, rolling_hash}` over the whole event log,
-/// ordered by ulid. The rolling hash is SHA-256 over one line per row: its
-/// `entry_hash`, or for a row without one, the canonical JSON of its
-/// [`ROLLING_ROW_COLUMNS`].
+/// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
+/// rolling_hash}` over the whole event log, ordered by ulid.
+///
+/// Each row's `entry_hash` is recomputed from its contents (as
+/// `event_log_verify` does), never taken as stored: the rolling hash is
+/// SHA-256 over one line per row holding the recomputed hash, or for a row
+/// without one (an imported legacy prefix), the canonical JSON of its
+/// [`ROLLING_ROW_COLUMNS`]. A stored hash that differs from its row is
+/// counted in `entry_hash_mismatches` and clears `chain_ok`.
 fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let mut hasher = Sha256::new();
-    let (mut count, mut first, mut last) = (0u64, Value::Null, Value::Null);
+    let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
     let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
-    want.push("entry_hash");
+    want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
     for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
         let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
         if count == 0 {
@@ -740,15 +754,37 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
         }
         last = ulid;
         count += 1;
-        match row.remove("entry_hash") {
-            Some(Value::String(h)) if !h.is_empty() => hasher.update(h.as_bytes()),
+        let stored = row.remove("entry_hash");
+        let dedupe_key = row.remove("dedupe_key");
+        let prev_hash = row.remove("prev_hash");
+        match stored {
+            Some(Value::String(h)) if !h.is_empty() => {
+                let text = |k: &str| row.get(k).and_then(Value::as_str);
+                let recomputed = ledger::compute_entry_hash(
+                    prev_hash.as_ref().and_then(Value::as_str),
+                    text("ulid").unwrap_or_default(),
+                    text("channel").unwrap_or_default(),
+                    text("payload").unwrap_or_default(),
+                    text("originator"),
+                    text("episode_id"),
+                    text("causal_parent_id"),
+                    text("created_at").unwrap_or_default(),
+                    dedupe_key.as_ref().and_then(Value::as_str),
+                );
+                if recomputed != h {
+                    mismatches += 1;
+                }
+                hasher.update(recomputed.as_bytes());
+            }
             _ => hasher.update(py_dumps(&Value::Object(row), None).as_bytes()),
         }
         hasher.update(b"\n");
         Ok(())
     })?;
     let mut out = Map::new();
+    out.insert("chain_ok".into(), json!(mismatches == 0));
     out.insert("count".into(), json!(count));
+    out.insert("entry_hash_mismatches".into(), json!(mismatches));
     out.insert("first_ulid".into(), first);
     out.insert("last_ulid".into(), last);
     out.insert("rolling_hash".into(), json!(hex::encode(hasher.finalize())));
@@ -768,7 +804,7 @@ fn write_manifest(
     // One read transaction: every table comes from the same snapshot, so a
     // write landing mid-export cannot leave a task without its events.
     let tx = c.unchecked_transaction()?;
-    let mut em = Emitter { hasher: Sha256::new(), out, bytes: 0, caps };
+    let mut em = Emitter { hasher: Sha256::new(), hashing: true, out, bytes: 0, caps };
     em.put("{")?;
 
     // event_log: the summary, then the rows after the cursor.
@@ -780,6 +816,10 @@ fn write_manifest(
         em.put(&py_dumps(v, None))?;
     }
     if let Some(since) = since_ulid {
+        // The listing depends on the cursor, not on the data: it stays out of
+        // the fingerprint, so exports of the same data with different
+        // cursors compare equal.
+        em.hashing = false;
         em.key(false, "rows")?;
         em.array(|item, em| {
             for_each_row(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid", Some(since), |row| {
@@ -790,6 +830,7 @@ fn write_manifest(
         })?;
         em.key(false, "since_ulid")?;
         em.put(&py_dumps(&json!(since), None))?;
+        em.hashing = true;
     }
     em.put("}")?;
 
@@ -1077,30 +1118,70 @@ pub struct CompareArgs {
     pub left: Option<Value>,
     /// Manifest object to compare against `left`. It must come from the same origin (`source_host`). Give this or `right_path`.
     pub right: Option<Value>,
-    /// A manifest file under `exports/` in your workspace, as `export_migration_manifest` returned its `path`.
+    /// A manifest file your own `export_migration_manifest` wrote under `exports/`, as it returned its `path`.
     pub left_path: Option<String>,
-    /// A manifest file under `exports/` in your workspace, compared against the left side.
+    /// A manifest file your own `export_migration_manifest` wrote, compared against the left side.
     pub right_path: Option<String>,
 }
 
-/// Read a manifest file the caller's own exports wrote: the path must resolve,
-/// with the sandbox check export uses for writing, inside `exports/` in the
-/// caller's workspace.
+/// Read a manifest file this caller's `export_migration_manifest` wrote. The
+/// path must resolve inside `exports/` in the caller's workspace (the sandbox
+/// check every workspace read gets), and an `agent.export.written` entry by
+/// the same caller must name it: `exports/` is shared by every agent without
+/// its own workspace, so being there is not enough. The file is opened
+/// without following a symlink and checked through the open handle.
 async fn read_export_file(ctx: &ToolCtx, field: &str, path: String) -> UaResult<Value> {
     let root = export_root(ctx)?;
     let field = field.to_string();
-    blocking(move || {
+    let (f, p) = (field.clone(), path.clone());
+    let (resolved, rel) = blocking(move || {
         let roots = std::slice::from_ref(&root);
-        let exports = ua_core::safety::resolve_in_root(EXPORT_DIR, roots, true)?;
-        let resolved = ua_core::safety::resolve_in_root(&path, roots, true)?;
+        let exports = ua_core::safety::resolve_in_root(EXPORT_DIR, roots, false)?;
+        let resolved = ua_core::safety::resolve_in_root(&p, roots, false)?;
         if resolved == exports || !resolved.starts_with(&exports) {
             return Err(UaError::denied(
                 "outside_exports",
-                format!("{field} {path:?} is not a file under {EXPORT_DIR}/ in the workspace"),
+                format!("{f} {p:?} is not a file under {EXPORT_DIR}/ in the workspace"),
             ));
         }
-        let meta = std::fs::metadata(&resolved)
-            .map_err(|_| UaError::not_found(format!("{field} {path:?} does not exist")))?;
+        let rel = resolved.strip_prefix(&root).unwrap_or(&resolved).to_string_lossy().into_owned();
+        Ok((resolved, rel))
+    })
+    .await?;
+    let who = ctx.caller.label.clone();
+    let recorded: bool = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM event_log WHERE channel = 'agent.export.written' \
+                 AND originator = ?1 AND json_extract(payload, '$.kind') = 'migration-manifest' \
+                 AND json_extract(payload, '$.path') = ?2)",
+                rusqlite::params![who, rel],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    if !recorded {
+        return Err(UaError::denied(
+            "not_your_export",
+            format!("{field} {path:?} is not a manifest your export_migration_manifest wrote"),
+        ));
+    }
+    blocking(move || {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = opts.open(&resolved).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => UaError::not_found(format!("{field} {path:?} does not exist")),
+            kind => UaError::invalid(format!("cannot open {field} {path:?}: {kind}")),
+        })?;
+        let meta =
+            file.metadata().map_err(|e| UaError::invalid(format!("cannot read {field} {path:?}: {e}")))?;
         if !meta.is_file() {
             return Err(UaError::invalid(format!("{field} {path:?} is not a file")));
         }
@@ -1109,8 +1190,6 @@ async fn read_export_file(ctx: &ToolCtx, field: &str, path: String) -> UaResult<
                 "{field} {path:?} is over the {FILE_MAX_BYTES} byte file cap"
             )));
         }
-        let file = std::fs::File::open(&resolved)
-            .map_err(|e| UaError::invalid(format!("cannot read {field} {path:?}: {}", e.kind())))?;
         let reader = std::io::BufReader::new(file.take(FILE_MAX_BYTES as u64 + 1));
         serde_json::from_reader(reader)
             .map_err(|e| UaError::invalid(format!("{field} {path:?} is not a JSON manifest: {e}")))
@@ -1139,8 +1218,10 @@ struct EventLog {
     first: Option<String>,
     last: Option<String>,
     rolling_hash: String,
-    /// The cursor and the ulids listed after it, when the export used one.
-    rows: Option<(String, BTreeSet<String>)>,
+    /// `chain_ok` as the export stated it (absent: not stated).
+    chain_ok: Option<bool>,
+    /// The cursor and, per ulid listed after it, a hash of the row.
+    rows: Option<(String, BTreeMap<String, String>)>,
 }
 
 fn opt_ulid(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
@@ -1173,12 +1254,13 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
         (None, None) => None,
         (Some(rows), Some(since)) => {
             let rows = object_rows(Some(rows), &format!("{side} event_log.rows"))?;
-            let mut ulids = BTreeSet::new();
+            let mut ulids = BTreeMap::new();
             for row in &rows {
                 let Some(ulid) = row.get("ulid").and_then(Value::as_str) else {
                     return Err(UaError::invalid(format!("{side} event_log.rows require a ulid")));
                 };
-                if !ulids.insert(ulid.to_string()) {
+                let hash = manifest_hash(&Value::Object(row.clone()));
+                if ulids.insert(ulid.to_string(), hash).is_some() {
                     return Err(UaError::invalid(format!(
                         "{side} event_log.rows contains duplicate ulid {ulid}"
                     )));
@@ -1192,7 +1274,12 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
             )));
         }
     };
-    Ok(Some(EventLog { count, first, last, rolling_hash, rows }))
+    let chain_ok = match log.get("chain_ok") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(UaError::invalid(format!("{side} event_log.chain_ok must be a boolean"))),
+    };
+    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, rows }))
 }
 
 /// Compare the two event-log summaries and, when both sides listed rows,
@@ -1216,7 +1303,7 @@ fn compare_event_logs(
     let count_match = l.count == r.count;
     let range_match = l.first == r.first && l.last == r.last;
     let rolling_hash_match = l.rolling_hash == r.rolling_hash;
-    let side = |e: &EventLog| json!({"count": e.count, "first_ulid": e.first, "last_ulid": e.last});
+    let side = |e: &EventLog| json!({"count": e.count, "first_ulid": e.first, "last_ulid": e.last, "chain_ok": e.chain_ok});
     let mut out = json!({
         "count_match": count_match,
         "range_match": range_match,
@@ -1229,19 +1316,32 @@ fn compare_event_logs(
         // Both sides list every row after their own cursor, so compare only
         // the range both cover.
         let since = std::cmp::max(l_since, r_since);
-        let after = |rows: &BTreeSet<String>| -> BTreeSet<String> {
-            rows.iter().filter(|u| u.as_str() > since.as_str()).cloned().collect()
+        let after = |rows: &'_ BTreeMap<String, String>| -> BTreeMap<String, String> {
+            rows.iter()
+                .filter(|(u, _)| u.as_str() > since.as_str())
+                .map(|(u, h)| (u.clone(), h.clone()))
+                .collect()
         };
         let (l_after, r_after) = (after(l_rows), after(r_rows));
-        let left_only = l_after.difference(&r_after).count();
-        let right_only = r_after.difference(&l_after).count();
-        rows_differ = left_only + right_only > 0;
+        let left_only = l_after.keys().filter(|u| !r_after.contains_key(*u)).count();
+        let right_only = r_after.keys().filter(|u| !l_after.contains_key(*u)).count();
+        let both = l_after.keys().filter(|u| r_after.contains_key(*u)).count();
+        // The same ulid with other contents: an edited or forged row.
+        let content_differs =
+            l_after.iter().filter(|(u, h)| r_after.get(*u).is_some_and(|rh| rh != *h)).count();
+        rows_differ = left_only + right_only + content_differs > 0;
         out["rows"] = json!({
             "since_ulid": since,
             "left_only": left_only,
             "right_only": right_only,
-            "both": l_after.intersection(&r_after).count(),
+            "both": both,
+            "content_differs": content_differs,
         });
+    }
+    for (name, e) in [("left", &l), ("right", &r)] {
+        if e.chain_ok == Some(false) {
+            conflicts.push(json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"}));
+        }
     }
     if !(count_match && range_match && rolling_hash_match) || rows_differ {
         conflicts.push(json!({
@@ -1412,15 +1512,17 @@ pub struct DataArgs {
     pub params: Option<Value>,
 }
 
-/// `export_data` reaches the manifest tools only for a profile that may call them directly.
-fn guard_profile(ctx: &ToolCtx, tool: &str) -> UaResult<()> {
-    if ctx.caller.enforce_profile && !ctx.caller.profile.allows_tool(tool) {
-        return Err(UaError::denied(
-            "profile_denied",
-            format!("tool {tool} is not available to profile {}", ctx.caller.profile),
-        ));
+/// The registry `export_data` hands its manifest actions to.
+fn inner_registry() -> &'static Registry {
+    static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::builtin_registry)
+}
+
+fn inner_params(params: Option<Value>) -> Value {
+    match params {
+        None | Some(Value::Null) => json!({}),
+        Some(v) => v,
     }
-    Ok(())
 }
 
 async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
@@ -1429,13 +1531,17 @@ async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
         "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", &action, a.params)?).await,
         "memory" | "export_memory" => export_memory(ctx, parse_params("export", &action, a.params)?).await,
         "journal" | "export_journal" => export_journal(ctx, parse_params("export", &action, a.params)?).await,
+        // A full governed call under the inner tool's name: its profile entry,
+        // policy rules, approval_tools and grants apply, not export_data's.
         "manifest" | "export_migration_manifest" => {
-            guard_profile(&ctx, "export_migration_manifest")?;
-            export_migration_manifest(ctx, parse_params("export", &action, a.params)?).await
+            inner_registry()
+                .call(&ctx.hub, &ctx.caller, "export_migration_manifest", inner_params(a.params))
+                .await
         }
         "compare" | "compare_migration_manifests" => {
-            guard_profile(&ctx, "compare_migration_manifests")?;
-            compare_migration_manifests(ctx, parse_params("export", &action, a.params)?).await
+            inner_registry()
+                .call(&ctx.hub, &ctx.caller, "compare_migration_manifests", inner_params(a.params))
+                .await
         }
         "import" | "rollback" => Err(UaError::invalid(format!(
             "export action {action:?} is not available: migration import and rollback are not implemented"
@@ -1491,10 +1597,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "export_migration_manifest",
             "Read-only migration snapshot of tasks, memory notes and memory graph rows when those tables \
-             exist, read in one transaction. The event log is summarised as {count, first_ulid, last_ulid, \
-             rolling_hash} (SHA-256 over the ulid-ordered entry hashes, or the canonical row where a row has \
-             none); events_since_ulid also lists the rows after that ulid, with client evidence (sdk. \
-             channels) carrying a trust label. Stable ids, claims, source hosts and provenance are preserved. \
+             exist, read in one transaction. The event log is summarised as {chain_ok, count, \
+             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: each row's entry hash is recomputed \
+             from its contents, and the rolling hash is SHA-256 over the ulid-ordered recomputed hashes (the \
+             canonical row where a row has none). events_since_ulid also lists the rows after that ulid, with \
+             client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
+             the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \
              rewrite or delete anything. The manifest is streamed and refused as soon as it would pass a cap: \
              2 MB inline, 32 MB as a file, 50000 memory notes. write_to_vault (default false) writes \
@@ -1509,12 +1617,14 @@ pub fn register(r: &mut Registry) {
         tool(
             "compare_migration_manifests",
             "Diff two migration manifests (version 2) from the same origin (`source_host`); rows are keyed \
-             by id. Each side is an inline manifest (left / right) or a file under exports/ in your workspace \
-             (left_path / right_path, as export_migration_manifest returned it); other paths are refused. \
+             by id. Each side is an inline manifest (left / right) or a file your own export_migration_manifest \
+             wrote under exports/ (left_path / right_path, as it returned the path; the ledger must record it \
+             as yours); other paths are refused. \
              Reports left-only, right-only and changed rows, claim conflicts, duplicate title/body candidates, \
              tasks whose parent is missing on either side, stated fingerprints that do not match the payload, \
-             and whether the event-log count, ulid range and rolling hash match (with left-only and \
-             right-only counts by ulid when both exports used events_since_ulid). Refuses duplicate ids. \
+             whether the event-log count, ulid range and rolling hash match, a side whose chain_ok is false, \
+             and, when both exports used events_since_ulid, left-only, right-only and content-differs counts \
+             by ulid after the later cursor. Refuses duplicate ids. \
              Fingerprints are recomputed; `same` needs equal fingerprints and no conflicts. Does not change \
              either source or the local database. Returns {same, summary, conflicts, \
              requires_human_disposition}. Coordinator profile only.",
@@ -1582,10 +1692,12 @@ mod tests {
         let c = db();
         c.execute("INSERT INTO tasks (title) VALUES ('caf\u{e9}')", []).unwrap();
         c.execute("INSERT INTO memory VALUES ('n1', 'note', 'body')", []).unwrap();
+        let good =
+            ua_store::ledger::compute_entry_hash(None, "01B", "agent.x", "{}", None, None, None, "t1", None);
         c.execute(
             "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES
-             ('01A', 'legacy', '{}', 't0', NULL), ('01B', 'agent.x', '{}', 't1', 'abc')",
-            [],
+             ('01A', 'legacy', '{}', 't0', NULL), ('01B', 'agent.x', '{}', 't1', ?1)",
+            [&good],
         )
         .unwrap();
         let mut out = Vec::new();
@@ -1599,11 +1711,50 @@ mod tests {
         assert_eq!(log["count"], 2);
         assert_eq!(log["first_ulid"], "01A");
         assert_eq!(log["last_ulid"], "01B");
-        // The unhashed legacy row is hashed as its canonical JSON.
+        assert_eq!(log["chain_ok"], true);
+        // The unhashed legacy row is hashed as its canonical JSON, the other by its recomputed hash.
         let legacy = json!({"ulid": "01A", "channel": "legacy", "payload": "{}", "created_at": "t0"});
-        let expected = hex::encode(Sha256::digest(format!("{}\nabc\n", py_dumps(&legacy, None)).as_bytes()));
+        let expected =
+            hex::encode(Sha256::digest(format!("{}\n{good}\n", py_dumps(&legacy, None)).as_bytes()));
         assert_eq!(log["rolling_hash"], expected);
         assert_eq!(log["rows"].as_array().unwrap().len(), 1);
         assert_eq!(log["rows"][0]["ulid"], "01B");
+
+        // The cursor listing is outside the fingerprint.
+        let mut plain = Vec::new();
+        let without = write_manifest(&c, "hub-a", None, caps(1 << 20, 10), &mut plain).unwrap();
+        assert_eq!(without.fingerprint, stats.fingerprint);
+    }
+
+    #[test]
+    fn a_tampered_payload_under_its_old_entry_hash_is_reported() {
+        let c = db();
+        let hash = ua_store::ledger::compute_entry_hash(
+            None,
+            "01B",
+            "agent.x",
+            "{\"n\":1}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1)",
+            [&hash],
+        )
+        .unwrap();
+        let summary = |c: &Connection| event_log_summary(c).unwrap();
+        let before = summary(&c);
+        assert_eq!(before["chain_ok"], true);
+        assert_eq!(before["entry_hash_mismatches"], 0);
+        // Rewrite the payload and keep the stored entry_hash.
+        c.execute("UPDATE event_log SET payload = '{\"n\":2}' WHERE ulid = '01B'", []).unwrap();
+        let after = summary(&c);
+        assert_eq!(after["chain_ok"], false);
+        assert_eq!(after["entry_hash_mismatches"], 1);
+        assert_ne!(after["rolling_hash"], before["rolling_hash"]);
+        assert_eq!(after["count"], before["count"]);
     }
 }

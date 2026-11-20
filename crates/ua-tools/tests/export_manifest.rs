@@ -407,6 +407,7 @@ async fn the_event_log_is_summarised_not_listed() {
         joined.push('\n');
     }
     assert_eq!(summary["rolling_hash"], hex_sha256(joined.as_bytes()), "{summary}");
+    assert_eq!(summary["chain_ok"], true, "{summary}");
     assert!(summary.get("rows").is_none(), "no cursor, no rows: {summary}");
 
     // The cursor lists only later rows; the summary still covers the whole log.
@@ -561,4 +562,161 @@ async fn compare_reports_event_log_differences() {
         call(&reg, &e.hub, "compare_migration_manifests", json!({"left": plain, "right": plain})).await;
     assert!(diff["summary"]["event_log"].get("rows").is_none(), "{diff}");
     assert_eq!(diff["same"], true, "{diff}");
+}
+
+#[tokio::test]
+async fn export_data_runs_the_manifest_tools_under_their_own_names() {
+    // The gate is set for the inner tool only, not for export_data.
+    let e = env_with(|cfg| {
+        cfg.approval_tools = vec!["export_migration_manifest".into(), "compare_migration_manifests".into()]
+    });
+    let reg = builtin_registry();
+    let err = reg
+        .call(&e.hub, &agent(), "export_data", json!({"action": "manifest", "params": {}}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ua_core::UaError::ApprovalRequired { tool, .. } if tool == "export_migration_manifest"),
+        "{err:?}"
+    );
+    let m = json!({"manifest_version": 2, "source_host": "hub-a"});
+    let err = reg
+        .call(
+            &e.hub,
+            &agent(),
+            "export_data",
+            json!({"action": "compare", "params": {"left": m, "right": m}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ua_core::UaError::ApprovalRequired { tool, .. } if tool == "compare_migration_manifests"),
+        "{err:?}"
+    );
+    // The other actions are not gated by those entries.
+    reg.call(
+        &e.hub,
+        &agent(),
+        "export_data",
+        json!({"action": "tasks", "params": {"write_to_vault": false}}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn different_cursors_over_the_same_data_compare_same() {
+    let e = env();
+    let reg = builtin_registry();
+    for n in 0..3 {
+        call(&reg, &e.hub, "task_add", json!({"title": format!("t{n}")})).await;
+    }
+    let rows = ledger_rows(&reg, &e.hub).await;
+    let early =
+        call(&reg, &e.hub, "export_migration_manifest", json!({"events_since_ulid": rows[0]["ulid"]})).await;
+    let late =
+        call(&reg, &e.hub, "export_migration_manifest", json!({"events_since_ulid": rows[1]["ulid"]})).await;
+    let none = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    assert_eq!(early["fingerprint"], late["fingerprint"]);
+    assert_eq!(early["fingerprint"], none["fingerprint"]);
+    let diff = call(
+        &reg,
+        &e.hub,
+        "compare_migration_manifests",
+        json!({"left": early["manifest"].clone(), "right": late["manifest"].clone()}),
+    )
+    .await;
+    assert_eq!(diff["same"], true, "{diff}");
+    assert_eq!(diff["summary"]["event_log"]["rows"]["since_ulid"], rows[1]["ulid"], "{diff}");
+    assert_eq!(diff["summary"]["event_log"]["rows"]["content_differs"], 0, "{diff}");
+}
+
+#[tokio::test]
+async fn compare_reports_rows_whose_content_differs_and_broken_chains() {
+    let e = env();
+    let reg = builtin_registry();
+    call(&reg, &e.hub, "task_add", json!({"title": "one"})).await;
+    call(&reg, &e.hub, "task_add", json!({"title": "two"})).await;
+    let exported = call(
+        &reg,
+        &e.hub,
+        "export_migration_manifest",
+        json!({"events_since_ulid": "00000000000000000000000000"}),
+    )
+    .await;
+    let left = exported["manifest"].clone();
+    assert_eq!(left["event_log"]["chain_ok"], true, "{left}");
+    assert_eq!(left["event_log"]["entry_hash_mismatches"], 0);
+
+    // Same ulid, other payload: matched by ulid alone it would look equal.
+    let mut right = left.clone();
+    right["event_log"]["rows"][0]["payload"] = json!("{\"forged\":true}");
+    let diff = call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left, "right": right})).await;
+    let rows = &diff["summary"]["event_log"]["rows"];
+    assert_eq!(rows["content_differs"], 1, "{diff}");
+    assert_eq!(rows["left_only"], 0, "{diff}");
+    assert!(
+        diff["conflicts"].as_array().unwrap().iter().any(|c| c["type"] == "event_log_mismatch"),
+        "{diff}"
+    );
+
+    // A side whose export found a stored hash that does not match its row.
+    let mut broken = left.clone();
+    broken["event_log"]["chain_ok"] = json!(false);
+    let diff =
+        call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left, "right": broken})).await;
+    assert!(
+        diff["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right"),
+        "{diff}"
+    );
+    assert_eq!(diff["same"], false);
+}
+
+#[tokio::test]
+async fn compare_reads_only_files_the_caller_exported() {
+    let e = env();
+    let reg = builtin_registry();
+    call(&reg, &e.hub, "task_add", json!({"title": "kept"})).await;
+    let mine = call(&reg, &e.hub, "export_migration_manifest", json!({"write_to_vault": true})).await;
+    let mine = mine["path"].as_str().unwrap().to_string();
+    // Another agent's export in the same shared exports/ folder.
+    let other = caller("builder-2", Profile::Coordinator);
+    let theirs =
+        reg.call(&e.hub, &other, "export_migration_manifest", json!({"write_to_vault": true})).await.unwrap();
+    let theirs = theirs["path"].as_str().unwrap().to_string();
+    let err = reg
+        .call(
+            &e.hub,
+            &agent(),
+            "compare_migration_manifests",
+            json!({"left_path": mine, "right_path": theirs}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.reason_code(), Some("not_your_export"), "{err}");
+    // A file dropped into exports/ by hand is not an export either.
+    std::fs::copy(e.workspace.join(&mine), e.workspace.join("exports/planted.json")).unwrap();
+    let err = reg
+        .call(
+            &e.hub,
+            &agent(),
+            "compare_migration_manifests",
+            json!({"left_path": mine, "right_path": "exports/planted.json"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.reason_code(), Some("not_your_export"), "{err}");
+    // Each caller can compare its own.
+    reg.call(
+        &e.hub,
+        &other,
+        "compare_migration_manifests",
+        json!({"left_path": theirs, "right_path": theirs}),
+    )
+    .await
+    .unwrap();
 }
