@@ -127,6 +127,46 @@ async fn role_rule_is_an_allow_list() {
 }
 
 #[tokio::test]
+async fn a_label_that_equals_a_profile_name_is_not_that_profile() {
+    // A bare profile name means the profile; an identity whose label happens
+    // to be "lead" (or a legacy name like "steward") does not pass for it.
+    let env = setup(
+        "rules:\n  - name: leads_only\n    type: role\n    tool: approval_pending\n    roles: [lead, steward]\n",
+    );
+    assert_eq!(env.denied(&dev("lead"), "approval_pending", json!({})).await, "role_denied");
+    assert_eq!(env.denied(&dev("steward"), "approval_pending", json!({})).await, "role_denied");
+    env.call(&agent("someone", Profile::Lead), "approval_pending", json!({})).await.unwrap();
+    env.call(&agent("someone-else", Profile::Reviewer), "approval_pending", json!({})).await.unwrap();
+
+    // `agent:<label>` names the identity explicitly; `profile:<name>` the profile.
+    let env = setup(
+        "rules:\n  - name: one_agent\n    type: role\n    tool: approval_pending\n    roles: [\"agent:lead\"]\n",
+    );
+    env.call(&dev("lead"), "approval_pending", json!({})).await.unwrap();
+    assert_eq!(
+        env.denied(&agent("someone", Profile::Lead), "approval_pending", json!({})).await,
+        "role_denied"
+    );
+    let env = setup(
+        "rules:\n  - name: one_profile\n    type: role\n    tool: approval_pending\n    roles: [\"profile:developer\"]\n",
+    );
+    env.call(&dev("builder-1"), "approval_pending", json!({})).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_profile_names_keep_working_in_policy_files() {
+    // A policy written for the Python hub: `chief-of-staff` in a role list
+    // and `steward` in profile_defaults name the coordinator and reviewer.
+    let env = setup(
+        "profile_defaults:\n  builder-1: steward\nrules:\n  - name: coord_only\n    type: role\n    tool: approval_pending\n    roles: [chief-of-staff]\n",
+    );
+    env.call(&agent("lead-1", Profile::Coordinator), "approval_pending", json!({})).await.unwrap();
+    assert_eq!(env.denied(&dev("builder-2"), "approval_pending", json!({})).await, "role_denied");
+    let status = env.call(&dev("builder-1"), "profile_status", json!({})).await.unwrap();
+    assert_eq!(status["profile"], "reviewer");
+}
+
+#[tokio::test]
 async fn threshold_rule_denies_breaches_and_fails_closed_on_missing_values() {
     let env = setup(
         "rules:\n  - name: small_pages\n    type: threshold\n    tool: event_log_query\n    field: limit\n    max: 10\n",
@@ -391,7 +431,7 @@ fn merge_args() -> Value {
 
 #[tokio::test]
 async fn prod_actions_refuse_revoked_unscoped_and_anonymous_callers() {
-    let lead = agent("lead-1", Profile::ChiefOfStaff);
+    let lead = agent("lead-1", Profile::Coordinator);
 
     let env = setup_with(None, |c| c.revoked_agents = vec!["lead-1".into()]);
     assert_eq!(env.denied(&lead, "git_merge_task", merge_args()).await, "agent_revoked");
@@ -404,7 +444,7 @@ async fn prod_actions_refuse_revoked_unscoped_and_anonymous_callers() {
         c.agent_scopes.insert("lead-2".into(), "merge|deploy".into());
     });
     assert_eq!(env.denied(&lead, "git_merge_task", merge_args()).await, "scope_denied");
-    let lead2 = agent("lead-2", Profile::ChiefOfStaff);
+    let lead2 = agent("lead-2", Profile::Coordinator);
     assert_eq!(
         env.call(&lead2, "git_merge_task", merge_args()).await.unwrap_err().code(),
         "approval_required"
@@ -431,7 +471,7 @@ async fn a_revoked_agent_cannot_spend_an_earlier_pass() {
     let mut cfg = config(dir.path());
     cfg.db_path = Some(dir.path().join("ua.db"));
     let reg = builtin_registry();
-    let lead = agent("lead-1", Profile::ChiefOfStaff);
+    let lead = agent("lead-1", Profile::Coordinator);
 
     let id = {
         let hub = Hub::open(cfg.clone()).unwrap();

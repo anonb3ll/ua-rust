@@ -23,7 +23,7 @@ impl H {
         std::fs::create_dir_all(dir.path().join("workflows")).unwrap();
         let mut cfg = Config::for_home(dir.path());
         cfg.human_identities = vec!["operator".into()];
-        cfg.profiles.insert("lead-1".into(), "chief-of-staff".into());
+        cfg.profiles.insert("lead-1".into(), "coordinator".into());
         tweak(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), _dir: dir }
     }
@@ -80,7 +80,7 @@ fn agent(label: &str) -> Caller {
 }
 
 fn lead(label: &str) -> Caller {
-    Caller { profile: Profile::ChiefOfStaff, ..agent(label) }
+    Caller { profile: Profile::Coordinator, ..agent(label) }
 }
 
 fn human() -> Caller {
@@ -540,7 +540,7 @@ async fn api_routines_fire_once_per_key_and_run_their_workflow_as_owner() {
     assert_eq!(replay["task_id"], fired["task_id"]);
     assert_eq!(replay["replayed"], true);
 
-    // The owner `lead-2` holds chief-of-staff in this session, but its
+    // The owner `lead-2` holds coordinator in this session, but its
     // configured default is developer: the routine's workflow runs with the
     // default, so a step the developer profile cannot see is refused.
     let l2 = lead("lead-2");

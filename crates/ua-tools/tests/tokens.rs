@@ -18,7 +18,7 @@ fn agent(label: &str) -> Caller {
     Caller {
         label: label.into(),
         kind: ActorKind::Agent,
-        profile: Profile::ChiefOfStaff,
+        profile: Profile::Coordinator,
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,

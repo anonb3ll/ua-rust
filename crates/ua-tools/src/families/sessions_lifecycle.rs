@@ -8,7 +8,9 @@
 //!
 //! - `session_packet` derives a bounded resume packet from existing
 //!   control-plane state and never reads a transcript. It is labelled
-//!   historical context (`authority: false`).
+//!   historical context (`authority: false`). It carries the session's
+//!   sealed handoff note (`handoff_note`) and the task's workflow record
+//!   (`workflow`) from the continuity family.
 //! - `propose_session_learnings` extracts deterministic candidates (an error
 //!   followed by a fix, always/never/gotcha rules) from a completed session's
 //!   lifecycle events and summary, with no model call, and files a reviewable
@@ -334,6 +336,14 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
         None => Value::Null,
     };
 
+    // The session's own sealed handoff note and the task's workflow record.
+    // Both are advisory: a failed read leaves the section null.
+    let handoff_note = match &sid_str {
+        Some(id) => super::continuity::latest_committed_note(conn, id).ok().flatten().unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    let workflow = super::continuity::packet_section(conn, task_id).unwrap_or(Value::Null);
+
     let session_section = session.as_ref().map(|s| {
         json!({
             "id": s["id"], "agent": s["agent"], "kind": s["kind"], "status": s["status"],
@@ -355,6 +365,7 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
                 "session": "T1", "task": "T1", "worktree": "T1", "delegations": "T1",
                 "approvals": "T0", "recent_events": "T1", "lifecycle": "T1",
                 "memory": "T2", "experience": "T2", "prior_handoff": "T2",
+                "handoff_note": "T2", "workflow": "T2",
             },
         },
         "generated_at": ua_core::time::now(),
@@ -372,8 +383,9 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
         "lifecycle": lifecycle,
         "why_chain": Value::Null,
         "operating_profile": Value::Null,
-        "handoff_note": Value::Null,
+        "handoff_note": handoff_note,
         "context_epoch": Value::Null,
+        "workflow": workflow,
     });
     Ok(bound_packet(packet))
 }
@@ -441,6 +453,22 @@ fn bound_packet(mut packet: Value) -> Value {
     }
     if let Some(notes) = packet["task"]["notes"].as_str().map(|n| truncate(n, 80)) {
         packet["task"]["notes"] = json!(notes);
+    }
+    // Agent-written sections go last: first the note's lists, then the
+    // capsule, then the whole note.
+    for key in ["open_questions", "done", "next_steps"] {
+        if size(&packet) <= PACKET_BYTE_LIMIT {
+            return packet;
+        }
+        if let Some(list) = packet["handoff_note"][key].as_array_mut() {
+            list.truncate(1);
+        }
+    }
+    if size(&packet) > PACKET_BYTE_LIMIT && packet["workflow"].is_object() {
+        packet["workflow"]["capsule"] = json!({ "_truncated": "session packet exceeded the payload limit" });
+    }
+    if size(&packet) > PACKET_BYTE_LIMIT {
+        packet["handoff_note"] = Value::Null;
     }
     packet
 }
@@ -1046,12 +1074,12 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
-    // The steward profile may watch a crew but not steer it. The profile table
+    // The reviewer profile may watch a crew but not steer it. The profile table
     // does not list this tool, so the tool enforces it itself.
-    if ctx.caller.profile == ua_core::Profile::Steward {
+    if ctx.caller.profile == ua_core::Profile::Reviewer {
         return Err(UaError::denied(
             "profile_denied",
-            "crew_intervene is not available to the steward profile",
+            "crew_intervene is not available to the reviewer profile",
         ));
     }
     let sid = a.session_id.trim().to_string();
@@ -1176,7 +1204,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "session_packet",
-            "Build a bounded resume packet from existing state: the task, worktree, delegations, live approvals tied to the task, recent events, related memory, earlier session summaries, the prior handoff and lifecycle observations. Never reads a transcript. Labelled historical context (authority: false): instructions and approval state stay authoritative elsewhere. Pass task_id or session_id (or both; they must agree). Capped at 16 KB. Returns {schema: \"ua.session_packet.v1\", labels, generated_at, requested_by, session_id, session, task, worktree, delegations, approvals, recent_events, memory, experience, prior_handoff, lifecycle, ...}.",
+            "Build a bounded resume packet from existing state: the task, worktree, delegations, live approvals tied to the task, recent events, related memory, earlier session summaries, the prior handoff, the session's sealed handoff note, the task's workflow record (stage, capsule, check grades) and lifecycle observations. Never reads a transcript. Labelled historical context (authority: false): instructions and approval state stay authoritative elsewhere. Pass task_id or session_id (or both; they must agree). Capped at 16 KB. Returns {schema: \"ua.session_packet.v1\", labels, generated_at, requested_by, session_id, session, task, worktree, delegations, approvals, recent_events, memory, experience, prior_handoff, handoff_note, workflow, lifecycle, ...}.",
             session_packet,
         )
         .family("sessions")

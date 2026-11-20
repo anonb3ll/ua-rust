@@ -1,4 +1,4 @@
-//! The steward inbox pipeline: `vault_ingest_status` (content-hash gate),
+//! The inbox ingest pipeline: `vault_ingest_status` (content-hash gate),
 //! `vault_archive_plan` (read-only filing plan) and `vault_to_memory_ingest`.
 
 use std::path::Path;
@@ -342,7 +342,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "vault_ingest_status",
-            "The steward pre-ingest gate. Hashes a capture (sha256) and compares it with the ingest ledger: new (never ingested), unchanged (skip it), changed (re-ingest it) or empty (reject it). After folding a new/changed capture into the wiki, call again with mark=true, an agent and the wiki pages it fed. Returns {path, content_hash, status, last_ingested_at, agent, pages}.",
+            "The inbox ingest gate. Hashes a capture (sha256) and compares it with the ingest ledger: new (never ingested), unchanged (skip it), changed (re-ingest it) or empty (reject it). After folding a new/changed capture into the wiki, call again with mark=true, an agent and the wiki pages it fed. Returns {path, content_hash, status, last_ingested_at, agent, pages}.",
             ingest_status,
         )
         .family("vault"),

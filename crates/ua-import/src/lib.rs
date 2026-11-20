@@ -5,10 +5,18 @@
 //! snapshot. Import a stopped hub or a backup copy: rows changed in the source
 //! after they were copied are not copied again.
 //!
-//! What is copied (see [`map::MAPS`]): tasks with dependencies, comments and
-//! goals, plans, delegations, memory notes and their versions (ids kept, the
+//! What is copied (see [`map::MAPS`]): tasks with dependencies, comments,
+//! goals, workflow records and checks, session handoff notes, plans,
+//! delegations, memory notes and their versions (ids kept, the
 //! full-text index rebuilt), the message index, agents, agent token hashes,
 //! approval history, and the event ledger.
+//!
+//! Parking: the Python hub parked a task by archiving it and appending a
+//! `[parked @ <ts> by <actor>] <reason>` (or `[folded-into: #<root> ...]`)
+//! line to its notes. ua-rust keeps parking in its own columns, so an
+//! unfinished archived task whose last closure line is a park or a fold is
+//! moved to `parked_at`, `parked_by`, `parked_reason` and `folded_into`, and
+//! un-archived. Notes are kept as they were.
 //!
 //! The ledger is copied byte-exactly, keeping `seq` (the Python `ROWID`),
 //! ULIDs, `prev_hash` and `entry_hash`. The whole source chain is verified
@@ -237,6 +245,13 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
     }
     src.execute_batch("COMMIT")?;
 
+    let parked = translate_parked(db)?;
+    if parked > 0 {
+        report
+            .notes
+            .push(format!("{parked} parked task(s) moved from archived_at and notes to the parking columns"));
+    }
+
     if copied_any {
         db.write(|tx| {
             tx.execute_batch(
@@ -257,6 +272,69 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
     }
     report.target_ledger = Some(verified);
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Parking.
+
+/// The last park, fold or unpark line in Python-hub task notes:
+/// `(kind, root, at, by, reason)` with kind `parked`, `folded` or `unparked`.
+fn closure_line(notes: &str) -> Option<(&'static str, Option<i64>, String, String, String)> {
+    let mut last = None;
+    for line in notes.lines() {
+        let Some(rest) = line.strip_prefix('[') else { continue };
+        let Some(close) = rest.find(']') else { continue };
+        let (head, reason) = (&rest[..close], rest[close + 1..].trim());
+        let Some((kind_part, tail)) = head.split_once(" @ ") else { continue };
+        let Some((at, by)) = tail.split_once(" by ") else { continue };
+        if at.is_empty() || at.contains(char::is_whitespace) {
+            continue;
+        }
+        let (kind, root) = match kind_part {
+            "parked" => ("parked", None),
+            "unparked" => ("unparked", None),
+            k => match k.strip_prefix("folded-into: #").and_then(|n| n.parse::<i64>().ok()) {
+                Some(root) => ("folded", Some(root)),
+                None => continue,
+            },
+        };
+        last = Some((kind, root, at.to_string(), by.trim().to_string(), reason.to_string()));
+    }
+    last
+}
+
+/// Move Python-style parked rows to the parking columns. Idempotent: a row
+/// already parked, finished or not archived is left alone.
+fn translate_parked(db: &Db) -> anyhow::Result<usize> {
+    db.write(|tx| {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, notes FROM tasks WHERE archived_at IS NOT NULL AND parked_at IS NULL \
+                 AND status NOT IN ('done','cancelled') AND notes IS NOT NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        };
+        let mut moved = 0;
+        for (id, notes) in rows {
+            let Some((kind, root, at, by, reason)) = closure_line(&notes) else { continue };
+            if kind == "unparked" {
+                continue;
+            }
+            let root = root.filter(|r| {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [r], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .unwrap_or(false)
+            });
+            moved += tx.execute(
+                "UPDATE tasks SET parked_at = ?1, parked_by = ?2, parked_reason = ?3, folded_into = ?4, \
+                 archived_at = NULL WHERE id = ?5",
+                params![at, by, reason, root, id],
+            )?;
+        }
+        Ok(moved)
+    })
+    .context("moving parked tasks to the parking columns")
 }
 
 // ---------------------------------------------------------------------------
