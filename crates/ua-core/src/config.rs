@@ -25,6 +25,9 @@ pub const DEFAULT_SHELL_ALLOWLIST: &[&str] = &[
     "ruff", "diff", "sort", "uniq", "which", "echo", "date", "cargo",
 ];
 
+/// The public GitHub REST API.
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+
 /// Vault directories agents may write to by default.
 pub const DEFAULT_VAULT_WRITE_DIRS: &[&str] = &["Inbox", "Logs", "Wiki"];
 
@@ -254,6 +257,63 @@ pub struct Config {
     /// credential-looking names are never passed, even when listed.
     #[serde(deserialize_with = "string_or_list")]
     pub cycle_validation_env: Vec<String>,
+    /// GitHub REST API base URL: `https://api.github.com` (default) or a
+    /// GitHub Enterprise Server API root such as `https://ghe.example.com/api/v3`.
+    /// Every GitHub request goes to this host and nowhere else.
+    pub github_api_url: String,
+    /// Name of the environment variable holding the GitHub token the hub
+    /// reads CI runs and pull requests with (read access to checks, actions,
+    /// pull requests and metadata of the bound repositories). The token is
+    /// never stored in the database or the config file and never logged.
+    /// Unset: no GitHub lookups at all.
+    pub github_token_env: Option<String>,
+    /// Name of the environment variable holding the secret that
+    /// `POST /api/github/webhook` verifies `X-Hub-Signature-256` with.
+    /// Unset: the endpoint refuses every delivery.
+    pub github_webhook_secret_env: Option<String>,
+    /// Seconds between polls of the bound repositories' open pull requests
+    /// under `ua serve` (a fallback for hubs GitHub cannot reach). 0 (the
+    /// default) turns polling off.
+    pub github_poll_interval_s: u64,
+    /// GitHub Apps whose check runs count as CI, by app slug or numeric app
+    /// id. A check run from any other app is never graded `verified`; a
+    /// workflow run (GitHub Actions) always may be. Default `["github-actions"]`.
+    #[serde(deserialize_with = "string_or_list")]
+    pub github_ci_apps: Vec<String>,
+    /// Which workflow verifies which check, by check name: a workflow name
+    /// (`"CI"`) or a workflow file path (`".github/workflows/ci.yml"`, which
+    /// pins the run to that file). Unmapped, a check with no bound job is
+    /// verified only by a run whose name is the check's name (ASCII case-blind).
+    pub github_check_workflows: BTreeMap<String, String>,
+    /// Require the workflow file at the run's head to be the same blob as on
+    /// the repository's default branch before a check is graded `verified`,
+    /// so a branch cannot rewrite the workflow that grades it. Off by default:
+    /// the comparison is still recorded (`observed.workflow_unchanged`), but a
+    /// branch that legitimately changes its workflow can still verify.
+    pub github_require_default_branch_workflow: bool,
+    /// Judge a bound job on its latest attempt only, keeping earlier attempts
+    /// in `observed`. Off by default: every attempt must agree, so a
+    /// rerun-to-green stays a mismatch and a flaky failure cannot be retried
+    /// away unnoticed.
+    pub github_ci_latest_attempt_only: bool,
+    /// Hours a webhook payload's own timestamp (`merged_at`, `updated_at`,
+    /// `completed_at`, ...) may lag behind the hub clock before the delivery
+    /// is refused as stale. 0 turns the check off. Default 24.
+    pub github_webhook_max_age_hours: u64,
+    /// The branch a merged pull request must target to close its task, by
+    /// project. Unlisted projects use the repository's default branch.
+    pub github_merge_branches: BTreeMap<String, String>,
+    /// The web host pull request links must name (`https://<host>/owner/name/pull/n`).
+    /// Unset: `github.com` for the public API, else the host of `github_api_url`.
+    pub github_web_host: Option<String>,
+    /// Test hook: a GitHub token handed in directly instead of through
+    /// `github_token_env`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub github_token_value: Option<SecretString>,
+    /// Test hook: a webhook secret handed in directly instead of through
+    /// `github_webhook_secret_env`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub github_webhook_secret_value: Option<SecretString>,
     /// Key(s) that encrypt managed secrets at rest (`UA_MANAGED_SECRET_KEY`):
     /// 32 random bytes as base64 or 64 hex characters. A comma-separated list
     /// rotates keys: the first encrypts new writes, every key decrypts.
@@ -572,6 +632,19 @@ impl Default for Config {
             autonomy_max_cost_cents: 1000.0,
             cycle_validation_command: Vec::new(),
             cycle_validation_env: Vec::new(),
+            github_api_url: DEFAULT_GITHUB_API_URL.into(),
+            github_token_env: None,
+            github_webhook_secret_env: None,
+            github_poll_interval_s: 0,
+            github_ci_apps: vec!["github-actions".into()],
+            github_check_workflows: BTreeMap::new(),
+            github_require_default_branch_workflow: false,
+            github_ci_latest_attempt_only: false,
+            github_webhook_max_age_hours: 24,
+            github_merge_branches: BTreeMap::new(),
+            github_web_host: None,
+            github_token_value: None,
+            github_webhook_secret_value: None,
             managed_secret_key: None,
             mcp_servers: BTreeMap::new(),
             mcp_review_ttl_days: 90,
@@ -697,11 +770,44 @@ impl Config {
             h.path_prepend = h.path_prepend.iter().map(|p| expand_tilde(p)).collect();
         }
         self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
+        self.github_api_url = self.github_api_url.trim().trim_end_matches('/').to_string();
+        if self.github_api_url.is_empty() {
+            self.github_api_url = DEFAULT_GITHUB_API_URL.into();
+        }
         for t in &mut self.trusted_cargo_configs {
             t.path = expand_tilde(&t.path);
             t.sha256 = t.sha256.trim().to_ascii_lowercase();
         }
         self
+    }
+
+    /// The GitHub token: the test hook, else the variable `github_token_env`
+    /// names (trimmed; empty means none). Never logged.
+    pub fn github_token(&self) -> Option<SecretString> {
+        secret_from(&self.github_token_value, self.github_token_env.as_deref())
+    }
+
+    /// The GitHub webhook secret: the test hook, else the variable
+    /// The host pull request links must name: `github_web_host`, else
+    /// `github.com` for the public API, else the API host (GHES serves the
+    /// web UI and `/api/v3` on one host). Lowercase.
+    pub fn github_web_host(&self) -> String {
+        if let Some(h) = self.github_web_host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            return h.to_ascii_lowercase();
+        }
+        let host = self
+            .github_api_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if host.is_empty() || host == "api.github.com" { "github.com".into() } else { host }
+    }
+
+    /// `github_webhook_secret_env` names (trimmed; empty means none).
+    pub fn github_webhook_secret(&self) -> Option<SecretString> {
+        secret_from(&self.github_webhook_secret_value, self.github_webhook_secret_env.as_deref())
     }
 
     /// Seconds between lease-reaper sweeps; 0 means off. See
@@ -847,6 +953,17 @@ impl Config {
         pairs.retain(|(_, t)| !collided.contains(t));
         pairs.into_iter().map(|(l, t)| (l, SecretString::from(t))).collect()
     }
+}
+
+/// A secret handed in directly, else read from the environment variable `name`.
+fn secret_from(direct: &Option<SecretString>, name: Option<&str>) -> Option<SecretString> {
+    if let Some(s) = direct.as_ref().filter(|s| !s.expose_secret().trim().is_empty()) {
+        return Some(s.clone());
+    }
+    let name = name.map(str::trim).filter(|n| !n.is_empty())?;
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| SecretString::from(value.to_string()))
 }
 
 /// Deserialize either a list or a comma/whitespace separated string.
@@ -1081,6 +1198,34 @@ provider_fallback = true
 
         let cfg = load("empty.toml", "human_identities = [\"operator\"]\nlifecycle_operators = []\n");
         assert!(!cfg.is_lifecycle_operator("operator"), "an empty list means nobody");
+    }
+
+    #[test]
+    fn github_settings_name_variables_and_never_print_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "github_api_url = \"https://ghe.example.com/api/v3/\"\ngithub_token_env = \"UA_TEST_UNSET_GITHUB_TOKEN_VAR\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert_eq!(cfg.github_api_url, "https://ghe.example.com/api/v3", "trailing slash trimmed");
+        assert!(cfg.github_token().is_none(), "an unset variable means no token");
+        assert_eq!(cfg.github_poll_interval_s, 0, "polling is off by default");
+        cfg.github_token_value = Some(SecretString::from("token-test-value-not-real".to_string()));
+        assert!(cfg.github_token().is_some());
+        assert!(
+            !format!("{cfg:?}").contains("token-test-value-not-real"),
+            "the token must not leak through Debug"
+        );
+        assert!(Config::default().github_webhook_secret().is_none());
+        assert_eq!(cfg.github_web_host(), "ghe.example.com", "GHES serves links on the API host");
+        let d = Config::default();
+        assert_eq!(d.github_web_host(), "github.com");
+        assert_eq!(d.github_ci_apps, vec!["github-actions".to_string()]);
+        assert_eq!(d.github_webhook_max_age_hours, 24);
+        assert!(!d.github_require_default_branch_workflow && !d.github_ci_latest_attempt_only);
     }
 
     #[test]
