@@ -82,6 +82,10 @@ pub(crate) const MAPS: &[TableMap] = &[
         refs: &[TASK_REF, Ref { col: "goal_id", table: "goals", key: "id" }],
         ..plain("task_goal_links")
     },
+    TableMap { refs: &[TASK_REF], ..plain("task_workflow") },
+    TableMap { refs: &[TASK_REF], ..plain("task_checks") },
+    // A handoff note keeps its task id as a record even when the task is gone.
+    plain("session_handoff_notes"),
     plain("plans"),
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_steps") },
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_checkpoints") },

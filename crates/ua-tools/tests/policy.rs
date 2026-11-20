@@ -501,3 +501,53 @@ async fn a_revoked_agent_cannot_spend_an_earlier_pass() {
     let live = pending["approved_unconsumed"].as_array().unwrap();
     assert!(live.iter().any(|a| a["id"] == id), "the pass stays unspent: {pending}");
 }
+
+#[tokio::test]
+async fn platform_object_reads_evaluate_the_policy_of_the_kinds_tool() {
+    // A role rule on approval_pending binds platform_object_get kind=approval.
+    let env = setup(
+        "rules:\n  - name: ops_only\n    type: role\n    tool: approval_pending\n    roles: [operator]\n",
+    );
+    let read = json!({ "kind": "approval", "id": "1" });
+    assert_eq!(env.denied(&dev("builder-1"), "approval_pending", json!({})).await, "role_denied");
+    assert_eq!(env.denied(&dev("builder-1"), "platform_object_get", read.clone()).await, "role_denied");
+    let deny = env
+        .decisions()
+        .await
+        .into_iter()
+        .find(|e| e["payload"]["tool"] == "platform_object_get")
+        .expect("the refused read is recorded");
+    assert_eq!(deny["payload"]["rule"], "ops_only");
+    // The operator passes the gate; there is simply no approval 1.
+    let err = env.call(&human(), "platform_object_get", read).await.unwrap_err();
+    assert_eq!(err.code(), "not_found", "{err}");
+    // Kinds behind other tools are untouched by the rule.
+    let err = env.call(&dev("builder-1"), "platform_object_get", json!({ "kind": "task", "id": "1" })).await;
+    assert_eq!(err.unwrap_err().code(), "not_found");
+
+    // default_action: deny refuses a kind whose tool no rule allows.
+    let env = setup(
+        "default_action: deny\nrules:\n  - {name: ok, type: tool, tool: \"platform_object_get\", action: allow}\n  - {name: tasks, type: tool, tool: \"task_*\", action: allow}\n",
+    );
+    let me = dev("builder-1");
+    let id = env.call(&me, "task_add", json!({ "title": "visible" })).await.unwrap()["id"].as_i64().unwrap();
+    let v =
+        env.call(&me, "platform_object_get", json!({ "kind": "task", "id": id.to_string() })).await.unwrap();
+    assert_eq!(v["task"]["title"], "visible");
+    for kind in ["approval", "plan", "delegation", "evidence_event"] {
+        let id = if kind == "evidence_event" { "0123456789ABCDEF" } else { "1" };
+        assert_eq!(
+            env.denied(&me, "platform_object_get", json!({ "kind": kind, "id": id })).await,
+            "default_deny",
+            "{kind}"
+        );
+    }
+
+    // A tool the policy parks for approval cannot be read around the gate.
+    let env =
+        setup("rules:\n  - {name: review_tasks, type: tool, tool: task_list, action: require_approval}\n");
+    assert_eq!(
+        env.denied(&dev("builder-1"), "platform_object_get", json!({ "kind": "board" })).await,
+        "approval_required"
+    );
+}
