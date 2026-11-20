@@ -61,10 +61,11 @@ Checks performed:
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
-9. `schema`: compares applied `schema_parts` checksums and `sqlite_master` tables/triggers against the running build (`drifted` parts or unexpected tables/triggers fail; `missing`/`extra` parts warn).
+9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, or unowned objects without an `extra` part fail; `missing`/`extra` parts warn).
 10. `ledger`: verifies the tamper-evident `event_log` hash chain cleanly (`ledger::verify`).
 11. `pre_restore_backups`: warns when leftover `*.pre-restore-*.bak*` recovery files remain in `$UA_HOME` so they can be pruned once verified.
-12. `registry`: confirms built-in tool registration count.
+12. `restore_staging`: warns when leftover `.ua.db.restore.*.d` rollback directories remain (indicating a failed rollback requiring inspection).
+13. `registry`: confirms built-in tool registration count.
 
 ## 3. Online backups (`ua backup`)
 
@@ -85,8 +86,9 @@ ua backup --to /var/backups/ua-rust/ua-20261120.db --manifest
 > be backed up separately in your secret store). Treat backup files as secrets.
 > Note that `ledger::verify` proves internal hash-chain **integrity** of
 > `event_log`, not cryptographic authenticity of non-ledger tables (`agent_tokens`,
-> triggers) on an untrusted file—always record and verify `--expected-sha256`
-> from a trusted manifest.
+> triggers) on an untrusted file—record and store `--expected-sha256` **separately
+> from the backup directory**, because the sibling `<backup>.sha256.json` manifest
+> is unsigned.
 
 ## 4. Verified restore (`ua restore`)
 
@@ -109,25 +111,32 @@ Key restore safeguards:
 
 1. **Pinned digest required:** Non-dry-run restores require `--expected-sha256 <hex>`
    unless `--allow-unpinned` is explicitly passed.
-2. **Single-open `O_NOFOLLOW` staging + `immutable=1`:** Sources with sibling
-   `-wal` or `-journal` sidecars are refused (`ua backup` creates self-contained
-   snapshots). The source is opened once (`O_NOFOLLOW`), streamed into a private
-   `0700` staging directory (`0600` file), hashed, checked (`PRAGMA integrity_check`,
-   required tables, schema/trigger compatibility unless `--allow-newer` overrides
-   additive parts, `ledger::verify`) via SQLite `immutable=1`, and never re-opened.
+2. **Single-open `O_NOFOLLOW | O_NONBLOCK` staging next to target + `immutable=1`:**
+   Sources with sibling `-wal` or `-journal` sidecars are refused (`ua backup` creates
+   self-contained snapshots) and FIFOs are rejected without blocking. The source is
+   opened once, streamed into a private `0700` staging directory beside the
+   destination (`0600` file, avoiding small `/tmp` mounts even for `--dry-run`), hashed,
+   and checked (`PRAGMA integrity_check`, required tables, `schema_parts` + normalized
+   table/view/index/trigger DDL compatibility, `ledger::verify`) via SQLite
+   `immutable=1`. `--allow-newer` allows snapshots containing `extra` schema parts and
+   their new objects (new tables/indexes/triggers on new tables), while still refusing
+   drifted parts, missing/altered known objects, triggers on known tables, or unowned
+   tables without an `extra` part.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when
    recovering a corrupt/tampered DB).
-4. **Atomic swap with rollback & credential handling:** Existing DB and sidecars
-   are moved into staging rollback before swapping in the new DB; any failure
-   enabling `WAL` mode, running post-install `quick_check`, appending `ops.restored`
-   to `event_log`, or re-verifying the chain restores the previous DB + sidecars
-   and reports the safety backup path. Because restoring an older snapshot can
-   resurrect previously revoked tokens, browser sessions, or OAuth grants, pass
-   `--revoke-sessions` to invalidate active UI sessions, login links, OAuth
-   grants/tokens/codes/requests, and node session credentials in the restore
-   transaction.
+4. **Crash-safe replace with hard-linked rollback & credential scope:** The existing DB
+   and sidecars are hard-linked (or copied on cross-filesystem mounts) into private
+   rollback staging while leaving `ua.db` intact in place, then `ua.db` is replaced
+   via `fs::rename`, stale sidecars are cleared, WAL mode + `ops.restored` +
+   post-install checks run, and on failure the original DB + sidecars are restored in
+   place (or rollback staging is preserved on disk and reported if rollback itself
+   fails). Pass `--revoke-sessions` to invalidate UI sessions, login links, OAuth
+   grants/tokens/codes/requests, and node `session_credentials` in the restore
+   transaction; **note that `--revoke-sessions` does not revoke `agent_tokens`,
+   static `UA_AGENT_TOKENS`, or `managed_secrets` ciphertext**—rotate compromised agent
+   tokens (`ua token revoke`/`rotate`) and managed secrets separately.
 
 ## 5. Graceful shutdown & process managers
 
@@ -145,17 +154,18 @@ Templates are provided in `deploy/`:
 
 - Docker: [`deploy/docker/Dockerfile`](../deploy/docker/Dockerfile),
   [`deploy/docker/compose.yaml`](../deploy/docker/compose.yaml), and root
-  [`.dockerignore`](../.dockerignore) (non-root user, `tini` / `init: true` PID 1
+  [`.dockerignore`](../.dockerignore) (non-root user with `0700` home, `tini` PID 1
   reaping, `embeddings` build feature with cache under `$UA_HOME/models`,
   `read_only: true`, `cap_drop: [ALL]`, loopback port bind).
 - Linux systemd: [`deploy/systemd/ua-hub.service`](../deploy/systemd/ua-hub.service)
   (dedicated OS user `ua-hub`, `KillMode=mixed` so `#38` graceful drains run,
-  `ProtectSystem=strict`, `ProtectHome=yes`, kernel/capability hardening,
-  `UMask=0077`).
+  `ProtectSystem=strict`, `ProtectHome=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`,
+  kernel/capability hardening, `UMask=0077`).
 - macOS launchd: [`deploy/launchd/com.example.ua-hub.plist`](../deploy/launchd/com.example.ua-hub.plist)
   (dedicated `_ua-hub` user/group, `Umask` `63` / `0077`, standard `/Library/`
-  paths, `KeepAlive`, `ExitTimeOut` `20`). Create `/Library/Application Support/ua-rust`
-  (`0700`) and `/Library/Logs/ua-rust` (`0750`) owned by `_ua-hub:_ua-hub` first.
+  paths, `KeepAlive`, `ExitTimeOut` `20`). Create the `_ua-hub` user/group (via `dscl`,
+  documented in the plist header), `/Library/Application Support/ua-rust` (`0700`),
+  and `/Library/Logs/ua-rust` (`0750`) first.
 - Continuous WAL replication: [`deploy/litestream/litestream.yml`](../deploy/litestream/litestream.yml)
   (unencrypted replica warning; stop alongside `ua serve` before `ua restore`).
 

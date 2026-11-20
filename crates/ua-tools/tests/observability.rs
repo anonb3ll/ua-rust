@@ -118,6 +118,13 @@ async fn doctor_flags_a_tampered_ledger() {
 
     let anomalies = call(&reg, &hub, &who, "check_anomalies", json!({})).await;
     assert!(anomalies["anomalies"].as_array().unwrap().iter().any(|a| a["rule"] == "ledger_chain"));
+
+    // Unexpected table with no corresponding schema_parts entry degrades `schema`.
+    exec(&hub, "CREATE TABLE rogue_table (x INTEGER);");
+    let report = call(&reg, &hub, &who, "system_doctor", json!({})).await;
+    let schema_row =
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(schema_row["status"], "DEGRADED", "{schema_row}");
 }
 
 fn insert_calls(hub: &Hub, tool: &str, caller: &str, durations: &[i64], errors: usize, started_at: &str) {

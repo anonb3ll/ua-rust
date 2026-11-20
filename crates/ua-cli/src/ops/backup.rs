@@ -47,7 +47,8 @@ pub struct RestoreArgs {
     #[arg(long)]
     pub no_safety_backup: bool,
     /// Invalidate active UI sessions, login links, OAuth grants/tokens/codes/requests,
-    /// and node session credentials inside the restore transaction.
+    /// and node session credentials inside the restore transaction (does not revoke
+    /// `agent_tokens`, static `UA_AGENT_TOKENS`, or `managed_secrets`).
     #[arg(long)]
     pub revoke_sessions: bool,
 }

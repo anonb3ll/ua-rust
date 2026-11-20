@@ -297,12 +297,20 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
 
     // Mint the initial token BEFORE installing `config.toml` / `policy.yaml` so a
     // refused interactive human TTY check or lock leaves existing config untouched.
+    // If installing config/policy subsequently fails, roll back any `.bak-*` files
+    // and revoke the newly minted token so no unshown active token is left behind.
+    let mut minted_context: Option<(Hub, i64, String)> = None;
     let issued_token = if let Some(agent_label) = agent.as_deref() {
         let db_path = cfg.db_path();
         let _lock = ua_import::HubLock::acquire_shared(&db_path, "init")?;
         let hub = Hub::open(cfg.clone())?;
+        let prev_max_id: i64 = hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_tokens", [], |r| r.get(0))?))
+            .unwrap_or(0);
         let token = crate::issue_agent_token(&cfg, &hub, agent_label, Some("ua init"), "cli")?;
         set_owner_only_file(&db_path)?;
+        minted_context = Some((hub, prev_max_id, agent_label.to_string()));
         Some(IssuedToken { agent: agent_label.to_string(), token })
     } else {
         None
@@ -310,22 +318,64 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
 
     drop(staged_cfg);
 
-    let mut backed_up_files = Vec::new();
-    if args.force {
-        if let Some(bak) = backup_existing_file(&config_path)? {
-            backed_up_files.push(bak.display().to_string());
+    let mut backed_up_files: Vec<String> = Vec::new();
+    let mut restore_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let install_res = (|| -> anyhow::Result<()> {
+        if args.force {
+            if let Some(bak) = backup_existing_file(&config_path)? {
+                backed_up_files.push(bak.display().to_string());
+                restore_pairs.push((bak, config_path.clone()));
+            }
+            if let Some(p) = &policy_path
+                && let Some(bak) = backup_existing_file(p)?
+            {
+                backed_up_files.push(bak.display().to_string());
+                restore_pairs.push((bak, p.clone()));
+            }
         }
-        if let Some(p) = &policy_path
-            && let Some(bak) = backup_existing_file(p)?
-        {
-            backed_up_files.push(bak.display().to_string());
-        }
-    }
 
-    if let Some(p) = &policy_path {
-        write_atomic_file(p, starter_policy_yaml().as_bytes(), args.force)?;
+        if let Some(p) = &policy_path {
+            write_atomic_file(p, starter_policy_yaml().as_bytes(), args.force)?;
+        }
+        write_atomic_file(&config_path, toml_text.as_bytes(), args.force)?;
+        Ok(())
+    })();
+
+    if let Err(err) = install_res {
+        for (bak, orig) in restore_pairs.iter().rev() {
+            let _ = fs::rename(bak, orig);
+        }
+        let mut revoke_note = String::new();
+        if let Some((hub, prev_max_id, label)) = minted_context {
+            let now = ua_core::time::now();
+            let rev = hub.db().write(|tx| {
+                let changed = tx.execute(
+                    "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?1 \
+                     WHERE id > ?2 AND agent_label = ?3 AND status = 'active'",
+                    rusqlite::params![&now, prev_max_id, &label],
+                )?;
+                if changed > 0 {
+                    ua_store::ledger::append(
+                        tx,
+                        ua_store::EventInput::new(
+                            "agent.token.revoked",
+                            json!({ "agent": &label, "reason": "ua_init_failed", "revoked_at": &now }),
+                        )
+                        .by("cli"),
+                    )?;
+                }
+                Ok(changed)
+            });
+            if matches!(rev, Ok(n) if n > 0) {
+                revoke_note = format!(" (revoked unshown initial token for `{label}`)");
+            } else {
+                revoke_note = format!(
+                    " (warning: initial token for `{label}` was committed before write failed; inspect with `ua token`)"
+                );
+            }
+        }
+        return Err(err.context(format!("installing hub configuration files{revoke_note}")));
     }
-    write_atomic_file(&config_path, toml_text.as_bytes(), args.force)?;
 
     let detected_harnesses = detect_harnesses();
     let mcp_snippets = build_snippets(cfg.bind, agent.as_deref().unwrap_or("builder-1"));

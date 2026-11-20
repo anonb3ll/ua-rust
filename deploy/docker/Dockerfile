@@ -13,6 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 ua \
     && useradd --system --uid 10001 --gid ua --home-dir /var/lib/ua-rust --create-home ua \
+    && chmod 0700 /var/lib/ua-rust \
     && install -d -m 0700 -o ua -g ua /var/lib/ua-rust/models
 
 COPY --from=builder /src/target/release/ua /usr/local/bin/ua

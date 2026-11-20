@@ -6,12 +6,14 @@
 //! is running under WAL mode without exposing intermediate files or copying raw
 //! WAL or SHM sidecars.
 //!
-//! Restores open `--from` once with `O_NOFOLLOW`, stream it into a private
-//! `0700` staging directory while hashing, run all SQLite integrity, schema,
-//! trigger, and `event_log` checks on that staged copy via `immutable=1`,
-//! preserve a `.pre-restore-*.bak` safety copy (including WAL/SHM/journal
-//! sidecars when falling back to raw copies), and swap atomically with full
-//! rollback on any post-install failure.
+//! Restores open `--from` once with `O_NOFOLLOW | O_NONBLOCK`, stream it into a
+//! private `0700` sibling staging directory while hashing, run all SQLite
+//! integrity, schema, trigger/index/table DDL, and `event_log` checks on that
+//! staged copy via `immutable=1`, preserve a `.pre-restore-*.bak` safety copy
+//! (including WAL/SHM/journal sidecars when falling back to raw copies),
+//! hard-link the previous DB and sidecars into rollback staging, replace `ua.db`
+//! via `fs::rename`, and restore cleanly on any post-install failure (preserving
+//! rollback staging intact if rollback itself fails).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -50,16 +52,39 @@ pub struct DbHealth {
     pub ledger: Option<VerifyReport>,
 }
 
-/// Comparison of a database's `schema_parts` and `sqlite_master` tables/triggers
-/// against the running build.
+/// Comparison of a database's `schema_parts` and `sqlite_master` objects
+/// (tables, views, indexes, triggers) against the running build.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SchemaCompatibility {
     pub ok: bool,
     pub missing: Vec<String>,
     pub drifted: Vec<String>,
     pub extra: Vec<String>,
+    pub missing_objects: Vec<String>,
+    pub modified_objects: Vec<String>,
+    pub unexpected_indexes: Vec<String>,
     pub unexpected_triggers: Vec<String>,
+    pub unexpected_triggers_on_known_tables: Vec<String>,
     pub unexpected_tables: Vec<String>,
+}
+
+impl SchemaCompatibility {
+    /// Whether any unexpected table, view, index, or trigger is present.
+    pub fn has_unexpected_objects(&self) -> bool {
+        !self.unexpected_tables.is_empty()
+            || !self.unexpected_indexes.is_empty()
+            || !self.unexpected_triggers.is_empty()
+    }
+
+    /// Whether the schema shows tampering or unowned SQLite objects that cannot
+    /// be attributed to `extra` (another build's `schema_parts`).
+    pub fn has_tampering_or_unowned_objects(&self) -> bool {
+        !self.drifted.is_empty()
+            || !self.missing_objects.is_empty()
+            || !self.modified_objects.is_empty()
+            || !self.unexpected_triggers_on_known_tables.is_empty()
+            || (self.extra.is_empty() && self.has_unexpected_objects())
+    }
 }
 
 /// Summary produced after taking and verifying a backup snapshot.
@@ -114,6 +139,7 @@ pub struct RestoreReport {
 
 struct DirGuard {
     dir: PathBuf,
+    keep: bool,
 }
 
 impl DirGuard {
@@ -136,7 +162,7 @@ impl DirGuard {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("setting 0700 permissions on {}", dir.display()))?;
         }
-        Ok(Self { dir })
+        Ok(Self { dir, keep: false })
     }
 
     fn create_private_sibling(dest: &Path, tag: &str) -> anyhow::Result<Self> {
@@ -148,11 +174,17 @@ impl DirGuard {
     fn file(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
+
+    fn disarm(&mut self) {
+        self.keep = true;
+    }
 }
 
 impl Drop for DirGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -293,8 +325,25 @@ fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Verify `schema_parts` checksums and `sqlite_master` tables, views, and
-/// triggers in `conn` against the schemas registered in the current build.
+fn read_master_objects(conn: &Connection) -> anyhow::Result<BTreeMap<(String, String), (String, String)>> {
+    let mut map = BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master \
+         WHERE type IN ('table', 'view', 'index', 'trigger') AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let obj_type = r.get::<_, String>(0)?;
+        let name = r.get::<_, String>(1)?;
+        let tbl_name = r.get::<_, String>(2)?;
+        let sql = normalize_sql(&r.get::<_, String>(3)?);
+        map.insert((obj_type, name), (tbl_name, sql));
+    }
+    Ok(map)
+}
+
+/// Verify `schema_parts` checksums and `sqlite_master` tables, views, indexes,
+/// and triggers in `conn` against the schemas registered in the current build.
 pub fn check_schema_compatibility(
     conn: &Connection,
     expected: &[SchemaPart],
@@ -316,95 +365,117 @@ pub fn check_schema_compatibility(
     let mut missing = Vec::new();
     let mut drifted = Vec::new();
     let mut known = BTreeSet::new();
+    let mut applied_parts = Vec::new();
+    let mut full_parts = Vec::with_capacity(expected.len() + optional.len());
 
     for part in expected {
         known.insert(part.name);
+        full_parts.push(*part);
         let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
         match applied.get(part.name) {
             None => missing.push(part.name.to_string()),
-            Some(s) if *s != sum => drifted.push(part.name.to_string()),
-            Some(_) => {}
+            Some(s) => {
+                applied_parts.push(*part);
+                if *s != sum {
+                    drifted.push(part.name.to_string());
+                }
+            }
         }
     }
     for part in optional {
         known.insert(part.name);
         let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
-        if let Some(s) = applied.get(part.name)
-            && *s != sum
-        {
-            drifted.push(part.name.to_string());
+        if let Some(s) = applied.get(part.name) {
+            full_parts.push(*part);
+            applied_parts.push(*part);
+            if *s != sum {
+                drifted.push(part.name.to_string());
+            }
         }
     }
 
     let extra: Vec<String> = applied.keys().filter(|k| !known.contains(k.as_str())).cloned().collect();
 
-    // Build an in-memory reference database with all known parts so both
-    // explicit tables/views/triggers and SQLite FTS5 shadow tables are derived.
-    let mut reference = Connection::open_in_memory().context("opening reference in-memory DB")?;
-    reference.execute_batch("PRAGMA foreign_keys = ON;")?;
-    let mut all_parts = Vec::with_capacity(expected.len() + optional.len());
-    all_parts.extend_from_slice(expected);
-    all_parts.extend_from_slice(optional);
-    schema::apply(&mut reference, &all_parts)?;
+    // Build in-memory reference databases so SQLite FTS5 shadow tables and
+    // normalized DDL match the bundled SQLite engine identically.
+    let mut full_ref = Connection::open_in_memory().context("opening reference in-memory DB")?;
+    full_ref.execute_batch("PRAGMA foreign_keys = ON;")?;
+    schema::apply(&mut full_ref, &full_parts)?;
+    let full_objs = read_master_objects(&full_ref)?;
+    let known_tables: BTreeSet<String> =
+        full_objs.keys().filter(|(t, _)| t == "table" || t == "view").map(|(_, n)| n.clone()).collect();
 
-    let mut expected_triggers = BTreeSet::new();
-    {
-        let mut stmt = reference
-            .prepare("SELECT name, tbl_name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger'")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            expected_triggers.insert((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                normalize_sql(&r.get::<_, String>(2)?),
-            ));
+    let applied_objs = {
+        let mut applied_ref = Connection::open_in_memory().context("opening applied reference DB")?;
+        applied_ref.execute_batch("PRAGMA foreign_keys = ON;")?;
+        if schema::apply(&mut applied_ref, &applied_parts).is_ok() {
+            Some(read_master_objects(&applied_ref)?)
+        } else {
+            None
         }
-    }
+    };
 
-    let mut expected_objects = BTreeSet::new();
-    {
-        let mut stmt = reference.prepare(
-            "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            expected_objects.insert((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
-        }
-    }
+    let actual_objs = read_master_objects(conn)?;
 
-    let mut unexpected_triggers = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT name, tbl_name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger'")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let key =
-                (r.get::<_, String>(0)?, r.get::<_, String>(1)?, normalize_sql(&r.get::<_, String>(2)?));
-            if !expected_triggers.contains(&key) {
-                unexpected_triggers.push(format!("{} on {}", key.0, key.1));
+    let mut missing_objects = Vec::new();
+    if let Some(ref exp) = applied_objs {
+        for (obj_type, name) in exp.keys() {
+            if !actual_objs.contains_key(&(obj_type.clone(), name.clone())) {
+                missing_objects.push(format!("{obj_type}:{name}"));
             }
         }
     }
 
+    let mut modified_objects = Vec::new();
+    let mut unexpected_indexes = Vec::new();
+    let mut unexpected_triggers = Vec::new();
+    let mut unexpected_triggers_on_known_tables = Vec::new();
     let mut unexpected_tables = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let key = (r.get::<_, String>(0)?, r.get::<_, String>(1)?);
-            if !expected_objects.contains(&key) {
-                unexpected_tables.push(format!("{}:{}", key.1, key.0));
+
+    for ((obj_type, name), (tbl_name, sql)) in &actual_objs {
+        let expected_def = applied_objs
+            .as_ref()
+            .and_then(|m| m.get(&(obj_type.clone(), name.clone())))
+            .or_else(|| full_objs.get(&(obj_type.clone(), name.clone())));
+        if let Some((exp_tbl, exp_sql)) = expected_def {
+            if exp_tbl != tbl_name || exp_sql != sql {
+                modified_objects.push(format!("{obj_type}:{name}"));
+            }
+        } else {
+            match obj_type.as_str() {
+                "table" | "view" => unexpected_tables.push(format!("{obj_type}:{name}")),
+                "index" => unexpected_indexes.push(format!("{name} on {tbl_name}")),
+                "trigger" => {
+                    let label = format!("{name} on {tbl_name}");
+                    if known_tables.contains(tbl_name) {
+                        unexpected_triggers_on_known_tables.push(label.clone());
+                    }
+                    unexpected_triggers.push(label);
+                }
+                _ => {}
             }
         }
     }
 
     let ok = drifted.is_empty()
         && extra.is_empty()
+        && missing_objects.is_empty()
+        && modified_objects.is_empty()
+        && unexpected_indexes.is_empty()
         && unexpected_triggers.is_empty()
         && unexpected_tables.is_empty();
-    Ok(SchemaCompatibility { ok, missing, drifted, extra, unexpected_triggers, unexpected_tables })
+    Ok(SchemaCompatibility {
+        ok,
+        missing,
+        drifted,
+        extra,
+        missing_objects,
+        modified_objects,
+        unexpected_indexes,
+        unexpected_triggers,
+        unexpected_triggers_on_known_tables,
+        unexpected_tables,
+    })
 }
 
 fn stream_sha256_and_size(path: &Path) -> anyhow::Result<(String, u64)> {
@@ -429,7 +500,7 @@ fn open_file_no_follow_ro(abs_path: &Path, role: &str) -> anyhow::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = opts.open(abs_path).with_context(|| match fs::symlink_metadata(abs_path) {
         Ok(m) if m.file_type().is_symlink() => {
@@ -883,17 +954,20 @@ fn revoke_active_sessions(
     Ok(revoked)
 }
 
+fn safety_note(safety_backup: &Option<String>) -> String {
+    safety_backup.as_deref().map(|p| format!(" (safety backup at {p})")).unwrap_or_default()
+}
+
+type PostCommitHook<'a> = &'a dyn Fn(&Path) -> anyhow::Result<()>;
+
 fn post_install_finalize(
     destination: &Path,
     sha256: &str,
     restored_head_seq: Option<i64>,
     restored_head_hash: Option<&str>,
     revoke_sessions: bool,
-    fail_hook: bool,
+    post_commit_hook: Option<PostCommitHook<'_>>,
 ) -> anyhow::Result<(String, BTreeMap<String, u64>, i64)> {
-    if fail_hook {
-        bail!("simulated post-install failure");
-    }
     let mut rw = Connection::open_with_flags(
         destination,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -930,6 +1004,10 @@ fn post_install_finalize(
     drop(rw);
     set_owner_only_file(destination)?;
 
+    if let Some(hook) = post_commit_hook {
+        hook(destination)?;
+    }
+
     let dst = open_read_only(destination)?;
     let qc = run_integrity_pragma(&dst, "PRAGMA quick_check")?;
     if qc != "ok" {
@@ -947,29 +1025,53 @@ fn post_install_finalize(
     Ok((qc, revoked_map, event_seq))
 }
 
-fn rollback_swap(destination: &Path, moved: &[(PathBuf, PathBuf)]) {
-    for path in [
-        destination.to_path_buf(),
-        wal_sidecar_path(destination),
-        shm_sidecar_path(destination),
-        journal_sidecar_path(destination),
-    ] {
-        if fs::symlink_metadata(&path).is_ok() {
-            let _ = fs::remove_file(&path);
+fn rollback_swap(destination: &Path, saved: &[(String, PathBuf, PathBuf)]) -> anyhow::Result<()> {
+    for sidecar in
+        [wal_sidecar_path(destination), shm_sidecar_path(destination), journal_sidecar_path(destination)]
+    {
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("clearing sidecar {}", sidecar.display())),
         }
     }
-    for (rb_path, orig_path) in moved.iter().rev() {
-        let _ = fs::rename(rb_path, orig_path);
+
+    let mut had_main = false;
+    for (tag, rb_path, orig_path) in saved {
+        if tag == "main" {
+            had_main = true;
+            // Rename directly over `destination` so `ua.db` never disappears mid-rollback.
+            fs::rename(rb_path, orig_path)
+                .with_context(|| format!("restoring {} -> {}", rb_path.display(), orig_path.display()))?;
+        }
+    }
+    if !had_main {
+        match fs::remove_file(destination) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing new database {}", destination.display()));
+            }
+        }
+    }
+    for (tag, rb_path, orig_path) in saved {
+        if tag != "main" {
+            fs::rename(rb_path, orig_path).with_context(|| {
+                format!("restoring sidecar {} -> {}", rb_path.display(), orig_path.display())
+            })?;
+        }
     }
     if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = sync_dir(parent);
     }
+    Ok(())
 }
 
-/// Verify a backup database (`O_NOFOLLOW` single-open copy into private staging,
-/// `immutable=1` checks: SHA-256, `PRAGMA integrity_check`, required hub tables,
-/// schema/trigger compatibility, `event_log` hash chain) and, unless `opts.dry_run`,
-/// atomically install it at `destination` with rollback on failure.
+/// Verify a backup database (`O_NOFOLLOW | O_NONBLOCK` single-open copy into private
+/// staging, `immutable=1` checks: SHA-256, `PRAGMA integrity_check`, required hub
+/// tables, schema/trigger/index/view compatibility, `event_log` hash chain) and,
+/// unless `opts.dry_run`, replace `destination` via hard-linked rollback staging +
+/// `fs::rename`, rolling back cleanly on post-install failure.
 ///
 /// Callers must hold an exclusive hub lock before invoking non-dry-run restore
 /// so no hub process writes to `destination` or its WAL during replacement.
@@ -978,14 +1080,35 @@ pub fn restore_database(
     destination: &Path,
     opts: RestoreOptions,
 ) -> anyhow::Result<RestoreReport> {
-    restore_database_inner(source, destination, opts, false)
+    restore_database_inner(source, destination, opts, None)
+}
+
+fn stage_rollback_copy(orig: &Path, rb: &Path) -> anyhow::Result<()> {
+    match fs::hard_link(orig, rb) {
+        Ok(()) => Ok(()),
+        #[cfg(unix)]
+        Err(e)
+            if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied) =>
+        {
+            let mut src = open_file_no_follow_ro(orig, "rollback source")?;
+            stream_fd_to_new_file_hashed(&mut src, rb)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(_) => {
+            let mut src = open_file_no_follow_ro(orig, "rollback source")?;
+            stream_fd_to_new_file_hashed(&mut src, rb)?;
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("hard-linking {} to {}", orig.display(), rb.display())),
+    }
 }
 
 fn restore_database_inner(
     source: &Path,
     destination: &Path,
     opts: RestoreOptions,
-    fail_after_swap: bool,
+    post_commit_hook: Option<PostCommitHook<'_>>,
 ) -> anyhow::Result<RestoreReport> {
     let abs_src = absolutize(source)?;
     let abs_dst = absolutize(destination)?;
@@ -1015,11 +1138,18 @@ fn restore_database_inner(
         bail!("destination {} already exists (pass --force to overwrite)", abs_dst.display());
     }
 
-    // Open `--from` once (`O_NOFOLLOW`), stream into private `0700` staging, and
-    // run every subsequent check solely on that staged copy via `immutable=1`.
+    // Open `--from` once (`O_NOFOLLOW | O_NONBLOCK`), stream into private `0700`
+    // staging next to `destination` (never `/tmp`), and run every subsequent
+    // check solely on that staged copy via `immutable=1`.
     let mut src_fd = open_file_no_follow_ro(&abs_src, "backup source")?;
-    let stage_dir = if opts.dry_run {
-        DirGuard::create_private_in(&std::env::temp_dir(), "ua-restore", "dry")?
+    let mut stage_dir = if opts.dry_run {
+        if abs_dst.parent().is_some_and(|p| p.is_dir()) {
+            DirGuard::create_private_sibling(&abs_dst, "restore-dry")?
+        } else if abs_src.parent().is_some_and(|p| p.is_dir()) {
+            DirGuard::create_private_sibling(&abs_src, "restore-dry")?
+        } else {
+            DirGuard::create_private_sibling(&abs_dst, "restore-dry")?
+        }
     } else {
         DirGuard::create_private_sibling(&abs_dst, "restore")?
     };
@@ -1054,17 +1184,31 @@ fn restore_database_inner(
                     compat.drifted.join(", ")
                 );
             }
-            if !compat.unexpected_triggers.is_empty() || !compat.unexpected_tables.is_empty() {
+            if !compat.missing_objects.is_empty() || !compat.modified_objects.is_empty() {
                 bail!(
-                    "refusing restore: unexpected schema objects (tables=[{}], triggers=[{}])",
-                    compat.unexpected_tables.join(", "),
-                    compat.unexpected_triggers.join(", ")
+                    "refusing restore: expected schema objects missing or modified (missing=[{}], modified=[{}])",
+                    compat.missing_objects.join(", "),
+                    compat.modified_objects.join(", ")
+                );
+            }
+            if !compat.unexpected_triggers_on_known_tables.is_empty() {
+                bail!(
+                    "refusing restore: unexpected triggers on known tables ([{}])",
+                    compat.unexpected_triggers_on_known_tables.join(", ")
                 );
             }
             if !compat.extra.is_empty() && !opts.allow_newer {
                 bail!(
                     "refusing restore: backup contains schema parts from a newer build ({}); pass --allow-newer to override",
                     compat.extra.join(", ")
+                );
+            }
+            if compat.extra.is_empty() && compat.has_unexpected_objects() {
+                bail!(
+                    "refusing restore: unexpected schema objects (tables=[{}], indexes=[{}], triggers=[{}])",
+                    compat.unexpected_tables.join(", "),
+                    compat.unexpected_indexes.join(", "),
+                    compat.unexpected_triggers.join(", ")
                 );
             }
             Some(compat)
@@ -1114,12 +1258,14 @@ fn restore_database_inner(
         } else {
             (None, Vec::new())
         };
+    let note = safety_note(&safety_backup);
 
-    // Move existing DB + WAL/SHM/journal sidecars into rollback inside staging so
-    // any post-install failure can restore them intact.
+    // Link (or copy on cross-FS/vfat) the existing DB and sidecars into private
+    // rollback staging WITHOUT unlinking `ua.db`, so a crash before `fs::rename`
+    // leaves the previous database untouched in place.
     let rollback_dir = stage_dir.file("rollback");
-    fs::create_dir(&rollback_dir).context("creating rollback staging dir")?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    fs::create_dir(&rollback_dir).with_context(|| format!("creating rollback staging dir{note}"))?;
+    let mut saved: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     for (tag, orig) in [
         ("main", abs_dst.clone()),
         ("wal", wal_sidecar_path(&abs_dst)),
@@ -1128,21 +1274,43 @@ fn restore_database_inner(
     ] {
         if fs::symlink_metadata(&orig).is_ok() {
             let rb = rollback_dir.join(tag);
-            if let Err(e) = fs::rename(&orig, &rb) {
-                for (prev_rb, prev_orig) in moved.iter().rev() {
-                    let _ = fs::rename(prev_rb, prev_orig);
-                }
-                return Err(e).with_context(|| format!("moving {} into rollback", orig.display()));
+            if let Err(e) = stage_rollback_copy(&orig, &rb) {
+                return Err(e).with_context(|| format!("staging rollback copy for {}{note}", orig.display()));
             }
-            moved.push((rb, orig));
+            saved.push((tag.to_string(), rb, orig));
         }
+    }
+    if let Err(e) = sync_dir(&rollback_dir) {
+        return Err(e).with_context(|| format!("syncing rollback staging dir{note}"));
     }
 
     if let Err(e) = fs::rename(&staged_db, &abs_dst) {
-        rollback_swap(&abs_dst, &moved);
-        let note = safety_backup.as_deref().map(|p| format!(" (safety backup at {p})")).unwrap_or_default();
         return Err(e)
-            .with_context(|| format!("swapping restored database into {}{note}", abs_dst.display()));
+            .with_context(|| format!("installing restored database into {}{note}", abs_dst.display()));
+    }
+    for sidecar in [wal_sidecar_path(&abs_dst), shm_sidecar_path(&abs_dst), journal_sidecar_path(&abs_dst)] {
+        if fs::symlink_metadata(&sidecar).is_ok()
+            && let Err(e) = fs::remove_file(&sidecar)
+        {
+            match rollback_swap(&abs_dst, &saved) {
+                Ok(()) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "clearing old sidecar {} (rolled back original database){note}",
+                            sidecar.display()
+                        )
+                    });
+                }
+                Err(rb_err) => {
+                    stage_dir.disarm();
+                    bail!(
+                        "failed clearing old sidecar {} ({e}) AND rollback FAILED ({rb_err:#}) — original recovery files preserved in {}{note}",
+                        sidecar.display(),
+                        rollback_dir.display()
+                    );
+                }
+            }
+        }
     }
     if let Some(parent) = abs_dst.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = sync_dir(parent);
@@ -1154,15 +1322,21 @@ fn restore_database_inner(
         restored_head_seq,
         restored_head_hash.as_deref(),
         opts.revoke_sessions,
-        fail_after_swap,
+        post_commit_hook,
     ) {
         Ok(res) => res,
-        Err(e) => {
-            rollback_swap(&abs_dst, &moved);
-            let note =
-                safety_backup.as_deref().map(|p| format!("; safety backup saved at {p}")).unwrap_or_default();
-            bail!("post-install failure rolled back original database{note}: {e:#}");
-        }
+        Err(e) => match rollback_swap(&abs_dst, &saved) {
+            Ok(()) => {
+                bail!("post-install failure; rolled back original database{note}: {e:#}");
+            }
+            Err(rb_err) => {
+                stage_dir.disarm();
+                bail!(
+                    "post-install failure ({e:#}); rollback FAILED ({rb_err:#}) — original recovery files preserved in {}{note}",
+                    rollback_dir.display()
+                );
+            }
+        },
     };
 
     drop(stage_dir);
@@ -1264,7 +1438,7 @@ mod tests {
         let stop_flag = stop.clone();
         let handle = std::thread::spawn(move || {
             let mut i = 0;
-            while !stop_flag.load(Ordering::Relaxed) && i < 100 {
+            while !stop_flag.load(Ordering::Relaxed) && i < 120 {
                 writer_db
                     .write(|tx| {
                         tx.execute("INSERT INTO items (val) VALUES (?1)", [format!("w-{i}")])?;
@@ -1272,15 +1446,31 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
+                std::thread::yield_now();
                 i += 1;
             }
         });
         let bak_dir = tempfile::tempdir().unwrap();
-        for n in 0..3 {
+        for n in 0..4 {
             let snap = bak_dir.path().join(format!("c-{n}.db"));
             let rep = backup_database(&src_path, &snap, false).unwrap();
             assert_eq!(rep.quick_check, "ok");
             assert!(rep.ledger.ok);
+            // Assert transactional consistency between `items` and `event_log` inside the snapshot.
+            let sc = open_read_only(&snap).unwrap();
+            let item_count: i64 = sc.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+            let ev_count: i64 = sc.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                item_count, ev_count,
+                "snapshot {n} saw torn transaction: items={item_count} ev={ev_count}"
+            );
+            if item_count > 0 {
+                let last_payload: String = sc
+                    .query_row("SELECT payload FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+                    .unwrap();
+                let expected = format!("{{\"i\":{}}}", item_count - 1);
+                assert_eq!(last_payload, expected);
+            }
         }
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1456,20 +1646,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("dest.db");
 
-        // Truncated/garbage source refused.
-        let garbage = dir.path().join("garbage.db");
-        fs::write(&garbage, b"truncated").unwrap();
+        // Real valid SQLite backup truncated in the middle (valid 100-byte header, truncated body).
+        let (_sdir, src_path, db) = test_db();
+        db.write(|tx| {
+            tx.execute("INSERT INTO items (val) VALUES ('row-0')", [])?;
+            ledger::append(tx, EventInput::new("ev", json!({})))?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let valid_for_trunc = dir.path().join("valid-for-trunc.db");
+        backup_database(&src_path, &valid_for_trunc, false).unwrap();
+        let full_bytes = fs::read(&valid_for_trunc).unwrap();
+        assert!(full_bytes.starts_with(b"SQLite format 3\0"));
+        let trunc_path = dir.path().join("truncated-real.db");
+        fs::write(&trunc_path, &full_bytes[..512]).unwrap();
         assert!(
-            restore_database(&garbage, &dest, RestoreOptions { allow_unpinned: true, ..Default::default() },)
-                .is_err()
+            restore_database(
+                &trunc_path,
+                &dest,
+                RestoreOptions { allow_unpinned: true, ..Default::default() }
+            )
+            .is_err()
         );
 
         // Source with `-wal` sidecar refused.
-        let (_sdir, src_path, db) = test_db();
-        db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
-        drop(db);
         let bak_with_wal = dir.path().join("withwal.db");
-        backup_database(&src_path, &bak_with_wal, false).unwrap();
+        fs::copy(&valid_for_trunc, &bak_with_wal).unwrap();
         fs::write(wal_sidecar_path(&bak_with_wal), b"wal-bytes").unwrap();
         let err = restore_database(
             &bak_with_wal,
@@ -1480,7 +1683,7 @@ mod tests {
         .to_string();
         assert!(err.contains("-wal sidecar"), "{err}");
 
-        // Planted trigger refused.
+        // Planted trigger refused (even with allow_newer if attached to a known table).
         let (_tdir, trig_src, trig_db) = test_db();
         trig_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
         trig_db
@@ -1495,25 +1698,81 @@ mod tests {
         let err = restore_database(
             &trig_bak,
             &dest,
+            RestoreOptions {
+                allow_unpinned: true,
+                allow_newer: true,
+                expected_schema: schema_pair(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unexpected triggers on known tables") || err.contains("unexpected schema"),
+            "{err}"
+        );
+
+        // Dropped expected trigger (`event_log_no_update`) refused.
+        let (_ddir, drop_trig_src, drop_trig_db) = test_db();
+        drop_trig_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        drop_trig_db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
+        drop(drop_trig_db);
+        let drop_trig_bak = dir.path().join("drop-trig.db");
+        backup_database(&drop_trig_src, &drop_trig_bak, false).unwrap();
+        let err = restore_database(
+            &drop_trig_bak,
+            &dest,
             RestoreOptions { allow_unpinned: true, expected_schema: schema_pair(), ..Default::default() },
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("unexpected schema objects"), "{err}");
+        assert!(err.contains("event_log_no_update"), "{err}");
 
-        // Schema part from newer build refused unless allow_newer = true.
+        // Missing expected table (`DROP TABLE items`) refused.
+        let (_mdir, miss_tbl_src, miss_tbl_db) = test_db();
+        miss_tbl_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        miss_tbl_db.write(|tx| Ok(tx.execute_batch("DROP TABLE items;")?)).unwrap();
+        drop(miss_tbl_db);
+        let miss_tbl_bak = dir.path().join("miss-tbl.db");
+        backup_database(&miss_tbl_src, &miss_tbl_bak, false).unwrap();
+        let err = restore_database(
+            &miss_tbl_bak,
+            &dest,
+            RestoreOptions { allow_unpinned: true, expected_schema: schema_pair(), ..Default::default() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("table:items"), "{err}");
+
+        // Altered expected table DDL (`ALTER TABLE items ADD COLUMN rogue TEXT`) refused.
+        let (_adir, alt_src, alt_db) = test_db();
+        alt_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        alt_db.write(|tx| Ok(tx.execute_batch("ALTER TABLE items ADD COLUMN rogue TEXT;")?)).unwrap();
+        drop(alt_db);
+        let alt_bak = dir.path().join("altered.db");
+        backup_database(&alt_src, &alt_bak, false).unwrap();
+        let err = restore_database(
+            &alt_bak,
+            &dest,
+            RestoreOptions { allow_unpinned: true, expected_schema: schema_pair(), ..Default::default() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("modified=[table:items]"), "{err}");
+
+        // Real newer-build SchemaPart creating a new table (`future_things`) + index
+        // refuses when allow_newer=false, and succeeds when allow_newer=true.
         const NEWER: SchemaPart = SchemaPart {
             name: "future_feature.v1",
-            sql: "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+            sql: "CREATE TABLE future_things (id INTEGER PRIMARY KEY, label TEXT NOT NULL);
+                  CREATE INDEX idx_future_things ON future_things(label);",
         };
-        let (_ndir, new_src, new_db) = test_db();
-        new_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        let new_src = dir.path().join("newer-src.db");
+        let new_db = Db::open(&new_src, &[LEDGER_SCHEMA, META_SCHEMA, EXTRA, NEWER]).unwrap();
         new_db
             .write(|tx| {
-                tx.execute(
-                    "INSERT INTO schema_parts (name, checksum, applied_at) VALUES (?1, 'abc', '2026-01-01T00:00:00+00:00')",
-                    [NEWER.name],
-                )?;
+                tx.execute("INSERT INTO future_things (label) VALUES ('ok')", [])?;
+                ledger::append(tx, EventInput::new("ev", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -1542,6 +1801,27 @@ mod tests {
         .unwrap();
         assert!(ok.restored_event_seq.is_some());
 
+        // Rogue table with NO unknown `schema_parts` refuses EVEN with allow_newer=true.
+        let (_rdir, rogue_src, rogue_db) = test_db();
+        rogue_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        rogue_db.write(|tx| Ok(tx.execute_batch("CREATE TABLE rogue_tbl (x INT);")?)).unwrap();
+        drop(rogue_db);
+        let rogue_bak = dir.path().join("rogue.db");
+        backup_database(&rogue_src, &rogue_bak, false).unwrap();
+        let err = restore_database(
+            &rogue_bak,
+            &dir.path().join("rogue-dest.db"),
+            RestoreOptions {
+                allow_unpinned: true,
+                allow_newer: true,
+                expected_schema: schema_pair(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unexpected schema objects"), "{err}");
+
         // Schema drift refused even with allow_newer = true.
         let drift_conn = Connection::open(&src_path).unwrap();
         drift_conn
@@ -1567,7 +1847,7 @@ mod tests {
 
     #[test]
     fn post_install_failure_rolls_back_previous_db_and_sidecars_and_reports_safety_path() {
-        let (_live_dir, live_path, db) = test_db();
+        let (live_dir, live_path, db) = test_db();
         db.read(|_| {
             for i in 0..3 {
                 db.write(|tx| {
@@ -1580,7 +1860,6 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        // Hold uncheckpointed write in WAL while taking backup from an earlier snapshot.
         let bak_dir = tempfile::tempdir().unwrap();
         let good_bak = bak_dir.path().join("bak.db");
         backup_database(&live_path, &good_bak, false).unwrap();
@@ -1593,6 +1872,7 @@ mod tests {
         .unwrap();
         drop(db);
 
+        // Fail AFTER ops.restored has committed + WAL created, then verify clean rollback.
         let err = restore_database_inner(
             &good_bak,
             &live_path,
@@ -1602,32 +1882,131 @@ mod tests {
                 keep_safety_backup: true,
                 ..Default::default()
             },
-            true,
+            Some(&|dest| {
+                let conn = open_read_only(dest)?;
+                let restored_cnt: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM event_log WHERE channel = 'ops.restored'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(restored_cnt, 1, "expected ops.restored committed before failure hook");
+                bail!("simulated failure after ops.restored commit");
+            }),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("rolled back original database"), "{err}");
         assert!(err.contains(".pre-restore-"), "{err}");
 
-        // Original DB + WAL must be completely intact (4 ledger entries and 'extra-before-swap').
+        // Original DB + WAL must be intact (4 entries, extra-before-swap present, NO ops.restored)
+        // and no leftover `.restore.` staging dir remains.
         let restored = check_database(&live_path).unwrap();
         assert_eq!(restored.ledger.unwrap().checked, 4);
         let c = open_read_only(&live_path).unwrap();
         let extra_cnt: i64 = c
             .query_row("SELECT COUNT(*) FROM items WHERE val = 'extra-before-swap'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(extra_cnt, 1);
+        let ops_cnt: i64 = c
+            .query_row("SELECT COUNT(*) FROM event_log WHERE channel = 'ops.restored'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((extra_cnt, ops_cnt), (1, 0));
+        let stray_staging: Vec<_> = fs::read_dir(live_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".restore."))
+            .collect();
+        assert!(stray_staging.is_empty(), "stray restore staging dirs: {stray_staging:?}");
+
+        // Now force rollback itself to fail (`destination` replaced with a directory -> EISDIR):
+        // rollback staging must be preserved (NOT deleted) and both rollback & safety paths reported.
+        let err = restore_database_inner(
+            &good_bak,
+            &live_path,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+            Some(&|dest| {
+                fs::remove_file(dest)?;
+                fs::create_dir(dest)?;
+                bail!("simulated swap corruption forcing rollback failure");
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rollback FAILED"), "{err}");
+        assert!(err.contains(".pre-restore-"), "{err}");
+        assert!(err.contains("rollback"), "{err}");
+
+        let preserved: Vec<_> = fs::read_dir(live_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(".restore.")))
+            .collect();
+        assert_eq!(preserved.len(), 1, "expected preserved rollback staging dir: {preserved:?}");
+        let rb_main = preserved[0].join("rollback/main");
+        assert!(rb_main.is_file(), "rollback/main missing in {}", preserved[0].display());
+        let rb_health = check_database(&rb_main).unwrap();
+        assert_eq!(rb_health.ledger.unwrap().checked, 4);
     }
 
     #[test]
-    fn check_uid_match_and_relative_file_colon_paths() {
+    fn check_uid_match_dir_owner_fifo_and_dry_run_staging_cleanup() {
         let err = check_uid_match(Path::new("/var/lib/ua-rust"), 0, 1000).unwrap_err().to_string();
         assert!(err.contains("sudo"), "{err}");
         assert!(check_uid_match(Path::new("/var/lib/ua-rust"), 1000, 1000).is_ok());
 
         let dir = tempfile::tempdir().unwrap();
+        check_dir_owner(dir.path()).unwrap();
+
         let missing = dir.path().join("file:tricky.db");
         assert!(!check_database(&missing).unwrap().exists);
+
+        // Dry-run stages next to destination and cleans up its staging dir on completion.
+        let (_sdir, src, db) = test_db();
+        db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        drop(db);
+        let bak = dir.path().join("snap.db");
+        let bak_rep = backup_database(&src, &bak, false).unwrap();
+        let dry_dst_dir = dir.path().join("hub-home");
+        fs::create_dir_all(&dry_dst_dir).unwrap();
+        let dry_dst = dry_dst_dir.join("ua.db");
+        let dry = restore_database(
+            &bak,
+            &dry_dst,
+            RestoreOptions {
+                dry_run: true,
+                expected_sha256: Some(bak_rep.sha256),
+                expected_schema: schema_pair(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(dry.dry_run);
+        let stray: Vec<_> = fs::read_dir(&dry_dst_dir).unwrap().collect();
+        assert!(stray.is_empty(), "dry-run left files in destination parent: {stray:?}");
+
+        // FIFO passed as `--from` must fail immediately without blocking.
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.path().join("pipe.db");
+            let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+            assert_eq!(rc, 0, "mkfifo failed");
+            let err = restore_database(
+                &fifo,
+                &dry_dst,
+                RestoreOptions { allow_unpinned: true, ..Default::default() },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("regular file"), "{err}");
+        }
     }
 
     #[test]

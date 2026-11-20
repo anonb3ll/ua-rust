@@ -195,6 +195,44 @@ fn doctor_checks_permissions_schema_drift_pre_restore_and_non_loopback_flag() {
     );
     fs::write(&policy_path, orig_policy).unwrap();
 
+    // Rogue unexpected table fails `schema` check (matching `system_doctor`).
+    let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+    conn.execute("CREATE TABLE rogue_tbl (x INT)", []).unwrap();
+    drop(conn);
+    let rogue = ua_cmd(&home).args(["doctor", "--json"]).output().unwrap();
+    assert!(!rogue.status.success());
+    let rogue_rep = parse_stdout_json(&rogue);
+    assert!(
+        rogue_rep["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "schema" && c["status"] == "fail")
+    );
+    let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+    conn.execute("DROP TABLE rogue_tbl", []).unwrap();
+    drop(conn);
+
+    // Dropped expected trigger (`event_log_no_delete`) fails `schema` check.
+    let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+    conn.execute("DROP TRIGGER event_log_no_delete", []).unwrap();
+    let dropped_trig = ua_cmd(&home).args(["doctor", "--json"]).output().unwrap();
+    assert!(!dropped_trig.status.success());
+    let dropped_rep = parse_stdout_json(&dropped_trig);
+    assert!(
+        dropped_rep["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "schema" && c["status"] == "fail")
+    );
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS event_log_no_delete BEFORE DELETE ON event_log \
+         BEGIN SELECT RAISE(ABORT, 'event_log is append-only'); END;",
+    )
+    .unwrap();
+    drop(conn);
+
     // Schema drift fails `schema` check.
     let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
     let orig_sum: String = conn
@@ -364,6 +402,21 @@ fn backup_manifest_and_lock_protected_restore_roundtrip() {
 
     let doc_clean = ua_cmd(&home).args(["doctor", "--json", "--strict"]).output().unwrap();
     assert!(doc_clean.status.success(), "stdout={}", String::from_utf8_lossy(&doc_clean.stdout));
+
+    // Leftover `.ua.db.restore.*.d` directory is flagged by `restore_staging`.
+    let fake_staging = home.join(".ua.db.restore.1.2.d/rollback");
+    fs::create_dir_all(&fake_staging).unwrap();
+    let doc_staging = ua_cmd(&home).args(["doctor", "--json", "--strict"]).output().unwrap();
+    assert!(!doc_staging.status.success());
+    let doc_staging_rep = parse_stdout_json(&doc_staging);
+    assert!(
+        doc_staging_rep["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "restore_staging" && c["status"] == "warn")
+    );
+    fs::remove_dir_all(home.join(".ua.db.restore.1.2.d")).unwrap();
 
     // Also confirm `--allow-unpinned` opts out when desired.
     let unpinned_ok = ua_cmd(&home)

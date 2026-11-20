@@ -263,22 +263,20 @@ fn check_schema(db_path: &Path) -> CheckResult {
         }
     };
     match ua_store::backup::check_schema_compatibility(&conn, &expected, &[ua_import::SCHEMA]) {
-        Ok(c)
-            if !c.drifted.is_empty()
-                || !c.unexpected_triggers.is_empty()
-                || !c.unexpected_tables.is_empty() =>
-        {
-            check(
-                "schema",
-                Status::Fail,
-                format!(
-                    "drifted=[{}], unexpected_tables=[{}], unexpected_triggers=[{}]",
-                    c.drifted.join(", "),
-                    c.unexpected_tables.join(", "),
-                    c.unexpected_triggers.join(", ")
-                ),
-            )
-        }
+        Ok(c) if c.has_tampering_or_unowned_objects() => check(
+            "schema",
+            Status::Fail,
+            format!(
+                "drifted=[{}], missing_objects=[{}], modified_objects=[{}], \
+                 unexpected_tables=[{}], unexpected_indexes=[{}], unexpected_triggers=[{}]",
+                c.drifted.join(", "),
+                c.missing_objects.join(", "),
+                c.modified_objects.join(", "),
+                c.unexpected_tables.join(", "),
+                c.unexpected_indexes.join(", "),
+                c.unexpected_triggers.join(", "),
+            ),
+        ),
         Ok(c) if !c.missing.is_empty() || !c.extra.is_empty() => check(
             "schema",
             Status::Warn,
@@ -286,6 +284,40 @@ fn check_schema(db_path: &Path) -> CheckResult {
         ),
         Ok(_) => check("schema", Status::Pass, format!("all {} expected schema parts match", expected.len())),
         Err(e) => check("schema", Status::Fail, format!("schema check failed: {e}")),
+    }
+}
+
+fn check_restore_staging(db_path: &Path) -> CheckResult {
+    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return check("restore_staging", Status::Pass, "no leftover restore staging directories");
+    };
+    if !parent.is_dir() {
+        return check("restore_staging", Status::Pass, "home directory not initialized yet");
+    }
+    let prefix = format!(".{}.restore", db_path.file_name().and_then(|s| s.to_str()).unwrap_or("ua.db"));
+    let mut found = Vec::new();
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with(&prefix) && entry.path().is_dir() {
+                found.push(entry.path().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    if found.is_empty() {
+        check("restore_staging", Status::Pass, "no leftover restore staging directories")
+    } else {
+        check(
+            "restore_staging",
+            Status::Warn,
+            format!(
+                "{} leftover restore staging dir(s) present ({}); inspect rollback/ before removing",
+                found.len(),
+                found.join(", ")
+            ),
+        )
     }
 }
 
@@ -413,6 +445,7 @@ pub fn run(args: DoctorArgs, explicit_config: Option<&Path>) -> anyhow::Result<E
                 }
             }
             checks.push(check_pre_restore_backups(&db_path));
+            checks.push(check_restore_staging(&db_path));
         }
         Err(e) => {
             checks.push(check("config", Status::Fail, format!("configuration failed to load: {e}")));

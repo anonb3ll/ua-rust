@@ -5,7 +5,7 @@ services:
       dockerfile: deploy/docker/Dockerfile
       args:
         UA_FEATURES: embeddings
-    init: true
+    # Dockerfile already uses /usr/bin/tini as PID 1 entrypoint.
     ports:
       # Bind loopback on the host and front with a TLS reverse proxy if remote.
       - "127.0.0.1:8765:8765"
