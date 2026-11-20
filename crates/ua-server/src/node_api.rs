@@ -11,6 +11,9 @@
 //! | `POST /api/node/followups` | `node_followups` |
 //! | `POST /api/node/permission`| `node_permission` |
 //! | `POST /api/node/session_credential` | `node_session_credential` (201, `Cache-Control: no-store`) |
+//! | `POST /api/node/wake`      | `node_wake` (long-poll, `offer_version` 3) |
+//! | `POST /api/node/wake/check` | `node_wake_check` |
+//! | `POST /api/node/wake/receipt` | `node_wake_receipt` (200; `duplicate: true` for a resend) |
 //! | `GET  /api/nodes`          | `node_list`, plus `recent_items` from `node_items` |
 //! | `GET  /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` (`?node=`) |
 //!
@@ -23,8 +26,8 @@
 //! credential refusal also carries `reason` (the same code), which is what
 //! the node keys on there.
 //!
-//! The idle-session wake transport (`/api/node/wake*`) and the harness
-//! config bundle (`/api/node/config`) are not built yet and answer `501`.
+//! The harness config bundle (`/api/node/config`) is not built yet and
+//! answers `501`.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -64,9 +67,18 @@ pub fn routes() -> Router<AppState> {
             post(|s, i, h, b| tool_route(s, i, h, b, "node_permission", Created::Never)),
         )
         .route("/api/node/session_credential", post(session_credential))
+        .route("/api/node/wake", post(|s, i, h, b| tool_route(s, i, h, b, "node_wake", Created::Never)))
+        .route(
+            "/api/node/wake/check",
+            post(|s, i, h, b| tool_route(s, i, h, b, "node_wake_check", Created::Never)),
+        )
+        .route(
+            "/api/node/wake/receipt",
+            post(|s, i, h, b| tool_route(s, i, h, b, "node_wake_receipt", Created::Never)),
+        )
         .route(
             "/api/node/{*rest}",
-            any(|| async { not_built("node_wake", "the node wake and harness config routes") }),
+            any(|| async { not_built("node_config", "the harness config bundle route") }),
         )
         .route("/api/nodes", get(list))
         .route("/api/nodes/acceptance", get(acceptance))

@@ -42,6 +42,7 @@ pub(crate) use holds::{task_hold, task_hold_get, task_holds};
 pub use lifecycle::is_retired;
 pub(crate) use lifecycle::{
     agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate, agent_unretire,
+    stopped,
 };
 pub(crate) use proposals::{
     check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
