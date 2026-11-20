@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 185 tools are registered and the core families are ported.
+> **Status: alpha.** 190 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -107,6 +107,7 @@ vulnerability.
 | Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
+| TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
 | Auth | OAuth 2.1 authorization server, passkeys, browser sessions | [auth](docs/auth.md) |
 | Migration | `ua import python-hub` with a dry run, resumable and chain-verified | |
@@ -117,9 +118,11 @@ The public relay (`relay_manage`), the node wake transport, harness config bundl
 (`/api/node/wake*`, `/config`, `/session_credential` answer 501), device
 acceptance, cloud executors, ACP, Slack and Zulip connectors, role
 workflows, CI lookups and close-on-merge (both wait for the native GitHub
-client), session-handoff failover, the TypeScript SDK's platform routes
-(`/api/runs`, `/api/platform/*` answer 501), billing and usage ledgers, and
-tenancy (`org_id`).
+client), session-handoff failover, the SDK's queue-health and node-session
+routes (`/api/queue-health`, `/api/action/node-session`), the provenance graph
+and evidence export, billing and usage ledgers, and tenancy (`org_id`). Work
+products (`/api/work-products*`) are not ported pending an explicit product
+decision (hub task #2658) and answer 501.
 
 ## License
 

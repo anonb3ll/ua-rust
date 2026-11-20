@@ -370,7 +370,7 @@ async fn record_decision(hub: &Hub, caller: &Caller, tool: &str, err: &UaError) 
 
 /// Append an `agent.gateway.decision` deny event. `rule` names the policy
 /// rule that fired; it is empty for profile and approval refusals.
-async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
+pub(crate) async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
     let reason_code = match err {
         UaError::Denied { reason_code, .. } => reason_code.clone(),
         other => other.code().to_string(),

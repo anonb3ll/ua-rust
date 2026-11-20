@@ -95,6 +95,13 @@ pub struct Config {
     /// Prior scenes kept per board for `graph_canvas_history` and
     /// `graph_canvas_restore`; older revisions are dropped. 0 keeps none.
     pub graph_canvas_history_max: u32,
+    /// Client evidence events (`evidence_append`) one identity may append per
+    /// rolling hour. Past it the call is refused (`rate_limited`). Counted
+    /// from the ledger, so it holds across restarts.
+    pub evidence_append_max_per_hour: u32,
+    /// Serialized payload bytes one identity may append through
+    /// `evidence_append` per rolling hour (`rate_limited` past it).
+    pub evidence_append_max_bytes_per_hour: u64,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -332,6 +339,8 @@ impl Default for Config {
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
+            evidence_append_max_per_hour: 120,
+            evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
