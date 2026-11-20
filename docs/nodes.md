@@ -11,6 +11,8 @@ calls out to the hub and never listens, so a node needs no inbound port.
 | `POST /api/node/register` | `node_register` | The node's agent |
 | `POST /api/node/heartbeat` | `node_heartbeat` | The node's agent |
 | `GET /api/nodes` | `node_list` + `node_items` | Any verified caller |
+| `GET /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` | Any verified caller |
+| `POST /api/node/session_credential` | `node_session_credential` | The node's agent |
 
 A node name belongs to the agent label that first registered it. One agent
 holds at most `node_max_per_agent` nodes in service. Host facts are bounded on
@@ -126,6 +128,23 @@ to the owner's label instead.
 | `node_followups` (`/api/node/followups`) | The node fetches queued follow-ups and acknowledges the ids it will deliver. Delivery is confirmed by a `followup_delivered` event. When the item ends, open follow-ups are dropped. |
 | `node_permission` (`/api/node/permission`) | The session asks a human to decide a tool call. The answer is `pending`, `approved` (with the chosen `option_id`) or `denied`. An approval answers one prompt. A cancelled item's prompts are denied without asking anyone, and so is a prompt with no option whose `kind` starts with `allow` (`no_allow_option`): there would be nothing to apply. |
 
+### Session credentials
+
+A node can hand the ACP session it launches for a claimed item its own
+short-lived hub credential instead of the node agent's token. The node's
+agent asks `POST /api/node/session_credential` with `{node, item_id,
+attempt}` and gets a `uas_…` value once (`201`, `Cache-Control: no-store`).
+The credential runs as the item's agent under the `acp-session` profile,
+reaches only `/mcp`, `/api/tools` and `/api/whoami`, and is bound to the
+node, item and attempt. It expires at the claim's lease deadline, idles out
+600 seconds after the last heartbeat that names the item, and is revoked by
+the item's receipt, a cancel, a lapsed lease, a closed task, retiring the
+agent, or an operator. Off unless `session_credentials_enabled = true`; the
+node learns the hub supports it from `acp_session_mcp` in the registration's
+`hub_features`, and advertises it in its own `node_features`. The full
+model, refusal reasons and tool set are in
+[auth](auth.md#session-credentials).
+
 ### Dispatch runs routed to a node
 
 `dispatch_task` with `node` (plus optional `backend` and `node_timeout_s`)
@@ -145,18 +164,74 @@ Every claim also runs the sweep for its own node. A claim that finds no
 work retries only the notices owed for its own node's items; a receipt
 retries only its item's.
 
+## Device acceptance
+
+Before a device takes real work it can pass a harmless acceptance run. The
+run queues two items with the built-in `acceptance` backend (no model, no
+harness) through the ordinary queue, so the node reaches them through the
+same claim, heartbeat, events and receipt paths as real work. The node must
+advertise the `acceptance` backend and a worktree root.
+
+| Action (`coordination_manage`) | Who | What |
+|---|---|---|
+| `node_acceptance_start` (params `node`) | The node's agent or an operator | Queue a run: a `complete` job (3 steps, 120 s) and a `cancel` job (300 s). No approval: neither runs a model. Refused while a run is pending (`acceptance_pending`). |
+| `node_acceptance_evaluate` (params `node`) | The node's agent or an operator | Re-evaluate the latest run and record the outcome. |
+| `node_acceptance_status` (params `node?`) | Any caller | One node's live evaluation (computed, not recorded), or every node in service's stored summary. Also `GET /api/nodes/acceptance[?node=]`. |
+| `node_acceptance_attest` (params `node, run_id, evidence_ref`) | An operator who is not the node's agent | Accept the exact pending run whose checks all passed, naming where the independent verification is recorded (1-1000 characters). |
+
+Each item's prompt is a JSON job spec (`{acceptance: "complete" | "cancel",
+run: "acc-<16 hex>", steps, step_s, hold_s?}`). The checks:
+
+| Check | Passes when |
+|---|---|
+| `launch` | the complete job reported an `acceptance_launch` event |
+| `progress` | it then reported `acceptance_progress` steps 1, 2, 3 (`of: 3`), in order |
+| `receipt` | it ended `finished` with `backend_status: "success"` and the text `acceptance:complete run=<run> bytes=<n> sha256=<digest>` of the job's expected output |
+| `cancel_confirmed` | the cancel job, which the hub cancels as soon as it reports progress, ended `killed` with reason `cancelled_by_hub` and a confirmed `acceptance_stopped` event after launch, step 1 and the heartbeat cancel relay |
+| `revocation` | the ownership gate every claim, heartbeat and receipt passes refuses the node to a foreign agent and once it is retired (probed against the stored row; nothing is written) |
+
+A run is `pending`, then `accepted` or `failed`. Passing every check is the
+node's own report, so the run stays `pending` (`awaiting_operator_attestation`)
+until an operator attests it. A failing check fails the run at once and
+cancels its open item. A run still pending 900 seconds after it started
+fails `timed_out`, naming whether only the attestation was missing. Every
+acceptance receipt re-evaluates its run. Events go on `agent.node`:
+`acceptance_started`, `acceptance_failed`, `acceptance_attested`.
+
+With `node_require_acceptance = true`, a node whose latest run is not
+accepted (and attested) takes no other work: `node_dispatch`,
+`node_command_start` and node-routed `dispatch_task` refuse it with
+`node_not_accepted` before any approval is asked for, and `node_claim` skips
+real items already queued for it. Acceptance items are claimable only while
+their run is the node's live pending run.
+
+An acceptance vouches for the node as it was. Retiring, forgetting or
+reassigning the node voids it, as does a registration that changes its
+`backends` or `harnesses` or a registration or heartbeat that changes a
+reported `code_sha`: a pending or accepted run is marked `failed` with
+reason `voided: <why>` (an `acceptance_failed` event; a forgotten node's row
+is deleted), and the node runs acceptance again before real work. An
+identical re-registration (a restart) keeps it.
+
 ## Not yet ported
 
 These routes answer `501`:
 
 - the idle-session wake transport (`/api/node/wake`, `/wake/check`,
   `/wake/receipt`);
-- the harness config bundle (`/api/node/config`);
-- per-item session credentials (`/api/node/session_credential`).
+- the harness config bundle (`/api/node/config`).
 
-These are not ported either:
+Resuming or adopting native sessions, provider accounts and the Pi backend
+are not ported either.
 
-- device acceptance runs;
-- resuming or adopting native sessions;
-- Hermes profile binding (`acp:hermes`);
-- the agent lifecycle (pause and terminate) that the original queue consults.
+## Agent lifecycle and holds
+
+The queue consults the governance controls (see
+[policy.md](policy.md#governance-controls)). Queuing work for a node whose
+owner is paused, terminated or retired, or for a task under an active
+subtree hold, is refused before any approval is asked for. `node_claim`
+refuses a stopped owner (`agent_paused`, `agent_terminated`,
+`agent_retired`) after the claim's sweep has committed, and skips a held
+task's items, which stay queued. Pausing an agent flags its claimed items
+for the node to stop and leaves its queued items queued for the resume;
+terminating or retiring it cancels both.

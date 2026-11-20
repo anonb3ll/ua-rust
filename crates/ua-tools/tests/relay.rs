@@ -88,11 +88,11 @@ fn human() -> Caller {
 
 /// An agent on a profile that sees the relay.
 fn agent() -> Caller {
-    caller("relay-agent", ActorKind::Agent, Profile::ChiefOfStaff)
+    caller("relay-agent", ActorKind::Agent, Profile::Coordinator)
 }
 
 fn other_agent() -> Caller {
-    caller("other-agent", ActorKind::Agent, Profile::ChiefOfStaff)
+    caller("other-agent", ActorKind::Agent, Profile::Coordinator)
 }
 
 fn reason(e: &UaError) -> String {
@@ -648,8 +648,8 @@ async fn withdrawn_approvals_cannot_be_resolved_and_developers_do_not_see_the_re
     let dev = caller("builder-1", ActorKind::Agent, Profile::Developer);
     let e = h.refused(&dev, "check", json!({ "target": TARGET, "text": CLEAN })).await;
     assert_eq!(reason(&e), "profile_denied");
-    // The reviewer profile (steward) does not speak publicly either.
-    let reviewer = caller("reviewer-1", ActorKind::Agent, Profile::Steward);
+    // The reviewer profile does not speak publicly either.
+    let reviewer = caller("reviewer-1", ActorKind::Agent, Profile::Reviewer);
     let e = h.refused(&reviewer, "draft", json!({ "target": TARGET, "text": CLEAN })).await;
     assert_eq!(reason(&e), "profile_denied");
     let anon = Caller { enforce_profile: false, ..caller("anon", ActorKind::Anonymous, Profile::Public) };

@@ -36,6 +36,11 @@ pub struct ListArgs {
     /// `true` lists only archived tasks; default lists only unarchived ones.
     #[serde(default)]
     pub archived: bool,
+    /// `true` lists only parked tasks (parked with `queue_park` or folded into
+    /// a parked root; `status` still filters, pass `all` for every status).
+    /// Default leaves parked tasks out. Exclusive with `archived`.
+    #[serde(default)]
+    pub parked: bool,
     /// `full` (default) or `compact` (drops notes bodies; adds `notes_chars`
     /// and marker flags).
     pub fields: Option<String>,
@@ -71,8 +76,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "task_list",
             "List tasks by status (or all), sorted by priority then age, with keyset pagination. \
-             Pass query= for ranked full-text search. Returns {tasks, truncated, next_cursor, limit}.",
-            |ctx: ToolCtx, a: ListArgs| async move { ctx.hub.db().read_async(move |c| list(c, a)).await },
+             Pass query= for ranked full-text search. Parked tasks are left out unless parked=true (the parked \
+             view; parking is not cancelling). Returns {tasks, truncated, next_cursor, limit}.",
+            |ctx: ToolCtx, a: ListArgs| async move {
+                let pin = crate::grant::pinned_task();
+                ctx.hub.db().read_async(move |c| list(c, a, pin)).await
+            },
         )
         .family("tasks")
         .read_only(),
@@ -167,7 +176,9 @@ fn shape(conn: &Connection, mut row: Map<String, Value>, compact_rows: bool) -> 
     Ok(row)
 }
 
-fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
+/// `pin`: a session credential's task ([`crate::grant::pinned_task`]); the
+/// listing then holds that task at most, whatever the other filters say.
+fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Value> {
     let status = a.status.clone().unwrap_or_else(|| "open".into());
     if status != "all" {
         check_one_of("status", &status, &STATUSES)?;
@@ -188,6 +199,11 @@ fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
     }
 
     let mut f = Filter { clauses: Vec::new(), values: Vec::new() };
+    match pin {
+        None => {}
+        Some(Some(id)) => f.push("id = ?", [Sql::Integer(id)]),
+        Some(None) => f.push("0", []),
+    }
     if let Some(p) = &a.project {
         f.push("project = ?", [Sql::Text(check_slug("project", p)?)]);
     }
@@ -233,7 +249,11 @@ fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
     if let Some(h) = &a.source_host {
         f.push("lower(source_host) = lower(?)", [Sql::Text(h.clone())]);
     }
+    if a.archived && a.parked {
+        return Err(UaError::invalid("archived and parked are separate views; pass one of them"));
+    }
     f.push(if a.archived { "archived_at IS NOT NULL" } else { "archived_at IS NULL" }, []);
+    f.push(if a.parked { "parked_at IS NOT NULL" } else { "parked_at IS NULL" }, []);
     if let Some(v) = &a.created_since {
         f.push("julianday(created_at) >= julianday(?)", [Sql::Text(since_bound("created_since", v)?)]);
     }

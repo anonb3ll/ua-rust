@@ -186,7 +186,7 @@ async fn send_validation() {
         bad(json!({"act": "inform", "to_office": "eng", "body": "x"}))
             .await
             .to_string()
-            .contains("org registry")
+            .contains("role addressing (to_office, to_role) is not supported")
     );
     assert!(
         bad(json!({"act": "inform", "to_agent": "builder-2", "body": "x", "handoff": {"done": "y"}}))

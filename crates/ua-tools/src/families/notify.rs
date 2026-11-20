@@ -14,7 +14,7 @@
 //!
 //! `batch_notify` queues messages per category in `pending_notifications`;
 //! `flush_digest` (or reaching `max_batch_size`) sends them as one digest.
-//! `notify` is denied to the developer and steward profiles by the profile
+//! `notify` is denied to the developer and reviewer profiles by the profile
 //! lists, as in the original hub.
 
 use std::time::Duration;

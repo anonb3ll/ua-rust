@@ -18,7 +18,7 @@ fn agent(label: &str) -> Caller {
 }
 
 fn human() -> Caller {
-    Caller { kind: ActorKind::Human, profile: Profile::ChiefOfStaff, ..agent("operator") }
+    Caller { kind: ActorKind::Human, profile: Profile::Coordinator, ..agent("operator") }
 }
 
 fn anon() -> Caller {
@@ -416,7 +416,7 @@ async fn query_ranks_by_lexical_seeds_and_pagerank() {
 #[tokio::test]
 async fn ingest_status_gate_and_archive_plan() {
     let t = T::new();
-    let a = agent("steward-1");
+    let a = agent("curator-1");
     t.put("Inbox/idea.md", "An idea.\nprocessed → [[Wiki/Idea]]\n");
     t.put("Inbox/blank.md", "  \n");
     t.put("Inbox/old.md", "superseded: [[Inbox/idea]]\n");
@@ -428,14 +428,14 @@ async fn ingest_status_gate_and_archive_plan() {
         .ok(
             &a,
             "vault_ingest_status",
-            json!({"path": "Inbox/idea.md", "mark": true, "agent": "steward-1", "pages": ["Wiki/Idea.md"]}),
+            json!({"path": "Inbox/idea.md", "mark": true, "agent": "curator-1", "pages": ["Wiki/Idea.md"]}),
         )
         .await;
     assert_eq!(m["status"], "marked");
     let s = t.ok(&a, "vault_ingest_status", json!({"path": "Inbox/idea.md"})).await;
     assert_eq!(s["status"], "unchanged");
     assert_eq!(s["pages"], json!(["Wiki/Idea.md"]));
-    assert_eq!(s["agent"], "steward-1");
+    assert_eq!(s["agent"], "curator-1");
 
     let plan = t.ok(&human(), "vault_archive_plan", json!({"as_of": "2026-01-05"})).await;
     assert_eq!(plan["read_only"], true);
@@ -454,7 +454,7 @@ async fn ingest_status_gate_and_archive_plan() {
     let s = t.ok(&a, "vault_ingest_status", json!({"path": "Inbox/blank.md"})).await;
     assert_eq!(s["status"], "empty");
     let e = t
-        .err(&a, "vault_ingest_status", json!({"path": "Inbox/blank.md", "mark": true, "agent": "steward-1"}))
+        .err(&a, "vault_ingest_status", json!({"path": "Inbox/blank.md", "mark": true, "agent": "curator-1"}))
         .await;
     assert_eq!(e.code(), "invalid_argument");
 
@@ -519,17 +519,18 @@ async fn move_list_search_custodian_and_memory_ingest() {
     let t = T::new();
     let a = agent("builder-1");
     t.put("Inbox/cap.md", "a capture");
-    // Developers cannot move notes; the chief-of-staff profile can.
+    // Developers cannot move notes; the coordinator profile can.
     let e = t.err(&a, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Cap.md"})).await;
     assert_eq!(reason(&e), "profile_denied");
-    let cos = Caller { profile: Profile::ChiefOfStaff, ..agent("chief-1") };
-    let m =
-        t.ok(&cos, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Moved/Cap.md"})).await;
+    let coord = Caller { profile: Profile::Coordinator, ..agent("coord-1") };
+    let m = t
+        .ok(&coord, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Moved/Cap.md"}))
+        .await;
     assert_eq!(m["destination"], "Wiki/Moved/Cap.md");
     assert!(!t.root.join("Inbox/cap.md").exists());
     t.put("Inbox/two.md", "two");
     let e = t
-        .err(&cos, "vault_move", json!({"source": "Inbox/two.md", "destination": "Wiki/Moved/Cap.md"}))
+        .err(&coord, "vault_move", json!({"source": "Inbox/two.md", "destination": "Wiki/Moved/Cap.md"}))
         .await;
     assert_eq!(e.code(), "conflict");
 

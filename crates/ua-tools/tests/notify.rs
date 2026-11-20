@@ -88,7 +88,7 @@ fn caller(label: &str, profile: Profile) -> Caller {
 }
 
 fn staff() -> Caller {
-    caller("chief-1", Profile::ChiefOfStaff)
+    caller("coord-1", Profile::Coordinator)
 }
 
 async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) -> Value {
@@ -156,7 +156,7 @@ async fn webhook_delivery_retries_server_errors() {
     assert!(last.head.contains(&format!("authorization: {}", HEADER_SECRET.to_ascii_lowercase())));
     assert_eq!(last.body["text"], "deploy finished");
     assert_eq!(last.body["kind"], "notify");
-    assert_eq!(last.body["agent"], "chief-1");
+    assert_eq!(last.body["agent"], "coord-1");
     assert_eq!(last.body["outbox_id"], res["outbox_id"]);
 
     // Delivered text is cleared from the outbox.
@@ -254,7 +254,7 @@ async fn digests_batch_and_flush() {
 async fn notify_keeps_the_profile_gate() {
     let hub = hub_with(None);
     let reg = builtin_registry();
-    for profile in [Profile::Developer, Profile::Steward] {
+    for profile in [Profile::Developer, Profile::Reviewer] {
         let err = reg
             .call(&hub, &caller("builder-1", profile), "notify", json!({ "message": "hi" }))
             .await

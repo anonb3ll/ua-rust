@@ -315,7 +315,7 @@ pub fn parse_policy_value(data: &Value) -> Result<Policy, String> {
             let mut out = BTreeMap::new();
             for (k, v) in o {
                 let p = v.as_str().ok_or_else(|| format!("profile_defaults.{k} must be a profile name"))?;
-                p.parse::<Profile>().map_err(|e| format!("profile_defaults.{k}: {e}"))?;
+                Profile::parse_assignable(p).map_err(|e| format!("profile_defaults.{k}: {e}"))?;
                 out.insert(k.clone(), p.to_string());
             }
             out
@@ -569,6 +569,9 @@ pub fn overlay_allowed<'a>(
     code_default: Profile,
     tools: impl IntoIterator<Item = &'a str>,
 ) -> bool {
+    if !chosen.assignable() {
+        return false;
+    }
     if chosen == code_default {
         return true;
     }
@@ -708,17 +711,36 @@ fn resolve_claims(conn: &Connection, label: &str) -> rusqlite::Result<Vec<Claim>
     rows.collect()
 }
 
-fn principals(caller: &Caller, scope: &Scope) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    if !scope.agent.is_empty() {
-        out.insert(scope.agent.clone());
-    }
-    out.insert(caller.profile.as_str().to_string());
-    out
+/// Who a `roles` list is matched against: the caller's identity label and
+/// its profile, kept apart so a label that happens to equal a profile name
+/// never stands in for the profile (or the other way round).
+struct Principals {
+    agent: Option<String>,
+    profile: Profile,
 }
 
-fn roles_apply(rule: &PolicyRule, principals: &BTreeSet<String>) -> bool {
-    rule.roles.is_empty() || rule.roles.iter().any(|r| principals.contains(r))
+fn principals(caller: &Caller, scope: &Scope) -> Principals {
+    Principals { agent: (!scope.agent.is_empty()).then(|| scope.agent.clone()), profile: caller.profile }
+}
+
+/// One `roles` entry: `agent:<label>` names an identity, `profile:<name>` a
+/// profile (a legacy profile name is accepted). A bare entry is a profile
+/// when it parses as one, else an identity label.
+fn role_matches(entry: &str, who: &Principals) -> bool {
+    if let Some(label) = entry.strip_prefix("agent:") {
+        return who.agent.as_deref() == Some(label);
+    }
+    if let Some(name) = entry.strip_prefix("profile:") {
+        return name.parse::<Profile>().is_ok_and(|p| p == who.profile);
+    }
+    match entry.parse::<Profile>() {
+        Ok(p) => p == who.profile,
+        Err(_) => who.agent.as_deref() == Some(entry),
+    }
+}
+
+fn roles_apply(rule: &PolicyRule, who: &Principals) -> bool {
+    rule.roles.is_empty() || rule.roles.iter().any(|r| role_matches(r, who))
 }
 
 fn payload_field<'a>(args: &'a Value, path: &str) -> Option<&'a Value> {

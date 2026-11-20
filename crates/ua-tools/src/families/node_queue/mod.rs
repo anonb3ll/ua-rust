@@ -31,10 +31,17 @@
 //! one item by `evidence_ref = "node:<node>:<item>"`. Only that item moves or
 //! closes the run; the dispatch reaper leaves such runs to this queue.
 //!
+//! A claimed ACP item's session can get its own short-lived hub credential
+//! ([`credentials`], `node_session_credential`), and a node can pass a
+//! harmless device acceptance run before real work (`acceptance`,
+//! `coordination_manage` `node_acceptance_*`).
+//!
 //! Every change is ledgered on `agent.node` in the same transaction.
 
+pub(crate) mod acceptance;
 mod claim;
 mod command;
+pub mod credentials;
 mod receipt;
 mod relay;
 
@@ -46,13 +53,17 @@ use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::verified;
-use super::nodes;
+use super::{governance, nodes};
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
+pub(crate) use acceptance::{
+    node_acceptance_attest, node_acceptance_evaluate, node_acceptance_start, node_acceptance_status,
+};
 pub(crate) use claim::on_heartbeat;
 pub(crate) use command::{node_command_adopt, node_command_start, node_command_status};
+pub(crate) use credentials::{revoke_for_agent, session_credential_revoke};
 pub(crate) use receipt::cancel_for_run;
 
 pub const CHANNEL: &str = "agent.node";
@@ -176,7 +187,7 @@ CREATE INDEX IF NOT EXISTS idx_node_followups_item_status ON node_followups(item
 };
 
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA]
+    vec![SCHEMA, credentials::SCHEMA, acceptance::SCHEMA]
 }
 
 // --- limits ---------------------------------------------------------------------
@@ -197,7 +208,7 @@ const PREVIEW_CHARS: usize = 80;
 
 /// Backends a node may run. `acceptance` is the hub's no-model self-test
 /// and `command` a supervised argv (queued through `node_command_start`).
-pub const NODE_BACKENDS: [&str; 17] = [
+pub const NODE_BACKENDS: [&str; 16] = [
     "codex",
     "agy",
     "pi",
@@ -212,7 +223,6 @@ pub const NODE_BACKENDS: [&str; 17] = [
     "acp:copilot",
     "acp:cursor",
     "acp:opencode",
-    "acp:hermes",
     "acceptance",
     "command",
 ];
@@ -762,11 +772,6 @@ pub(crate) fn validate_new(
     if !NODE_BACKENDS.contains(&backend.as_str()) {
         return Err(UaError::invalid(format!("backend must be one of {}", NODE_BACKENDS.join(", "))));
     }
-    if backend == "acp:hermes" {
-        return Err(UaError::invalid(
-            "acp:hermes needs a Hermes profile binding, which this hub does not serve yet; use another backend",
-        ));
-    }
     if prompt.trim().is_empty() {
         return Err(UaError::invalid("prompt must not be empty"));
     }
@@ -835,10 +840,10 @@ fn settings_source(n: &NewItem) -> String {
     }
 }
 
-/// The node `n.node` can take this item now: registered, in service and
+/// The node `n.node` can take this item now: registered, in service,
 /// advertising the backend (when it reports a list), with the features the
-/// item needs.
-pub(crate) fn accepting_node(c: &Connection, n: &NewItem) -> UaResult<NodeRow> {
+/// item needs, and past device acceptance when `node_require_acceptance` is on.
+pub(crate) fn accepting_node(c: &Connection, cfg: &ua_core::Config, n: &NewItem) -> UaResult<NodeRow> {
     let Some(row) = load_node(c, &n.node)? else {
         return Err(UaError::not_found(format!("node {:?} is not registered", n.node)));
     };
@@ -871,6 +876,7 @@ pub(crate) fn accepting_node(c: &Connection, n: &NewItem) -> UaResult<NodeRow> {
             format!("node {:?} does not support ACP session settings; only supervised mode", n.node),
         ));
     }
+    acceptance::require_accepted(c, cfg, &row, &n.backend)?;
     Ok(row)
 }
 
@@ -907,6 +913,9 @@ pub(crate) fn insert_item(
     node: &NodeRow,
     created_by: &str,
 ) -> UaResult<Value> {
+    // The one claim gate, again at the enqueue itself (every path queues here).
+    governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+    acceptance::require_accepted(tx, hub.cfg(), node, &n.backend)?;
     if let Some(t) = n.task_id {
         let exists: Option<String> =
             tx.query_row("SELECT status FROM tasks WHERE id = ?1", [t], |r| r.get(0)).optional()?;
@@ -917,6 +926,9 @@ pub(crate) fn insert_item(
             }
             _ => {}
         }
+        // Node work bound to a proposal-spawned task (node_dispatch, a
+        // command, node-routed dispatch) fails closed on a drifted contract.
+        governance::task_contract(tx, t)?;
     }
     let id = new_item_id();
     let ts = now();
@@ -1030,7 +1042,13 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
             {
                 return Ok(Ok(prev));
             }
-            let node = accepting_node(tx, &n)?;
+            let node = accepting_node(tx, hub2.cfg(), &n)?;
+            // Before the approval gate, so stopped, held or drifted work never
+            // consumes one.
+            governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+            if let Some(t) = n.task_id {
+                governance::task_contract(tx, t)?;
+            }
             match approvals::gate(tx, hub2.cfg(), &caller, "node_dispatch", &gate_payload(&n, &who))? {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => return Ok(Err(Some(approval_id))),
@@ -1081,6 +1099,7 @@ pub(crate) fn cancel_item(tx: &mut WriteTx<'_>, id: &str, actor: &str, reason: &
             actor,
         )?;
         relay::drop_open_followups(tx, id, "item_cancelled")?;
+        credentials::revoke_for_item(tx, id, "cancelled", actor)?;
         let run = close_linked_cancel(tx, &item, actor)?;
         return Ok(
             json!({ "item_id": id, "status": "cancelled", "cancel_requested": true, "changed": true, "run_outcome": run }),
@@ -1098,6 +1117,7 @@ pub(crate) fn cancel_item(tx: &mut WriteTx<'_>, id: &str, actor: &str, reason: &
             actor,
         )?;
     }
+    credentials::revoke_for_item(tx, id, "cancelled", actor)?;
     Ok(
         json!({ "item_id": id, "status": item.status, "cancel_requested": true, "changed": !item.cancel_requested }),
     )
@@ -1385,6 +1405,7 @@ pub(crate) fn sweep_tx(tx: &mut WriteTx<'_>, node: Option<&str>, actor: &str) ->
                 actor,
             )?;
             relay::drop_open_followups(tx, &item.id, "delivery_unconfirmed")?;
+            credentials::revoke_for_item(tx, &item.id, "lease_expired", actor)?;
             close_linked_run(tx, &item, "failed", Some(LEASE_EXPIRED), actor, false)?;
             failed.push(item.id);
         }
@@ -1591,6 +1612,7 @@ pub fn register(r: &mut Registry) {
         .family("nodes"),
     );
     claim::register(r);
+    credentials::register(r);
     receipt::register(r);
     relay::register(r);
 }

@@ -15,8 +15,9 @@ use super::{
     run_object, states, transition,
 };
 use crate::approvals::{self, GateOutcome};
-use crate::families::node_queue;
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
+use crate::families::{governance, node_queue};
+use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 const PROMPT_CAP: usize = 32 * 1024;
@@ -416,8 +417,8 @@ fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResu
 
 /// The default prompt for a run routed to a node: the node's receipt
 /// reports the outcome, so the session is not asked to report it.
-fn node_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str, node: &str) -> String {
-    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+fn node_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: &str, node: &str) -> String {
+    let notes: String = notes.chars().take(8000).collect();
     format!(
         "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id} on node {node}. The hub records the \
          outcome from this session's end; do the work and leave a clear final summary.",
@@ -426,8 +427,10 @@ fn node_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str, node: &str
 }
 
 /// The default prompt: the task title and notes, and the run to report on.
-fn default_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str) -> String {
-    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+/// `notes` is the task's work order: its notes, or for a task an approved
+/// work proposal spawned, the contract block alone.
+fn default_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: &str) -> String {
+    let notes: String = notes.chars().take(8000).collect();
     format!(
         "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id}. When done, call \
          dispatch_report_self(state, run_id=\"{run_id}\", evidence=...).",
@@ -481,6 +484,7 @@ enum Gated {
 /// node's roots, else the node's first existing root).
 fn node_route(
     tx: &rusqlite::Connection,
+    cfg: &ua_core::Config,
     node: &str,
     agent: &str,
     backend: Option<&str>,
@@ -539,7 +543,7 @@ fn node_route(
             )
         })?;
     let probe = node_queue::validate_new(&name, &backend, "probe", &cwd, None, None, None, None, None, None)?;
-    node_queue::accepting_node(tx, &probe)?;
+    node_queue::accepting_node(tx, cfg, &probe)?;
     Ok((row, backend, cwd))
 }
 
@@ -657,6 +661,18 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             let task = require_task(tx, tid)?;
             check_task_free(tx, tid, &ag, None)?;
+            // The one claim gate: a stopped agent or a held task takes no run.
+            governance::check_claim(tx, Some(&ag), Some(tid), false)?;
+            // A proposal-spawned task must still match its frozen contract,
+            // and its work order is the contract block: notes appended after
+            // it never reach a prompt the hub builds.
+            let work_order = governance::check_contract(
+                tx,
+                tid,
+                str_field(&task, "title").unwrap_or_default(),
+                str_field(&task, "notes").unwrap_or_default(),
+            )?;
+            let notes = work_order.unwrap_or_else(|| str_field(&task, "notes").unwrap_or_default().to_string());
             let workdir = match &h2 {
                 None => None,
                 Some((name, h)) => {
@@ -673,14 +689,14 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             };
             let route = match &node {
                 None => None,
-                Some(n) => Some(node_route(tx, n, &ag, a.backend.as_deref(), &task)?),
+                Some(n) => Some(node_route(tx, hub.cfg(), n, &ag, a.backend.as_deref(), &task)?),
             };
             let run_id = derive_run_id(tx, tid, &ag)?;
             let (prompt, source) = match &a.prompt {
                 Some(p) => (p.clone(), "args"),
                 None => match &route {
-                    Some((row, _, _)) => (node_prompt(tid, &task, &run_id, &row.node), "task"),
-                    None => (default_prompt(tid, &task, &run_id), "task"),
+                    Some((row, _, _)) => (node_prompt(tid, &task, &notes, &run_id, &row.node), "task"),
+                    None => (default_prompt(tid, &task, &notes, &run_id), "task"),
                 },
             };
             if prompt.len() > PROMPT_CAP {
@@ -893,12 +909,16 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     check_agent_or_operator(&ctx.caller, "dispatch_cancel", &run.agent_label)?;
     let reason =
         a.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or("client cancelled".into());
-    let actor = ctx.caller.label.clone();
+    cancel_run(&ctx.hub, ctx.caller.label.clone(), rid, reason).await
+}
 
+/// Cancel one run as `actor`: record the intent, stop the process (or ask
+/// the node to), and commit the outcome. The caller has checked authority.
+/// A refusal is an `{ok: false, reason}` reply, not an error.
+pub(crate) async fn cancel_run(hub: &Hub, actor: String, rid: String, reason: String) -> UaResult<Value> {
     // 1. Record the intent (state unchanged) as a compare-and-swap.
     let (rid2, actor2, reason2) = (rid.clone(), actor.clone(), reason.clone());
-    let intent = ctx
-        .hub
+    let intent = hub
         .db()
         .write_async(move |tx| {
             let Some(run) = load_run(tx, &rid2)? else {
@@ -942,12 +962,16 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     // 2. Stop the process (re-read: a launch may have recorded a pid since).
     // A node-routed run is stopped by its node: cessation is confirmed only
     // by the node's receipt, unless the item was never claimed.
-    let fresh = require_run(&ctx, &rid).await?;
+    let rid3 = rid.clone();
+    let fresh = hub
+        .db()
+        .read_async(move |c| load_run(c, &rid3))
+        .await?
+        .ok_or_else(|| UaError::not_found(format!("unknown dispatch run: {rid}")))?;
     let termination = match fresh.evidence_ref.clone().filter(|e| e.starts_with("node:")) {
         Some(ev) => {
             let by = actor.clone();
-            ctx.hub
-                .db()
+            hub.db()
                 .write_async(move |tx| Ok(node_queue::cancel_for_run(tx, &ev, &by)?.unwrap_or("unknown")))
                 .await?
         }
@@ -957,8 +981,7 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
 
     // 3. Commit the outcome.
     let by = actor.clone();
-    let mut out = ctx
-        .hub
+    let mut out = hub
         .db()
         .write_async(move |tx| {
             finalize_cancellation(tx, &rid, &actor, "cancel", &reason, termination, cessation)
@@ -1172,6 +1195,10 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             let binding = check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
+            // A resumed attempt is new work: the one claim gate applies, and
+            // a proposal-spawned task must still match its frozen contract.
+            governance::check_claim(tx, Some(&run.agent_label), Some(run.task_id), false)?;
+            governance::task_contract(tx, run.task_id)?;
             // The approver sees what will run, and the attempt it replaces:
             // a pass resumes this attempt only.
             let mut payload = json!({

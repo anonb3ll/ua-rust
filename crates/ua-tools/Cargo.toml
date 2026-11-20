@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+rand.workspace = true
 jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -78,7 +79,6 @@ tree-sitter-go = "0.25"
 # RustCrypto crates were already in the dependency tree (cookie, webauthn-rs).
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 hmac = "0.13"
-rand.workspace = true
 # MCP gateway: the client side of the official SDK (the server side is in
 # ua-server), over a child's stdio or Streamable HTTP through our reqwest.
 rmcp = { version = "=3.11.0", default-features = false, features = [

@@ -213,8 +213,6 @@ async fn work_round_trips_through_the_device_plane() {
     // Routes not built yet still say so.
     let (status, v) = post(&hub, "/api/node/wake", Some(BUILDER), json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{v}");
-    let resp = hub.send(get("/api/nodes/acceptance", None, Some(BUILDER))).await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]
@@ -237,4 +235,42 @@ async fn a_refused_listing_answers_in_the_node_error_shape() {
     assert_eq!(v["code"], "profile_denied", "{v}");
     assert_eq!(v["nodes"], json!([]));
     assert!(v["error"].is_string());
+}
+
+#[tokio::test]
+async fn a_retired_agents_static_token_is_refused_until_it_is_unretired() {
+    let hub = TestHub::new(config());
+    let (status, _) = post(&hub, "/api/node/register", Some(BUILDER), json!({ "node": "node-a" })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let operator = Caller {
+        label: "operator".into(),
+        kind: ActorKind::Human,
+        profile: Profile::Developer,
+        enforce_profile: true,
+        session_key: None,
+        transport: Transport::Http,
+    };
+    let manage = |action: &'static str| json!({ "action": action, "params": { "agent": "builder-1", "reason": "decommissioned" } });
+    hub.state
+        .registry
+        .call(&hub.state.hub, &operator, "coordination_manage", manage("agent_retire"))
+        .await
+        .unwrap();
+
+    // A token in configuration cannot be revoked; the retirement refuses it.
+    let (status, _) =
+        post(&hub, "/api/node/heartbeat", Some(BUILDER), json!({ "node": "node-a", "running": null })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let resp = hub.send(get("/api/nodes", None, Some(OTHER))).await;
+    assert_eq!(resp.status(), StatusCode::OK, "another agent is unaffected");
+
+    hub.state
+        .registry
+        .call(&hub.state.hub, &operator, "coordination_manage", manage("agent_unretire"))
+        .await
+        .unwrap();
+    let (status, _) =
+        post(&hub, "/api/node/heartbeat", Some(BUILDER), json!({ "node": "node-a", "running": null })).await;
+    assert_eq!(status, StatusCode::OK);
 }

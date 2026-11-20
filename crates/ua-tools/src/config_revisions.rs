@@ -294,7 +294,8 @@ fn tool_names() -> Vec<&'static str> {
 
 /// Validate a profile overlay: known labels and profiles, each entry repeats
 /// or lowers the identity's configured default without granting a tool that
-/// default refuses, and at least one configured chief of staff remains.
+/// default refuses, and at least one identity holding config authority (the
+/// coordinator profile) remains.
 fn validate_overlay(cfg: &Config, overlay: &Value) -> UaResult<Map<String, Value>> {
     let Some(obj) = overlay.as_object() else { return Err(bad("profile overlay must be an object")) };
     let tools = tool_names();
@@ -305,9 +306,8 @@ fn validate_overlay(cfg: &Config, overlay: &Value) -> UaResult<Map<String, Value
         }
         let chosen: Profile = value
             .as_str()
-            .ok_or_else(|| bad(format!("unknown profile {value} for {key}")))?
-            .parse()
-            .map_err(|e: String| bad(format!("{e} for {key}")))?;
+            .ok_or_else(|| bad(format!("unknown profile {value} for {key}")))
+            .and_then(|name| Profile::parse_assignable(name).map_err(|e| bad(format!("{e} for {key}"))))?;
         let code_default: Profile =
             cfg.profiles.get(key).and_then(|p| p.parse().ok()).unwrap_or(Profile::Developer);
         if !policy::overlay_allowed(chosen, code_default, tools.iter().copied()) {
@@ -321,19 +321,30 @@ fn validate_overlay(cfg: &Config, overlay: &Value) -> UaResult<Map<String, Value
         }
         clean.insert(key.clone(), json!(chosen.as_str()));
     }
-    let chiefs: Vec<&String> = cfg
+    // The coordinator profile holds config authority: it is the recovery
+    // path for config revisions, so an overlay may not demote every identity
+    // configured with it. Legacy profile names count as the profile they name.
+    let authority = Profile::Coordinator;
+    let holders: Vec<&String> = cfg
         .profiles
         .iter()
-        .filter(|(_, p)| p.as_str() == Profile::ChiefOfStaff.as_str())
+        .filter(|(_, p)| p.parse::<Profile>().ok() == Some(authority))
         .map(|(k, _)| k)
         .collect();
-    let cos = Profile::ChiefOfStaff.as_str();
-    let remaining =
-        chiefs.iter().filter(|k| clean.get(k.as_str()).and_then(Value::as_str).unwrap_or(cos) == cos).count();
-    if !chiefs.is_empty() && remaining == 0 {
-        return Err(bad(
-            "profile overlay must leave at least one chief-of-staff identity; it is the recovery path for config revisions",
-        ));
+    let remaining = holders
+        .iter()
+        .filter(|k| {
+            clean
+                .get(k.as_str())
+                .and_then(Value::as_str)
+                .is_none_or(|p| p.parse::<Profile>().ok() == Some(authority))
+        })
+        .count();
+    if !holders.is_empty() && remaining == 0 {
+        return Err(bad(format!(
+            "profile overlay must leave at least one identity holding config authority (the {authority} profile); \
+             it is the recovery path for config revisions"
+        )));
     }
     Ok(clean)
 }

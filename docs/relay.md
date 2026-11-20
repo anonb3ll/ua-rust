@@ -169,9 +169,9 @@ and credential fingerprint only.
 
 ## Profiles
 
-`relay_manage` is outbound speech, like `notify`: the `developer`, `cto` and
-`steward` (reviewer) profiles do not see it. Profiles with a deny list that does not name it, and
-humans, do. Every send still needs a human approval.
+`relay_manage` is outbound speech, like `notify`: the `developer`, `lead` and
+`reviewer` profiles do not see it. Profiles with a deny list that does not
+name it, and humans, do. Every send still needs a human approval.
 
 ## Configuration
 

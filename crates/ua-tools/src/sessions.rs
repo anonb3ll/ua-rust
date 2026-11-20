@@ -46,8 +46,14 @@ CREATE INDEX IF NOT EXISTS idx_agent_tokens_label ON agent_tokens(agent_label, s
 };
 
 /// The profile an identity gets when nothing is activated.
+/// A configured profile no identity may hold (`acp-session`; config loading
+/// refuses it) resolves to `public`, never to the broad default.
 pub fn default_profile(hub: &Hub, label: &str) -> Profile {
-    hub.cfg().profiles.get(label).and_then(|p| p.parse().ok()).unwrap_or(Profile::Developer)
+    match hub.cfg().profiles.get(label).and_then(|p| p.parse::<Profile>().ok()) {
+        Some(p) if p.assignable() => p,
+        Some(_) => Profile::Public,
+        None => Profile::Developer,
+    }
 }
 
 /// The profile currently bound to (identity, session), else the default.
@@ -65,7 +71,10 @@ pub fn resolve_profile(hub: &Hub, label: &str, session_key: Option<&str>) -> Pro
             .ok()
             .flatten()
     });
-    bound.and_then(|p| p.parse().ok()).unwrap_or_else(|| default_profile(hub, label))
+    bound
+        .and_then(|p| p.parse::<Profile>().ok())
+        .filter(|p| p.assignable())
+        .unwrap_or_else(|| default_profile(hub, label))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -75,7 +84,7 @@ pub struct NoArgs {}
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActivateArgs {
-    /// Profile name, e.g. `research` or `steward`.
+    /// Profile name, e.g. `research` or `reviewer`. Legacy names are accepted.
     pub profile: String,
 }
 
@@ -156,6 +165,12 @@ pub fn register(r: &mut Registry) {
             "Switch this session to another profile. Agents may only move to a profile no more privileged than their default.",
             |ctx: ToolCtx, a: ActivateArgs| async move {
                 let p: Profile = a.profile.parse().map_err(UaError::invalid)?;
+                if !p.assignable() {
+                    return Err(UaError::denied(
+                        "profile_reserved",
+                        format!("profile {p} is reserved for session credentials and cannot be activated"),
+                    ));
+                }
                 bind(ctx, Some(p)).await
             },
         )

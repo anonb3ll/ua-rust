@@ -14,11 +14,16 @@ struct Env {
 }
 
 fn setup(initial: Option<&str>) -> Env {
+    setup_lead_profile(initial, "coordinator")
+}
+
+/// `lead-1` is configured with `lead_profile` (a current or legacy name).
+fn setup_lead_profile(initial: Option<&str>, lead_profile: &str) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path());
     cfg.human_identities = vec!["operator".into()];
     cfg.approval_tools = vec!["event_log_verify".into()];
-    cfg.profiles.insert("lead-1".into(), "chief-of-staff".into());
+    cfg.profiles.insert("lead-1".into(), lead_profile.into());
     let path = dir.path().join("conf").join("policy.yaml");
     cfg.policy_file = Some(path.clone());
     if let Some(text) = initial {
@@ -33,7 +38,7 @@ fn lead() -> Caller {
     Caller {
         label: "lead-1".into(),
         kind: ActorKind::Agent,
-        profile: Profile::ChiefOfStaff,
+        profile: Profile::Coordinator,
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
@@ -265,20 +270,43 @@ async fn profile_overlay_commits_validate_privilege() {
     assert_eq!(err.code(), "denied", "{err}");
     // Escalation above the configured default is refused too.
     let err = env
-        .manage(&lead(), json!({ "action": "commit", "kind": "profile", "document": { "overlay": { "builder-1": "cto" } } }))
+        .manage(&lead(), json!({ "action": "commit", "kind": "profile", "document": { "overlay": { "builder-1": "lead" } } }))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "denied", "{err}");
-    // The last chief of staff cannot be demoted.
+    // The last identity holding config authority cannot be demoted.
     let err = env
         .manage(&lead(), json!({ "action": "commit", "kind": "profile", "document": { "overlay": { "lead-1": "developer" } } }))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("chief-of-staff"), "{err}");
+    assert!(err.to_string().contains("coordinator"), "{err}");
 
     let shown = env.ok(json!({ "action": "show", "kind": "profile", "revision": 1 })).await;
     assert_eq!(shown["document"]["overlay"]["builder-1"], "research");
-    assert_eq!(shown["document"]["code_defaults"]["lead-1"], "chief-of-staff");
+    assert_eq!(shown["document"]["code_defaults"]["lead-1"], "coordinator");
+}
+
+#[tokio::test]
+async fn legacy_profile_names_are_accepted_and_stored_under_current_names() {
+    // A configuration written for the Python hub names the coordinator
+    // profile by its old name; it still holds config authority.
+    let env = setup_lead_profile(Some(V1), "chief-of-staff");
+    let err = env
+        .manage(&lead(), json!({ "action": "commit", "kind": "profile", "document": { "overlay": { "lead-1": "developer" } } }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("config authority"), "{err}");
+
+    // An overlay may use a legacy name; it is stored under the current one.
+    env.gated(
+        json!({ "action": "commit", "kind": "profile", "document": { "overlay": { "builder-1": "steward", "lead-1": "chief-of-staff" } } }),
+        "config_revision_commit",
+    )
+    .await;
+    let shown = env.ok(json!({ "action": "show", "kind": "profile", "revision": 1 })).await;
+    assert_eq!(shown["document"]["overlay"]["builder-1"], "reviewer");
+    assert_eq!(shown["document"]["overlay"]["lead-1"], "coordinator");
+    assert!(!env.file().contains("steward"), "{}", env.file());
 }
 
 #[tokio::test]
