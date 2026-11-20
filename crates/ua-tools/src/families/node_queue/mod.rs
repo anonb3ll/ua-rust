@@ -677,6 +677,7 @@ pub(crate) fn close_linked_run(
                 Some("error".into())
             },
             usage: None,
+            quota_signal: None,
         },
     )?;
     Ok(Some(out))

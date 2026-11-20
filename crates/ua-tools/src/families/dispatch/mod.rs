@@ -475,6 +475,9 @@ pub(crate) struct Outcome<'a> {
     pub failure_reason: Option<String>,
     pub failure_class: Option<String>,
     pub usage: Option<Value>,
+    /// The harness-declared quota signal (`{source, line}`) behind a
+    /// `provider_quota_exhausted` class; only the supervisor sets it.
+    pub quota_signal: Option<Value>,
 }
 
 /// Record a terminal (or `retryable`) outcome on a live run. Refusals are
@@ -508,11 +511,12 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
     let reason = o.failure_reason.as_deref().map(|r| cap(r, 200));
     let class = match o.state {
         "finished" => None,
-        // A reported reason quoting a provider usage limit is quota evidence.
+        // A reported reason quoting a provider usage limit is advisory: it is
+        // recorded, and never rate-limits the account.
         _ if o.failure_class.is_none()
             && o.failure_reason.as_deref().is_some_and(super::provider_accounts::quota_signal) =>
         {
-            Some(super::provider_accounts::QUOTA_CLASS.to_string())
+            Some(super::provider_accounts::QUOTA_REPORTED_CLASS.to_string())
         }
         _ => Some(o.failure_class.clone().unwrap_or_else(|| "error".into())),
     };
@@ -531,7 +535,14 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
     let ulid = record_transition(tx, o.run_id, o.state, o.actor, json!({ "source": o.source }))?;
     insert_receipt(tx, o.run_id, o.source, o.actor, ulid.as_deref())?;
     settle_task(tx, &run, o.state, o.evidence.as_deref())?;
-    super::provider_accounts::observe_outcome(tx, o.run_id, o.state, class.as_deref(), o.actor)?;
+    super::provider_accounts::observe_outcome(
+        tx,
+        o.run_id,
+        o.state,
+        class.as_deref(),
+        o.quota_signal.as_ref(),
+        o.actor,
+    )?;
     Ok(json!({
         "ok": true,
         "run_id": o.run_id,

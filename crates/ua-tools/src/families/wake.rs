@@ -8,20 +8,29 @@
 //!    a wake by itself; withdrawing it clears outstanding offers.
 //! 2. **The grant.** Only a verified human sets it (`session_wake_grant`).
 //!    A grant is bound to one hub session id; a new session needs a new one.
-//! 3. **No decline.** A human, a lifecycle operator or the session's own agent
-//!    may decline (`session_wake_decline`). A decline revokes any grant and
-//!    is kept until a later grant: asking again does not clear it.
+//! 3. **No decline.** Any verified human, a lifecycle operator or the
+//!    session's own agent may decline (`session_wake_decline`); a decline
+//!    only restricts. It revokes any grant and is kept until a later grant:
+//!    asking again does not clear it.
 //!
-//! Delivery uses the node's own outbound channel. The node on the session's
-//! host (the node's name and the session's `host` compare by short lowercase
-//! name) long-polls `node_wake` (`POST /api/node/wake`, `offer_version` 3).
+//! Delivery uses the node's own outbound channel. A session wakes only
+//! through its *wake node* ([`wake_node`]): a node its own agent owns. The
+//! session may name that node when it asks (`node`); then only that node is
+//! used. Otherwise it is the agent's one live node whose name matches the
+//! session's `host` by short lowercase name, or, when several do, the one
+//! whose full name is the host; still ambiguous, the session is not woken.
+//! Another agent's node never sees the session, and two machines that share
+//! a short name never receive each other's wakes. The wake node long-polls
+//! `node_wake` (`POST /api/node/wake`, `offer_version` 3; at most
+//! [`MAX_POLLS_PER_NODE`] polls open per node).
 //! The hub applies every gate centrally and answers ids and counts only:
 //! `{session_id, external_session_id, unread, newest_seq, expires_at,
 //! offer_id}`. The node types the fixed [`WAKE_TEXT`] line itself, reserves
 //! the attempt first with `node_wake_check` (`/api/node/wake/check`), and
 //! reports `delivered`, `failed` or `skipped` with `node_wake_receipt`
 //! (`/api/node/wake/receipt`). A receipt is idempotent: a resend, or one for
-//! an offer that lapsed, answers `duplicate: true`.
+//! an offer that lapsed, answers `duplicate: true`. A check or receipt from
+//! any node but the session's wake node is refused (`not_found`).
 //!
 //! Gates, in order: an offer still outstanding (120 s); the retry hold after
 //! a failed or skipped offer (30 s); the breaker ([`BREAKER_AFTER`] wakes or
@@ -36,6 +45,8 @@
 //! `message_reads`), never message bodies, so no message text reaches a wake.
 //! Every change is ledgered on `agent.wake*` in the same transaction.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
@@ -104,6 +115,15 @@ CREATE INDEX IF NOT EXISTS idx_session_wake_offers_session ON session_wake_offer
 ",
 };
 
+/// The node a session named when it asked for wakes: once set, the only node
+/// its wakes go through.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "wake.v2",
+    sql: "
+ALTER TABLE session_wake ADD COLUMN node TEXT;
+",
+};
+
 /// Acts that ring the doorbell. `inform` and `done` wait for the session's
 /// hooks, unless the sender set `expects_reply`.
 pub const WAKE_ACTS: [&str; 3] = ["handoff", "query", "request"];
@@ -152,6 +172,8 @@ pub const WAKE_MAX_WAIT_S: f64 = 30.0;
 const WAKE_POLL: Duration = Duration::from_secs(1);
 /// Offers handed out by one poll.
 const MAX_OFFERS: usize = 50;
+/// Wake long-polls one node may hold open at once.
+pub const MAX_POLLS_PER_NODE: usize = 2;
 /// Upper bound of a unix timestamp the hub accepts (year 9999).
 const MAX_UNIX: f64 = 253_402_300_800.0;
 
@@ -212,12 +234,14 @@ struct WakeRow {
     attempts_last_hour: i64,
     unacked_attempts: i64,
     paused_reason: Option<String>,
+    /// The node the session named when it asked, if any.
+    node: Option<String>,
 }
 
 const ROW_COLS: &str = "w.session_id, s.agent, s.external_session_id, s.host, s.status, w.opted_in, \
     w.granted_at IS NOT NULL, w.declined_at IS NOT NULL, w.offered_at, w.offered_seq, w.offered_id, w.retry_at, \
     w.attempts, w.last_wake_at, w.last_wake_seq, w.hour_started_at, w.wakes_last_hour, w.unacked_wakes, \
-    w.last_attempt_at, w.attempt_hour_started_at, w.attempts_last_hour, w.unacked_attempts, w.paused_reason";
+    w.last_attempt_at, w.attempt_hour_started_at, w.attempts_last_hour, w.unacked_attempts, w.paused_reason, w.node";
 
 fn wake_row(r: &Row<'_>) -> rusqlite::Result<WakeRow> {
     Ok(WakeRow {
@@ -244,6 +268,7 @@ fn wake_row(r: &Row<'_>) -> rusqlite::Result<WakeRow> {
         attempts_last_hour: r.get(20)?,
         unacked_attempts: r.get(21)?,
         paused_reason: r.get(22)?,
+        node: r.get(23)?,
     })
 }
 
@@ -263,11 +288,52 @@ impl WakeRow {
     fn open(&self) -> bool {
         matches!(self.status.as_str(), "starting" | "running" | "waiting")
     }
+}
 
-    fn on_host(&self, node: &str) -> bool {
-        let key = host_key(node);
-        !key.is_empty() && self.host.as_deref().map(host_key).as_deref() == Some(key.as_str())
+/// The one node a session's wakes go through, or `None`. Only a live node
+/// the session's own agent owns qualifies: the node the session named when it
+/// asked, else the agent's one node whose short name is the session host's,
+/// else, among several such, the one whose full name is the host
+/// (case-insensitively). Anything still ambiguous wakes nothing, so two
+/// machines sharing a short name never receive each other's wakes.
+fn wake_node(c: &Connection, row: &WakeRow) -> UaResult<Option<String>> {
+    if let Some(named) = &row.node {
+        let owned = c
+            .query_row(
+                "SELECT 1 FROM nodes WHERE node = ?1 AND agent = ?2 AND retired_at IS NULL",
+                params![named, row.agent],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        return Ok(owned.then(|| named.clone()));
     }
+    let Some(host) = row.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) else { return Ok(None) };
+    let key = host_key(host);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt =
+        c.prepare("SELECT node FROM nodes WHERE agent = ?1 AND retired_at IS NULL ORDER BY node")?;
+    let same_short: Vec<String> = stmt
+        .query_map([&row.agent], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|n| host_key(n) == key)
+        .collect();
+    if same_short.len() <= 1 {
+        return Ok(same_short.into_iter().next());
+    }
+    let mut exact = same_short.into_iter().filter(|n| n.eq_ignore_ascii_case(host));
+    match (exact.next(), exact.next()) {
+        (Some(n), None) => Ok(Some(n)),
+        _ => Ok(None),
+    }
+}
+
+/// Whether `node` is `row`'s wake node.
+fn wakes_through(c: &Connection, row: &WakeRow, node: &str) -> UaResult<bool> {
+    Ok(wake_node(c, row)?.as_deref() == Some(node))
 }
 
 /// The session's agent, or not found.
@@ -358,41 +424,57 @@ fn unread(c: &Connection, agent: &str, session_id: &str) -> UaResult<i64> {
 
 // --- gates ----------------------------------------------------------------------
 
-/// The breaker, floor and hourly caps. Known delivery and the conservative
-/// one-shot attempt budget are counted separately. A read since the last
-/// wake or attempt resets the breaker (a write).
-fn budget_hold(tx: &WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Option<&'static str>> {
+/// The breaker, floor and hourly caps, read-only. Known delivery and the
+/// conservative one-shot attempt budget are counted separately. A read since
+/// the last wake or attempt resets the breaker: the second value says that
+/// reset is due (a write, applied by [`budget_hold`]).
+fn budget(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Option<&'static str>, bool)> {
     let last = match (row.last_wake_at, row.last_attempt_at) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
     let mut unacked = row.unacked_wakes.max(row.unacked_attempts);
     let read_after = row.last_attempt_at.or(row.last_wake_at);
+    let mut reset = false;
     if unacked > 0
         && let Some(since) = read_after
-        && read_since(tx, &row.agent, &row.session_id, since)?
+        && read_since(c, &row.agent, &row.session_id, since)?
     {
-        tx.execute(
-            "UPDATE session_wake SET unacked_wakes = 0, unacked_attempts = 0, paused_reason = NULL \
-             WHERE session_id = ?1",
-            [&row.session_id],
-        )?;
         unacked = 0;
+        reset = true;
     }
     if unacked >= BREAKER_AFTER {
-        return Ok(Some("breaker"));
+        return Ok((Some("breaker"), reset));
     }
     if last.is_some_and(|l| now - l < FLOOR_S) {
-        return Ok(Some("floor"));
+        return Ok((Some("floor"), reset));
     }
     for (start, count) in
         [(row.hour_started_at, row.wakes_last_hour), (row.attempt_hour_started_at, row.attempts_last_hour)]
     {
         if start.is_some_and(|s| now - s < 3600.0) && count >= HOURLY_CAP {
-            return Ok(Some("hourly_cap"));
+            return Ok((Some("hourly_cap"), reset));
         }
     }
-    Ok(None)
+    Ok((None, reset))
+}
+
+/// [`budget`], applying a due breaker reset.
+fn budget_hold(tx: &WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Option<&'static str>> {
+    let (hold, reset) = budget(tx, row, now)?;
+    if reset {
+        reset_breaker(tx, &row.session_id)?;
+    }
+    Ok(hold)
+}
+
+fn reset_breaker(tx: &WriteTx<'_>, session_id: &str) -> UaResult<()> {
+    tx.execute(
+        "UPDATE session_wake SET unacked_wakes = 0, unacked_attempts = 0, paused_reason = NULL \
+         WHERE session_id = ?1",
+        [session_id],
+    )?;
+    Ok(())
 }
 
 enum Verdict {
@@ -400,52 +482,85 @@ enum Verdict {
     Hold(&'static str),
 }
 
-fn gate(tx: &mut WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Verdict> {
+/// Every gate, read-only. The flag says a breaker reset is due.
+fn evaluate(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Verdict, bool)> {
     if row.offered_at.is_some_and(|o| now - o < OFFER_LEASE_S) {
-        return Ok(Verdict::Hold("offer_outstanding"));
+        return Ok((Verdict::Hold("offer_outstanding"), false));
     }
     if row.retry_at.is_some_and(|r| now < r) {
-        return Ok(Verdict::Hold("retry_wait"));
+        return Ok((Verdict::Hold("retry_wait"), false));
     }
-    if governance::claim_block(tx, Some(&row.agent), None, false)?.is_some() {
-        return Ok(Verdict::Hold("agent_stopped"));
+    if governance::stopped(c, &row.agent)?.is_some() {
+        return Ok((Verdict::Hold("agent_stopped"), false));
     }
-    if let Some(hold) = budget_hold(tx, row, now)? {
-        return Ok(Verdict::Hold(hold));
+    let (hold, reset) = budget(c, row, now)?;
+    if let Some(hold) = hold {
+        return Ok((Verdict::Hold(hold), reset));
     }
-    let mail = trigger(tx, &row.agent, &row.session_id, row.last_wake_seq, i64::MAX)?;
+    let mail = trigger(c, &row.agent, &row.session_id, row.last_wake_seq, i64::MAX)?;
     let Some(newest) = mail.newest.filter(|_| mail.n > 0) else {
-        return Ok(Verdict::Hold("nothing_to_wake"));
+        return Ok((Verdict::Hold("nothing_to_wake"), reset));
     };
     let quiet = mail.newest_at.map_or(0.0, |t| now - t);
     let held = mail.oldest_at.map_or(0.0, |t| now - t);
     if quiet < DEBOUNCE_QUIET_S && held < DEBOUNCE_MAX_HOLD_S {
-        return Ok(Verdict::Hold("debounce"));
+        return Ok((Verdict::Hold("debounce"), reset));
     }
-    let unread = unread(tx, &row.agent, &row.session_id)?;
+    let unread = unread(c, &row.agent, &row.session_id)?;
     if unread <= 0 {
-        return Ok(Verdict::Hold("nothing_to_wake"));
+        return Ok((Verdict::Hold("nothing_to_wake"), reset));
     }
-    Ok(Verdict::Due { unread, newest_seq: newest })
+    Ok((Verdict::Due { unread, newest_seq: newest }, reset))
 }
 
-/// Granted, opted-in, undeclined open sessions with a native id, on the
-/// node's host.
-fn candidates(c: &Connection, node: &str) -> UaResult<Vec<WakeRow>> {
+fn gate(tx: &mut WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Verdict> {
+    let (verdict, reset) = evaluate(tx, row, now)?;
+    if reset {
+        reset_breaker(tx, &row.session_id)?;
+    }
+    Ok(verdict)
+}
+
+/// Granted, opted-in, undeclined open sessions with a native id whose wake
+/// node is `node`, which `agent` owns: only the agent's own sessions.
+fn candidates(c: &Connection, node: &str, agent: &str) -> UaResult<Vec<WakeRow>> {
     let mut stmt = c.prepare(&format!(
         "SELECT {ROW_COLS} FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
          WHERE w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
-         AND s.status IN ({OPEN}) AND s.external_session_id IS NOT NULL ORDER BY w.session_id"
+         AND s.status IN ({OPEN}) AND s.external_session_id IS NOT NULL AND s.agent = ?1 \
+         ORDER BY w.session_id"
     ))?;
-    let rows = stmt.query_map([], wake_row)?.collect::<Result<Vec<_>, _>>()?;
-    Ok(rows.into_iter().filter(|r| r.on_host(node)).collect())
+    let rows = stmt.query_map([agent], wake_row)?.collect::<Result<Vec<_>, _>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        if wakes_through(c, &r, node)? {
+            out.push(r);
+        }
+    }
+    Ok(out)
 }
 
-/// Sessions on `node`'s host that are due a wake now, marked offered.
+/// Whether a poll of `node` has anything to write now: an offer due, a
+/// breaker reset or a pause to record. Read-only, so an idle long-poll never
+/// takes the write lock.
+fn poll_pending(c: &Connection, node: &str, agent: &str, now: f64) -> UaResult<bool> {
+    for row in candidates(c, node, agent)? {
+        let (verdict, reset) = evaluate(c, &row, now)?;
+        let pause = matches!(verdict, Verdict::Hold("breaker"))
+            && row.paused_reason.as_deref() != Some(PAUSED_NO_READ);
+        if reset || pause || matches!(verdict, Verdict::Due { .. }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Sessions whose wake node is `node` that are due a wake now, marked
+/// offered.
 fn due_wakes(tx: &mut WriteTx<'_>, node: &str, identity: &str, now: f64) -> UaResult<Vec<Value>> {
     let name = node_queue::owned_node(tx, node, identity)?.node;
     let mut out = Vec::new();
-    for row in candidates(tx, &name)? {
+    for row in candidates(tx, &name, identity)? {
         if out.len() >= MAX_OFFERS {
             break;
         }
@@ -572,10 +687,11 @@ fn check_offer_id(id: &str) -> UaResult<String> {
     Ok(id.to_string())
 }
 
-/// The wake row of `session_id` on `node`'s host, else not found.
-fn host_row(c: &Connection, session_id: &str, node: &str) -> UaResult<WakeRow> {
+/// The wake row of `session_id` when `node` (which `agent` owns) is its wake
+/// node, else not found: no other node may check, report or see it.
+fn node_row(c: &Connection, session_id: &str, node: &str, agent: &str) -> UaResult<WakeRow> {
     match load_row(c, session_id)? {
-        Some(r) if r.on_host(node) => Ok(r),
+        Some(r) if r.agent == agent && wakes_through(c, &r, node)? => Ok(r),
         _ => {
             Err(UaError::not_found(format!("session {session_id:?} is not a wake session on node {node:?}")))
         }
@@ -588,13 +704,14 @@ fn check_offer(tx: &mut WriteTx<'_>, node: &str, identity: &str, a: &CheckArgs, 
     let seq = check_seq(a.seq)?;
     let expires_at = check_stamp(a.expires_at, "expires_at")?;
     let offer_id = check_offer_id(&a.offer_id)?;
-    let row = host_row(tx, &sid, &name)?;
+    let row = node_row(tx, &sid, &name, identity)?;
     let mut remaining = live_offer(&row, seq, now, expires_at, &offer_id);
     if remaining > 0.0 {
         let attempted: Option<Option<f64>> = tx
             .query_row(
-                "SELECT attempted_at FROM session_wake_offers WHERE offer_id = ?1 AND session_id = ?2",
-                params![offer_id, sid],
+                "SELECT attempted_at FROM session_wake_offers WHERE offer_id = ?1 AND session_id = ?2 \
+                 AND node = ?3",
+                params![offer_id, sid, name],
                 |r| r.get(0),
             )
             .optional()?;
@@ -609,7 +726,7 @@ fn check_offer(tx: &mut WriteTx<'_>, node: &str, identity: &str, a: &CheckArgs, 
         remaining = 0.0;
     }
     if remaining > 0.0 {
-        let fresh = host_row(tx, &sid, &name)?;
+        let fresh = node_row(tx, &sid, &name, identity)?;
         remaining = live_offer(&fresh, seq, now, expires_at, &offer_id);
         if remaining > 0.0 && !reserve_attempt(tx, &fresh, &offer_id, now, identity)? {
             remaining = 0.0;
@@ -663,12 +780,12 @@ fn record_receipt(
         }
         _ => None,
     };
-    let row = host_row(tx, &sid, &name)?;
+    let row = node_row(tx, &sid, &name, identity)?;
     let offer: Option<OfferRow> = tx
         .query_row(
             "SELECT offered_seq, expires_at, attempted_at, invalidated_at, recorded_at FROM session_wake_offers \
-             WHERE offer_id = ?1 AND session_id = ?2",
-            params![offer_id, sid],
+             WHERE offer_id = ?1 AND session_id = ?2 AND node = ?3",
+            params![offer_id, sid, name],
             |r| {
                 Ok(OfferRow {
                     offered_seq: r.get(0)?,
@@ -775,31 +892,32 @@ fn record_receipt(
 
 /// Keep granted sessions open while the node still sees their panes: an idle
 /// session at its prompt runs no hook, so nothing heartbeats it and the
-/// reaper would close it. Only a session that asked for wakes, was granted
-/// them and registered on this node's host is touched; one the reaper closed
-/// comes back, one that ended any other way stays ended.
-/// `(id, agent, status, exit_status, external_session_id, host)` of one session.
-type LiveRow = (String, String, String, Option<String>, Option<String>, Option<String>);
+/// reaper would close it. Only a session of the node's own agent that asked
+/// for wakes, was granted them and wakes through this node is touched; one
+/// the reaper closed comes back, one that ended any other way stays ended.
+/// `(id, agent, status, exit_status, external_session_id)` of one session.
+type LiveRow = (String, String, String, Option<String>, Option<String>);
 
 fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[String]) -> UaResult<Value> {
     let name = node_queue::owned_node(tx, node, identity)?.node;
-    let key = host_key(&name);
     let rows: Vec<LiveRow> = {
         let mut stmt = tx.prepare(
-            "SELECT s.id, s.agent, s.status, s.exit_status, s.external_session_id, s.host \
+            "SELECT s.id, s.agent, s.status, s.exit_status, s.external_session_id \
              FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
              WHERE w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
-             AND s.external_session_id IS NOT NULL",
+             AND s.external_session_id IS NOT NULL AND s.agent = ?1",
         )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        stmt.query_map([identity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<Result<_, _>>()?
     };
     let ts = ua_core::time::now();
     let (mut kept, mut revived) = (0, 0);
-    for (id, agent, status, exit, ext, host) in rows {
-        if !ext.as_ref().is_some_and(|e| ids.contains(e))
-            || host.as_deref().map(host_key) != Some(key.clone())
-        {
+    for (id, agent, status, exit, ext) in rows {
+        if !ext.as_ref().is_some_and(|e| ids.contains(e)) {
+            continue;
+        }
+        let Some(row) = load_row(tx, &id)? else { continue };
+        if !wakes_through(tx, &row, &name)? {
             continue;
         }
         if matches!(status.as_str(), "starting" | "running" | "waiting") {
@@ -822,10 +940,43 @@ fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[S
     Ok(json!({ "kept_open": kept, "revived": revived }))
 }
 
-/// Whether any armed session may be on `node`'s host: the long-poll's cheap
-/// read before it takes the write lock.
-fn any_candidate(c: &Connection, node: &str) -> UaResult<bool> {
-    Ok(!candidates(c, node)?.is_empty())
+/// Open wake polls per `(hub database, node)`.
+type PollKey = (usize, String);
+static POLLS: LazyLock<Mutex<HashMap<PollKey, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One open wake poll of a node; dropping it frees the slot.
+struct PollSlot(PollKey);
+
+impl PollSlot {
+    fn take(hub: &crate::hub::Hub, node: &str) -> UaResult<Self> {
+        // The database handle lives as long as the hub, so its address tells
+        // hubs in one process apart.
+        let key = (std::ptr::from_ref(hub.db()) as usize, node.to_string());
+        let mut polls = POLLS.lock().unwrap_or_else(|e| e.into_inner());
+        let open = polls.entry(key.clone()).or_insert(0);
+        if *open >= MAX_POLLS_PER_NODE {
+            return Err(UaError::conflict_code(
+                "wake_poll_busy",
+                format!(
+                    "node {node:?} already holds {MAX_POLLS_PER_NODE} wake polls open; wait for one to end"
+                ),
+            ));
+        }
+        *open += 1;
+        Ok(Self(key))
+    }
+}
+
+impl Drop for PollSlot {
+    fn drop(&mut self) {
+        let mut polls = POLLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(open) = polls.get_mut(&self.0) {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                polls.remove(&self.0);
+            }
+        }
+    }
 }
 
 // --- device-plane tools -----------------------------------------------------------
@@ -833,8 +984,9 @@ fn any_candidate(c: &Connection, node: &str) -> UaResult<bool> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WakePollArgs {
-    /// Your registered node. Only sessions whose registered host matches the
-    /// node's name (short, lowercase) are offered.
+    /// Your registered node. Only your own sessions whose wake node it is
+    /// are offered: the node a session named when it asked, else your one
+    /// node whose name matches the session's host by short lowercase name.
     pub node: String,
     /// Seconds to wait for an offer, 0-30.
     pub wait_s: Option<f64>,
@@ -893,6 +1045,10 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
         Some(w) if w.is_finite() => w.clamp(0.0, WAKE_MAX_WAIT_S),
         Some(_) => return Err(UaError::invalid("wait_s must be a number")),
     };
+    // Only the node's own agent holds a poll (and a slot) open.
+    let (n, ag) = (node.clone(), agent.clone());
+    let node = ctx.hub.db().read_async(move |c| Ok(node_queue::owned_node(c, &n, &ag)?.node)).await?;
+    let _slot = PollSlot::take(&ctx.hub, &node)?;
     if let Some(live) = a.live_sessions {
         if live.len() > MAX_LIVE_SESSIONS
             || live.iter().any(|e| e.is_empty() || e.chars().count() > MAX_EXTERNAL_ID_CHARS)
@@ -903,22 +1059,20 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
         ctx.hub.db().write_async(move |tx| note_live_sessions(tx, &n, &ag, &live)).await?;
     }
     let deadline = Instant::now() + Duration::from_secs_f64(wait);
-    let mut first = true;
     loop {
         let last = Instant::now() >= deadline;
-        if !first && !last {
-            let n = node.clone();
-            let armed = ctx.hub.db().read_async(move |c| any_candidate(c, &n)).await?;
-            if !armed {
-                tokio::time::sleep(WAKE_POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
-                continue;
+        // Read first: the write transaction runs only when something is due.
+        let (n, ag) = (node.clone(), agent.clone());
+        let pending = ctx.hub.db().read_async(move |c| poll_pending(c, &n, &ag, now_f())).await?;
+        if pending {
+            let (n, ag) = (node.clone(), agent.clone());
+            let wakes = ctx.hub.db().write_async(move |tx| due_wakes(tx, &n, &ag, now_f())).await?;
+            if !wakes.is_empty() {
+                return Ok(json!({ "wakes": wakes }));
             }
         }
-        first = false;
-        let (n, ag) = (node.clone(), agent.clone());
-        let wakes = ctx.hub.db().write_async(move |tx| due_wakes(tx, &n, &ag, now_f())).await?;
-        if !wakes.is_empty() || last {
-            return Ok(json!({ "wakes": wakes }));
+        if last {
+            return Ok(json!({ "wakes": [] }));
         }
         tokio::time::sleep(WAKE_POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
     }
@@ -944,6 +1098,12 @@ pub struct OptInArgs {
     /// `true` (default) asks for wakes; `false` withdraws the request and
     /// clears any outstanding offer.
     pub wake: Option<bool>,
+    /// The node on this session's machine that delivers its wakes: one of
+    /// your own registered nodes. Once named, only that node is offered the
+    /// session's wakes, checks or reports them, or keeps the session open.
+    /// Unnamed, the wake node is your one node whose name matches the
+    /// session's host (short, lowercase), and none when that is ambiguous.
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -982,6 +1142,10 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
     let who = verified_identity(&ctx.caller, "session_wake_opt_in")?;
     let sid = check_session_id(&a.session_id)?;
     let wake = a.wake.unwrap_or(true);
+    let node = a.node.as_deref().map(nodes::validate_node_name).transpose()?;
+    if node.is_some() && !wake {
+        return Err(UaError::invalid("node applies only when asking for wakes"));
+    }
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -995,16 +1159,34 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
             if wake && !matches!(status.as_str(), "starting" | "running" | "waiting") {
                 return Err(UaError::conflict(format!("session {sid:?} has ended ({status}); it cannot ask for wakes")));
             }
-            let before: Option<i64> =
-                tx.query_row("SELECT opted_in FROM session_wake WHERE session_id = ?1", [&sid], |r| r.get(0)).optional()?;
-            let changed = before.unwrap_or(0) != i64::from(wake);
+            // A named wake node must be one of the session's own agent's.
+            if let Some(n) = &node {
+                node_queue::owned_node(tx, n, &who)?;
+            }
+            let before: Option<(i64, Option<String>)> = tx
+                .query_row("SELECT opted_in, node FROM session_wake WHERE session_id = ?1", [&sid], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            let renamed = node.is_some() && before.as_ref().and_then(|(_, n)| n.as_ref()) != node.as_ref();
+            let changed = before.as_ref().map_or(0, |(o, _)| *o) != i64::from(wake) || renamed;
             let ts = ua_core::time::now();
             if wake {
+                if renamed {
+                    // Offers made through another node no longer count.
+                    invalidate_offers(tx, &sid, now_f())?;
+                }
                 tx.execute(
-                    "INSERT INTO session_wake (session_id, opted_in, requested_at, updated_at) VALUES (?1, 1, ?2, ?2) \
+                    "INSERT INTO session_wake (session_id, opted_in, requested_at, node, updated_at) \
+                     VALUES (?1, 1, ?2, ?3, ?2) \
                      ON CONFLICT(session_id) DO UPDATE SET opted_in = 1, \
-                     requested_at = COALESCE(requested_at, excluded.requested_at), updated_at = excluded.updated_at",
-                    params![sid, ts],
+                     requested_at = COALESCE(requested_at, excluded.requested_at), \
+                     node = COALESCE(excluded.node, node), \
+                     offered_at = CASE WHEN ?4 THEN NULL ELSE offered_at END, \
+                     offered_seq = CASE WHEN ?4 THEN NULL ELSE offered_seq END, \
+                     offered_id = CASE WHEN ?4 THEN NULL ELSE offered_id END, \
+                     updated_at = excluded.updated_at",
+                    params![sid, ts, node, renamed],
                 )?;
             } else if changed {
                 tx.execute(
@@ -1019,7 +1201,7 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
                     tx,
                     CHANNEL_REQUEST,
                     if wake { "requested" } else { "withdrawn" },
-                    json!({ "session_id": sid, "agent": agent }),
+                    json!({ "session_id": sid, "agent": agent, "node": node }),
                     &who,
                 )?;
             }
@@ -1091,7 +1273,10 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(MAX_DECLINE_REASON).collect::<String>());
-    let operator = governance::is_operator(ctx.hub.cfg(), &ctx.caller, &actor);
+    // A decline only restricts, so any verified human may make one, as may a
+    // lifecycle operator or the session's own agent.
+    let human = ctx.caller.is_human();
+    let operator = human || governance::is_operator(ctx.hub.cfg(), &ctx.caller, &actor);
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -1099,7 +1284,7 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
             if !operator && agent != actor {
                 return Err(UaError::denied(
                     "not_authorized",
-                    "a wake request is declined by a human, a lifecycle operator or the session's own agent",
+                    "a wake request is declined by a verified human, a lifecycle operator or the session's own agent",
                 ));
             }
             let declined: Option<bool> = tx
@@ -1232,11 +1417,12 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "node_wake",
-            "Device plane: long-poll (wait_s up to 30, offer_version 3) for idle-session wakes your node should \
-             deliver: granted, opted-in sessions on the node's host with new trigger mail (request, query, \
-             handoff or expects_reply) past the debounce, floor, hourly caps and breaker. Returns {wakes: \
-             [{session_id, external_session_id, unread, newest_seq, expires_at, offer_id}]}, ids and counts only. \
-             live_sessions (native ids with a pane here) keeps idle granted sessions open.",
+            "Device plane: long-poll (wait_s up to 30, offer_version 3, at most 2 open per node) for idle-session \
+             wakes your node should deliver: your own granted, opted-in sessions whose wake node this is, with \
+             new trigger mail (request, query, handoff or expects_reply) past the debounce, floor, hourly caps \
+             and breaker. Returns {wakes: [{session_id, external_session_id, unread, newest_seq, expires_at, \
+             offer_id}]}, ids and counts only. live_sessions (native ids with a pane here) keeps those idle \
+             granted sessions open.",
             node_wake,
         )
         .family("nodes"),
@@ -1277,6 +1463,71 @@ mod tests {
     #[test]
     fn the_wake_text_is_a_constant_and_a_number() {
         assert_eq!(wake_text(3), "You have 3 new hub messages; run message_inbox");
+    }
+
+    /// Review finding: an idle long-poll took the write lock every second.
+    /// The poll now reads first and writes only when something is due.
+    #[tokio::test]
+    async fn an_idle_poll_has_nothing_to_write() {
+        use ua_core::{ActorKind, Profile, identity::Transport};
+        let mut cfg = ua_core::Config::for_home(std::env::temp_dir());
+        cfg.human_identities = vec!["operator".into()];
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        let reg = crate::builtin_registry();
+        let who = |label: &str, kind| Caller {
+            label: label.into(),
+            kind,
+            profile: Profile::Developer,
+            enforce_profile: true,
+            session_key: None,
+            transport: Transport::Http,
+        };
+        let me = who("builder-1", ActorKind::Agent);
+        reg.call(&hub, &me, "node_register", json!({ "node": "box", "facts": { "backends": ["codex"] } }))
+            .await
+            .unwrap();
+        let s = reg
+            .call(
+                &hub,
+                &me,
+                "session_start",
+                json!({ "kind": "interactive", "external_session_id": "x", "host": "box" }),
+            )
+            .await
+            .unwrap();
+        let sid = s["session_id"].as_str().unwrap().to_string();
+        let params = json!({ "session_id": sid });
+        for (caller, action) in
+            [(&me, "session_wake_opt_in"), (&who("operator", ActorKind::Human), "session_wake_grant")]
+        {
+            reg.call(&hub, caller, "coordination_manage", json!({ "action": action, "params": params }))
+                .await
+                .unwrap();
+        }
+        let pending = || hub.db().read(|c| poll_pending(c, "box", "builder-1", now_f())).unwrap();
+        assert!(!pending(), "no mail: nothing to write");
+        reg.call(
+            &hub,
+            &who("lead-1", ActorKind::Agent),
+            "message_send",
+            json!({ "act": "request", "to_agent": "builder-1", "body": "b" }),
+        )
+        .await
+        .unwrap();
+        assert!(!pending(), "debounce: still nothing to write");
+        hub.db()
+            .write(|tx| {
+                tx.execute_batch(
+                    "UPDATE message_index SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-90 seconds')",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(pending(), "due: the poll writes the offer");
+        assert!(
+            !hub.db().read(|c| poll_pending(c, "box", "intruder", now_f())).unwrap(),
+            "only the owner's sessions"
+        );
     }
 
     #[test]

@@ -294,10 +294,11 @@ async fn a_node_long_polls_checks_and_reports_a_wake_over_http() {
         transport: Transport::Http,
     };
     let (reg, h) = (&hub.state.registry, &hub.state.hub);
+    // The node wakes only its own agent's sessions.
     let session = reg
         .call(
             h,
-            &as_caller("builder-2", ActorKind::Agent),
+            &as_caller("builder-1", ActorKind::Agent),
             "session_start",
             json!({ "kind": "interactive", "external_session_id": "native-1", "host": "box.local" }),
         )
@@ -307,7 +308,7 @@ async fn a_node_long_polls_checks_and_reports_a_wake_over_http() {
     let manage = |action: &str| json!({ "action": action, "params": { "session_id": sid } });
     reg.call(
         h,
-        &as_caller("builder-2", ActorKind::Agent),
+        &as_caller("builder-1", ActorKind::Agent),
         "coordination_manage",
         manage("session_wake_opt_in"),
     )
@@ -323,9 +324,9 @@ async fn a_node_long_polls_checks_and_reports_a_wake_over_http() {
     .unwrap();
     reg.call(
         h,
-        &as_caller("builder-1", ActorKind::Agent),
+        &as_caller("builder-2", ActorKind::Agent),
         "message_send",
-        json!({ "act": "request", "to_agent": "builder-2", "body": "look" }),
+        json!({ "act": "request", "to_agent": "builder-1", "body": "look" }),
     )
     .await
     .unwrap();

@@ -7,6 +7,8 @@ use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
 use ua_tools::{Hub, Registry, builtin_registry};
 
 const EXT: &str = "codex:0b6f1d2e-3c4a-4b5c-8d6e-7f8091a2b3c4";
+/// The session's own agent owns the node that wakes it.
+const NODE_AGENT: &str = "builder-1";
 
 struct W {
     hub: Hub,
@@ -34,7 +36,9 @@ fn human() -> Caller {
 
 fn code(e: &UaError) -> String {
     match e {
-        UaError::Denied { reason_code, .. } => reason_code.clone(),
+        UaError::Denied { reason_code, .. } | UaError::ConflictCode { reason_code, .. } => {
+            reason_code.clone()
+        }
         other => other.code().to_string(),
     }
 }
@@ -74,11 +78,11 @@ impl W {
         self.hub.db().read(move |c| Ok(c.query_row(&q, [], |r| r.get(0))?)).unwrap()
     }
 
-    /// `node-agent` registers node `name`; `builder-1` opens a session on
-    /// `host`. Returns the session id.
+    /// `builder-1` registers node `name` and opens a session on `host`.
+    /// Returns the session id.
     async fn setup(&self, node: &str, host: &str) -> String {
         self.ok(
-            &agent("node-agent"),
+            &agent(NODE_AGENT),
             "node_register",
             json!({ "node": node, "facts": { "backends": ["codex"] } }),
         )
@@ -115,13 +119,13 @@ impl W {
     }
 
     async fn poll(&self, node: &str) -> Vec<Value> {
-        let v = self.ok(&agent("node-agent"), "node_wake", json!({ "node": node, "offer_version": 3 })).await;
+        let v = self.ok(&agent(NODE_AGENT), "node_wake", json!({ "node": node, "offer_version": 3 })).await;
         v["wakes"].as_array().unwrap().clone()
     }
 
     async fn check(&self, offer: &Value) -> Value {
         self.ok(
-            &agent("node-agent"),
+            &agent(NODE_AGENT),
             "node_wake_check",
             json!({
                 "node": "box", "session_id": offer["session_id"], "seq": offer["newest_seq"],
@@ -142,7 +146,7 @@ impl W {
         if outcome == "delivered" {
             body["delivered_at"] = json!(ua_core::time::now_ms() as f64 / 1000.0);
         }
-        self.ok(&agent("node-agent"), "node_wake_receipt", body).await
+        self.ok(&agent(NODE_AGENT), "node_wake_receipt", body).await
     }
 
     async fn status(&self, sid: &str) -> Value {
@@ -221,12 +225,8 @@ async fn consent_takes_a_request_and_a_human_grant_and_a_decline_sticks() {
 async fn offers_go_only_to_the_node_on_the_sessions_host() {
     let w = W::new();
     let sid = w.setup("box", "BOX.example.com").await;
-    w.ok(
-        &agent("node-agent"),
-        "node_register",
-        json!({ "node": "other", "facts": { "backends": ["codex"] } }),
-    )
-    .await;
+    w.ok(&agent(NODE_AGENT), "node_register", json!({ "node": "other", "facts": { "backends": ["codex"] } }))
+        .await;
     w.arm(&sid).await;
     w.send("request", false).await;
     w.age_mail();
@@ -239,7 +239,7 @@ async fn offers_go_only_to_the_node_on_the_sessions_host() {
     assert_eq!(code(&e), "node_owned_elsewhere");
     let e = w.call(&human(), "node_wake", json!({ "node": "box", "offer_version": 3 })).await.unwrap_err();
     assert_eq!(code(&e), "agent_identity_required");
-    let e = w.call(&agent("node-agent"), "node_wake", json!({ "node": "box" })).await.unwrap_err();
+    let e = w.call(&agent(NODE_AGENT), "node_wake", json!({ "node": "box" })).await.unwrap_err();
     assert!(e.to_string().contains("offer_version=3"), "{e}");
 
     let offers = w.poll("box").await;
@@ -331,7 +331,7 @@ async fn an_offer_is_checked_once_and_its_receipt_is_idempotent() {
     assert_eq!(code(&e), "node_owned_elsewhere");
     let e = w
         .call(
-            &agent("node-agent"),
+            &agent(NODE_AGENT),
             "node_wake_receipt",
             json!({ "node": "box", "session_id": "nope", "seq": 1, "outcome": "failed",
                     "expires_at": 1.0, "offer_id": "0".repeat(32) }),
@@ -395,7 +395,7 @@ async fn live_sessions_keep_an_idle_granted_session_open() {
         "UPDATE agent_sessions SET status = 'abandoned', exit_status = 'no_heartbeat' WHERE id = '{sid}'"
     ));
     w.ok(
-        &agent("node-agent"),
+        &agent(NODE_AGENT),
         "node_wake",
         json!({ "node": "box", "offer_version": 3, "live_sessions": [EXT, "claude-other"] }),
     )
@@ -406,7 +406,7 @@ async fn live_sessions_keep_an_idle_granted_session_open() {
     // A session its agent ended stays ended.
     w.sql(&format!("UPDATE agent_sessions SET status = 'completed', exit_status = 'ok' WHERE id = '{sid}'"));
     w.ok(
-        &agent("node-agent"),
+        &agent(NODE_AGENT),
         "node_wake",
         json!({ "node": "box", "offer_version": 3, "live_sessions": [EXT] }),
     )
@@ -414,11 +414,158 @@ async fn live_sessions_keep_an_idle_granted_session_open() {
     assert_eq!(w.status(&sid).await["session_status"], "completed");
     let e = w
         .call(
-            &agent("node-agent"),
+            &agent(NODE_AGENT),
             "node_wake",
             json!({ "node": "box", "offer_version": 3, "live_sessions": vec!["x"; 65] }),
         )
         .await
         .unwrap_err();
     assert_eq!(code(&e), "invalid_argument");
+}
+
+/// Review finding: wakes were routed by short host name alone, so another
+/// agent's node named like the host (`box.evil`, `BOX`) received the offers,
+/// could report on them and could revive reaped sessions.
+#[tokio::test]
+async fn another_agents_node_never_sees_checks_reports_or_revives_a_session() {
+    let w = W::new();
+    let sid = w.setup("box", "box.local").await;
+    for n in ["box.evil", "BOX"] {
+        w.ok(&agent("intruder"), "node_register", json!({ "node": n, "facts": { "backends": ["codex"] } }))
+            .await;
+    }
+    w.arm(&sid).await;
+    w.send("request", false).await;
+    w.age_mail();
+
+    for n in ["box.evil", "BOX"] {
+        let v = w
+            .ok(
+                &agent("intruder"),
+                "node_wake",
+                json!({ "node": n, "offer_version": 3, "live_sessions": [EXT] }),
+            )
+            .await;
+        assert_eq!(v["wakes"], json!([]), "{n} must see nothing: {v}");
+    }
+    let offer = w.poll("box").await.remove(0);
+    assert_eq!(offer["session_id"], sid);
+
+    // Echoing a real offer through a foreign node is refused outright.
+    for (tool, mut body) in [
+        ("node_wake_check", json!({})),
+        ("node_wake_receipt", json!({ "outcome": "skipped", "reason": "no_match" })),
+    ] {
+        body["node"] = json!("BOX");
+        for k in ["session_id", "expires_at", "offer_id"] {
+            body[k] = offer[k].clone();
+        }
+        body["seq"] = offer["newest_seq"].clone();
+        let e = w.call(&agent("intruder"), tool, body).await.unwrap_err();
+        assert_eq!(code(&e), "not_found", "{tool}");
+    }
+    let st = w.status(&sid).await;
+    assert_eq!((st["attempts"].clone(), st["last_outcome"].clone()), (json!(0), Value::Null));
+    assert_eq!(w.check(&offer).await["valid"], true, "the real node's offer is untouched");
+
+    // A reaped session comes back only through its own node.
+    w.sql(&format!(
+        "UPDATE agent_sessions SET status = 'abandoned', exit_status = 'no_heartbeat' WHERE id = '{sid}'"
+    ));
+    w.ok(
+        &agent("intruder"),
+        "node_wake",
+        json!({ "node": "BOX", "offer_version": 3, "live_sessions": [EXT] }),
+    )
+    .await;
+    assert_eq!(w.status(&sid).await["session_status"], "abandoned");
+    w.ok(
+        &agent(NODE_AGENT),
+        "node_wake",
+        json!({ "node": "box", "offer_version": 3, "live_sessions": [EXT] }),
+    )
+    .await;
+    assert_eq!(w.status(&sid).await["session_status"], "running");
+}
+
+/// Two machines of one agent that share a short name never receive each
+/// other's wakes: an ambiguous host wakes nothing until the session names its
+/// node, and then only that node is used.
+#[tokio::test]
+async fn machines_sharing_a_short_name_do_not_cross_receive() {
+    let w = W::new();
+    let sid = w.setup("box", "box.local").await;
+    w.ok(
+        &agent(NODE_AGENT),
+        "node_register",
+        json!({ "node": "box.lan", "facts": { "backends": ["codex"] } }),
+    )
+    .await;
+    w.ok(&agent("intruder"), "node_register", json!({ "node": "box.x", "facts": { "backends": ["codex"] } }))
+        .await;
+    w.arm(&sid).await;
+    w.send("request", false).await;
+    w.age_mail();
+    assert!(w.poll("box").await.is_empty(), "ambiguous: box");
+    assert!(w.poll("box.lan").await.is_empty(), "ambiguous: box.lan");
+
+    // A session names its node; it must be one of its own agent's.
+    let e = w
+        .manage(&agent("builder-1"), "session_wake_opt_in", json!({ "session_id": sid, "node": "box.x" }))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), "node_owned_elsewhere");
+    w.manage(&agent("builder-1"), "session_wake_opt_in", json!({ "session_id": sid, "node": "box.lan" }))
+        .await
+        .unwrap();
+    assert!(w.poll("box").await.is_empty(), "the other machine still sees nothing");
+    let offer = w.poll("box.lan").await.remove(0);
+    let mut echo = json!({
+        "node": "box", "session_id": sid, "seq": offer["newest_seq"],
+        "expires_at": offer["expires_at"], "offer_id": offer["offer_id"],
+    });
+    let e = w.call(&agent(NODE_AGENT), "node_wake_check", echo.clone()).await.unwrap_err();
+    assert_eq!(code(&e), "not_found", "a sibling node of the same agent cannot check it");
+    echo["node"] = json!("box.lan");
+    assert_eq!(w.ok(&agent(NODE_AGENT), "node_wake_check", echo).await["valid"], true);
+}
+
+/// A node holds at most two wake polls open at once.
+#[tokio::test]
+async fn a_node_holds_at_most_two_wake_polls_open() {
+    let w = W::new();
+    w.setup("box", "box").await;
+    let me = agent(NODE_AGENT);
+    let long = || w.call(&me, "node_wake", json!({ "node": "box", "offer_version": 3, "wait_s": 2 }));
+    let third = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        w.call(&me, "node_wake", json!({ "node": "box", "offer_version": 3 })).await
+    };
+    let (a, b, c) = tokio::join!(long(), long(), third);
+    assert_eq!(a.unwrap()["wakes"], json!([]));
+    assert_eq!(b.unwrap()["wakes"], json!([]));
+    assert_eq!(code(&c.unwrap_err()), "wake_poll_busy");
+    // The slots are freed when the polls end.
+    assert_eq!(w.poll("box").await.len(), 0);
+}
+
+/// A verified human may decline any session's wakes, even one not listed as
+/// a human identity or operator: a decline only restricts.
+#[tokio::test]
+async fn any_verified_human_may_decline() {
+    let w = W::new();
+    let sid = w.setup("box", "box").await;
+    w.arm(&sid).await;
+    let v = w
+        .manage(
+            &caller("night-shift", ActorKind::Human),
+            "session_wake_decline",
+            json!({ "session_id": sid }),
+        )
+        .await
+        .unwrap();
+    assert_eq!((v["declined"].clone(), v["granted"].clone()), (json!(true), json!(false)));
+    let e =
+        w.manage(&agent("lead-1"), "session_wake_decline", json!({ "session_id": sid })).await.unwrap_err();
+    assert_eq!(code(&e), "not_authorized");
 }

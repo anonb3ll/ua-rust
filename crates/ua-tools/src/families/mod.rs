@@ -62,6 +62,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(provider_accounts::SCHEMA);
     parts.push(routines::SCHEMA);
     parts.push(wake::SCHEMA);
+    parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
     parts.push(workflows::SCHEMA);
     parts
