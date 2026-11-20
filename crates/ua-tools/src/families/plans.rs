@@ -864,6 +864,9 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 a.step_idx, a.plan_id
             )));
         }
+        // The one claim gate, agent part: a paused, terminated or retired
+        // agent claims no plan step either.
+        crate::families::governance::check_claim(tx, Some(&agent), None, false)?;
         let n = tx.execute(
             "UPDATE plan_steps SET owner = ?2, status = 'doing', updated_at = ?3 \
              WHERE id = ?1 AND status IN ('open','failed') AND (owner IS NULL OR owner = ?2)",

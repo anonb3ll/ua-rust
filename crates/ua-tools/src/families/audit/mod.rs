@@ -19,6 +19,7 @@
 mod remediate;
 pub mod rules;
 mod safe_io;
+mod triage;
 
 use std::path::{Path, PathBuf};
 
@@ -613,6 +614,7 @@ pub fn register(r: &mut Registry) {
         )
         .family("audit"),
     );
+    triage::register(r);
 }
 
 #[cfg(test)]

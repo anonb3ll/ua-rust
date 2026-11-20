@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use ua_core::{Profile, UaError, UaResult};
 
 use super::*;
+use crate::families::governance;
 use crate::registry::{Registry, ToolCtx, tool};
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -196,38 +197,20 @@ async fn add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
             {
                 return Ok(prior);
             }
-            let (mut project, mut domain, mut lane, mut untrusted) = (project, domain, lane, a.untrusted);
-            if let Some(pid) = a.parent_id {
-                check_nesting(tx, pid, None)?;
-                let parent = require_task(tx, pid)?;
-                project = project.or_else(|| str_field(&parent, "project").map(String::from));
-                domain = domain.or_else(|| str_field(&parent, "domain").map(String::from));
-                lane = lane.or_else(|| str_field(&parent, "lane").map(String::from));
-                untrusted |= int_field(&parent, "untrusted").unwrap_or(0) != 0;
-            }
-            let ts = now();
-            tx.execute(
-                "INSERT INTO tasks (title, notes, priority, parent_id, created_at, updated_at, untrusted, \
-                 project, domain, due_at, evidence_ref, lane) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    title,
-                    a.notes,
-                    priority,
-                    a.parent_id,
-                    ts,
-                    untrusted as i64,
-                    project.unwrap_or_else(|| "default".into()),
-                    domain.unwrap_or_else(|| "general".into()),
-                    opt_trim(a.due_at),
-                    opt_trim(a.evidence_ref),
-                    lane.unwrap_or_else(|| "default".into()),
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            emit(
+            let id = insert_task(
                 tx,
-                "agent.task.created",
-                json!({ "task_id": id, "title": title, "priority": priority, "parent_id": a.parent_id }),
+                NewTask {
+                    title,
+                    notes: a.notes,
+                    priority,
+                    parent_id: a.parent_id,
+                    untrusted: a.untrusted,
+                    project,
+                    domain,
+                    due_at: opt_trim(a.due_at),
+                    evidence_ref: opt_trim(a.evidence_ref),
+                    lane,
+                },
                 &by,
             )?;
             let res = json!({ "id": id });
@@ -237,6 +220,81 @@ async fn add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
             Ok(res)
         })
         .await
+}
+
+/// A task to insert. The title and priority are already validated; the
+/// project, domain and lane are checked slugs or `None` (inherit, else default).
+pub(crate) struct NewTask {
+    pub title: String,
+    pub notes: Option<String>,
+    pub priority: String,
+    pub parent_id: Option<i64>,
+    pub untrusted: bool,
+    pub project: Option<String>,
+    pub domain: Option<String>,
+    pub due_at: Option<String>,
+    pub evidence_ref: Option<String>,
+    pub lane: Option<String>,
+}
+
+impl NewTask {
+    /// A top-level task with defaults for everything but title, notes and priority.
+    pub(crate) fn simple(title: String, notes: String, priority: &str) -> Self {
+        Self {
+            title,
+            notes: Some(notes),
+            priority: priority.to_string(),
+            parent_id: None,
+            untrusted: false,
+            project: None,
+            domain: None,
+            due_at: None,
+            evidence_ref: None,
+            lane: None,
+        }
+    }
+}
+
+/// Insert one task and its `agent.task.created` event in the caller's write
+/// transaction. Returns the new id. Every task creation goes through here.
+pub(crate) fn insert_task(tx: &mut WriteTx<'_>, t: NewTask, by: &str) -> UaResult<i64> {
+    check_title(&t.title)?;
+    check_one_of("priority", &t.priority, &PRIORITIES)?;
+    let (mut project, mut domain, mut lane, mut untrusted) = (t.project, t.domain, t.lane, t.untrusted);
+    if let Some(pid) = t.parent_id {
+        check_nesting(tx, pid, None)?;
+        let parent = require_task(tx, pid)?;
+        project = project.or_else(|| str_field(&parent, "project").map(String::from));
+        domain = domain.or_else(|| str_field(&parent, "domain").map(String::from));
+        lane = lane.or_else(|| str_field(&parent, "lane").map(String::from));
+        untrusted |= int_field(&parent, "untrusted").unwrap_or(0) != 0;
+    }
+    let ts = now();
+    tx.execute(
+        "INSERT INTO tasks (title, notes, priority, parent_id, created_at, updated_at, untrusted, \
+         project, domain, due_at, evidence_ref, lane) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            t.title,
+            t.notes,
+            t.priority,
+            t.parent_id,
+            ts,
+            untrusted as i64,
+            project.unwrap_or_else(|| "default".into()),
+            domain.unwrap_or_else(|| "general".into()),
+            t.due_at,
+            t.evidence_ref,
+            lane.unwrap_or_else(|| "default".into()),
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    emit(
+        tx,
+        "agent.task.created",
+        json!({ "task_id": id, "title": t.title, "priority": t.priority, "parent_id": t.parent_id }),
+        by,
+    )?;
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,15 +449,18 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             if let Some(v) = &a.title {
                 s.set("title", text(v.clone()));
             }
+            let mut notes_after = str_field(&old, "notes").unwrap_or_default().to_string();
             if let Some(v) = &a.notes {
                 s.set("notes", text(v.clone()));
+                notes_after = v.clone();
             }
             if let Some(note) = &a.append_note {
                 let note = note.trim();
                 let current = str_field(&old, "notes").unwrap_or_default();
                 if !note_is_duplicate(current, note) {
                     let joined = if current.is_empty() { note.to_string() } else { format!("{current}\n{note}") };
-                    s.set("notes", text(joined));
+                    s.set("notes", text(joined.clone()));
+                    notes_after = joined;
                 }
             }
             if let Some(v) = &a.priority {
@@ -528,6 +589,13 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                             clear_claim = true;
                         }
                     }
+                    // Entering doing from another status is a new claim: the one
+                    // claim gate applies to the agent that will hold it, and a
+                    // proposal-spawned task must still match its contract.
+                    let doing_agent = claimed_by.clone().filter(|_| !clear_claim).unwrap_or_else(|| identity.clone());
+                    governance::check_claim(tx, Some(&doing_agent), Some(id), false)?;
+                    let title_after = a.title.as_deref().or(str_field(&old, "title")).unwrap_or_default();
+                    governance::check_contract(tx, id, title_after, &notes_after)?;
                 }
             }
             if clear_claim {
@@ -695,6 +763,14 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             if row.get("archived_at").is_some_and(|v| !v.is_null()) {
                 return Err(UaError::invalid(format!("task {id} is archived (parked): unarchive it before claiming")));
             }
+            // A task spawned from an approved work proposal fails closed when
+            // its title or notes drifted from the frozen contract.
+            governance::check_contract(
+                tx,
+                id,
+                str_field(&row, "title").unwrap_or_default(),
+                str_field(&row, "notes").unwrap_or_default(),
+            )?;
 
             let ts = now();
             let holder = str_field(&row, "claimed_by").map(String::from);
@@ -715,6 +791,10 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 }));
             }
             let renewal = lock_active && status == "doing";
+            // The one claim gate. A live renewal of the caller's own lease
+            // passes a subtree hold (an in-flight run may finish); a lease with
+            // no expiry is not a renewal, since it would renew forever.
+            governance::check_claim(tx, Some(&agent), Some(id), renewal && expires.is_some())?;
             let takeover = if !lock_active { holder.clone().filter(|h| h != &agent) } else { None };
 
             let mut notes = str_field(&row, "notes").unwrap_or_default().to_string();

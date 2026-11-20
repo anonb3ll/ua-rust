@@ -28,6 +28,7 @@
   "vault_move"
  ],
  "LEAD_EXTRA_TOOLS": [
+  "audit_triage_tasks",
   "event_log_verify",
   "injection_triage",
   "mcp_health_telemetry",
@@ -36,6 +37,7 @@
  "REVIEWER_DENIED_TOOLS": [
   "approval_resolve",
   "autonomous_cycle_manage",
+  "cleanup_stale_worktrees",
   "config_revision_manage",
   "coordination_manage",
   "delegate",
@@ -188,7 +190,11 @@
   "plan_step_edit",
   "plan_step_remove",
   "plan_step_reorder",
-  "plan_update"
+  "plan_update",
+  "project_repo_get",
+  "project_repo_list",
+  "task_hold_get",
+  "task_holds"
  ],
  "REMOTE_ASSISTANT_ALLOWED_ACTIONS": [
   "agent_context",
