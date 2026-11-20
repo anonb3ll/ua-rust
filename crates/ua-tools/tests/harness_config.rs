@@ -1334,3 +1334,26 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
         .unwrap();
     assert_eq!(statuses, ["expired", "expired", "consumed", "pending", "pending"]);
 }
+
+#[test]
+fn skills_may_carry_license_version_and_plain_metadata_but_rules_text_may_not() {
+    let skill =
+        |body: &str| json!({ "version": "1", "skills": [{ "name": "s", "description": "d", "body": body }] });
+    let described =
+        "---\nname: s\ndescription: d\nlicense: MIT\nversion: 2\nmetadata: {author: x, team: y}\n---\nbody\n";
+    policy::validate(&skill(described)).unwrap();
+    // metadata holds plain values only.
+    let e = refusal(skill("---\nname: s\nmetadata: {tools: [Bash]}\n---\nbody\n"));
+    assert!(e.contains("`metadata`") && e.contains("map of plain values"), "{e}");
+    let e = refusal(skill("---\nname: s\nmetadata:\n  a:\n    tools: Bash\n---\nbody\n"));
+    assert!(e.contains("`metadata`"), "{e}");
+    // Permission-bearing keys stay refused in skills.
+    for key in ["allowed-tools", "tools", "permission", "hooks"] {
+        let e = refusal(skill(&format!("---\nname: s\nlicense: MIT\n{key}: x\n---\nbody\n")));
+        assert!(e.contains(&format!("`{key}`")), "{key}: {e}");
+    }
+    // Rules text keeps the strict list.
+    for key in ["license: MIT", "version: 1", "metadata: {author: x}"] {
+        refused_on_agents_surface(&format!("---\nname: h\n{key}\n---\nbody\n"), "not allowed");
+    }
+}

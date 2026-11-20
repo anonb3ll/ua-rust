@@ -298,6 +298,59 @@ fn check_description(skill: &Skill, out: &mut Vec<Finding>) {
 pub const SAFE_FRONT_MATTER_KEYS: [&str; 6] =
     ["name", "description", "globs", "alwaysApply", "argument-hint", "model"];
 
+/// Keys a skill (`SKILL.md`) may carry on top of [`SAFE_FRONT_MATTER_KEYS`]:
+/// the Agent Skills format's descriptive fields, which grant nothing.
+/// `metadata` may be a map, of plain values only. Rules text never gets them.
+pub const SKILL_FRONT_MATTER_KEYS: [&str; 3] = ["license", "version", "metadata"];
+
+/// What a front-matter block belongs to: a skill gets
+/// [`SKILL_FRONT_MATTER_KEYS`] as well; rules text only the strict list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontMatterOf {
+    Rules,
+    Skill,
+}
+
+/// The keys front matter of `of` may carry.
+pub fn allowed_front_matter_keys(of: FrontMatterOf) -> Vec<&'static str> {
+    let mut keys = SAFE_FRONT_MATTER_KEYS.to_vec();
+    if of == FrontMatterOf::Skill {
+        keys.extend(SKILL_FRONT_MATTER_KEYS);
+    }
+    keys
+}
+
+/// Problems with a parsed front-matter mapping, as (key, message): a key not
+/// allowed for `of`, or an allowed key whose value is not plain (a scalar or
+/// a list of scalars; for `metadata`, a scalar or a map of scalars).
+pub(crate) fn front_matter_key_problems(
+    meta: &Map<String, Value>,
+    of: FrontMatterOf,
+) -> Vec<(String, String)> {
+    let allowed = allowed_front_matter_keys(of);
+    let scalar = |v: &Value| !matches!(v, Value::Object(_) | Value::Array(_));
+    let mut out = Vec::new();
+    for (key, v) in meta {
+        if !allowed.contains(&key.as_str()) {
+            out.push((
+                key.clone(),
+                format!("front matter key `{key}` is not allowed (allowed: {})", allowed.join(", ")),
+            ));
+            continue;
+        }
+        let (plain, shape) = match (key.as_str(), v) {
+            ("metadata", Value::Object(m)) => (m.values().all(scalar), "a map of plain values"),
+            ("metadata", other) => (scalar(other), "a map of plain values"),
+            (_, Value::Array(items)) => (items.iter().all(scalar), "a plain value or a list of them"),
+            (_, other) => (scalar(other), "a plain value or a list of them"),
+        };
+        if !plain {
+            out.push((key.clone(), format!("front matter key `{key}` must be {shape}")));
+        }
+    }
+    out
+}
+
 /// Code points that hide or reorder text from a human reader: Unicode tag
 /// characters (U+E0000-E007F), zero-width characters and bidi controls.
 pub(crate) fn hidden_char(c: char) -> bool {
@@ -321,25 +374,16 @@ pub(crate) fn hidden_chars(text: &str) -> Vec<(usize, char)> {
         .collect()
 }
 
-/// Keys of a front-matter mapping outside [`SAFE_FRONT_MATTER_KEYS`].
-pub(crate) fn disallowed_keys(meta: &Map<String, Value>) -> Vec<String> {
-    meta.keys().filter(|k| !SAFE_FRONT_MATTER_KEYS.contains(&k.as_str())).cloned().collect()
-}
-
 /// Security checks: a skill reaches every host it is distributed to, so it
 /// may not grant itself tools or hooks, or carry text a reviewer cannot see.
 fn check_security(skill: &Skill, out: &mut Vec<Finding>) {
-    for key in disallowed_keys(&skill.meta) {
+    for (key, problem) in front_matter_key_problems(&skill.meta, FrontMatterOf::Skill) {
         out.push(finding(
             skill,
             "SKILL-PERMISSIONS",
             "high",
             skill.meta_line(&key),
-            format!(
-                "frontmatter key `{key}` is not one a distributed skill may carry (allowed: {}); hosts grant \
-                 tools, hooks and permissions through such keys",
-                SAFE_FRONT_MATTER_KEYS.join(", ")
-            ),
+            format!("{problem}; hosts grant tools, hooks and permissions through front matter"),
             "remove it; a distributed skill gets no permissions of its own",
         ));
     }

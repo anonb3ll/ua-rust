@@ -93,7 +93,8 @@ from its commit history.
   payload shape, pending or approved but unused; nodes report again.
 - Front matter in harness config rules text and skills may carry only
   allowlisted keys (`name`, `description`, `globs`, `alwaysApply`,
-  `argument-hint`, `model`) with plain values; front matter that does not
-  parse is refused.
+  `argument-hint`, `model`; skills also `license`, `version` and a
+  `metadata` map of plain values) with plain values; front matter that does
+  not parse is refused.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

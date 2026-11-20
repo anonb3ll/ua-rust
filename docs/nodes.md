@@ -362,8 +362,10 @@ node unseen. The renderer is never changed; the bundle is refused instead.
 - Front matter in a skill body or in any rules text (a rules surface may be
   a host's command or subagent file, `.claude/commands/*.md` or
   `.claude/agents/*.md`) with a key outside the allowlist `name`,
-  `description`, `globs`, `alwaysApply`, `argument-hint`, `model`, or with a
-  value that is not a scalar or a list of scalars. Hosts grant tools, hooks,
+  `description`, `globs`, `alwaysApply`, `argument-hint`, `model` (a skill
+  may also carry the Agent Skills fields `license`, `version` and
+  `metadata`, the last a map of plain values only), or with a value that is
+  not a scalar or a list of scalars. Hosts grant tools, hooks,
   permissions and forked agents through other keys (`allowed-tools`, `tools`,
   `permission`, `permissionMode`, `context`, `agent`, ...), so the hub lists
   what is safe instead of what is not; the error names the key. Front matter

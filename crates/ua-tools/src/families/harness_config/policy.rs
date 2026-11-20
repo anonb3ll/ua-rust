@@ -16,7 +16,8 @@
 //!   rules or skills, and front matter in a skill body or any rules text (a
 //!   rules surface may be a host's command or subagent file,
 //!   `.claude/commands/*.md`, `.claude/agents/*.md`) only with the keys in
-//!   [`SAFE_FRONT_MATTER_KEYS`] and plain values; a block that does not
+//!   [`SAFE_FRONT_MATTER_KEYS`](crate::families::skills::SAFE_FRONT_MATTER_KEYS) (skills also `license`, `version`,
+//!   `metadata`) and plain values; a block that does not
 //!   parse is refused ([`front_matter_findings`]);
 //! - surfaces: at most [`MAX_SURFACES`]; `kind` is `rules` or `mcp`, and a
 //!   default surface keeps its default kind; paths are relative with no empty,
@@ -31,7 +32,7 @@ use serde_json::Value;
 use ua_core::{UaError, UaResult};
 
 use super::render::{self, Bundle, DEFAULT_SURFACES};
-use crate::families::skills::{SAFE_FRONT_MATTER_KEYS, disallowed_keys, hidden_chars};
+use crate::families::skills::{FrontMatterOf, front_matter_key_problems, hidden_chars};
 
 /// Surfaces one bundle may declare.
 pub const MAX_SURFACES: usize = 16;
@@ -226,10 +227,11 @@ pub fn description_refusal(d: &str) -> Option<&'static str> {
 ///   horizontal rule above prose) the text has none.
 /// - **Fail closed:** a closed block that does not parse (too deeply
 ///   nested, malformed) is refused, as is a language other than YAML or
-///   TOML. A mapping may hold only [`SAFE_FRONT_MATTER_KEYS`], each with a
+///   TOML. A mapping may hold only [`SAFE_FRONT_MATTER_KEYS`](crate::families::skills::SAFE_FRONT_MATTER_KEYS) (a skill also
+///   `license`, `version` and `metadata`, a map of scalars), each with a
 ///   scalar or a list of scalars. Keys are read after parsing, so flow
 ///   mappings, indentation and escaped quoted keys change nothing.
-pub fn front_matter_findings(text: &str) -> Vec<String> {
+pub fn front_matter_findings(text: &str, of: FrontMatterOf) -> Vec<String> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     let Some(open) = lines.iter().position(|l| !l.trim().is_empty()) else { return Vec::new() };
@@ -249,9 +251,9 @@ pub fn front_matter_findings(text: &str) -> Vec<String> {
     let close = body.iter().position(|l| l.trim_start().starts_with(delim));
     let mut out = Vec::new();
     match close {
-        Some(end) => check_front_matter_block(&body[..end].join("\n"), toml, true, &mut out),
+        Some(end) => check_front_matter_block(&body[..end].join("\n"), toml, true, of, &mut out),
         // Unclosed: front matter only if a host could read the rest as one.
-        None => check_front_matter_block(&body.join("\n"), toml, false, &mut out),
+        None => check_front_matter_block(&body.join("\n"), toml, false, of, &mut out),
     }
     // A host that closes on `---` at the end of a line reads less.
     if !toml {
@@ -260,7 +262,7 @@ pub fn front_matter_findings(text: &str) -> Vec<String> {
             let mut block: Vec<&str> = body[..end].to_vec();
             let last = body[end].trim_end();
             block.push(&last[..last.len() - 3]);
-            check_front_matter_block(&block.join("\n"), false, true, &mut out);
+            check_front_matter_block(&block.join("\n"), false, true, of, &mut out);
         }
     }
     out.dedup();
@@ -270,7 +272,7 @@ pub fn front_matter_findings(text: &str) -> Vec<String> {
 /// Check one candidate front-matter block. `closed`: a host certainly reads
 /// it as front matter, so a parse failure is refused; an unclosed block that
 /// does not parse to a mapping is no front matter at all.
-fn check_front_matter_block(block: &str, toml: bool, closed: bool, out: &mut Vec<String>) {
+fn check_front_matter_block(block: &str, toml: bool, closed: bool, of: FrontMatterOf, out: &mut Vec<String>) {
     let parsed: Result<Value, String> = if toml {
         toml::from_str::<toml::Table>(block)
             .map_err(|e| e.to_string())
@@ -289,29 +291,14 @@ fn check_front_matter_block(block: &str, toml: bool, closed: bool, out: &mut Vec
         }
         Err(_) => return,
     };
-    for key in disallowed_keys(&meta) {
-        out.push(format!(
-            "front matter key `{key}` is not allowed (allowed: {})",
-            SAFE_FRONT_MATTER_KEYS.join(", ")
-        ));
-    }
-    for (key, v) in &meta {
-        let scalar = |v: &Value| !matches!(v, Value::Object(_) | Value::Array(_));
-        let plain = match v {
-            Value::Array(items) => items.iter().all(scalar),
-            other => scalar(other),
-        };
-        if SAFE_FRONT_MATTER_KEYS.contains(&key.as_str()) && !plain {
-            out.push(format!("front matter key `{key}` must be a plain value or a list of them"));
-        }
-    }
+    out.extend(front_matter_key_problems(&meta, of).into_iter().map(|(_, problem)| problem));
 }
 
 /// Security findings for one skill: front matter in its body that is not
 /// allowlisted or does not parse ([`front_matter_findings`]), and hidden
 /// code points in its description or body.
 pub fn skill_findings(description: &str, body: &str) -> Vec<String> {
-    let mut out = front_matter_findings(body);
+    let mut out = front_matter_findings(body, FrontMatterOf::Skill);
     for (where_, text) in [("description", description), ("body", body)] {
         for (line, c) in hidden_chars(text) {
             out.push(format!("{where_} line {line}: hidden code point U+{:04X}", c as u32));
@@ -335,7 +322,7 @@ fn check_text(b: &Bundle) -> UaResult<()> {
         }
         // Any rules text may land in a host's command or subagent file,
         // whose front matter grants tools.
-        let findings = front_matter_findings(text);
+        let findings = front_matter_findings(text, FrontMatterOf::Rules);
         if !findings.is_empty() {
             return refuse(format!("rules.{surface} refused: {}", findings.join("; ")));
         }
