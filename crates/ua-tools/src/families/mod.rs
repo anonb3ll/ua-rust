@@ -8,6 +8,7 @@ pub mod agents;
 pub mod audit;
 pub mod capability;
 pub mod code;
+pub mod continuity;
 pub mod core_schema;
 pub mod cycles;
 pub mod delegation;
@@ -43,6 +44,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
+    parts.extend(continuity::schema_parts());
     parts.extend(dispatch::schema_parts());
     parts.extend(memory::schema_parts());
     parts.extend(tasks::schema_parts());

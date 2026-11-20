@@ -193,8 +193,11 @@
   "plan_update",
   "project_repo_get",
   "project_repo_list",
+  "queue_health",
+  "session_handoff_recover",
   "task_hold_get",
-  "task_holds"
+  "task_holds",
+  "task_workflow_get"
  ],
  "REMOTE_ASSISTANT_ALLOWED_ACTIONS": [
   "agent_context",

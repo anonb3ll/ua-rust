@@ -99,6 +99,12 @@ pub(crate) fn normalize_repo(raw: &str) -> UaResult<String> {
     Ok(format!("{}/{}", segments[0].to_ascii_lowercase(), segments[1].to_ascii_lowercase()))
 }
 
+/// The normalized `owner/name` a project stream is bound to, if any.
+pub(crate) fn bound_repo(c: &Connection, project: &str) -> UaResult<Option<String>> {
+    Ok(c.query_row("SELECT repo FROM project_repo_bindings WHERE project = ?1", [project], |r| r.get(0))
+        .optional()?)
+}
+
 fn binding(c: &Connection, project: &str) -> UaResult<Option<Value>> {
     let row = c
         .query_row("SELECT * FROM project_repo_bindings WHERE project = ?1", [project], row_object)
