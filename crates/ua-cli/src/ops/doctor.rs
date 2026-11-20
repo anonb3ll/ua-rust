@@ -262,11 +262,9 @@ fn check_schema(db_path: &Path) -> CheckResult {
             return check("schema", Status::Fail, format!("could not open database for schema check: {e}"));
         }
     };
-    match ua_store::backup::check_schema_compatibility(&conn, &expected, &[ua_import::SCHEMA]) {
-        Ok(c) if c.has_tampering_or_unowned_objects() => check(
-            "schema",
-            Status::Fail,
-            format!(
+    match ua_store::backup::check_schema_compatibility(&conn, &expected, &ua_tools::optional_schema_parts()) {
+        Ok(c) if c.has_tampering_or_unowned_objects() => {
+            let mut parts = vec![format!(
                 "drifted=[{}], missing_objects=[{}], modified_objects=[{}], \
                  unexpected_tables=[{}], unexpected_indexes=[{}], unexpected_triggers=[{}]",
                 c.drifted.join(", "),
@@ -275,8 +273,21 @@ fn check_schema(db_path: &Path) -> CheckResult {
                 c.unexpected_tables.join(", "),
                 c.unexpected_indexes.join(", "),
                 c.unexpected_triggers.join(", "),
-            ),
-        ),
+            )];
+            if let Some(ref err) = c.reference_error {
+                parts.push(format!("reference_error=[{err}]"));
+            }
+            if !c.conflicting_objects.is_empty() {
+                parts.push(format!("conflicting_objects=[{}]", c.conflicting_objects.join(", ")));
+            }
+            if !c.unexpected_indexes_on_known_tables.is_empty() {
+                parts.push(format!(
+                    "unexpected_indexes_on_known_tables=[{}]",
+                    c.unexpected_indexes_on_known_tables.join(", ")
+                ));
+            }
+            check("schema", Status::Fail, parts.join(", "))
+        }
         Ok(c) if !c.missing.is_empty() || !c.extra.is_empty() => check(
             "schema",
             Status::Warn,

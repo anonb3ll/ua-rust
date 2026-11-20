@@ -3,8 +3,10 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   macOS launchd daemon template for ua-rust (adapt placeholders before loading on a host).
-  Create a dedicated `_ua-hub` service user/group first (or substitute an existing
-  non-root hub account), then create owner-only directories before bootstrapping launchd:
+  Create a dedicated `_ua-hub` service user/group first (pick an unused UID/GID
+  below 500 from `dscl . -list /Users UniqueID` and `dscl . -list /Groups PrimaryGroupID`,
+  or substitute an existing non-root hub account), then create owner-only directories
+  before bootstrapping launchd:
     sudo dscl . -create /Groups/_ua-hub
     sudo dscl . -create /Groups/_ua-hub PrimaryGroupID 399
     sudo dscl . -create /Users/_ua-hub

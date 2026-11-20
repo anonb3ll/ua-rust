@@ -120,8 +120,9 @@ Key restore safeguards:
    table/view/index/trigger DDL compatibility, `ledger::verify`) via SQLite
    `immutable=1`. `--allow-newer` allows snapshots containing `extra` schema parts and
    their new objects (new tables/indexes/triggers on new tables), while still refusing
-   drifted parts, missing/altered known objects, triggers on known tables, or unowned
-   tables without an `extra` part.
+   drifted parts, missing/altered known objects, broken schema dependency chains,
+   triggers or indexes on known tables, objects colliding with known schema names, or
+   unowned objects without an `extra` part.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when

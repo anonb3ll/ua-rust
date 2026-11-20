@@ -894,8 +894,12 @@ struct DbFacts {
 }
 
 fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
-    let schema_compat = ua_store::backup::check_schema_compatibility(c, &crate::schema_parts(), &[])
-        .map_err(|e| e.to_string());
+    let schema_compat = ua_store::backup::check_schema_compatibility(
+        c,
+        &crate::schema_parts(),
+        &crate::optional_schema_parts(),
+    )
+    .map_err(|e| e.to_string());
     let count = |sql: &str| -> UaResult<i64> { Ok(c.query_row(sql, [], |r| r.get(0)).unwrap_or(0)) };
     let last_delivery = c
         .query_row("SELECT status, last_error FROM notify_outbox ORDER BY id DESC LIMIT 1", [], |r| {
@@ -1203,6 +1207,9 @@ fn schema_check(facts: &DbFacts) -> Value {
     };
     if compat.has_tampering_or_unowned_objects() {
         let mut issues = Vec::new();
+        if let Some(ref err) = compat.reference_error {
+            issues.push(format!("reference schema error: {err}"));
+        }
         if !compat.drifted.is_empty() {
             issues.push(format!("applied parts differ from this build: {}", compat.drifted.join(", ")));
         }
@@ -1211,6 +1218,15 @@ fn schema_check(facts: &DbFacts) -> Value {
         }
         if !compat.modified_objects.is_empty() {
             issues.push(format!("modified DDL: {}", compat.modified_objects.join(", ")));
+        }
+        if !compat.conflicting_objects.is_empty() {
+            issues.push(format!("conflicting objects: {}", compat.conflicting_objects.join(", ")));
+        }
+        if !compat.unexpected_indexes_on_known_tables.is_empty() {
+            issues.push(format!(
+                "unexpected indexes on known tables: {}",
+                compat.unexpected_indexes_on_known_tables.join(", ")
+            ));
         }
         if !compat.unexpected_tables.is_empty() {
             issues.push(format!("unexpected tables/views: {}", compat.unexpected_tables.join(", ")));

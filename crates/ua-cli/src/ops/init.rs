@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::Args;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -239,6 +239,14 @@ impl Drop for TempConfigGuard {
 }
 
 pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()> {
+    run_inner(args, explicit_config, None)
+}
+
+fn run_inner(
+    args: InitArgs,
+    explicit_config: Option<&Path>,
+    before_config_write: Option<&dyn Fn() -> anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let operator = args.operator.trim().to_string();
     if operator.is_empty() {
         bail!("--operator label must not be empty");
@@ -307,7 +315,7 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
         let prev_max_id: i64 = hub
             .db()
             .read(|c| Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_tokens", [], |r| r.get(0))?))
-            .unwrap_or(0);
+            .context("reading agent_tokens high-water mark before minting initial token")?;
         let token = crate::issue_agent_token(&cfg, &hub, agent_label, Some("ua init"), "cli")?;
         set_owner_only_file(&db_path)?;
         minted_context = Some((hub, prev_max_id, agent_label.to_string()));
@@ -320,6 +328,7 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
 
     let mut backed_up_files: Vec<String> = Vec::new();
     let mut restore_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut created_files: Vec<PathBuf> = Vec::new();
     let install_res = (|| -> anyhow::Result<()> {
         if args.force {
             if let Some(bak) = backup_existing_file(&config_path)? {
@@ -335,13 +344,23 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
         }
 
         if let Some(p) = &policy_path {
+            let had_backup = restore_pairs.iter().any(|(_, orig)| orig == p);
             write_atomic_file(p, starter_policy_yaml().as_bytes(), args.force)?;
+            if !had_backup {
+                created_files.push(p.clone());
+            }
+        }
+        if let Some(hook) = before_config_write {
+            hook()?;
         }
         write_atomic_file(&config_path, toml_text.as_bytes(), args.force)?;
         Ok(())
     })();
 
     if let Err(err) = install_res {
+        for created in created_files.iter().rev() {
+            let _ = fs::remove_file(created);
+        }
         for (bak, orig) in restore_pairs.iter().rev() {
             let _ = fs::rename(bak, orig);
         }
@@ -426,4 +445,108 @@ pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()>
         println!("MCP stdio:           {}", report.mcp_snippets.stdio_command);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, OpenFlags};
+
+    fn test_args(home: &Path, agent: Option<&str>, with_policy: bool, force: bool) -> InitArgs {
+        InitArgs {
+            home: Some(home.to_path_buf()),
+            workspace: Some(home.join("workspace")),
+            operator: "operator".into(),
+            agent: agent.map(str::to_string),
+            with_policy,
+            force,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn install_failure_revokes_only_newly_minted_token_and_cleans_created_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("hub-home");
+        ensure_dir_private(&home).unwrap();
+
+        // Pre-seed an active token for the same label before `ua init` fails.
+        let mut seed_cfg = Config::for_home(&home);
+        seed_cfg.db_path = None;
+        let hub = Hub::open(seed_cfg.clone()).unwrap();
+        crate::issue_agent_token(&seed_cfg, &hub, "builder-1", Some("pre-existing"), "cli").unwrap();
+        drop(hub);
+
+        let err = run_inner(
+            test_args(&home, Some("builder-1"), true, false),
+            None,
+            Some(&|| bail!("simulated config install failure")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("revoked unshown initial token"), "{msg}");
+
+        // Non-`--force` starter policy must not remain behind to block retry.
+        assert!(!home.join("policy.yaml").exists(), "policy.yaml leaked after failed init");
+        assert!(!home.join("config.toml").exists(), "config.toml should not exist");
+
+        let conn = Connection::open_with_flags(
+            seed_cfg.db_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let statuses: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, status FROM agent_tokens WHERE agent_label = 'builder-1' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(statuses.len(), 2, "expected pre-existing + revoked newly minted token: {statuses:?}");
+        assert_eq!(statuses[0].1, "active", "pre-existing token was unexpectedly revoked: {statuses:?}");
+        assert_eq!(statuses[1].1, "revoked", "newly minted token stayed active: {statuses:?}");
+
+        let revoked_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM event_log WHERE channel = 'agent.token.revoked'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(revoked_events, 1);
+        assert!(ua_store::ledger::verify(&conn).unwrap().ok);
+        drop(conn);
+
+        // Retrying without `--force` must succeed because failed init left no stale files.
+        run_inner(test_args(&home, None, true, false), None, None).unwrap();
+        assert!(home.join("policy.yaml").is_file());
+        assert!(home.join("config.toml").is_file());
+    }
+
+    #[test]
+    fn force_install_failure_restores_previous_config_and_revokes_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("hub-home");
+        ensure_dir_private(&home).unwrap();
+        let config_path = home.join("config.toml");
+        fs::write(&config_path, "# sentinel original config\n").unwrap();
+
+        let err = run_inner(
+            test_args(&home, Some("builder-1"), false, true),
+            None,
+            Some(&|| bail!("simulated force write failure")),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("revoked unshown initial token"), "{msg}");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "# sentinel original config\n");
+
+        let conn = Connection::open_with_flags(
+            home.join("ua.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let active: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, 0);
+        assert!(ua_store::ledger::verify(&conn).unwrap().ok);
+    }
 }

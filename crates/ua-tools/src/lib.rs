@@ -46,6 +46,12 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts
 }
 
+/// Optional schema parts recognized by this build (applied only by optional
+/// commands such as `ua import`, not on every `Hub::open`).
+pub fn optional_schema_parts() -> Vec<SchemaPart> {
+    vec![ua_store::schema::IMPORT_SCHEMA]
+}
+
 /// The full registry of built-in tools.
 pub fn builtin_registry() -> Registry {
     let mut r = Registry::default();

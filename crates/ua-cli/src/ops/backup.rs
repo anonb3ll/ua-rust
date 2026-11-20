@@ -131,7 +131,7 @@ pub fn run_restore(cfg: &Config, args: RestoreArgs) -> anyhow::Result<()> {
             allow_newer: args.allow_newer,
             keep_safety_backup: !args.no_safety_backup,
             revoke_sessions: args.revoke_sessions,
-            expected_schema: Some((ua_tools::schema_parts(), vec![ua_import::SCHEMA])),
+            expected_schema: Some((ua_tools::schema_parts(), ua_tools::optional_schema_parts())),
         },
     )?;
 
