@@ -27,7 +27,7 @@ fn setup_with(tweak: impl FnOnce(&mut Config)) -> (Hub, Registry) {
     let mut cfg = Config::for_home(std::env::temp_dir());
     cfg.human_identities = vec!["operator".into()];
     cfg.profiles.insert("scout-1".into(), "research".into());
-    cfg.profiles.insert("boss".into(), "chief-of-staff".into());
+    cfg.profiles.insert("boss".into(), "coordinator".into());
     cfg.profiles.insert("dev-1".into(), "developer".into());
     tweak(&mut cfg);
     (Hub::in_memory(cfg).unwrap(), builtin_registry())
@@ -440,9 +440,9 @@ async fn the_hub_map_is_shown_to_operators_only() {
     assert!(!agents.is_empty());
     assert!(agents.iter().all(|a| a.get("host").is_none()), "{agents:?}");
 
-    let human = caller("operator", ActorKind::Human, Profile::ChiefOfStaff);
+    let human = caller("operator", ActorKind::Human, Profile::Coordinator);
     let ops_bot = caller("ops-bot", ActorKind::Agent, Profile::Developer);
-    let boss = caller("boss", ActorKind::Agent, Profile::ChiefOfStaff);
+    let boss = caller("boss", ActorKind::Agent, Profile::Coordinator);
     for who in [human, ops_bot, boss] {
         let full = ok(&reg, &hub, &who, "capability_catalog", json!({})).await;
         assert_eq!(full["redacted"], json!([]), "{}", who.label);

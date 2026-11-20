@@ -41,7 +41,7 @@ use ua_store::{EventInput, SchemaPart, ledger};
 
 use crate::registry::{Registry, ToolCtx};
 
-/// The steward pre-ingest ledger: the content hash of each capture as it was
+/// The inbox ingest ledger: the content hash of each capture as it was
 /// last folded into the wiki.
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "vault.v1",
@@ -135,10 +135,10 @@ impl Vault {
         Ok(p)
     }
 
-    /// The cloud-vault-steward profile reaches only `Wiki/` (and writes the
+    /// The remote-vault-curator profile reaches only `Wiki/` (and writes the
     /// daily journal under `Logs/`).
     fn guard_profile(&self, p: &Path, for_write: bool) -> UaResult<()> {
-        if self.caller.profile != ua_core::Profile::CloudVaultSteward {
+        if self.caller.profile != ua_core::Profile::RemoteVaultCurator {
             return Ok(());
         }
         let rel = self.rel(p);
@@ -149,7 +149,7 @@ impl Vault {
         if rel == "Wiki" || rel.starts_with("Wiki/") || journal {
             return Ok(());
         }
-        Err(UaError::denied("profile_vault_scope", "the cloud-vault-steward profile is confined to Wiki/"))
+        Err(UaError::denied("profile_vault_scope", "the remote-vault-curator profile is confined to Wiki/"))
     }
 
     /// `p` relative to the vault root, `/`-separated; `.` for the root.

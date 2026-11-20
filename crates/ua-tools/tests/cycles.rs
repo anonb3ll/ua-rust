@@ -304,9 +304,9 @@ async fn kill_switch_stops_any_live_cycle_and_capabilities_are_checked() {
 }
 
 #[tokio::test]
-async fn steward_profile_cannot_reach_the_cycle_manager() {
+async fn reviewer_profile_cannot_reach_the_cycle_manager() {
     let h = H::new();
-    let s = Caller { profile: Profile::Steward, ..agent("steward-1") };
+    let s = Caller { profile: Profile::Reviewer, ..agent("reviewer-1") };
     let e = h.manage(&s, "list", json!({})).await.unwrap_err();
     assert_eq!(e.code(), "denied");
 }

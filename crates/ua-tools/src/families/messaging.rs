@@ -157,11 +157,11 @@ pub struct SendArgs {
     /// Track this message in the sender's `message_list(waiting_on_reply=true)`.
     #[serde(default)]
     pub expects_reply: bool,
-    /// Office addressing needs an org registry, which this hub does not have.
-    /// Accepted for compatibility; a value is refused.
+    /// Not supported: address `to_agent` or `to_session`. Accepted for
+    /// compatibility with the Python hub; a value is refused.
     pub to_office: Option<String>,
-    /// Role addressing needs an org registry, which this hub does not have.
-    /// Accepted for compatibility; a value is refused.
+    /// Not supported: address `to_agent` or `to_session`. Accepted for
+    /// compatibility with the Python hub; a value is refused.
     pub to_role: Option<String>,
     /// Typed handoff fields, only on `act="handoff"`: `done`, `open_questions`
     /// (string or list of strings), `next_action`, `why`, `reviewed_head_sha`
@@ -270,7 +270,7 @@ struct Viewer {
     /// Verified label; `None` for an unverified or in-process caller.
     identity: Option<String>,
     /// May read every mailbox: unverified local callers, humans and the
-    /// chief-of-staff profile.
+    /// coordinator profile.
     unrestricted: bool,
     /// The configured label of an unverified caller, used where a mailbox is
     /// required and none was named.
@@ -286,7 +286,7 @@ impl Viewer {
         let unrestricted = identity.is_none()
             || ctx.caller.is_human()
             || identity.as_deref().is_some_and(|l| cfg.is_human(l))
-            || ctx.caller.profile == Profile::ChiefOfStaff;
+            || ctx.caller.profile == Profile::Coordinator;
         Self {
             identity,
             unrestricted,
@@ -661,7 +661,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     }
     if clean(a.to_office.as_deref()).is_some() || clean(a.to_role.as_deref()).is_some() {
         return Err(UaError::invalid(
-            "office and role addressing need an org registry, which this hub does not have; address to_agent or to_session",
+            "role addressing (to_office, to_role) is not supported; address to_agent or to_session",
         ));
     }
     let sender = match &v.identity {
