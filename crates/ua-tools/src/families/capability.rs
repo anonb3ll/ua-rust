@@ -251,7 +251,8 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 }
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
-fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
+/// Whether `caller` may see hub boundaries (the program allowlist among them).
+pub(crate) fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
     if caller.is_human() || matches!(caller.profile, Profile::Coordinator | Profile::Operator) {
         return true;
     }
