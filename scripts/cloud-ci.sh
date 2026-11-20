@@ -2,8 +2,14 @@
 # Run CI for one exact commit on Google Cloud Build and post GitHub commit
 # statuses for it.
 #
-#   scripts/cloud-ci.sh <pr-number | branch | sha>
+#   scripts/cloud-ci.sh [--allow-fork] [--default-sa] <pr-number | branch | sha>
 #   scripts/cloud-ci.sh --reconcile <build-id> <pr-number | branch | sha>
+#
+# The build runs as UA_CI_SERVICE_ACCOUNT (an email or full resource name);
+# without it the run refuses unless --default-sa accepts the project's default
+# build account. A pull request from a fork is refused unless --allow-fork: the
+# head's own code runs with the build's credentials. A sha is run as given;
+# only pass one you have reviewed.
 #
 # A fresh run uploads a one-commit checkout of the resolved head (nothing else
 # from this machine), submits deploy/cloudbuild/ci.yaml from THIS checkout with
@@ -45,17 +51,27 @@ if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     exec "$BASH" -c "$program" "$0" "$@"
 fi
 
-usage="usage: scripts/cloud-ci.sh [--reconcile <build-id>] <pr-number|branch|sha>"
+usage="usage: scripts/cloud-ci.sh [--allow-fork] [--default-sa] [--reconcile <build-id>] <pr-number|branch|sha>"
 attach=""
-if [ "${1:-}" = "--reconcile" ]; then
-    attach="${2:-}"
-    # Cloud Build ids are UUIDs; the id is also matched inside status text.
-    if ! [[ "$attach" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
-        echo "$usage" >&2
-        exit 2
-    fi
-    shift 2
-fi
+allow_fork=0
+default_sa=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --reconcile)
+            attach="${2:-}"
+            # Cloud Build ids are UUIDs; the id is also matched inside status text.
+            if ! [[ "$attach" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+                echo "$usage" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
+        --allow-fork) allow_fork=1; shift ;;
+        --default-sa) default_sa=1; shift ;;
+        -*) echo "$usage" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
 ref="${1:?$usage}"
 project="${UA_CI_GCP_PROJECT:?set UA_CI_GCP_PROJECT to the intended GCP project}"
 region="${UA_CI_GCP_REGION:-us-central1}"
@@ -63,6 +79,29 @@ repo="${UA_CI_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 root="$(git rev-parse --show-toplevel)"
 config="$root/deploy/cloudbuild/ci.yaml"
 dry_run="${UA_CI_NO_STATUS:-0}"
+
+# The build's identity. The head's own code runs in the build and can use
+# whatever this account can reach, so a fresh run needs a least-privilege
+# account (CONTRIBUTING.md, Cloud Build CI) unless the operator explicitly
+# accepts the project's default build account.
+sa=""
+if [ -z "$attach" ]; then
+    sa="${UA_CI_SERVICE_ACCOUNT:-}"
+    if [ -n "$sa" ]; then
+        [[ "$sa" == projects/* ]] || sa="projects/$project/serviceAccounts/$sa"
+        if ! [[ "$sa" =~ ^projects/[a-z0-9.:-]+/serviceAccounts/[A-Za-z0-9._@-]+$ ]]; then
+            echo "UA_CI_SERVICE_ACCOUNT is not a service account email or resource name." >&2
+            exit 2
+        fi
+    elif [ "$default_sa" = "1" ]; then
+        echo "WARNING: --default-sa: the build runs as $project's default Cloud Build service" \
+            "account, with all of its permissions, and the commit's own code can use them." >&2
+    else
+        echo "Set UA_CI_SERVICE_ACCOUNT to the CI's least-privilege service account, or pass" \
+            "--default-sa to accept the project's default build account. Nothing was submitted." >&2
+        exit 2
+    fi
+fi
 
 # Each context and the build step that settles it. full-verification also
 # requires the whole build to have succeeded.
@@ -78,7 +117,19 @@ describe() { # build-id format [gcloud flag...]
 
 git -C "$root" fetch -q origin
 if [[ "$ref" =~ ^[0-9]+$ ]]; then
-    sha="$(gh pr view "$ref" -R "$repo" --json headRefOid -q .headRefOid)"
+    read -r sha cross < <(gh pr view "$ref" -R "$repo" --json headRefOid,isCrossRepository \
+        -q '.headRefOid + " " + (.isCrossRepository | tostring)') || true
+    # A fork's head is code nobody with push access wrote; running it with the
+    # build's credentials needs an explicit decision. A --reconcile runs no code.
+    if [ -z "$attach" ] && [ "${cross:-}" != "false" ] && [ "$allow_fork" != "1" ]; then
+        if [ "${cross:-}" = "true" ]; then
+            echo "Refusing: PR #$ref comes from a fork. Review its head, then pass --allow-fork" \
+                "to run it. Nothing was submitted." >&2
+        else
+            echo "Could not tell whether PR #$ref comes from a fork; nothing was submitted." >&2
+        fi
+        exit 1
+    fi
     git -C "$root" fetch -q origin "pull/$ref/head"
 elif git -C "$root" rev-parse -q --verify "origin/$ref^{commit}" >/dev/null; then
     sha="$(git -C "$root" rev-parse "origin/$ref^{commit}")"
@@ -302,10 +353,12 @@ if [ -n "$attach" ]; then
     echo "re-attaching to build $build_id for $short; nothing is submitted"
     echo "$url"
 else
-    if [ ! -f "$config" ] || [ ! -f "$root/deploy/cloudbuild/ci-step.sh" ]; then
-        echo "This checkout has no deploy/cloudbuild/ci.yaml and ci-step.sh; nothing was submitted." >&2
-        exit 1
-    fi
+    for f in "$config" "$root/deploy/cloudbuild/ci-step.sh" "$root/scripts/vocab-check.sh"; do
+        if [ ! -f "$f" ]; then
+            echo "This checkout has no ${f#"$root/"}; nothing was submitted." >&2
+            exit 1
+        fi
+    done
     # The newest status id before submitting; anything later from another
     # build is a newer run. This also fails, before billing, for a commit
     # GitHub does not have.
@@ -331,10 +384,14 @@ else
     rm -f -- "$src/repo/.git/FETCH_HEAD"
     # gcloud's generated ignore file would drop .git; this one ignores nothing.
     printf '# Upload the exact checkout, including its Git metadata.\n' >"$src/.gcloudignore"
+    # The step script and the vocab check come from THIS checkout, not the
+    # commit under test: the private denylist is only ever handed to code the
+    # operator runs, never to the head's own scripts.
     cp -- "$root/deploy/cloudbuild/ci-step.sh" "$src/ci-step.sh"
-    echo "cloud CI for $short in $project ($region)"
+    cp -- "$root/scripts/vocab-check.sh" "$src/vocab-check.sh"
+    echo "cloud CI for $short in $project ($region) as ${sa:-the default build account}"
     build_id="$(gcloud builds submit "$src" --project="$project" --region="$region" \
-        --config="$config" --substitutions="_SOURCE_SHA=$sha" --async --format='value(id)')"
+        --config="$config" --substitutions="_SOURCE_SHA=$sha,_CI_SA=$sa" --async --format='value(id)')"
     if ! [[ "$build_id" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
         echo "gcloud returned no usable build id ('$build_id')." >&2
         build_id=""

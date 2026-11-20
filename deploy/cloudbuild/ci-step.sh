@@ -35,18 +35,21 @@ vocab)
     verify_head
     mkdir -p "$ci"
     err="$ci/vocab-secret.err"
+    # The check is the operator's copy of scripts/vocab-check.sh, uploaded
+    # beside this script; the head's own copy never sees the denylist.
+    check=/workspace/vocab-check.sh
     # Private patterns (the VOCAB_DENYLIST secret on GitHub) come from Secret
     # Manager when the secret exists in the build's project. The value is only
     # ever held in this variable; it is never echoed or written to disk.
     if denylist="$(gcloud secrets versions access latest --secret="$DENYLIST_SECRET" 2>"$err")"; then
         rm -f "$err"
         echo "vocab: private patterns loaded from Secret Manager secret $DENYLIST_SECRET"
-        VOCAB_DENYLIST="$denylist" scripts/vocab-check.sh
+        VOCAB_DENYLIST="$denylist" bash "$check"
     elif grep -qE 'NOT_FOUND|SERVICE_DISABLED|has not been used in project' "$err"; then
         rm -f "$err"
         echo "vocab: no Secret Manager secret $DENYLIST_SECRET in this project (not found," \
             "or the Secret Manager API is not enabled); checking generic patterns only"
-        env -u VOCAB_DENYLIST scripts/vocab-check.sh
+        env -u VOCAB_DENYLIST bash "$check"
     else
         # The secret may exist but cannot be read: fail rather than silently
         # skip the private patterns. gcloud's error holds no secret payload.

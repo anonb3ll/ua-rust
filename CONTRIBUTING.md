@@ -58,7 +58,8 @@ the results as GitHub commit statuses. GitHub Actions stays the primary CI
 dispatch job); Cloud Build is an additional runner for a pinned head.
 
 ```sh
-UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh <pr-number | branch | sha>
+UA_CI_GCP_PROJECT=<project-id> UA_CI_SERVICE_ACCOUNT=ua-rust-ci@<project-id>.iam.gserviceaccount.com \
+  scripts/cloud-ci.sh <pr-number | branch | sha>
 ```
 
 - It uploads a one-commit checkout of the resolved head, submits
@@ -66,6 +67,15 @@ UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh <pr-number | branch | sha>
   posts `CI / vocab`, `CI / check` and `CI / full-verification`. Each status
   names the build and links to its log. A PR number or branch resolves to the
   head GitHub has, so push first.
+- The commit's own code (build scripts, tests) runs inside the build with the
+  build's credentials. A PR from a fork is therefore refused unless you have
+  reviewed it and pass `--allow-fork`; a SHA is run as given. The build runs as
+  `UA_CI_SERVICE_ACCOUNT` (see below). Without it the script refuses, unless
+  `--default-sa` explicitly accepts the project's default build account and
+  all of its permissions.
+- The `vocab` step runs your checkout's `scripts/vocab-check.sh` (uploaded
+  beside the step script), never the head's copy, so the private denylist is
+  only handed to code you run.
 - `UA_CI_GCP_PROJECT` is required; no default project is assumed.
   `UA_CI_GCP_REGION` defaults to `us-central1`, `UA_CI_REPO` to the current
   repository. `UA_CI_NO_STATUS=1` posts nothing (the build still runs and is
@@ -89,6 +99,23 @@ UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh <pr-number | branch | sha>
   project, and needs the build's service account to be able to read it.
   Without the secret it checks the generic patterns only and says so in the
   log.
+
+### The build's service account
+
+Use a dedicated, least-privilege account. It needs:
+
+- `roles/logging.logWriter` on the project, for the build log (the config
+  logs to Cloud Logging only, as a user-specified account requires);
+- `roles/secretmanager.secretAccessor` on the `ua-rust-vocab-denylist` secret
+  only, and only if that secret exists;
+- nothing else. If the first build cannot fetch its source,
+  `roles/storage.objectViewer` on the `<project-id>_cloudbuild` bucket, where
+  `gcloud builds submit` uploads it, is the one addition to make.
+
+Whoever runs the script also needs `roles/iam.serviceAccountUser` on that
+account, to start builds as it. The commit under test runs with this
+account's token, so anything the account can read, the commit can read too:
+the denylist is the only secret within its reach.
 
 ## Privacy
 
