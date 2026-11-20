@@ -127,4 +127,4 @@ and usage ledgers, and tenancy (`org_id`). Work products
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
