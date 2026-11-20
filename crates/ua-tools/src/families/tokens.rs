@@ -30,6 +30,7 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, ledger};
 
 use crate::approvals::{self, GateOutcome};
+use crate::families::managed_secrets::config_fingerprint;
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const OAUTH_SCHEMA: SchemaPart = SchemaPart {
@@ -257,6 +258,29 @@ pub struct DeviceArgs {
     pub session_id: Option<String>,
     /// Revoke: every live session of this identity.
     pub identity: Option<String>,
+}
+
+/// What an approval of `agent_token_issue` / `agent_token_rotate` binds:
+/// every argument except the token value, which is replaced by a keyed
+/// fingerprint (see [`config_fingerprint`]) and its length. The value itself
+/// never reaches the approvals table.
+fn token_gate_payload(value_field: &'static str) -> impl Fn(&ua_core::Config, &Value) -> Value {
+    move |cfg, args| {
+        let value = args.get(value_field).and_then(Value::as_str).unwrap_or("");
+        let mut out = args.as_object().cloned().unwrap_or_default();
+        out.remove(value_field);
+        out.insert("value_fingerprint".into(), json!(config_fingerprint(cfg, value)));
+        out.insert("value_bytes".into(), json!(value.len()));
+        Value::Object(out)
+    }
+}
+
+fn issue_gate_payload(cfg: &ua_core::Config, args: &Value) -> Value {
+    token_gate_payload("value")(cfg, args)
+}
+
+fn rotate_gate_payload(cfg: &ua_core::Config, args: &Value) -> Value {
+    token_gate_payload("new_value")(cfg, args)
 }
 
 fn default_action() -> String {
@@ -519,6 +543,8 @@ pub fn register(r: &mut Registry) {
              stores its SHA-256 digest and returns metadata, never the value. It authenticates from the next request.",
             |ctx: ToolCtx, a: IssueArgs| issue(ctx, a),
         )
+        .gate_payload(issue_gate_payload)
+        .secret_args()
         .family("tokens"),
     );
     r.add(
@@ -528,6 +554,8 @@ pub fn register(r: &mut Registry) {
              authenticating at once; the new row links to it. Returns metadata, never the value.",
             |ctx: ToolCtx, a: RotateArgs| rotate(ctx, a),
         )
+        .gate_payload(rotate_gate_payload)
+        .secret_args()
         .family("tokens"),
     );
     r.add(
@@ -546,6 +574,7 @@ pub fn register(r: &mut Registry) {
              session of an identity. Revoke needs a one-time human approval: the first call returns an approval id.",
             |ctx: ToolCtx, a: DeviceArgs| device_manage(ctx, a),
         )
+        .handler_may_gate(crate::HandlerGate::Actions(&["revoke"]))
         .family("tokens"),
     );
 }

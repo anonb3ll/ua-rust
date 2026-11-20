@@ -1018,6 +1018,7 @@ pub fn register(r: &mut Registry) {
              lookup, spec_check, spec_template, spec_build. `params` holds the action's arguments.",
             |ctx: ToolCtx, a: ManageArgs| blocking(move || dispatch(&ctx, &a.action, a.params)),
         )
+        .handler_may_gate(crate::HandlerGate::Actions(&["create"]))
         .family("delegation"),
     );
     r.add(
@@ -1074,6 +1075,7 @@ pub fn register(r: &mut Registry) {
              lifecycle ids: {handoff_id, task_id, status}.",
             |ctx: ToolCtx, a: HandoffArgs| blocking(move || handoff(&ctx, a, "handoff")),
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("delegation"),
     );
     r.add(

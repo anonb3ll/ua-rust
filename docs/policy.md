@@ -32,6 +32,22 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+### Requesting an approval ahead of a call
+
+`POST /api/approvals/request` runs steps 1-3 for the named tool and its
+arguments (a refusal is the same `403` a call would get), checks the
+arguments against the tool's typed argument struct, and parks the payload
+the tool's gate would bind, without running anything or consuming a pass.
+It answers `409` for a tool step 4 would not gate: only approval-gated tools
+can be requested. It also answers `409` for a tool whose handler asks the
+gate itself on values it resolves (marked `gates_in_handler`,
+`handler_gates_with` or `handler_may_gate`; a test walks every
+`approvals::gate` call site and fails for an unmarked tool). A tool with a
+secret argument is marked `secret_args` and must bind a `gate_payload`
+projection; without one, gating it is refused (`secret_args_unprojected`)
+rather than store the secret. The full status table is in
+[sdk.md](sdk.md#not-supported).
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client

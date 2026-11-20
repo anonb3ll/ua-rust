@@ -1405,6 +1405,7 @@ pub fn register(r: &mut Registry) {
              human approval. Returns {exit_code, stdout, stderr, truncated, timed_out, warnings}.",
             run_cmd,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workspace"),
     );
     r.add(

@@ -281,6 +281,7 @@ pub fn register(r: &mut Registry) {
              step. Returns {workflow, run_id, status, steps, outputs, resumed, duplicate}.",
             workflow_run,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workflows"),
     );
     langgraph::register(r);

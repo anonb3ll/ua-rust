@@ -50,7 +50,35 @@ pub struct ToolDef {
     /// instead of the arguments themselves, so a value that must never be
     /// stored (a secret) is not parked in the approvals table.
     pub gate_payload: Option<GatePayload>,
+    /// Calls whose handler may ask the approval gate itself, on values it
+    /// resolves, besides any registry gate: such a call cannot be requested
+    /// ahead (`POST /api/approvals/request` answers 409). Unlike
+    /// [`ToolDef::gates_in_handler`] it does not change the call path.
+    pub handler_may_gate: HandlerGate,
+    /// An argument carries a secret (a token or credential value). Gating
+    /// such a tool needs a `gate_payload` projection; without one the gate
+    /// refuses rather than park the secret (`secret_args_unprojected`).
+    pub secret_args: bool,
+    /// Deserializes arguments into the tool's typed argument struct, so a
+    /// request can be checked without running the handler.
+    check: Checker,
     handler: Handler,
+}
+
+type Checker = Arc<dyn Fn(&Value) -> UaResult<()> + Send + Sync>;
+
+/// Which calls of a tool may gate inside its handler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HandlerGate {
+    /// Never: only the registry gate applies.
+    #[default]
+    Never,
+    /// Any call.
+    Always,
+    /// Calls whose `action` argument is one of these.
+    Actions(&'static [&'static str]),
+    /// Calls that carry this argument (not null).
+    WithArg(&'static str),
 }
 
 /// Maps a call's arguments to the payload its approval binds.
@@ -96,6 +124,40 @@ impl ToolDef {
         self.gates_in_handler
             || self.handler_gate_arg.is_some_and(|k| args.get(k).is_some_and(|v| !v.is_null()))
     }
+
+    /// The handler may gate this call itself (see [`ToolDef::handler_may_gate`]).
+    pub fn handler_may_gate(mut self, when: HandlerGate) -> Self {
+        self.handler_may_gate = when;
+        self
+    }
+
+    /// An argument carries a secret (see [`ToolDef::secret_args`]).
+    pub fn secret_args(mut self) -> Self {
+        self.secret_args = true;
+        self
+    }
+
+    /// Whether this call's approval is (or may be) decided inside the
+    /// handler on values only it resolves, so it cannot be requested ahead.
+    pub fn handler_decides(&self, args: &Value) -> bool {
+        self.handler_gates(args)
+            || match self.handler_may_gate {
+                HandlerGate::Never => false,
+                HandlerGate::Always => true,
+                HandlerGate::Actions(list) => {
+                    args.get("action").and_then(Value::as_str).is_some_and(|a| list.contains(&a.trim()))
+                }
+                HandlerGate::WithArg(k) => {
+                    args.get(k).is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+                }
+            }
+    }
+
+    /// Check `args` against the tool's typed arguments (unknown fields are
+    /// refused) without running it.
+    pub fn check_args(&self, args: &Value) -> UaResult<()> {
+        (self.check)(args)
+    }
     /// Gate on `f(config, args)` rather than on the raw arguments.
     pub fn gate_payload(mut self, f: GatePayload) -> Self {
         self.gate_payload = Some(f);
@@ -117,6 +179,10 @@ where
         obj.entry("type").or_insert(json!("object"));
         obj.entry("properties").or_insert(json!({}));
     }
+    let check: Checker = Arc::new(|raw: &Value| {
+        let raw = if raw.is_null() { json!({}) } else { raw.clone() };
+        serde_json::from_value::<A>(raw).map(drop).map_err(|e| UaError::invalid(e.to_string()))
+    });
     let f = Arc::new(f);
     let handler: Handler = Arc::new(move |ctx, raw| {
         let f = f.clone();
@@ -136,6 +202,9 @@ where
         gates_in_handler: false,
         handler_gate_arg: None,
         gate_payload: None,
+        handler_may_gate: HandlerGate::Never,
+        secret_args: false,
+        check,
         handler,
     }
 }
@@ -206,6 +275,10 @@ impl Registry {
         if gated && !def.handler_gates(&args) {
             let gate_args = match def.gate_payload {
                 Some(f) => f(hub.cfg(), &args),
+                None if def.secret_args => {
+                    release_reservation(hub, reservation).await;
+                    return Err(unprojected_secret(name));
+                }
                 None => args.clone(),
             };
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), gate_args);
@@ -269,11 +342,15 @@ impl Registry {
         if !gated {
             return Ok(ApprovalRequest::NotGated);
         }
-        if def.handler_gates(&args) {
+        if def.handler_decides(&args) {
             return Ok(ApprovalRequest::GatesInHandler);
         }
+        // The arguments must be a call the tool would accept: what a human
+        // approves is exactly what can run.
+        def.check_args(&args)?;
         Ok(ApprovalRequest::Payload(match def.gate_payload {
             Some(f) => f(hub.cfg(), &args),
+            None if def.secret_args => return Err(unprojected_secret(name)),
             None => args,
         }))
     }
@@ -426,6 +503,15 @@ impl Registry {
 
         Ok(Admitted { caller, args, policy_gated, reservation })
     }
+}
+
+/// A gated call of a tool whose arguments carry a secret and that has no
+/// projection: refused rather than park the secret in the approvals table.
+fn unprojected_secret(name: &str) -> UaError {
+    UaError::denied(
+        "secret_args_unprojected",
+        format!("tool {name} carries a secret argument and has no approval projection; it cannot be gated"),
+    )
 }
 
 /// A call that passed every check before the approval gate.

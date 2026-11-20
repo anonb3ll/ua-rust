@@ -612,6 +612,7 @@ pub fn register(r: &mut Registry) {
             "Audit a project (or, with vault=true, a vault note or directory) for AI-development security problems: committed secrets and private keys, .env exposure, permissive agent settings and risky hooks, MCP configs with literal secrets or unpinned packages, hidden Unicode and bypass directives in instruction files, eval/shell use near LLM SDKs, lockfile and .gitignore hygiene, and injection phrases, hidden Unicode and base64 blobs in documents. A finding never contains a secret value, only file, line, rule and a redacted preview. Lines with `ua:allow` are exempt. Scans at most 5000 files of 1 MB; remediate=true applies safe fixes inside the workspace, but only after a human approves the exact list of files it would change (the call parks as approval_required first), and records each changed file's SHA-256 before and after in the ledger. Returns {root, files_scanned, status, grade, summary, findings, findings_total, truncated, truncated_by}; status is fail (any high), warn (any medium) or pass.",
             security_audit,
         )
+        .handler_may_gate(crate::HandlerGate::WithArg("remediate"))
         .family("audit"),
     );
     triage::register(r);

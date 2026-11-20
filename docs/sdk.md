@@ -171,10 +171,33 @@ pending an explicit product decision; hub task #2658 lists the options.
 Until that decision, `/api/work-products*` answers `501` and the manifest
 lists `work_product` with `served: false`.
 
-`requestApproval` queues a request only for a tool that is gated (always
-gated, `approval_tools`, or a policy rule); for any other tool it answers
-`409`, so the SDK's live write suite needs `approval_tools` to include
-`task_update`, which in turn parks its `updateTask` step.
+`requestApproval` (`POST /api/approvals/request`, body `{tool, payload}`)
+queues a human approval ahead of a call and never runs anything. This is the
+settled contract:
+
+| Status | When |
+|---|---|
+| `202 {approval_id, status: "pending", tool, payload}` | A new or identical open request for a gated tool. |
+| `200` with `status` `approved` or `denied` | An identical request already decided (a live pass is reported, never consumed). |
+| `400` | A malformed body, or a `payload` the tool's typed arguments refuse (unknown or missing fields). A caller without a profile limit also gets `400` for an unknown tool. |
+| `401` | No verified identity. |
+| `403` | The same refusal a call would get: the caller's profile cannot call the tool (or `approval_pending`), the session grant, a policy rule or the prod-action check refuses it. An unknown tool reads the same for a profile-bound caller, so the route cannot enumerate tools. |
+| `409` | The tool is not approval-gated (always gated, `approval_tools`, or a policy `require_approval` rule): there is nothing to approve. Also for a tool whose handler binds its approval to values it resolves when called (dispatch and node work, `run_cmd`, workflows and routines, cycle transitions, audit remediation, OAuth revoke, config revisions, managed secrets, MCP registrations and gateway writes, relay sends): call the tool instead. |
+| `413` | `payload` over 16 KiB. |
+| `429` | The requester holds 20 open requests, or filed 60 in the last hour that are still open or that it withdrew itself; the message names which. |
+
+The stored payload is the one the tool's own gate binds: a tool with a
+secret argument binds a projection instead (`agent_token_issue` and
+`agent_token_rotate` bind the label and a keyed fingerprint of the token,
+never the value). An approved request is a one-time pass that the
+requester's next identical call consumes within `approval_pass_ttl_hours`;
+the requester cannot approve its own request.
+
+The SDK's live write suite is being changed (separately) to request
+approval for a gated tool. `crew_intervene` is one: always approval-gated
+with no configuration, gated by the registry rather than its handler (so it
+is requestable here), and callable with a developer-profile token. Its
+payload is `{session_id, message}`.
 
 ## Verifying
 

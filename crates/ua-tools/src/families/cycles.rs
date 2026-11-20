@@ -1178,6 +1178,7 @@ pub fn register(r: &mut Registry) {
              keys, expected_version checks, approval gates, budgets and kill switch all apply.",
             manage,
         )
+        .handler_may_gate(crate::HandlerGate::Actions(&["transition"]))
         .family("cycles"),
     );
     r.add(
@@ -1199,6 +1200,7 @@ pub fn register(r: &mut Registry) {
              clears a merge or PR.",
             transition,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("cycles"),
     );
     r.add(

@@ -114,17 +114,81 @@ pub fn gate(
     }
 
     // Reuse an identical pending request, or park a new one.
-    let pending: Option<i64> = tx
+    if let Some(approval_id) = pending_id(tx, tool, &canon, &caller.label)? {
+        return Ok(GateOutcome::Pending { approval_id });
+    }
+    park(tx, caller, tool, &canon, &now)
+}
+
+/// Queue a request for `args` ahead of a call, inside the caller's write
+/// transaction, without consuming anything: a recorded denial of this exact
+/// request answers `Denied`, a live pass answers `Pass` (left unconsumed;
+/// an expired one is marked expired, as [`gate`] would), an identical
+/// pending request is reused, and otherwise a new `pending` row is parked
+/// and ledgered.
+pub fn request(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+) -> UaResult<GateOutcome> {
+    let canon = canonical_payload(args);
+    let now = ua_core::time::now();
+    let denied: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+             AND status = 'denied' ORDER BY id DESC LIMIT 1",
+            params![tool, canon, caller.label],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((approval_id, reason)) = denied {
+        return Ok(GateOutcome::Denied { approval_id, reason });
+    }
+    let passes: Vec<(i64, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+             AND status = 'approved' ORDER BY id ASC",
+        )?;
+        stmt.query_map(params![tool, canon, caller.label], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    for (id, resolved_at) in passes {
+        if pass_expired(cfg, resolved_at.as_deref()) {
+            tx.execute(
+                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+            continue;
+        }
+        return Ok(GateOutcome::Pass { approval_id: id });
+    }
+    if let Some(approval_id) = pending_id(tx, tool, &canon, &caller.label)? {
+        return Ok(GateOutcome::Pending { approval_id });
+    }
+    park(tx, caller, tool, &canon, &now)
+}
+
+/// The oldest pending request for exactly this call, if any.
+pub fn pending_id(
+    conn: &rusqlite::Connection,
+    tool: &str,
+    canon: &str,
+    requester: &str,
+) -> UaResult<Option<i64>> {
+    Ok(conn
         .query_row(
             "SELECT id FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
              AND status = 'pending' ORDER BY id ASC LIMIT 1",
-            params![tool, canon, caller.label],
+            params![tool, canon, requester],
             |r| r.get(0),
         )
-        .optional()?;
-    if let Some(approval_id) = pending {
-        return Ok(GateOutcome::Pending { approval_id });
-    }
+        .optional()?)
+}
+
+/// Insert a new pending request and ledger it.
+fn park(tx: &mut WriteTx<'_>, caller: &Caller, tool: &str, canon: &str, now: &str) -> UaResult<GateOutcome> {
     tx.execute(
         "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
          VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
@@ -197,6 +261,10 @@ pub struct PendingArgs {
     pub newest_expired: bool,
 }
 
+/// Most approved rows `approval_pending` reads to split live from expired
+/// passes.
+const APPROVED_SCAN: i64 = 2000;
+
 fn default_limit() -> i64 {
     100
 }
@@ -218,17 +286,28 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
     let cfg = ctx.hub.cfg().clone();
     ctx.hub.db().read(|c| {
         let tool_filter = args.tool.clone();
-        let fetch = |status: &str| -> UaResult<Vec<ApprovalRow>> {
-            let mut stmt = c.prepare(
-                "SELECT * FROM approvals WHERE status = ?1 AND (?2 IS NULL OR tool = ?2) ORDER BY id ASC",
-            )?;
-            let rows = stmt.query_map(params![status, tool_filter], row_to_approval)?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        };
-        let mut pending = fetch("pending")?;
-        pending.truncate(limit);
+        // Bounded in SQL: the oldest `limit` pending requests, and the newest
+        // APPROVED_SCAN approved rows (live passes are recent; older ones
+        // are only counted).
+        let mut stmt = c.prepare(
+            "SELECT * FROM approvals WHERE status = 'pending' AND (?1 IS NULL OR tool = ?1) ORDER BY id ASC LIMIT ?2",
+        )?;
+        let pending: Vec<ApprovalRow> =
+            stmt.query_map(params![tool_filter, limit as i64], row_to_approval)?.collect::<Result<_, _>>()?;
+        let mut stmt = c.prepare(
+            "SELECT * FROM approvals WHERE status = 'approved' AND (?1 IS NULL OR tool = ?1) \
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut approved: Vec<ApprovalRow> =
+            stmt.query_map(params![tool_filter, APPROVED_SCAN], row_to_approval)?.collect::<Result<_, _>>()?;
+        approved.reverse();
+        let approved_total: i64 = c.query_row(
+            "SELECT COUNT(*) FROM approvals WHERE status = 'approved' AND (?1 IS NULL OR tool = ?1)",
+            params![tool_filter],
+            |r| r.get(0),
+        )?;
         let (mut live, mut expired): (Vec<_>, Vec<_>) =
-            fetch("approved")?.into_iter().partition(|a| !pass_expired(&cfg, a.resolved_at.as_deref()));
+            approved.into_iter().partition(|a| !pass_expired(&cfg, a.resolved_at.as_deref()));
         let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
         for a in live.iter_mut().chain(expired.iter_mut()) {
             a.expires_at = a
@@ -238,7 +317,8 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
                 .and_then(|t| t.checked_add(jiff::SignedDuration::from_secs(ttl_s)).ok())
                 .map(ua_core::time::format_ts);
         }
-        let expired_total = expired.len();
+        // Approved rows past the scan are old, so expired.
+        let expired_total = usize::try_from(approved_total).unwrap_or(0).saturating_sub(live.len());
         live.truncate(limit);
         if args.newest_expired && expired.len() > limit {
             expired.drain(..expired.len() - limit);

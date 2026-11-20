@@ -801,6 +801,7 @@ pub fn register(r: &mut Registry) {
              arguments or results.",
             mcp_gateway,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("mcp"),
     );
 }

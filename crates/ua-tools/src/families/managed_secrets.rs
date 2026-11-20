@@ -179,6 +179,14 @@ fn fingerprint(key: &Key, value: &str) -> String {
     hex::encode(mac.finalize().into_bytes())[..32].to_string()
 }
 
+/// A keyed fingerprint of `value` under the configured `managed_secret_key`,
+/// for an approval to bind a secret argument without storing it. `None`
+/// when no key is configured: the approval then cannot tell two values
+/// apart.
+pub(crate) fn config_fingerprint(cfg: &Config, value: &str) -> Option<String> {
+    write_key(cfg).ok().map(|k| fingerprint(&k, value))
+}
+
 fn aad(name: &str, consumer: &str) -> Vec<u8> {
     format!("{AAD_PREFIX}\0{name}\0{consumer}").into_bytes()
 }
@@ -541,6 +549,8 @@ pub fn register(r: &mut Registry) {
             managed_secret_set,
         )
         .gate_payload(set_gate_payload)
+        .secret_args()
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("secrets"),
     );
     r.add(
