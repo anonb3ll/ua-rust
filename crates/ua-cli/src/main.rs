@@ -155,12 +155,15 @@ fn confirm_on_tty(label: &str) -> bool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
+    // rmcp logs whole requests and responses at debug level: tool arguments
+    // (a managed_secret_set value) and downstream MCP results (a reflected
+    // credential). Cap it at info whatever UA_LOG asks for.
+    let filter = match "rmcp=info".parse() {
+        Ok(cap) => filter.add_directive(cap),
+        Err(_) => filter,
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
     let cfg = load_config(&cli)?;
 
     if let Cmd::Config = cli.cmd {

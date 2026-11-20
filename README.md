@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 175 tools are registered and the core families are ported.
+> **Status: alpha.** 183 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -81,6 +81,9 @@ over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
   build tools need approval.
 - `/api` and `/ui` refuse unknown hosts (DNS rebinding) and cross-site
   writes; the UI uses CSRF tokens and a strict CSP.
+- Managed secrets are encrypted at rest with a key the database never holds,
+  and no tool returns a value. Downstream MCP servers get them by reference
+  and see only what their registration names.
 - Run agents under a different OS user than the hub: anything running as the
   hub's user can edit its database directly.
 
@@ -98,6 +101,8 @@ vulnerability.
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
 | Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node | [nodes](docs/nodes.md) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
+| Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
+| Managed secrets | `managed_secret_set` (human or operator), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
@@ -106,7 +111,7 @@ vulnerability.
 
 ## Not yet ported
 
-The node wake transport, harness config bundle and session credentials
+The public relay (`relay_manage`), the node wake transport, harness config bundle and session credentials
 (`/api/node/wake*`, `/config`, `/session_credential` answer 501), device
 acceptance, cloud executors, ACP, Slack and Zulip
 connectors, role workflows, the TypeScript SDK's platform routes
