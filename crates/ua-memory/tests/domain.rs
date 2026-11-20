@@ -2,6 +2,7 @@
 //! search, read, delete and restore a note.
 
 use serde_json::json;
+use ua_core::UaError;
 use ua_core::{ActorKind, Caller, Config, Profile, identity::Transport};
 use ua_memory::save::SaveRequest;
 use ua_memory::search::{GetRequest, SearchRequest};
@@ -92,4 +93,48 @@ async fn save_search_get_delete_restore_without_a_registry() {
         })
         .unwrap();
     assert_eq!(channels, ["agent.memory.saved", "agent.memory.deleted", "agent.memory.restored"]);
+}
+
+/// A tombstone written before deletes were tagged `meta:deleted-by-human` is
+/// judged by who wrote it: when `updated_by` is a configured human identity,
+/// only a human may restore the note.
+#[tokio::test]
+async fn a_legacy_human_delete_is_restored_only_by_a_human() {
+    let db = db();
+    let mut cfg = cfg();
+    cfg.human_identities = vec!["operator".into()];
+    let owner = agent("builder-1");
+    let saved = save::save(
+        &db,
+        &cfg,
+        &owner,
+        SaveRequest { content: "Legacy note.".into(), title: Some("Legacy".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let id = saved["id"].as_str().unwrap().to_string();
+    let legacy_delete = |id: String, by: &'static str| {
+        db.write(move |tx| {
+            tx.execute(
+                "UPDATE memory SET content = 'tombstone', tags = '[\"meta:deleted\"]', updated_by = ?1 \
+                 WHERE id = ?2",
+                rusqlite::params![by, id],
+            )?;
+            Ok(())
+        })
+        .unwrap()
+    };
+
+    legacy_delete(id.clone(), "operator");
+    let err = lifecycle::restore(&db, &cfg, &owner, id.clone()).await.unwrap_err();
+    assert!(matches!(&err, UaError::Denied { reason_code, .. } if reason_code == "human_only"), "{err:?}");
+    let human = Caller { kind: ActorKind::Human, ..agent("operator") };
+    let restored = lifecycle::restore(&db, &cfg, &human, id.clone()).await.unwrap();
+    assert_eq!(restored["restored"], json!(true));
+
+    // Deleted by an identity that is not a configured human: the owner may restore it.
+    legacy_delete(id.clone(), "builder-1");
+    let restored = lifecycle::restore(&db, &cfg, &owner, id.clone()).await.unwrap();
+    assert_eq!(restored["restored"], json!(true));
+    assert_eq!(search::get(&db, get_req(&id)).await.unwrap()["content"], json!("Legacy note."));
 }

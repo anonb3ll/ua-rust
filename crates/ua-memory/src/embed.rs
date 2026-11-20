@@ -247,7 +247,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Store (or replace) a note's vector.
-pub fn store_vector(
+pub(crate) fn store_vector(
     conn: &Connection,
     note_id: &str,
     model: &str,

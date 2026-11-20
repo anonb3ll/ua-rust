@@ -1,7 +1,7 @@
 //! Memory notes: persistent, searchable notes shared by every agent session.
 //!
 //! This crate is the memory domain: the storage schema ([`schema`]), the note
-//! model and eligibility filter ([`note`]), saving ([`save`]), search, listing
+//! model and eligibility filter (`note`, crate-private), saving ([`save`]), search, listing
 //! and reads ([`search`]) with their rank fusion ([`rank`]) and embeddings
 //! ([`embed`]), delete, restore and feedback ([`lifecycle`]), and the
 //! report-only maintenance passes ([`maintenance`]). It depends on `ua-core`
@@ -31,7 +31,7 @@
 pub mod embed;
 pub mod lifecycle;
 pub mod maintenance;
-pub mod note;
+pub(crate) mod note;
 pub mod rank;
 pub mod save;
 pub mod schema;
@@ -40,7 +40,7 @@ pub mod search;
 pub use embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
-pub use note::mark_untrusted;
+pub use note::{Filter, mark_untrusted};
 pub use schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA, schema_parts};
 
 use ua_core::{UaError, UaResult};

@@ -32,7 +32,7 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
                 "not_owner",
                 format!(
                     "memory note {:?} is owned by {:?}; you are {actor:?}. Only the note owner or a verified \
-                         human identity can delete it.",
+                     human identity can delete it.",
                     id,
                     n.author.as_deref().unwrap_or_default()
                 ),
@@ -68,130 +68,131 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
 }
 
 /// Re-promote superseded note `id`, or undo its soft delete from the newest
-/// version recorded before the delete, as `caller`. `cfg` names the human
-/// identities whose deletes only a human may undo.
+/// version recorded before the delete, as `caller`. `cfg.human_identities`
+/// names the identities whose deletes only a human may undo.
 pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaResult<Value> {
     let caller = caller.clone();
-    let cfg = cfg.clone();
+    // Only what `Config::is_human` reads, not the whole config.
+    let humans = cfg.human_identities.clone();
     db.write_async(move |tx| {
-            let n = note::require(tx, &id)?;
-            let actor = verified(&caller).map(str::to_string);
-            let human = is_human(&caller);
-            if n.is_deleted() {
-                let Some(actor) = actor else {
-                    return Err(UaError::denied(
-                        "unverified",
-                        "restoring a deleted memory note requires a verified identity; an unverified or spoofed \
-                         author is refused",
-                    ));
-                };
-                // A delete a human made is undone only by a human; an older
-                // tombstone is judged by the identity that wrote it.
-                let human_deleted = n.tags.iter().any(|t| t == DELETED_BY_HUMAN_TAG)
-                    || n.updated_by.as_deref().is_some_and(|u| cfg.is_human(u));
-                if human_deleted && !human {
-                    return Err(UaError::denied(
-                        "human_only",
-                        format!(
-                            "memory note {:?} was deleted by a verified human ({:?}); only a verified human \
-                             identity can restore it.",
-                            id,
-                            n.updated_by.as_deref().unwrap_or_default()
-                        ),
-                    ));
-                }
-                if n.author.as_deref() != Some(actor.as_str()) && !human {
-                    return Err(UaError::denied(
-                        "not_owner",
-                        format!(
-                            "memory note {:?} is owned by {:?}; you are {actor:?}. Only the note owner or a \
-                             verified human identity can restore it.",
-                            id,
-                            n.author.as_deref().unwrap_or_default()
-                        ),
-                    ));
-                }
-                let prior = {
-                    let mut stmt = tx.prepare(
-                        "SELECT version, content, tags FROM memory_versions WHERE note_id = ?1 ORDER BY version DESC",
-                    )?;
-                    let rows = stmt.query_map([&id], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
-                    })?;
-                    let mut found = None;
-                    for row in rows {
-                        let (version, content, tags) = row?;
-                        let tags = json_list(tags);
-                        if !tags.iter().any(|t| t == DELETED_TAG) {
-                            found = Some((version, content, tags));
-                            break;
-                        }
-                    }
-                    found
-                };
-                let Some((version, content, mut tags)) = prior else {
-                    return Err(UaError::invalid(format!(
-                        "memory note {:?} has no recorded version from before its deletion, so it cannot be \
-                         restored in place. memory_get still reads the tombstone, which keeps the deleted text; \
-                         save that as a new note instead.",
-                        id
-                    )));
-                };
-                tags.sort();
-                tags.dedup();
-                // A restored broadcast note is a broadcast again.
-                assert_privileged(&caller, &tags, None)?;
-                let ts = ua_core::time::now();
-                tx.execute(
-                    "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 WHERE id = ?5",
-                    params![content, json_text(&tags), ts, actor, id],
-                )?;
-                ledger::append(
-                    tx,
-                    EventInput::new(
-                        "agent.memory.restored",
-                        json!({ "id": id, "was_deleted": true, "restored_version": version, "actor": actor }),
-                    )
-                    .by(caller.label.clone()),
-                )?;
-                let revision = note::require(tx, &id)?.revision();
-                let mut res = json!({
-                    "id": id,
-                    "restored": true,
-                    "was_superseded_by": null,
-                    "was_deleted": true,
-                    "restored_version": version,
-                    "revision": revision,
-                });
-                if let Some(by) = &n.superseded_by {
-                    // Undelete only; a second memory_restore re-promotes it.
-                    res["superseded_by"] = json!(by);
-                }
-                return Ok(res);
-            }
-
-            let Some(was) = n.superseded_by.clone() else {
-                return Ok(json!({ "id": id, "restored": false, "was_superseded_by": null }));
+        let n = note::require(tx, &id)?;
+        let actor = verified(&caller).map(str::to_string);
+        let human = is_human(&caller);
+        if n.is_deleted() {
+            let Some(actor) = actor else {
+                return Err(UaError::denied(
+                    "unverified",
+                    "restoring a deleted memory note requires a verified identity; an unverified or spoofed \
+                     author is refused",
+                ));
             };
-            // Restore reverses a supersede, so it takes the same owner rule.
-            if let Some(actor) = &actor
-                && !human
-                && n.author.as_deref() != Some(actor.as_str())
-            {
-                return Err(UaError::denied("not_owner", "only the note owner or a verified human can restore it"));
+            // A delete a human made is undone only by a human; an older
+            // tombstone is judged by the identity that wrote it.
+            let human_deleted = n.tags.iter().any(|t| t == DELETED_BY_HUMAN_TAG)
+                || n.updated_by.as_deref().is_some_and(|u| humans.iter().any(|h| h == u));
+            if human_deleted && !human {
+                return Err(UaError::denied(
+                    "human_only",
+                    format!(
+                        "memory note {:?} was deleted by a verified human ({:?}); only a verified human \
+                         identity can restore it.",
+                        id,
+                        n.updated_by.as_deref().unwrap_or_default()
+                    ),
+                ));
             }
-            tx.execute("UPDATE memory SET superseded_by = NULL, valid_to = NULL WHERE id = ?1", [&id])?;
+            if n.author.as_deref() != Some(actor.as_str()) && !human {
+                return Err(UaError::denied(
+                    "not_owner",
+                    format!(
+                        "memory note {:?} is owned by {:?}; you are {actor:?}. Only the note owner or a \
+                         verified human identity can restore it.",
+                        id,
+                        n.author.as_deref().unwrap_or_default()
+                    ),
+                ));
+            }
+            let prior = {
+                let mut stmt = tx.prepare(
+                    "SELECT version, content, tags FROM memory_versions WHERE note_id = ?1 ORDER BY version DESC",
+                )?;
+                let rows = stmt.query_map([&id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                })?;
+                let mut found = None;
+                for row in rows {
+                    let (version, content, tags) = row?;
+                    let tags = json_list(tags);
+                    if !tags.iter().any(|t| t == DELETED_TAG) {
+                        found = Some((version, content, tags));
+                        break;
+                    }
+                }
+                found
+            };
+            let Some((version, content, mut tags)) = prior else {
+                return Err(UaError::invalid(format!(
+                    "memory note {:?} has no recorded version from before its deletion, so it cannot be \
+                     restored in place. memory_get still reads the tombstone, which keeps the deleted text; \
+                     save that as a new note instead.",
+                    id
+                )));
+            };
+            tags.sort();
+            tags.dedup();
+            // A restored broadcast note is a broadcast again.
+            assert_privileged(&caller, &tags, None)?;
+            let ts = ua_core::time::now();
+            tx.execute(
+                "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 WHERE id = ?5",
+                params![content, json_text(&tags), ts, actor, id],
+            )?;
             ledger::append(
                 tx,
                 EventInput::new(
                     "agent.memory.restored",
-                    json!({ "id": id, "was_superseded_by": was, "actor": actor }),
+                    json!({ "id": id, "was_deleted": true, "restored_version": version, "actor": actor }),
                 )
                 .by(caller.label.clone()),
             )?;
-            Ok(json!({ "id": id, "restored": true, "was_superseded_by": was }))
-        })
-        .await
+            let revision = note::require(tx, &id)?.revision();
+            let mut res = json!({
+                "id": id,
+                "restored": true,
+                "was_superseded_by": null,
+                "was_deleted": true,
+                "restored_version": version,
+                "revision": revision,
+            });
+            if let Some(by) = &n.superseded_by {
+                // Undelete only; a second memory_restore re-promotes it.
+                res["superseded_by"] = json!(by);
+            }
+            return Ok(res);
+        }
+
+        let Some(was) = n.superseded_by.clone() else {
+            return Ok(json!({ "id": id, "restored": false, "was_superseded_by": null }));
+        };
+        // Restore reverses a supersede, so it takes the same owner rule.
+        if let Some(actor) = &actor
+            && !human
+            && n.author.as_deref() != Some(actor.as_str())
+        {
+            return Err(UaError::denied("not_owner", "only the note owner or a verified human can restore it"));
+        }
+        tx.execute("UPDATE memory SET superseded_by = NULL, valid_to = NULL WHERE id = ?1", [&id])?;
+        ledger::append(
+            tx,
+            EventInput::new(
+                "agent.memory.restored",
+                json!({ "id": id, "was_superseded_by": was, "actor": actor }),
+            )
+            .by(caller.label.clone()),
+        )?;
+        Ok(json!({ "id": id, "restored": true, "was_superseded_by": was }))
+    })
+    .await
 }
 
 const SIGNALS: [(&str, &str); 4] = [

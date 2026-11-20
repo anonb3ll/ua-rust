@@ -24,7 +24,7 @@ use ua_store::SchemaPart;
 pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
-pub(crate) use ua_memory::note::mark_untrusted;
+pub(crate) use ua_memory::mark_untrusted;
 pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA};
 
 use crate::registry::{Registry, ToolCtx, tool};
@@ -106,29 +106,55 @@ pub struct SaveArgs {
     pub expected_revision: Option<String>,
 }
 
+// Every conversion below destructures its source in full (no `..`) and
+// builds its target with a struct literal, so a field added to either side
+// fails to compile until it is mapped.
+
 impl From<SaveArgs> for SaveRequest {
     fn from(a: SaveArgs) -> Self {
+        let SaveArgs {
+            content,
+            title,
+            tags,
+            id,
+            author,
+            append,
+            overwrite,
+            check_only,
+            salience,
+            confidence,
+            expires_at,
+            clear_expires_at,
+            idempotency_key,
+            epistemic,
+            evidence,
+            valid_from,
+            supersedes,
+            contradicts,
+            evidence_replace,
+            expected_revision,
+        } = a;
         Self {
-            content: a.content,
-            title: a.title,
-            tags: a.tags,
-            id: a.id,
-            author: a.author,
-            append: a.append,
-            overwrite: a.overwrite,
-            check_only: a.check_only,
-            salience: a.salience,
-            confidence: a.confidence,
-            expires_at: a.expires_at,
-            clear_expires_at: a.clear_expires_at,
-            idempotency_key: a.idempotency_key,
-            epistemic: a.epistemic,
-            evidence: a.evidence,
-            valid_from: a.valid_from,
-            supersedes: a.supersedes,
-            contradicts: a.contradicts,
-            evidence_replace: a.evidence_replace,
-            expected_revision: a.expected_revision,
+            content,
+            title,
+            tags,
+            id,
+            author,
+            append,
+            overwrite,
+            check_only,
+            salience,
+            confidence,
+            expires_at,
+            clear_expires_at,
+            idempotency_key,
+            epistemic,
+            evidence,
+            valid_from,
+            supersedes,
+            contradicts,
+            evidence_replace,
+            expected_revision,
         }
     }
 }
@@ -209,38 +235,37 @@ pub struct GetArgs {
     pub count_access: bool,
 }
 
+impl From<SearchArgs> for SearchRequest {
+    fn from(a: SearchArgs) -> Self {
+        let SearchArgs { query, tags, limit, source_host, include_expired, as_of, author } = a;
+        Self { query, tags, limit, source_host, include_expired, as_of, author }
+    }
+}
+
+impl From<ListArgs> for ListRequest {
+    fn from(a: ListArgs) -> Self {
+        let ListArgs { tag, limit, include_expired, author, tags } = a;
+        Self { tag, limit, include_expired, author, tags }
+    }
+}
+
+impl From<GetArgs> for GetRequest {
+    fn from(a: GetArgs) -> Self {
+        let GetArgs { id, as_of, include_versions, count_access } = a;
+        Self { id, as_of, include_versions, count_access }
+    }
+}
+
 async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
-    let req = SearchRequest {
-        query: a.query,
-        tags: a.tags,
-        limit: a.limit,
-        source_host: a.source_host,
-        include_expired: a.include_expired,
-        as_of: a.as_of,
-        author: a.author,
-    };
-    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), req).await
+    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), a.into()).await
 }
 
 async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    let req = ListRequest {
-        tag: a.tag,
-        limit: a.limit,
-        include_expired: a.include_expired,
-        author: a.author,
-        tags: a.tags,
-    };
-    ua_memory::search::list(ctx.hub.db(), req).await
+    ua_memory::search::list(ctx.hub.db(), a.into()).await
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
-    let req = GetRequest {
-        id: a.id,
-        as_of: a.as_of,
-        include_versions: a.include_versions,
-        count_access: a.count_access,
-    };
-    ua_memory::search::get(ctx.hub.db(), req).await
+    ua_memory::search::get(ctx.hub.db(), a.into()).await
 }
 
 fn register_search(r: &mut Registry) {
@@ -307,16 +332,21 @@ pub struct FeedbackArgs {
     pub signal: String,
 }
 
+// These take plain arguments; destructuring in full keeps the same guarantee.
+
 async fn delete(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
-    ua_memory::lifecycle::delete(ctx.hub.db(), &ctx.caller, a.id).await
+    let IdArgs { id } = a;
+    ua_memory::lifecycle::delete(ctx.hub.db(), &ctx.caller, id).await
 }
 
 async fn restore(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
-    ua_memory::lifecycle::restore(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, a.id).await
+    let IdArgs { id } = a;
+    ua_memory::lifecycle::restore(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, id).await
 }
 
 async fn feedback(ctx: ToolCtx, a: FeedbackArgs) -> UaResult<Value> {
-    ua_memory::lifecycle::feedback(ctx.hub.db(), &ctx.caller, a.id, a.signal).await
+    let FeedbackArgs { id, signal } = a;
+    ua_memory::lifecycle::feedback(ctx.hub.db(), &ctx.caller, id, signal).await
 }
 
 fn register_lifecycle(r: &mut Registry) {
@@ -382,23 +412,26 @@ pub struct MaintenanceArgs {
     pub limit: Option<i64>,
 }
 
+impl From<PruneArgs> for PruneRequest {
+    fn from(a: PruneArgs) -> Self {
+        let PruneArgs { salience_threshold, max_age_days, limit } = a;
+        Self { salience_threshold, max_age_days, limit }
+    }
+}
+
+impl From<MaintenanceArgs> for MaintenanceRequest {
+    fn from(a: MaintenanceArgs) -> Self {
+        let MaintenanceArgs { dry_run, stale_days, confidence_floor, limit } = a;
+        Self { dry_run, stale_days, confidence_floor, limit }
+    }
+}
+
 async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
-    let req = PruneRequest {
-        salience_threshold: a.salience_threshold,
-        max_age_days: a.max_age_days,
-        limit: a.limit,
-    };
-    ua_memory::maintenance::prune_candidates(ctx.hub.db(), req).await
+    ua_memory::maintenance::prune_candidates(ctx.hub.db(), a.into()).await
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    let req = MaintenanceRequest {
-        dry_run: a.dry_run,
-        stale_days: a.stale_days,
-        confidence_floor: a.confidence_floor,
-        limit: a.limit,
-    };
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), req).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), a.into()).await
 }
 
 fn register_maintenance(r: &mut Registry) {
