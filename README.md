@@ -96,20 +96,20 @@ vulnerability.
 | Memory and vault | Memory notes (FTS5, optional embeddings), Obsidian vault read/write, graph query, journal | |
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
-| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node | [nodes](docs/nodes.md) |
+| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance` | [nodes](docs/nodes.md) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
-| Auth | OAuth 2.1 authorization server, passkeys, browser sessions | [auth](docs/auth.md) |
+| Auth | OAuth 2.1 authorization server, passkeys, browser sessions, node session credentials | [auth](docs/auth.md) |
 | Migration | `ua import python-hub` with a dry run, resumable and chain-verified | |
 
 ## Not yet ported
 
-The node wake transport, harness config bundle and session credentials
-(`/api/node/wake*`, `/config`, `/session_credential` answer 501), device
-acceptance, cloud executors, ACP, Slack and Zulip
+The node wake transport and harness config bundle (`/api/node/wake*`,
+`/api/node/config` answer 501), native-session resume and adopt, provider
+accounts, the Pi backend, cloud executors, ACP, Slack and Zulip
 connectors, role workflows, the TypeScript SDK's platform routes
 (`/api/runs`, `/api/platform/*` answer 501), billing and usage ledgers, and
 tenancy (`org_id`).

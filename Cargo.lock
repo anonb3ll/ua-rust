@@ -5200,6 +5200,7 @@ dependencies = [
  "ignore",
  "jiff 1.0.1",
  "libc",
+ "rand 0.9.5",
  "regex",
  "reqwest 0.13.5",
  "rusqlite",

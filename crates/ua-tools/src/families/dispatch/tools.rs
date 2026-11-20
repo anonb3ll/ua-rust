@@ -484,6 +484,7 @@ enum Gated {
 /// node's roots, else the node's first existing root).
 fn node_route(
     tx: &rusqlite::Connection,
+    cfg: &ua_core::Config,
     node: &str,
     agent: &str,
     backend: Option<&str>,
@@ -542,7 +543,7 @@ fn node_route(
             )
         })?;
     let probe = node_queue::validate_new(&name, &backend, "probe", &cwd, None, None, None, None, None, None)?;
-    node_queue::accepting_node(tx, &probe)?;
+    node_queue::accepting_node(tx, cfg, &probe)?;
     Ok((row, backend, cwd))
 }
 
@@ -688,7 +689,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             };
             let route = match &node {
                 None => None,
-                Some(n) => Some(node_route(tx, n, &ag, a.backend.as_deref(), &task)?),
+                Some(n) => Some(node_route(tx, hub.cfg(), n, &ag, a.backend.as_deref(), &task)?),
             };
             let run_id = derive_run_id(tx, tid, &ag)?;
             let (prompt, source) = match &a.prompt {

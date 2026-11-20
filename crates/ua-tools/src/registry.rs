@@ -148,11 +148,14 @@ impl Registry {
     }
 
     /// The tools `caller` can see. Profile filtering applies only when the
-    /// caller's session enforces it; legacy aliases are then hidden too.
+    /// caller's session enforces it; legacy aliases are then hidden too. A
+    /// session-credential request sees only its grant's tools.
     pub fn visible_to<'a>(&'a self, caller: &'a Caller) -> impl Iterator<Item = &'a ToolDef> + 'a {
+        let grant = crate::grant::current();
         self.tools.values().filter(move |t| {
-            !caller.enforce_profile
-                || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name))
+            grant.as_ref().is_none_or(|g| g.allows_tool(t.name))
+                && (!caller.enforce_profile
+                    || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name)))
         })
     }
 
@@ -161,6 +164,15 @@ impl Registry {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
+
+        // A session credential's grant is the outer limit: no profile,
+        // policy or approval can widen it.
+        if let Some(g) = crate::grant::current()
+            && let Err(err) = g.check(name, &args)
+        {
+            record_decision(hub, caller, name, &err).await;
+            return Err(err);
+        }
 
         // The policy file is read once per call (cached by mtime). A file that
         // cannot be loaded refuses the call below, after the profile check.

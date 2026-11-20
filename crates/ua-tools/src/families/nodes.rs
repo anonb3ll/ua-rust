@@ -121,7 +121,9 @@ const HEARTBEAT_KEYS: [&str; 5] = ["code_sha", "harness_config", "native_session
 const SHED_ORDER: [&str; 4] = ["native_sessions", "repos", "worktree_roots", "harnesses"];
 /// Protocol features this hub serves to nodes, returned at registration.
 /// `node_code_sha`: heartbeats may carry a `code_sha` fact.
-const HUB_FEATURES: [&str; 1] = ["node_code_sha"];
+/// `acp_session_mcp`: the hub mints session credentials for ACP items (code
+/// support; whether it is switched on is checked per call).
+const HUB_FEATURES: [&str; 2] = ["node_code_sha", super::node_queue::credentials::FEATURE];
 
 /// Lists the ids of queued or claimed work items assigned to a node.
 pub(crate) type OpenWork = fn(&Connection, &str) -> UaResult<Vec<String>>;

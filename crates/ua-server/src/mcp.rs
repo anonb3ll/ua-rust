@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use ua_core::Caller;
 use ua_core::identity::Transport;
 use ua_tools::ToolDef;
+use ua_tools::grant::{self, SessionGrant};
 
 use crate::AppState;
 use crate::auth::{AuthIdentity, LOCAL_LABEL, caller_for, session_key};
@@ -50,9 +51,19 @@ impl UaMcp {
             label: LOCAL_LABEL.into(),
             kind: ua_core::ActorKind::Anonymous,
             verified: false,
+            grant: None,
         });
         let key = parts.and_then(|p| session_key(&p.headers));
         caller_for(&self.state, &id, key, Transport::Mcp)
+    }
+
+    /// The session-credential grant of this request, if it carries one.
+    fn grant(&self, ctx: &RequestContext<RoleServer>) -> Option<Arc<SessionGrant>> {
+        if self.fixed_caller.is_some() {
+            return None;
+        }
+        let parts = ctx.extensions.get::<axum::http::request::Parts>();
+        parts.and_then(|p| p.extensions.get::<AuthIdentity>()).and_then(|id| id.grant.clone())
     }
 }
 
@@ -79,7 +90,10 @@ impl ServerHandler for UaMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let caller = self.caller(&ctx);
-        let tools = self.state.registry.visible_to(&caller).map(to_mcp_tool).collect();
+        let registry = &self.state.registry;
+        let tools =
+            grant::scope(self.grant(&ctx), async { registry.visible_to(&caller).map(to_mcp_tool).collect() })
+                .await;
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -90,7 +104,8 @@ impl ServerHandler for UaMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let caller = self.caller(&ctx);
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
-        let result = self.state.registry.call(&self.state.hub, &caller, &request.name, args).await;
+        let call = self.state.registry.call(&self.state.hub, &caller, &request.name, args);
+        let result = grant::scope(self.grant(&ctx), call).await;
         Ok(match result {
             Ok(v) => CallToolResult::structured(v),
             Err(e) => CallToolResult::structured_error(e.to_json()),
