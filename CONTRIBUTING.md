@@ -49,6 +49,47 @@ scripts/vocab-check.sh
 CI runs the full suite. Commit messages: imperative subject, a short body
 saying what and why.
 
+## Cloud Build CI
+
+`scripts/cloud-ci.sh` runs the `check` and `vocab` jobs of
+`.github/workflows/ci.yml` for one exact commit on Google Cloud Build and posts
+the results as GitHub commit statuses. GitHub Actions stays the primary CI
+(its minutes are free for this public repository and it runs the macOS
+dispatch job); Cloud Build is an additional runner for a pinned head.
+
+```sh
+UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh <pr-number | branch | sha>
+```
+
+- It uploads a one-commit checkout of the resolved head, submits
+  `deploy/cloudbuild/ci.yaml` from your checkout, waits for the build, and
+  posts `CI / vocab`, `CI / check` and `CI / full-verification`. Each status
+  names the build and links to its log. A PR number or branch resolves to the
+  head GitHub has, so push first.
+- `UA_CI_GCP_PROJECT` is required; no default project is assumed.
+  `UA_CI_GCP_REGION` defaults to `us-central1`, `UA_CI_REPO` to the current
+  repository. `UA_CI_NO_STATUS=1` posts nothing (the build still runs and is
+  billed).
+- Needs `git`, `gcloud` (allowed to submit builds in the project), `gh`
+  (allowed to write commit statuses) and GNU `timeout`. Statuses are posted
+  from your machine; no GitHub credential enters the build.
+- If the watcher is interrupted, do not resubmit. Re-attach to the same build,
+  which posts its final statuses without starting another:
+
+  ```sh
+  UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh --reconcile <build-id> <pr-number | branch | sha>
+  ```
+
+- An older build never overwrites a newer run's statuses: the script compares
+  build creation times and refuses, posting nothing, when a context holds a
+  status from a run it cannot prove older.
+- The `vocab` step reads private patterns from the Secret Manager secret
+  `ua-rust-vocab-denylist` (newline-separated extended regexes, the same
+  format as the `VOCAB_DENYLIST` Actions secret) when it exists in the build's
+  project, and needs the build's service account to be able to read it.
+  Without the secret it checks the generic patterns only and says so in the
+  log.
+
 ## Privacy
 
 This repository is public. No personal names, e-mail addresses, home
