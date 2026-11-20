@@ -57,6 +57,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Resolve a presented static or managed token to an identity label.
+/// Blocking: it reads `agent_tokens`.
 pub fn lookup_token(state: &AppState, token: &str) -> Option<String> {
     let presented = token.as_bytes();
     let mut found = None;
@@ -99,8 +100,16 @@ fn retired(state: &AppState, label: &str) -> bool {
 
 /// Resolve any bearer credential for a request to `path`. A retired agent
 /// identity resolves to nothing, whichever credential it presents (a static
-/// token in configuration cannot be revoked any other way).
-pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthIdentity> {
+/// token in configuration cannot be revoked any other way). The lookups
+/// (managed tokens, OAuth tokens, agent lifecycle) run off the async runtime.
+pub async fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthIdentity> {
+    let (state, token, path) = (state.clone(), token.to_string(), path.to_string());
+    tokio::task::spawn_blocking(move || resolve_bearer_blocking(&state, &token, &path)).await.ok().flatten()
+}
+
+/// [`resolve_bearer`] for code already off the async runtime: it reads the
+/// database on the calling thread.
+pub fn resolve_bearer_blocking(state: &AppState, token: &str, path: &str) -> Option<AuthIdentity> {
     // A session credential is never a static, managed or OAuth token.
     if credentials::is_session_token(token) {
         return None;
@@ -193,13 +202,13 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
             Err(resp) => return *resp,
         }
     } else if let Some(tok) = bearer(req.headers()) {
-        match resolve_bearer(&state, tok, &path) {
+        match resolve_bearer(&state, tok, &path).await {
             Some(id) => id,
             None if public => anonymous(),
             None => return unauthorized(&state, Some("invalid_token"), "invalid token"),
         }
     } else if let Some(session) =
-        cookie_scope.then(|| login::session_from_headers(&state, req.headers())).flatten()
+        if cookie_scope { login::session_from_headers(&state, req.headers()).await } else { None }
     {
         if login::is_unsafe(req.method()) {
             let provided = req.headers().get(CSRF_HEADER).and_then(|v| v.to_str().ok());

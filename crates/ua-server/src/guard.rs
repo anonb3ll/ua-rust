@@ -1,9 +1,13 @@
 //! Browser-facing request guard for `/api` and `/ui`.
 //!
-//! - DNS rebinding: a request whose `Host` is neither in `allowed_hosts` nor
-//!   the host of `public_url` is refused, and each refused host is logged
-//!   once at warn level. (A request with no `Host` header cannot come from a
-//!   browser and is let through.)
+//! - DNS rebinding: a request naming a host that is neither in
+//!   `allowed_hosts` nor the host of `public_url` is refused, and each
+//!   refused host is logged once at warn level. The names checked are the
+//!   `Host` header and the request target's authority: HTTP/2 carries the
+//!   host in the `:authority` pseudo-header (`uri().authority()`) and may
+//!   send no `Host` at all, and an HTTP/1.1 absolute-form target carries one
+//!   too. Every name present must be allowed. (A request naming no host
+//!   cannot come from a browser and is let through.)
 //! - CSRF on the JSON API: a state-changing `/api` request must not be
 //!   cross-site (`Sec-Fetch-Site`, `Origin`), and a body must be sent as
 //!   `application/json`, which a cross-site page cannot do without a CORS
@@ -14,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -30,15 +34,21 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// `host[:port]` or `[v6]:port` without the port, lower-cased.
+/// `host[:port]` or `[v6]:port` without the port, lower-cased, without the
+/// trailing dot of a fully qualified name (`hub.example.com.` names the same
+/// host as `hub.example.com`).
 fn host_only(raw: &str) -> String {
     let raw = raw.trim().to_ascii_lowercase();
     if let Some(rest) = raw.strip_prefix('[') {
         return rest.split(']').next().unwrap_or("").to_string();
     }
-    match raw.rsplit_once(':') {
+    let host = match raw.rsplit_once(':') {
         Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => h.to_string(),
         _ => raw,
+    };
+    match host.strip_suffix('.') {
+        Some(h) if !h.is_empty() && !h.ends_with('.') => h.to_string(),
+        _ => host,
     }
 }
 
@@ -47,10 +57,32 @@ fn refuse(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-pub fn host_allowed(allowed: &[String], h: &HeaderMap) -> bool {
-    let Some(host) = header_str(h, header::HOST.as_str()) else { return true };
-    let host = host_only(host);
-    allowed.iter().any(|a| host_only(a) == host)
+/// Every host the request names: its `Host` header and its target's
+/// authority (HTTP/2 `:authority`, or an absolute-form HTTP/1.1 target).
+fn named_hosts<'a>(h: &'a HeaderMap, uri: &'a Uri) -> Vec<&'a str> {
+    let mut named = Vec::with_capacity(2);
+    if let Some(host) = header_str(h, header::HOST.as_str()) {
+        named.push(host);
+    }
+    if let Some(authority) = uri.authority() {
+        named.push(authority.host());
+    }
+    named
+}
+
+/// Whether every host the request names is allowed. A request naming none
+/// (not a browser) passes.
+pub fn host_allowed(allowed: &[String], h: &HeaderMap, uri: &Uri) -> bool {
+    named_hosts(h, uri).into_iter().all(|host| {
+        let host = host_only(host);
+        allowed.iter().any(|a| host_only(a) == host)
+    })
+}
+
+/// `host[:port]` the request was sent to, for comparing with `Origin`: the
+/// `Host` header, else the HTTP/2 `:authority`.
+pub(crate) fn request_authority<'a>(h: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    header_str(h, header::HOST.as_str()).or_else(|| uri.authority().map(|a| a.as_str()))
 }
 
 /// `allowed_hosts` plus the host of `public_url`, when it is set.
@@ -76,12 +108,12 @@ fn first_refusal(host: &str) -> bool {
     seen.insert(host.to_string())
 }
 
-fn same_origin(h: &HeaderMap) -> bool {
+fn same_origin(h: &HeaderMap, uri: &Uri) -> bool {
     if header_str(h, "sec-fetch-site") == Some("cross-site") {
         return false;
     }
     let Some(origin) = header_str(h, header::ORIGIN.as_str()) else { return true };
-    let Some(host) = header_str(h, header::HOST.as_str()) else { return false };
+    let Some(host) = request_authority(h, uri) else { return false };
     origin == format!("http://{host}") || origin == format!("https://{host}")
 }
 
@@ -107,13 +139,9 @@ pub async fn protect(State(state): State<AppState>, req: Request, next: Next) ->
         return next.run(req).await;
     }
     let h = req.headers();
-    if !host_allowed(&effective_allowed_hosts(state.hub.cfg()), h) {
-        let host: String = header_str(h, header::HOST.as_str())
-            .unwrap_or("")
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(255)
-            .collect();
+    if !host_allowed(&effective_allowed_hosts(state.hub.cfg()), h, req.uri()) {
+        let host: String =
+            named_hosts(h, req.uri()).join(" ").chars().filter(|c| !c.is_control()).take(255).collect();
         if first_refusal(&host) {
             tracing::warn!(host = %host, "refused a request for a host outside allowed_hosts and public_url; \
                 add it to allowed_hosts if this hub is reached by that name (logged once per host)");
@@ -122,7 +150,7 @@ pub async fn protect(State(state): State<AppState>, req: Request, next: Next) ->
     }
     let safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     if api && !safe {
-        if !same_origin(h) {
+        if !same_origin(h, req.uri()) {
             return refuse(StatusCode::FORBIDDEN, "cross-site request");
         }
         if has_body(h) && !is_json(h) {
@@ -140,6 +168,7 @@ mod tests {
     fn host_matching_ignores_port_and_case() {
         let allowed = vec!["localhost".to_string(), "127.0.0.1".into(), "::1".into()];
         let mut h = HeaderMap::new();
+        let uri = Uri::from_static("/api/whoami");
         for (host, ok) in [
             ("localhost:8765", true),
             ("LOCALHOST", true),
@@ -149,7 +178,7 @@ mod tests {
             ("localhost.evil.example.com:8765", false),
         ] {
             h.insert(header::HOST, host.parse().unwrap());
-            assert_eq!(host_allowed(&allowed, &h), ok, "{host}");
+            assert_eq!(host_allowed(&allowed, &h, &uri), ok, "{host}");
         }
     }
 
@@ -159,12 +188,75 @@ mod tests {
         cfg.public_url = Some("https://hub.example.com".into());
         let allowed = effective_allowed_hosts(&cfg);
         let mut h = HeaderMap::new();
+        let uri = Uri::from_static("/api/whoami");
         h.insert(header::HOST, "hub.example.com".parse().unwrap());
-        assert!(host_allowed(&allowed, &h));
+        assert!(host_allowed(&allowed, &h, &uri));
         h.insert(header::HOST, "other.example.com".parse().unwrap());
-        assert!(!host_allowed(&allowed, &h));
+        assert!(!host_allowed(&allowed, &h, &uri));
         cfg.public_url = Some("http://[::1]:8765".into());
         assert!(effective_allowed_hosts(&cfg).contains(&"::1".to_string()));
+    }
+
+    /// HTTP/2 names the host in `:authority` (the URI) and may send no
+    /// `Host`: the same allowlist applies. When both are present, both must
+    /// be allowed.
+    #[test]
+    fn the_http2_authority_is_checked_like_host() {
+        let allowed = vec!["localhost".to_string(), "::1".into(), "hub.example.com".into()];
+        let none = HeaderMap::new();
+        for (uri, ok) in [
+            ("https://hub.example.com/api/whoami", true),
+            ("https://hub.example.com:8443/ui", true),
+            ("http://[::1]:8765/ui", true),
+            ("https://rebound.example.net/api/whoami", false),
+            ("https://user@rebound.example.net/api/whoami", false),
+            ("/api/whoami", true),
+        ] {
+            assert_eq!(host_allowed(&allowed, &none, &uri.parse().unwrap()), ok, "{uri}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "hub.example.com".parse().unwrap());
+        let rebound: Uri = "https://rebound.example.net/api/whoami".parse().unwrap();
+        assert!(!host_allowed(&allowed, &h, &rebound), "an allowed Host does not excuse the authority");
+        h.insert(header::HOST, "rebound.example.net".parse().unwrap());
+        let good: Uri = "https://hub.example.com/api/whoami".parse().unwrap();
+        assert!(!host_allowed(&allowed, &h, &good), "an allowed authority does not excuse the Host");
+        // Origin comparison uses the authority when there is no Host header.
+        let mut o = HeaderMap::new();
+        o.insert(header::ORIGIN, "https://hub.example.com".parse().unwrap());
+        assert!(same_origin(&o, &good));
+        o.insert(header::ORIGIN, "https://rebound.example.net".parse().unwrap());
+        assert!(!same_origin(&o, &good));
+    }
+
+    /// Edge cases: a trailing dot names the same host (only one dot), case
+    /// does not matter in `:authority` either, and an allowed IPv6
+    /// `:authority` does not excuse a `Host` naming another host.
+    #[test]
+    fn host_edge_cases() {
+        let allowed = vec!["hub.example.com".to_string(), "::1".into()];
+        let none = HeaderMap::new();
+        for (uri, ok) in [
+            ("https://hub.example.com./api/whoami", true),
+            ("https://hub.example.com../api/whoami", false),
+            ("https://HUB.Example.COM:8443/api/whoami", true),
+            ("https://REBOUND.example.net/api/whoami", false),
+            ("http://[::1]:8765/api/whoami", true),
+            ("http://[::2]:8765/api/whoami", false),
+        ] {
+            assert_eq!(host_allowed(&allowed, &none, &uri.parse().unwrap()), ok, "{uri}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "HUB.EXAMPLE.COM.:443".parse().unwrap());
+        assert!(host_allowed(&allowed, &h, &Uri::from_static("/api/whoami")));
+        h.insert(header::HOST, "rebound.example.net".parse().unwrap());
+        let v6: Uri = "http://[::1]:8765/api/whoami".parse().unwrap();
+        assert!(!host_allowed(&allowed, &h, &v6), "an allowed IPv6 authority does not excuse the Host");
+        h.insert(header::HOST, "[::1]:8765".parse().unwrap());
+        assert!(host_allowed(&allowed, &h, &v6));
+        // An allowlist entry written with a trailing dot matches too.
+        let dotted = vec!["hub.example.com.".to_string()];
+        assert!(host_allowed(&dotted, &none, &"https://hub.example.com/".parse().unwrap()));
     }
 
     #[test]

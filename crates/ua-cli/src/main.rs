@@ -177,8 +177,141 @@ fn confirm_on_tty(label: &str) -> bool {
     std::io::stdin().lock().read_line(&mut line).is_ok() && line.trim() == label
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// How long a shutdown waits for open connections and background tasks.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for SIGINT (Ctrl-C) or, on Unix, SIGTERM (service managers,
+/// containers). Returns the signal's name.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; only Ctrl-C stops the hub gracefully");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term => "SIGTERM",
+    }
+}
+
+/// How long the runtime waits, after the drain, for tasks still running
+/// (blocking work included) before the process exits.
+const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Serve until `ct` is cancelled (or the server stops on its own), then
+/// drain everything at once against one deadline ([`SHUTDOWN_GRACE`]):
+/// - the HTTP server's open requests (event streams and MCP sessions end on
+///   the token);
+/// - MCP tool calls in flight ([`AppState::calls`]);
+/// - dispatch runs: they may finish until shortly before the deadline, then
+///   each child's process group gets SIGTERM, then SIGKILL, and the run is
+///   recorded `retryable` with a `hub_shutdown` receipt;
+/// - the background loops (stopped between ticks; aborted at the deadline).
+///
+/// Then the WAL is checkpointed and truncated.
+async fn serve_until_shutdown(
+    state: AppState,
+    ct: CancellationToken,
+    background: Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let (hub, calls) = (state.hub.clone(), state.calls.clone());
+    let server = ua_server::serve_http(state, ct.clone());
+    tokio::pin!(server);
+    let ended = tokio::select! {
+        r = &mut server => Some(r),
+        _ = ct.cancelled() => None,
+    };
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    // The server stopped by itself (a bind error): stop everything else too.
+    ct.cancel();
+    let http = async {
+        match ended {
+            Some(r) => r,
+            None => match tokio::time::timeout_at(deadline, &mut server).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(
+                        grace_s = SHUTDOWN_GRACE.as_secs(),
+                        "connections still open after the grace period; closing them"
+                    );
+                    Ok(())
+                }
+            },
+        }
+    };
+    let mcp_calls = async {
+        calls.close();
+        if tokio::time::timeout_at(deadline, calls.wait()).await.is_err() {
+            tracing::warn!(open = calls.len(), "MCP tool calls still running after the grace period");
+        }
+    };
+    let loops = async {
+        let mut abandoned = 0;
+        for task in background {
+            let abort = task.abort_handle();
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                abort.abort();
+                abandoned += 1;
+            }
+        }
+        if abandoned > 0 {
+            tracing::warn!(abandoned, "background tasks still running after the grace period were stopped");
+        }
+    };
+    let (served, (), (), runs) = tokio::join!(
+        http,
+        mcp_calls,
+        loops,
+        ua_tools::families::dispatch::executor::drain_supervisors(deadline)
+    );
+    if runs.stopped > 0 || runs.unfinished > 0 {
+        tracing::info!(
+            stopped = runs.stopped,
+            unfinished = runs.unfinished,
+            "dispatch runs stopped for the shutdown (recorded retryable, hub_shutdown)"
+        );
+    }
+    match tokio::task::spawn_blocking(move || hub.db().checkpoint_truncate()).await {
+        Ok(Ok((false, _, done))) => {
+            tracing::info!(checkpointed_frames = done, "WAL checkpointed and truncated")
+        }
+        Ok(Ok((true, log, done))) => {
+            tracing::warn!(
+                wal_frames = log,
+                checkpointed_frames = done,
+                "WAL checkpoint incomplete: a reader was busy"
+            )
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "WAL checkpoint failed"),
+        Err(e) => tracing::warn!(error = %e, "WAL checkpoint task failed"),
+    }
+    tracing::info!("hub stopped");
+    served
+}
+
+/// Build the runtime, run the command, then give the runtime
+/// [`RUNTIME_SHUTDOWN`] for what is still running. The shared hub lock is
+/// released only after that, so an import cannot start while this process's
+/// tasks may still write.
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let mut hub_lock = None;
+    let result = rt.block_on(run(&mut hub_lock));
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN);
+    drop(hub_lock);
+    result
+}
+
+async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
     {
@@ -209,16 +342,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Every command that opens the hub holds a shared lock while it runs, so an
     // import (which takes it exclusively) refuses while any of them is live.
-    let _hub_lock = ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?;
+    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
-    let state = AppState { hub: hub.clone(), registry: registry.clone() };
+    let state = AppState::new(hub.clone(), registry.clone());
 
     match cli.cmd {
         Cmd::Serve => {
             warn_if_locked_out(&state).await;
+            // One token for the server and every background loop: a signal
+            // cancels it, then `serve_until_shutdown` drains them.
+            let ct = CancellationToken::new();
+            let mut background = Vec::new();
             if cfg.routines_enabled {
-                tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone()));
+                background
+                    .push(tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone(), ct.clone())));
             }
             if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
                 tracing::warn!("{w}");
@@ -248,20 +386,43 @@ async fn main() -> anyhow::Result<()> {
             // sweeping. Only the server reaps: a short-lived `ua call` or a
             // stdio session must not judge another process's children.
             ua_tools::families::dispatch::startup_sweep(&hub).await;
-            let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
+            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
             // Expire waits and lapsed node leases, and retry owed command
             // notices, for every node.
-            let _node_sweeper = ua_tools::families::node_queue::spawn_sweeper(&hub);
+            background.extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
             // Poll the bound repositories' open pull requests when no webhook
             // can reach this hub (github_poll_interval_s; 0 = off).
-            let _github_poller = ua_tools::families::github::spawn_poller(&hub);
-            let ct = CancellationToken::new();
-            let ct2 = ct.clone();
+            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+            // Routine fires a previous process left mid-workflow or unstarted.
+            let h = hub.clone();
+            background.push(tokio::spawn(async move {
+                match ua_tools::families::routines::reconcile_fires(&h).await {
+                    Ok(v) => {
+                        let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+                        if n("interrupted") + n("not_run") + n("rerun") > 0 {
+                            tracing::info!(
+                                interrupted = n("interrupted"),
+                                not_run = n("not_run"),
+                                rerun = n("rerun"),
+                                "reconciled routine fires"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "could not reconcile routine fires"),
+                }
+            }));
+            let signal_ct = ct.clone();
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                ct2.cancel();
+                let which = shutdown_signal().await;
+                tracing::info!(signal = which, "shutting down: draining connections and background tasks");
+                signal_ct.cancel();
+                // A second signal does not wait for the drain.
+                let again = shutdown_signal().await;
+                let killed = ua_tools::families::dispatch::executor::kill_live_groups();
+                tracing::warn!(signal = again, killed_run_groups = killed, "second signal: exiting now");
+                std::process::exit(if again == "SIGTERM" { 143 } else { 130 });
             });
-            ua_server::serve_http(state, ct).await?;
+            serve_until_shutdown(state, ct, background).await?;
         }
         Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
         Cmd::Tools { names } => {

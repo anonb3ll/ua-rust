@@ -44,10 +44,10 @@ pub enum GateOutcome {
     Denied { approval_id: i64, reason: Option<String> },
 }
 
-/// Canonical text form of arguments: sorted keys, no whitespace.
+/// Canonical text form of arguments: sorted keys at every depth, no
+/// whitespace ([`ua_core::canonical`], independent of serde_json's map order).
 pub fn canonical_payload(args: &Value) -> String {
-    // serde_json's default map is ordered by key, so this is canonical.
-    serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+    ua_core::canonical::to_string(args)
 }
 
 pub(crate) fn pass_expired(cfg: &Config, resolved_at: Option<&str>) -> bool {

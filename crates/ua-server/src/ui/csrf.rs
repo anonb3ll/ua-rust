@@ -69,13 +69,14 @@ fn header_str<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// Refuse cross-site requests by `Sec-Fetch-Site` and `Origin`.
-fn check_origin(h: &HeaderMap) -> Result<(), &'static str> {
+/// Refuse cross-site requests by `Sec-Fetch-Site` and `Origin`. The host is
+/// the `Host` header, else the HTTP/2 `:authority`.
+fn check_origin(h: &HeaderMap, uri: &axum::http::Uri) -> Result<(), &'static str> {
     if header_str(h, "sec-fetch-site") == Some("cross-site") {
         return Err("cross-site request");
     }
     let Some(origin) = header_str(h, header::ORIGIN.as_str()) else { return Ok(()) };
-    let host = header_str(h, "x-forwarded-host").or_else(|| header_str(h, header::HOST.as_str()));
+    let host = header_str(h, "x-forwarded-host").or_else(|| crate::guard::request_authority(h, uri));
     let ok =
         host.is_some_and(|host| origin == format!("http://{host}") || origin == format!("https://{host}"));
     if ok { Ok(()) } else { Err("origin does not match this host") }
@@ -97,7 +98,7 @@ pub async fn protect(req: Request, next: Next) -> Response {
     let secure = is_https(&req);
     let mut req = req;
     if !safe {
-        if let Err(why) = check_origin(req.headers()) {
+        if let Err(why) = check_origin(req.headers(), req.uri()) {
             return refuse(why);
         }
         let Some(expected) = existing.clone() else { return refuse("missing CSRF cookie") };
@@ -159,14 +160,15 @@ mod tests {
 
     #[test]
     fn origin_must_match_host() {
+        let uri = axum::http::Uri::from_static("/ui/tasks");
         let mut h = HeaderMap::new();
         h.insert(header::HOST, HeaderValue::from_static("hub.example.com"));
         h.insert(header::ORIGIN, HeaderValue::from_static("https://hub.example.com"));
-        assert!(check_origin(&h).is_ok());
+        assert!(check_origin(&h, &uri).is_ok());
         h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.example.net"));
-        assert!(check_origin(&h).is_err());
+        assert!(check_origin(&h, &uri).is_err());
         h.remove(header::ORIGIN);
         h.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
-        assert!(check_origin(&h).is_err());
+        assert!(check_origin(&h, &uri).is_err());
     }
 }

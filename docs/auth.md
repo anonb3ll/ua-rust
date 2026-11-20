@@ -50,7 +50,10 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 
 `allowed_hosts` (default `localhost`, `127.0.0.1`, `::1`) lists the `Host`
 headers `/mcp`, `/api` and `/ui` answer, as protection against DNS
-rebinding. The host of `public_url` is always allowed as well, so a hub
+rebinding. An HTTP/2 request names its host in the `:authority`
+pseudo-header and may send no `Host`; `/api` and `/ui` check the authority
+against the same list, and when a request carries both, both must be
+allowed. The host of `public_url` is always allowed as well, so a hub
 reached only through its public name needs no entry. Add every other name
 the hub is reached by, for example:
 
@@ -190,6 +193,15 @@ Code: `crates/ua-server/src/login.rs`.
 | `POST /login/passkeys/register/start`, `/finish` | Passkey registration (session + CSRF header). |
 | `POST /logout` | Ends the session (CSRF token in the header or a `csrf` form field). |
 | `GET /api/session` | The CSRF helper (below). |
+| `GET /login/assets/login.js`, `/login/assets/page.css` | The sign-in pages' script and style, public. |
+
+The sign-in, passkey and consent pages run no inline script or style. They
+send `Content-Security-Policy: default-src 'none'; script-src 'self';
+style-src 'self'; ...` with no `'unsafe-inline'`, load their script and
+stylesheet from the routes above, and pass values to the script in
+HTML-escaped `data-` attributes (`data-next`, `data-csrf`). The policy has no
+`form-action`: the consent form's answer redirects to the client's
+`redirect_uri`, which browsers check against `form-action`.
 
 **First sign-in on a fresh install.** There is no passkey yet. On the hub
 host run:
@@ -207,7 +219,13 @@ passkey on the page you land on.
 `ui_keys` table) and set with `HttpOnly; SameSite=Lax; Path=/` plus `Secure`
 unless `ui_cookie_secure` is off. It has no `Max-Age`; the server-side row
 bounds its life. Removing a label from `human_identities` ends its sessions at
-once.
+once. The hub keeps the key in memory and re-reads `ui_keys` at most once a
+minute, so reading a cookie does not query it. A sign-in always encrypts its
+new cookie with the key the table holds at that moment, and refreshes the
+cached copy. There is no rotation command: deleting the `ui_keys` row makes
+the hub create a new key, which signs every browser out within a minute (at
+once after a restart). Nothing in the hub deletes or replaces the row; code
+that ever does so in-process must call `CookieKeyCache::invalidate`.
 
 The cookie is `SameSite=Lax`, not `Strict`, on purpose. An MCP client starts
 OAuth by sending the browser from another site (the client's page or a

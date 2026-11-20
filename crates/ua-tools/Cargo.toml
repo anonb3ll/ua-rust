@@ -27,6 +27,8 @@ hex.workspace = true
 rand.workspace = true
 jiff.workspace = true
 tokio.workspace = true
+# CancellationToken: `ua serve` stops the background loops with one token.
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 globset = "0.4"
 ignore = "0.4"
@@ -95,7 +97,6 @@ tempfile.workspace = true
 axum = "0.8.9"
 # The fake downstream MCP server in tests/mcp_gateway.rs.
 rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
-tokio-util = "0.7"
 
 # Runs its own small harness so the test binary can double as the fake stdio
 # MCP server it spawns (libtest would write to the child's stdout first). It
