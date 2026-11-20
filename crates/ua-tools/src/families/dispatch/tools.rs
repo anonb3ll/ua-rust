@@ -16,7 +16,7 @@ use super::{
 };
 use crate::approvals::{self, GateOutcome};
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
-use crate::families::{governance, node_queue};
+use crate::families::{governance, node_queue, provider_accounts};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -348,8 +348,14 @@ fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
 /// payload is the binding resolved from them.
 const ARG_KEYS: [&str; 8] =
     ["task_id", "agent", "harness", "prompt", "lease_seconds", "node", "backend", "node_timeout_s"];
-const BOUND_KEYS: [&str; 12] = [
+const BOUND_KEYS: [&str; 18] = [
     "node_cwd",
+    "env",
+    "env_denylist",
+    "path_prepend",
+    "stdin",
+    "provider_account",
+    "rerouted_from",
     "run_id",
     "workdir",
     "argv",
@@ -380,6 +386,24 @@ fn harness_binding(
     m.insert("output_cap_bytes".into(), json!(harness.map(|(_, h)| h.output_cap_bytes)));
     if harness.is_some_and(|(_, h)| h.pass_agent_token) {
         m.insert("passes_token_of".into(), json!(agent));
+    }
+    // Launch settings an approver must see, bound only when a harness sets them.
+    if let Some((_, h)) = harness {
+        if !h.env.is_empty() {
+            m.insert("env".into(), json!(h.env));
+        }
+        if !h.env_denylist.is_empty() {
+            m.insert("env_denylist".into(), json!(h.env_denylist));
+        }
+        if !h.path_prepend.is_empty() {
+            m.insert("path_prepend".into(), json!(h.path_prepend));
+        }
+        if let Some(t) = &h.stdin {
+            m.insert("stdin".into(), json!(t));
+        }
+        if let Some(a) = &h.provider_account {
+            m.insert("provider_account".into(), json!(a));
+        }
     }
     m
 }
@@ -472,10 +496,22 @@ fn stale_pass(
 }
 
 enum Gated {
-    Run { run_id: String, prompt: String, workdir: Option<PathBuf> },
+    Run {
+        run_id: String,
+        prompt: String,
+        workdir: Option<PathBuf>,
+        harness: Box<Option<(String, ua_core::config::HarnessConfig)>>,
+        rerouted_from: Option<Value>,
+    },
     Routed(Value),
-    Pending { approval_id: i64, stale: Option<(i64, Vec<String>)> },
-    Denied { approval_id: i64, reason: Option<String> },
+    Pending {
+        approval_id: i64,
+        stale: Option<(i64, Vec<String>)>,
+    },
+    Denied {
+        approval_id: i64,
+        reason: Option<String>,
+    },
 }
 
 /// The node a run is routed to: registered, in service, owned by the run's
@@ -673,6 +709,15 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 str_field(&task, "notes").unwrap_or_default(),
             )?;
             let notes = work_order.unwrap_or_else(|| str_field(&task, "notes").unwrap_or_default().to_string());
+            // The harness's provider account must be able to take the run;
+            // with provider_fallback another harness of the provider may.
+            let (h2, rerouted_from) = match h2 {
+                None => (None, None),
+                Some((name, h)) => {
+                    let (name, h, from) = provider_accounts::select_harness(tx, hub.cfg(), name, h)?;
+                    (Some((name, h)), from)
+                }
+            };
             let workdir = match &h2 {
                 None => None,
                 Some((name, h)) => {
@@ -714,6 +759,9 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             if let Some(o) = payload.as_object_mut() {
                 o.extend(harness_binding(h2.as_ref(), workdir.as_deref(), &ag));
             }
+            if let Some(from) = &rerouted_from {
+                payload["rerouted_from"] = from.clone();
+            }
             if let Some((row, backend, cwd)) = &route {
                 payload["node"] = json!(row.node);
                 payload["backend"] = json!(backend);
@@ -747,8 +795,9 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let ts = now();
             tx.execute(
                 "INSERT INTO dispatch_runs (run_id, task_id, agent_label, harness, state, actor, lease_owner, \
-                 lease_expires_at, attempt, fence, workdir, prompt, prompt_sha256, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'claimed', ?5, ?5, ?6, 1, 1, ?7, ?8, ?9, ?10, ?10)",
+                 lease_expires_at, attempt, fence, workdir, prompt, prompt_sha256, created_at, updated_at, \
+                 provider_account) \
+                 VALUES (?1, ?2, ?3, ?4, 'claimed', ?5, ?5, ?6, 1, 1, ?7, ?8, ?9, ?10, ?10, ?11)",
                 params![
                     run_id,
                     tid,
@@ -759,7 +808,8 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     payload["workdir"].as_str(),
                     prompt,
                     prompt_sha,
-                    ts
+                    ts,
+                    payload["provider_account"].as_str(),
                 ],
             )?;
             bind_task(tx, tid, &run_id, &ag, &lease_at)?;
@@ -769,11 +819,13 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
                 return Ok(Gated::Routed(out));
             }
-            Ok(Gated::Run { run_id, prompt, workdir })
+            Ok(Gated::Run { run_id, prompt, workdir, harness: Box::new(h2), rerouted_from })
         })
         .await?;
-    let (run_id, prompt, workdir) = match gated {
-        Gated::Run { run_id, prompt, workdir } => (run_id, prompt, workdir),
+    let (run_id, prompt, workdir, harness, rerouted_from) = match gated {
+        Gated::Run { run_id, prompt, workdir, harness, rerouted_from } => {
+            (run_id, prompt, workdir, *harness, rerouted_from)
+        }
         Gated::Routed(mut out) => {
             out["task_id"] = json!(tid);
             out["agent_label"] = json!(agent);
@@ -821,6 +873,9 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         o.insert("task_id".into(), json!(tid));
         o.insert("agent_label".into(), json!(agent));
         o.entry("fence").or_insert(json!(1));
+        if let Some(from) = rerouted_from {
+            o.insert("rerouted_from".into(), from);
+        }
     }
     Ok(out)
 }
@@ -1085,8 +1140,13 @@ fn resume_refusal(run: &super::Run) -> Option<String> {
 /// An approval recorded before `timeout_s` and `output_cap_bytes` were bound
 /// lacks them, so it counts as changed and such a run must be dispatched
 /// again: the approver never saw those limits.
-const RESUME_BOUND_KEYS: [&str; 8] = [
+const RESUME_BOUND_KEYS: [&str; 13] = [
     "harness",
+    "env",
+    "env_denylist",
+    "path_prepend",
+    "stdin",
+    "provider_account",
     "workdir",
     "argv",
     "env_allowlist",
@@ -1193,6 +1253,11 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
             let binding = check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
+            // A resume runs what was approved: it is refused, never rerouted,
+            // while the harness's provider account cannot take a run.
+            if let Some((name, h)) = &h2 {
+                provider_accounts::check_available(tx, name, h)?;
+            }
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
             // A resumed attempt is new work: the one claim gate applies, and
@@ -1385,6 +1450,8 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
         "approval_id": approval.map(|(id, _)| id),
         "evidence_ref": get("evidence_ref"),
         "failure_reason": get("failure_reason"),
+        "failure_class": get("failure_class"),
+        "provider_account": get("provider_account"),
         "termination_outcome": get("termination_outcome"),
         "cancelled_by": get("cancelled_by"),
         "final_task_state": task_state,

@@ -213,16 +213,88 @@ reason `voided: <why>` (an `acceptance_failed` event; a forgotten node's row
 is deleted), and the node runs acceptance again before real work. An
 identical re-registration (a restart) keeps it.
 
+## Idle-session wakes
+
+An agent session that sits idle at its prompt runs no hooks, so it does not
+see new mail until someone types. A wake has the node on the session's host
+type one fixed line into it: `You have <n> new hub messages; run
+message_inbox`. No message text ever reaches a wake; the hub hands the node
+ids and counts only.
+
+### Consent
+
+Three locks, all required. Each change is ledgered on `agent.wake.request`
+or `agent.wake.grant`.
+
+| Action (`coordination_manage`) | Who | What |
+|---|---|---|
+| `session_wake_opt_in` (params `session_id, wake?`) | The session's own agent | Ask for wakes (`wake` defaults to `true`), or withdraw the request (`false`), which clears any outstanding offer. A request alone enables nothing. |
+| `session_wake_grant` (params `session_id, grant?`) | A verified human only | Grant wakes to that one hub session, or revoke them (`grant = false`, clearing offers). A new session needs a new grant. |
+| `session_wake_decline` (params `session_id, reason?`) | A human, a lifecycle operator, or the session's own agent | Decline: revokes any grant and clears offers. The decline stays when the session asks again; only a later grant clears it. |
+| `session_wake_status` (params `session_id?`) | The session's agent or an operator | One session's state, or every session you may see with fleet counts (requested, granted, awaiting a grant, paused, woken). |
+
+A session is offered wakes only while it is opted in, granted, not declined,
+open, has an `external_session_id` (the harness's native id, which the node
+matches to a pane), and its agent is not paused, terminated or retired.
+
+### Delivery
+
+The node already holds an outbound channel to the hub, so wakes use it; the
+hub never connects to a node. The node's own host is its name: a session is
+on the node's host when the session's registered `host` and the node name
+match by short lowercase name (`Box.local` and `box` are one host).
+
+| Route | Tool | What |
+|---|---|---|
+| `POST /api/node/wake` | `node_wake` (`node, wait_s, offer_version, live_sessions?`) | Long-poll up to 30 seconds. `offer_version` must be `3`. Answers `{wakes: [{session_id, external_session_id, unread, newest_seq, expires_at, offer_id}]}`. |
+| `POST /api/node/wake/check` | `node_wake_check` (`node, session_id, seq, expires_at, offer_id`) | Right before typing: reserve the one attempt an offer allows. Answers `{session_id, valid, remaining_s}`; type only when `valid`, within `remaining_s`. |
+| `POST /api/node/wake/receipt` | `node_wake_receipt` (`node, session_id, seq, outcome, reason?, expires_at, offer_id, delivered_at?`) | Report `delivered` (with `delivered_at`, the node's unix time), `failed` or `skipped` (with a `reason` of 1-64 `[a-z0-9_:.-]`). Idempotent: a resend, or a receipt for an offer that lapsed or was superseded, answers `{recorded: false, duplicate: true}`. |
+
+Only the node's agent may call them; another agent's node is refused
+(`node_owned_elsewhere`). The registration's `hub_features` carry
+`node_wake_v3` and `node_wake_live_sessions`.
+
+`live_sessions` lists the native session ids that have a pane on the node's
+host (at most 64). It keeps idle granted sessions on that host open, since
+nothing else heartbeats them, and reopens one the reaper closed for lack of
+heartbeats; a session that ended any other way stays ended
+(`agent.wake.session_revived`).
+
+### The budget
+
+Gates, in the order the hub applies them on every poll:
+
+| Hold | Rule |
+|---|---|
+| `offer_outstanding` | An offer has no receipt yet and is younger than 120 seconds. |
+| `retry_wait` | A failed or skipped offer is retried 30 seconds later. |
+| `breaker` | 3 delivered wakes, or 3 reserved attempts, with no inbox read in between pause the session (`paused_reason = no_inbox_read`) until it reads its mail. |
+| `floor` | At least 600 seconds between wakes (delivered or attempted). |
+| `hourly_cap` | At most 6 wakes and 6 attempts per hour. |
+| `nothing_to_wake` | No unread trigger mail newer than the last woken set: a `request`, `query` or `handoff`, or any message with `expects_reply`. `inform` and `done` wait for the session's own hooks. |
+| `debounce` | The newest trigger message is under 20 seconds old and the oldest under 60. |
+
+`unread` is every unread message of the session, counted when the offer is
+made. An offer carries a random `offer_id`; a check or receipt must echo it,
+`newest_seq` and `expires_at` exactly, so a delayed answer to an old offer
+never counts for a new one. A check also re-verifies consent, the trigger
+mail and the budget, and is valid once per offer. A `delivered` receipt
+counts only when an attempt was reserved and `delivered_at` falls inside the
+offer (5 seconds of clock slack) and before any revocation. It advances the
+mail cursor and the floor. A `skipped` receipt with reason
+`delivery_uncertain` keeps the spent attempt and gives the mail set up. The
+final skips (`no_match`, `herdr_missing`, `input_state_unavailable`,
+`already_delivered`, `delivery_uncertain`) and the 20th retry of one mail set
+leave it to the session's hooks. Offers, attempts (`agent.wake.attempt`) and
+outcomes are ledgered on `agent.wake`.
+
+A client that hangs up mid-poll may leave an offer it never received; it
+lapses after 120 seconds and the session is offered again.
+
 ## Not yet ported
 
-These routes answer `501`:
-
-- the idle-session wake transport (`/api/node/wake`, `/wake/check`,
-  `/wake/receipt`);
-- the harness config bundle (`/api/node/config`).
-
-Resuming or adopting native sessions, provider accounts and the Pi backend
-are not ported either.
+The harness config bundle route (`/api/node/config`) answers `501`.
+Resuming or adopting native sessions is not ported either.
 
 ## Agent lifecycle and holds
 

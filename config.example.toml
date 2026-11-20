@@ -83,3 +83,26 @@ reviewer-1 = "reviewer"
 # Per-agent workspace roots, or "deny".
 [agent_workspaces]
 # researcher-1 = "deny"
+
+# Agent harnesses dispatch_task may start (see docs/dispatch.md). A harness
+# may name the provider account it bills (provider_account_register); dispatch
+# refuses it while that account is disabled or rate-limited, or, with
+# provider_fallback, runs another harness whose account has the same provider.
+# [harnesses.coder]
+# argv = ["agent-cli", "--print", "{prompt}"]
+# env_allowlist = ["PROVIDER_API_KEY"]
+# timeout_s = 3600
+# provider_account = "anthropic-team"
+# provider_fallback = false
+
+# Pi (pi.dev) in print mode on a subscription account. The provider and model
+# are pinned in argv so Pi never falls back to a settings default; metered keys
+# are denied even if the hub's environment holds them.
+# [harnesses.pi]
+# argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex",
+#         "--model", "gpt-5.5", "--no-session", "{prompt}"]
+# env_allowlist = ["OPENAI_API_KEY", "PI_API_KEY", "OPENROUTER_API_KEY"]
+# env_denylist = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+# path_prepend = ["~/.local/bin"]
+# timeout_s = 3600
+# provider_account = "pi-subscription"

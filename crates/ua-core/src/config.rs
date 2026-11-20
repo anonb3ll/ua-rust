@@ -284,6 +284,28 @@ pub struct HarnessConfig {
     /// `UA_AGENT_BEARER_TOKEN`, so the child can call `dispatch_report_self`.
     /// Off by default; no other agent's token is ever passed.
     pub pass_agent_token: bool,
+    /// Fixed environment values for the child, e.g. `{ PI_SKIP_VERSION_CHECK
+    /// = "1" }`. Values take the argv placeholders. A name in the hub's `UA_`
+    /// namespace, a hub secret or a binding name is never set.
+    pub env: BTreeMap<String, String>,
+    /// Names never passed to the child, even when inherited or listed in
+    /// `env_allowlist` or `env`: e.g. metered provider keys a subscription
+    /// CLI must not fall back to.
+    pub env_denylist: Vec<String>,
+    /// Directories put in front of the child's `PATH`, e.g. `~/.local/bin`.
+    pub path_prepend: Vec<PathBuf>,
+    /// Text written to the child's standard input, then closed. Takes the
+    /// argv placeholders plus `{prompt_json}` (the prompt as a JSON string).
+    /// Unset, standard input is empty.
+    pub stdin: Option<String>,
+    /// The provider account (`provider_account_register`) this harness bills.
+    /// `dispatch_task` refuses the harness while the account is disabled or
+    /// rate-limited, and records the account on the run.
+    pub provider_account: Option<String>,
+    /// When this harness's account is disabled or rate-limited, run the
+    /// first other harness (by name) whose account has the same provider and
+    /// is available, instead of refusing. Off by default.
+    pub provider_fallback: bool,
 }
 
 impl Default for HarnessConfig {
@@ -295,6 +317,12 @@ impl Default for HarnessConfig {
             output_cap_bytes: 1024 * 1024,
             workdir: None,
             pass_agent_token: false,
+            env: BTreeMap::new(),
+            env_denylist: Vec::new(),
+            path_prepend: Vec::new(),
+            stdin: None,
+            provider_account: None,
+            provider_fallback: false,
         }
     }
 }
@@ -462,6 +490,7 @@ impl Config {
         self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
         for h in self.harnesses.values_mut() {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
+            h.path_prepend = h.path_prepend.iter().map(|p| expand_tilde(p)).collect();
         }
         self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
         for t in &mut self.trusted_cargo_configs {
@@ -732,6 +761,34 @@ mod tests {
         let off = dir.path().join("off.toml");
         std::fs::write(&off, "dispatch_reaper_interval_s = 0\n").unwrap();
         assert_eq!(Config::load_inner(Some(&off), false).unwrap().dispatch_reaper_interval(), 0);
+    }
+
+    #[test]
+    fn a_pi_harness_table_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pi.toml");
+        std::fs::write(
+            &file,
+            r#"
+[harnesses.pi]
+argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex", "--model", "gpt-5.5", "{prompt}"]
+env_allowlist = ["OPENAI_API_KEY", "PI_API_KEY"]
+env_denylist = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+env = { PI_SKIP_VERSION_CHECK = "1" }
+path_prepend = ["~/.local/bin"]
+provider_account = "pi-subscription"
+provider_fallback = true
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        let h = &cfg.harnesses["pi"];
+        assert_eq!(h.env["PI_SKIP_VERSION_CHECK"], "1");
+        assert_eq!(h.env_denylist, vec!["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]);
+        assert_eq!(h.provider_account.as_deref(), Some("pi-subscription"));
+        assert!(h.provider_fallback);
+        assert!(h.stdin.is_none());
+        assert!(!h.path_prepend[0].to_string_lossy().starts_with('~'), "tilde expanded");
     }
 
     #[test]

@@ -210,8 +210,11 @@ async fn work_round_trips_through_the_device_plane() {
     let v = json_body(hub.send(get("/api/nodes", None, Some(OTHER))).await).await;
     assert_eq!(v["recent_items"][0]["item_id"], id, "{v}");
 
-    // Routes not built yet still say so.
+    // The wake poll needs the current offer protocol; the config bundle is
+    // not built yet and says so.
     let (status, v) = post(&hub, "/api/node/wake", Some(BUILDER), json!({ "node": "node-a" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let (status, v) = post(&hub, "/api/node/config", Some(BUILDER), json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{v}");
 }
 
@@ -273,4 +276,96 @@ async fn a_retired_agents_static_token_is_refused_until_it_is_unretired() {
     let (status, _) =
         post(&hub, "/api/node/heartbeat", Some(BUILDER), json!({ "node": "node-a", "running": null })).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_node_long_polls_checks_and_reports_a_wake_over_http() {
+    let hub = TestHub::new(config());
+    let (status, v) = post(&hub, "/api/node/register", Some(BUILDER), json!({ "node": "box" })).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v["hub_features"].as_array().unwrap().contains(&json!("node_wake_v3")), "{v}");
+
+    let as_caller = |label: &str, kind: ActorKind| Caller {
+        label: label.into(),
+        kind,
+        profile: Profile::Developer,
+        enforce_profile: true,
+        session_key: None,
+        transport: Transport::Http,
+    };
+    let (reg, h) = (&hub.state.registry, &hub.state.hub);
+    let session = reg
+        .call(
+            h,
+            &as_caller("builder-2", ActorKind::Agent),
+            "session_start",
+            json!({ "kind": "interactive", "external_session_id": "native-1", "host": "box.local" }),
+        )
+        .await
+        .unwrap();
+    let sid = session["session_id"].as_str().unwrap().to_string();
+    let manage = |action: &str| json!({ "action": action, "params": { "session_id": sid } });
+    reg.call(
+        h,
+        &as_caller("builder-2", ActorKind::Agent),
+        "coordination_manage",
+        manage("session_wake_opt_in"),
+    )
+    .await
+    .unwrap();
+    reg.call(
+        h,
+        &as_caller("operator", ActorKind::Human),
+        "coordination_manage",
+        manage("session_wake_grant"),
+    )
+    .await
+    .unwrap();
+    reg.call(
+        h,
+        &as_caller("builder-1", ActorKind::Agent),
+        "message_send",
+        json!({ "act": "request", "to_agent": "builder-2", "body": "look" }),
+    )
+    .await
+    .unwrap();
+    h.db()
+        .write(|tx| {
+            tx.execute_batch(
+                "UPDATE message_index SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-90 seconds')",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (status, v) = post(
+        &hub,
+        "/api/node/wake",
+        Some(BUILDER),
+        json!({ "node": "box", "wait_s": 0, "offer_version": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let offer = v["wakes"][0].clone();
+    assert_eq!(offer["session_id"], sid.as_str(), "{v}");
+    let echo = json!({
+        "node": "box", "session_id": sid, "seq": offer["newest_seq"],
+        "expires_at": offer["expires_at"], "offer_id": offer["offer_id"],
+    });
+    let (status, v) = post(&hub, "/api/node/wake/check", Some(BUILDER), echo.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["valid"], true);
+    let mut receipt = echo;
+    receipt["outcome"] = json!("delivered");
+    receipt["delivered_at"] = json!(ua_core::time::now_ms() as f64 / 1000.0);
+    let (status, v) = post(&hub, "/api/node/wake/receipt", Some(BUILDER), receipt.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["recorded"], true);
+    let (status, v) = post(&hub, "/api/node/wake/receipt", Some(BUILDER), receipt.clone()).await;
+    assert_eq!((status, v["duplicate"].clone()), (StatusCode::OK, json!(true)), "{v}");
+
+    // Another agent's token cannot speak for the node.
+    let (status, v) = post(&hub, "/api/node/wake/receipt", Some(OTHER), receipt).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "node_owned_elsewhere");
 }

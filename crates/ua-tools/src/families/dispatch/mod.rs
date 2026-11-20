@@ -134,8 +134,19 @@ CREATE TABLE IF NOT EXISTS dispatch_meta (
 ",
 };
 
+/// The provider account a run's harness bills, recorded at dispatch so an
+/// outcome can be observed against it.
+pub const SCHEMA_V3: SchemaPart = SchemaPart {
+    name: "dispatch.v3",
+    sql: "
+ALTER TABLE dispatch_runs ADD COLUMN provider_account TEXT;
+CREATE INDEX IF NOT EXISTS idx_dispatch_runs_provider_account ON dispatch_runs(provider_account, created_at)
+    WHERE provider_account IS NOT NULL;
+",
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA, SCHEMA_V2]
+    vec![SCHEMA, SCHEMA_V2, SCHEMA_V3]
 }
 
 pub fn register(r: &mut Registry) {
@@ -497,13 +508,19 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
     let reason = o.failure_reason.as_deref().map(|r| cap(r, 200));
     let class = match o.state {
         "finished" => None,
+        // A reported reason quoting a provider usage limit is quota evidence.
+        _ if o.failure_class.is_none()
+            && o.failure_reason.as_deref().is_some_and(super::provider_accounts::quota_signal) =>
+        {
+            Some(super::provider_accounts::QUOTA_CLASS.to_string())
+        }
         _ => Some(o.failure_class.clone().unwrap_or_else(|| "error".into())),
     };
     let mut edge = Edge::to(o.state)
         .null("lease_expires_at")
         .set("ended_at", now())
         .set_opt("failure_reason", reason.clone())
-        .set_opt("failure_class", class)
+        .set_opt("failure_class", class.clone())
         .set_opt("evidence_ref", o.evidence.clone());
     if let Some(u) = &o.usage {
         edge = edge.set("usage", u.to_string());
@@ -514,6 +531,7 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
     let ulid = record_transition(tx, o.run_id, o.state, o.actor, json!({ "source": o.source }))?;
     insert_receipt(tx, o.run_id, o.source, o.actor, ulid.as_deref())?;
     settle_task(tx, &run, o.state, o.evidence.as_deref())?;
+    super::provider_accounts::observe_outcome(tx, o.run_id, o.state, class.as_deref(), o.actor)?;
     Ok(json!({
         "ok": true,
         "run_id": o.run_id,
