@@ -59,6 +59,12 @@ htmd = "0.6"
 dom_query = "0.29"
 base64 = "0.22"
 url = "2.5"
+# Relay gates: Unicode properties (default-ignorable, unassigned, private
+# use), NFKC, and HTML entity decoding. All three were already in the tree
+# (url's IDNA support and dom_smoothie).
+icu_properties = { version = "2.4", default-features = false, features = ["compiled_data"] }
+icu_normalizer = { version = "2.4", default-features = false, features = ["compiled_data"] }
+html-escape = "0.2"
 encoding_rs = "0.8"
 toml = "0.8"
 tree-sitter = "0.27"

@@ -5,12 +5,17 @@
 //! ([`gates`]); a human approves the exact text and destination; only then is
 //! it sent ([`github`]). Actions:
 //!
-//! * `check`: run the gates only. Nothing is stored or recorded.
+//! * `check`: run the gates only. Needs an identity; nothing is stored, and
+//!   the ledger records the verdict and categories (never the text).
 //! * `draft`: run the gates and store the draft. A blocked draft is recorded
-//!   without its text.
+//!   without its text. `check` and `draft` together are limited to
+//!   `relay_checks_per_hour` runs per caller, so the private denylist cannot
+//!   be probed term by term.
 //! * `request_send`: re-run the gates under the current configuration, check
 //!   the destination and credential, and park a human approval bound to the
-//!   draft id, channel, target and exact text.
+//!   draft id, channel, target and exact text. The approval record holds the
+//!   text (and an escaped view of it) only while it is pending: once it is
+//!   decided, only the SHA-256, sizes and link hosts remain.
 //! * `send`: the requester repeats the exact text. Refused unless it matches
 //!   the stored text byte for byte, the stored draft still matches what the
 //!   approval bound, and the gates still pass. Consumes the one-time pass,
@@ -171,19 +176,27 @@ impl Row {
     }
 
     /// The payload a human approves. Every value that changes what is sent,
-    /// or where, is in it; the gate adds the requester.
-    /// What a send approval binds: the exact text and target, and the
-    /// credential it will post with (by name and keyed fingerprint), so a
-    /// token swapped after the approval cannot post under another account.
+    /// or where, is in it; the gate adds the requester. It binds the exact
+    /// text (by SHA-256) and target, and the credential it will post with
+    /// (by name and keyed fingerprint), so a token swapped after the
+    /// approval cannot post under another account. For the approver it also
+    /// carries the text, the text with every non-ASCII character escaped
+    /// (`\u{200B}`), and the host of every link; the two text fields are
+    /// dropped from the record once the approval is decided
+    /// ([`approval_decided`]).
     fn approval_payload(&self, credential: &Credential) -> Value {
+        let text = self.text.as_deref().unwrap_or_default();
         json!({
             "action": "send",
             "draft_id": self.id,
             "channel": self.channel,
             "target": self.target,
             "text": self.text,
+            "text_escaped": self.text.as_deref().map(gates::escaped),
             "text_sha256": self.text_sha256,
             "chars": self.chars,
+            "bytes": self.bytes,
+            "link_hosts": gates::link_hosts(text),
             "credential": { "name": credential.name, "fingerprint": credential.fingerprint },
         })
     }
@@ -203,11 +216,101 @@ impl Row {
     }
 }
 
-fn set_status(tx: &WriteTx<'_>, id: i64, status: &str) -> UaResult<()> {
+/// The fields of an approval payload that hold the text itself.
+const TEXT_FIELDS: [&str; 2] = ["text", "text_escaped"];
+
+/// `payload` with the text fields set to null: what an approval record keeps
+/// once it is decided.
+fn without_text(payload: &Value) -> Value {
+    let mut p = payload.clone();
+    if let Some(m) = p.as_object_mut() {
+        for k in TEXT_FIELDS {
+            if m.contains_key(k) {
+                m.insert(k.into(), Value::Null);
+            }
+        }
+    }
+    p
+}
+
+fn drop_approval_text(tx: &WriteTx<'_>, approval_id: i64, payload: &Value) -> UaResult<()> {
     tx.execute(
-        "UPDATE relay_messages SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, status, ua_core::time::now()],
+        "UPDATE approvals SET payload = ?2 WHERE id = ?1",
+        params![approval_id, approvals::canonical_payload(&without_text(payload))],
     )?;
+    Ok(())
+}
+
+/// Cancel a draft whose approval was denied or withdrawn, dropping its text.
+fn cancel_withdrawn(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    row: &Row,
+    approval_id: i64,
+    approval_status: &str,
+) -> UaResult<()> {
+    tx.execute(
+        "UPDATE relay_messages SET status = 'cancelled', text = NULL, error = ?2, updated_at = ?3 WHERE id = ?1",
+        params![row.id, format!("approval {approval_id} was {approval_status}"), ua_core::time::now()],
+    )?;
+    emit(
+        tx,
+        caller,
+        "relay.cancelled",
+        json!({
+            "draft_id": row.id, "approval_id": approval_id, "approval_status": approval_status,
+            "target": row.target, "previous_status": row.status,
+        }),
+    )
+}
+
+/// Called by `approval_resolve` once a relay approval is decided. The
+/// approval record keeps the text only while it is pending, so the text
+/// fields are dropped from it now; a denial or revocation also cancels the
+/// draft and drops its stored text, since that text will never be sent.
+pub fn approval_decided(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    approval: &approvals::ApprovalRow,
+    status: &str,
+) -> UaResult<()> {
+    drop_approval_text(tx, approval.id, &approval.payload)?;
+    if matches!(status, "denied" | "revoked") {
+        let row = tx
+            .query_row(
+                "SELECT * FROM relay_messages WHERE approval_id = ?1 AND status = 'pending_approval'",
+                [approval.id],
+                row_from,
+            )
+            .optional()?;
+        if let Some(row) = row {
+            cancel_withdrawn(tx, caller, &row, approval.id, status)?;
+        }
+    }
+    Ok(())
+}
+
+/// At most `relay_checks_per_hour` gate runs (`check` and `draft`) per
+/// caller in the last hour, counted from the ledger.
+fn throttle(c: &Connection, cfg: &Config, caller: &Caller) -> UaResult<()> {
+    let limit = i64::from(cfg.relay_checks_per_hour);
+    let since = jiff::Timestamp::from_millisecond(ua_core::time::now_ms() - 3_600_000)
+        .map(ua_core::time::format_ts)
+        .map_err(|e| UaError::internal(e.to_string()))?;
+    let runs: i64 = c.query_row(
+        "SELECT COUNT(*) FROM event_log WHERE created_at >= ?1 AND channel IN ('relay.check', 'relay.drafted') \
+         AND originator = ?2",
+        params![since, caller.label],
+        |r| r.get(0),
+    )?;
+    if runs >= limit {
+        return Err(UaError::denied(
+            "rate_limited",
+            format!(
+                "the relay's gates run at most {limit} times an hour per caller (check and draft); try later"
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -328,25 +431,45 @@ fn prepare(cfg: &Config, p: DraftParams) -> UaResult<Prepared> {
     Ok(Prepared { target, text: p.text, verdict })
 }
 
-fn check(ctx: &ToolCtx, p: DraftParams) -> UaResult<Value> {
-    let d = prepare(ctx.hub.cfg(), p)?;
-    let mut out = d.verdict.to_json();
-    out["channel"] = json!(CHANNEL);
-    out["target"] = json!(d.target.canonical());
-    out["chars"] = json!(d.text.chars().count());
-    out["bytes"] = json!(d.text.len());
-    out["text_sha256"] = json!(sha256(&d.text));
-    out["recorded"] = json!(false);
-    Ok(out)
+async fn check(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
+    require_identity(&ctx.caller)?;
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    let d = crate::registry::blocking(move || prepare(hub.cfg(), p)).await?;
+    let (hub, caller2) = (ctx.hub.clone(), caller.clone());
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            throttle(tx, hub.cfg(), &caller2)?;
+            // Verdict and categories only: never the text, its hash or a pattern.
+            emit(
+                tx,
+                &caller2,
+                "relay.check",
+                json!({
+                    "channel": CHANNEL, "target": d.target.canonical(), "verdict": d.verdict.label(),
+                    "categories": d.verdict.categories(),
+                }),
+            )?;
+            let mut out = d.verdict.to_json();
+            out["channel"] = json!(CHANNEL);
+            out["target"] = json!(d.target.canonical());
+            out["chars"] = json!(d.text.chars().count());
+            out["bytes"] = json!(d.text.len());
+            out["text_sha256"] = json!(sha256(&d.text));
+            out["stored"] = json!(false);
+            Ok(out)
+        })
+        .await
 }
 
 async fn draft(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
     let d = prepare(ctx.hub.cfg(), p)?;
-    let caller = ctx.caller.clone();
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     ctx.hub
         .db()
         .write_async(move |tx| {
+            throttle(tx, hub.cfg(), &caller)?;
             let passed = d.verdict.passed();
             let report = d.verdict.to_json();
             let (sha, chars, bytes) = (sha256(&d.text), d.text.chars().count() as i64, d.text.len() as i64);
@@ -615,55 +738,78 @@ fn begin_send(
     }
     let credential = credential(tx, cfg)?;
     let payload = row.approval_payload(&credential);
-    if let Some(id) = row.approval_id {
-        let approval = approvals::get(tx, id)?;
-        if approval.tool != TOOL || approval.payload != payload {
-            return Err(UaError::denied(
-                "approval_mismatch",
-                format!(
-                    "relay draft {} no longer matches what approval {id} bound (text, target, channel or \
-                     credential changed); nothing was sent",
-                    row.id
-                ),
-            ));
-        }
-        match approval.status.as_str() {
-            "approved" | "pending" => {}
-            "denied" => {
-                set_status(tx, row.id, "cancelled")?;
-                return Ok(Err(UaError::denied(
-                    "approval_denied",
-                    format!(
-                        "approval {id} was denied: {}; relay draft {} is cancelled",
-                        approval.reason.unwrap_or_default(),
-                        row.id
-                    ),
-                )));
-            }
-            other => {
-                return Err(UaError::conflict(format!(
-                    "approval {id} is {other}; draft again for a new human decision"
-                )));
-            }
-        }
+    let id = row.approval_id.ok_or_else(|| {
+        UaError::conflict(format!("relay draft {} has no approval; call request_send", row.id))
+    })?;
+    let approval = approvals::get(tx, id)?;
+    // The record drops the text once decided; the SHA-256 still binds it.
+    let stored_text = approval.payload.get("text").filter(|t| !t.is_null());
+    let bound = approval.tool == TOOL
+        && approval.requested_by.as_deref() == Some(caller.label.as_str())
+        && without_text(&approval.payload) == without_text(&payload)
+        && stored_text.is_none_or(|t| Some(t) == payload.get("text"));
+    if !bound {
+        return Err(UaError::denied(
+            "approval_mismatch",
+            format!(
+                "relay draft {} no longer matches what approval {id} bound (text, target, channel or credential \
+                 changed); nothing was sent",
+                row.id
+            ),
+        ));
     }
-    let approval_id = match approvals::gate(tx, cfg, caller, TOOL, &payload)? {
-        GateOutcome::Pass { approval_id } => approval_id,
-        GateOutcome::Pending { approval_id } => {
-            // Still waiting, or the pass expired and a new request was parked.
-            if row.approval_id != Some(approval_id) {
-                tx.execute(
-                    "UPDATE relay_messages SET approval_id = ?2, updated_at = ?3 WHERE id = ?1",
-                    params![row.id, approval_id, ua_core::time::now()],
-                )?;
-            }
+    let approval_id = match approval.status.as_str() {
+        "pending" => return Ok(Err(UaError::ApprovalRequired { tool: TOOL.into(), approval_id: id })),
+        "approved" if !approvals::pass_expired(cfg, approval.resolved_at.as_deref()) => {
+            let now = ua_core::time::now();
+            tx.execute(
+                "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2, payload = ?3 \
+                 WHERE id = ?1 AND status = 'approved'",
+                params![id, now, approvals::canonical_payload(&without_text(&approval.payload))],
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new("agent.approval.consumed", json!({ "approval_id": id, "tool": TOOL }))
+                    .by(caller.label.clone()),
+            )?;
+            id
+        }
+        "approved" => {
+            // The pass expired unspent: ask a human again.
+            tx.execute(
+                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
+                params![id, ua_core::time::now()],
+            )?;
+            drop_approval_text(tx, id, &approval.payload)?;
+            let GateOutcome::Pending { approval_id } = approvals::gate(tx, cfg, caller, TOOL, &payload)?
+            else {
+                return Err(UaError::internal(format!(
+                    "unexpected approval state for relay draft {}",
+                    row.id
+                )));
+            };
+            tx.execute(
+                "UPDATE relay_messages SET approval_id = ?2, updated_at = ?3 WHERE id = ?1",
+                params![row.id, approval_id, ua_core::time::now()],
+            )?;
             return Ok(Err(UaError::ApprovalRequired { tool: TOOL.into(), approval_id }));
         }
-        GateOutcome::Denied { approval_id, reason } => {
-            return Err(UaError::denied(
+        status @ ("denied" | "revoked") => {
+            drop_approval_text(tx, id, &approval.payload)?;
+            cancel_withdrawn(tx, caller, &row, id, status)?;
+            return Ok(Err(UaError::denied(
                 "approval_denied",
-                format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-            ));
+                format!(
+                    "approval {id} was {status}: {}; relay draft {} is cancelled and its text dropped",
+                    approval.reason.unwrap_or_default(),
+                    row.id
+                ),
+            )));
+        }
+        other => {
+            return Err(UaError::conflict(format!(
+                "approval {id} is {other}; draft again for a new human decision"
+            )));
         }
     };
     tx.execute(
@@ -737,10 +883,11 @@ async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {
             "receipt": receipt,
             "recording_gap": recorded.is_err(),
         })),
-        Outcome::Failed { error, .. } => Err(UaError::invalid(format!(
-            "relay send of draft {} failed before reaching GitHub: {}. The approval was consumed; draft again for \
-             a new human decision.",
+        Outcome::Failed { error, http_status } => Err(UaError::invalid(format!(
+            "relay send of draft {} was rejected by GitHub or never reached it{}: {}. Nothing was posted. The \
+             approval was consumed; draft again for a new human decision.",
             row.id,
+            http_status.map(|s| format!(" (HTTP {s})")).unwrap_or_default(),
             clip(&error)
         ))),
         Outcome::Uncertain { error, .. } => Err(UaError::conflict_code(
@@ -841,6 +988,7 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                     "approved" => Some("revoked"),
                     _ => None,
                 };
+                let approval = approvals::get(tx, a)?;
                 if let Some(new) = new {
                     tx.execute(
                         "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = COALESCE(resolved_by, ?4), \
@@ -849,6 +997,8 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                     )?;
                     approval_status = Some(new);
                 }
+                // Neither record keeps text that will never be sent.
+                drop_approval_text(tx, a, &approval.payload)?;
             }
             // The text never went out; do not keep it.
             tx.execute(
@@ -943,10 +1093,7 @@ async fn relay_manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
     let action = a.action.trim().to_ascii_lowercase();
     let f = "relay";
     match action.as_str() {
-        "check" => {
-            let p = parse_params(f, &action, a.params)?;
-            crate::registry::blocking(move || check(&ctx, p)).await
-        }
+        "check" => check(ctx, parse_params(f, &action, a.params)?).await,
         "draft" => draft(ctx, parse_params(f, &action, a.params)?).await,
         "request_send" => request_send(ctx, parse_params(f, &action, a.params)?).await,
         "send" => send(ctx, parse_params(f, &action, a.params)?).await,
@@ -965,9 +1112,12 @@ pub fn register(r: &mut Registry) {
             "Public relay: post an agent's message to a public surface (a comment on an issue or pull request in a \
              repository listed in relay_github_repos) only after public-safety gates pass and a human approves the \
              exact text. Actions: check (gates only), draft, request_send (parks the approval), send (repeat the \
-             exact approved text), status, list, cancel, resolve (a human records an uncertain send's outcome). Gates refuse secrets, hidden or bidirectional Unicode, \
-             private addresses and internal host names, home paths, e-mail addresses and other personal data, \
-             over-long text and the operator's private denylist; they never rewrite the text.",
+             exact approved text), status, list, cancel, resolve (a human records an uncertain send's outcome). \
+             Gates refuse secrets (also encoded or split), invisible or non-ASCII whitespace characters, raw HTML \
+             and character references, mismatched link text, link shorteners, unlisted @-mentions and \
+             cross-references, private addresses and internal host names, home paths, e-mail addresses and other \
+             personal data, over-long text and the operator's private denylist, over the text as written and \
+             decoded; they never rewrite the text. check and draft need an identity and are rate-limited.",
             relay_manage,
         )
         .gates_in_handler()
