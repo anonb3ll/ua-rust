@@ -231,6 +231,20 @@ pub struct Config {
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.
     pub notify_max_attempts: u32,
+    /// Zulip site, for example `https://chat.example.com`. `zulip_send_message`
+    /// and `zulip_fetch_messages` stay off until this, `zulip_email` and
+    /// `zulip_api_key` are all set. `http` is accepted only for a loopback host
+    /// so a local stub can stand in for the API.
+    pub zulip_site: Option<String>,
+    /// Bot email used as the Zulip basic-auth user. Never logged together with the API key.
+    pub zulip_email: Option<String>,
+    /// Bot API key (`UA_ZULIP_API_KEY`). Held as a secret: never logged, never written to the database.
+    #[serde(skip_serializing)]
+    pub zulip_api_key: Option<SecretString>,
+    /// Outbound-send kill switch (`UA_ZULIP_RETIRED`). Unset, empty, or any
+    /// value other than `0`, `false`, `no` or `off` keeps `zulip_send_message`
+    /// retired. Fetch is unaffected.
+    pub zulip_retired: Option<String>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
     /// Empty means dispatch only records runs and spawns nothing.
     pub harnesses: BTreeMap<String, HarnessConfig>,
@@ -633,6 +647,10 @@ impl Default for Config {
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
             notify_max_attempts: 3,
+            zulip_site: None,
+            zulip_email: None,
+            zulip_api_key: None,
+            zulip_retired: None,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,

@@ -188,3 +188,11 @@ reviewer-1 = "reviewer"
 # search = "read"
 # get_page = "read"
 # put_page = "write"
+
+# Zulip relay. Both tools stay off until site, email and api_key are set.
+# The API key is a secret (UA_ZULIP_API_KEY); it is never logged.
+# zulip_send_message also stays retired until zulip_retired is 0, false, no or off.
+# zulip_site = "https://chat.example.com"
+# zulip_email = "bot@example.com"
+# zulip_api_key = "set-me"
+# zulip_retired = "0"
