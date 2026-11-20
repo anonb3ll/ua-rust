@@ -579,38 +579,79 @@ pub fn check_schema_compatibility(
     })
 }
 
-/// Largest `sqlite_sequence` value accepted for an AUTOINCREMENT table other
-/// than `event_log`: 2^53 - 1, the largest integer JSON clients (JavaScript
-/// numbers, many JSON parsers) represent exactly. Ids are exposed through
-/// JSON, so a legitimate hub never gets near it, while a tampered value at or
-/// near 2^63 would make every later insert fail with "database or disk is
-/// full".
-const MAX_AUTOINCREMENT_SEQ: i64 = (1_i64 << 53) - 1;
+/// Largest id accepted in an AUTOINCREMENT table, and the largest counter
+/// accepted in `sqlite_sequence`: 2^52.
+///
+/// Ids are exposed through JSON, and 2^53 - 1 is the largest integer JSON
+/// clients (JavaScript numbers, many JSON parsers) represent exactly. Capping
+/// at 2^52 leaves 2^52 further ids of headroom below that limit, so a restored
+/// hub can keep inserting for longer than it will exist (at a million inserts
+/// a second, about 142 years) without leaving exact-JSON range, while no honest
+/// hub comes near 2^52. A tampered id or counter near 2^63 would otherwise make
+/// every later insert fail with "database or disk is full".
+const MAX_AUTOINCREMENT_ID: i64 = 1_i64 << 52;
 
-/// Check the `sqlite_sequence` rows that drive AUTOINCREMENT. Table data is
-/// not covered by the ledger hash chain, so a backup could carry a tampered
-/// counter that bricks inserts or makes deleted ids reusable.
+/// Check the AUTOINCREMENT state of every table that uses it. Table data and
+/// `seq` values are not covered by the ledger hash chain, so a backup could
+/// carry a tampered id or counter that bricks inserts or makes deleted ids
+/// reusable.
 ///
 /// Rules (returns one message per violation, empty when consistent):
-/// - every row names an existing, non-internal table exactly once, with an
-///   integer `seq` (SQLite drops a table's row when the table is dropped, and
-///   never writes duplicates or non-integers);
+/// - every AUTOINCREMENT table, found from its DDL in `sqlite_master` (not from
+///   `sqlite_sequence`, whose rows can be deleted), plus `event_log` itself,
+///   must have `MAX(rowid) <= MAX_AUTOINCREMENT_ID`, whether or not it has a
+///   counter row. SQLite takes the next id from the larger of the counter and
+///   `MAX(rowid)`, so bounding only the counter is not enough;
+/// - every `sqlite_sequence` row names an existing, non-internal table exactly
+///   once, with an integer `seq` (SQLite drops a table's row when the table is
+///   dropped, and never writes duplicates or non-integers);
 /// - `event_log` is append-only (UPDATE/DELETE triggers) and nothing inserts
 ///   into it with `OR IGNORE`, so its counter must equal `MAX(seq)`, or `0`
 ///   for an empty ledger. A missing `event_log` row is accepted: SQLite then
 ///   continues from `MAX(seq)`, which is the same result;
-/// - any other AUTOINCREMENT table may have deleted rows, so its counter may
-///   exceed `MAX(rowid)`, but it must not be below it (that would let ids of
-///   deleted rows be handed out again) nor above [`MAX_AUTOINCREMENT_SEQ`].
+/// - any other counter may exceed `MAX(rowid)` (rows may have been deleted),
+///   but must not be below it (ids of deleted rows would be handed out again)
+///   nor above `MAX_AUTOINCREMENT_ID`.
+///
+/// `event_log` is deliberately not required to be contiguous (`MAX(seq) =
+/// COUNT(*)`): `ua import` copies `seq` verbatim from the source hub without
+/// requiring it to be gap-free, so honest imported ledgers can have gaps.
 pub fn check_autoincrement_sequences(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    if !table_exists(conn, "sqlite_sequence")? {
-        return Ok(Vec::new());
-    }
-    let tables: BTreeSet<String> = {
-        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
-        stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
-    };
     let mut problems = Vec::new();
+    let max_rowid = |name: &str| -> rusqlite::Result<Option<i64>> {
+        conn.query_row(&format!("SELECT MAX(rowid) FROM \"{}\"", name.replace('"', "\"\"")), [], |r| r.get(0))
+    };
+
+    let mut tables = BTreeSet::new();
+    let mut autoinc_tables = BTreeSet::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT name, upper(COALESCE(sql, '')) FROM sqlite_master WHERE type = 'table'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            let sql: String = r.get(1)?;
+            // A WITHOUT ROWID table cannot use AUTOINCREMENT, so the word can
+            // only appear there inside a comment or string.
+            if (name == "event_log" || sql.contains("AUTOINCREMENT")) && !sql.contains("WITHOUT ROWID") {
+                autoinc_tables.insert(name.clone());
+            }
+            tables.insert(name);
+        }
+    }
+    for name in &autoinc_tables {
+        match max_rowid(name) {
+            Ok(Some(max)) if max > MAX_AUTOINCREMENT_ID => problems.push(format!(
+                "{name} holds id {max}, above the limit {MAX_AUTOINCREMENT_ID}; the next insert would leave exact-JSON range or fail"
+            )),
+            Ok(_) => {}
+            Err(e) => problems.push(format!("cannot read MAX(rowid) of {name}: {e}")),
+        }
+    }
+
+    if !tables.contains("sqlite_sequence") {
+        return Ok(problems);
+    }
     let mut seen = BTreeSet::new();
     let mut stmt =
         conn.prepare("SELECT CAST(name AS TEXT), typeof(name), seq, typeof(seq) FROM sqlite_sequence")?;
@@ -636,18 +677,13 @@ pub fn check_autoincrement_sequences(conn: &Connection) -> anyhow::Result<Vec<St
             continue;
         }
         let seq: i64 = r.get(2)?;
-        let max_rowid: Option<i64> = match conn.query_row(
-            &format!("SELECT MAX(rowid) FROM \"{}\"", name.replace('"', "\"\"")),
-            [],
-            |r| r.get(0),
-        ) {
-            Ok(v) => v,
+        let floor = match max_rowid(&name) {
+            Ok(v) => v.unwrap_or(0),
             Err(e) => {
                 problems.push(format!("cannot read MAX(rowid) of {name} for its sqlite_sequence row: {e}"));
                 continue;
             }
         };
-        let floor = max_rowid.unwrap_or(0);
         if name == "event_log" {
             if seq != floor {
                 problems.push(format!(
@@ -658,10 +694,9 @@ pub fn check_autoincrement_sequences(conn: &Connection) -> anyhow::Result<Vec<St
             problems.push(format!(
                 "sqlite_sequence for {name} is {seq}, below MAX(rowid) {floor}; ids of deleted rows could be reused"
             ));
-        } else if seq > MAX_AUTOINCREMENT_SEQ {
-            problems.push(format!(
-                "sqlite_sequence for {name} is {seq}, above the limit {MAX_AUTOINCREMENT_SEQ}"
-            ));
+        } else if seq > MAX_AUTOINCREMENT_ID {
+            problems
+                .push(format!("sqlite_sequence for {name} is {seq}, above the limit {MAX_AUTOINCREMENT_ID}"));
         }
     }
     Ok(problems)
@@ -2991,7 +3026,8 @@ mod tests {
     fn tampered_sqlite_sequence_is_refused() {
         const COUNTED: SchemaPart = SchemaPart {
             name: "counted.v1",
-            sql: "CREATE TABLE IF NOT EXISTS counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);",
+            sql: "CREATE TABLE IF NOT EXISTS counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+                  CREATE TABLE IF NOT EXISTS idle (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);",
         };
         let parts = vec![LEDGER_SCHEMA, META_SCHEMA, COUNTED];
         let dir = tempfile::tempdir().unwrap();
@@ -3020,7 +3056,17 @@ mod tests {
         backup_database(&src, &bak, false).unwrap();
         let clean = open_read_only(&bak).unwrap();
         assert_eq!(check_autoincrement_sequences(&clean).unwrap(), Vec::<String>::new());
+        let idle_rows: i64 = clean
+            .query_row("SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'idle'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idle_rows, 0, "the empty AUTOINCREMENT table must have no counter row");
         drop(clean);
+        // Honest control: a backup with deleted AUTOINCREMENT rows (counter above
+        // MAX(rowid)) and an empty AUTOINCREMENT table without a counter row restores.
+        let honest =
+            restore_database(&bak, &dir.path().join("dest-honest.db"), restore_opts(parts.clone(), false))
+                .unwrap();
+        assert_eq!(honest.restored_event_seq, Some(3));
 
         // event_log's counter pushed toward 2^63 would make every later append fail.
         let near_max = tamper_copy(
@@ -3060,18 +3106,18 @@ mod tests {
         // A missing event_log row is harmless: SQLite continues from MAX(seq).
         let gone = problems_for("seq-gone.db", "DELETE FROM sqlite_sequence WHERE name = 'event_log';");
         assert!(gone.is_empty(), "{gone:?}");
-        // Other counters: not below MAX(rowid), not above 2^53 - 1.
+        // Other counters: not below MAX(rowid), not above 2^52.
         let reuse =
             problems_for("seq-reuse.db", "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'counted';");
         assert!(reuse.iter().any(|p| p.contains("counted") && p.contains("reused")), "{reuse:?}");
         let huge = problems_for(
             "seq-huge.db",
-            "UPDATE sqlite_sequence SET seq = 9007199254740992 WHERE name = 'counted';",
+            "UPDATE sqlite_sequence SET seq = 4503599627370497 WHERE name = 'counted';",
         );
         assert!(huge.iter().any(|p| p.contains("counted") && p.contains("limit")), "{huge:?}");
         let at_cap = problems_for(
             "seq-cap.db",
-            "UPDATE sqlite_sequence SET seq = 9007199254740991 WHERE name = 'counted';",
+            "UPDATE sqlite_sequence SET seq = 4503599627370496 WHERE name = 'counted';",
         );
         assert!(at_cap.is_empty(), "{at_cap:?}");
         // Rows SQLite would never write: orphans, duplicates, non-integers.
@@ -3086,6 +3132,85 @@ mod tests {
         let text =
             problems_for("seq-text.db", "UPDATE sqlite_sequence SET seq = 'x' WHERE name = 'counted';");
         assert!(text.iter().any(|p| p.contains("not an integer")), "{text:?}");
+    }
+
+    #[test]
+    fn autoincrement_ids_above_cap_are_refused_with_or_without_a_counter_row() {
+        const COUNTED: SchemaPart = SchemaPart {
+            name: "counted.v1",
+            sql: "CREATE TABLE IF NOT EXISTS counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);",
+        };
+        let parts = vec![LEDGER_SCHEMA, META_SCHEMA, COUNTED];
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("cap-src.db");
+        let db = Db::open(&src, &parts).unwrap();
+        db.write(|tx| {
+            tx.execute("INSERT INTO counted (v) VALUES ('a')", [])?;
+            ledger::append(tx, EventInput::new("a", json!({})))?;
+            ledger::append(tx, EventInput::new("b", json!({})))?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let bak = dir.path().join("cap-bak.db");
+        backup_database(&src, &bak, false).unwrap();
+
+        // A. Move the last ledger row's seq near 2^63 behind a recreated, identical
+        //    no-update trigger and keep the counter equal to MAX(seq). The hash chain
+        //    does not cover seq, and the schema check sees the original trigger.
+        let ledger_a = tamper_copy(
+            &bak,
+            "cap-ledger.db",
+            "DROP TRIGGER event_log_no_update;
+             UPDATE event_log SET seq = 9223372036854775805 WHERE seq = (SELECT MAX(seq) FROM event_log);
+             CREATE TRIGGER IF NOT EXISTS event_log_no_update BEFORE UPDATE ON event_log
+             BEGIN SELECT RAISE(ABORT, 'event_log is append-only'); END;
+             UPDATE sqlite_sequence SET seq = 9223372036854775805 WHERE name = 'event_log';",
+        );
+        let ro = open_read_only(&ledger_a).unwrap();
+        assert!(ledger::verify(&ro).unwrap().ok, "probe must pass the hash chain to be meaningful");
+        assert!(check_schema_compatibility(&ro, &parts, &[]).unwrap().ok, "probe must pass the schema check");
+        drop(ro);
+        let err = restore_database(
+            &ledger_a,
+            &dir.path().join("dest-ledger.db"),
+            restore_opts(parts.clone(), false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("event_log holds id 9223372036854775805"), "{err}");
+
+        // B. A huge id in another AUTOINCREMENT table with its counter row deleted.
+        let table_b = tamper_copy(
+            &bak,
+            "cap-table.db",
+            "INSERT INTO counted (id, v) VALUES (9223372036854775807, 'x');
+             DELETE FROM sqlite_sequence WHERE name = 'counted';",
+        );
+        let err = restore_database(
+            &table_b,
+            &dir.path().join("dest-table.db"),
+            RestoreOptions { allow_unpinned: true, ..Default::default() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("counted holds id 9223372036854775807"), "{err}");
+
+        // The cap itself is accepted; one above it is not.
+        let at_cap = tamper_copy(
+            &bak,
+            "cap-at.db",
+            "INSERT INTO counted (id, v) VALUES (4503599627370496, 'x');
+             DELETE FROM sqlite_sequence WHERE name = 'counted';",
+        );
+        let c = open_read_only(&at_cap).unwrap();
+        assert_eq!(check_autoincrement_sequences(&c).unwrap(), Vec::<String>::new());
+        drop(c);
+        let over =
+            tamper_copy(&bak, "cap-over.db", "INSERT INTO counted (id, v) VALUES (4503599627370497, 'x');");
+        let c = open_read_only(&over).unwrap();
+        let problems = check_autoincrement_sequences(&c).unwrap();
+        assert!(problems.iter().any(|p| p.contains("counted holds id")), "{problems:?}");
     }
 
     #[test]

@@ -121,14 +121,21 @@ Key restore safeguards:
    `ledger::verify`) via SQLite `immutable=1`. Objects named with the reserved
    `sqlite_` prefix (which only `PRAGMA writable_schema` can create) are refused,
    apart from SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and
-   automatic indexes. The `event_log` AUTOINCREMENT counter must equal `MAX(seq)`;
-   every other counter must lie between `MAX(rowid)` and 2^53 - 1.
+   automatic indexes. Every AUTOINCREMENT table (including `event_log`) must have
+   `MAX(rowid)` at or below 2^52, whether or not it has a `sqlite_sequence` row, which
+   keeps later ids well inside the exact-JSON integer range. The `event_log` counter
+   must equal `MAX(seq)`; every other counter must lie between `MAX(rowid)` and 2^52.
+   `event_log` is not required to be gap-free, because `ua import` keeps the source
+   hub's `seq` values as they are.
    `--allow-newer` allows snapshots containing `extra` schema parts and
    their new objects (new tables/indexes/triggers on new tables), while still refusing
    drifted parts, missing/altered known objects, broken schema dependency chains,
    triggers or indexes on known tables, new tables with foreign keys into known
    tables, objects colliding with known schema names, or unowned objects without an
-   `extra` part.
+   `extra` part. A new table with a foreign key into a known table is refused even
+   under `--allow-newer`, including one added by a genuine newer build: the running
+   build does not know that child table, so its writes to the known parent could fail
+   or cascade. Restore such a backup with a build that knows that schema part.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when
