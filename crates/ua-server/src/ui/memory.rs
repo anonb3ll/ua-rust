@@ -96,7 +96,7 @@ pub struct NotePage {
 }
 
 pub async fn note(ui: Ui, Path(id): Path<String>) -> Response {
-    let v = match ui.call("memory_get", json!({ "id": id, "count_access": false })).await {
+    let v = match ui.call_read("memory_get", json!({ "id": id, "count_access": false })).await {
         Ok(v) => v,
         Err(e) => {
             let status = crate::api::status_for(&e);

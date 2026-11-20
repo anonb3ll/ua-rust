@@ -358,9 +358,23 @@ node unseen. The renderer is never changed; the bundle is refused instead.
   `signature`, ...) or path segment (long and random-looking), or plain
   `http` to a host that is not loopback.
 - Hidden text: invisible, bidi or tag code points (U+E0000-E007F,
-  zero-width characters, bidi overrides) in rules or skills, and
-  permission-bearing front matter (`allowed-tools`, `hooks`, `permissions`)
-  in a skill body.
+  zero-width characters, bidi overrides) in rules or skills.
+- Front matter in a skill body or in any rules text (a rules surface may be
+  a host's command or subagent file, `.claude/commands/*.md` or
+  `.claude/agents/*.md`) with a key outside the allowlist `name`,
+  `description`, `globs`, `alwaysApply`, `argument-hint`, `model` (a skill
+  may also carry the Agent Skills fields `license`, `version` and
+  `metadata`, the last a map of plain values only), or with a value that is
+  not a scalar or a list of scalars. Hosts grant tools, hooks,
+  permissions and forked agents through other keys (`allowed-tools`, `tools`,
+  `permission`, `permissionMode`, `context`, `agent`, ...), so the hub lists
+  what is safe instead of what is not; the error names the key. Front matter
+  opens on the first non-blank line starting with `---` (`---yaml`) or
+  `+++` (TOML) and closes on the next line starting with the same
+  delimiter; a line ending in `---` is also read as a close, as some hosts
+  do. A closed block that does not parse is refused; an unclosed one is
+  front matter only if the rest parses as a mapping, so a markdown rule
+  above prose is not. Other front-matter languages are refused.
 - Surfaces: more than 16; a `kind` other than `rules` or `mcp`, or a default
   surface with another kind than its default; a path that is absolute, has
   an empty, `.` or `..` segment, lies in a git or hooks directory, is
@@ -427,10 +441,31 @@ node's `diff` is ignored and never stored.
 
 Each accepted proposal parks (or reuses) one `harness_config_apply` approval
 bound to `{node, surface, path, bundle_version, desired_hash,
-change_summary}`. `change_summary` is computed by the hub: the full unified
-diff (never truncated; surfaces are capped instead), with lines added and
-removed, from the content last applied to that surface of that node under
-the same agent (`base: last_applied`), or from nothing (`base: none`).
+change_summary}`. `change_summary` names what the change starts from: the
+content last applied to that surface of that node under the same agent
+(`base: last_applied`, with its `from_bundle_version`, `from_hash` and the
+SHA-256 of that text, `from_text_sha256`), or nothing (`base: none`). Every
+bound value is deterministic, so the payload recomputed when the pass is
+checked always equals the approved one.
+
+The diff itself is not bound: it is computed with a time limit, and past the
+limit its exact output depends on wall time. The hub computes the full
+unified diff (never truncated; surfaces are capped instead) from that base,
+keeps it on the proposal row with the base it was computed from, and shows
+it to the approver beside the payload: `approval_pending` adds `display:
+{proposal_id, lines_added, lines_removed, diff}` to each pending
+`harness_config_apply` request, one approval read (`GET
+/api/approvals/{id}`, `platform_object_get`) carries it whatever the
+approval's status, and the Control Center inbox shows the diff above the
+arguments. Whenever an approval is parked on a new base (a report, or an
+`applied` call after another change was applied to that surface), the
+diff is recomputed from that base. A stored diff whose base is not the
+`from_text_sha256` the approval binds is never shown in its place
+(`diff: null` with a `note`). The approval row itself stays small.
+
+Upgrading expires `harness_config_apply` approvals, pending or approved but
+unused, that still carry the diff in their payload (schema part
+`harness_config.v2`); the node's next report parks new ones.
 
 A proposal is `pending` until it is `applied`, or `denied`, `expired` (its
 pass was revoked or outlived its TTL) or `closed` (the node was reassigned

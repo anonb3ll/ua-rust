@@ -16,6 +16,7 @@ mod fs;
 mod git;
 mod shell;
 
+pub(crate) use fs::{guard_configured_hooks, guard_configured_hooks_dir};
 pub(crate) use shell::ScratchHome;
 pub use shell::{
     RUN_CACHE_MAX_AGE, ancestor_cargo_configs, cargo_config_warning, prune_run_caches, sweep_run_homes,

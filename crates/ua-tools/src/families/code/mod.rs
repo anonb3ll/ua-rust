@@ -1,6 +1,6 @@
 //! Code family: symbol indexing and repository maps (`fs_*_symbols`,
-//! `fs_repo_map`), `read_image`, `format_render`, `detect_dev_servers` and
-//! the offline docset tools (`dash_*`).
+//! `fs_repo_map`), `read_image`, `format_render`, `detect_dev_servers`,
+//! `python_lint_and_format` and the offline docset tools (`dash_*`).
 //!
 //! Paths go through the workspace family's sandbox: indexing, symbol listing
 //! and images stay inside the workspace root; `detect_dev_servers` may also
@@ -11,6 +11,7 @@ mod devservers;
 mod format;
 mod index;
 pub mod lang;
+pub mod lint;
 pub mod media;
 
 use ua_store::SchemaPart;
@@ -50,5 +51,6 @@ pub fn register(r: &mut Registry) {
     devservers::register(r);
     format::register(r);
     index::register(r);
+    lint::register(r);
     media::register(r);
 }

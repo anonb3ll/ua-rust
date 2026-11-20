@@ -34,7 +34,9 @@
   "routine_list",
   "routine_pause",
   "vault_archive_plan",
-  "vault_move"
+  "vault_move",
+  "zulip_resolve_send",
+  "zulip_send_message"
  ],
  "LEAD_EXTRA_TOOLS": [
   "audit_triage_tasks",
@@ -47,6 +49,7 @@
   "approval_resolve",
   "autonomous_cycle_manage",
   "cleanup_stale_worktrees",
+  "compare_migration_manifests",
   "config_revision_manage",
   "coordination_manage",
   "delegate",
@@ -57,6 +60,7 @@
   "dispatch_confirm_cancellation",
   "dispatch_retry_cancellation",
   "export_data",
+  "export_migration_manifest",
   "fs_write",
   "git_commit_staged",
   "git_merge_task",
@@ -82,6 +86,7 @@
   "provider_account_disable",
   "provider_account_register",
   "provider_account_update",
+  "python_lint_and_format",
   "relay_manage",
   "routine_add",
   "routine_fire",
@@ -92,7 +97,9 @@
   "vault_archive_plan",
   "vault_move",
   "vault_to_memory_ingest",
-  "workflow_run"
+  "workflow_run",
+  "zulip_resolve_send",
+  "zulip_send_message"
  ],
  "RESEARCH_ALLOWED_TOOLS": [
   "capability_catalog",

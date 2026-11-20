@@ -1,9 +1,12 @@
 //! Import a small Python-shaped hub database.
 //!
-//! The fixture's CREATE TABLE statements are copied from the Python hub's
-//! schema (including columns ua-rust does not store, such as `org_id`), and
-//! its three-event ledger is hashed with the shared hash function, the first
-//! entry against the reference value computed by the Python implementation.
+//! The fixture's CREATE TABLE statements follow the original implementation's
+//! schema in full: columns ua-rust does not store (such as `org_id`), CHECK
+//! and DEFAULT clauses, AUTOINCREMENT keys (so the source has a
+//! `sqlite_sequence` table) and the external-content FTS table. Only default
+//! values that named a particular deployment are replaced with neutral ones.
+//! The three-event ledger is hashed with the shared hash function, the first
+//! entry against the reference value computed by the original implementation.
 
 use std::path::{Path, PathBuf};
 
@@ -67,8 +70,8 @@ CREATE TABLE tasks (
   untrusted INTEGER NOT NULL DEFAULT 0,
   worktree_path TEXT,
   branch TEXT,
-  project TEXT NOT NULL DEFAULT 'unified-agent',
-  domain TEXT NOT NULL DEFAULT 'hobby',
+  project TEXT NOT NULL DEFAULT 'default',
+  domain TEXT NOT NULL DEFAULT 'general',
   due_at TEXT,
   evidence_ref TEXT,
   lane TEXT NOT NULL DEFAULT 'default' CHECK (length(lane) >= 1 AND length(lane) <= 64),
@@ -112,7 +115,7 @@ CREATE TABLE goals (
   title TEXT NOT NULL,
   statement TEXT NOT NULL DEFAULT '',
   parent_goal_id INTEGER,
-  project TEXT NOT NULL DEFAULT 'unified-agent',
+  project TEXT NOT NULL DEFAULT 'default',
   status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','achieved','abandoned')),
   created_by TEXT,
   created_at TEXT NOT NULL,
@@ -451,7 +454,7 @@ INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) V
   ('default', '{{\"elements\": []}}', 'agent-1', '{T0}');
 INSERT INTO nodes (node, agent, device_node, facts_json, version, registered_at, last_heartbeat, updated_at,
   retired_at, retired_by, retired_reason, heartbeat_floor) VALUES
-  ('mac-1', 'agent-1', 'mac-1', '{{\"worktree_roots\": [\"/Users/someone/secret\"]}}', '0.9.1', '{T0}', '{T0}', '{T0}',
+  ('mac-1', 'agent-1', 'mac-1', '{{\"worktree_roots\":[\"/srv/work/repo\"]}}', '0.9.1', '{T0}', '{T0}', '{T0}',
    NULL, NULL, NULL, NULL),
   ('old-box', 'agent-2', NULL, NULL, NULL, '{T0}', '{T0}', '{T0}', '{T0}', 'operator', 'decommissioned', '{T0}');
 ",
@@ -610,6 +613,48 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert!(r.unmapped_tables.contains(&"zulip_cursors".to_string()));
     assert!(r.unmapped_tables.contains(&"memory_embeddings".to_string()));
     assert!(r.derived_tables.contains(&"memory_fts".to_string()));
+    // SQLite's own bookkeeping tables are neither unmapped nor derived.
+    assert!(!r.unmapped_tables.iter().chain(&r.derived_tables).any(|t| t.starts_with("sqlite_")), "{r:?}");
+    // The node's host facts stay behind.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE facts_json LIKE '%/srv/work/repo%'"), 0);
+}
+
+/// The fixture keeps the shapes the importer has to cope with: AUTOINCREMENT
+/// keys leave a `sqlite_sequence` table behind, the FTS table is
+/// external-content, and the child tables carry their own `id` columns.
+#[test]
+fn the_fixture_keeps_the_full_source_schema() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    let has_table = |name: &str| -> bool {
+        c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+            == 1
+    };
+    assert!(has_table("sqlite_sequence"));
+    let fts: String =
+        c.query_row("SELECT sql FROM sqlite_master WHERE name = 'memory_fts'", [], |r| r.get(0)).unwrap();
+    assert!(fts.contains("content='memory'"), "{fts}");
+    let cols = |t: &str| -> Vec<String> {
+        let mut s = c.prepare("SELECT name FROM pragma_table_info(?1)").unwrap();
+        s.query_map([t], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    for t in ["task_comments", "delegations", "plan_steps", "plan_checkpoints", "task_dependencies"] {
+        assert!(cols(t).iter().any(|c| c == "id"), "{t} lost its id column");
+    }
+    assert!(cols("task_comments").iter().any(|c| c == "parent_comment_id"));
+    for col in ["payload", "reason", "resolved_by", "resolved_at"] {
+        assert!(cols("approvals").iter().any(|c| c == col), "approvals.{col}");
+    }
+    for col in ["expires_at", "revoked_at", "rotated_at"] {
+        assert!(cols("agent_tokens").iter().any(|c| c == col), "agent_tokens.{col}");
+    }
+    let schema: String = c
+        .query_row("SELECT group_concat(sql, ' ') FROM sqlite_master WHERE sql IS NOT NULL", [], |r| r.get(0))
+        .unwrap();
+    assert!(!schema.contains("unified-agent") && !schema.contains("hobby"), "deployment-specific default");
 }
 
 #[test]

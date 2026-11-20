@@ -147,8 +147,12 @@ async fn poll_repo(hub: &Hub, gh: &GitHub, repo: &BoundRepo) -> UaResult<Value> 
     Ok(report)
 }
 
-/// Run [`poll_once`] every `github_poll_interval_s` seconds (0: never).
-pub fn spawn_poller(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
+/// Run [`poll_once`] every `github_poll_interval_s` seconds (0: never), until
+/// `ct` is cancelled; a poll in progress finishes first.
+pub fn spawn_poller(
+    hub: &Hub,
+    ct: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let every = hub.cfg().github_poll_interval_s;
     if every == 0 {
         return None;
@@ -158,7 +162,11 @@ pub fn spawn_poller(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(every.max(10)));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return,
+                _ = tick.tick() => {}
+            }
             if let Err(e) = poll_once(&hub).await {
                 tracing::warn!(error = %e, "GitHub poll failed");
             }

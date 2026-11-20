@@ -68,8 +68,7 @@ const DEFAULT_STALE_S: i64 = 300;
 
 /// Compact JSON with sorted keys (the original hub's canonical form).
 fn canonical(v: &Value) -> String {
-    // serde_json's map is ordered by key, so this is already sorted.
-    serde_json::to_string(v).unwrap_or_default()
+    ua_core::canonical::to_string(v)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -955,6 +954,21 @@ mod tests {
             r#"{"notes":"n","scope":{"files":["a.rs","b.rs"],"repo":"o/r"},"title":"t"}"#
         );
         assert_eq!(contract_digest("t", "n", &scope).len(), 64);
+    }
+
+    /// The digest sorts keys itself: a scope object built in another key
+    /// order (as serde_json's `preserve_order` would keep it) digests the same.
+    #[test]
+    fn the_digest_does_not_depend_on_key_insertion_order() {
+        let mut fwd = serde_json::Map::new();
+        fwd.insert("files".into(), json!(["a.rs"]));
+        fwd.insert("repo".into(), json!("o/r"));
+        let mut rev = serde_json::Map::new();
+        rev.insert("repo".into(), json!("o/r"));
+        rev.insert("files".into(), json!(["a.rs"]));
+        let (fwd, rev) = (Value::Object(fwd), Value::Object(rev));
+        assert_eq!(canonical(&fwd), canonical(&rev));
+        assert_eq!(contract_digest("t", "n", &fwd), contract_digest("t", "n", &rev));
     }
 
     #[test]

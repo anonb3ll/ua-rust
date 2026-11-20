@@ -38,6 +38,7 @@ pub mod runs;
 pub mod sessions_lifecycle;
 pub mod skill_registry;
 pub mod skills;
+pub mod slack;
 pub mod tasks;
 pub mod tokens;
 pub mod vault;
@@ -45,13 +46,14 @@ pub mod wake;
 pub mod web;
 pub mod workflows;
 pub mod workspace;
+pub mod zulip;
 
 use ua_store::SchemaPart;
 
 use crate::registry::Registry;
 
 pub fn schema_parts() -> Vec<SchemaPart> {
-    let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2];
+    let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2, core_schema::SCHEMA_V3];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
     parts.extend(continuity::schema_parts());
@@ -67,6 +69,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
     parts.push(harness_config::SCHEMA);
+    parts.push(harness_config::SCHEMA_V2);
     parts.push(managed_secrets::SCHEMA);
     parts.push(mcp::SCHEMA);
     parts.push(messaging::SCHEMA);
@@ -78,10 +81,12 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
     parts.push(skill_registry::SCHEMA);
+    parts.push(slack::SCHEMA);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
     parts.push(workflows::SCHEMA);
+    parts.push(zulip::SCHEMA);
     parts
 }
 
@@ -119,6 +124,7 @@ pub fn register(r: &mut Registry) {
     sessions_lifecycle::register(r);
     skill_registry::register(r);
     skills::register(r);
+    slack::register(r);
     tasks::register(r);
     tokens::register(r);
     vault::register(r);
@@ -126,4 +132,5 @@ pub fn register(r: &mut Registry) {
     web::register(r);
     workflows::register(r);
     workspace::register(r);
+    zulip::register(r);
 }
