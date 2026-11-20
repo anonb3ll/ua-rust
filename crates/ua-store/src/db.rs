@@ -298,8 +298,10 @@ mod tests {
 
     use super::*;
 
-    const PART: SchemaPart =
-        SchemaPart { name: "pool_test.v1", sql: "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);" };
+    const PART: SchemaPart = SchemaPart {
+        name: "pool_test.v1",
+        sql: "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);",
+    };
 
     fn file_db() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();

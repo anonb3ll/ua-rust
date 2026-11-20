@@ -21,6 +21,9 @@
 //! - `POST /login/passkeys/register/start|finish`
 //! - `GET  /api/session`                    who is signed in, plus the CSRF token
 
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -84,8 +87,50 @@ pub fn routes() -> Router<AppState> {
 
 // ---------------------------------------------------------------- sessions
 
-/// The cookie encryption key, created on first use and kept in `ui_keys`.
-fn cookie_key(hub: &Hub) -> UaResult<Key> {
+/// How long the in-memory copy of the cookie key is trusted before it is
+/// read again. Bounds how long a key replaced outside this process (the
+/// `ui_keys` row deleted or rewritten) keeps being used.
+pub const COOKIE_KEY_TTL: Duration = Duration::from_secs(60);
+
+/// The cookie encryption key, cached in [`AppState`] so an authenticated UI
+/// request does not query `ui_keys`. The key is created on first use; it is
+/// re-read at most every [`COOKIE_KEY_TTL`], and at once after
+/// [`CookieKeyCache::invalidate`], which any code that replaces the key must
+/// call. (The hub has no in-process rotation command: rotating means
+/// deleting the `ui_keys` row, which signs every browser out once the
+/// cached copy lapses.)
+#[derive(Default)]
+pub struct CookieKeyCache {
+    slot: RwLock<Option<(Key, Instant)>>,
+}
+
+impl CookieKeyCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop the cached key; the next request reads `ui_keys` again.
+    pub fn invalidate(&self) {
+        *self.slot.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn fresh(&self) -> Option<Key> {
+        let slot = self.slot.read().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().filter(|(_, at)| at.elapsed() < COOKIE_KEY_TTL).map(|(k, _)| k.clone())
+    }
+
+    fn store(&self, key: &Key) {
+        *self.slot.write().unwrap_or_else(|e| e.into_inner()) = Some((key.clone(), Instant::now()));
+    }
+}
+
+fn parse_key(hexkey: &str) -> UaResult<Key> {
+    let bytes = hex::decode(hexkey).map_err(|_| UaError::internal("cookie key is corrupt"))?;
+    Key::try_from(bytes.as_slice()).map_err(|_| UaError::internal("cookie key is too short"))
+}
+
+/// Read the cookie key from `ui_keys`, creating it on first use. Blocking.
+fn load_cookie_key(hub: &Hub) -> UaResult<Key> {
     let read = |hub: &Hub| {
         hub.db().read(|c| {
             Ok(c.query_row("SELECT key_hex FROM ui_keys WHERE name = 'cookie'", [], |r| {
@@ -95,8 +140,7 @@ fn cookie_key(hub: &Hub) -> UaResult<Key> {
         })
     };
     if let Some(hexkey) = read(hub)? {
-        let bytes = hex::decode(hexkey).map_err(|_| UaError::internal("cookie key is corrupt"))?;
-        return Key::try_from(bytes.as_slice()).map_err(|_| UaError::internal("cookie key is too short"));
+        return parse_key(&hexkey);
     }
     let fresh = hex::encode(Key::generate().master());
     hub.db().write(|tx| {
@@ -106,38 +150,82 @@ fn cookie_key(hub: &Hub) -> UaResult<Key> {
         )?;
         Ok(())
     })?;
-    let hexkey = read(hub)?.ok_or_else(|| UaError::internal("cookie key missing"))?;
-    let bytes = hex::decode(hexkey).map_err(|_| UaError::internal("cookie key is corrupt"))?;
-    Key::try_from(bytes.as_slice()).map_err(|_| UaError::internal("cookie key is too short"))
+    // Another process may have won the insert: use whichever key is stored.
+    parse_key(&read(hub)?.ok_or_else(|| UaError::internal("cookie key missing"))?)
+}
+
+/// The cookie key: the cached copy, else read off the async runtime.
+async fn cookie_key(state: &AppState) -> UaResult<Key> {
+    if let Some(k) = state.cookie_key.fresh() {
+        return Ok(k);
+    }
+    let hub = state.hub.clone();
+    let key = tokio::task::spawn_blocking(move || load_cookie_key(&hub))
+        .await
+        .map_err(|e| UaError::internal(format!("blocking task failed: {e}")))??;
+    state.cookie_key.store(&key);
+    Ok(key)
+}
+
+/// [`cookie_key`] for code already off the async runtime.
+fn cookie_key_blocking(state: &AppState) -> UaResult<Key> {
+    if let Some(k) = state.cookie_key.fresh() {
+        return Ok(k);
+    }
+    let key = load_cookie_key(&state.hub)?;
+    state.cookie_key.store(&key);
+    Ok(key)
+}
+
+/// The digest of the session id in the request's (decrypted) cookie.
+fn session_id_hash(headers: &HeaderMap, key: Key) -> Option<String> {
+    let jar = PrivateCookieJar::from_headers(headers, key);
+    let raw = jar.get(SESSION_COOKIE)?.value().to_string();
+    Some(digest(&raw))
+}
+
+type SessionRow = (String, String, String);
+
+fn session_row(c: &rusqlite::Connection, id_hash: &str) -> UaResult<Option<SessionRow>> {
+    Ok(c.query_row(
+        "SELECT label, csrf, expires_at FROM ui_sessions WHERE id_hash = ?1 AND revoked_at IS NULL \
+         AND expires_at > ?2",
+        params![id_hash, ua_core::time::now()],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+    )
+    .optional()?)
+}
+
+fn live_session(state: &AppState, row: SessionRow, id_hash: String) -> Option<UiSession> {
+    let (label, csrf_token, expires_at) = row;
+    state.hub.cfg().is_human(&label).then_some(UiSession { label, csrf_token, expires_at, id_hash })
 }
 
 /// The live session named by the request's cookie. Only configured human
 /// identities hold sessions; a label removed from `human_identities` loses
-/// its sessions at once.
-pub fn session_from_headers(state: &AppState, headers: &HeaderMap) -> Option<UiSession> {
+/// its sessions at once. The cookie key comes from the in-memory cache and
+/// the session row is read off the async runtime.
+pub async fn session_from_headers(state: &AppState, headers: &HeaderMap) -> Option<UiSession> {
     if !headers.contains_key(header::COOKIE) {
         return None;
     }
-    let key = cookie_key(&state.hub).ok()?;
-    let jar = PrivateCookieJar::from_headers(headers, key);
-    let raw = jar.get(SESSION_COOKIE)?.value().to_string();
-    let id_hash = digest(&raw);
-    let row = state
-        .hub
-        .db()
-        .read(|c| {
-            Ok(c.query_row(
-                "SELECT label, csrf, expires_at FROM ui_sessions WHERE id_hash = ?1 AND revoked_at IS NULL \
-                 AND expires_at > ?2",
-                params![id_hash, ua_core::time::now()],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
-            )
-            .optional()?)
-        })
-        .ok()
-        .flatten()?;
-    let (label, csrf_token, expires_at) = row;
-    state.hub.cfg().is_human(&label).then_some(UiSession { label, csrf_token, expires_at, id_hash })
+    let key = cookie_key(state).await.ok()?;
+    let id_hash = session_id_hash(headers, key)?;
+    let h = id_hash.clone();
+    let row = state.hub.db().read_async(move |c| session_row(c, &h)).await.ok().flatten()?;
+    live_session(state, row, id_hash)
+}
+
+/// [`session_from_headers`] for code already off the async runtime (the
+/// event stream's periodic re-check).
+pub fn session_from_headers_blocking(state: &AppState, headers: &HeaderMap) -> Option<UiSession> {
+    if !headers.contains_key(header::COOKIE) {
+        return None;
+    }
+    let key = cookie_key_blocking(state).ok()?;
+    let id_hash = session_id_hash(headers, key)?;
+    let row = state.hub.db().read(|c| session_row(c, &id_hash)).ok().flatten()?;
+    live_session(state, row, id_hash)
 }
 
 /// Constant-time CSRF check.
@@ -155,22 +243,35 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 /// Open a session for `label`. Returns the raw cookie value.
-fn create_session(state: &AppState, label: &str, method: &str, headers: &HeaderMap) -> UaResult<String> {
+async fn create_session(
+    state: &AppState,
+    label: &str,
+    method: &str,
+    headers: &HeaderMap,
+) -> UaResult<String> {
     let raw = random_token(SESSION_PREFIX);
     let csrf = random_token("");
     let ttl = state.hub.cfg().ui_session_ttl_hours.clamp(1, 24 * 30) as i64 * 3600;
     let ua: Option<String> = header_str(headers, "user-agent").map(|s| s.chars().take(300).collect());
     let (hash, label, method) = (digest(&raw), label.to_string(), method.to_string());
-    state.hub.db().write(|tx| {
-        let now = ua_core::time::now();
-        tx.execute(
-            "INSERT INTO ui_sessions (id_hash, label, csrf, method, created_at, expires_at, last_seen_at, user_agent) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?7)",
-            params![hash, label, csrf, method, now, ts_in(ttl), ua],
-        )?;
-        ledger::append(tx, EventInput::new("agent.ui.login", json!({ "identity": label, "method": method })).by(label.clone()))?;
-        Ok(())
-    })?;
+    state
+        .hub
+        .db()
+        .write_async(move |tx| {
+            let now = ua_core::time::now();
+            tx.execute(
+                "INSERT INTO ui_sessions (id_hash, label, csrf, method, created_at, expires_at, last_seen_at, user_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?7)",
+                params![hash, label, csrf, method, now, ts_in(ttl), ua],
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new("agent.ui.login", json!({ "identity": label, "method": method }))
+                    .by(label.clone()),
+            )?;
+            Ok(())
+        })
+        .await?;
     Ok(raw)
 }
 
@@ -186,8 +287,8 @@ fn session_cookie(state: &AppState, raw: String) -> Cookie<'static> {
 }
 
 /// A response that sets a fresh session cookie.
-fn with_session(state: &AppState, raw: String, resp: Response) -> Response {
-    match cookie_key(&state.hub) {
+async fn with_session(state: &AppState, raw: String, resp: Response) -> Response {
+    match cookie_key(state).await {
         Ok(key) => (PrivateCookieJar::new(key).add(session_cookie(state, raw)), resp).into_response(),
         Err(e) => server_error(e),
     }
@@ -314,24 +415,27 @@ fn user_uuid(label: &str) -> Uuid {
     Uuid::from_bytes(b)
 }
 
-fn load_passkeys(hub: &Hub, label: &str) -> UaResult<Vec<(String, Passkey)>> {
-    hub.db().read(|c| {
-        let mut stmt =
-            c.prepare("SELECT cred_id, passkey FROM passkeys WHERE label = ?1 ORDER BY created_at")?;
-        let rows: Vec<(String, String)> =
-            stmt.query_map([label], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(id, pk)| serde_json::from_str::<Passkey>(&pk).ok().map(|p| (id, p)))
-            .collect())
-    })
+async fn load_passkeys(hub: &Hub, label: &str) -> UaResult<Vec<(String, Passkey)>> {
+    let label = label.to_string();
+    hub.db()
+        .read_async(move |c| {
+            let mut stmt =
+                c.prepare("SELECT cred_id, passkey FROM passkeys WHERE label = ?1 ORDER BY created_at")?;
+            let rows: Vec<(String, String)> =
+                stmt.query_map([&label], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(id, pk)| serde_json::from_str::<Passkey>(&pk).ok().map(|p| (id, p)))
+                .collect())
+        })
+        .await
 }
 
 fn cred_key(p: &Passkey) -> String {
     serde_json::to_value(p.cred_id()).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
-fn save_state(
+async fn save_state(
     hub: &Hub,
     kind: &str,
     label: &str,
@@ -342,39 +446,43 @@ fn save_state(
     let state_json = serde_json::to_string(state).map_err(|e| UaError::internal(e.to_string()))?;
     let (hash, kind, label, session_hash) =
         (digest(&id), kind.to_string(), label.to_string(), session_hash.map(str::to_string));
-    hub.db().write(|tx| {
-        tx.execute("DELETE FROM webauthn_states WHERE expires_at <= ?1", [ua_core::time::now()])?;
-        tx.execute(
-            "INSERT INTO webauthn_states (id_hash, kind, label, session_hash, state, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![hash, kind, label, session_hash, state_json, ts_in(CEREMONY_TTL_SECS)],
-        )?;
-        Ok(())
-    })?;
+    hub.db()
+        .write_async(move |tx| {
+            tx.execute("DELETE FROM webauthn_states WHERE expires_at <= ?1", [ua_core::time::now()])?;
+            tx.execute(
+                "INSERT INTO webauthn_states (id_hash, kind, label, session_hash, state, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![hash, kind, label, session_hash, state_json, ts_in(CEREMONY_TTL_SECS)],
+            )?;
+            Ok(())
+        })
+        .await?;
     Ok(id)
 }
 
 /// Consume a ceremony state (single use). Returns `(label, state_json)`.
-fn take_state(
+async fn take_state(
     hub: &Hub,
     id: &str,
     kind: &str,
     session_hash: Option<&str>,
 ) -> UaResult<Option<(String, String)>> {
     let (hash, kind, session_hash) = (digest(id), kind.to_string(), session_hash.map(str::to_string));
-    hub.db().write(|tx| {
-        let row: Option<(String, String, Option<String>, String)> = tx
-            .query_row(
-                "SELECT label, state, session_hash, expires_at FROM webauthn_states WHERE id_hash = ?1 AND kind = ?2",
-                params![hash, kind],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        tx.execute("DELETE FROM webauthn_states WHERE id_hash = ?1", [&hash])?;
-        Ok(row.and_then(|(label, state, sess, expires)| {
-            (expires > ua_core::time::now() && sess == session_hash).then_some((label, state))
-        }))
-    })
+    hub.db()
+        .write_async(move |tx| {
+            let row: Option<(String, String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT label, state, session_hash, expires_at FROM webauthn_states WHERE id_hash = ?1 AND kind = ?2",
+                    params![hash, kind],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            tx.execute("DELETE FROM webauthn_states WHERE id_hash = ?1", [&hash])?;
+            Ok(row.and_then(|(label, state, sess, expires)| {
+                (expires > ua_core::time::now() && sess == session_hash).then_some((label, state))
+            }))
+        })
+        .await
 }
 
 #[derive(Deserialize)]
@@ -393,7 +501,7 @@ async fn passkey_login_start(State(state): State<AppState>, Json(body): Json<Log
         Ok(w) => w,
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "passkeys_unavailable", &e),
     };
-    let keys = match load_passkeys(&state.hub, &label) {
+    let keys = match load_passkeys(&state.hub, &label).await {
         Ok(k) if !k.is_empty() => k,
         Ok(_) => return generic(),
         Err(e) => return server_error(e),
@@ -403,7 +511,7 @@ async fn passkey_login_start(State(state): State<AppState>, Json(body): Json<Log
         Ok(v) => v,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "passkey_error", &e.to_string()),
     };
-    match save_state(&state.hub, "login", &label, None, &auth_state) {
+    match save_state(&state.hub, "login", &label, None, &auth_state).await {
         Ok(id) => Json(json!({ "ok": true, "state_id": id, "options": options })).into_response(),
         Err(e) => server_error(e),
     }
@@ -427,7 +535,7 @@ async fn passkey_login_finish(
         Ok(w) => w,
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "passkeys_unavailable", &e),
     };
-    let (label, st) = match take_state(&state.hub, &body.state_id, "login", None) {
+    let (label, st) = match take_state(&state.hub, &body.state_id, "login", None).await {
         Ok(Some(v)) => v,
         Ok(None) => return refused(),
         Err(e) => return server_error(e),
@@ -444,21 +552,31 @@ async fn passkey_login_finish(
         return refused();
     }
     // Store the new counter / backup state on the matching credential.
-    if let Ok(keys) = load_passkeys(&state.hub, &label) {
-        for (id, mut pk) in keys {
-            if pk.update_credential(&result) == Some(true) || pk.cred_id() == result.cred_id() {
-                let json = serde_json::to_string(&pk).unwrap_or_default();
-                let _ = state.hub.db().write(|tx| {
-                    tx.execute(
-                        "UPDATE passkeys SET passkey = ?2, last_used_at = ?3 WHERE cred_id = ?1",
-                        params![id, json, ua_core::time::now()],
-                    )?;
+    if let Ok(keys) = load_passkeys(&state.hub, &label).await {
+        let updated: Vec<(String, String)> = keys
+            .into_iter()
+            .filter_map(|(id, mut pk)| {
+                (pk.update_credential(&result) == Some(true) || pk.cred_id() == result.cred_id())
+                    .then(|| (id, serde_json::to_string(&pk).unwrap_or_default()))
+            })
+            .collect();
+        if !updated.is_empty() {
+            let _ = state
+                .hub
+                .db()
+                .write_async(move |tx| {
+                    for (id, json) in &updated {
+                        tx.execute(
+                            "UPDATE passkeys SET passkey = ?2, last_used_at = ?3 WHERE cred_id = ?1",
+                            params![id, json, ua_core::time::now()],
+                        )?;
+                    }
                     Ok(())
-                });
-            }
+                })
+                .await;
         }
     }
-    match create_session(&state, &label, "passkey", &headers) {
+    match create_session(&state, &label, "passkey", &headers).await {
         Ok(raw) => {
             let next = safe_next(body.next.as_deref());
             with_session(
@@ -466,13 +584,14 @@ async fn passkey_login_finish(
                 raw,
                 Json(json!({ "ok": true, "identity": label, "next": next })).into_response(),
             )
+            .await
         }
         Err(e) => server_error(e),
     }
 }
 
 async fn passkey_register_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(sess) = session_from_headers(&state, &headers) else {
+    let Some(sess) = session_from_headers(&state, &headers).await else {
         return json_error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first");
     };
     if !csrf_matches(&sess, header_str(&headers, CSRF_HEADER)) {
@@ -483,6 +602,7 @@ async fn passkey_register_start(State(state): State<AppState>, headers: HeaderMa
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "passkeys_unavailable", &e),
     };
     let exclude = load_passkeys(&state.hub, &sess.label)
+        .await
         .map(|k| k.into_iter().map(|(_, p)| p.cred_id().clone()).collect::<Vec<_>>())
         .unwrap_or_default();
     let (options, reg_state) = match wa.start_passkey_registration(
@@ -494,7 +614,7 @@ async fn passkey_register_start(State(state): State<AppState>, headers: HeaderMa
         Ok(v) => v,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "passkey_error", &e.to_string()),
     };
-    match save_state(&state.hub, "register", &sess.label, Some(&sess.id_hash), &reg_state) {
+    match save_state(&state.hub, "register", &sess.label, Some(&sess.id_hash), &reg_state).await {
         Ok(id) => Json(json!({ "ok": true, "state_id": id, "options": options })).into_response(),
         Err(e) => server_error(e),
     }
@@ -512,7 +632,7 @@ async fn passkey_register_finish(
     headers: HeaderMap,
     Json(body): Json<RegisterFinish>,
 ) -> Response {
-    let Some(sess) = session_from_headers(&state, &headers) else {
+    let Some(sess) = session_from_headers(&state, &headers).await else {
         return json_error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first");
     };
     if !csrf_matches(&sess, header_str(&headers, CSRF_HEADER)) {
@@ -522,7 +642,7 @@ async fn passkey_register_finish(
         Ok(w) => w,
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "passkeys_unavailable", &e),
     };
-    let st = match take_state(&state.hub, &body.state_id, "register", Some(&sess.id_hash)) {
+    let st = match take_state(&state.hub, &body.state_id, "register", Some(&sess.id_hash)).await {
         Ok(Some((label, st))) if label == sess.label => st,
         Ok(_) => return json_error(StatusCode::BAD_REQUEST, "expired", "registration expired; start again"),
         Err(e) => return server_error(e),
@@ -537,17 +657,22 @@ async fn passkey_register_finish(
     let name: String = body.name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(60).collect();
     let (id, json, label) =
         (cred_key(&passkey), serde_json::to_string(&passkey).unwrap_or_default(), sess.label);
-    let res = state.hub.db().write(|tx| {
-        tx.execute(
-            "INSERT INTO passkeys (cred_id, label, name, passkey, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, label, (!name.trim().is_empty()).then_some(name.trim()), json, ua_core::time::now()],
-        )?;
-        ledger::append(
-            tx,
-            EventInput::new("agent.ui.passkey_registered", json!({ "identity": label })).by(label.clone()),
-        )?;
-        Ok(())
-    });
+    let res = state
+        .hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute(
+                "INSERT INTO passkeys (cred_id, label, name, passkey, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, label, (!name.trim().is_empty()).then_some(name.trim()), json, ua_core::time::now()],
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new("agent.ui.passkey_registered", json!({ "identity": label }))
+                    .by(label.clone()),
+            )?;
+            Ok(())
+        })
+        .await;
     match res {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(UaError::Conflict(_)) => {
@@ -588,20 +713,24 @@ async fn link_consume(
     Form(f): Form<LinkForm>,
 ) -> Response {
     let hash = digest(f.token.trim());
-    let consumed = state.hub.db().write(|tx| {
-        let now = ua_core::time::now();
-        let label: Option<String> = tx
-            .query_row(
-                "SELECT label FROM login_links WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
-                params![hash, now],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if label.is_some() {
-            tx.execute("UPDATE login_links SET used_at = ?2 WHERE token_hash = ?1", params![hash, now])?;
-        }
-        Ok(label)
-    });
+    let consumed = state
+        .hub
+        .db()
+        .write_async(move |tx| {
+            let now = ua_core::time::now();
+            let label: Option<String> = tx
+                .query_row(
+                    "SELECT label FROM login_links WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
+                    params![hash, now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if label.is_some() {
+                tx.execute("UPDATE login_links SET used_at = ?2 WHERE token_hash = ?1", params![hash, now])?;
+            }
+            Ok(label)
+        })
+        .await;
     let label = match consumed {
         Ok(Some(l)) if state.hub.cfg().is_human(&l) => l,
         Ok(_) => {
@@ -614,8 +743,8 @@ async fn link_consume(
         }
         Err(e) => return server_error(e),
     };
-    match create_session(&state, &label, "login_link", &headers) {
-        Ok(raw) => with_session(&state, raw, Redirect::to("/login/passkeys").into_response()),
+    match create_session(&state, &label, "login_link", &headers).await {
+        Ok(raw) => with_session(&state, raw, Redirect::to("/login/passkeys").into_response()).await,
         Err(e) => server_error(e),
     }
 }
@@ -628,23 +757,27 @@ struct LogoutForm {
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap, Form(f): Form<LogoutForm>) -> Response {
-    if let Some(sess) = session_from_headers(&state, &headers) {
+    if let Some(sess) = session_from_headers(&state, &headers).await {
         let provided = header_str(&headers, CSRF_HEADER).or(f.csrf.as_deref());
         if !csrf_matches(&sess, provided) {
             return json_error(StatusCode::FORBIDDEN, "csrf", "missing or wrong CSRF token");
         }
         let (hash, label) = (sess.id_hash.clone(), sess.label.clone());
-        let res = state.hub.db().write(|tx| {
-            tx.execute(
-                "UPDATE ui_sessions SET revoked_at = ?2 WHERE id_hash = ?1 AND revoked_at IS NULL",
-                params![hash, ua_core::time::now()],
-            )?;
-            ledger::append(
-                tx,
-                EventInput::new("agent.ui.logout", json!({ "identity": label })).by(label.clone()),
-            )?;
-            Ok(())
-        });
+        let res = state
+            .hub
+            .db()
+            .write_async(move |tx| {
+                tx.execute(
+                    "UPDATE ui_sessions SET revoked_at = ?2 WHERE id_hash = ?1 AND revoked_at IS NULL",
+                    params![hash, ua_core::time::now()],
+                )?;
+                ledger::append(
+                    tx,
+                    EventInput::new("agent.ui.logout", json!({ "identity": label })).by(label.clone()),
+                )?;
+                Ok(())
+            })
+            .await;
         if let Err(e) = res {
             return server_error(e);
         }
@@ -689,7 +822,7 @@ async fn login_page(
     Query(q): Query<LoginQuery>,
 ) -> Response {
     let next = safe_next(q.next.as_deref());
-    if session_from_headers(&state, &headers).is_some() {
+    if session_from_headers(&state, &headers).await.is_some() {
         return Redirect::to(&next).into_response();
     }
     let body = format!(
@@ -718,19 +851,21 @@ j=await r.json();if(!r.ok)return say(j.message||'Sign-in failed');location.href=
 }
 
 async fn passkeys_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(sess) = session_from_headers(&state, &headers) else {
+    let Some(sess) = session_from_headers(&state, &headers).await else {
         return Redirect::to("/login?next=/login/passkeys").into_response();
     };
+    let label = sess.label.clone();
     let keys: Vec<(String, Option<String>, String, Option<String>)> = state
         .hub
         .db()
-        .read(|c| {
+        .read_async(move |c| {
             let mut stmt =
                 c.prepare("SELECT cred_id, name, created_at, last_used_at FROM passkeys WHERE label = ?1 ORDER BY created_at")?;
             Ok(stmt
-                .query_map([&sess.label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .query_map([&label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                 .collect::<Result<_, _>>()?)
         })
+        .await
         .unwrap_or_default();
     let list: String = if keys.is_empty() {
         "<p class=\"hint\">No passkey yet. Register one so you can sign in without a login link.</p>".into()

@@ -37,7 +37,7 @@ fn config() -> Config {
 
 fn app(cfg: Config) -> (Router, AppState) {
     let hub = Hub::in_memory(cfg).unwrap();
-    let state = AppState { hub, registry: Arc::new(builtin_registry()) };
+    let state = AppState::new(hub, Arc::new(builtin_registry()));
     (ua_server::router(state.clone(), CancellationToken::new()), state)
 }
 

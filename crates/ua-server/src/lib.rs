@@ -27,6 +27,15 @@ use ua_tools::{Hub, Registry};
 pub struct AppState {
     pub hub: Hub,
     pub registry: Arc<Registry>,
+    /// The browser-session cookie key, cached so authenticated UI requests
+    /// do not read `ui_keys` ([`login::CookieKeyCache`]).
+    pub cookie_key: Arc<login::CookieKeyCache>,
+}
+
+impl AppState {
+    pub fn new(hub: Hub, registry: Arc<Registry>) -> Self {
+        Self { hub, registry, cookie_key: Arc::new(login::CookieKeyCache::new()) }
+    }
 }
 
 pub const INSTRUCTIONS: &str = "Agent-operations hub. One governed tool surface for every agent: tasks, plans, \

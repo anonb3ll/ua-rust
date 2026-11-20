@@ -197,3 +197,40 @@ async fn passkey_start_does_not_reveal_identities() {
     assert!(v["options"]["publicKey"]["challenge"].is_string());
     assert_eq!(v["options"]["publicKey"]["rp"]["id"], "hub.example.com");
 }
+
+/// The cookie key is cached in the app state: once a session exists, an
+/// authenticated request does not read `ui_keys` (deleting the row changes
+/// nothing), and invalidating the cache makes the hub read the table again
+/// (here: mint a new key, so the old cookie no longer decrypts).
+#[tokio::test]
+async fn the_cookie_key_is_cached_and_invalidation_rereads_it() {
+    let hub = TestHub::new(config());
+    let cookie = hub.sign_in("operator").await;
+    let key_rows = |hub: &TestHub| -> i64 {
+        hub.state
+            .hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM ui_keys", [], |r| r.get(0))?))
+            .unwrap()
+    };
+    assert_eq!(key_rows(&hub), 1);
+    hub.state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute("DELETE FROM ui_keys", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    let resp = hub.send(get("/api/session", Some(&cookie), None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(json_body(resp).await["auth"], "cookie");
+    assert_eq!(key_rows(&hub), 0, "an authenticated request served from the cache reads no key row");
+
+    hub.state.cookie_key.invalidate();
+    let resp = hub.send(get("/ui/work", Some(&cookie), None)).await;
+    assert!(resp.status().is_redirection(), "a replaced key signs the browser out: {}", resp.status());
+    assert!(location(&resp).starts_with("/login?next="));
+    assert_eq!(key_rows(&hub), 1, "the miss re-read ui_keys and created a fresh key");
+}

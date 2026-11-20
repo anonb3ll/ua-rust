@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
     let _hub_lock = ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?;
     let hub = Hub::open(cfg.clone())?;
     let registry = Arc::new(builtin_registry());
-    let state = AppState { hub: hub.clone(), registry: registry.clone() };
+    let state = AppState::new(hub.clone(), registry.clone());
 
     match cli.cmd {
         Cmd::Serve => {
