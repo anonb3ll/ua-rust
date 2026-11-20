@@ -108,7 +108,13 @@ impl Step {
     }
 }
 
-async fn run_fixed(argv: &[String], cwd: &Path, env: &[(String, String)], timeout: Duration, which: &str) -> Step {
+async fn run_fixed(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    which: &str,
+) -> Step {
     if !argv_on_allowlist(argv) {
         return Step { error: Some(argv_refusal().to_string()), ..Step::default() };
     }
@@ -124,9 +130,10 @@ async fn run_fixed(argv: &[String], cwd: &Path, env: &[(String, String)], timeou
             stderr: output_text(&out.stderr),
             ..Step::default()
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Step { error: Some(format!("failed to execute ruff {which}: command not found")), ..Step::default() }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Step {
+            error: Some(format!("failed to execute ruff {which}: command not found")),
+            ..Step::default()
+        },
         Err(e) => Step { error: Some(format!("failed to execute ruff {which}: {e}")), ..Step::default() },
     }
 }
@@ -155,8 +162,8 @@ fn first_symlink(dir: &Path) -> UaResult<Option<std::path::PathBuf>> {
     let mut stack = vec![dir.to_path_buf()];
     let mut seen = 0usize;
     while let Some(d) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&d).map_err(|e| UaError::invalid(format!("cannot read {}: {e}", d.display())))?;
+        let entries = std::fs::read_dir(&d)
+            .map_err(|e| UaError::invalid(format!("cannot read {}: {e}", d.display())))?;
         for entry in entries {
             let entry = entry.map_err(|e| UaError::invalid(format!("cannot read {}: {e}", d.display())))?;
             seen += 1;

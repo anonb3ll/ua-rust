@@ -53,7 +53,9 @@ fn caller(label: &str, profile: Profile) -> Caller {
 
 impl Env {
     async fn call(&self, args: Value) -> Result<Value, ua_core::UaError> {
-        self.reg.call(&self.hub, &caller("builder-1", Profile::Developer), "python_lint_and_format", args).await
+        self.reg
+            .call(&self.hub, &caller("builder-1", Profile::Developer), "python_lint_and_format", args)
+            .await
     }
 
     fn write(&self, rel: &str, body: &str) -> PathBuf {
@@ -267,7 +269,10 @@ async fn fixed_argv_runs_in_the_workspace_without_a_shell_or_config() {
     e.write(tricky, "x = 1\n");
     // A project config that would pull in a file outside the workspace and
     // move the cache there: --isolated means ruff never reads it.
-    e.write("pyproject.toml", "[tool.ruff]\nextend = \"/etc/hostname\"\ncache-dir = \"/var/tmp/ruff-cache\"\n");
+    e.write(
+        "pyproject.toml",
+        "[tool.ruff]\nextend = \"/etc/hostname\"\ncache-dir = \"/var/tmp/ruff-cache\"\n",
+    );
 
     let ran = e.call(json!({"path": tricky, "args": []})).await.unwrap();
     assert_eq!(ran["success"], true, "{ran}");
