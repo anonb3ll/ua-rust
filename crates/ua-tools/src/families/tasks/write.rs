@@ -58,7 +58,8 @@ pub struct UpdateArgs {
     pub parent_id: Option<i64>,
     /// `true` quarantines; clearing a quarantine needs a verified human.
     pub untrusted: Option<bool>,
-    /// `true` archives (parks) the task, `false` unarchives it.
+    /// `true` archives (files away) the task, `false` unarchives it. Parking
+    /// stale work is `coordination_manage(action="queue_park")`.
     pub archived: Option<bool>,
     /// Move the task to this project stream.
     pub project: Option<String>,
@@ -546,6 +547,12 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                 if is_terminal(st) && !is_terminal(&old_status) {
                     ownership_ended = true;
                 }
+                // A closed task is no longer parked: the park ends with it.
+                if is_terminal(st) && old.get("parked_at").is_some_and(|v| !v.is_null()) {
+                    for col in ["parked_at", "parked_by", "parked_reason", "folded_into"] {
+                        s.raw(col, "NULL");
+                    }
+                }
                 if st == "doing" && old_status != "doing" {
                     let lane_after = lane.as_deref().unwrap_or(&old_lane);
                     if UNCLAIMABLE_LANES.contains(&lane_after) {
@@ -575,7 +582,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                         a.archived == Some(true) || (a.archived.is_none() && old.get("archived_at") != Some(&Value::Null));
                     if stays_archived {
                         return Err(UaError::invalid(format!(
-                            "task {id} is archived (parked): pass archived=false to unpark it before work starts"
+                            "task {id} is archived: pass archived=false to unarchive it before work starts"
                         )));
                     }
                     // A lapsed claim survives only for its own claimant.
@@ -761,7 +768,7 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 return Err(UaError::invalid(format!("task {id} is already {status}")));
             }
             if row.get("archived_at").is_some_and(|v| !v.is_null()) {
-                return Err(UaError::invalid(format!("task {id} is archived (parked): unarchive it before claiming")));
+                return Err(UaError::invalid(format!("task {id} is archived: unarchive it before claiming")));
             }
             // A task spawned from an approved work proposal fails closed when
             // its title or notes drifted from the frozen contract.

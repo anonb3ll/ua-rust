@@ -10,7 +10,7 @@ Re-check a row before relying on it after a few months.
 |---|---|---|---|
 | Async runtime | tokio 1.54 | — | The default; axum and rmcp both build on it. |
 | HTTP framework | axum 0.8 + tower 0.5 + tower-http 0.7 | actix-web 4.20 | rmcp's Streamable HTTP service is a Tower service and mounts with `nest_service("/mcp", …)`. The single call wrapper (auth → profile → policy → approval → ledger) is written as Tower layers plus one in-process dispatcher. |
-| MCP | rmcp 3.11 (official SDK) | rust-mcp-sdk 2.0 | Implements spec revision 2026-07-28 (stateless, no `initialize`), with a legacy session mode for 2025-11-25 clients. We implement `list_tools`/`call_tool` by hand so the tool list is filtered per profile. rmcp has no OAuth authorization server. |
+| MCP | rmcp 3.11 (official SDK); its client features power `mcp_gateway` | rust-mcp-sdk 2.0 | Implements spec revision 2026-07-28 (stateless, no `initialize`), with a legacy session mode for 2025-11-25 clients. We implement `list_tools`/`call_tool` by hand so the tool list is filtered per profile. rmcp has no OAuth authorization server. |
 | SQLite | rusqlite 0.43 (bundled SQLite 3.54, FTS5 on) | sqlx 0.9 | Full control over WAL, `BEGIN IMMEDIATE`, custom functions and virtual tables. One writer connection plus a read pool; blocking work runs on `spawn_blocking`. Storage sits behind repository traits so a Postgres backend can be added later. |
 | Migrations | Named schema parts (own code, about 50 lines) | rusqlite_migration 2.7 | Each feature module contributes idempotent parts recorded by name and checksum, so modules add tables without coordinating version numbers. |
 | Full-text search | SQLite FTS5 | tantivy 0.27 | Same transaction as the row write; no second index to keep in sync. |
@@ -20,6 +20,7 @@ Re-check a row before relying on it after a few months.
 | Ledger signing | ed25519-dalek 3.0 (`verify_strict`) | — | Signed producer events. |
 | Timestamp anchors | sigstore-tsa 0.16 (RFC 3161) | x509-tsp + cms (RCs) | Optional anchor backend. |
 | Constant-time compare | subtle 2.6 | — | Token checks. |
+| Secrets at rest | aes-gcm 0.10 (AES-256-GCM) + hmac 0.13 (RustCrypto) | chacha20poly1305 0.10 | Both were already in the tree (cookie, webauthn-rs), so managed secrets add no new crate. aes-gcm 0.10 is the audited RustCrypto line (NCC Group, 2020); the 0.11 line in the tree is newer and less deployed. |
 | OAuth 2.1 server | Hand-written on axum (PKCE S256, client ID metadata documents, dynamic registration, RFC 8414 and RFC 9728 metadata, RFC 8707 resource indicators, refresh rotation, revocation) | oauth-as 1.1 | No mature crate exists; we own the code and its conformance tests. |
 | JWT | jsonwebtoken 12 | jwt-simple 0.15 | Bearer tokens are opaque and stored hashed; JWT only where a spec needs it. |
 | Password hashing | argon2 0.6 | — | Human-chosen secrets only. High-entropy tokens use SHA-256. |

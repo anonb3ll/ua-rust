@@ -42,6 +42,12 @@ node_max_per_agent = 8
 # graph_canvas_max_boards = 1000
 # graph_canvas_history_max = 20
 
+# Client evidence (evidence_append, POST /api/evidence) per identity per
+# rolling hour: events and serialized payload bytes. Past either the append
+# is refused with rate_limited.
+# evidence_append_max_per_hour = 120
+# evidence_append_max_bytes_per_hour = 2097152
+
 # Tools that always need a one-time human approval.
 approval_tools = ["git_merge_task"]
 
@@ -72,6 +78,16 @@ autonomy_max_cost_cents = 1000.0
 # cycle merge and PR transition waits for a human approval.
 # cycle_validation_command = ["cargo", "test", "--quiet"]
 
+# Managed secrets (managed_secret_set) are encrypted at rest with this key:
+# 32 random bytes as base64 or hex (`openssl rand -base64 32`). Prefer the
+# UA_MANAGED_SECRET_KEY environment variable to keep it out of this file. A
+# comma-separated list rotates keys: the first encrypts, all decrypt. Unset,
+# secrets cannot be stored. See docs/mcp.md.
+# managed_secret_key = "<base64 key>"
+
+# Days an approved MCP server registration or review stays valid (1-365).
+# mcp_review_ttl_days = 90
+
 # Default profile per identity. Unlisted identities get "developer". Profiles:
 # coordinator, lead, developer, reviewer, operator, research, acp-session,
 # remote-vault-curator, remote-assistant, public (see docs/policy.md).
@@ -83,3 +99,22 @@ reviewer-1 = "reviewer"
 # Per-agent workspace roots, or "deny".
 [agent_workspaces]
 # researcher-1 = "deny"
+
+# Downstream MCP servers for mcp_gateway, declared by the operator. Same
+# fields as mcp_server_register's spec, plus review_expires_at. Secrets are
+# managed secret names bound to consumer "mcp:<server>". An empty
+# read_profiles admits humans and configured operator identities only; list
+# the agent profiles that may read. See docs/mcp.md.
+# [mcp_servers.docs]
+# transport = "streamable_http"
+# url = "https://docs.example.com/mcp"
+# address_scope = "public"            # public | private | loopback
+# secrets = [{ secret = "docs-token", inject = "bearer" }]
+# read_profiles = ["developer", "reviewer"]
+# timeout_s = 30
+# review_expires_at = "2027-03-01"
+#
+# [mcp_servers.docs.tools]
+# search = "read"
+# get_page = "read"
+# put_page = "write"
