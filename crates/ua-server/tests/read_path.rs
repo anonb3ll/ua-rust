@@ -165,3 +165,43 @@ async fn tool_calls_from_clients_still_record_one_row_each() {
     s.registry.call(&s.hub, &local, "dependency_list", json!({})).await.unwrap();
     assert_eq!(total(&hub), before + 2);
 }
+
+/// An MCP `tools/call` runs as its own tracked task (so a shutdown can wait
+/// for it) and records one row, as before.
+#[tokio::test]
+async fn an_mcp_tool_call_is_tracked_and_recorded() {
+    let hub = TestHub::new(config());
+    seed(&hub).await;
+    let before = total(&hub);
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "task_list", "arguments": { "status": "open" },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    let auth = format!("Bearer {BUILDER}");
+    let resp = hub
+        .send(common::post_json(
+            "/mcp",
+            &call,
+            &[
+                ("authorization", &auth),
+                ("accept", "application/json, text/event-stream"),
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "task_list"),
+                ("host", "localhost"),
+            ],
+        ))
+        .await;
+    let status = resp.status();
+    let body = text_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Wire the board"), "{body}");
+    assert_eq!(total(&hub), before + 1, "{:?}", rows(&hub));
+    assert!(hub.state.calls.is_empty(), "the tracked call finished");
+}
