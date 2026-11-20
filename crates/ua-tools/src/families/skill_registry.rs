@@ -3,28 +3,33 @@
 //! A skill version is immutable: `(name, version)` with the SHA-256 of its
 //! content, never updated or deleted (triggers refuse both). Publishing the
 //! same content again returns the existing version. A skill is assigned to an
-//! agent label or a profile, optionally pinned to a version (else the latest
-//! when resolved); an agent assignment wins over a profile assignment of the
-//! same skill. The harness config bundle served to a node carries the skills
-//! resolved for the node's agent (see [`super::harness_config`]).
+//! agent label or a profile, always pinned to the version that was approved;
+//! an agent assignment wins over a profile assignment of the same skill. The
+//! harness config bundle served to a node carries the skills resolved for the
+//! node's agent (see [`super::harness_config`]).
 //!
 //! Actions (`action` + `params`, as in the Python hub):
-//! - `publish` {name, path}: version one skill (`SKILL.md`, or a skill
-//!   directory holding only `SKILL.md`) from the workspace, after
-//!   `skill_review` passes without a high-severity finding;
+//! - `publish` {name, path}: review one skill (`SKILL.md`, or a skill
+//!   directory holding only `SKILL.md`) in the workspace, copy it into the
+//!   hub's staging table and ask for a human approval that shows the full
+//!   text; `publish` {staging_id}: after approval, version that staged copy
+//!   (the workspace file is never read again);
 //! - `list` {name?}, `get` {name, version?};
 //! - `assign` {skill_name, target, target_type?, version?}, `unassign`;
-//! - `resolve` {agent_label, profile?}: what an agent is assigned;
+//! - `resolve` {agent_label, profile?}: what an agent is assigned (the
+//!   caller's own, or any agent's for an operator);
 //! - `drift` {surface_dir, agent_label?, profile?}: a read-only comparison of
-//!   a skills directory with the registry.
+//!   a skills directory in the workspace with the registry.
 //!
-//! Publish, assign and unassign are operator actions (a human or a lifecycle
-//! operator): a skill's text lands in the harness of every node it reaches,
-//! so it is a prompt-injection path. A new version (`publish`) and an
-//! assignment (`assign`) each also need a one-time human approval, bound to
-//! the content hash (and, for an assignment, the target and pin). They append
-//! `skill.published`, `skill.assigned` and `skill.unassigned` events in the
-//! same transaction.
+//! A skill's text lands in the harness of every node it reaches, so it is a
+//! prompt-injection path: publish, assign and unassign are operator actions
+//! (a human or a lifecycle operator), and each needs a one-time human
+//! approval bound to the content (publish: the staged text and its review
+//! findings; assign: target, pinned version and hash; unassign: the target).
+//! `skill_review` refuses permission-bearing front matter and hidden text.
+//! Paths are resolved inside the workspace without following symlinks, and
+//! outputs never carry the hub's filesystem paths. Events: `skill.published`,
+//! `skill.assigned` and `skill.unassigned`, in the same transaction.
 //!
 //! Not ported: multi-file skill packages (a publish source with supporting
 //! files is refused), the catalog and team installs, and git skill sources.
@@ -32,7 +37,7 @@
 //! `SKILL.md` and manifest hash are verified on read.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use schemars::JsonSchema;
@@ -43,7 +48,6 @@ use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, ledger};
 
 use super::agents::verified;
-use super::audit::resolve_target;
 use super::harness_config::render::{content_hash, py_dumps};
 use super::node_queue::is_operator;
 use crate::approvals::{self, GateOutcome};
@@ -81,6 +85,19 @@ CREATE TABLE IF NOT EXISTS skill_assignments (
     UNIQUE(skill_name, target_type, target)
 );
 CREATE INDEX IF NOT EXISTS idx_skill_assignments_target ON skill_assignments(target_type, target);
+-- A publish request's own copy of the SKILL.md: approved and published
+-- from here, never re-read from the workspace.
+CREATE TABLE IF NOT EXISTS skill_publish_staging (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source TEXT NOT NULL,
+    findings_json TEXT NOT NULL DEFAULT '[]',
+    requested_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    published_version INTEGER
+);
 CREATE TRIGGER IF NOT EXISTS skill_versions_immutable_update BEFORE UPDATE ON skill_versions
 BEGIN SELECT RAISE(ABORT, 'skill versions and provenance are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS skill_versions_immutable_delete BEFORE DELETE ON skill_versions
@@ -169,7 +186,6 @@ fn version_row(r: &Row<'_>) -> rusqlite::Result<Value> {
         "name": r.get::<_, String>(1)?,
         "version": r.get::<_, i64>(2)?,
         "content_hash": r.get::<_, String>(3)?,
-        "source": r.get::<_, String>(4)?,
         "published_by": r.get::<_, Option<String>>(5)?,
         "published_at": r.get::<_, String>(6)?,
         "package_manifest": manifest.and_then(|m| serde_json::from_str::<Value>(&m).ok()),
@@ -250,7 +266,6 @@ pub(crate) struct Resolved {
     pub name: String,
     pub version: i64,
     pub hash: String,
-    pub source: String,
     pub content: String,
     /// `agent` or `profile`: which assignment matched.
     pub via: &'static str,
@@ -300,7 +315,6 @@ pub(crate) fn resolve(c: &Connection, agent: &str, profile: Option<&str>) -> UaR
         out.push(Resolved {
             version: row["version"].as_i64().unwrap_or_default(),
             hash: row["content_hash"].as_str().unwrap_or_default().to_string(),
-            source: row["source"].as_str().unwrap_or_default().to_string(),
             content: row["content"].as_str().unwrap_or_default().to_string(),
             name,
             via,
@@ -324,8 +338,14 @@ pub struct SkillRegistryArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublishParams {
-    name: String,
-    path: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// Stage the skill at this workspace path and ask for approval.
+    #[serde(default)]
+    path: Option<String>,
+    /// Publish this approved staged copy.
+    #[serde(default)]
+    staging_id: Option<String>,
     /// Accepted for compatibility; the verified caller is always the author.
     #[serde(default)]
     #[allow(dead_code)]
@@ -433,27 +453,81 @@ fn positive(version: Option<i64>) -> UaResult<Option<i64>> {
     }
 }
 
-/// The single `SKILL.md` a publish reads: a `SKILL.md` file, or a skill
-/// directory holding nothing else.
-fn skill_md(resolved: &Path, shown: &str) -> UaResult<PathBuf> {
-    let dir = if resolved.is_file() {
-        if resolved.file_name().is_none_or(|n| n != "SKILL.md") {
+/// Resolve `raw` inside the workspace without following any symlink: every
+/// component is checked with `symlink_metadata`. A path that is missing and
+/// one outside the workspace get the same refusal. Returns the absolute path
+/// and its workspace-relative form.
+fn workspace_target(ctx: &ToolCtx, raw: &str) -> UaResult<(PathBuf, String)> {
+    let not_found = || UaError::not_found(format!("{raw:?} does not exist inside the workspace"));
+    let raw_t = raw.trim();
+    if raw_t.contains('\0') {
+        return Err(not_found());
+    }
+    let ws = ctx.hub.cfg().workspace_root();
+    let ws_real = ws.canonicalize().map_err(|_| not_found())?;
+    let p = Path::new(if raw_t.is_empty() { "." } else { raw_t });
+    let rel: PathBuf = if p.is_absolute() {
+        p.strip_prefix(&ws_real).or_else(|_| p.strip_prefix(&ws)).map_err(|_| not_found())?.to_path_buf()
+    } else {
+        p.to_path_buf()
+    };
+    let mut cur = ws_real;
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                cur.push(seg);
+                parts.push(seg.to_string_lossy().into_owned());
+                let meta = std::fs::symlink_metadata(&cur).map_err(|_| not_found())?;
+                if meta.file_type().is_symlink() {
+                    return Err(UaError::invalid(format!(
+                        "{raw:?} passes through a symlink; symlinks are not followed"
+                    )));
+                }
+            }
+            Component::CurDir => {}
+            _ => return Err(not_found()),
+        }
+    }
+    Ok((cur, parts.join("/")))
+}
+
+fn is_regular_file(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// The single `SKILL.md` a publish reads (a `SKILL.md` file, or a skill
+/// directory holding nothing else), with its workspace-relative path.
+fn skill_md(target: &Path, rel: &str, shown: &str) -> UaResult<(PathBuf, String)> {
+    let (dir, rel_dir) = if is_regular_file(target) {
+        if target.file_name().is_none_or(|n| n != "SKILL.md") {
             return Err(UaError::invalid(format!("{shown:?} is a file but not a SKILL.md")));
         }
-        resolved.parent().map(Path::to_path_buf).unwrap_or_default()
-    } else if resolved.join("SKILL.md").is_file() {
-        resolved.to_path_buf()
+        let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+        (parent, rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default())
+    } else if is_real_dir(target) {
+        (target.to_path_buf(), rel.to_string())
     } else {
-        return Err(UaError::invalid(format!(
-            "{shown:?} has no SKILL.md at its root; publish takes one skill directory or SKILL.md file"
-        )));
+        return Err(UaError::invalid(format!("{shown:?} is neither a SKILL.md nor a skill directory")));
     };
     let md = dir.join("SKILL.md");
-    if std::fs::symlink_metadata(&md).map(|m| m.file_type().is_symlink()).unwrap_or(true) {
-        return Err(UaError::invalid("skill package refuses symlink sources"));
+    match std::fs::symlink_metadata(&md) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(UaError::invalid("SKILL.md is a symlink; symlinks are not followed"));
+        }
+        Ok(m) if m.file_type().is_file() => {}
+        _ => {
+            return Err(UaError::invalid(format!(
+                "{shown:?} has no SKILL.md at its root; publish takes one skill directory or SKILL.md file"
+            )));
+        }
     }
     let others: Vec<String> = std::fs::read_dir(&dir)
-        .map_err(|e| UaError::invalid(format!("cannot read {shown:?}: {e}")))?
+        .map_err(|_| UaError::invalid(format!("cannot read {shown:?}")))?
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != "SKILL.md")
@@ -464,10 +538,14 @@ fn skill_md(resolved: &Path, shown: &str) -> UaResult<PathBuf> {
              (multi-file packages are not ported)",
         ));
     }
-    Ok(md)
+    let rel_md = if rel_dir.is_empty() { "SKILL.md".to_string() } else { format!("{rel_dir}/SKILL.md") };
+    Ok((md, rel_md))
 }
 
 fn read_bounded(md: &Path) -> UaResult<String> {
+    if !is_regular_file(md) {
+        return Err(UaError::invalid("SKILL.md could not be read"));
+    }
     let bytes = std::fs::read(md).map_err(|_| UaError::invalid("SKILL.md could not be read"))?;
     if bytes.len() > MAX_SKILL_FILE_BYTES {
         return Err(UaError::invalid(format!("SKILL.md exceeds the {MAX_SKILL_FILE_BYTES}-byte limit")));
@@ -475,30 +553,79 @@ fn read_bounded(md: &Path) -> UaResult<String> {
     String::from_utf8(bytes).map_err(|_| UaError::invalid("SKILL.md must be valid UTF-8"))
 }
 
-fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
-    let who = operator(ctx, "publishing a skill")?;
-    let name = check_name(&p.name)?;
-    let target = resolve_target(ctx, &p.path, false, false)?;
-    let ws = ctx.hub.cfg().workspace_root();
-    let ws = ws.canonicalize().unwrap_or(ws);
-    if !target.path.starts_with(&ws) {
-        return Err(UaError::denied(
-            "outside_workspace",
-            format!(
-                "publish source {:?} is outside the workspace; read roots are audit sources only",
-                p.path
-            ),
-        ));
-    }
-    let md = skill_md(&target.path, &p.path)?;
+/// One staged publish: the hub's own copy of a `SKILL.md`, taken when the
+/// publish was requested. The approval shows and binds this copy, and an
+/// approved publish versions it without reading the workspace again.
+struct Staged {
+    id: String,
+    name: String,
+    content: String,
+    content_hash: String,
+    source: String,
+    findings: Value,
+    requested_by: String,
+    published_version: Option<i64>,
+}
+
+fn load_staged(c: &Connection, id: &str) -> UaResult<Option<Staged>> {
+    Ok(c.query_row(
+        "SELECT id, name, content, content_hash, source, findings_json, requested_by, published_version \
+         FROM skill_publish_staging WHERE id = ?1",
+        [id],
+        |r| {
+            let findings: String = r.get(5)?;
+            Ok(Staged {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                content: r.get(2)?,
+                content_hash: r.get(3)?,
+                source: r.get(4)?,
+                findings: serde_json::from_str(&findings).unwrap_or_else(|_| json!([])),
+                requested_by: r.get(6)?,
+                published_version: r.get(7)?,
+            })
+        },
+    )
+    .optional()?)
+}
+
+/// What a publish approval shows and binds: the full staged text (at most
+/// 64 KiB), its hash and the review's findings.
+fn staged_payload(s: &Staged) -> Value {
+    json!({
+        "action": "publish",
+        "staging_id": s.id,
+        "name": s.name,
+        "content_hash": s.content_hash,
+        "content": s.content,
+        "review_findings": s.findings,
+    })
+}
+
+fn existing_version(c: &Connection, name: &str, hash: &str) -> UaResult<Option<Value>> {
+    Ok(c.query_row(
+        &format!(
+            "SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND content_hash = ?2 \
+             ORDER BY version DESC LIMIT 1"
+        ),
+        params![name, hash],
+        version_row,
+    )
+    .optional()?)
+}
+
+/// `publish {name, path}`: review the skill, copy it into the hub's staging
+/// table and ask for the approval. It never publishes; after approval,
+/// `publish {staging_id}` versions the staged copy.
+fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult<Value> {
+    let name = check_name(name.as_deref().unwrap_or_default())?;
+    let (target, rel) = workspace_target(ctx, path)?;
+    let (md, rel_md) = skill_md(&target, &rel, path)?;
     let text = read_bounded(&md)?;
     let dir = md.parent().map(Path::to_path_buf).unwrap_or_default();
     let review = super::skills::review_dirs(vec![dir.clone()], &dir, "info");
     if review["status"] == "fail" {
         return Ok(json!({ "ok": false, "blocked": true, "name": name, "review": review }));
-    }
-    if read_bounded(&md)? != text {
-        return Err(UaError::conflict("skill package changed while it was being reviewed; retry publish"));
     }
     if let Some(fm) = frontmatter(&text)
         && let Some(fm_name) = fm.get("name").and_then(Value::as_str)
@@ -509,54 +636,124 @@ fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
         )));
     }
     let hash = content_hash(&text);
-    let source = target.path.to_string_lossy().into_owned();
+    let findings: Vec<Value> = review["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| json!({ "rule": f["rule"], "severity": f["severity"], "message": f["message"], "line": f["line"] }))
+        .collect();
+    let caller = ctx.caller.clone();
+    let cfg = ctx.hub.cfg().clone();
+    let who = who.to_string();
     ctx.hub.db().write(|tx| {
-        let existing = tx
+        if let Some(skill) = existing_version(tx, &name, &hash)? {
+            return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
+        }
+        let reuse: Option<String> = tx
             .query_row(
-                &format!(
-                    "SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND content_hash = ?2 \
-                     ORDER BY version DESC LIMIT 1"
-                ),
-                params![name, hash],
-                version_row,
+                "SELECT id FROM skill_publish_staging WHERE name = ?1 AND content_hash = ?2 AND requested_by = ?3 \
+                 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![name, hash, who],
+                |r| r.get(0),
             )
             .optional()?;
-        if let Some(skill) = existing {
-            return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review })));
-        }
-        // A new version reaches every node its skill is assigned to: a human
-        // approves this exact content first.
-        let payload = json!({ "action": "publish", "name": name, "content_hash": hash, "source": source });
-        if let Some(id) = gate(tx, ctx, &payload)? {
-            return Ok(Err(id));
-        }
-        let next: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM skill_versions WHERE name = ?1",
-            [&name],
-            |r| r.get(0),
-        )?;
-        let now = ua_core::time::now();
-        tx.execute(
-            "INSERT INTO skill_versions (name, version, content_hash, source, content, published_by, published_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![name, next, hash, source, text, who, now],
-        )?;
-        ledger::append(
-            tx,
-            EventInput::new(
-                "skill.published",
-                json!({ "name": name, "version": next, "content_hash": hash, "source": source, "published_at": now }),
-            )
-            .by(who.clone()),
-        )?;
-        let skill = tx.query_row(
-            &format!("SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND version = ?2"),
-            params![name, next],
-            version_row,
-        )?;
-        Ok(Ok(json!({ "ok": true, "idempotent": false, "skill": skill, "review": review })))
+        let id = match reuse {
+            Some(id) => id,
+            None => {
+                let id = format!("sk-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+                tx.execute(
+                    "INSERT INTO skill_publish_staging (id, name, content, content_hash, source, findings_json, \
+                     requested_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![id, name, text, hash, rel_md, json!(findings).to_string(), who, ua_core::time::now()],
+                )?;
+                id
+            }
+        };
+        let staged = load_staged(tx, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
+        let state = approvals::request(tx, &cfg, &caller, GATE, &staged_payload(&staged))?;
+        Ok(json!({
+            "ok": false,
+            "status": format!("approval_{}", state.status()),
+            "approval_id": state.approval_id(),
+            "staging_id": id,
+            "name": name,
+            "content_hash": hash,
+            "review": review,
+            "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the file",
+        }))
     })
-    .and_then(pending)
+}
+
+/// `publish {staging_id}`: version the staged copy behind its approval.
+fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
+    ctx.hub
+        .db()
+        .write(|tx| {
+            let missing = || UaError::not_found(format!("no staged publish {id:?} of yours"));
+            let staged = load_staged(tx, id.trim())?.ok_or_else(missing)?;
+            if staged.requested_by != who {
+                return Err(missing());
+            }
+            if let Some(skill) = existing_version(tx, &staged.name, &staged.content_hash)? {
+                return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill })));
+            }
+            if staged.published_version.is_some() {
+                return Err(UaError::conflict("this staged publish was already used"));
+            }
+            if let Some(approval) = gate(tx, ctx, &staged_payload(&staged))? {
+                return Ok(Err(approval));
+            }
+            let next: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM skill_versions WHERE name = ?1",
+                [&staged.name],
+                |r| r.get(0),
+            )?;
+            let now = ua_core::time::now();
+            tx.execute(
+                "INSERT INTO skill_versions (name, version, content_hash, source, content, published_by, \
+                 published_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![staged.name, next, staged.content_hash, staged.source, staged.content, who, now],
+            )?;
+            tx.execute(
+                "UPDATE skill_publish_staging SET published_version = ?2 WHERE id = ?1",
+                params![staged.id, next],
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "skill.published",
+                    json!({
+                        "name": staged.name,
+                        "version": next,
+                        "content_hash": staged.content_hash,
+                        "source": staged.source,
+                        "staging_id": staged.id,
+                        "published_at": now,
+                    }),
+                )
+                .by(who.to_string()),
+            )?;
+            let skill = tx.query_row(
+                &format!("SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND version = ?2"),
+                params![staged.name, next],
+                version_row,
+            )?;
+            Ok(Ok(json!({ "ok": true, "idempotent": false, "skill": skill })))
+        })
+        .and_then(pending)
+}
+
+fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
+    let who = operator(ctx, "publishing a skill")?;
+    match (p.staging_id.as_deref(), p.path.as_deref()) {
+        (Some(id), None) => publish_staged(ctx, &who, id),
+        (None, Some(path)) => stage(ctx, &who, p.name, path),
+        _ => Err(UaError::invalid(
+            "publish takes {name, path} to stage and request approval, or {staging_id} to publish an approved \
+             staged copy",
+        )),
+    }
 }
 
 fn list(ctx: &ToolCtx, p: ListParams) -> UaResult<Value> {
@@ -591,23 +788,25 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     }
     let pin = positive(p.version)?;
     ctx.hub.db().write(|tx| {
-        let hash: Option<String> = match pin {
+        // The approved version is always the pin: a later version reaches
+        // nobody until it is assigned (and approved) itself.
+        let found: Option<(i64, String)> = match pin {
             Some(v) => tx
                 .query_row(
-                    "SELECT content_hash FROM skill_versions WHERE name = ?1 AND version = ?2",
+                    "SELECT version, content_hash FROM skill_versions WHERE name = ?1 AND version = ?2",
                     params![name, v],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?,
             None => tx
                 .query_row(
-                    "SELECT content_hash FROM skill_versions WHERE name = ?1 ORDER BY version DESC LIMIT 1",
+                    "SELECT version, content_hash FROM skill_versions WHERE name = ?1 ORDER BY version DESC LIMIT 1",
                     [&name],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?,
         };
-        let Some(hash) = hash else {
+        let Some((pin, hash)) = found else {
             return Err(match pin {
                 Some(v) => UaError::not_found(format!("unknown version {v} for skill {name:?}")),
                 None => UaError::not_found(format!("skill {name:?} has no published version yet")),
@@ -665,7 +864,26 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     // Unassigning is idempotent and also clears a profile's rows stored
     // under its legacy name.
     let targets = if ttype == "profile" { profile_keys(&target) } else { vec![target.clone()] };
-    ctx.hub.db().write(|tx| {
+    ctx.hub
+        .db()
+        .write(|tx| {
+        let mut present = 0;
+        for t in &targets {
+            present += tx.query_row(
+                "SELECT COUNT(*) FROM skill_assignments WHERE skill_name = ?1 AND target_type = ?2 AND target = ?3",
+                params![name, ttype, t],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        if present == 0 {
+            return Ok(Ok(json!({ "removed": false })));
+        }
+        // Removing a skill changes what every node of the target is served:
+        // a human approves it too.
+        let payload = json!({ "action": "unassign", "skill_name": name, "target_type": ttype, "target": target });
+        if let Some(id) = gate(tx, ctx, &payload)? {
+            return Ok(Err(id));
+        }
         let mut removed = 0;
         for t in &targets {
             removed += tx.execute(
@@ -683,12 +901,20 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
                 .by(who.clone()),
             )?;
         }
-        Ok(json!({ "removed": removed > 0 }))
+        Ok(Ok(json!({ "removed": removed > 0 })))
     })
+        .and_then(pending)
 }
 
 fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
+    let who = author(ctx)?;
     let label = p.agent_label.trim().to_string();
+    if label != who && !is_operator(&ctx.hub, &ctx.caller, &who) {
+        return Err(UaError::denied(
+            "not_own_agent",
+            "resolve shows the caller's own skills; an operator may resolve any agent's",
+        ));
+    }
     let profile = match p.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => Some(profile_target(raw)?),
         None if label.is_empty() => None,
@@ -702,7 +928,6 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
                 "name": s.name,
                 "version": s.version,
                 "hash": s.hash,
-                "source": s.source,
                 "via": s.via,
                 "content": s.content.chars().take(CONTENT_CAP).collect::<String>(),
             })
@@ -712,8 +937,8 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
 }
 
 fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
-    let root = resolve_target(ctx, &p.surface_dir, false, false)?.path;
-    if !root.is_dir() {
+    let (root, _) = workspace_target(ctx, &p.surface_dir)?;
+    if !is_real_dir(&root) {
         return Err(UaError::invalid(format!("not a directory: {:?}", p.surface_dir)));
     }
     let mut on_disk: BTreeMap<String, String> = BTreeMap::new();
@@ -729,8 +954,10 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
                 "drift scan exceeds the {MAX_DRIFT_ENTRIES}-entry work limit"
             )));
         }
+        // No symlink is followed: neither a linked skill directory nor a
+        // linked SKILL.md counts.
         let path = e.path();
-        if path.is_dir() && path.join("SKILL.md").is_file() {
+        if is_real_dir(&path) && is_regular_file(&path.join("SKILL.md")) {
             dirs.push(path);
             if dirs.len() > MAX_DRIFT_SKILLS {
                 return Err(UaError::invalid(format!(
@@ -809,7 +1036,7 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         }
     }
     Ok(json!({
-        "root": root.to_string_lossy(),
+        "root": p.surface_dir,
         "comparison": if label.is_some() { "resolved_assignments" } else { "latest_published" },
         "missing": missing,
         "stale": stale,
@@ -847,14 +1074,15 @@ pub fn register(r: &mut Registry) {
         tool(
             "skill_registry",
             "The skills registry: immutable content-hash versions of agent skills, assigned to an agent label or a \
-             profile. publish, assign and unassign are operator actions; publish and assign each need a \
-             one-time human approval bound to the content hash. Actions: publish {name, path} (one SKILL.md-only skill from the workspace, refused when \
-             skill_review finds a high-severity issue; identical content returns the existing version), list \
-             {name?}, get {name, version?}, assign {skill_name, target, target_type: agent|profile, version?} (an \
-             agent assignment wins over a profile one), unassign {skill_name, target, target_type}, resolve \
-             {agent_label, profile?}, drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, \
-             unregistered, unassigned and synced skills). The harness config bundle served to a node carries the \
-             skills resolved for its agent.",
+             profile and pinned to the approved version. publish, assign and unassign are operator actions, each \
+             behind a one-time human approval. Actions: publish {name, path} (review a SKILL.md-only skill in the \
+             workspace, stage the hub's copy and ask for approval; refused when skill_review finds a high-severity \
+             issue, including permission front matter or hidden text), publish {staging_id} (version the approved \
+             staged copy), list {name?}, get {name, version?}, assign {skill_name, target, target_type: \
+             agent|profile, version?} (an agent assignment wins over a profile one), unassign {skill_name, target, \
+             target_type}, resolve {agent_label, profile?} (own skills, or any agent's for an operator), drift \
+             {surface_dir, agent_label?, profile?} (read-only: missing, stale, unregistered, unassigned and synced \
+             skills). The harness config bundle served to a node carries the skills resolved for its agent.",
             skill_registry,
         )
         .gates_in_handler()

@@ -4,17 +4,19 @@
 //!
 //! Tools:
 //! - `harness_config_publish` (an operator): validate a bundle and make it the
-//!   active one. Always a one-time human approval, bound to the version and
-//!   the SHA-256 of the canonical bundle; a version is published once.
+//!   active one. Always a one-time human approval whose payload shows every
+//!   item in full (rules text, skill bodies, servers, surfaces) with its hash,
+//!   bound to the version and the SHA-256 of the canonical bundle; a version
+//!   is published once.
 //! - `harness_config_status` (read-only): the active bundle and recent
-//!   proposals.
+//!   proposals (the caller's own nodes', or every node's for an operator).
 //! - `node_config` (the device plane, behind `GET|POST /api/node/config`):
 //!   `get` the bundle for the caller's node with every surface rendered and
 //!   the apply grants it holds; `report` drift, which parks one
 //!   `harness_config_apply` approval per surface bound to {node, surface,
-//!   path, bundle_version, desired_hash} plus the hub's own summary of the
-//!   change from the content last applied there; `applied` after the node
-//!   wrote a surface, which consumes that approved pass.
+//!   path, bundle_version, desired_hash} plus the hub's full diff from the
+//!   content last applied there; `applied` after the node wrote a surface,
+//!   which consumes that approved pass.
 //!
 //! The node never writes a surface without a consumed pass (proposal mode).
 //! A drift report must name the active version (else `400` when missing,
@@ -22,29 +24,47 @@
 //! (the node never chooses where a file goes), carries at most
 //! [`render::MAX_PROPOSALS_PER_REPORT`] proposals, and each `desired_hash`
 //! must equal the hub's own render of that surface (else `409`), so a node
-//! cannot have arbitrary content approved.
+//! cannot have arbitrary content approved. Reports are rate-limited per node
+//! ([`MAX_REPORTS_PER_WINDOW`]); an identical re-report adds no drift row and
+//! no ledger event. Diffs are computed outside the write transaction, which
+//! re-checks that nothing they depend on moved. A proposal whose approval is
+//! denied, revoked or expired leaves the pending state; reassigning or
+//! forgetting a node closes its open proposals, and the applied history is
+//! keyed by (node, agent).
+//!
+//! Every bundle passes the Python hub's validation ([`render::normalize`])
+//! and the hub's own policy ([`policy`]): no TOML injection into the codex
+//! surface, clean MCP URLs, no hidden text or permission front matter,
+//! allowlisted surface kinds and paths, capped rendered sizes. The active
+//! bundle is re-validated on every read, so an imported or older bundle that
+//! fails is refused (`unsafe_bundle`), not served.
 //!
 //! The bundle a node is served is the active bundle plus the registry skills
 //! resolved for the node's agent ([`super::skill_registry`]), appended after
-//! the bundle's own skills (a bundle skill of the same name wins). Rendering
-//! is byte-compatible with the Python hub ([`render`]), so Python nodes
-//! compare hashes unchanged.
+//! the bundle's own skills (a bundle skill of the same name wins; one that
+//! fails the policy is left out with a note). Rendering is byte-compatible
+//! with the Python hub ([`render`]), so Python nodes compare hashes
+//! unchanged.
 //!
-//! Publish, report and applied are ledgered on `agent.harness_config` in the
-//! same transaction as the change.
+//! Publish, report, applied and closing are ledgered on
+//! `agent.harness_config` in the same transaction as the change.
 
+pub mod policy;
 pub mod render;
+
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use ua_core::{Caller, UaError, UaResult};
+use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use self::render::{
-    Bundle, MAX_BUNDLE_BYTES, MAX_PROPOSALS_PER_REPORT, MAX_SKILLS, Skill, clip_diff, content_hash,
-    diff_from_empty, py_strip, render_all, render_surface, valid_surface,
+    Bundle, MAX_BUNDLE_BYTES, MAX_PROPOSALS_PER_REPORT, MAX_SKILLS, Rendered, Skill, content_hash, py_strip,
+    render_all, render_surface, valid_surface,
 };
 use super::node_queue::{device_agent, is_operator, owned_node, verified_caller};
 use super::skill_registry;
@@ -65,9 +85,12 @@ CREATE TABLE IF NOT EXISTS harness_config_bundles (
     org_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_harness_config_bundles_active ON harness_config_bundles(active);
+-- One drift proposal per (node, agent, surface, version, desired content).
+-- diff_text is the hub's own change summary, never the node's diff.
 CREATE TABLE IF NOT EXISTS harness_config_proposals (
     id TEXT PRIMARY KEY,
     node TEXT NOT NULL,
+    agent TEXT,
     surface TEXT NOT NULL,
     path TEXT NOT NULL,
     bundle_version TEXT NOT NULL,
@@ -96,6 +119,12 @@ CREATE TABLE IF NOT EXISTS harness_config_drift (
     reported_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_harness_config_drift_node ON harness_config_drift(node, reported_at);
+-- Drift reports per node in the current rate-limit window.
+CREATE TABLE IF NOT EXISTS harness_config_report_window (
+    node TEXT PRIMARY KEY,
+    window_start TEXT NOT NULL,
+    reports INTEGER NOT NULL
+);
 ",
 };
 
@@ -106,6 +135,11 @@ pub const PUBLISH_TOOL: &str = "harness_config_publish";
 /// The node's default harness-config root, reported when
 /// `harness_config_root_hint` is unset.
 pub const DEFAULT_ROOT_HINT: &str = "~/.unified_agent/harness-config";
+/// Drift reports one node may send per [`REPORT_WINDOW_S`].
+pub const MAX_REPORTS_PER_WINDOW: i64 = 12;
+pub const REPORT_WINDOW_S: i64 = 600;
+/// How long one change-summary diff may take to compute.
+const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_DESCRIPTION: usize = 1024;
 
@@ -113,6 +147,13 @@ fn record(tx: &mut WriteTx<'_>, kind: &str, mut payload: Value, by: &str) -> UaR
     payload["kind"] = json!(kind);
     ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?;
     Ok(())
+}
+
+fn state_changed() -> UaError {
+    UaError::conflict_code(
+        "state_changed",
+        "the active bundle or this node's applied state changed; report again",
+    )
 }
 
 // --- the active bundle ------------------------------------------------------------
@@ -124,6 +165,8 @@ struct Active {
     bundle: Bundle,
 }
 
+/// The active bundle, re-validated: a stored bundle (an imported one, or one
+/// from an older hub) that fails today's checks is refused, not served.
 fn active(c: &Connection) -> UaResult<Option<Active>> {
     let row: Option<(String, String, String, String)> = c
         .query_row(
@@ -134,15 +177,23 @@ fn active(c: &Connection) -> UaResult<Option<Active>> {
         )
         .optional()?;
     let Some((version, published_at, published_by, json)) = row else { return Ok(None) };
-    // A stored bundle that no longer parses is treated as no bundle, as the
-    // Python hub does.
-    let Ok(bundle) = serde_json::from_str::<Bundle>(&json) else { return Ok(None) };
+    let unsafe_bundle = |why: String| {
+        UaError::conflict_code(
+            "unsafe_bundle",
+            format!("the active bundle {version:?} fails the hub's checks ({why}); publish a new version"),
+        )
+    };
+    let raw: Value =
+        serde_json::from_str(&json).map_err(|e| unsafe_bundle(format!("it does not parse: {e}")))?;
+    let bundle = policy::validate(&raw).map_err(|e| unsafe_bundle(e.to_string()))?;
     Ok(Some(Active { version, published_at, published_by, bundle }))
 }
 
 /// The bundle a node of `agent` is served: the active bundle plus the
 /// registry skills resolved for the agent (and its default profile), and a
-/// note per resolved skill saying whether it was included.
+/// note per resolved skill saying whether it was included. A registry skill
+/// that fails the bundle policy (a description that cannot go into TOML,
+/// hidden text, permission front matter) is left out and the note says why.
 fn effective(c: &Connection, hub: &Hub, agent: &str, bundle: &Bundle) -> UaResult<(Bundle, Vec<Value>)> {
     let profile = crate::sessions::default_profile(hub, agent);
     let resolved = skill_registry::resolve(c, agent, Some(profile.as_str()))?;
@@ -150,17 +201,24 @@ fn effective(c: &Connection, hub: &Hub, agent: &str, bundle: &Bundle) -> UaResul
     let mut notes = Vec::new();
     for s in resolved {
         let mut note = json!({ "name": s.name, "version": s.version, "hash": s.hash, "via": s.via });
+        let description: String = skill_registry::frontmatter(&s.content)
+            .and_then(|m| m.get("description").and_then(Value::as_str).map(|d| py_strip(d).to_string()))
+            .map(|d| d.chars().take(MAX_DESCRIPTION).collect())
+            .unwrap_or_default();
+        let mut findings = policy::skill_findings(&description, &s.content);
+        if let Some(why) = policy::description_refusal(&description) {
+            findings.insert(0, format!("description {why}"));
+        }
         let skipped = if out.skills.iter().any(|k| k.name == s.name) {
             Some("bundle_defines")
         } else if out.skills.len() >= MAX_SKILLS {
             Some("skill_limit")
+        } else if !findings.is_empty() {
+            note["findings"] = json!(findings);
+            Some("unsafe_skill")
         } else {
-            let description = skill_registry::frontmatter(&s.content)
-                .and_then(|m| m.get("description").and_then(Value::as_str).map(|d| py_strip(d).to_string()))
-                .map(|d| d.chars().take(MAX_DESCRIPTION).collect())
-                .unwrap_or_default();
             out.skills.push(Skill { name: s.name.clone(), description, body: s.content.clone() });
-            if out.to_json().len() > MAX_BUNDLE_BYTES {
+            if out.to_json().len() > MAX_BUNDLE_BYTES || policy::check_rendered(&out).is_err() {
                 out.skills.pop();
                 Some("size_limit")
             } else {
@@ -173,17 +231,6 @@ fn effective(c: &Connection, hub: &Hub, agent: &str, bundle: &Bundle) -> UaResul
         }
         notes.push(note);
     }
-    // A bundle stored by an older hub may name an absolute or escaping path;
-    // nothing is served or approved for it.
-    if let Some((name, s)) = out.surfaces().into_iter().find(|(_, s)| !render::safe_path(&s.path)) {
-        return Err(UaError::conflict_code(
-            "unsafe_surface_path",
-            format!(
-                "the active bundle's surface {name:?} has an unsafe path {:?}; publish a new version",
-                s.path
-            ),
-        ));
-    }
     Ok((out, notes))
 }
 
@@ -195,28 +242,35 @@ fn surface_path(bundle: &Bundle, surface: &str) -> Option<String> {
     })
 }
 
-/// Characters of hub-computed diff an apply approval carries.
-const MAX_SUMMARY_DIFF: usize = 20_000;
+// --- apply approvals --------------------------------------------------------------
 
-/// What changes on the node if `desired` is applied, computed by the hub from
-/// the content it last saw applied to this node's surface (not from anything
-/// the node sent).
-fn change_summary(c: &Connection, node: &str, surface: &str, path: &str, desired: &str) -> UaResult<Value> {
-    let last: Option<(String, String, Option<String>)> = c
-        .query_row(
-            "SELECT bundle_version, desired_hash, desired_text FROM harness_config_proposals \
-             WHERE node = ?1 AND surface = ?2 AND status = 'applied' \
-             ORDER BY resolved_at DESC, rowid DESC LIMIT 1",
-            params![node, surface],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let (base, from_version, from_hash, old) = match &last {
-        None => ("none", None, None, String::new()),
-        Some((v, h, Some(text))) => ("last_applied", Some(v), Some(h), text.clone()),
-        Some((v, h, None)) => ("last_applied_text_unknown", Some(v), Some(h), String::new()),
+/// The proposal last applied to this node's surface for this agent: id,
+/// version, hash and content. History is keyed by (node, agent), so a node
+/// reassigned to another agent starts from nothing.
+type LastApplied = Option<(String, String, String, Option<String>)>;
+
+fn last_applied(c: &Connection, node: &str, agent: &str, surface: &str) -> UaResult<LastApplied> {
+    Ok(c.query_row(
+        "SELECT id, bundle_version, desired_hash, desired_text FROM harness_config_proposals \
+         WHERE node = ?1 AND agent = ?2 AND surface = ?3 AND status = 'applied' \
+         ORDER BY resolved_at DESC, rowid DESC LIMIT 1",
+        params![node, agent, surface],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .optional()?)
+}
+
+/// What changes on the node if `desired` is applied, computed by the hub
+/// from the content last applied there (never from anything the node sent).
+/// The diff is never truncated: surfaces are capped instead
+/// ([`policy::MAX_SURFACE_BYTES`]), so the approver sees the whole change.
+fn change_summary(last: &LastApplied, path: &str, desired: &str) -> Value {
+    let (base, from_version, from_hash, old) = match last {
+        None => ("none", None, None, ""),
+        Some((_, v, h, Some(text))) => ("last_applied", Some(v), Some(h), text.as_str()),
+        Some((_, v, h, None)) => ("last_applied_text_unknown", Some(v), Some(h), ""),
     };
-    let diff = similar::TextDiff::from_lines(old.as_str(), desired);
+    let diff = similar::TextDiff::configure().timeout(DIFF_TIMEOUT).diff_lines(old, desired);
     let (mut added, mut removed) = (0, 0);
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -225,39 +279,36 @@ fn change_summary(c: &Connection, node: &str, surface: &str, path: &str, desired
             similar::ChangeTag::Equal => {}
         }
     }
-    let mut text =
+    let text =
         diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string();
-    if text.chars().count() > MAX_SUMMARY_DIFF {
-        text = text.chars().take(MAX_SUMMARY_DIFF).collect::<String>() + "\n# ... diff truncated ...\n";
-    }
-    Ok(json!({
+    json!({
         "base": base,
         "from_bundle_version": from_version,
         "from_hash": from_hash,
         "lines_added": added,
         "lines_removed": removed,
         "diff": text,
-    }))
+    })
 }
 
-/// What a `harness_config_apply` approval binds: the node, surface, path,
-/// version and hash, and the hub's summary of the change for the approver.
+/// What a `harness_config_apply` approval binds: node, surface, path,
+/// version, hash, and the hub's full summary of the change for the approver.
 fn canonical(
-    c: &Connection,
     node: &str,
     surface: &str,
     path: &str,
     version: &str,
     desired: &str,
-) -> UaResult<Value> {
-    Ok(json!({
+    last: &LastApplied,
+) -> Value {
+    json!({
         "node": node,
         "surface": surface,
         "path": path,
         "bundle_version": version,
         "desired_hash": content_hash(desired),
-        "change_summary": change_summary(c, node, surface, path, desired)?,
-    }))
+        "change_summary": change_summary(last, path, desired),
+    })
 }
 
 /// Surfaces with an approved, unconsumed apply pass for this node whose
@@ -269,20 +320,21 @@ fn apply_grants(
     agent: &str,
     node: &str,
     version: &str,
-    current: &std::collections::BTreeMap<String, render::Rendered>,
+    current: &BTreeMap<String, Rendered>,
 ) -> UaResult<Vec<Value>> {
     let mut stmt = c.prepare(
-        "SELECT id, surface, path, desired_hash, approval_id FROM harness_config_proposals \
-         WHERE node = ?1 AND bundle_version = ?2 AND status IN ('pending', 'approved') ORDER BY created_at, id",
+        "SELECT id, surface, path, desired_hash FROM harness_config_proposals \
+         WHERE node = ?1 AND agent = ?2 AND bundle_version = ?3 AND status = 'pending' ORDER BY created_at, id",
     )?;
-    let rows: Vec<(String, String, String, String, Option<i64>)> = stmt
-        .query_map(params![node, version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map(params![node, agent, version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<_, _>>()?;
     let mut grants = Vec::new();
-    for (id, surface, path, hash, approval_id) in rows {
+    for (id, surface, path, hash) in rows {
         let Some(r) = current.get(&surface).filter(|r| r.hash == hash && r.path == path) else { continue };
-        let payload = canonical(c, node, &surface, &path, version, &r.content)?;
-        if let Some(RequestState::Approved { approval_id: pass }) =
+        let last = last_applied(c, node, agent, &surface)?;
+        let payload = canonical(node, &surface, &path, version, &r.content, &last);
+        if let Some(RequestState::Approved { approval_id }) =
             approvals::peek(c, hub.cfg(), agent, APPLY_TOOL, &payload)?
         {
             grants.push(json!({
@@ -290,12 +342,57 @@ fn apply_grants(
                 "surface": surface,
                 "path": path,
                 "desired_hash": hash,
-                "approval_id": approval_id.unwrap_or(pass),
+                "approval_id": approval_id,
                 "bundle_version": version,
             }));
         }
     }
     Ok(grants)
+}
+
+/// Move this node's pending proposals whose approval was denied, revoked or
+/// has expired out of the pending state. Returns how many moved.
+fn settle(tx: &mut WriteTx<'_>, hub: &Hub, node: &str, agent: &str, by: &str) -> UaResult<usize> {
+    let mut stmt = tx.prepare(
+        "SELECT p.id, a.status, a.resolved_at FROM harness_config_proposals p \
+         JOIN approvals a ON a.id = p.approval_id \
+         WHERE p.node = ?1 AND p.agent = ?2 AND p.status = 'pending'",
+    )?;
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map(params![node, agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    let now = ua_core::time::now();
+    let mut moved = 0;
+    for (id, status, resolved_at) in rows {
+        let to = match status.as_str() {
+            "denied" => "denied",
+            "revoked" | "expired" => "expired",
+            "approved" if approvals::pass_expired(hub.cfg(), resolved_at.as_deref()) => "expired",
+            _ => continue,
+        };
+        moved += tx.execute(
+            "UPDATE harness_config_proposals SET status = ?2, updated_at = ?3, resolved_at = ?3, resolved_by = ?4 \
+             WHERE id = ?1",
+            params![id, to, now, by],
+        )?;
+    }
+    Ok(moved)
+}
+
+/// Close a node's open proposals when it is reassigned or forgotten, so its
+/// pending approvals never apply under another owner.
+pub(crate) fn close_for_node(tx: &mut WriteTx<'_>, node: &str, reason: &str, by: &str) -> UaResult<()> {
+    let now = ua_core::time::now();
+    let n = tx.execute(
+        "UPDATE harness_config_proposals SET status = 'closed', updated_at = ?2, resolved_at = ?2, \
+         resolved_by = ?3 WHERE node = ?1 AND status = 'pending'",
+        params![node, now, by],
+    )?;
+    if n > 0 {
+        record(tx, "harness_config_closed", json!({ "node": node, "reason": reason, "proposals": n }), by)?;
+    }
+    Ok(())
 }
 
 fn new_proposal_id() -> String {
@@ -326,7 +423,7 @@ fn field(raw: &Map<String, Value>, key: &str, limit: usize) -> UaResult<Option<S
 
 // --- node_config ------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfigArgs {
     /// The calling agent's node.
@@ -335,7 +432,8 @@ pub struct NodeConfigArgs {
     #[serde(default)]
     pub action: Option<String>,
     /// `report`: up to 32 drift proposals, each {surface, path, desired_hash,
-    /// observed_hash?, diff?}.
+    /// observed_hash?, diff?}. `diff` is accepted for compatibility and
+    /// ignored: the hub computes its own.
     #[serde(default)]
     pub proposals: Option<Value>,
     /// `report`: the bundle version the node rendered; must be the active one.
@@ -383,10 +481,30 @@ fn get_payload(c: &Connection, hub: &Hub, agent: &str, node: &str) -> UaResult<V
     }))
 }
 
-fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) -> UaResult<Value> {
-    let agent = caller.label.as_str();
-    let node = owned_node(tx, &a.node, agent)?.node;
-    let Some(active) = active(tx)? else {
+/// One validated drift proposal, with its approval payload computed outside
+/// the write transaction.
+struct Planned {
+    surface: String,
+    path: String,
+    desired_hash: String,
+    desired: String,
+    observed_hash: Option<String>,
+    payload: Value,
+    /// The last applied proposal the change summary was computed from.
+    base: Option<String>,
+}
+
+struct ReportPlan {
+    node: String,
+    version: String,
+    items: Vec<Planned>,
+}
+
+/// Validate a report and compute every approval payload (diffs included)
+/// on a read connection.
+fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> UaResult<ReportPlan> {
+    let node = owned_node(c, &a.node, agent)?.node;
+    let Some(active) = active(c)? else {
         return Err(UaError::not_found("no active harness config bundle"));
     };
     let version = active.version.clone();
@@ -405,9 +523,8 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
     if proposals.len() > MAX_PROPOSALS_PER_REPORT {
         return Err(UaError::invalid(format!("at most {MAX_PROPOSALS_PER_REPORT} proposals per report")));
     }
-    let (bundle, _) = effective(tx, hub, agent, &active.bundle)?;
-    let now = ua_core::time::now();
-    let mut accepted = Vec::new();
+    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
+    let mut items = Vec::new();
     for raw in proposals {
         let Some(raw) = raw.as_object() else {
             return Err(UaError::invalid("each proposal must be an object"));
@@ -415,7 +532,7 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
         let Some(surface) = field(raw, "surface", 32)?.filter(|s| valid_surface(s)) else {
             return Err(UaError::invalid("proposal.surface is invalid"));
         };
-        let Some(path) = field(raw, "path", 256)?.filter(|p| !p.split('/').any(|s| s == "..")) else {
+        let Some(path) = field(raw, "path", 256)? else {
             return Err(UaError::invalid("proposal.path is invalid"));
         };
         let Some(desired_hash) = field(raw, "desired_hash", 64)?.filter(|h| sha256_hex(h)) else {
@@ -439,92 +556,199 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
             ));
         }
         let observed_hash = field(raw, "observed_hash", 64)?;
-        let diff = match raw.get("diff").and_then(Value::as_str) {
-            Some(d) if !d.is_empty() => clip_diff(d.to_string()),
-            _ => diff_from_empty(&path, &desired),
-        };
-        let payload = canonical(tx, &node, &surface, &path, &version, &desired)?;
-        let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &payload)?;
-        let existing: Option<String> = tx
+        let last = last_applied(c, &node, agent, &surface)?;
+        let payload = canonical(&node, &surface, &path, &version, &desired, &last);
+        items.push(Planned {
+            surface,
+            path,
+            desired_hash,
+            desired,
+            observed_hash,
+            payload,
+            base: last.map(|l| l.0),
+        });
+    }
+    Ok(ReportPlan { node, version, items })
+}
+
+/// Count this report against the node's window; refuse past the limit.
+fn rate_limit(tx: &mut WriteTx<'_>, node: &str) -> UaResult<()> {
+    let now = ua_core::time::now();
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT window_start, reports FROM harness_config_report_window WHERE node = ?1",
+            [node],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let fresh = match &row {
+        None => true,
+        Some((start, _)) => match (ua_core::time::parse_ts(start), ua_core::time::parse_ts(&now)) {
+            (Some(s), Some(n)) => (n.as_second() - s.as_second()) >= REPORT_WINDOW_S,
+            _ => true,
+        },
+    };
+    if fresh {
+        tx.execute(
+            "INSERT INTO harness_config_report_window (node, window_start, reports) VALUES (?1, ?2, 1) \
+             ON CONFLICT(node) DO UPDATE SET window_start = excluded.window_start, reports = 1",
+            params![node, now],
+        )?;
+        return Ok(());
+    }
+    let count = row.map(|r| r.1).unwrap_or_default();
+    if count >= MAX_REPORTS_PER_WINDOW {
+        return Err(UaError::conflict_code(
+            "report_rate_limited",
+            format!(
+                "at most {MAX_REPORTS_PER_WINDOW} drift reports per node every {REPORT_WINDOW_S} seconds"
+            ),
+        ));
+    }
+    tx.execute("UPDATE harness_config_report_window SET reports = reports + 1 WHERE node = ?1", [node])?;
+    Ok(())
+}
+
+fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportPlan) -> UaResult<Value> {
+    let agent = caller.label.as_str();
+    let node = owned_node(tx, &plan.node, agent)?.node;
+    if active(tx)?.map(|a| a.version).as_deref() != Some(plan.version.as_str()) {
+        return Err(state_changed());
+    }
+    for item in &plan.items {
+        if last_applied(tx, &node, agent, &item.surface)?.map(|l| l.0) != item.base {
+            return Err(state_changed());
+        }
+    }
+    rate_limit(tx, &node)?;
+    let mut changed = settle(tx, hub, &node, agent, agent)? > 0;
+    let version = plan.version;
+    let now = ua_core::time::now();
+    let mut accepted = Vec::new();
+    for item in plan.items {
+        let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &item.payload)?;
+        let diff = item.payload["change_summary"]["diff"].as_str().unwrap_or_default().to_string();
+        let existing: Option<(String, Option<String>, Option<i64>)> = tx
             .query_row(
-                "SELECT id FROM harness_config_proposals WHERE node = ?1 AND surface = ?2 AND bundle_version = ?3 \
-                 AND desired_hash = ?4 AND path = ?5 AND status IN ('pending', 'approved') ORDER BY created_at DESC \
-                 LIMIT 1",
-                params![node, surface, version, desired_hash, path],
-                |r| r.get(0),
+                "SELECT id, observed_hash, approval_id FROM harness_config_proposals WHERE node = ?1 AND agent = ?2 \
+                 AND surface = ?3 AND bundle_version = ?4 AND desired_hash = ?5 AND path = ?6 \
+                 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+                params![node, agent, item.surface, version, item.desired_hash, item.path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let proposal_id = match existing {
-            Some(id) => {
-                tx.execute(
-                    "UPDATE harness_config_proposals SET observed_hash = ?2, diff_text = ?3, approval_id = ?4, \
-                     updated_at = ?5, desired_text = ?6 WHERE id = ?1",
-                    params![id, observed_hash, diff, state.approval_id(), now, desired],
-                )?;
+            Some((id, observed, approval)) => {
+                if observed != item.observed_hash || approval != Some(state.approval_id()) {
+                    tx.execute(
+                        "UPDATE harness_config_proposals SET observed_hash = ?2, approval_id = ?3, updated_at = ?4 \
+                         WHERE id = ?1",
+                        params![id, item.observed_hash, state.approval_id(), now],
+                    )?;
+                    changed = true;
+                }
                 id
             }
             None => {
                 let id = new_proposal_id();
                 tx.execute(
-                    "INSERT INTO harness_config_proposals (id, node, surface, path, bundle_version, desired_hash, \
-                     observed_hash, diff_text, desired_text, status, approval_id, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?11, ?11)",
+                    "INSERT INTO harness_config_proposals (id, node, agent, surface, path, bundle_version, \
+                     desired_hash, observed_hash, diff_text, desired_text, status, approval_id, created_at, \
+                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?12)",
                     params![
                         id,
                         node,
-                        surface,
-                        path,
+                        agent,
+                        item.surface,
+                        item.path,
                         version,
-                        desired_hash,
-                        observed_hash,
+                        item.desired_hash,
+                        item.observed_hash,
                         diff,
-                        desired,
+                        item.desired,
                         state.approval_id(),
                         now
                     ],
                 )?;
+                changed = true;
                 id
             }
         };
-        tx.execute(
-            "INSERT INTO harness_config_drift (node, surface, path, bundle_version, observed_hash, desired_hash, \
-             reported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![node, surface, path, version, observed_hash, desired_hash, now],
-        )?;
+        if let RequestState::Denied { .. } = state {
+            tx.execute(
+                "UPDATE harness_config_proposals SET status = 'denied', resolved_at = ?2, resolved_by = ?3, \
+                 updated_at = ?2 WHERE id = ?1 AND status = 'pending'",
+                params![proposal_id, now, agent],
+            )?;
+        }
+        // One drift row per distinct observation, not per report.
+        let last_drift: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT bundle_version, observed_hash, desired_hash FROM harness_config_drift \
+                 WHERE node = ?1 AND surface = ?2 ORDER BY id DESC LIMIT 1",
+                params![node, item.surface],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if last_drift != Some((version.clone(), item.observed_hash.clone(), item.desired_hash.clone())) {
+            tx.execute(
+                "INSERT INTO harness_config_drift (node, surface, path, bundle_version, observed_hash, \
+                 desired_hash, reported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![node, item.surface, item.path, version, item.observed_hash, item.desired_hash, now],
+            )?;
+            changed = true;
+        }
         accepted.push(json!({
             "proposal_id": proposal_id,
-            "surface": surface,
-            "path": path,
+            "surface": item.surface,
+            "path": item.path,
             "approval_id": state.approval_id(),
             "status": state.status(),
             "inbox": null,
         }));
     }
-    let summary: Vec<Value> = accepted
-        .iter()
-        .map(|p| json!({ "proposal_id": p["proposal_id"], "surface": p["surface"], "approval_id": p["approval_id"], "status": p["status"] }))
-        .collect();
-    record(
-        tx,
-        "harness_config_report",
-        json!({ "node": node, "bundle_version": version, "proposals": summary }),
-        agent,
-    )?;
-    let rendered = render_all(&bundle)?;
-    let grants = apply_grants(tx, hub, agent, &node, &version, &rendered)?;
-    Ok(json!({ "ok": true, "bundle_version": version, "proposals": accepted, "apply_grants": grants }))
+    if changed {
+        let summary: Vec<Value> = accepted
+            .iter()
+            .map(|p| {
+                json!({
+                    "proposal_id": p["proposal_id"],
+                    "surface": p["surface"],
+                    "approval_id": p["approval_id"],
+                    "status": p["status"],
+                })
+            })
+            .collect();
+        record(
+            tx,
+            "harness_config_report",
+            json!({ "node": node, "bundle_version": version, "proposals": summary }),
+            agent,
+        )?;
+    }
+    Ok(json!({ "ok": true, "bundle_version": version, "proposals": accepted }))
 }
 
-/// `applied`: consume the surface's approved pass and mark its proposal
-/// applied. `Ok(Err(id))` when the approval is still pending (committed so
-/// the pending request stands).
-fn applied(
-    tx: &mut WriteTx<'_>,
-    hub: &Hub,
-    caller: &Caller,
-    a: &NodeConfigArgs,
-) -> UaResult<Result<Value, i64>> {
-    let agent = caller.label.as_str();
+/// The grants a node holds now, for a report's answer.
+fn grants_now(c: &Connection, hub: &Hub, agent: &str, node: &str) -> UaResult<Vec<Value>> {
+    let Some(active) = active(c)? else { return Ok(Vec::new()) };
+    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
+    apply_grants(c, hub, agent, node, &active.version, &render_all(&bundle)?)
+}
+
+/// An `applied` call, validated and with its approval payload computed.
+struct AppliedPlan {
+    node: String,
+    version: String,
+    surface: String,
+    hash: String,
+    proposal_id: String,
+    path: String,
+    payload: Value,
+    base: Option<String>,
+}
+
+fn plan_applied(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> UaResult<AppliedPlan> {
     let surface = a.surface.as_deref().map(py_strip).unwrap_or_default().to_string();
     if !valid_surface(&surface) {
         return Err(UaError::invalid("surface is invalid"));
@@ -533,12 +757,12 @@ fn applied(
     if !sha256_hex(&hash) {
         return Err(UaError::invalid("desired_hash must be sha256 hex"));
     }
-    let node = owned_node(tx, &a.node, agent)?.node;
-    let Some(active) = active(tx)? else {
+    let node = owned_node(c, &a.node, agent)?.node;
+    let Some(active) = active(c)? else {
         return Err(UaError::not_found("no active harness config bundle"));
     };
     let version = active.version.clone();
-    let (bundle, _) = effective(tx, hub, agent, &active.bundle)?;
+    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
     let desired = render_surface(&bundle, &surface)?;
     if content_hash(&desired) != hash {
         return Err(UaError::conflict_code(
@@ -546,16 +770,17 @@ fn applied(
             "desired_hash does not match active bundle",
         ));
     }
-    let proposal: Option<(String, String)> = tx
+    let proposal: Option<(String, String)> = c
         .query_row(
-            "SELECT id, path FROM harness_config_proposals WHERE node = ?1 AND surface = ?2 AND bundle_version = ?3 \
-             AND desired_hash = ?4 AND status IN ('pending', 'approved') ORDER BY created_at DESC, id DESC LIMIT 1",
-            params![node, surface, version, hash],
+            "SELECT id, path FROM harness_config_proposals WHERE node = ?1 AND agent = ?2 AND surface = ?3 \
+             AND bundle_version = ?4 AND desired_hash = ?5 AND status = 'pending' \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![node, agent, surface, version, hash],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     let Some((proposal_id, path)) = proposal else {
-        return Err(UaError::not_found("no matching pending/approved proposal"));
+        return Err(UaError::not_found("no matching pending proposal"));
     };
     if surface_path(&bundle, &surface).as_deref() != Some(path.as_str()) {
         return Err(UaError::conflict_code(
@@ -563,42 +788,82 @@ fn applied(
             "the proposal's path is not the hub's rendered path",
         ));
     }
-    let payload = canonical(tx, &node, &surface, &path, &version, &desired)?;
-    let approval_id = match approvals::gate(tx, hub.cfg(), caller, APPLY_TOOL, &payload)? {
+    let last = last_applied(c, &node, agent, &surface)?;
+    let payload = canonical(&node, &surface, &path, &version, &desired, &last);
+    Ok(AppliedPlan { node, version, surface, hash, proposal_id, path, payload, base: last.map(|l| l.0) })
+}
+
+/// Why an `applied` call did not apply, committed with its bookkeeping.
+enum NotApplied {
+    Pending(i64),
+    Denied(i64, Option<String>),
+}
+
+fn commit_applied(
+    tx: &mut WriteTx<'_>,
+    hub: &Hub,
+    caller: &Caller,
+    p: AppliedPlan,
+) -> UaResult<Result<Value, NotApplied>> {
+    let agent = caller.label.as_str();
+    owned_node(tx, &p.node, agent)?;
+    if active(tx)?.map(|a| a.version).as_deref() != Some(p.version.as_str())
+        || last_applied(tx, &p.node, agent, &p.surface)?.map(|l| l.0) != p.base
+    {
+        return Err(state_changed());
+    }
+    settle(tx, hub, &p.node, agent, agent)?;
+    let status: Option<String> = tx
+        .query_row("SELECT status FROM harness_config_proposals WHERE id = ?1", [&p.proposal_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if status.as_deref() != Some("pending") {
+        return Err(UaError::not_found("no matching pending proposal"));
+    }
+    let now = ua_core::time::now();
+    let approval_id = match approvals::gate(tx, hub.cfg(), caller, APPLY_TOOL, &p.payload)? {
         GateOutcome::Pass { approval_id } => approval_id,
-        GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
+        GateOutcome::Pending { approval_id } => {
+            tx.execute(
+                "UPDATE harness_config_proposals SET approval_id = ?2 WHERE id = ?1",
+                params![p.proposal_id, approval_id],
+            )?;
+            return Ok(Err(NotApplied::Pending(approval_id)));
+        }
         GateOutcome::Denied { approval_id, reason } => {
-            return Err(UaError::denied(
-                "approval_denied",
-                format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-            ));
+            tx.execute(
+                "UPDATE harness_config_proposals SET status = 'denied', resolved_at = ?2, resolved_by = ?3, \
+                 updated_at = ?2 WHERE id = ?1",
+                params![p.proposal_id, now, agent],
+            )?;
+            return Ok(Err(NotApplied::Denied(approval_id, reason)));
         }
     };
-    let now = ua_core::time::now();
     tx.execute(
         "UPDATE harness_config_proposals SET status = 'applied', approval_id = ?2, updated_at = ?3, \
          resolved_at = ?3, resolved_by = ?4 WHERE id = ?1",
-        params![proposal_id, approval_id, now, agent],
+        params![p.proposal_id, approval_id, now, agent],
     )?;
     record(
         tx,
         "harness_config_applied",
         json!({
-            "node": node,
-            "surface": surface,
-            "path": path,
-            "proposal_id": proposal_id,
+            "node": p.node,
+            "surface": p.surface,
+            "path": p.path,
+            "proposal_id": p.proposal_id,
             "approval_id": approval_id,
-            "bundle_version": version,
-            "desired_hash": hash,
+            "bundle_version": p.version,
+            "desired_hash": p.hash,
         }),
         agent,
     )?;
     Ok(Ok(json!({
         "ok": true,
-        "proposal_id": proposal_id,
-        "surface": surface,
-        "bundle_version": version,
+        "proposal_id": p.proposal_id,
+        "surface": p.surface,
+        "bundle_version": p.version,
         "approval_id": approval_id,
     })))
 }
@@ -607,13 +872,33 @@ async fn node_config(ctx: ToolCtx, a: NodeConfigArgs) -> UaResult<Value> {
     device_agent(&ctx.caller)?;
     let action = a.action.clone().unwrap_or_else(|| "get".into());
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    let agent = caller.label.clone();
+    let db = ctx.hub.db();
     match action.as_str() {
-        "get" => ctx.hub.db().read_async(move |c| get_payload(c, &hub, &caller.label, &a.node)).await,
-        "report" => ctx.hub.db().write_async(move |tx| report(tx, &hub, &caller, &a)).await,
-        "applied" => match ctx.hub.db().write_async(move |tx| applied(tx, &hub, &caller, &a)).await? {
-            Ok(v) => Ok(v),
-            Err(approval_id) => Err(UaError::ApprovalRequired { tool: APPLY_TOOL.into(), approval_id }),
-        },
+        "get" => db.read_async(move |c| get_payload(c, &hub, &agent, &a.node)).await,
+        "report" => {
+            let (h, ag) = (hub.clone(), agent.clone());
+            let plan = db.read_async(move |c| plan_report(c, &h, &ag, &a)).await?;
+            let node = plan.node.clone();
+            let h = hub.clone();
+            let mut out = db.write_async(move |tx| commit_report(tx, &h, &caller, plan)).await?;
+            out["apply_grants"] = json!(db.read_async(move |c| grants_now(c, &hub, &agent, &node)).await?);
+            Ok(out)
+        }
+        "applied" => {
+            let (h, ag) = (hub.clone(), agent.clone());
+            let plan = db.read_async(move |c| plan_applied(c, &h, &ag, &a)).await?;
+            match db.write_async(move |tx| commit_applied(tx, &hub, &caller, plan)).await? {
+                Ok(v) => Ok(v),
+                Err(NotApplied::Pending(approval_id)) => {
+                    Err(UaError::ApprovalRequired { tool: APPLY_TOOL.into(), approval_id })
+                }
+                Err(NotApplied::Denied(approval_id, reason)) => Err(UaError::denied(
+                    "approval_denied",
+                    format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+                )),
+            }
+        }
         _ => Err(UaError::invalid("action must be 'get', 'report', or 'applied'")),
     }
 }
@@ -625,20 +910,32 @@ async fn node_config(ctx: ToolCtx, a: NodeConfigArgs) -> UaResult<Value> {
 pub struct PublishArgs {
     /// The bundle: {version, rules?: {surface: text}, skills?: [{name,
     /// description?, body?}], mcp_servers?: [{name, url, auth?: oauth|oauth2|none,
-    /// transport?}], surfaces?: {surface: {path, kind?}}}.
+    /// transport?}], surfaces?: {surface: {path, kind?: rules|mcp}}}.
     pub bundle: Value,
 }
 
-/// What a publish approval binds: the version and the SHA-256 of the
-/// canonical bundle, with a summary for the approver.
+/// What a publish approval binds and shows: the version, the SHA-256 of the
+/// canonical bundle, and every item in full with its own hash, so the
+/// approver sees exactly what nodes will be served.
 fn publish_payload(b: &Bundle) -> Value {
+    let rules: Map<String, Value> =
+        b.rules.iter().map(|(k, t)| (k.clone(), json!({ "sha256": content_hash(t), "text": t }))).collect();
     json!({
         "version": b.version,
         "bundle_sha256": b.sha256(),
         "surfaces": b.surfaces().into_iter().map(|(n, s)| json!({ "surface": n, "path": s.path, "kind": s.kind })).collect::<Vec<_>>(),
-        "rules": b.rules.keys().collect::<Vec<_>>(),
-        "skills": b.skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-        "mcp_servers": b.mcp_servers.iter().map(|s| json!({ "name": s.name, "url": s.url, "auth": s.auth })).collect::<Vec<_>>(),
+        "rules": rules,
+        "skills": b.skills.iter().map(|s| json!({
+            "name": s.name,
+            "description": s.description,
+            "sha256": content_hash(&s.body),
+            "body": s.body,
+        })).collect::<Vec<_>>(),
+        "mcp_servers": b.mcp_servers.iter().map(|s| json!({
+            "name": s.name, "url": s.url, "auth": s.auth, "transport": s.transport,
+        })).collect::<Vec<_>>(),
+        "checks": "passed: TOML-safe names, URLs, descriptions and rules; no hidden text; no permission front matter; \
+                   surface paths and kinds allowlisted; rendered size within limits",
     })
 }
 
@@ -650,7 +947,8 @@ async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
             "publishing a harness config bundle is an operator action (a human or a lifecycle operator)",
         ));
     }
-    let bundle = render::normalize(&a.bundle)?;
+    let bundle = policy::validate(&a.bundle)?;
+    let payload = publish_payload(&bundle);
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let out = ctx
         .hub
@@ -665,7 +963,7 @@ async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
                     format!("version {:?} already published", bundle.version),
                 ));
             }
-            match approvals::gate(tx, hub.cfg(), &caller, PUBLISH_TOOL, &publish_payload(&bundle))? {
+            match approvals::gate(tx, hub.cfg(), &caller, PUBLISH_TOOL, &payload)? {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
                 GateOutcome::Denied { approval_id, reason } => {
@@ -715,21 +1013,31 @@ async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
 pub struct StatusArgs {}
 
 async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
+    if matches!(ctx.caller.kind, ActorKind::Anonymous) {
+        return Err(UaError::Unauthenticated(
+            "the harness config status needs an authenticated identity".into(),
+        ));
+    }
     let who = verified_caller(&ctx.caller, "reading the harness config status")?;
     // Operators see every node's proposals; anyone else only their own nodes'.
     let scope: Option<String> = (!is_operator(&ctx.hub, &ctx.caller, &who)).then_some(who);
     ctx.hub
         .db()
         .read_async(move |c| {
-            let active = active(c)?.map(|a| {
-                json!({
-                    "version": a.version,
-                    "published_at": a.published_at,
-                    "published_by": a.published_by,
-                    "bundle": a.bundle.to_value(),
-                })
-            });
-            let filter = "(?1 IS NULL OR node IN (SELECT node FROM nodes WHERE agent = ?1))";
+            let active = match active(c) {
+                Ok(a) => a.map(|a| {
+                    json!({
+                        "version": a.version,
+                        "published_at": a.published_at,
+                        "published_by": a.published_by,
+                        "bundle": a.bundle.to_value(),
+                    })
+                }),
+                Err(e) => {
+                    Some(json!({ "error": e.to_string(), "code": e.reason_code().unwrap_or(e.code()) }))
+                }
+            };
+            let filter = "(?1 IS NULL OR (agent = ?1 AND node IN (SELECT node FROM nodes WHERE agent = ?1)))";
             let pending: i64 = c.query_row(
                 &format!(
                     "SELECT COUNT(*) FROM harness_config_proposals WHERE status = 'pending' AND {filter}"
@@ -772,11 +1080,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "harness_config_publish",
             "Publish a harness config bundle (operators only): rules text per surface, skills and MCP servers \
-             (OAuth or none; bearer/token auth and embedded secrets are refused), rendered by each node into \
-             CLAUDE.md, AGENTS.md, .cursorrules, codex and opencode config. Always needs a one-time human \
-             approval bound to the version and the bundle's SHA-256; a version is published once (conflict \
-             otherwise). Makes it the active bundle. Returns {ok, version, bundle_id, published_at, \
-             published_by, surfaces, mcp_servers, skills}.",
+             (OAuth or none), rendered by each node into CLAUDE.md, AGENTS.md, .cursorrules, codex and opencode \
+             config. Refused: bearer/token auth or embedded secrets, unclean MCP URLs, TOML-breaking names, URLs, \
+             descriptions or rules, hidden text, permission front matter, surface kinds other than rules and mcp, \
+             unsafe surface paths, oversized renders. Always needs a one-time human approval showing every item \
+             in full and bound to the bundle's SHA-256; a version is published once. Makes it the active bundle. \
+             Returns {ok, version, bundle_id, published_at, published_by, surfaces, mcp_servers, skills}.",
             publish,
         )
         .always_gated()
@@ -798,11 +1107,11 @@ pub fn register(r: &mut Registry) {
             "node_config",
             "Device plane for the calling agent's node (POST /api/node/config). action get: the active bundle \
              (plus registry skills assigned to the agent) with every surface rendered and hashed, and the apply \
-             grants the node holds. action report {bundle_version, proposals}: drift, at most 32 surfaces; each \
-             desired_hash must equal the hub's render, and each parks one harness_config_apply approval bound to \
-             {node, surface, path, bundle_version, desired_hash} with the hub's diff from the content last applied. \
-             bundle_version is required and each path must be the hub's rendered path. action applied {surface, desired_hash}: after the \
-             node wrote a surface, consumes that approved pass.",
+             grants the node holds. action report {bundle_version, proposals}: drift, at most 32 surfaces, rate \
+             limited per node; bundle_version is required, each path must be the hub's rendered path and each \
+             desired_hash the hub's render; each parks one harness_config_apply approval bound to {node, surface, \
+             path, bundle_version, desired_hash} with the hub's full diff from the content last applied. action \
+             applied {surface, desired_hash}: after the node wrote a surface, consumes that approved pass.",
             node_config,
         )
         .family("nodes"),

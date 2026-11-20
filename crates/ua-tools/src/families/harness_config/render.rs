@@ -214,63 +214,6 @@ fn repr(s: &str) -> String {
 
 // --- validation -------------------------------------------------------------------
 
-/// A surface path the node may write: relative (no leading `/`), no `.` or
-/// `..` segment and no empty segment, within the Python hub's character set.
-/// Stricter than the Python hub, which accepted an absolute path.
-pub fn safe_path(p: &str) -> bool {
-    rx().path.is_match(p)
-        && !p.starts_with('/')
-        && p.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
-}
-
-/// Query parameter names that look like credentials.
-fn secret_param(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    const PARTS: [&str; 10] = [
-        "token",
-        "secret",
-        "passw",
-        "apikey",
-        "api_key",
-        "api-key",
-        "auth",
-        "signature",
-        "credential",
-        "session",
-    ];
-    PARTS.iter().any(|p| n.contains(p))
-        || matches!(n.as_str(), "key" | "sig" | "pwd" | "jwt")
-        || n.ends_with("_key")
-        || n.ends_with("-key")
-}
-
-/// MCP URL hygiene: no userinfo, no credential-looking query parameter, and
-/// `https` unless the host is loopback.
-fn check_mcp_url(name: &str, raw: &str) -> UaResult<()> {
-    let refuse = |why: &str| Err(UaError::invalid(format!("mcp_server {} url {why}", repr(name))));
-    let Ok(url) = url::Url::parse(raw) else { return refuse("is not a valid URL") };
-    if !url.username().is_empty() || url.password().is_some() {
-        return refuse("must not carry credentials (user:password@)");
-    }
-    if let Some((k, _)) = url.query_pairs().find(|(k, _)| secret_param(k)) {
-        return refuse(&format!(
-            "must not carry a secret-looking query parameter ({k:?}); use OAuth on the hub"
-        ));
-    }
-    let loopback = match url.host() {
-        Some(url::Host::Domain(d)) => {
-            d.eq_ignore_ascii_case("localhost") || d.to_ascii_lowercase().ends_with(".localhost")
-        }
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
-    if url.scheme() != "https" && !loopback {
-        return refuse("must use https (plain http only for a loopback host)");
-    }
-    Ok(())
-}
-
 fn validate_mcp_servers(v: Option<&Value>) -> UaResult<Vec<McpServer>> {
     let list = match v {
         None | Some(Value::Null) => return Ok(Vec::new()),
@@ -295,7 +238,6 @@ fn validate_mcp_servers(v: Option<&Value>) -> UaResult<Vec<McpServer>> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(UaError::invalid(format!("mcp_server {} url must be http(s)", repr(&name))));
         }
-        check_mcp_url(&name, &url)?;
         let auth_raw = py_or(&[raw.get("auth"), raw.get("auth_type")]);
         let auth = match auth_raw {
             Some(v) if truthy(Some(v)) => match v {
@@ -408,7 +350,7 @@ fn validate_surfaces(v: Option<&Value>) -> UaResult<BTreeMap<String, Surface>> {
             return Err(UaError::invalid(format!("surfaces.{surface} must be an object")));
         };
         let path = bounded_str(raw.get("path"), 256)?;
-        let Some(path) = path.filter(|p| safe_path(p)) else {
+        let Some(path) = path.filter(|p| rx().path.is_match(p) && !p.split('/').any(|s| s == "..")) else {
             return Err(UaError::invalid(format!("surfaces.{surface}.path is invalid")));
         };
         let kind = bounded_str(raw.get("kind"), 32)?.unwrap_or_else(rules_kind);
@@ -417,8 +359,10 @@ fn validate_surfaces(v: Option<&Value>) -> UaResult<BTreeMap<String, Surface>> {
     Ok(if out.is_empty() { default_surfaces() } else { out })
 }
 
-/// Validate and canonicalize a publish payload (the Python hub's
-/// `normalize_bundle`). Every refusal is an invalid argument.
+/// Validate and canonicalize a publish payload exactly as the Python hub's
+/// `normalize_bundle` does. Every refusal is an invalid argument. The hub
+/// applies its stricter policy on top ([`super::policy::check`]); this
+/// function alone is what the golden render fixtures pin.
 pub fn normalize(raw: &Value) -> UaResult<Bundle> {
     let Some(raw) = raw.as_object() else {
         return Err(UaError::invalid("bundle must be a JSON object"));
@@ -734,29 +678,9 @@ mod tests {
             json!({ "version": "1", "surfaces": { "x": { "path": "../escape" } } }),
             json!({ "version": "bad version" }),
             json!({ "version": "1", "rules": { "claude": 5 } }),
-            json!({ "version": "1", "surfaces": { "x": { "path": "/etc/profile" } } }),
-            json!({ "version": "1", "surfaces": { "x": { "path": "a/./b" } } }),
-            json!({ "version": "1", "surfaces": { "x": { "path": "a//b" } } }),
-            json!({ "version": "1", "mcp_servers": [{ "name": "a", "url": "https://user:pw@x.example.com/mcp" }] }),
-            json!({ "version": "1", "mcp_servers": [{ "name": "a", "url": "https://x.example.com/mcp?access_token=t" }] }),
-            json!({ "version": "1", "mcp_servers": [{ "name": "a", "url": "https://x.example.com/mcp?Key=t" }] }),
-            json!({ "version": "1", "mcp_servers": [{ "name": "a", "url": "http://x.example.com/mcp" }] }),
         ];
         for raw in bad {
             assert!(normalize(&raw).is_err(), "{raw}");
-        }
-    }
-
-    #[test]
-    fn loopback_http_and_plain_query_parameters_are_accepted() {
-        for url in [
-            "http://127.0.0.1:8765/mcp",
-            "http://localhost/mcp",
-            "http://[::1]:9/mcp",
-            "https://x.example.com/mcp?region=eu&x=1",
-        ] {
-            let raw = json!({ "version": "1", "mcp_servers": [{ "name": "a", "url": url }] });
-            assert!(normalize(&raw).is_ok(), "{url}");
         }
     }
 

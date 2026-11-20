@@ -333,16 +333,6 @@ the five default ones:
 A rules surface without text gets a placeholder. Any other declared surface
 renders like `opencode`.
 
-What a publish refuses (stricter than the Python hub, never changing what an
-accepted bundle renders):
-
-- a surface path that is absolute, or has an empty, `.` or `..` segment;
-- MCP servers with bearer, token or header auth, or an embedded token, key
-  or header (OAuth or `none` only);
-- an MCP URL with user info (`user:password@`), with a credential-looking
-  query parameter (`token`, `secret`, `key`, `auth`, `signature`, ...), or
-  over plain `http` to a host that is not loopback.
-
 **Byte compatibility.** Python nodes render the served bundle themselves and
 compare each surface by SHA-256, and the hub accepts a drift report only for
 its own render. The Rust renderer therefore produces exactly the bytes of the
@@ -354,24 +344,70 @@ asserts byte equality for every surface. To regenerate them, run
 `scripts/harness_config_fixtures.py` with the Python hub's interpreter and
 `--python-src` pointing at its source tree.
 
+**What the hub refuses.** On top of the Python hub's validation, the hub
+refuses anything that could escape its place in a rendered file or reach a
+node unseen. The renderer is never changed; the bundle is refused instead.
+
+- TOML injection into the codex surface: an MCP server name outside
+  `[A-Za-z0-9_-]{1,64}`; an MCP URL with a control, whitespace, quote,
+  backslash or bracket character; a skill description with a backslash, a
+  control character or a newline; `"""` in `rules.codex` or `rules.agents`.
+- MCP servers: bearer, token or header auth, or an embedded token, key or
+  header (OAuth or `none` only); a URL with user info, a fragment, a
+  credential-looking query parameter (`token`, `secret`, `key`, `auth`,
+  `signature`, ...) or path segment (long and random-looking), or plain
+  `http` to a host that is not loopback.
+- Hidden text: invisible, bidi or tag code points (U+E0000-E007F,
+  zero-width characters, bidi overrides) in rules or skills, and
+  permission-bearing front matter (`allowed-tools`, `hooks`, `permissions`)
+  in a skill body.
+- Surfaces: more than 16; a `kind` other than `rules` or `mcp`, or a default
+  surface with another kind than its default; a path that is absolute, has
+  an empty, `.` or `..` segment, lies in a git or hooks directory, is
+  `.mcp.json` or a host settings file (`.claude/settings*.json`), or lacks an
+  extension that fits its kind (rules: `md`, `mdc`, `txt` or a rules
+  dotfile; mcp: `json`, `jsonc`, `toml`); two paths equal ignoring case.
+- Size: a rendered surface over 600,000 bytes, or all of them over
+  3,000,000.
+
+The active bundle is checked again on every read: a stored bundle (imported
+from the Python hub, or published by an older hub) that fails is refused
+with `unsafe_bundle` and never served.
+
 **Publishing.** `harness_config_publish {bundle}` is an operator action (a
-human or a lifecycle operator). It always needs a one-time human approval,
-bound to the version and the SHA-256 of the canonical bundle, with the
-surfaces, skills and servers listed for the approver. A version is published
-once; publishing a new one makes it the active bundle.
+human or a lifecycle operator). It always needs a one-time human approval
+whose payload shows everything nodes will be served: every rules text and
+skill body in full with its SHA-256, the servers and surfaces, and the
+SHA-256 of the canonical bundle it is bound to. A version is published once;
+publishing a new one makes it the active bundle.
 
 **Skills from the registry.** `skill_registry` keeps immutable skill versions
 keyed by content hash and assigns them to an agent label or a profile (an
 agent assignment wins over a profile one). A skill's text lands in the
-harness of every node it reaches, so publishing, assigning and unassigning
-are operator actions, and a new version (`publish`) and an assignment
-(`assign`) each need a one-time human approval bound to the content hash
-(and the target and pin). The bundle a node is served is the
-active bundle plus the skills resolved for the node's agent and its default
-profile, appended after the bundle's own skills; a bundle skill of the same
-name wins. `assigned_skills` in the answer says what was included. Changing
-an assignment changes the rendered hashes, so nodes report drift again and a
-human approves the new content.
+harness of every node it reaches, so it is a prompt-injection path:
+
+- `publish {name, path}` (an operator) reviews the skill with `skill_review`
+  (which refuses permission front matter and hidden text), copies its
+  `SKILL.md` into the hub's staging table and asks for a human approval
+  whose payload holds the full text, its hash and the review's findings.
+  `publish {staging_id}` versions that staged copy after approval; the
+  workspace file is never read again. Paths are resolved inside the
+  workspace without following symlinks; a missing path and one outside the
+  workspace get the same refusal.
+- `assign` and `unassign` (operators) each need a human approval. An
+  assignment is always pinned to the version that was approved, so a later
+  version reaches nobody until it is assigned itself.
+- `resolve` answers for the caller's own agent label, or any for an
+  operator. No output carries the hub's filesystem paths.
+
+The bundle a node is served is the active bundle plus the skills resolved
+for the node's agent and its default profile, appended after the bundle's
+own skills; a bundle skill of the same name wins. A registry skill that
+fails the bundle checks (a description that cannot go into TOML, hidden
+text, permission front matter) is left out. `assigned_skills` in the answer
+says what was included and why not. Changing an assignment changes the
+rendered hashes, so nodes report drift again and a human approves the new
+content.
 
 **The node's calls** (`POST /api/node/config` with `node` and `action`;
 `GET /api/node/config?node=` is `get`):
@@ -385,24 +421,34 @@ human approves the new content.
 A report without `bundle_version` is refused with `400`, one naming another
 version with `409`, more than 32 proposals with `400`, a `path` other than
 the hub's rendered path for that surface with `400`, and a `desired_hash`
-that is not the hub's own render of that surface with `409`. Each accepted
-proposal parks (or reuses) one `harness_config_apply` approval bound to
-`{node, surface, path, bundle_version, desired_hash, change_summary}`.
-`change_summary` is computed by the hub, never taken from the node: the
-unified diff (and lines added and removed) from the content last applied to
-that node's surface (`base: last_applied`), or from nothing (`base: none`).
-A proposal's `status` is `pending`, `approved` or `denied`. `apply_grants` lists the surfaces whose pass is approved and whose
-hash is still the current render. `applied` consumes that pass and marks the
-proposal applied; while the approval is pending it answers `202
-{"status": "approval_pending", "approval_id", "code": "approval_required",
-"tool": "harness_config_apply"}`. Only the node's own agent may call: another
-label gets `403 node_owned_elsewhere`, an unregistered node `404`.
+that is not the hub's own render of that surface with `409`. A node may send
+12 reports every 10 minutes (`409 report_rate_limited` past that). The
+node's `diff` is ignored and never stored.
+
+Each accepted proposal parks (or reuses) one `harness_config_apply` approval
+bound to `{node, surface, path, bundle_version, desired_hash,
+change_summary}`. `change_summary` is computed by the hub: the full unified
+diff (never truncated; surfaces are capped instead), with lines added and
+removed, from the content last applied to that surface of that node under
+the same agent (`base: last_applied`), or from nothing (`base: none`).
+
+A proposal is `pending` until it is `applied`, or `denied`, `expired` (its
+pass was revoked or outlived its TTL) or `closed` (the node was reassigned
+or forgotten). `apply_grants` lists the surfaces whose pass is approved,
+live, and whose hash is still the current render. A pass binds its node,
+surface, path, version and content: it never applies to another node or a
+later version. `applied` consumes that pass and marks the proposal applied;
+while the approval is pending it answers `202 {"status": "approval_pending",
+"approval_id", "code": "approval_required", "tool": "harness_config_apply"}`.
+Only the node's own agent may call: another label gets `403
+node_owned_elsewhere`, a retired node `403 node_retired`, an unregistered
+node `404`. An identical re-report adds no drift row and no ledger event.
 
 `harness_config_status` lists the caller's own nodes' proposals; operators
-see every node's.
+see every node's. Anonymous callers get `401`.
 
-Publish, report and applied are ledgered on `agent.harness_config`. The
-Python node keys on no hub feature for this route.
+Publish, report, applied and closing are ledgered on `agent.harness_config`.
+The Python node keys on no hub feature for this route.
 
 Not ported: the vault inbox note the Python hub wrote per pending proposal
 (`inbox` is always `null`), multi-file skill packages, and the skill catalog.

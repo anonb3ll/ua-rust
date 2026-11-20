@@ -219,8 +219,7 @@ async fn config_get(
     axum::extract::Query(q): axum::extract::Query<NodeQuery>,
 ) -> Response {
     let Some(node) = q.node.filter(|n| !n.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "node query parameter is required" })))
-            .into_response();
+        return node_err(&UaError::invalid("node query parameter is required"));
     };
     let body = Bytes::from(json!({ "node": node, "action": "get" }).to_string());
     config_call(&state, &id, &headers, &body).await

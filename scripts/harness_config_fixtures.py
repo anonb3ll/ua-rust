@@ -105,6 +105,44 @@ CASES: dict[str, dict] = {
             "claude": {"path": "nested/dir/CLAUDE.md", "kind": "mcp"},
         },
     },
+    # The escaping case within the hub's stricter policy (which these
+    # fixtures do not test; they pin the renderer): non-ASCII and control
+    # text in rules and bodies, quotes in a description.
+    "escaping_strict": {
+        "version": "esc_2",
+        "rules": {
+            "claude": "caf\u00e9 \u2014 \u65e5\u672c \U0001f680 tab\there\r\nback\\slash \"q\"\n",
+            "agents": "\x00\x01\x08\x0c\x1f\x7f\u0080\u2028end",
+            "opencode": "rules with \u00fc and \U0001f600",
+        },
+        "skills": [
+            {
+                "name": "quote-skill",
+                "description": 'He said "hi" \u00e9 \U0001f680',
+                "body": "line1\nline2\t\"q\" \\ \u00e9 \U0001f680\x7f\n",
+            }
+        ],
+        "mcp_servers": [
+            {"name": "z-last", "url": "https://z.example.com/mcp"},
+            {"name": "a_first", "url": "https://a.example.com/mcp?x=1&y=two", "auth": "oauth2"},
+        ],
+    },
+    # Declared surfaces within the hub's policy: custom rules and mcp
+    # surfaces, a default surface at another path.
+    "custom_surfaces_strict": {
+        "version": "custom.3",
+        "rules": {"notes": "custom notes\n", "zed": "zed rules", "agents": "agents\n"},
+        "skills": [{"name": "s1", "description": "first", "body": "b1"}],
+        "mcp_servers": [{"name": "one", "url": "https://one.example.com/mcp", "transport": "http"}],
+        "surfaces": {
+            "notes": {"path": "docs/NOTES.md", "kind": "rules"},
+            "zed": {"path": "zed/settings.json", "kind": "mcp"},
+            "plain": {"path": "plain/plain.toml", "kind": "mcp"},
+            "empty-rules": {"path": "EMPTY.md"},
+            "claude": {"path": "nested/dir/CLAUDE.md", "kind": "rules"},
+            "codex": {"path": "codex/config.toml", "kind": "mcp"},
+        },
+    },
     # Codex with servers but no skills and no rules, and an empty surfaces
     # object (which falls back to the defaults).
     "codex_servers_only": {

@@ -71,6 +71,8 @@ async fn a_node_pulls_reports_and_applies_its_config_over_http() {
     // GET carries the node on the query string.
     let resp = hub.send(get("/api/node/config", None, Some(BUILDER))).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert_eq!(v["code"], "invalid_argument", "a refusal carries a code: {v}");
     let resp = hub.send(get("/api/node/config?node=node-a", None, Some(BUILDER))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
@@ -211,5 +213,7 @@ async fn bad_reports_and_foreign_nodes_are_refused() {
     let resp = hub.send(get("/api/node/config?node=node-a", None, Some(OTHER))).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let resp = hub.send(get("/api/node/config?node=node-a", None, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = hub.send(get("/api/harness-config", None, None)).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
