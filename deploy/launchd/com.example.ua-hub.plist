@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd daemon template for ua-rust (adapt placeholders before loading on a host).
+  Create a dedicated `_ua-hub` service user/group first (pick an unused UID/GID
+  below 500 from `dscl . -list /Users UniqueID` and `dscl . -list /Groups PrimaryGroupID`,
+  or substitute an existing non-root hub account), then create owner-only directories
+  before bootstrapping launchd:
+    sudo dscl . -create /Groups/_ua-hub
+    sudo dscl . -create /Groups/_ua-hub PrimaryGroupID 399
+    sudo dscl . -create /Users/_ua-hub
+    sudo dscl . -create /Users/_ua-hub UniqueID 399
+    sudo dscl . -create /Users/_ua-hub PrimaryGroupID 399
+    sudo dscl . -create /Users/_ua-hub UserShell /usr/bin/false
+    sudo dscl . -create /Users/_ua-hub NFSHomeDirectory "/Library/Application Support/ua-rust"
+    sudo install -d -m 0700 -o _ua-hub -g _ua-hub "/Library/Application Support/ua-rust"
+    sudo install -d -m 0750 -o _ua-hub -g _ua-hub /Library/Logs/ua-rust
+  Run ua commands (`ua init`, `ua backup`, `ua restore`, `ua doctor`) as `_ua-hub`
+  so ownership and 0700/0600 permissions match SECURITY.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.ua-hub</string>
+
+  <key>UserName</key>
+  <string>_ua-hub</string>
+  <key>GroupName</key>
+  <string>_ua-hub</string>
+  <!-- 63 decimal == 0077 octal -->
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/ua</string>
+    <string>serve</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>UA_HOME</key>
+    <string>/Library/Application Support/ua-rust</string>
+    <key>UA_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Library/Application Support/ua-rust</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Match ua serve shutdown grace (10s drain + 3s runtime + WAL checkpoint). -->
+  <key>ExitTimeOut</key>
+  <integer>20</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Library/Logs/ua-rust/ua-hub.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Library/Logs/ua-rust/ua-hub.stderr.log</string>
+</dict>
+</plist>

@@ -50,21 +50,7 @@ use ua_store::{Db, SchemaPart};
 use map::{Kind, LEDGER_COLUMNS, MAPS, Ref, TableMap};
 
 /// Import progress, per source and table.
-pub const SCHEMA: SchemaPart = SchemaPart {
-    name: "import.v1",
-    sql: "
-CREATE TABLE IF NOT EXISTS import_runs (
-    source_hash TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    copied INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0,
-    last_key INTEGER NOT NULL DEFAULT 0,
-    started_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (source_hash, table_name)
-);
-",
-};
+pub const SCHEMA: SchemaPart = ua_store::schema::IMPORT_SCHEMA;
 
 /// Every ua-rust schema part plus the import bookkeeping table.
 pub fn schema_parts() -> Vec<SchemaPart> {

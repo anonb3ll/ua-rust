@@ -882,7 +882,7 @@ struct DbFacts {
     page_count: i64,
     page_size: i64,
     freelist: i64,
-    applied_parts: BTreeMap<String, String>,
+    schema_compat: Result<ua_store::backup::SchemaCompatibility, String>,
     chain: ledger::VerifyReport,
     notes: i64,
     embedded: i64,
@@ -894,15 +894,12 @@ struct DbFacts {
 }
 
 fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
-    let mut applied = BTreeMap::new();
-    {
-        let mut stmt = c.prepare("SELECT name, checksum FROM schema_parts")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (n, s) = row?;
-            applied.insert(n, s);
-        }
-    }
+    let schema_compat = ua_store::backup::check_schema_compatibility(
+        c,
+        &crate::schema_parts(),
+        &crate::optional_schema_parts(),
+    )
+    .map_err(|e| e.to_string());
     let count = |sql: &str| -> UaResult<i64> { Ok(c.query_row(sql, [], |r| r.get(0)).unwrap_or(0)) };
     let last_delivery = c
         .query_row("SELECT status, last_error FROM notify_outbox ORDER BY id DESC LIMIT 1", [], |r| {
@@ -917,7 +914,7 @@ fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
         page_count: pragma_i64(c, "page_count")?,
         page_size: pragma_i64(c, "page_size")?,
         freelist: pragma_i64(c, "freelist_count")?,
-        applied_parts: applied,
+        schema_compat,
         chain: ledger::verify(c)?,
         notes: count("SELECT COUNT(*) FROM memory")?,
         embedded: count("SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id")?,
@@ -1220,29 +1217,62 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
 
 fn schema_check(facts: &DbFacts) -> Value {
     let expected = crate::schema_parts();
-    let mut missing = Vec::new();
-    let mut drifted = Vec::new();
-    for part in &expected {
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
-        match facts.applied_parts.get(part.name) {
-            None => missing.push(part.name),
-            Some(s) if *s != sum => drifted.push(part.name),
-            Some(_) => {}
-        }
-    }
-    let known: BTreeSet<&str> = expected.iter().map(|p| p.name).collect();
-    let extra = facts.applied_parts.keys().filter(|k| !known.contains(k.as_str())).count();
     let gate = "schema_parts";
-    if !missing.is_empty() {
-        finding("schema", MISCONFIGURED, format!("schema parts not applied: {}", missing.join(", ")), gate)
-    } else if !drifted.is_empty() {
+    let compat = match &facts.schema_compat {
+        Ok(c) => c,
+        Err(e) => return finding("schema", DEGRADED, format!("schema check failed: {e}"), gate),
+    };
+    if compat.has_tampering_or_unowned_objects() {
+        let mut issues = Vec::new();
+        if let Some(ref err) = compat.reference_error {
+            issues.push(format!("reference schema error: {err}"));
+        }
+        if !compat.drifted.is_empty() {
+            issues.push(format!("applied parts differ from this build: {}", compat.drifted.join(", ")));
+        }
+        if !compat.missing_objects.is_empty() {
+            issues.push(format!("missing objects: {}", compat.missing_objects.join(", ")));
+        }
+        if !compat.modified_objects.is_empty() {
+            issues.push(format!("modified DDL: {}", compat.modified_objects.join(", ")));
+        }
+        if !compat.conflicting_objects.is_empty() {
+            issues.push(format!("conflicting objects: {}", compat.conflicting_objects.join(", ")));
+        }
+        if !compat.unexpected_indexes_on_known_tables.is_empty() {
+            issues.push(format!(
+                "unexpected indexes on known tables: {}",
+                compat.unexpected_indexes_on_known_tables.join(", ")
+            ));
+        }
+        if !compat.reserved_name_objects.is_empty() {
+            issues.push(format!("reserved sqlite_ names: {}", compat.reserved_name_objects.join(", ")));
+        }
+        if !compat.unexpected_foreign_keys_to_known_tables.is_empty() {
+            issues.push(format!(
+                "foreign keys into known tables: {}",
+                compat.unexpected_foreign_keys_to_known_tables.join(", ")
+            ));
+        }
+        if !compat.unexpected_tables.is_empty() {
+            issues.push(format!("unexpected tables/views: {}", compat.unexpected_tables.join(", ")));
+        }
+        if !compat.unexpected_indexes.is_empty() {
+            issues.push(format!("unexpected indexes: {}", compat.unexpected_indexes.join(", ")));
+        }
+        if !compat.unexpected_triggers.is_empty() {
+            issues.push(format!("unexpected triggers: {}", compat.unexpected_triggers.join(", ")));
+        }
+        finding("schema", DEGRADED, issues.join("; "), gate)
+    } else if !compat.missing.is_empty() {
         finding(
             "schema",
-            DEGRADED,
-            format!("applied parts differ from this build: {}", drifted.join(", ")),
+            MISCONFIGURED,
+            format!("schema parts not applied: {}", compat.missing.join(", ")),
             gate,
         )
     } else {
+        let extra = compat.extra.len();
         let note = if extra > 0 { format!("; {extra} part(s) from another build") } else { String::new() };
         finding("schema", LIVE, format!("all {} schema parts applied{note}", expected.len()), gate)
     }
