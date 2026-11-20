@@ -427,10 +427,21 @@ node's `diff` is ignored and never stored.
 
 Each accepted proposal parks (or reuses) one `harness_config_apply` approval
 bound to `{node, surface, path, bundle_version, desired_hash,
-change_summary}`. `change_summary` is computed by the hub: the full unified
-diff (never truncated; surfaces are capped instead), with lines added and
-removed, from the content last applied to that surface of that node under
-the same agent (`base: last_applied`), or from nothing (`base: none`).
+change_summary}`. `change_summary` names what the change starts from: the
+content last applied to that surface of that node under the same agent
+(`base: last_applied`, with its `from_bundle_version`, `from_hash` and the
+SHA-256 of that text, `from_text_sha256`), or nothing (`base: none`). Every
+bound value is deterministic, so the payload recomputed when the pass is
+checked always equals the approved one.
+
+The diff itself is not bound: it is computed with a time limit, and past the
+limit its exact output depends on wall time. The hub computes the full
+unified diff (never truncated; surfaces are capped instead) from that base,
+keeps it on the proposal row, and shows it to the approver beside the
+payload: `approval_pending` adds `display: {proposal_id, lines_added,
+lines_removed, diff}` to each pending `harness_config_apply` request, and the
+Control Center inbox shows the diff above the arguments. The approval row
+itself stays small.
 
 A proposal is `pending` until it is `applied`, or `denied`, `expired` (its
 pass was revoked or outlived its TTL) or `closed` (the node was reassigned

@@ -115,11 +115,16 @@ fn reason(e: &UaError) -> String {
 
 impl H {
     fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.human_identities = vec!["operator".into()];
         cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-bot".into()]);
         cfg.workspace = Some(ws.path().to_path_buf());
+        tweak(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), _ws: ws }
     }
 
@@ -181,6 +186,14 @@ impl H {
             self.scalar(&format!("SELECT payload FROM approvals WHERE id = {id}")).as_str().unwrap(),
         )
         .unwrap()
+    }
+
+    /// What `approval_pending` shows the approver beside a pending
+    /// approval's payload.
+    async fn approval_display(&self, id: i64) -> Value {
+        let queue = self.ok(&human(), "approval_pending", json!({})).await;
+        let row = queue["pending"].as_array().unwrap().iter().find(|a| a["id"] == id).cloned();
+        row.unwrap_or_else(|| panic!("approval {id} is not pending: {queue}"))["display"].clone()
     }
 
     /// Park the call, approve it as the human operator, and retry it.
@@ -336,19 +349,23 @@ async fn a_node_gets_reports_drift_and_applies_only_with_an_approved_pass() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM harness_config_drift"), json!(2));
     assert_eq!(h.events("harness_config_report"), 1);
 
-    // The approval binds node, surface, path, version and hash, and carries
-    // the hub's own summary of the change (nothing applied yet: all added).
+    // The approval binds node, surface, path, version, hash and the base the
+    // change starts from (nothing applied yet), all deterministic; the
+    // approver is shown the hub's own diff beside it (all added).
     let approval_id = r1["proposals"][0]["approval_id"].as_i64().unwrap();
-    let mut payload = h.approval_payload(approval_id);
-    let summary = payload.as_object_mut().unwrap().remove("change_summary").unwrap();
     assert_eq!(
-        payload,
-        json!({ "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1", "desired_hash": claude["hash"] })
+        h.approval_payload(approval_id),
+        json!({
+            "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
+            "desired_hash": claude["hash"],
+            "change_summary": { "base": "none", "from_bundle_version": null, "from_hash": null, "from_text_sha256": null },
+        })
     );
-    assert_eq!(summary["base"], "none");
-    assert_eq!(summary["lines_added"], 1);
-    assert_eq!(summary["lines_removed"], 0);
-    assert!(summary["diff"].as_str().unwrap().contains("+rules"), "{summary}");
+    let shown = h.approval_display(approval_id).await;
+    assert_eq!(shown["proposal_id"], r1["proposals"][0]["proposal_id"]);
+    assert_eq!(shown["lines_added"], 1);
+    assert_eq!(shown["lines_removed"], 0);
+    assert!(shown["diff"].as_str().unwrap().contains("+rules"), "{shown}");
 
     // Before approval, applied parks (stays pending) and writes nothing.
     let applied = json!({ "action": "applied", "surface": "claude", "desired_hash": claude["hash"] });
@@ -800,14 +817,17 @@ async fn the_apply_approval_summarizes_the_change_from_the_last_applied_content(
         )
         .await
         .unwrap();
-    let summary =
-        h.approval_payload(r["proposals"][0]["approval_id"].as_i64().unwrap())["change_summary"].clone();
+    let id = r["proposals"][0]["approval_id"].as_i64().unwrap();
+    let summary = h.approval_payload(id)["change_summary"].clone();
     assert_eq!(summary["base"], "last_applied");
     assert_eq!(summary["from_bundle_version"], "v1");
     assert_eq!(summary["from_hash"], hash);
-    assert_eq!(summary["lines_added"], 1);
-    assert_eq!(summary["lines_removed"], 1);
-    let diff = summary["diff"].as_str().unwrap();
+    assert_eq!(summary["from_text_sha256"], hash, "the SHA-256 of the text last applied");
+    assert!(summary.get("diff").is_none(), "the diff is not bound: {summary}");
+    let shown = h.approval_display(id).await;
+    assert_eq!(shown["lines_added"], 1);
+    assert_eq!(shown["lines_removed"], 1);
+    let diff = shown["diff"].as_str().unwrap();
     assert!(diff.contains("-two") && diff.contains("+three") && diff.contains("a/CLAUDE.md"), "{diff}");
 }
 
@@ -1012,6 +1032,44 @@ async fn a_large_change_is_shown_in_full_in_the_apply_approval() {
     let rules: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
     h.publish(json!({ "version": "v1", "rules": { "claude": rules } })).await;
     let (_, id) = report(&h, "v1", "claude").await;
-    let diff = h.approval_payload(id)["change_summary"]["diff"].as_str().unwrap().to_string();
+    let diff = h.approval_display(id).await["diff"].as_str().unwrap().to_string();
     assert!(diff.len() > 100_000 && diff.contains("+line 19999") && !diff.contains("truncated"));
+    // The approval row holds only the deterministic binding, not the diff.
+    let stored = h.scalar(&format!("SELECT length(payload) FROM approvals WHERE id = {id}"));
+    assert!(stored.as_i64().unwrap() < 1_000, "{stored}");
+}
+
+#[tokio::test]
+async fn an_apply_pass_does_not_depend_on_how_long_the_diff_took() {
+    // Every diff on this hub times out, so its change summary is a full
+    // replacement rather than the minimal diff.
+    let h = H::with(|c| c.harness_config_diff_timeout_ms = Some(0));
+    h.register().await;
+    h.publish(json!({ "version": "v1", "rules": { "claude": "a\nX\nb\nY\nc\n" } })).await;
+    let got = h.config(json!({})).await.unwrap();
+    let (_, id) = report(&h, "v1", "claude").await;
+    h.approve(id).await;
+    h.config(applied_args(&got, "claude")).await.unwrap();
+
+    h.publish(json!({ "version": "v2", "rules": { "claude": "a\nP\nb\nQ\nc\n" } })).await;
+    let got = h.config(json!({})).await.unwrap();
+    let (_, id) = report(&h, "v2", "claude").await;
+    // The approver still sees the whole change, as the timed-out diff gave it.
+    let diff = h.approval_display(id).await["diff"].as_str().unwrap().to_string();
+    assert!(diff.contains("-X") && diff.contains("+P") && diff.contains("+Q"), "{diff}");
+    h.approve(id).await;
+
+    // The same database seen by a hub whose diff completes: the approval was
+    // bound to deterministic values, so the approved pass still matches.
+    let mut cfg = h.hub.cfg().clone();
+    cfg.harness_config_diff_timeout_ms = None;
+    let other = Hub::new(cfg, h.hub.db().clone());
+    let (dev, get) = (device(), json!({ "node": NODE }));
+    let grants = h.reg.call(&other, &dev, "node_config", get).await.unwrap()["apply_grants"].clone();
+    assert_eq!(grants.as_array().map(Vec::len), Some(1), "{grants}");
+    assert_eq!(grants[0]["approval_id"], id);
+    let mut args = applied_args(&got, "claude");
+    args["node"] = json!(NODE);
+    let applied = h.reg.call(&other, &dev, "node_config", args).await.unwrap();
+    assert_eq!(applied["approval_id"], id, "{applied}");
 }

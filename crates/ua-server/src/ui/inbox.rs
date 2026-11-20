@@ -21,6 +21,12 @@ pub struct ApprovalView {
     pub resolved_at: String,
     pub expires_at: String,
     pub payload: String,
+    /// The change the approval is for, as the approver reads it (a
+    /// `harness_config_apply` diff), from the row's display-only `display`.
+    /// Empty when the tool shows none.
+    pub change: String,
+    /// "+added −removed" for `change`.
+    pub change_counts: String,
 }
 
 impl ApprovalView {
@@ -34,6 +40,12 @@ impl ApprovalView {
             resolved_at: text(v, "resolved_at"),
             expires_at: text(v, "expires_at"),
             payload: pretty(v.get("payload").unwrap_or(&Value::Null)),
+            change: v.get("display").map(|d| text(d, "diff")).unwrap_or_default(),
+            change_counts: v
+                .get("display")
+                .filter(|d| d.get("diff").is_some())
+                .map(|d| format!("+{} \u{2212}{}", text(d, "lines_added"), text(d, "lines_removed")))
+                .unwrap_or_default(),
         }
     }
 }

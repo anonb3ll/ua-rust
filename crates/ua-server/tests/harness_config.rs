@@ -217,3 +217,35 @@ async fn bad_reports_and_foreign_nodes_are_refused() {
     let resp = hub.send(get("/api/harness-config", None, None)).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn the_inbox_shows_the_whole_diff_of_an_apply_approval() {
+    let hub = TestHub::new(config());
+    let (status, _) = post(&hub, "/api/node/register", BUILDER, json!({ "node": "node-a" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let rules: String = (0..300).map(|i| format!("rule <{i}>\n")).collect();
+    publish(&hub, json!({ "version": "2026.2", "rules": { "claude": rules } })).await;
+    let got = json_body(hub.send(get("/api/node/config?node=node-a", None, Some(BUILDER))).await).await;
+    let claude = got["rendered"]["claude"].clone();
+    let proposal = json!({ "surface": "claude", "path": "CLAUDE.md", "desired_hash": claude["hash"] });
+    let report =
+        json!({ "node": "node-a", "action": "report", "bundle_version": "2026.2", "proposals": [proposal] });
+    let (status, r) = post(&hub, "/api/node/config", BUILDER, report).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    let approval_id = r["proposals"][0]["approval_id"].as_i64().unwrap();
+
+    let cookie = hub.sign_in("operator").await;
+    let page = hub.send(get("/ui/inbox", Some(&cookie), None)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = common::text_body(page).await;
+    let at = html.find(&format!("id=\"approval-{approval_id}\"")).expect("the approval is listed");
+    let card = &html[at..];
+    let card = &card[..card.find("</article>").unwrap()];
+    // The diff is shown as text, escaped, every line of it, and opened.
+    assert!(card.contains("<details open><summary>Change (+300 \u{2212}0 lines)"), "{card}");
+    assert!(card.contains("+++ b/CLAUDE.md"), "{card}");
+    assert!(card.contains("+rule &#60;0&#62;") && card.contains("+rule &#60;299&#62;"), "{card}");
+    assert!(!card.contains("<0>"), "the diff is escaped");
+    // The arguments the approval binds carry no diff.
+    assert!(!card.contains("\\n+rule"), "the diff is not in the payload: {card}");
+}

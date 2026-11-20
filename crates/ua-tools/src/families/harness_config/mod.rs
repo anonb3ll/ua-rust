@@ -14,9 +14,10 @@
 //!   `get` the bundle for the caller's node with every surface rendered and
 //!   the apply grants it holds; `report` drift, which parks one
 //!   `harness_config_apply` approval per surface bound to {node, surface,
-//!   path, bundle_version, desired_hash} plus the hub's full diff from the
-//!   content last applied there; `applied` after the node wrote a surface,
-//!   which consumes that approved pass.
+//!   path, bundle_version, desired_hash} and the content last applied there
+//!   (by hash), with the hub's full diff from it shown beside the approval
+//!   but not bound by it; `applied` after the node wrote a surface, which
+//!   consumes that approved pass.
 //!
 //! The node never writes a surface without a consumed pass (proposal mode).
 //! A drift report must name the active version (else `400` when missing,
@@ -125,6 +126,16 @@ CREATE TABLE IF NOT EXISTS harness_config_report_window (
     window_start TEXT NOT NULL,
     reports INTEGER NOT NULL
 );
+",
+};
+
+/// Looks up the proposal behind an apply approval, for the diff shown with
+/// it ([`approval_display`]).
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "harness_config.v2",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_harness_config_proposals_approval
+    ON harness_config_proposals(approval_id);
 ",
 };
 
@@ -260,39 +271,61 @@ fn last_applied(c: &Connection, node: &str, agent: &str, surface: &str) -> UaRes
     .optional()?)
 }
 
-/// What changes on the node if `desired` is applied, computed by the hub
-/// from the content last applied there (never from anything the node sent).
-/// The diff is never truncated: surfaces are capped instead
-/// ([`policy::MAX_SURFACE_BYTES`]), so the approver sees the whole change.
-fn change_summary(last: &LastApplied, path: &str, desired: &str) -> Value {
-    let (base, from_version, from_hash, old) = match last {
-        None => ("none", None, None, ""),
-        Some((_, v, h, Some(text))) => ("last_applied", Some(v), Some(h), text.as_str()),
-        Some((_, v, h, None)) => ("last_applied_text_unknown", Some(v), Some(h), ""),
+/// What a change is computed from: the content last applied to this
+/// surface of this node under the same agent (`base: last_applied`), or
+/// nothing (`base: none`). Deterministic: the approval binds these values,
+/// never the diff, whose output depends on how long it was allowed to run.
+fn change_base(last: &LastApplied) -> Value {
+    let (base, from_version, from_hash, from_text) = match last {
+        None => ("none", None, None, None),
+        Some((_, v, h, Some(text))) => ("last_applied", Some(v), Some(h), Some(content_hash(text))),
+        Some((_, v, h, None)) => ("last_applied_text_unknown", Some(v), Some(h), None),
     };
-    let diff = similar::TextDiff::configure().timeout(DIFF_TIMEOUT).diff_lines(old, desired);
-    let (mut added, mut removed) = (0, 0);
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Insert => added += 1,
-            similar::ChangeTag::Delete => removed += 1,
-            similar::ChangeTag::Equal => {}
-        }
-    }
-    let text =
-        diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string();
     json!({
         "base": base,
         "from_bundle_version": from_version,
         "from_hash": from_hash,
-        "lines_added": added,
-        "lines_removed": removed,
-        "diff": text,
+        "from_text_sha256": from_text,
     })
 }
 
+/// The unified diff of what changes on the node if `desired` is applied,
+/// computed by the hub from the content last applied there (never from
+/// anything the node sent). Display only: it is stored on the proposal and
+/// shown with the approval ([`approval_display`]), but not bound by it. The
+/// diff is never truncated: surfaces are capped instead
+/// ([`policy::MAX_SURFACE_BYTES`]), so the approver sees the whole change.
+/// Past the time limit `similar` returns a correct but less minimal diff.
+fn change_diff(hub: &Hub, last: &LastApplied, path: &str, desired: &str) -> String {
+    let old = match last {
+        Some((_, _, _, Some(text))) => text.as_str(),
+        _ => "",
+    };
+    let timeout = hub.cfg().harness_config_diff_timeout_ms.map_or(DIFF_TIMEOUT, Duration::from_millis);
+    let diff = similar::TextDiff::configure().timeout(timeout).diff_lines(old, desired);
+    diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
+}
+
+/// Lines added and removed in a unified diff (hunk bodies only).
+fn diff_counts(diff: &str) -> (usize, usize) {
+    let (mut added, mut removed, mut in_hunk) = (0, 0, false);
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk && line.starts_with('+') {
+            added += 1;
+        } else if in_hunk && line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// What a `harness_config_apply` approval binds: node, surface, path,
-/// version, hash, and the hub's full summary of the change for the approver.
+/// version, the desired content's hash and the base it replaces (with the
+/// SHA-256 of the last applied text). Every value is deterministic, so the
+/// payload recomputed when the pass is checked equals the one approved. The
+/// diff the approver reads is display only ([`approval_display`]).
 fn canonical(
     node: &str,
     surface: &str,
@@ -307,8 +340,27 @@ fn canonical(
         "path": path,
         "bundle_version": version,
         "desired_hash": content_hash(desired),
-        "change_summary": change_summary(last, path, desired),
+        "change_summary": change_base(last),
     })
+}
+
+/// What the approver of a `harness_config_apply` approval is shown beside
+/// its payload: the hub's full diff, kept on the proposal row, with lines
+/// added and removed. Not part of what the approval binds.
+pub(crate) fn approval_display(c: &Connection, approval_id: i64) -> UaResult<Option<Value>> {
+    let row: Option<(String, Option<String>)> = c
+        .query_row(
+            "SELECT id, diff_text FROM harness_config_proposals WHERE approval_id = ?1 \
+             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            [approval_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(proposal_id, diff)| {
+        let diff = diff.unwrap_or_default();
+        let (added, removed) = diff_counts(&diff);
+        json!({ "proposal_id": proposal_id, "lines_added": added, "lines_removed": removed, "diff": diff })
+    }))
 }
 
 /// Surfaces with an approved, unconsumed apply pass for this node whose
@@ -490,6 +542,8 @@ struct Planned {
     desired: String,
     observed_hash: Option<String>,
     payload: Value,
+    /// The hub's diff for the approver (display only, not in `payload`).
+    diff: String,
     /// The last applied proposal the change summary was computed from.
     base: Option<String>,
 }
@@ -558,6 +612,7 @@ fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> Ua
         let observed_hash = field(raw, "observed_hash", 64)?;
         let last = last_applied(c, &node, agent, &surface)?;
         let payload = canonical(&node, &surface, &path, &version, &desired, &last);
+        let diff = change_diff(hub, &last, &path, &desired);
         items.push(Planned {
             surface,
             path,
@@ -565,6 +620,7 @@ fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> Ua
             desired,
             observed_hash,
             payload,
+            diff,
             base: last.map(|l| l.0),
         });
     }
@@ -627,7 +683,6 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
     let mut accepted = Vec::new();
     for item in plan.items {
         let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &item.payload)?;
-        let diff = item.payload["change_summary"]["diff"].as_str().unwrap_or_default().to_string();
         let existing: Option<(String, Option<String>, Option<i64>)> = tx
             .query_row(
                 "SELECT id, observed_hash, approval_id FROM harness_config_proposals WHERE node = ?1 AND agent = ?2 \
@@ -640,10 +695,11 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
         let proposal_id = match existing {
             Some((id, observed, approval)) => {
                 if observed != item.observed_hash || approval != Some(state.approval_id()) {
+                    // A new approval means a new base: refresh the diff shown with it.
                     tx.execute(
-                        "UPDATE harness_config_proposals SET observed_hash = ?2, approval_id = ?3, updated_at = ?4 \
-                         WHERE id = ?1",
-                        params![id, item.observed_hash, state.approval_id(), now],
+                        "UPDATE harness_config_proposals SET observed_hash = ?2, approval_id = ?3, updated_at = ?4, \
+                         diff_text = CASE WHEN approval_id IS ?3 THEN diff_text ELSE ?5 END WHERE id = ?1",
+                        params![id, item.observed_hash, state.approval_id(), now, item.diff],
                     )?;
                     changed = true;
                 }
@@ -664,7 +720,7 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
                         version,
                         item.desired_hash,
                         item.observed_hash,
-                        diff,
+                        item.diff,
                         item.desired,
                         state.approval_id(),
                         now
@@ -1110,7 +1166,8 @@ pub fn register(r: &mut Registry) {
              grants the node holds. action report {bundle_version, proposals}: drift, at most 32 surfaces, rate \
              limited per node; bundle_version is required, each path must be the hub's rendered path and each \
              desired_hash the hub's render; each parks one harness_config_apply approval bound to {node, surface, \
-             path, bundle_version, desired_hash} with the hub's full diff from the content last applied. action \
+             path, bundle_version, desired_hash} and the content last applied (by hash); approval_pending shows \
+             the hub's full diff beside it. action \
              applied {surface, desired_hash}: after the node wrote a surface, consumes that approved pass.",
             node_config,
         )
