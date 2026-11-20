@@ -72,7 +72,10 @@ over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
   serve`), and list the host in `allowed_hosts`.
 - Tokens are opaque, compared in constant time and stored as SHA-256 digests.
 - Every call passes the same wrapper: profile, policy rules, approval gate,
-  typed arguments, then a `tool_calls` row and ledger events.
+  typed arguments, then a `tool_calls` row and ledger events. Ledger
+  verification (`event_log_verify`, `evidence_report`) fails on any row
+  without a hash after the chain starts; only an imported legacy prefix may
+  lack one, and it is reported as `unhashed_legacy_prefix`.
 - Approvals need a verified human. The approval payload binds the exact
   arguments, and for dispatch the resolved workdir, argv and prompt.
 - `fs_*`, `run_cmd` and `git_*` are confined to a workspace root. Hook

@@ -119,7 +119,7 @@ fn chain_integrity(c: &Connection) -> UaResult<Value> {
         "head_hash": head.as_ref().map(|h| &h.0),
         "head_ulid": head.as_ref().map(|h| &h.1),
         "total_verified": report.checked,
-        "unhashed_skipped": report.unhashed,
+        "unhashed_legacy_prefix": report.unhashed_legacy_prefix,
         "first_bad_seq": report.first_bad_seq,
         "reason": report.reason,
     }))

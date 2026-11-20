@@ -318,13 +318,22 @@ pub fn query(conn: &Connection, q: &EventQuery) -> UaResult<Vec<Event>> {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct VerifyReport {
     pub ok: bool,
+    /// Hashed rows recomputed and linked.
     pub checked: u64,
-    pub unhashed: u64,
+    /// Unhashed rows before the first hashed row: a legacy prefix carried
+    /// over from an import, never verified.
+    pub unhashed_legacy_prefix: u64,
     pub first_bad_seq: Option<i64>,
     pub reason: Option<String>,
 }
 
 /// Recompute the whole chain.
+///
+/// Rows without an `entry_hash` are accepted only as a contiguous prefix
+/// before the first hashed row (an imported legacy ledger, which the import
+/// verifies the same way) and are counted in `unhashed_legacy_prefix`. An
+/// unhashed row after the chain has started fails verification: nothing the
+/// hub appends lacks a hash, so such a row was written around the ledger.
 pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     let mut stmt = conn.prepare(
         "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, dedupe_key, \
@@ -332,22 +341,26 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     )?;
     let mut rows = stmt.query([])?;
     let mut expected_prev = GENESIS_HASH.to_string();
-    let mut report = VerifyReport { ok: true, checked: 0, unhashed: 0, first_bad_seq: None, reason: None };
+    let mut report =
+        VerifyReport { ok: true, checked: 0, unhashed_legacy_prefix: 0, first_bad_seq: None, reason: None };
     while let Some(r) = rows.next()? {
         let seq: i64 = r.get(0)?;
-        let entry: Option<String> = r.get(10)?;
-        let Some(entry) = entry else {
-            report.unhashed += 1;
-            continue;
-        };
-        let prev: Option<String> = r.get(9)?;
         let fail = |reason: &str| VerifyReport {
             ok: false,
             checked: report.checked,
-            unhashed: report.unhashed,
+            unhashed_legacy_prefix: report.unhashed_legacy_prefix,
             first_bad_seq: Some(seq),
             reason: Some(reason.to_string()),
         };
+        let entry: Option<String> = r.get(10)?;
+        let Some(entry) = entry else {
+            if report.checked > 0 {
+                return Ok(fail("unhashed row after the hash chain started"));
+            }
+            report.unhashed_legacy_prefix += 1;
+            continue;
+        };
+        let prev: Option<String> = r.get(9)?;
         if prev.as_deref() != Some(expected_prev.as_str()) {
             return Ok(fail("prev_hash does not link to the previous entry"));
         }
@@ -457,5 +470,52 @@ mod tests {
         let report = db.read(verify).unwrap();
         assert!(!report.ok);
         assert_eq!(report.first_bad_seq, Some(2));
+    }
+
+    /// Insert a row with no hashes, as a legacy import or a direct write would.
+    fn insert_unhashed(db: &Db, ulid: &str) {
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO event_log (ulid, channel, payload, created_at) \
+                 VALUES (?1, 'legacy.event', '{}', '2026-01-01T00:00:00+00:00')",
+                [ulid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unhashed_row_after_the_chain_started_fails_verification() {
+        let db = Db::open_in_memory(&[SCHEMA]).unwrap();
+        for i in 0..2 {
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+        }
+        insert_unhashed(&db, "01J0000000000000000000ZZZZ");
+        db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": 2 })))).unwrap();
+        let report = db.read(verify).unwrap();
+        assert!(!report.ok, "{report:?}");
+        assert_eq!(report.first_bad_seq, Some(3));
+        assert_eq!(report.reason.as_deref(), Some("unhashed row after the hash chain started"));
+    }
+
+    #[test]
+    fn a_contiguous_legacy_prefix_verifies_and_is_reported() {
+        let db = Db::open_in_memory(&[SCHEMA]).unwrap();
+        insert_unhashed(&db, "01J0000000000000000000000A");
+        insert_unhashed(&db, "01J0000000000000000000000B");
+        for i in 0..3 {
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+        }
+        let report = db.read(verify).unwrap();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.checked, 3);
+        assert_eq!(report.unhashed_legacy_prefix, 2);
+
+        // Only unhashed rows: nothing is verified, and the prefix is named.
+        let legacy = Db::open_in_memory(&[SCHEMA]).unwrap();
+        insert_unhashed(&legacy, "01J0000000000000000000000A");
+        let report = legacy.read(verify).unwrap();
+        assert!(report.ok && report.checked == 0 && report.unhashed_legacy_prefix == 1, "{report:?}");
     }
 }

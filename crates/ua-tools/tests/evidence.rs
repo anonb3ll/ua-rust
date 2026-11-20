@@ -175,6 +175,27 @@ async fn project_chain_and_tampered_ledger() {
 }
 
 #[tokio::test]
+async fn an_unhashed_row_inside_the_chain_is_not_verified() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let who = agent("builder-1");
+    let id = finished_task(&reg, &hub, &who).await;
+    // A row written around the ledger, after hashed rows, without a hash.
+    exec(
+        &hub,
+        "INSERT INTO event_log (ulid, channel, payload, created_at) \
+         VALUES ('01ZZZZZZZZZZZZZZZZZZZZZZZZ', 'agent.task.updated', '{}', '2026-01-01T00:00:00+00:00');",
+    );
+    let report = call(&reg, &hub, &who, "evidence_report", json!({ "task_id": id })).await;
+    let chain = &report["chain_integrity"];
+    assert_eq!(chain["verified"], false, "{chain}");
+    assert_eq!(chain["status"], "tampered");
+    assert_eq!(chain["reason"], "unhashed row after the hash chain started");
+    assert_eq!(chain["unhashed_legacy_prefix"], 0);
+    assert_eq!(report["gate_failures"], json!(["evidence_chain_integrity"]));
+}
+
+#[tokio::test]
 async fn state_sync_verify_detects_and_repairs_drift() {
     let hub = hub();
     let reg = builtin_registry();

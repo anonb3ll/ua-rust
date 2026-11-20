@@ -1147,7 +1147,12 @@ fn ledger_check(facts: &DbFacts) -> Value {
     if c.checked == 0 {
         return finding("ledger_chain", DORMANT, "the ledger is empty", gate);
     }
-    finding("ledger_chain", LIVE, format!("{} entries verify ({} unhashed)", c.checked, c.unhashed), gate)
+    finding(
+        "ledger_chain",
+        LIVE,
+        format!("{} entries verify ({} unhashed legacy prefix)", c.checked, c.unhashed_legacy_prefix),
+        gate,
+    )
 }
 
 fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
