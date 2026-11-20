@@ -42,6 +42,10 @@ pub struct ToolDef {
     /// bound to values it resolves (config, task, run), so the registry does
     /// not gate on the bare arguments.
     pub gates_in_handler: bool,
+    /// An argument that, when present (not null), moves the approval gate
+    /// into the handler for that call: the handler then checks an
+    /// alternative authority (a policy authorization) on resolved values.
+    pub handler_gate_arg: Option<&'static str>,
     /// When set, the approval gate binds this projection of the arguments
     /// instead of the arguments themselves, so a value that must never be
     /// stored (a secret) is not parked in the approvals table.
@@ -81,6 +85,17 @@ impl ToolDef {
         self
     }
 
+    /// When a call carries argument `arg`, the handler gates itself (see
+    /// [`ToolDef::handler_gate_arg`]); without it the registry gate applies.
+    pub fn handler_gates_with(mut self, arg: &'static str) -> Self {
+        self.handler_gate_arg = Some(arg);
+        self
+    }
+
+    fn handler_gates(&self, args: &Value) -> bool {
+        self.gates_in_handler
+            || self.handler_gate_arg.is_some_and(|k| args.get(k).is_some_and(|v| !v.is_null()))
+    }
     /// Gate on `f(config, args)` rather than on the raw arguments.
     pub fn gate_payload(mut self, f: GatePayload) -> Self {
         self.gate_payload = Some(f);
@@ -119,6 +134,7 @@ where
         read_only: false,
         always_gated: false,
         gates_in_handler: false,
+        handler_gate_arg: None,
         gate_payload: None,
         handler,
     }
@@ -183,6 +199,13 @@ impl Registry {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
 
+        // A hub-internal identity with a narrow grant may make only the calls
+        // the grant names, whatever its profile or enforce_profile say.
+        if let Some(why) = crate::families::github::grant_refusal(caller, name, &args) {
+            let err = UaError::denied("grant_denied", why);
+            record_decision(hub, caller, name, &err).await;
+            return Err(err);
+        }
         // A session credential's grant is the outer limit: no profile,
         // policy or approval can widen it. The `acp-session` profile without
         // a grant (it can only be reached by misconfiguration) gets nothing.
@@ -303,7 +326,7 @@ impl Registry {
         }
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if gated && !def.gates_in_handler {
+        if gated && !def.handler_gates(&args) {
             let gate_args = match def.gate_payload {
                 Some(f) => f(hub.cfg(), &args),
                 None => args.clone(),

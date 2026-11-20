@@ -81,6 +81,11 @@ over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
   build tools need approval.
 - `/api` and `/ui` refuse unknown hosts (DNS rebinding) and cross-site
   writes; the UI uses CSRF tokens and a strict CSP.
+- The GitHub webhook authenticates each delivery by HMAC-SHA256 and refuses
+  replayed delivery ids; the GitHub token is read from an environment
+  variable the config names and is never stored or logged; only
+  repositories bound to a project are ever requested
+  ([docs/github.md](docs/github.md#security-model)).
 - Managed secrets are encrypted at rest with a key the database never holds,
   and no tool returns a value. Downstream MCP servers get them by reference
   and see only what their registration names.
@@ -103,10 +108,12 @@ vulnerability.
 | Harness config | Versioned bundles of rules, skills and OAuth MCP servers published behind a human approval (`harness_config_publish`), served at `/api/node/config` rendered byte-for-byte as the Python hub renders them; drift reports park one `harness_config_apply` approval per surface, and a node writes only after consuming it; the skills registry (`skill_registry`: immutable content-hash versions assigned to agents and profiles, publish and assign behind an operator and a human approval) feeds each node's bundle | [nodes](docs/nodes.md#harness-config-bundle) |
 | Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from harness-declared signals (`quota_patterns` on stderr, Pi's JSON error events; `provider_quota_status`), `dispatch_task` refusals or same-provider, same-billing fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
-| Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`); delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
+| Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`), close-on-merge (`queue_close_merged`); the review queue (`task_list(stage="review")`) and a `review_ready` notification; delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
+| GitHub | Native REST client scoped to bound repositories (no redirects, bounded, rate-limit aware); CI runs and jobs verify task checks; signed webhook `POST /api/github/webhook` with replay protection (merges close tasks, completed runs re-verify checks); ETag polling fallback; `policy_authorization_record` / `policy_authorization_list`, accepted by `git_merge_task` in place of a one-time approval for one exact head | [github](docs/github.md) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
 | Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
+| Public relay | `relay_manage`: an agent drafts a comment for an issue or pull request in an allowlisted GitHub repository; gates refuse secrets, hidden or bidirectional Unicode, private addresses and internal host names, home paths, personal data, over-long text and a private denylist, never rewriting the text; a human approves the exact text and target, the send repeats it byte for byte, and the token is a managed secret | [relay](docs/relay.md) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
@@ -116,9 +123,9 @@ vulnerability.
 
 ## Not yet ported
 
-The public relay (`relay_manage`), native-session resume and adopt, cloud
-executors, ACP, Slack and Zulip connectors, role workflows, CI lookups and close-on-merge
-(both wait for the native GitHub client), session-handoff failover, the SDK's
+Native-session resume and adopt, cloud executors, ACP, Slack and Zulip
+connectors, role workflows, GitHub writes (comments, labels, held PRs, the
+GitHub App installation flow), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,
 `/api/action/node-session`), the provenance graph and evidence export, billing
 and usage ledgers, and tenancy (`org_id`). Work products
@@ -127,4 +134,4 @@ and usage ledgers, and tenancy (`org_id`). Work products
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

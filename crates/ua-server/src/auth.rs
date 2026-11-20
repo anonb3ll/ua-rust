@@ -173,6 +173,8 @@ fn is_public_path(path: &str) -> bool {
         || path_is(path, "/oauth")
         || path_is(path, "/login")
         || path == "/logout"
+        // GitHub signs its deliveries instead (see `github_api`).
+        || path == crate::github_api::WEBHOOK_PATH
 }
 
 pub async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {

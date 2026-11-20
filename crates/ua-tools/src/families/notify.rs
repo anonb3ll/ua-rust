@@ -224,18 +224,18 @@ fn settle(tx: &mut WriteTx<'_>, id: i64, agent: &str, d: &Delivery) -> UaResult<
 
 /// Record a message in the outbox and deliver it when a webhook is configured.
 async fn send(
-    ctx: &ToolCtx,
+    hub: &crate::Hub,
     kind: &'static str,
     category: Option<String>,
     agent: String,
     message: String,
     timeout: Duration,
 ) -> UaResult<Value> {
-    let hook = webhook(ctx.hub.cfg())?;
+    let hook = webhook(hub.cfg())?;
     let configured = hook.is_some();
     let chars = message.chars().count();
     let (a, m, c) = (agent.clone(), message.clone(), category.clone());
-    let id = ctx.hub.db().write_async(move |tx| enqueue(tx, kind, c.as_deref(), &a, &m, configured)).await?;
+    let id = hub.db().write_async(move |tx| enqueue(tx, kind, c.as_deref(), &a, &m, configured)).await?;
     let Some(hook) = hook else {
         return Ok(json!({
             "delivered": false,
@@ -265,8 +265,21 @@ async fn send(
         "attempts": d.attempts,
         "http_status": d.http_status,
     });
-    ctx.hub.db().write_async(move |tx| settle(tx, id, &agent, &d)).await?;
+    hub.db().write_async(move |tx| settle(tx, id, &agent, &d)).await?;
     Ok(out)
+}
+
+/// A hub-originated notification (for example `review_ready`): the same
+/// outbox and webhook as `notify`, with `category` naming the event.
+pub(crate) async fn send_event(
+    hub: &crate::Hub,
+    category: &str,
+    agent: &str,
+    message: &str,
+) -> UaResult<Value> {
+    let message = prepare_message(message)?;
+    let category = clean_category(Some(category))?;
+    send(hub, "notify", Some(category), agent.to_string(), message, timeout_of(Some(20))).await
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +314,7 @@ fn timeout_of(raw: Option<i64>) -> Duration {
 async fn notify(ctx: ToolCtx, a: NotifyArgs) -> UaResult<Value> {
     let message = prepare_message(&a.message)?;
     let agent = ctx.caller.label.clone();
-    send(&ctx, "notify", None, agent, message, timeout_of(a.timeout_s)).await
+    send(&ctx.hub, "notify", None, agent, message, timeout_of(a.timeout_s)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +468,7 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
         text = text.chars().take(MAX_CHARS).collect::<String>() + TRUNCATED;
     }
     // The digest is a system send: entries were attributed when queued.
-    let res = send(&ctx, "digest", category, "system".into(), text, timeout_of(None)).await?;
+    let res = send(&ctx.hub, "digest", category, "system".into(), text, timeout_of(None)).await?;
     Ok(json!({
         "flushed_count": rows.len(),
         "delivered": res["delivered"],
