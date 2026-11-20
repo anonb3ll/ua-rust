@@ -16,6 +16,7 @@ readme = "README.md"
 ua-core = { path = "crates/ua-core" }
 ua-store = { path = "crates/ua-store" }
 ua-memory = { path = "crates/ua-memory" }
+ua-org = { path = "crates/ua-org" }
 ua-tools = { path = "crates/ua-tools" }
 ua-server = { path = "crates/ua-server" }
 ua-import = { path = "crates/ua-import" }

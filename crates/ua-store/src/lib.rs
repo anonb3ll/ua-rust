@@ -11,6 +11,7 @@
 
 pub mod db;
 pub mod ledger;
+pub mod org;
 pub mod schema;
 
 pub use db::{Db, WriteTx};

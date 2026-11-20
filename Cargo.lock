@@ -5149,6 +5149,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-org"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "ua-core",
+ "ua-store",
+ "ulid",
+]
+
+[[package]]
 name = "ua-server"
 version = "0.1.0"
 dependencies = [
@@ -5255,6 +5269,7 @@ dependencies = [
  "tree-sitter-typescript",
  "ua-core",
  "ua-memory",
+ "ua-org",
  "ua-store",
  "ulid",
  "url",
