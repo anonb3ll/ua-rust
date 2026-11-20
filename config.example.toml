@@ -191,3 +191,7 @@ reviewer-1 = "reviewer"
 # search = "read"
 # get_page = "read"
 # put_page = "write"
+
+# Slack request signing (no route serves Slack yet; see docs/slack.md). Set
+# the signing secret in the hub's environment as UA_SLACK_SIGNING_SECRET, not
+# in this file. The value is never logged or stored.

@@ -38,6 +38,7 @@ pub mod runs;
 pub mod sessions_lifecycle;
 pub mod skill_registry;
 pub mod skills;
+pub mod slack;
 pub mod tasks;
 pub mod tokens;
 pub mod vault;
@@ -79,6 +80,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
     parts.push(skill_registry::SCHEMA);
+    parts.push(slack::SCHEMA);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
@@ -120,6 +122,7 @@ pub fn register(r: &mut Registry) {
     sessions_lifecycle::register(r);
     skill_registry::register(r);
     skills::register(r);
+    slack::register(r);
     tasks::register(r);
     tokens::register(r);
     vault::register(r);
