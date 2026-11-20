@@ -626,8 +626,11 @@ by their acceptance of an admin's request), and `consolidate_private` is
 changed only by that member (organization doc). An `org_admin` who holds an
 agent's tokens therefore cannot point it at someone's private notes. Nor can
 the admin take over an agent the user pointed: claiming an agent revokes the
-credentials others issued for it, and while it has an owner any new credential
-for it needs that owner's approval (organization doc, writer rules).
+credentials others issued for it, and while it has an owner a new root
+credential for it is issued by the owner or approved by the owner (organization
+doc, writer rules; per-dispatch node session credentials are minted by the
+agent's own node). A claim itself needs both the user and an `org_admin`, so no
+one can take over another's agent by claiming it.
 
 **Grouping.** The scheduled pass runs as `system_for(org)` with a **grouping
 scope**: it reads note ids, scope columns, tags and entity rows — never titles
