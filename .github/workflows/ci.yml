@@ -33,10 +33,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+      # The build without the optional heavy deps (tree-sitter, dom_smoothie,
+      # rmcp) must stay warning-free and green too, and the off-by-default
+      # embeddings feature (fastembed; ort downloads its runtime) must compile.
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo check -p ua-memory --features embeddings
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --no-tests=pass
+      - run: cargo nextest run --workspace --no-tests=pass --no-default-features
       - run: cargo test --workspace --doc
 
   # The hub also runs on macOS, where orphan recovery and the stale-worktree

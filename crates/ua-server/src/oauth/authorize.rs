@@ -239,9 +239,17 @@ pub async fn show(
         ClientKind::MetadataDocument => "identified by its metadata document URL",
         _ => "registered with this hub",
     };
+    // What the grant reaches: the MCP endpoint, or the whole hub (the JSON API
+    // and tools; the only resource of a build without the mcp-server feature).
+    let reach = if p.resource == super::mcp_resource(cfg) {
+        "this hub's MCP tools"
+    } else {
+        "this hub's API and tools"
+    };
     let body = format!(
         "<h1>Authorize {name}</h1>\
-<p><strong>{name}</strong> ({source}) asks to use this hub's MCP tools.</p>\
+<p><strong>{name}</strong> ({source}) asks to use {reach}.</p>\
+<p class=\"hint\">Resource: <code>{resource}</code></p>\
 <p class=\"hint\">After approval you are sent back to <code>{host}</code>. Signed in as <strong>{human}</strong>.</p>\
 <form method=\"post\" action=\"/oauth/authorize\">\
 <input type=\"hidden\" name=\"request_id\" value=\"{rid}\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
@@ -250,6 +258,7 @@ pub async fn show(
 <button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>\
 <button class=\"secondary\" type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form>",
         name = html_escape(&client.client_name),
+        resource = html_escape(&p.resource),
         host = html_escape(&redirect_host),
         human = html_escape(&session.label),
         rid = html_escape(&request_id),

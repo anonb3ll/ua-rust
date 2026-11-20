@@ -175,6 +175,19 @@ fn mcp_surface() -> Value {
         ("agy", "Google Antigravity", "Agentic IDE and terminal orchestration client"),
         ("cursor", "Cursor", "IDE pair programmer client"),
     ];
+    if !cfg!(feature = "mcp-server") {
+        // Built without the hub's MCP server: no /mcp route, no `ua mcp`.
+        return json!({
+            "server": {
+                "transports": [],
+                "endpoint": null,
+                "status": "not_built",
+                "note": "built without the mcp-server feature: this hub serves no MCP (no /mcp route, no `ua mcp`); \
+                    tools are reachable through the JSON API at /api/tools",
+            },
+            "clients": [],
+        });
+    }
     json!({
         "server": {
             "transports": ["stdio", "streamable_http"],
@@ -189,6 +202,12 @@ fn mcp_surface() -> Value {
             "capabilities": caps,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Tools a disabled Cargo feature leaves out of this build, and why:
+/// `[{tool, feature}]`, empty in a default build.
+fn compiled_out() -> Value {
+    crate::compiled_out_tools().map(|(tool, feature)| json!({ "tool": tool, "feature": feature })).collect()
 }
 
 /// Configuration-gated health, from configuration alone (no probes).
@@ -360,6 +379,8 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         "install_is_explicit": true,
         "approval_gated": true,
         "versions": { "ua_rust": env!("CARGO_PKG_VERSION") },
+        "build_features": crate::build_features(),
+        "compiled_out_tools": compiled_out(),
         "agents": agents_list,
         "mcp_tools": tools,
         "tool_families": families,
@@ -393,7 +414,9 @@ pub fn register(r: &mut Registry) {
             "capability_catalog",
             "Read-only inventory of this hub: agents, every tool by family, allowlisted programs, harnesses, \
              workflows, workspace skills, configuration health, boundaries (workspace, vault write dirs, \
-             approval-gated tools) and what the MCP server supports per client. Boundaries, health, agent \
+             approval-gated tools), what the MCP server supports per client, the optional Cargo features this \
+             build has (build_features: code_intel, readability, mcp_gateway, mcp_server, embeddings) and the \
+             tools a disabled feature leaves out (compiled_out_tools: [{tool, feature}]). Boundaries, health, agent \
              hosts and the allowlisted programs (clis) are shown to operators only; for everyone else they \
              are null or absent and named in `redacted`. With task_id and agent_label it also reports whether \
              that agent is ready for that task: prerequisites {capable, ready, missing_config: [{gate, action, \

@@ -1,5 +1,6 @@
 //! Code family: symbol indexing on fixture sources, repository maps, images,
 //! formatting, dev-server detection and docsets, through the registry.
+//! The symbol tests need the `code-intel` feature (tree-sitter).
 
 use std::path::{Path, PathBuf};
 
@@ -197,11 +198,13 @@ impl Env {
         self.call(tool, args.clone()).await.unwrap_or_else(|e| panic!("{tool} {args}: {e}"))
     }
 
+    #[cfg(feature = "code-intel")]
     async fn symbols(&self, file: &str) -> Vec<Value> {
         self.ok("fs_list_symbols", json!({ "file_path": file })).await["symbols"].as_array().unwrap().clone()
     }
 }
 
+#[cfg(feature = "code-intel")]
 fn find<'a>(syms: &'a [Value], name: &str) -> &'a Value {
     syms.iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("no symbol {name} in {syms:?}"))
 }
@@ -213,6 +216,7 @@ fn reason(e: &UaError) -> String {
     }
 }
 
+#[cfg(feature = "code-intel")]
 #[tokio::test]
 async fn indexes_fixture_sources() {
     let env = setup();
@@ -300,6 +304,7 @@ async fn indexes_fixture_sources() {
     assert_eq!(events["events"][0]["payload"]["files_indexed"], 5);
 }
 
+#[cfg(feature = "code-intel")]
 #[tokio::test]
 async fn search_list_and_reindex() {
     let env = setup();
@@ -350,6 +355,7 @@ async fn search_list_and_reindex() {
     assert_eq!(err.code(), "not_found");
 }
 
+#[cfg(feature = "code-intel")]
 #[tokio::test]
 async fn repo_map_ranks_and_budgets() {
     let env = setup();
@@ -568,6 +574,12 @@ async fn dash_searches_and_views_docsets() {
     let page = env.ok("dash_view", json!({ "docset_id": "Rusty Docs", "path": "std/vec.html#main" })).await;
     assert!(page["content"].as_str().unwrap().contains("contiguous growable array"), "{page}");
     assert_eq!(page["truncated"], false);
+    let how = page["extraction"].as_str().unwrap();
+    if cfg!(feature = "readability") {
+        assert!(["readability", "full-page"].contains(&how), "{page}");
+    } else {
+        assert_eq!(how, "full-page", "{page}");
+    }
 
     let err =
         env.call("dash_view", json!({ "docset_id": "rusty", "path": "../../Info.plist" })).await.unwrap_err();

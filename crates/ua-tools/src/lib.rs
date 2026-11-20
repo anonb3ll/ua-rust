@@ -62,6 +62,75 @@ pub fn builtin_registry() -> Registry {
     r
 }
 
+/// One optional Cargo feature of this build, as callers see it.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildFeature {
+    /// The Cargo feature name (`code-intel`).
+    pub feature: &'static str,
+    /// The key in [`build_features`] (`code_intel`).
+    pub key: &'static str,
+    /// Whether this build has it.
+    pub enabled: bool,
+    /// Tools registered only with it.
+    pub tools: &'static [&'static str],
+    /// What a build without it lacks.
+    pub without: &'static str,
+}
+
+/// The optional Cargo features, in report order. `code-intel`,
+/// `readability`, `mcp-gateway` and `mcp-server` are default features;
+/// `embeddings` is off by default.
+pub const BUILD_FEATURES: &[BuildFeature] = &[
+    BuildFeature {
+        feature: "code-intel",
+        key: "code_intel",
+        enabled: cfg!(feature = "code-intel"),
+        tools: &["fs_index_symbols", "fs_list_symbols", "fs_search_symbols", "fs_repo_map"],
+        without: "no tree-sitter symbol tools (fs_index_symbols, fs_list_symbols, fs_search_symbols, fs_repo_map)",
+    },
+    BuildFeature {
+        feature: "readability",
+        key: "readability",
+        enabled: cfg!(feature = "readability"),
+        tools: &[],
+        without: "web_fetch and dash_view convert the whole HTML page (extraction: \"full-page\")",
+    },
+    BuildFeature {
+        feature: "mcp-gateway",
+        key: "mcp_gateway",
+        enabled: cfg!(feature = "mcp-gateway"),
+        tools: &["mcp_gateway"],
+        without: "no downstream MCP client: no mcp_gateway tool, and mcp_server_register refuses",
+    },
+    BuildFeature {
+        feature: "mcp-server",
+        key: "mcp_server",
+        enabled: cfg!(feature = "mcp-server"),
+        tools: &[],
+        without: "the hub serves no MCP: no /mcp route and no `ua mcp`; the JSON API at /api remains",
+    },
+    BuildFeature {
+        feature: "embeddings",
+        key: "embeddings",
+        enabled: ua_memory::EMBEDDINGS_ENABLED,
+        tools: &[],
+        without: "memory search is lexical (FTS5) only",
+    },
+];
+
+/// Which optional Cargo features this build has, keyed by
+/// [`BuildFeature::key`]: `{code_intel, readability, mcp_gateway, mcp_server,
+/// embeddings}`.
+pub fn build_features() -> serde_json::Value {
+    serde_json::Value::Object(BUILD_FEATURES.iter().map(|f| (f.key.to_string(), f.enabled.into())).collect())
+}
+
+/// Tools this build does not register because a feature is off, with the
+/// Cargo feature that adds each.
+pub fn compiled_out_tools() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BUILD_FEATURES.iter().filter(|f| !f.enabled).flat_map(|f| f.tools.iter().map(move |t| (*t, f.feature)))
+}
+
 /// The built-in registry, built once per process. For code that only reads
 /// the tool table (catalogs, doctors, name lists); a server that serves
 /// calls holds its own [`builtin_registry`].
@@ -100,12 +169,45 @@ mod profile_table_tests {
 
     #[test]
     fn every_profile_tool_name_is_registered() {
+        // profiles.json is one table for every build: a tool a disabled
+        // feature leaves out still counts, as long as BUILD_FEATURES names it.
         let names = registered();
+        let compiled_out: BTreeSet<&str> = crate::compiled_out_tools().map(|(t, _)| t).collect();
         let mut dead = Vec::new();
         for (key, list) in Profile::tool_lists() {
-            dead.extend(list.iter().filter(|n| !names.contains(n.as_str())).map(|n| format!("{key}: {n}")));
+            dead.extend(
+                list.iter()
+                    .filter(|n| !names.contains(n.as_str()) && !compiled_out.contains(n.as_str()))
+                    .map(|n| format!("{key}: {n}")),
+            );
         }
         assert!(dead.is_empty(), "profiles.json names tools this hub does not register: {dead:#?}");
+    }
+
+    #[test]
+    fn build_features_name_exactly_the_tools_they_gate() {
+        // A feature's tools are registered when it is on and absent when it
+        // is off, so compiled_out_tools() and the catalog stay truthful.
+        let names = registered();
+        for f in crate::BUILD_FEATURES {
+            for t in f.tools {
+                assert_eq!(
+                    names.contains(t),
+                    f.enabled,
+                    "{t} (feature {}, enabled {})",
+                    f.feature,
+                    f.enabled
+                );
+            }
+        }
+        let report = crate::build_features();
+        let keys: Vec<&str> = report.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), crate::BUILD_FEATURES.len());
+        for k in ["code_intel", "readability", "mcp_gateway", "mcp_server", "embeddings"] {
+            assert!(report[k].is_boolean(), "{k}: {report}");
+        }
+        assert_eq!(report["code_intel"], cfg!(feature = "code-intel"));
+        assert_eq!(report["mcp_gateway"], cfg!(feature = "mcp-gateway"));
     }
 
     #[test]

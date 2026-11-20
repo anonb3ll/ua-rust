@@ -415,7 +415,10 @@ async fn capability_follows_the_agents_profile() {
         assert!(cat["tool_families"]["graph"].as_array().unwrap().iter().any(|x| x == t), "{t}");
     }
     assert_eq!(cat["prerequisites"]["ready"], false);
-    assert_eq!(cat["mcp_client_matrix"]["server"]["capabilities"]["tool_annotations"]["status"], "supported");
+    if cfg!(feature = "mcp-server") {
+        let annotations = &cat["mcp_client_matrix"]["server"]["capabilities"]["tool_annotations"];
+        assert_eq!(annotations["status"], "supported");
+    }
     let e = reg.call(&hub, &dev(), "capability_catalog", json!({ "task_id": id })).await.unwrap_err();
     assert!(matches!(e, UaError::InvalidArgument(_)));
 
@@ -528,5 +531,39 @@ async fn the_hub_map_is_shown_to_operators_only() {
         assert_eq!(full["clis"], full["boundaries"]["shell_allowlist"], "{}", who.label);
         assert!(full["clis"].as_array().is_some_and(|c| !c.is_empty()), "{}", who.label);
         assert!(full["agents"].as_array().unwrap().iter().any(|a| a["host"] == "box-1.internal"));
+    }
+}
+
+#[tokio::test]
+async fn the_catalog_reports_this_builds_features() {
+    let (hub, reg) = setup_with(|_| {});
+    let c = ok(&reg, &hub, &dev(), "capability_catalog", json!({})).await;
+    let f = &c["build_features"];
+    assert_eq!(f["code_intel"], cfg!(feature = "code-intel"), "{f}");
+    assert_eq!(f["readability"], cfg!(feature = "readability"), "{f}");
+    assert_eq!(f["mcp_gateway"], cfg!(feature = "mcp-gateway"), "{f}");
+    assert_eq!(f["mcp_server"], cfg!(feature = "mcp-server"), "{f}");
+    assert!(f["embeddings"].is_boolean(), "{f}");
+
+    // A tool a disabled feature leaves out is named with that feature, and
+    // is missing from the tool list.
+    let out = c["compiled_out_tools"].as_array().unwrap();
+    let tools = c["mcp_tools"].as_array().unwrap();
+    let symbols = json!({ "tool": "fs_list_symbols", "feature": "code-intel" });
+    assert_eq!(out.contains(&symbols), !cfg!(feature = "code-intel"), "{out:?}");
+    assert_eq!(tools.contains(&json!("fs_list_symbols")), cfg!(feature = "code-intel"));
+    let gateway = json!({ "tool": "mcp_gateway", "feature": "mcp-gateway" });
+    assert_eq!(out.contains(&gateway), !cfg!(feature = "mcp-gateway"), "{out:?}");
+
+    // The MCP surface is reported only when the hub serves it.
+    let server = &c["mcp_client_matrix"]["server"];
+    if cfg!(feature = "mcp-server") {
+        assert_eq!(server["endpoint"], "/mcp", "{server}");
+        assert_eq!(server["transports"], json!(["stdio", "streamable_http"]), "{server}");
+    } else {
+        assert_eq!(server["endpoint"], Value::Null, "{server}");
+        assert_eq!(server["transports"], json!([]), "{server}");
+        assert_eq!(server["status"], "not_built", "{server}");
+        assert_eq!(c["mcp_client_matrix"]["clients"], json!([]));
     }
 }

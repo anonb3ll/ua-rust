@@ -10,10 +10,24 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+# On by default, so `cargo build -p ua-server` still serves MCP and links the
+# same ua-tools extras as before. `--no-default-features` drops all four.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+code-intel = ["ua-tools/code-intel"]
+readability = ["ua-tools/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway"]
+# The hub's own MCP server: the `/mcp` route, `serve_stdio` (`ua mcp`) and the
+# OAuth protected resource metadata for `/mcp`. Without it the hub serves the
+# JSON API, the UI and OAuth for `/api` only.
+mcp-server = ["dep:rmcp", "ua-tools/mcp-server"]
+# Off by default, as in ua-tools.
+embeddings = ["ua-tools/embeddings"]
+
 [dependencies]
 ua-core.workspace = true
 ua-store.workspace = true
-ua-tools.workspace = true
+ua-tools = { workspace = true, default-features = false }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +42,7 @@ hex.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
 rusqlite.workspace = true
-rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+rmcp = { version = "=3.11.0", optional = true, features = ["server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 jiff.workspace = true
 rand.workspace = true
 ulid.workspace = true

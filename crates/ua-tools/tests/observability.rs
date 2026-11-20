@@ -95,6 +95,26 @@ async fn doctor_reports_every_capability_without_secrets() {
     assert!(["LIVE", "DORMANT"].contains(&status("ledger_chain")));
     // No notes yet, or no embeddings feature: either way nothing to embed.
     assert_eq!(status("semantic_search"), "DORMANT");
+    // Optional Cargo features: the row and build.features follow this build.
+    let all_default = cfg!(feature = "code-intel")
+        && cfg!(feature = "readability")
+        && cfg!(feature = "mcp-gateway")
+        && cfg!(feature = "mcp-server");
+    assert_eq!(status("build_features"), if all_default { "LIVE" } else { "DORMANT" });
+    let features = &report["build"]["features"];
+    assert_eq!(features["code_intel"], cfg!(feature = "code-intel"), "{features}");
+    assert_eq!(features["readability"], cfg!(feature = "readability"), "{features}");
+    assert_eq!(features["mcp_gateway"], cfg!(feature = "mcp-gateway"), "{features}");
+    assert_eq!(features["mcp_server"], cfg!(feature = "mcp-server"), "{features}");
+    assert!(features["embeddings"].is_boolean(), "{features}");
+    let out: Vec<&str> = report["build"]["compiled_out_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(out.contains(&"fs_repo_map"), !cfg!(feature = "code-intel"), "{out:?}");
+    assert_eq!(out.contains(&"mcp_gateway"), !cfg!(feature = "mcp-gateway"), "{out:?}");
     assert_eq!(report["database"]["journal_mode"], "wal");
     assert_eq!(report["database"]["quick_check"], "ok");
 

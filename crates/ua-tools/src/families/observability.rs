@@ -1097,6 +1097,23 @@ fn search_check(reg: &Registry) -> Value {
     }
 }
 
+/// The default Cargo features this build left out, and what each one's
+/// absence costs. `embeddings` is off by default and has its own row
+/// (semantic_search).
+fn build_features_check() -> Value {
+    let gate = "cargo features code-intel, readability, mcp-gateway, mcp-server (all default)";
+    let off: Vec<String> = crate::BUILD_FEATURES
+        .iter()
+        .filter(|f| !f.enabled && f.feature != "embeddings")
+        .map(|f| format!("{}: {}", f.feature, f.without))
+        .collect();
+    if off.is_empty() {
+        finding("build_features", LIVE, "every default feature is compiled in", gate)
+    } else {
+        finding("build_features", DORMANT, format!("built without {}", off.join("; ")), gate)
+    }
+}
+
 fn embeddings_check(facts: &DbFacts) -> Value {
     let gate = "cargo feature `embeddings`, UA_EMBED_MODEL";
     if !ua_memory::EMBEDDINGS_ENABLED {
@@ -1453,6 +1470,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         vault_check(cfg),
         workspace_check(cfg),
         search_check(reg),
+        build_features_check(),
         embeddings_check(&facts),
         ledger_check(&facts),
         db_row,
@@ -1485,7 +1503,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         "build": {
             "name": "ua-rust",
             "version": env!("CARGO_PKG_VERSION"),
-            "features": { "embeddings": ua_memory::EMBEDDINGS_ENABLED },
+            "features": crate::build_features(),
+            "compiled_out_tools": crate::compiled_out_tools()
+                .map(|(tool, feature)| json!({ "tool": tool, "feature": feature }))
+                .collect::<Vec<_>>(),
             "tool_count": reg.len(),
         },
     }))
@@ -1681,7 +1702,9 @@ pub fn register(r: &mut Registry) {
             "system_doctor",
             "Read-only LIVE/DORMANT/DEGRADED/MISCONFIGURED/UNKNOWN report over every config-gated capability of \
              this build: hub auth and token sources, HTTP bind, approval gating, vault, workspace root, search \
-             provider, semantic search (embeddings feature), ledger chain, database size and WAL, schema parts, \
+             provider, optional Cargo features left out of this build (build_features; build.features lists \
+             code_intel, readability, mcp_gateway, mcp_server and embeddings, build.compiled_out_tools the tools \
+             a disabled feature removes), semantic search (embeddings feature), ledger chain, database size and WAL, schema parts, \
              notification webhook and policy file. Each finding names the setting that gates it. Never returns \
              secret values. refresh=true adds SQLite quick_check.",
             system_doctor,

@@ -10,10 +10,21 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+# Forwarding only: this crate uses none of these itself. They exist so that
+# `cargo build -p ua-import` links the same ua-tools as a default build, and
+# `--no-default-features` (or ua-cli without them) keeps the heavy optional
+# deps out. The hub's MCP server is not here: ua-import never serves.
+default = ["code-intel", "readability", "mcp-gateway"]
+code-intel = ["ua-tools/code-intel"]
+readability = ["ua-tools/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway"]
+embeddings = ["ua-tools/embeddings"]
+
 [dependencies]
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
-ua-tools.workspace = true
+ua-tools = { workspace = true, default-features = false }
 anyhow.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

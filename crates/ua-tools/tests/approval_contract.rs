@@ -278,8 +278,14 @@ fn every_tool_that_gates_in_its_handler_is_marked() {
          those tools (gates_in_handler, handler_gates_with or handler_may_gate)"
     );
     let reg = builtin_registry();
+    // The scan reads every source file, compiled or not; a tool whose feature
+    // is off in this build is not registered and has nothing to check.
+    let compiled_out: Vec<&str> = ua_tools::compiled_out_tools().map(|(t, _)| t).collect();
     for (file, (_, calls)) in &sites {
         for (tool, args) in calls {
+            if compiled_out.contains(tool) {
+                continue;
+            }
             let def = reg.get(tool).unwrap_or_else(|| panic!("{file}: no tool {tool}"));
             assert!(
                 def.handler_decides(args),

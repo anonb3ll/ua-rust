@@ -168,6 +168,7 @@ async fn tool_calls_from_clients_still_record_one_row_each() {
 
 /// An MCP `tools/call` runs as its own tracked task (so a shutdown can wait
 /// for it) and records one row, as before.
+#[cfg(feature = "mcp-server")]
 #[tokio::test]
 async fn an_mcp_tool_call_is_tracked_and_recorded() {
     let hub = TestHub::new(config());

@@ -93,7 +93,10 @@ check)
     rustc --version
     cargo fmt --all --check
     cargo clippy --workspace --all-targets
+    cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+    cargo check -p ua-memory --features embeddings
     cargo nextest run --workspace --no-tests=pass
+    cargo nextest run --workspace --no-tests=pass --no-default-features
     cargo test --workspace --doc
     ;;
 *)

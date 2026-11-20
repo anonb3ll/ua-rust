@@ -87,6 +87,17 @@ from its commit history.
   not depend on the tool registry. Tool names, arguments, schema parts and
   ledger events are unchanged; `ua-tools/embeddings` still turns on semantic
   search.
+- tree-sitter, dom_smoothie and rmcp are optional, behind cargo features that
+  are on by default: `code-intel` (the four symbol tools), `readability`
+  (article extraction in `web_fetch` and `dash_view`), `mcp-gateway` (the
+  `mcp_gateway` client) and `mcp-server` (`/mcp` and `ua mcp`). Every crate
+  forwards them, and `embeddings`, under the same names. A
+  `--no-default-features` build reports what it lacks: `system_doctor` and
+  `capability_catalog` list `build_features` and the tools left out,
+  `web_fetch` and `dash_view` results carry `extraction`, `mcp_server_register`
+  refuses without a gateway, and without an MCP server `ua serve` warns, OAuth
+  issues hub-wide tokens and does not advertise `/mcp`, and `ua mcp` exits with
+  an error naming the feature.
 
 ### Security
 
