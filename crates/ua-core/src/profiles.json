@@ -28,6 +28,7 @@
   "mcp_server_revoke",
   "notify",
   "profile_activate",
+  "relay_manage",
   "review_and_notify",
   "rollback_migration_import",
   "routine_add",

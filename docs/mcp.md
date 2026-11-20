@@ -234,4 +234,5 @@ with `is_error: true`.
 - Policy `rate_limit` and `cooldown` rules count `tool_calls` rows. Those rows
   carry the tool name `mcp_gateway`, so rate-limit `mcp_gateway` itself; a
   rate limit on `mcp_gateway.<server>.<tool>` never trips.
-- The public relay (`relay_manage`) is a later slice.
+- The public relay (`relay_manage`) loads its GitHub token from the same
+  store, bound to consumer `relay:github`; see [relay.md](relay.md).
