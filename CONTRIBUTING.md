@@ -49,6 +49,74 @@ scripts/vocab-check.sh
 CI runs the full suite. Commit messages: imperative subject, a short body
 saying what and why.
 
+## Cloud Build CI
+
+`scripts/cloud-ci.sh` runs the `check` and `vocab` jobs of
+`.github/workflows/ci.yml` for one exact commit on Google Cloud Build and posts
+the results as GitHub commit statuses. GitHub Actions stays the primary CI
+(its minutes are free for this public repository and it runs the macOS
+dispatch job); Cloud Build is an additional runner for a pinned head.
+
+```sh
+UA_CI_GCP_PROJECT=<project-id> UA_CI_SERVICE_ACCOUNT=ua-rust-ci@<project-id>.iam.gserviceaccount.com \
+  scripts/cloud-ci.sh <pr-number | branch | sha>
+```
+
+- It uploads a one-commit checkout of the resolved head, submits
+  `deploy/cloudbuild/ci.yaml` from your checkout, waits for the build, and
+  posts `CI / vocab`, `CI / check` and `CI / full-verification`. Each status
+  names the build and links to its log. A PR number or branch resolves to the
+  head GitHub has, so push first.
+- The commit's own code (build scripts, tests) runs inside the build with the
+  build's credentials. A PR from a fork is therefore refused unless you have
+  reviewed it and pass `--allow-fork`; a SHA is run as given. The build runs as
+  `UA_CI_SERVICE_ACCOUNT` (see below). Without it the script refuses, unless
+  `--default-sa` explicitly accepts the project's default build account and
+  all of its permissions.
+- The `vocab` step runs your checkout's `scripts/vocab-check.sh` (uploaded
+  beside the step script), never the head's copy, so the private denylist is
+  only handed to code you run.
+- `UA_CI_GCP_PROJECT` is required; no default project is assumed.
+  `UA_CI_GCP_REGION` defaults to `us-central1`, `UA_CI_REPO` to the current
+  repository. `UA_CI_NO_STATUS=1` posts nothing (the build still runs and is
+  billed).
+- Needs `git`, `gcloud` (allowed to submit builds in the project), `gh`
+  (allowed to write commit statuses) and GNU `timeout`. Statuses are posted
+  from your machine; no GitHub credential enters the build.
+- If the watcher is interrupted, do not resubmit. Re-attach to the same build,
+  which posts its final statuses without starting another:
+
+  ```sh
+  UA_CI_GCP_PROJECT=<project-id> scripts/cloud-ci.sh --reconcile <build-id> <pr-number | branch | sha>
+  ```
+
+- An older build never overwrites a newer run's statuses: the script compares
+  build creation times and refuses, posting nothing, when a context holds a
+  status from a run it cannot prove older.
+- The `vocab` step reads private patterns from the Secret Manager secret
+  `ua-rust-vocab-denylist` (newline-separated extended regexes, the same
+  format as the `VOCAB_DENYLIST` Actions secret) when it exists in the build's
+  project, and needs the build's service account to be able to read it.
+  Without the secret it checks the generic patterns only and says so in the
+  log.
+
+### The build's service account
+
+Use a dedicated, least-privilege account. It needs:
+
+- `roles/logging.logWriter` on the project, for the build log (the config
+  logs to Cloud Logging only, as a user-specified account requires);
+- `roles/secretmanager.secretAccessor` on the `ua-rust-vocab-denylist` secret
+  only, and only if that secret exists;
+- nothing else. If the first build cannot fetch its source,
+  `roles/storage.objectViewer` on the `<project-id>_cloudbuild` bucket, where
+  `gcloud builds submit` uploads it, is the one addition to make.
+
+Whoever runs the script also needs `roles/iam.serviceAccountUser` on that
+account, to start builds as it. The commit under test runs with this
+account's token, so anything the account can read, the commit can read too:
+the denylist is the only secret within its reach.
+
 ## Privacy
 
 This repository is public. No personal names, e-mail addresses, home
