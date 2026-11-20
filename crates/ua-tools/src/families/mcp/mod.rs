@@ -32,6 +32,9 @@
 //! and the approved revocation deletes them. A re-registration starts with no
 //! credential; the operator sets it again for the new spec.
 
+#![cfg_attr(not(feature = "rmcp"), allow(rustdoc::broken_intra_doc_links))]
+
+#[cfg(feature = "rmcp")]
 pub mod gateway;
 pub mod redact;
 pub mod scope;
@@ -1078,6 +1081,7 @@ pub fn register(r: &mut Registry) {
         .read_only()
         .family("mcp"),
     );
+    #[cfg(feature = "rmcp")]
     gateway::register(r);
 }
 

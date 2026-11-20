@@ -10,10 +10,18 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+# On by default so this crate still links the same ua-tools as a default
+# build. `--no-default-features` does not pull the heavy deps back in.
+default = ["tree-sitter", "dom_smoothie", "rmcp"]
+tree-sitter = ["ua-tools/tree-sitter"]
+dom_smoothie = ["ua-tools/dom_smoothie"]
+rmcp = ["ua-tools/rmcp"]
+
 [dependencies]
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
-ua-tools.workspace = true
+ua-tools = { workspace = true, default-features = false }
 anyhow.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

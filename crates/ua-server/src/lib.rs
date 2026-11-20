@@ -10,6 +10,7 @@ pub mod events;
 pub mod github_api;
 pub mod guard;
 pub mod login;
+#[cfg(feature = "rmcp")]
 pub mod mcp;
 pub mod node_api;
 pub mod oauth;
@@ -61,10 +62,14 @@ an approval id; retry the identical call after it is approved.";
 /// ends MCP sessions and open event streams.
 pub fn router(state: AppState, ct: CancellationToken) -> Router {
     let state = AppState { shutdown: ct.clone(), ..state };
-    let mcp = mcp::http_service(state.clone(), ct);
-    Router::new()
-        .nest_service("/mcp", mcp)
-        .merge(api::routes())
+    #[cfg(feature = "rmcp")]
+    let app = Router::new().nest_service("/mcp", mcp::http_service(state.clone(), ct));
+    #[cfg(not(feature = "rmcp"))]
+    let app = {
+        drop(ct);
+        Router::new()
+    };
+    app.merge(api::routes())
         .merge(oauth::routes())
         .merge(login::routes())
         .merge(compat_api::routes())

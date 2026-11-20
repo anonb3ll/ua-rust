@@ -11,14 +11,22 @@ repository.workspace = true
 name = "ua"
 path = "src/main.rs"
 
+[features]
+# On by default, so `ua` with no feature flags is the same binary as before.
+# `--no-default-features` builds it without tree-sitter, dom_smoothie and rmcp.
+default = ["tree-sitter", "dom_smoothie", "rmcp"]
+tree-sitter = ["ua-tools/tree-sitter", "ua-server/tree-sitter", "ua-import/tree-sitter"]
+dom_smoothie = ["ua-tools/dom_smoothie", "ua-server/dom_smoothie", "ua-import/dom_smoothie"]
+rmcp = ["ua-tools/rmcp", "ua-server/rmcp", "ua-import/rmcp"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 ua-core.workspace = true
 ua-store.workspace = true
-ua-tools.workspace = true
-ua-server.workspace = true
-ua-import.workspace = true
+ua-tools = { workspace = true, default-features = false }
+ua-server = { workspace = true, default-features = false }
+ua-import = { workspace = true, default-features = false }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

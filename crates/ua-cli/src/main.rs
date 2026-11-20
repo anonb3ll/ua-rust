@@ -29,6 +29,7 @@ enum Cmd {
     /// Run the HTTP hub (MCP at /mcp, JSON API at /api).
     Serve,
     /// Serve MCP over stdin/stdout for one local client.
+    #[cfg(feature = "rmcp")]
     Mcp {
         /// Identity label to act as.
         #[arg(long, env = "UA_AGENT_LABEL")]
@@ -424,6 +425,7 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
             });
             serve_until_shutdown(state, ct, background).await?;
         }
+        #[cfg(feature = "rmcp")]
         Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
         Cmd::Tools { names } => {
             for t in registry.all() {

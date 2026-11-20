@@ -471,14 +471,20 @@ fn page_title(html: &str) -> Option<String> {
 /// Falls back to converting the whole page when no article is found.
 pub fn html_to_markdown(html: &str, url: Option<&str>) -> (Option<String>, String) {
     let conv = markdown_converter();
-    let article = dom_smoothie::Readability::new(html, url, None).ok().and_then(|mut r| r.parse().ok());
-    if let Some(a) = article {
-        let md = conv.convert(a.content.as_ref()).map(|m| tidy_markdown(&m)).unwrap_or_default();
-        if !md.trim().is_empty() {
-            let title = Some(collapse_ws(&a.title)).filter(|t| !t.is_empty()).or_else(|| page_title(html));
-            return (title, md);
+    #[cfg(feature = "dom_smoothie")]
+    {
+        let article = dom_smoothie::Readability::new(html, url, None).ok().and_then(|mut r| r.parse().ok());
+        if let Some(a) = article {
+            let md = conv.convert(a.content.as_ref()).map(|m| tidy_markdown(&m)).unwrap_or_default();
+            if !md.trim().is_empty() {
+                let title =
+                    Some(collapse_ws(&a.title)).filter(|t| !t.is_empty()).or_else(|| page_title(html));
+                return (title, md);
+            }
         }
     }
+    #[cfg(not(feature = "dom_smoothie"))]
+    let _ = url;
     let md = conv.convert(html).map(|m| tidy_markdown(&m)).unwrap_or_default();
     (page_title(html), md)
 }

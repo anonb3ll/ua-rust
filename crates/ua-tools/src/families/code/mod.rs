@@ -9,7 +9,9 @@
 mod dash;
 mod devservers;
 mod format;
+#[cfg(feature = "tree-sitter")]
 mod index;
+#[cfg(feature = "tree-sitter")]
 pub mod lang;
 pub mod lint;
 pub mod media;
@@ -50,6 +52,7 @@ pub fn register(r: &mut Registry) {
     dash::register(r);
     devservers::register(r);
     format::register(r);
+    #[cfg(feature = "tree-sitter")]
     index::register(r);
     lint::register(r);
     media::register(r);
