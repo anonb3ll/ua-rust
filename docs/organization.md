@@ -114,9 +114,23 @@ orgs ─────────────────────┼── of
 
 **One label namespace.** Agent labels and user labels share one hub-wide
 namespace, compared **case-insensitively** (as `agent_lifecycle.agent` already
-is): the writers for `agents` and `users` each refuse a label the other table
-holds in any case. Labels are identifiers, not secrets; creating either is
-admin-gated, so the existence of a label is not treated as confidential.
+is). Today `agents.label` is a case-sensitive primary key, so `Builder-1` in B
+could coexist with `builder-1` in A and then overwrite A's NOCASE
+`agent_lifecycle` row. `organization.v1` therefore adds a unique index on
+`agents(label COLLATE NOCASE)`, after a pre-check that refuses to apply the
+part and lists any existing case-collisions for the operator to resolve; the
+writers for `agents` and `users` — including `touch_agent`'s auto-create on
+first contact — each refuse a label the other table holds in any case. Labels
+are identifiers, not secrets; creating either is admin-gated, so the existence
+of a label is not treated as confidential.
+
+**Reserved labels.** Every label named in hub configuration —
+`human_identities`, `lifecycle_operators`, static `UA_AGENT_TOKENS` labels and
+the `[profiles]` map — is **reserved**. Every label writer, `touch_agent`'s
+auto-create included, refuses a reserved label unless a hub owner writes it,
+and then only into `'default'`. A tenant admin therefore cannot pre-create a
+row for a label the hub's own config will later trust, and the config's trust
+never lands in a tenant.
 
 ## People
 
@@ -137,6 +151,8 @@ CREATE TABLE IF NOT EXISTS org_memberships (
     role     TEXT NOT NULL
              CHECK (role IN ('org_owner','org_admin','team_lead','member','auditor')),
     profile  TEXT,                 -- session profile in this org; NULL = 'reviewer'
+    consolidate_private INTEGER NOT NULL DEFAULT 0
+             CHECK (consolidate_private IN (0,1)),  -- set only by the member themselves
     added_by TEXT NOT NULL,
     added_at TEXT NOT NULL,
     PRIMARY KEY (org_id, user_id)
@@ -197,6 +213,12 @@ instead; that affects their organization only.
   user holds any membership outside that organization or is a hub owner. So a
   tenant admin who adds someone else's user to their organization cannot then
   sign in as them.
+- **Adding** an existing user who holds a membership in another organization,
+  or who is a hub owner, is itself two-person with required authority
+  **`hub_owner`**. This closes the reverse path: B's admins cannot create a
+  user (perhaps under an expected label), give it credentials, and wait for A's
+  admin to add "the same person" to A, because that addition needs a hub owner
+  who sees the user's other memberships and credential issuers.
 - `agent_token_issue` and the managed-token tools refuse any label that is a
   `users` label or listed in `human_identities`; agent tokens are for agents.
 - Granting `team_lead`, `org_admin` or `org_owner` is also two-person, with
@@ -221,9 +243,11 @@ for each listed label with no `org_bootstrap` row:
   revokes every credential issued for that row, sets `bootstrap = 1` and
   records the adoption on the ledger.
 
-In the same transaction the bootstrap re-owns that person's memory notes
-(`owner_type = 'human', owner = users.id` where `owner_type = 'agent'` and
-`owner` equals the label) — see `docs/memory.md`; the step is idempotent.
+In the same transaction the bootstrap calls the memory re-own hook for the new
+user. The hook, and the `memory.owner_type` column it writes, belong to the
+memory scope PR (`docs/memory.md`, `MemoryRepo::reown_for_user`); before that
+part has applied no hook is registered and the call does nothing. The step is
+idempotent.
 
 A later explicit removal of the membership is respected: the `org_bootstrap`
 row is the tombstone, so a restart does not re-promote. Removing a label from
@@ -265,15 +289,21 @@ fn require(caller: &Caller, need: &[Authority], target_org: &str) -> UaResult<()
 Every check names the organization of the **target row** and fails when it
 differs from the caller's, except `HubOwner` on hub-scoped tools and
 `LifecycleOperator`, which are hub authority by definition.
+`LifecycleOperator` holds only when the caller's label is in
+`lifecycle_operators` **and** is either an agent whose row is in `'default'` or
+a hub-owner user — never a same-named row a tenant created (reserved labels make
+that row impossible to create, and this check makes it useless if it existed).
 
-**The guard test** scans `ua-tools`, `ua-server` and `ua-cli` and fails on any
-of these outside `authz`: a call to `is_human(` or `is_lifecycle_operator(`, a
-definition of `fn is_human`, and a `match`/`matches!` on `caller.profile` used
+**The guard test** scans **every workspace crate except `ua-org`** and fails on
+any of these outside `authz`: a call to `is_human(` or `is_lifecycle_operator(`,
+a definition of `fn is_human`, and a `match`/`matches!` on `caller.profile` used
 as an authority decision. Known sites the implementation must move include
 `compat_api.rs`'s local `is_human`, `capability.rs` (hub boundaries shown to
 the `operator` profile), `dispatch/tools.rs`, `vault_move`, `messaging.rs`,
-`config_revisions.rs`, `nodes.rs`, `node_queue/command.rs` and
-`continuity/mod.rs`.
+`config_revisions.rs`, `nodes.rs`, `node_queue/command.rs`,
+`continuity/mod.rs`, and in `crates/ua-memory` (extracted by #49) the
+`fn is_human` in `note.rs` and its uses in `lifecycle.rs` (delete, restore,
+privileged fields).
 
 **Tool scope.** Each registered tool declares `scope: Hub | Tenant`, an
 approval authority class, and whether its approvals are `team_routable`. A
@@ -301,8 +331,9 @@ site; this table is the rule it follows):
 
 **`lifecycle_operators`** stays hub configuration. Its members are hub-level
 operators who may act across organizations; `require()` admits them through
-`Authority::LifecycleOperator`, and the list is edited only by whoever controls
-the hub's config file. An organization's own `org_admin` has lifecycle
+`Authority::LifecycleOperator` (bound to a `'default'` agent row or a hub-owner
+user, above), and the list is edited only by whoever controls the hub's config
+file. An organization's own `org_admin` has lifecycle
 authority over that organization's agents and nodes only.
 
 **Profiles.** A profile decides which tools a session sees; a role never does,
@@ -330,25 +361,50 @@ scheduled jobs skip it and its nodes take no work.
 
 Released schema parts are immutable; `ua-store/src/schema.rs` refuses to apply a
 changed part and requires a new one. The organization model lands as **several
-parts**, one per implementation step, in this order:
+steps**, one per implementation PR, in this order:
 
-| Part | Contents |
+| Step | Contents |
 |---|---|
-| `organization.v1` | `orgs`, `org_id` columns with immutability and existence triggers, `hash_v`, the classification test, the importer exclusion, `Caller.org_id` |
+| `organization.v1` | `orgs`, `org_id` columns with immutability and existence triggers, `hash_v`, the case-insensitive agent label index, the recreated `memory_versions_capture` trigger, the `node_dispatch` launch-key index, the classification test, the importer exclusion, `Caller.org_id` |
 | `organization.v1-rebuild` | the tables whose keys must change ([Global keys](#global-keys-and-table-rebuilds)) |
 | `organization.v2` | `users`, `org_memberships`, `org_bootstrap`, agent owner and profile columns, `authz` |
-| `organization.v3` | approval routing columns |
-| `organization.v4` | `offices`, `teams`, `team_members`, `reporting`, `team_specs` |
+| `organization.v3` | `offices`, `teams`, `team_members`, `reporting`, `team_specs` |
+| `organization.v4` | approval routing columns and their same-organization team triggers |
 | `organization.v5` | `org_proposals` |
 
-The memory parts (`docs/memory.md`) follow `organization.v1`; team visibility
-needs `organization.v4`.
+Teams come before approval routing because routing (`task_team`, rule 3b) and
+its `tasks_team_same_org` / `approvals_team_same_org` triggers read `teams` and
+`team_members`. The memory parts (`docs/memory.md`) follow `organization.v1`;
+team visibility needs `organization.v3`.
+
+**Parts per owning crate.** Tenant tables are created by several crates
+(`ua-tools`, `ua-memory`, `ua-import`, …), and a crate's own test database
+applies only that crate's parts, so one part that `ALTER`s every crate's tables
+would fail there with "no such table". Each step is therefore a set of parts,
+one per owner: `ua-store` owns `organization.v1.store` (`orgs`, the seed, the
+`event_log` columns), and each crate that owns tenant tables declares
+`organization.v1.<crate>` for its own tables. All of them are produced by one
+helper, `ua_store::org::tenant_part(owner, tables)`, which emits the `ADD
+COLUMN`, the generated `org_exists` / `org_immutable` triggers and the
+backfills for exactly the listed tables, so the rules are written once.
+
+**Two part kinds.** `SchemaPart` today is a static `name` and `sql`. It becomes:
+
+| Kind | Body | Checksum covers |
+|---|---|---|
+| `Static` | a `&'static str` of SQL | that SQL, as today |
+| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name, the `version`, and the SQL text the procedure generated on this database, recorded at apply |
+
+A procedure that changes must bump its `version`, which makes it a new part, so
+immutability holds for both kinds. The seed (whose timestamp is bound from
+`ua_core::time::now()`), the helper-generated tenant parts and the rebuild are
+procedures; the rebuild is the only `standalone` one.
 
 `schema::apply` today runs every pending part in one `BEGIN IMMEDIATE`
-transaction. It changes so that a part flagged `rebuild` runs **alone**: the
-pending parts before it are committed first, the rebuild part runs in its own
-procedure ([below](#global-keys-and-table-rebuilds)), and the parts after it
-resume in a new transaction.
+transaction. It changes so that a `standalone` part runs **alone**: the pending
+parts before it are committed first, the standalone part runs its own procedure
+([below](#global-keys-and-table-rebuilds)), and the parts after it resume in a
+new transaction.
 
 ### `organization.v1`
 
@@ -412,7 +468,44 @@ CREATE TRIGGER IF NOT EXISTS tasks_org_immutable
 BEFORE UPDATE OF org_id ON tasks
 WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
 BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;
+
+-- one label namespace, case-insensitive (after the duplicate pre-check)
+CREATE UNIQUE INDEX IF NOT EXISTS agents_label_nocase ON agents(label COLLATE NOCASE);
+
+-- launch keys are client-chosen: scope them to the organization
+DROP INDEX IF EXISTS idx_node_dispatch_launch_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_dispatch_launch_key
+    ON node_dispatch(org_id, launch_key);
+
+-- the existing version-capture trigger (part memory_versions.v1) inserts
+-- without naming org_id, so every tenant's history would land in 'default'
+DROP TRIGGER IF EXISTS memory_versions_capture;
+CREATE TRIGGER memory_versions_capture
+BEFORE UPDATE OF content, tags ON memory
+FOR EACH ROW
+WHEN (OLD.content IS NOT NEW.content OR OLD.tags IS NOT NEW.tags)
+BEGIN
+    INSERT INTO memory_versions (org_id, note_id, version, content, tags, updated_at, actor, recorded_at)
+    VALUES (
+        OLD.org_id,
+        OLD.id,
+        COALESCE((SELECT MAX(version) FROM memory_versions WHERE note_id = OLD.id), 0) + 1,
+        OLD.content,
+        OLD.tags,
+        OLD.updated_at,
+        COALESCE(OLD.updated_by, OLD.author),
+        strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')
+    );
+    DELETE FROM memory_versions
+    WHERE note_id = OLD.id
+      AND version <= (SELECT MAX(version) FROM memory_versions WHERE note_id = OLD.id) - 50;
+END;
 ```
+
+The duplicate pre-check runs before the label index:
+`SELECT lower(label) FROM agents GROUP BY lower(label) HAVING count(*) > 1`
+(and the same across `agents` and `users` once `users` exists). Any row refuses
+the part and names the labels.
 
 An existence trigger (`<table>_org_exists`) and an immutability trigger
 (`<table>_org_immutable`) are generated for every tenant table. A row never
@@ -431,7 +524,10 @@ failing. Three guards:
 
 1. The resolver always binds `org_id` explicitly; it is never omitted.
 2. A unit test walks the statement strings in the tenant-scoped families and
-   fails for an `INSERT INTO <tenant table>` that does not name `org_id`.
+   fails for an `INSERT INTO <tenant table>` that does not name `org_id`. It
+   also walks the SQL of **every trigger** in `sqlite_master` after all parts
+   have applied, because trigger bodies insert too (the
+   `memory_versions_capture` case above) and no Rust string shows them.
 3. Every lookup by id takes the caller's organization (`WHERE id = ? AND
    org_id = ?`) and returns the same `not_found` for another organization's row
    as for a missing one. This includes `approvals::get` in `resolve`.
@@ -451,7 +547,9 @@ global key in the tree is classified:
 | `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`. |
-| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, key)`; a replay never returns another organization's stored result. |
+| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. |
+| `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
+| `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together. |
@@ -471,7 +569,12 @@ procedure:
    `INSERT INTO <table>_new SELECT …, COALESCE(org_id, 'default') …`; drop the
    old table; rename; recreate the recorded indexes, triggers (including the
    generated `org_exists` and `org_immutable` triggers) and views;
-3. `PRAGMA foreign_key_check` — any row aborts with `ROLLBACK`;
+3. `PRAGMA foreign_key_check(<table>)` for **each rebuilt table** — any row
+   aborts with `ROLLBACK`. Not a whole-database check: legacy dangling
+   references elsewhere (which `state_sync_verify` exists to report, and which
+   imports can carry) must not stop the hub from starting. None of the rebuilt
+   tables declares a foreign key or is referenced by one today, so the
+   per-table check is what proves the rebuild itself is sound;
 4. compare the set of trigger and view names against the recorded set — any
    difference aborts with `ROLLBACK`;
 5. record the part, `COMMIT`, `PRAGMA foreign_keys = ON`.
@@ -486,7 +589,7 @@ the adapter from the verified credential and from nothing else:
 
 | Credential | Organization | User |
 |---|---|---|
-| Static config token (`UA_AGENT_TOKENS`) | the label's `agents.org_id`, else `'default'` | the users row, when the label is human |
+| Static config token (`UA_AGENT_TOKENS`) | always `'default'` — it is hub configuration, and its label is reserved, so no tenant row can claim it | the users row, when the label is human |
 | Agent token row (`agent_tokens`) | `agent_tokens.org_id`, set at issue to the agent's organization | none — refused for human labels |
 | Node session credential (`uas_…`) | `session_credentials.org_id`, the organization of the work item it was minted for | none |
 | OAuth grant | `oauth_grants.org_id`, which must equal the subject agent's organization — checked at grant creation and on every use | none — OAuth never acts as a human |
@@ -511,7 +614,7 @@ the hub owner for routine approvals, and must not be able to approve Team B's
 deploys — or anything that needs an admin.
 
 ```sql
--- organization.v3
+-- organization.v4
 ALTER TABLE approvals ADD COLUMN team_id TEXT;
 ALTER TABLE approvals ADD COLUMN routing_basis TEXT NOT NULL DEFAULT 'hub'
     CHECK (routing_basis IN ('hub','task_team','named_team','org'));
@@ -537,7 +640,7 @@ BEGIN SELECT RAISE(ABORT, 'tasks.team_id must be a team of the task''s organizat
 
 The matching insert/update triggers are generated for both columns. The column
 defaults are the **narrowest** values, so a pending approval from before the
-migration fails closed: on first start after `organization.v3`, a one-time step
+migration fails closed: on first start after `organization.v4`, a one-time step
 reclassifies each pending row from the tool registry (`routing_basis = 'org'`,
 `required_authority = 'org_admin'` for tenant-scoped tools; hub-scoped rows
 stay as they are).
@@ -619,7 +722,7 @@ notifications and confers no approval authority.
 ## Teams
 
 ```sql
--- organization.v4
+-- organization.v3
 CREATE TABLE IF NOT EXISTS offices (
     id         TEXT PRIMARY KEY,
     org_id     TEXT NOT NULL REFERENCES orgs(id),
@@ -685,8 +788,14 @@ Writer rules the schema cannot express, each with an acceptance test:
   user stops leading without a second step.
 - A human `principal` must have a membership in the team's organization; an
   agent `principal` must be an agent of that organization.
-- `agents.owner_user_id` must be a member of the agent's organization; only
-  `org_admin` sets it.
+- `agents.owner_user_id` must be a member of the agent's organization, and is
+  set **only by the named user's own act**: the user claims the agent, or
+  accepts an `org_admin`'s request to link it. An `org_admin` may clear it
+  (that narrows), never set it to someone else. Memory uses this link to decide
+  which agent may summarize that person's private notes, so an admin who holds
+  an agent's tokens must not be able to aim it at another person.
+- `org_memberships.consolidate_private` is changed only by the member
+  themselves (default off); see `docs/memory.md`.
 - `offices.profiles` and `agents.default_profile` must be within the
   organization's `allowed_profiles`.
 - `reporting` endpoints must belong to the same organization; only
@@ -793,6 +902,12 @@ When a team has a committed spec, its seats are governed by its edges — as
 actors **and** as targets. Agents that are not seats of any spec are
 unaffected as actors, but they cannot reach into a governed seat.
 
+**Leaving a seat does not free an agent.** An agent removed from a spec's
+seats but still a `team_members` row of that team stays **governed with no
+edges**: it may not delegate, observe or count as a reviewer until an
+`org_admin` removes it from the team. So a team lead's narrowing approval of a
+seat removal cannot be used to lift that agent's edge restrictions.
+
 | Edge | Enforced at | As actor | As target |
 |---|---|---|---|
 | `delegates_to` | delegation and dispatch | A seat may delegate only along its edges. | A seat accepts delegation only from a seat with an edge to it, or from a human `org_admin` or lead of its team. |
@@ -893,9 +1008,10 @@ Rules:
      order);
    - removing a `delegates_to` or `can_observe` edge;
    - narrowing a `trust_root` to a subdirectory of itself;
-   - removing a seat or an agent member that is **not** an endpoint of a
-     `reviews` edge and **not** an `escalates_to` or `approval_escalation`
-     target.
+   - removing a seat that is **not** an endpoint of a `reviews` edge and
+     **not** an `escalates_to` or `approval_escalation` target — the agent
+     stays a governed team member with no edges ([above](#edges-are-enforced-not-decorative));
+     removing the agent from the team itself needs `org_admin`.
 
    Everything else needs `org_admin` or `org_owner`. That includes adding
    members, any `reviews` change, `approval_escalation` and `escalates_to`
@@ -921,7 +1037,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
-| Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md` |
+| Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
@@ -930,7 +1046,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
 | Global identity | `users`, `passkeys`, `webauthn_states`, `login_links`, `oauth_clients`, `oauth_codes`, `oauth_grants`, `oauth_requests`, `oauth_tokens`, `ui_keys`, `ui_sessions`, `org_bootstrap` | Identity is global; the **grant** carries the organization (`oauth_grants.org_id`, `ui_sessions.org_id`, `agent_tokens.org_id`) |
-| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state`, `slack_seen_signatures`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
+| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state`, `slack_seen_signatures`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `import_org_map`, `import_finalized`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
 
 The vault is hub-scoped, so anything that copies tenant data into it —
 `memory_promote` above all — is allowed only in `'default'` (see
@@ -991,8 +1107,9 @@ the Python hub is frozen and never reads a `ua-rust` ledger.
   check and approval eligibility. Its tools register through `ua-tools`, which
   stays a thin registry and envelope; no organization logic is added to
   `ua-tools` beyond the calls into `ua-org`.
-- **`ua-store`** gains a `repo` module with an `OrgRepo` trait and its SQLite
-  implementation. `ua-org` reaches the database only through that trait, and
+- **`ua-store`** gains the `org::tenant_part` helper and the `Procedure` part
+  kind ([Schema](#schema)), and a `repo` module with an `OrgRepo` trait and its
+  SQLite implementation. `ua-org` reaches the database only through that trait, and
   the trait exposes no `rusqlite` types. Methods are synchronous and run inside
   the hub's existing write transaction, because each write must commit
   atomically with its ledger append. A PostgreSQL backend is a later decision;
@@ -1019,11 +1136,40 @@ explicit mapping is given:
 The importer still requires a target ledger holding no events it did not write
 (today's rule), so it runs against a fresh store before the hub first serves.
 For option B it **creates the mapped organizations itself**, as `orgs` rows
-with no ledger events, then imports the source chain unchanged (`hash_v = 1`),
-and appends its own completion event — which records the full mapping — **after**
-the imported chain, as the first `hash_v = 2` row. `verify()` therefore sees
-the order it requires. The migration manifest compare records the mapping in
-its fingerprint.
+with no ledger events, then imports the source chain unchanged (`hash_v = 1`).
+
+`ua-import` is resumable and supports catch-up runs (`import_runs.last_key`),
+so the completion event cannot be written on every run: a catch-up after it
+would append `hash_v = 1` rows after a `hash_v = 2` row, which `verify()`
+refuses. So:
+
+```sql
+CREATE TABLE IF NOT EXISTS import_org_map (
+    source_hash   TEXT NOT NULL,
+    source_org_id TEXT NOT NULL,
+    target_org_id TEXT NOT NULL REFERENCES orgs(id),
+    PRIMARY KEY (source_hash, source_org_id)
+);
+CREATE TABLE IF NOT EXISTS import_finalized (
+    source_hash  TEXT PRIMARY KEY,
+    finalized_at TEXT NOT NULL,
+    event_ulid   TEXT NOT NULL
+);
+```
+
+- Each run records its mapping in `import_org_map`; a later run with a
+  different mapping for the same source is refused.
+- Ordinary and catch-up runs write **no** `hash_v = 2` row. They are refused if
+  the target holds any `hash_v = 2` row.
+- `ua import python-hub --finalize` is the explicit last run: it imports any
+  remaining rows, appends the completion event — which records the full mapping
+  — as the first `hash_v = 2` row, and writes `import_finalized`.
+- After finalization every further import into that target is refused.
+- `ua serve` refuses to start on a store with an import recorded but not
+  finalized, so the hub cannot append `hash_v = 2` rows ahead of a catch-up.
+
+`verify()` therefore always sees the order it requires. The migration manifest
+compare records the mapping in its fingerprint.
 
 Imported ledger rows keep `hash_v = 1`, so the `org_id` the mapping assigns to
 them is **not** covered by their hash. Imported boundaries are as trustworthy as
@@ -1078,7 +1224,9 @@ Parity and isolation
    table missing either generated trigger; FTS virtual and shadow tables and
    SQLite internals pass as classified.
 4. **Resolver guard.** The statement-walking test fails if a tenant-scoped
-   insert omits `org_id`.
+   insert omits `org_id`, in Rust statement strings **or** in any trigger body
+   in `sqlite_master`; after `organization.v1`, editing a note in B writes its
+   `memory_versions` row with B's `org_id`.
 5. **Cross-org references.** Inserting a team member, team office, spec, task
    `team_id` or approval `team_id` that points at another organization fails.
 6. **`org_id` is immutable.** An `UPDATE` changing `org_id` on any tenant table
@@ -1086,11 +1234,19 @@ Parity and isolation
 7. **Global keys.** After the rebuild, A and B can each create a secret, a skill
    version, a skill assignment, a harness bundle, a project binding and a canvas
    board with the same name, and neither error reveals the other; the same
-   idempotency key used in A and B returns each its own result; the same web
-   search in A and B is cached separately; a rebuild that fails
-   `foreign_key_check` or loses a trigger leaves the database unchanged and the
-   hub refuses to start; the parts before a rebuild part are committed and the
-   parts after it apply.
+   idempotency key used in A and B, or by two principals in one organization,
+   returns each its own result and the second first-use is a fresh call, not a
+   collision; the same node launch key used in A and B succeeds in both; the
+   same web search in A and B is cached separately; a rebuild whose rebuilt
+   tables fail `foreign_key_check` or that loses a trigger leaves the database
+   unchanged and the hub refuses to start, while an unrelated dangling
+   reference elsewhere does not stop it; the parts before a standalone part are
+   committed and the parts after it apply.
+7a. **Schema parts.** Each crate's test database applies its own
+   `organization.v1.<crate>` part without the other crates' tables; a
+   procedure part whose generated SQL or `version` changes is refused as a
+   changed part; the `agents` label index part refuses to apply while two
+   agent labels differ only in case, and names them.
 
 People and authority
 
@@ -1102,11 +1258,13 @@ People and authority
    a tenant admin created is not a hub owner, and `system_doctor` reports it;
    `ua org adopt-owner` revokes that row's credentials before adopting it.
 10. **Authz guard.** The test fails on `is_human(`, `is_lifecycle_operator(`, a
-    `fn is_human` or a profile match used as authority outside `authz`, in
-    `ua-tools`, `ua-server` and `ua-cli`; for each row of the authority table,
-    a `member` and an `auditor` are refused, and a caller in B is refused on A's
-    target (for example minting a token for A's agent); a lifecycle operator
-    may retire a node in any organization.
+    `fn is_human` or a profile match used as authority outside `authz`, in any
+    workspace crate other than `ua-org` (including `ua-memory`); for each row
+    of the authority table, a `member` and an `auditor` are refused, and a
+    caller in B is refused on A's target (for example minting a token for A's
+    agent); a lifecycle operator whose label is a `'default'` agent or a hub
+    owner may retire a node in any organization, and a same-named label
+    resolving to anything else may not.
 11. **Hub scope.** A hub-scoped tool is refused to an agent and to a human
     outside `'default'`; its approval is refused to an `org_admin` and accepted
     from a hub owner; `org_create` (with its first owner) and `org_suspend` are
@@ -1121,20 +1279,34 @@ People and authority
 14. **Bootstrap.** A label in `human_identities` gets one `org_owner`
     membership once; removing that membership explicitly survives a restart;
     removing the label from the config removes hub-owner authority but not the
-    membership; the person's agent-owned memory notes are re-owned to the user
-    once.
+    membership; once `memory.scope.v1` has applied, the person's agent-owned
+    memory notes are re-owned to the user once through the memory hook, and
+    before it the bootstrap succeeds without touching memory.
 15. **Two-person rule.** Granting `team_lead` or above, and issuing a credential
     for another human, are refused without an approval from a different
     eligible human who is not the subject; a hub owner's own request proceeds
     and is recorded; the last owner cannot be removed or demoted.
-16. **Cross-org people.** An `org_admin` of B can add a user who belongs to A,
-    but issuing that user a credential needs a hub owner; the same holds for a
-    hub owner as the target; `agent_token_issue` refuses a human label.
+16. **Cross-org people.** An `org_admin` of B cannot add a user who belongs to
+    A, or a hub owner, without a hub owner's approval; issuing such a user a
+    credential also needs a hub owner; a user B created and credentialed, once
+    added to A with that approval, is not reachable by B's credentials in A
+    without A's own membership; `agent_token_issue` refuses a human label.
 17. **Label namespace.** Creating a user with an agent's label, or the reverse,
-    in any letter case, is refused.
+    in any letter case, is refused; creating agent `Builder-1` in B while
+    `builder-1` exists in A is refused, including through `touch_agent`'s
+    auto-create, so B cannot overwrite A's `agent_lifecycle` row.
+17a. **Reserved labels.** A tenant admin, and `touch_agent`, cannot create an
+    agent or user whose label is in `human_identities`, `lifecycle_operators`,
+    a static token or the `[profiles]` map, in any case; a hub owner can, only
+    in `'default'`.
+17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` to
+    another user, and can clear it; the named user can set it by claiming the
+    agent or accepting a request; only the member can turn
+    `consolidate_private` on or off.
 18. **Resolution.** For each credential row of the resolution table, the caller
-    gets the stated organization — including a static token for an agent of B,
-    and an `agent_tokens` row of B; an OAuth grant whose `org_id` differs from
+    gets the stated organization — including a static token, which resolves to
+    `'default'` even if a same-named agent row exists elsewhere, and an
+    `agent_tokens` row of B; an OAuth grant whose `org_id` differs from
     its subject agent's organization is refused at creation and on use; a UI
     session whose membership is removed is refused on its next request;
     switching organization rotates the session id and CSRF token; `--org`
@@ -1193,7 +1365,9 @@ Teams
     reusable; a changed `plan_sha256` needs a new approval.
 30. **Edges.** For each edge type, the action is allowed with the edge and
     refused without it (naming the edge); a non-seat agent cannot delegate to or
-    observe a governed seat; an `auditor` human can observe.
+    observe a governed seat; an `auditor` human can observe; an agent removed
+    from its seat but still on the team cannot delegate, observe or review
+    until an `org_admin` removes it from the team.
 31. **Budgets.** A seat at its cap is refused with `budget_exhausted` regardless
     of fallbacks; a primary marked unavailable falls back within the same pool;
     usage records carry `usage_source`.
@@ -1201,7 +1375,8 @@ Teams
     the daily limit is enforced; the setting off suppresses proposing; a stale
     base is not applied; for each non-narrowing category — including removing a
     `reviews` endpoint or an escalation target — a team lead's approval is
-    refused and an admin's is accepted; apply writes a new spec version.
+    refused and an admin's is accepted; a lead-approved seat removal leaves the
+    agent governed with no edges; apply writes a new spec version.
 33. **Teams and reporting.** Deleting a team fails and archiving blocks new
     members, commits and `team_up`; a reporting query for a past date returns
     the supervisor in effect then; only `org_admin` and above write
@@ -1215,5 +1390,8 @@ Importer
 35. **Mapping and cutover.** `--drop-org-scope` imports everything into
     `'default'`; an unmapped source id refuses the import; a full two-organization
     cutover with both ids mapped creates both organizations, keeps both
-    boundaries, appends one completion event after the imported chain, and
-    `verify()` then reports a valid chain.
+    boundaries, and writes no `hash_v = 2` row; a catch-up run with the same
+    mapping imports only new rows and a different mapping is refused;
+    `--finalize` appends one completion event after the imported chain, after
+    which `verify()` reports a valid chain and any further import is refused;
+    `ua serve` refuses to start on an imported but unfinalized store.
