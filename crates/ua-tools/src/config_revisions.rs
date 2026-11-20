@@ -289,7 +289,7 @@ fn label_ok(s: &str) -> bool {
 }
 
 fn tool_names() -> Vec<&'static str> {
-    crate::builtin_registry().all().map(|t| t.name).collect()
+    crate::builtin_registry_shared().all().map(|t| t.name).collect()
 }
 
 /// Validate a profile overlay: known labels and profiles, each entry repeats
