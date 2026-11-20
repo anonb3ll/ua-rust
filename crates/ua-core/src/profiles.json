@@ -153,6 +153,7 @@
   "memory_get",
   "memory_list",
   "memory_search",
+  "node_list",
   "profile_status",
   "session_list",
   "task_list"
