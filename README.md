@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 192 tools are registered and the core families are ported.
+> **Status: alpha.** 200 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -99,7 +99,8 @@ vulnerability.
 | Memory and vault | Memory notes (FTS5, optional embeddings), Obsidian vault read/write, graph query, journal | |
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
-| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance` | [nodes](docs/nodes.md) |
+| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance`; idle-session wakes over the session's own agent's node long-poll (`/api/node/wake`, check and receipt) behind a session request and a human grant, with the original budget (debounce, floor, hourly caps, breaker) | [nodes](docs/nodes.md#idle-session-wakes) |
+| Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from harness-declared signals (`quota_patterns` on stderr, Pi's JSON error events; `provider_quota_status`), `dispatch_task` refusals or same-provider, same-billing fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`); delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
@@ -115,9 +116,8 @@ vulnerability.
 
 ## Not yet ported
 
-The node wake transport and harness config
-bundle (`/api/node/wake*`, `/api/node/config` answer 501), native-session
-resume and adopt, provider accounts, the Pi backend, cloud executors, ACP,
+The harness config bundle (`/api/node/config` answers 501), native-session
+resume and adopt, cloud executors, ACP,
 Slack and Zulip connectors, role workflows, CI lookups and close-on-merge
 (both wait for the native GitHub client), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,

@@ -29,6 +29,7 @@ pub mod notify;
 pub mod observability;
 pub mod plans;
 pub mod platform;
+pub mod provider_accounts;
 pub mod relay;
 pub mod routines;
 pub mod runs;
@@ -37,6 +38,7 @@ pub mod skills;
 pub mod tasks;
 pub mod tokens;
 pub mod vault;
+pub mod wake;
 pub mod web;
 pub mod workflows;
 pub mod workspace;
@@ -66,8 +68,11 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(nodes::SCHEMA);
     parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
+    parts.push(provider_accounts::SCHEMA);
     parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
+    parts.push(wake::SCHEMA);
+    parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
     parts.push(workflows::SCHEMA);
     parts
@@ -97,6 +102,7 @@ pub fn register(r: &mut Registry) {
     notify::register(r);
     observability::register(r);
     plans::register(r);
+    provider_accounts::register(r);
     platform::register(r);
     relay::register(r);
     routines::register(r);
@@ -106,6 +112,7 @@ pub fn register(r: &mut Registry) {
     tasks::register(r);
     tokens::register(r);
     vault::register(r);
+    wake::register(r);
     web::register(r);
     workflows::register(r);
     workspace::register(r);
