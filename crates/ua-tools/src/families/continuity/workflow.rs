@@ -621,7 +621,8 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
     }
     let expected_revision = a.expected_revision;
     let ctx2 = ctx.clone();
-    ctx.hub
+    let out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let task = require_task(tx, id)?;
@@ -675,7 +676,9 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
             )?;
             view(tx, id, None)
         })
-        .await
+        .await?;
+    review_ready(&ctx.hub, id).await;
+    Ok(out)
 }
 
 /// `coordination_manage(action="task_check_record")`.
@@ -842,6 +845,8 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
                 run_id: run_id.clone(),
                 head_sha: row.head_sha.clone(),
                 expect: if row.outcome == "pass" { "success" } else { "failure" }.into(),
+                check: name.to_string(),
+                job: job.clone(),
             };
             let ci = ctx.hub.ci();
             let mut outcome = ci.verify_run(&run).await;
@@ -874,7 +879,8 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
     };
 
     let (who, n, h) = (who.to_string(), name.to_string(), head.to_string());
-    ctx.hub
+    let out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let verified_at = (grade == VERIFIED).then(now_micros);
@@ -902,5 +908,118 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
             }
             view(tx, id, Some(&h))
         })
-        .await
+        .await?;
+    if grade == VERIFIED {
+        review_ready(&ctx.hub, id).await;
+    }
+    Ok(out)
 }
+
+// --- review-ready notification ------------------------------------------------------
+
+/// The shortest gap between two `review_ready` notices for one task.
+const REVIEW_READY_GAP_S: i64 = 600;
+
+/// Notify when a task sits at stage `review`, expects at least one check, and
+/// every expected check is `verified` at the capsule's head.
+///
+/// The message is a fixed template (task id, head, check names): nothing an
+/// agent wrote (title, notes, detail) reaches the notification channel, so a
+/// profile that denies `notify` cannot push text through it. Each head is
+/// announced at most once per task (`review_ready_notices`), and a task gets
+/// at most one notice per [`REVIEW_READY_GAP_S`] seconds; a head that becomes
+/// ready inside the gap is ledgered as `review_ready_suppressed` and not sent.
+/// Best effort: a failure is logged, never returned to the writer.
+pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
+    let claimed = hub
+        .db()
+        .write_async(move |tx| {
+            let row: Option<(Option<String>, Option<String>)> = tx
+                .query_row("SELECT stage, head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            let Some((Some(stage), Some(head))) = row else { return Ok(None) };
+            if stage != "review" || !is_full_sha(&head) {
+                return Ok(None);
+            }
+            let sent: bool = tx
+                .query_row(
+                    "SELECT 1 FROM review_ready_notices WHERE task_id = ?1 AND head_sha = ?2",
+                    params![task_id, head],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if sent {
+                return Ok(None);
+            }
+            let v = view(tx, task_id, None)?;
+            let expected: Vec<String> = json_list(Some(v["expected_checks"].to_string()));
+            let checks = v["checks"].as_array().cloned().unwrap_or_default();
+            let verified = |name: &str| checks.iter().any(|c| c["name"] == name && c["grade"] == VERIFIED);
+            if expected.is_empty() || !expected.iter().all(|n| verified(n)) {
+                return Ok(None);
+            }
+            let now = jiff::Timestamp::now();
+            let since = ua_core::time::format_ts(
+                now.checked_sub(jiff::SignedDuration::from_secs(REVIEW_READY_GAP_S)).unwrap_or(now),
+            );
+            let recent: bool = tx
+                .query_row(
+                    "SELECT 1 FROM review_ready_notices WHERE task_id = ?1 AND notified_at > ?2 LIMIT 1",
+                    params![task_id, since],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if recent {
+                emit(
+                    tx,
+                    CHANNEL,
+                    json!({ "kind": "review_ready_suppressed", "task_id": task_id, "head_sha": head,
+                            "reason": "rate limited: one notice per task per 10 minutes" }),
+                    REVIEW_READY_AGENT,
+                )?;
+                return Ok(None);
+            }
+            tx.execute(
+                "INSERT INTO review_ready_notices (task_id, head_sha, notified_at) VALUES (?1, ?2, ?3)",
+                params![task_id, head, ua_core::time::format_ts(now)],
+            )?;
+            tx.execute(
+                "UPDATE task_workflow SET review_notified_head = ?1 WHERE task_id = ?2",
+                params![head, task_id],
+            )?;
+            emit(
+                tx,
+                CHANNEL,
+                json!({ "kind": "review_ready", "task_id": task_id, "head_sha": head, "checks": expected }),
+                REVIEW_READY_AGENT,
+            )?;
+            Ok(Some(review_ready_message(task_id, &head, &expected)))
+        })
+        .await;
+    match claimed {
+        Ok(Some(message)) => {
+            if let Err(e) =
+                crate::families::notify::send_event(hub, "review_ready", REVIEW_READY_AGENT, &message).await
+            {
+                tracing::warn!(task_id, error = %e, "review_ready notification failed");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(task_id, error = %e, "review_ready check failed"),
+    }
+}
+
+/// The fixed review-ready text. Check names are validated identifiers
+/// (`a-z0-9_.:-`) and the head is hex, so nothing here is free text.
+fn review_ready_message(task_id: i64, head: &str, checks: &[String]) -> String {
+    let short: String = head.chars().take(12).collect();
+    let names: Vec<&str> = checks.iter().map(String::as_str).filter(|n| check_name(n).is_ok()).collect();
+    format!("Task #{task_id} is ready for review (head {short}; verified checks: {})", names.join(", "))
+}
+
+/// The identity review-ready notifications are attributed to.
+const REVIEW_READY_AGENT: &str = "hub";

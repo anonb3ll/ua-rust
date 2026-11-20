@@ -199,6 +199,13 @@ revoked_agents = ["example_retired_agent"]
 example_lead_agent = "merge|deploy"
 ```
 
+`git_merge_task` also accepts a **policy authorization** in place of the
+one-time approval: a verified human records with
+`policy_authorization_record` that a standing policy covers merging one
+exact head of one task in its project's bound repository, with an expiry;
+the merge names it as `policy_authorization_id` and spends it. The identity
+checks above still run first. See [github](github.md#policy-authorizations).
+
 ## Governance controls
 
 The policy file and profiles decide whether a call may run. The governance

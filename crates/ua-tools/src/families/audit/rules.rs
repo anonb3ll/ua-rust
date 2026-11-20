@@ -207,6 +207,49 @@ pub fn redact_secrets(text: &str) -> (String, usize) {
     (out, count)
 }
 
+/// One credential-shaped match found by [`secret_spans`].
+pub struct SecretSpan {
+    /// The shape's name, e.g. `GitHub token`.
+    pub name: &'static str,
+    /// Byte range of the whole match in the scanned text.
+    pub start: usize,
+    pub end: usize,
+    /// The credential part (the `val` group, else the whole match).
+    pub value: String,
+}
+
+/// Every credential-shaped match in `text`, with the same shapes as
+/// [`redact_secrets`], for callers that refuse rather than redact. Stricter
+/// about placeholders than the audit: only a value that is wholly a
+/// placeholder form (`<token>`, `${VAR}`, `$VAR`, `%VAR%`, a mask such as
+/// `xxxx`, or `[REDACTED_SECRET]`) is exempt, not one that merely contains a
+/// hint word such as "example".
+pub fn secret_spans(text: &str) -> Vec<SecretSpan> {
+    let mut out = Vec::new();
+    for shape in secret_shapes() {
+        for caps in shape.rx.captures_iter(text) {
+            let Some(whole) = caps.get(0) else { continue };
+            let value = caps.name("val").map(|m| m.as_str()).unwrap_or(whole.as_str());
+            if shape.name == "HTTP Basic credentials"
+                && !value.chars().any(|c| c.is_ascii_digit() || matches!(c, '+' | '/' | '='))
+            {
+                continue;
+            }
+            let bare = value.trim_matches(|c| c == '"' || c == '\'');
+            if placeholder_shape().is_match(bare) || bare == "[REDACTED_SECRET]" {
+                continue;
+            }
+            out.push(SecretSpan {
+                name: shape.name,
+                start: whole.start(),
+                end: whole.end(),
+                value: value.into(),
+            });
+        }
+    }
+    out
+}
+
 pub fn check_private_key(relpath: &str, text: &str) -> Vec<Finding> {
     static RX: OnceLock<Regex> = OnceLock::new();
     let rx = RX.get_or_init(|| rx(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY"));

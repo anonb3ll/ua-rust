@@ -7,6 +7,7 @@ pub mod api;
 pub mod auth;
 pub mod compat_api;
 pub mod events;
+pub mod github_api;
 pub mod guard;
 pub mod login;
 pub mod mcp;
@@ -42,6 +43,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(oauth::routes())
         .merge(login::routes())
         .merge(compat_api::routes())
+        .merge(github_api::routes())
         .merge(node_api::routes())
         .merge(platform_api::routes())
         .merge(ui::routes())

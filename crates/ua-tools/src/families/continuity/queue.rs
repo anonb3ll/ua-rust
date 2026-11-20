@@ -38,8 +38,9 @@
 //! descendant held by someone other than the caller needs an operator too.
 //! Unpark is judged on the root alone: restoring a fold hides nothing.
 //!
-//! Close-on-merge (`queue_close_merged` in the Python hub) needs merged-PR
-//! evidence from the forge and waits for the native GitHub client.
+//! Close-on-merge (`queue_close_merged`) lives in [`super::merged`]: a task
+//! linking a merged pull request closes through `task_update`, guarded by
+//! the same protection rules.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -147,12 +148,12 @@ pub struct UnparkArgs {
 
 /// A verified caller allowed to write the queue, and whether it holds
 /// operator authority (a human or a lifecycle operator).
-struct Writer {
-    who: String,
-    operator: bool,
+pub(super) struct Writer {
+    pub(super) who: String,
+    pub(super) operator: bool,
 }
 
-fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> UaResult<Writer> {
+pub(super) fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> UaResult<Writer> {
     acting_identity(&ctx.caller, actor)?;
     let who = governance::verified_actor(&ctx.caller, verb)?;
     let operator = governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who);
@@ -216,7 +217,7 @@ fn clean_reason(raw: &str) -> UaResult<String> {
     Ok(text)
 }
 
-type Row = Map<String, Value>;
+pub(super) type Row = Map<String, Value>;
 
 fn s<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
     str_field(row, key)
@@ -231,7 +232,7 @@ fn is_parked(row: &Row) -> bool {
 }
 
 /// Unfinished, unparked and not archived: work the queue still shows.
-fn is_active(row: &Row) -> bool {
+pub(super) fn is_active(row: &Row) -> bool {
     ACTIVE_STATUSES.contains(&status(row)) && !is_parked(row) && s(row, "archived_at").is_none()
 }
 
@@ -323,7 +324,7 @@ fn gate_reasons(row: &Row) -> Vec<String> {
 }
 
 /// Everything that keeps the sweep from proposing a park.
-fn protection(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
+pub(super) fn protection(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
     let mut out = gate_reasons(row);
     if s(row, "lane") == Some("tracking") {
         out.push("tracking lane".into());
@@ -332,14 +333,14 @@ fn protection(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Ve
     Ok(out)
 }
 
-fn task_rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> UaResult<Vec<Row>> {
+pub(super) fn task_rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> UaResult<Vec<Row>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(p, row_object)?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
 /// Every descendant row of `id` (not `id` itself), parents before children.
-fn descendants(conn: &Connection, id: i64) -> UaResult<Vec<Row>> {
+pub(super) fn descendants(conn: &Connection, id: i64) -> UaResult<Vec<Row>> {
     let mut out = Vec::new();
     for d in subtree_ids(conn, id)?.into_iter().filter(|d| *d != id) {
         out.push(require_task(conn, d)?);

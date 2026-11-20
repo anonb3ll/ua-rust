@@ -604,3 +604,102 @@ async fn pruning_frees_room_and_keeps_used_clients() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].payload["count"], 1);
 }
+
+// --- GitHub webhook ---------------------------------------------------------------------
+
+const WEBHOOK_SECRET: &str = "webhook-secret-for-tests";
+
+fn webhook(body: &Value, delivery: &str, event: &str, secret: &str) -> Request<Body> {
+    let sig = ua_tools::families::github::signature_for(secret.as_bytes(), body.to_string().as_bytes());
+    post_json(
+        "/api/github/webhook",
+        body,
+        &[("x-github-event", event), ("x-github-delivery", delivery), ("x-hub-signature-256", &sig)],
+    )
+}
+
+#[tokio::test]
+async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
+    let mut cfg = stream_config();
+    cfg.github_webhook_secret_value = Some(SecretString::from(WEBHOOK_SECRET));
+    let hub = TestHub::new(cfg);
+    let reg = &hub.state.registry;
+    let human = Caller {
+        label: "operator".into(),
+        kind: ActorKind::Human,
+        profile: Profile::Operator,
+        enforce_profile: false,
+        session_key: None,
+        transport: Transport::Internal,
+    };
+    reg.call(
+        &hub.state.hub,
+        &human,
+        "coordination_manage",
+        json!({ "action": "project_repo_bind", "params": { "project": "default", "repo": "example/repo" } }),
+    )
+    .await
+    .unwrap();
+    let task = reg
+        .call(
+            &hub.state.hub,
+            &human,
+            "task_add",
+            json!({ "title": "feature", "notes": "closes: example/repo#4" }),
+        )
+        .await
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let merge = "0123456789abcdef0123456789abcdef01234567";
+    let payload = json!({
+        "action": "closed",
+        "pull_request": { "number": 4, "merged": true, "merge_commit_sha": merge,
+                          "head": { "ref": "feature" }, "base": { "ref": "main" },
+                          "html_url": "https://github.com/example/repo/pull/4" },
+        "repository": { "full_name": "example/repo", "default_branch": "main" },
+    });
+
+    // No bearer is needed, but the signature is.
+    let resp = hub.send(webhook(&payload, "delivery-1", "pull_request", "wrong-secret")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(resp).await["error"], "bad_signature");
+    let resp = hub.send(webhook(&payload, "delivery-1", "pull_request", WEBHOOK_SECRET)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["result"]["closed"][0]["task_id"], task, "{v}");
+    let status: (String, Option<String>) = hub
+        .state
+        .hub
+        .db()
+        .read(move |c| {
+            Ok(c.query_row("SELECT status, evidence_ref FROM tasks WHERE id = ?1", [task], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
+        })
+        .unwrap();
+    assert_eq!(status, ("done".to_string(), Some(merge.to_string())));
+    // The same delivery again is refused.
+    let resp = hub.send(webhook(&payload, "delivery-1", "pull_request", WEBHOOK_SECRET)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(resp).await["error"], "replayed");
+    // So is the same signed body under a fresh delivery id (the headers are not signed).
+    let resp = hub.send(webhook(&payload, "delivery-2", "pull_request", WEBHOOK_SECRET)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(resp).await["error"], "replayed");
+    // A form-encoded body never reaches the handler.
+    let req = Request::post("/api/github/webhook")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("x-github-event", "ping")
+        .body(Body::from("payload=%7B%7D"))
+        .unwrap();
+    assert_eq!(hub.send(req).await.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // Other /api routes still need a bearer.
+    let resp = hub.send(post_json("/api/tools/task_list", &json!({}), &[])).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Without a configured secret the endpoint refuses everything.
+    let hub2 = TestHub::new(stream_config());
+    let resp = hub2.send(webhook(&payload, "delivery-2", "pull_request", WEBHOOK_SECRET)).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
