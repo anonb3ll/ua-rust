@@ -172,7 +172,10 @@ impl Row {
 
     /// The payload a human approves. Every value that changes what is sent,
     /// or where, is in it; the gate adds the requester.
-    fn approval_payload(&self) -> Value {
+    /// What a send approval binds: the exact text and target, and the
+    /// credential it will post with (by name and keyed fingerprint), so a
+    /// token swapped after the approval cannot post under another account.
+    fn approval_payload(&self, credential: &Credential) -> Value {
         json!({
             "action": "send",
             "draft_id": self.id,
@@ -181,6 +184,7 @@ impl Row {
             "text": self.text,
             "text_sha256": self.text_sha256,
             "chars": self.chars,
+            "credential": { "name": credential.name, "fingerprint": credential.fingerprint },
         })
     }
 
@@ -434,6 +438,35 @@ fn recheck(c: &Connection, cfg: &Config, row: &Row) -> UaResult<(Target, String)
     Ok((target, text))
 }
 
+/// The relay's GitHub credential: its managed-secret name, the token and the
+/// token's keyed fingerprint.
+struct Credential {
+    name: String,
+    token: secrecy::SecretBox<str>,
+    fingerprint: String,
+}
+
+fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Credential> {
+    let name = github::secret_name(cfg)?.to_string();
+    let (token, fingerprint) =
+        managed_secrets::load_for_consumer(tx, cfg, &name, github::CONSUMER).map_err(|e| {
+            UaError::denied(
+                "relay_unavailable",
+                format!(
+                    "the relay's GitHub credential is not usable: {}",
+                    e.reason_code().unwrap_or(e.code())
+                ),
+            )
+        })?;
+    if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
+        return Err(UaError::denied(
+            "relay_unavailable",
+            "the relay's GitHub credential is not a single-line token",
+        ));
+    }
+    Ok(Credential { name, token, fingerprint })
+}
+
 async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
@@ -459,7 +492,8 @@ async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
                 }
             }
             let (target, text) = recheck(tx, hub.cfg(), &row)?;
-            let payload = row.approval_payload();
+            let credential = credential(tx, hub.cfg())?;
+            let payload = row.approval_payload(&credential);
             let approval_id = match approvals::gate(tx, hub.cfg(), &caller, TOOL, &payload)? {
                 GateOutcome::Pending { approval_id } => approval_id,
                 // A fresh draft id has never been requested, so no decision
@@ -579,32 +613,16 @@ fn begin_send(
             ),
         ));
     }
-    let name = github::secret_name(cfg)?;
-    let (token, _fingerprint) =
-        managed_secrets::load_for_consumer(tx, cfg, name, github::CONSUMER).map_err(|e| {
-            UaError::denied(
-                "relay_unavailable",
-                format!(
-                    "the relay's GitHub credential is not usable: {}",
-                    e.reason_code().unwrap_or(e.code())
-                ),
-            )
-        })?;
-    if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
-        return Err(UaError::denied(
-            "relay_unavailable",
-            "the relay's GitHub credential is not a single-line token",
-        ));
-    }
-    let payload = row.approval_payload();
+    let credential = credential(tx, cfg)?;
+    let payload = row.approval_payload(&credential);
     if let Some(id) = row.approval_id {
         let approval = approvals::get(tx, id)?;
         if approval.tool != TOOL || approval.payload != payload {
             return Err(UaError::denied(
                 "approval_mismatch",
                 format!(
-                    "relay draft {} no longer matches what approval {id} bound (text, target or channel changed); \
-                     nothing was sent",
+                    "relay draft {} no longer matches what approval {id} bound (text, target, channel or \
+                     credential changed); nothing was sent",
                     row.id
                 ),
             ));
@@ -661,7 +679,7 @@ fn begin_send(
             "chars": row.chars, "bytes": row.bytes, "text_sha256": row.text_sha256,
         }),
     )?;
-    Ok(Ok(Ready { row, target, text, approval_id, token }))
+    Ok(Ok(Ready { row, target, text, approval_id, token: credential.token }))
 }
 
 async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {

@@ -627,3 +627,25 @@ async fn withdrawn_approvals_cannot_be_resolved_and_developers_do_not_see_the_re
     let e = h.refused(&anon, "draft", json!({ "target": TARGET, "text": CLEAN })).await;
     assert_eq!(reason(&e), "identity_required");
 }
+
+#[tokio::test]
+async fn a_token_swapped_after_approval_does_not_post() {
+    let h = H::with(|c| c.human_identities.push("operator-2".into())).await;
+    let (id, approval_id) = h.requested(CLEAN).await;
+    h.approve(approval_id).await;
+    // Another human replaces the relay's token; a replacement needs its own
+    // approval, given here by the first human.
+    let second = caller("operator-2", ActorKind::Human, Profile::Operator);
+    let args = json!({ "name": "relay-gh", "consumer": "relay:github", "value": "ghp_other_account_token_value_0000000000" });
+    match h.reg.call(&h.hub, &second, "managed_secret_set", args.clone()).await {
+        Err(UaError::ApprovalRequired { approval_id, .. }) => {
+            h.approve(approval_id).await;
+            h.ok(&second, "managed_secret_set", args).await;
+        }
+        Ok(_) => {}
+        Err(e) => panic!("replacing the token failed: {e:?}"),
+    }
+    let e = h.refused(&agent(), "send", json!({ "draft_id": id, "text": CLEAN })).await;
+    assert_eq!(reason(&e), "approval_mismatch", "{e:?}");
+    assert!(h.mock.requests().is_empty(), "nothing was posted under the new token");
+}
