@@ -580,12 +580,16 @@ fn begin_send(
         ));
     }
     let name = github::secret_name(cfg)?;
-    let token = managed_secrets::load_for_consumer(tx, cfg, name, github::CONSUMER).map_err(|e| {
-        UaError::denied(
-            "relay_unavailable",
-            format!("the relay's GitHub credential is not usable: {}", e.reason_code().unwrap_or(e.code())),
-        )
-    })?;
+    let (token, _fingerprint) =
+        managed_secrets::load_for_consumer(tx, cfg, name, github::CONSUMER).map_err(|e| {
+            UaError::denied(
+                "relay_unavailable",
+                format!(
+                    "the relay's GitHub credential is not usable: {}",
+                    e.reason_code().unwrap_or(e.code())
+                ),
+            )
+        })?;
     if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
         return Err(UaError::denied(
             "relay_unavailable",
