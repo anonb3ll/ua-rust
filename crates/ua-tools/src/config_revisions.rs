@@ -1082,6 +1082,7 @@ pub fn register(r: &mut Registry) {
              written.",
             manage,
         )
+        .handler_may_gate(crate::HandlerGate::Actions(&["commit", "rollback"]))
         .family("config"),
     );
 }

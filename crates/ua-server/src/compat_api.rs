@@ -34,12 +34,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, UaError};
-use ua_tools::approvals::{self, GateOutcome};
+use ua_tools::ApprovalRequest;
+use ua_tools::approvals::{self, RequestState};
 
 use crate::AppState;
 use crate::api::status_for;
@@ -594,14 +595,24 @@ async fn approval_detail(
 }
 
 enum RequestOutcome {
-    Pending(i64),
-    Approved(i64),
-    Denied(i64, Option<String>),
-    TooMany,
+    Recorded(RequestState),
+    TooMany(Cap),
+}
+
+/// Which request cap refused a request.
+enum Cap {
+    Open,
+    Hourly,
 }
 
 /// Open approval requests one requester may have queued at once.
 const MAX_PENDING_PER_REQUESTER: i64 = 20;
+/// Requests one requester may file per rolling hour that are still pending
+/// or that the requester denied or revoked itself, so a request-and-withdraw
+/// loop cannot flood the inbox past the open cap.
+const MAX_REQUESTS_PER_HOUR: i64 = 60;
+/// Largest `payload` a request may carry, serialized.
+const MAX_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024;
 
 async fn approval_request(
     State(state): State<AppState>,
@@ -634,81 +645,111 @@ async fn approval_request(
         Some(Value::Object(m)) => Value::Object(m.clone()),
         Some(_) => return err(StatusCode::BAD_REQUEST, "payload must be a JSON object"),
     };
-    let Some(def) = state.registry.get(&tool) else {
-        return err(StatusCode::BAD_REQUEST, format!("unknown tool: {tool}"));
-    };
+    if serde_json::to_vec(&payload).map_or(true, |b| b.len() > MAX_REQUEST_PAYLOAD_BYTES) {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("payload must be at most {MAX_REQUEST_PAYLOAD_BYTES} bytes of JSON"),
+        );
+    }
     let caller = caller(&state, &id, &headers);
     if !may(&caller, "approval_pending") {
         return err(StatusCode::FORBIDDEN, "approval requests are not exposed by the active profile");
     }
-    // Only for a tool the caller could actually run: no inbox spam for tools
-    // its profile hides.
-    if !may(&caller, &tool) {
-        return err(StatusCode::FORBIDDEN, format!("tool {tool:?} is not available to the active profile"));
+    // An unknown tool reads like one the profile hides, so a profile-bound
+    // caller cannot enumerate the registry; an unrestricted caller gets 400.
+    if state.registry.get(&tool).is_none() {
+        return if caller.enforce_profile {
+            err(StatusCode::FORBIDDEN, format!("tool {tool:?} is not available to the active profile"))
+        } else {
+            err(StatusCode::BAD_REQUEST, format!("unknown tool: {tool}"))
+        };
     }
-    let gated = def.always_gated || state.hub.cfg().approval_tools.contains(&tool);
-    if !gated {
-        return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
-    }
+    // The checks a call of the tool would pass before its gate (grant,
+    // profile, policy rules, prod-action identity), then the payload its gate
+    // would bind: a `gate_payload` projection, never the raw arguments, so a
+    // secret value is not parked in the approvals table.
+    let payload = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
+        Ok(ApprovalRequest::Payload(p)) => p,
+        Err(e) if e.reason_code() == Some("secret_args_unprojected") => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": e.to_string(), "reason_code": "secret_args_unprojected" })),
+            )
+                .into_response();
+        }
+        Ok(ApprovalRequest::NotGated) => {
+            return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
+        }
+        Ok(ApprovalRequest::GatesInHandler) => {
+            return err(
+                StatusCode::CONFLICT,
+                format!(
+                    "tool {tool:?} binds its approval to values it resolves when called; call the tool to \
+                     request its approval"
+                ),
+            );
+        }
+        Err(e) => return tool_err(&e),
+    };
     let (hub, c, t, p) = (state.hub.clone(), caller.clone(), tool.clone(), payload.clone());
     let res = state
         .hub
         .db()
         .write_async(move |tx| {
             let cfg = hub.cfg();
-            let canon = approvals::canonical_payload(&p);
-            let denied: Option<(i64, Option<String>)> = tx
-                .query_row(
-                    "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-                     AND status = 'denied' ORDER BY id DESC LIMIT 1",
-                    params![t, canon, c.label],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((id, reason)) = denied {
-                return Ok(RequestOutcome::Denied(id, reason));
+            // A request already on record for this exact call (denied, a
+            // live pass, or pending) answers as it stands, whatever the caps
+            // say. Read-only: nothing is consumed.
+            if let Some(state) = approvals::peek(tx, cfg, &c.label, &t, &p)? {
+                return Ok(RequestOutcome::Recorded(state));
             }
             // Bound the human inbox: one requester cannot queue more than
-            // MAX_PENDING_PER_REQUESTER open requests.
-            let open: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM approvals WHERE requested_by = ?1 AND status = 'pending'",
-                params![c.label],
-                |r| r.get(0),
+            // MAX_PENDING_PER_REQUESTER open requests, nor file more than
+            // MAX_REQUESTS_PER_HOUR that are open or that it withdrew itself.
+            let hour_ago = ua_core::time::format_ts(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
+            let (open, recent): (i64, i64) = tx.query_row(
+                "SELECT COALESCE(SUM(status = 'pending'), 0), COALESCE(SUM(created_at >= ?2 AND (status = 'pending' \
+                 OR (status IN ('denied', 'revoked') AND resolved_by = requested_by))), 0) \
+                 FROM approvals WHERE requested_by = ?1",
+                params![c.label, hour_ago],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             if open >= MAX_PENDING_PER_REQUESTER {
-                return Ok(RequestOutcome::TooMany);
+                return Ok(RequestOutcome::TooMany(Cap::Open));
             }
-            // A live pass is reported, never consumed: this route runs nothing.
-            let ttl_s = (cfg.approval_pass_ttl_hours * 3600.0) as i64;
-            let passes: Vec<(i64, Option<String>)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-                     AND status = 'approved' ORDER BY id ASC",
-                )?;
-                stmt.query_map(params![t, canon, c.label], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<Result<_, _>>()?
-            };
-            if let Some((id, _)) =
-                passes.iter().find(|(_, at)| ts_s(at.as_deref()).is_some_and(|s| s + ttl_s >= now_s()))
-            {
-                return Ok(RequestOutcome::Approved(*id));
+            if recent >= MAX_REQUESTS_PER_HOUR {
+                return Ok(RequestOutcome::TooMany(Cap::Hourly));
             }
-            match approvals::gate(tx, cfg, &c, &t, &p)? {
-                GateOutcome::Pending { approval_id } => Ok(RequestOutcome::Pending(approval_id)),
-                GateOutcome::Denied { approval_id, reason } => Ok(RequestOutcome::Denied(approval_id, reason)),
-                // Unreachable: live passes were handled above in this transaction.
-                GateOutcome::Pass { approval_id } => Ok(RequestOutcome::Approved(approval_id)),
-            }
+            // Never consumes a pass: this route runs nothing.
+            Ok(RequestOutcome::Recorded(approvals::request(tx, cfg, &c, &t, &p)?))
         })
         .await;
     let (status, approval_id, decision, reason) = match res {
-        Ok(RequestOutcome::Pending(a)) => (StatusCode::ACCEPTED, a, "pending", None),
-        Ok(RequestOutcome::Approved(a)) => (StatusCode::OK, a, "approved", None),
-        Ok(RequestOutcome::Denied(a, r)) => (StatusCode::OK, a, "denied", r),
-        Ok(RequestOutcome::TooMany) => {
+        Ok(RequestOutcome::Recorded(state)) => {
+            let code = if matches!(state, RequestState::Pending { .. }) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            let reason = match &state {
+                RequestState::Denied { reason, .. } => reason.clone(),
+                _ => None,
+            };
+            (code, state.approval_id(), state.status(), reason)
+        }
+        Ok(RequestOutcome::TooMany(Cap::Open)) => {
             return err(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("{MAX_PENDING_PER_REQUESTER} approval requests are already open for this identity"),
+            );
+        }
+        Ok(RequestOutcome::TooMany(Cap::Hourly)) => {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "{MAX_REQUESTS_PER_HOUR} approval requests filed in the last hour are open or were withdrawn \
+                     by this identity"
+                ),
             );
         }
         Err(e) => return tool_err(&e),

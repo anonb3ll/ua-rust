@@ -32,7 +32,7 @@ pub mod registry;
 pub mod sessions;
 
 pub use hub::Hub;
-pub use registry::{Registry, ToolCtx, ToolDef, tool};
+pub use registry::{ApprovalRequest, HandlerGate, Registry, ToolCtx, ToolDef, tool};
 
 use ua_store::SchemaPart;
 
@@ -40,6 +40,7 @@ use ua_store::SchemaPart;
 pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts =
         vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
+    parts.push(ua_store::ledger::META_SCHEMA);
     parts.extend(families::schema_parts());
     parts.push(config_revisions::SCHEMA);
     parts

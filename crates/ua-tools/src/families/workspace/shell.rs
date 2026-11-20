@@ -1217,10 +1217,34 @@ fn resolve_cwd(sb: &Sandbox, cwd: &str) -> UaResult<PathBuf> {
     Ok(dir)
 }
 
+/// Refusals whose text or code would tell the caller whether a program is
+/// on the allowlist: not on it, or refused for a reason checked only once
+/// it is.
+const ALLOWLIST_REVEALING: [&str; 3] = ["program_not_allowed", "git_config_override", "destructive"];
+
+/// [`vet_command`] against the hub's allowlist. The allowlist is a boundary
+/// shown to operators only (`capability_catalog`), so for anyone else every
+/// refusal that would confirm or deny a program's membership reads the same.
+fn vet(ctx: &ToolCtx, cmd: &str) -> UaResult<ua_core::safety::VettedCommand> {
+    let cfg = ctx.hub.cfg();
+    vet_command(cmd, &cfg.shell_allowlist()).map_err(|e| {
+        let revealing = e.reason_code().is_some_and(|c| ALLOWLIST_REVEALING.contains(&c));
+        if revealing && !crate::families::capability::is_operator(&ctx.caller, cfg) {
+            UaError::denied(
+                "command_refused",
+                "command refused: run_cmd runs only allowlisted programs, without config overrides or \
+                 destructive arguments",
+            )
+        } else {
+            e
+        }
+    })
+}
+
 fn run_cmd_check(ctx: &ToolCtx, a: CheckArgs) -> UaResult<Value> {
     let sb = sandbox(ctx)?;
     let mut findings = Vec::new();
-    let argv: Vec<String> = match vet_command(&a.command, &ctx.hub.cfg().shell_allowlist()) {
+    let argv: Vec<String> = match vet(ctx, &a.command) {
         Ok(v) => std::iter::once(v.program).chain(v.args).collect(),
         Err(e) => {
             let code = match &e {
@@ -1287,7 +1311,7 @@ async fn force_gate(ctx: &ToolCtx, payload: Value) -> UaResult<()> {
 
 async fn run_cmd(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let sb = sandbox(&ctx)?;
-    let vetted = vet_command(&a.command, &ctx.hub.cfg().shell_allowlist())?;
+    let vetted = vet(&ctx, &a.command)?;
     let workdir = resolve_cwd(&sb, &a.cwd)?;
     let argv: Vec<String> =
         std::iter::once(vetted.program.clone()).chain(vetted.args.iter().cloned()).collect();
@@ -1381,6 +1405,7 @@ pub fn register(r: &mut Registry) {
              human approval. Returns {exit_code, stdout, stderr, truncated, timed_out, warnings}.",
             run_cmd,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workspace"),
     );
     r.add(

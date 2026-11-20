@@ -131,6 +131,7 @@ pub fn register(r: &mut Registry) {
         )
         // Gated in the handler, not by the registry: the approval must cover
         // values resolved from the task and config, not just the arguments.
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("dispatch"),
     );
     r.add(

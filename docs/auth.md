@@ -304,10 +304,13 @@ answers 403 (`session_credential_path`).
 **Authority.** The request runs as the subject with kind `agent` under the
 `acp-session` profile, whatever session key the client sends, and inside the
 credential's grant. The grant is the `acp-session` tool list
-(`ACP_SESSION_ALLOWED_TOOLS`: `evidence_report`, `memory_get`, `memory_list`,
-`memory_save`, `memory_search`, `profile_status`, `session_packet`,
-`task_comment`, `task_list`), narrowed to what the subject's own default
-profile exposes. The task tools reach the item's own task only, and a
+(`ACP_SESSION_ALLOWED_TOOLS`: `evidence_report`, `profile_status`,
+`session_packet`, `task_comment`, `task_list`), narrowed to what the
+subject's own default profile exposes. Memory tools are not in it: a
+credential would otherwise read every agent's notes and write notes in its
+owner's name. Each tool in the list has its own rule in the grant; a tool
+without one is refused (`session_tool_unscoped`) even if a stored grant names
+it. The task tools reach the item's own task only, and a
 refusal names `session_task_scope`:
 
 - `task_comment` may only `append` to or `list` that task's comments.

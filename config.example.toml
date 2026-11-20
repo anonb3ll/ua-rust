@@ -40,10 +40,12 @@ node_max_per_agent = 8
 # harness_config_root_hint = "~/.unified_agent/harness-config"
 
 # Planning canvas (graph_canvas_write): new boards per agent, boards in all,
-# and prior scenes kept per board for graph_canvas_history/restore.
+# and prior scenes kept per board for graph_canvas_history/restore, by count
+# and by total bytes (the oldest are dropped first past either).
 # graph_canvas_max_boards_per_agent = 50
 # graph_canvas_max_boards = 1000
 # graph_canvas_history_max = 20
+# graph_canvas_history_max_bytes = 10000000
 
 # Client evidence (evidence_append, POST /api/evidence) per identity per
 # rolling hour: events and serialized payload bytes. Past either the append

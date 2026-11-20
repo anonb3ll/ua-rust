@@ -912,6 +912,7 @@ pub fn register(r: &mut Registry) {
              the scheduler. Needs routines_enabled.",
             routine_fire,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("routines"),
     );
 }

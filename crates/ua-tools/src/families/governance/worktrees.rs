@@ -26,13 +26,15 @@
 //! or locked. A stale but non-disposable worktree is reported under
 //! `retained` with the reason. Nothing is ever deleted any other way.
 //!
-//! "In use" comes from `/proc` (working directory, executable and absolute
-//! command-line arguments of every process). Without `/proc` liveness is
-//! unknown and every candidate is kept. A process with this hub's own
-//! credentials that hides its working directory (a non-dumpable daemon such
-//! as an SSH agent) is listed under `unreadable_processes` rather than
-//! making liveness unknown: removal still needs a clean, merged worktree and
-//! never forces.
+//! "In use" comes from the process table ([`super::procscan`]): the working
+//! directory, executable and absolute command-line arguments of every
+//! process, read from `/proc` on Linux and through `proc_pidinfo`,
+//! `proc_pidpath` and `KERN_PROCARGS2` on macOS. Where the table cannot be
+//! read liveness is unknown and every candidate is kept. A process with this
+//! hub's own credentials that hides its working directory (a non-dumpable
+//! daemon such as an SSH agent) is listed under `unreadable_processes`
+//! rather than making liveness unknown: removal still needs a clean, merged
+//! worktree and never forces.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -43,6 +45,7 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use super::procscan::{Live, live_process_paths};
 use crate::families::workspace::{RunOutput, git_env, run_program, sandbox};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -131,66 +134,6 @@ fn last_activity(item: &Path) -> SystemTime {
         }
     }
     newest
-}
-
-/// Paths running processes use (working directory, executable and
-/// absolute command-line arguments), plus the processes of this user whose
-/// working directory could not be read, or `None` when processes cannot be
-/// listed at all (no `/proc`). Unknown keeps every candidate.
-#[cfg(target_os = "linux")]
-fn live_process_paths() -> Option<Live> {
-    // Equal Uid, Gid, Groups and CapPrm lines: the same credentials as ours.
-    fn creds(status: &Path) -> Option<Vec<String>> {
-        let text = std::fs::read_to_string(status).ok()?;
-        Some(
-            text.lines()
-                .filter(|l| ["Uid:", "Gid:", "Groups:", "CapPrm:"].iter().any(|k| l.starts_with(k)))
-                .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-                .collect(),
-        )
-    }
-    let own = creds(Path::new("/proc/self/status"));
-    let mut live = Live::default();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let dir = entry.path();
-        let theirs = creds(&dir.join("status"));
-        let mut denied = false;
-        for link in ["cwd", "exe"] {
-            match std::fs::read_link(dir.join(link)) {
-                Ok(p) => live.paths.push(p),
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => denied = true,
-                Err(_) => {}
-            }
-        }
-        if let Ok(raw) = std::fs::read(dir.join("cmdline")) {
-            for arg in raw.split(|b| *b == 0).filter(|a| a.first() == Some(&b'/')) {
-                live.paths.push(PathBuf::from(String::from_utf8_lossy(arg).into_owned()));
-            }
-        }
-        if denied && theirs.is_some() && theirs == own {
-            let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
-            live.unreadable.push(format!("pid {name} ({})", comm.trim()));
-        }
-    }
-    Some(live)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn live_process_paths() -> Option<Live> {
-    None
-}
-
-/// What the process scan saw.
-#[derive(Debug, Default)]
-struct Live {
-    paths: Vec<PathBuf>,
-    /// Processes with our credentials whose working directory is hidden
-    /// (a non-dumpable daemon such as an SSH agent).
-    unreadable: Vec<String>,
 }
 
 /// Whether a running process uses `item`; `None` when unknown.

@@ -1114,6 +1114,7 @@ pub fn register(r: &mut Registry) {
              applied {surface, desired_hash}: after the node wrote a surface, consumes that approved pass.",
             node_config,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("nodes"),
     );
 }

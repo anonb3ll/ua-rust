@@ -1040,6 +1040,7 @@ pub fn register(r: &mut Registry) {
              again.",
             mcp_server_register,
         )
+        .secret_args()
         .gates_in_handler()
         .family("mcp"),
     );

@@ -120,6 +120,37 @@ async fn a_canvas_round_trips_with_suggestions_and_refuses_a_stale_write() {
 }
 
 #[tokio::test]
+async fn deleted_elements_are_not_parsed() {
+    let (hub, reg) = setup();
+    let scene = json!({ "elements": [
+        { "id": "a", "type": "rectangle", "label": "Design" },
+        { "id": "b", "type": "rectangle", "label": "Build" },
+        // Deleted in the editor: a shape, a label, and an arrow.
+        { "id": "gone", "type": "rectangle", "label": "Removed", "isDeleted": true },
+        { "id": "c", "type": "rectangle" },
+        { "id": "tc", "type": "text", "text": "Ghost label", "containerId": "c", "isDeleted": true },
+        { "id": "note", "type": "text", "text": "Deleted note", "isDeleted": true },
+        { "id": "e1", "type": "arrow", "startBinding": { "elementId": "a" }, "endBinding": { "elementId": "b" } },
+        { "id": "e2", "type": "arrow", "isDeleted": true,
+          "startBinding": { "elementId": "b" }, "endBinding": { "elementId": "a" } },
+        // Kept: `isDeleted: false` is a live element.
+        { "id": "d", "type": "ellipse", "label": "Ship", "isDeleted": false },
+    ]});
+    write(&reg, &hub, &dev(), "plan", scene).await.unwrap();
+    let r = ok(&reg, &hub, &dev(), "graph_canvas_read", json!({ "board_id": "plan" })).await;
+    let p = &r["parsed"];
+    let titles: Vec<&str> =
+        p["task_suggestions"].as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Design", "Build", "Ship"], "{p}");
+    assert_eq!(p["node_count"], 4, "{p}");
+    assert_eq!(p["edge_count"], 1, "{p}");
+    assert_eq!(p["dependency_suggestions"].as_array().unwrap().len(), 1, "{p}");
+    assert_eq!(p["dependency_suggestions"][0]["from_id"], "a");
+    // The unlabeled live shape `c` (its label was deleted) is the one unparsed element.
+    assert_eq!(p["unparsed_count"], 1, "{p}");
+}
+
+#[tokio::test]
 async fn new_boards_are_capped_per_agent_and_per_hub_but_updates_are_not() {
     let (hub, reg) = setup_with(|c| {
         c.graph_canvas_max_boards_per_agent = 2;
@@ -243,6 +274,44 @@ async fn overwrites_keep_a_bounded_history_that_can_be_restored() {
     let (hub, reg) = setup_with(|c| c.graph_canvas_history_max = 0);
     write(&reg, &hub, &dev(), "plan", labeled("v1")).await.unwrap();
     let w = write(&reg, &hub, &dev(), "plan", labeled("v2")).await.unwrap();
+    assert_eq!(w["kept_revision"], Value::Null);
+    let h = ok(&reg, &hub, &dev(), "graph_canvas_history", json!({ "board_id": "plan" })).await;
+    assert_eq!(h["revisions"], json!([]));
+}
+
+/// A scene of `n` bytes once serialized, labeled `label`.
+fn sized(label: &str, n: usize) -> Value {
+    let base = serde_json::to_string(&labeled(label)).unwrap().len();
+    json!({ "elements": [{ "id": "n", "type": "rectangle", "label": label }], "pad": "x".repeat(n - base - 9) })
+}
+
+#[tokio::test]
+async fn history_is_bounded_by_bytes_per_board_oldest_first() {
+    let (hub, reg) = setup_with(|c| {
+        c.graph_canvas_history_max = 20;
+        c.graph_canvas_history_max_bytes = 2_500;
+    });
+    for v in ["v1", "v2", "v3", "v4"] {
+        write(&reg, &hub, &dev(), "plan", sized(v, 1_000)).await.unwrap();
+    }
+    assert_eq!(serde_json::to_string(&sized("v1", 1_000)).unwrap().len(), 1_000);
+    // v1, v2 and v3 were replaced (3000 bytes); only the newest two fit.
+    let h = ok(&reg, &hub, &dev(), "graph_canvas_history", json!({ "board_id": "plan" })).await;
+    assert_eq!(h["history_max_bytes"], 2_500);
+    let revs = h["revisions"].as_array().unwrap();
+    assert_eq!(revs.iter().map(|r| r["revision"].clone()).collect::<Vec<_>>(), [json!(3), json!(2)]);
+    let r2 =
+        ok(&reg, &hub, &dev(), "graph_canvas_history", json!({ "board_id": "plan", "revision": 2 })).await;
+    assert_eq!(r2["scene"], sized("v2", 1_000));
+    // Another board has its own budget.
+    write(&reg, &hub, &dev(), "other", labeled("a")).await.unwrap();
+    let w = write(&reg, &hub, &dev(), "other", labeled("b")).await.unwrap();
+    assert_eq!(w["kept_revision"], 1);
+
+    // A replaced scene larger than the whole budget is not kept.
+    let (hub, reg) = setup_with(|c| c.graph_canvas_history_max_bytes = 500);
+    write(&reg, &hub, &dev(), "plan", sized("big", 1_000)).await.unwrap();
+    let w = write(&reg, &hub, &dev(), "plan", labeled("small")).await.unwrap();
     assert_eq!(w["kept_revision"], Value::Null);
     let h = ok(&reg, &hub, &dev(), "graph_canvas_history", json!({ "board_id": "plan" })).await;
     assert_eq!(h["revisions"], json!([]));
@@ -433,9 +502,11 @@ async fn the_hub_map_is_shown_to_operators_only() {
     ok(&reg, &hub, &dev(), "agent_heartbeat", json!({ "host": "box-1.internal" })).await;
 
     let plain = ok(&reg, &hub, &dev(), "capability_catalog", json!({})).await;
-    assert_eq!(plain["redacted"], json!(["boundaries", "health", "agents.host"]));
+    assert_eq!(plain["redacted"], json!(["boundaries", "health", "agents.host", "clis"]));
     assert_eq!(plain["boundaries"], Value::Null);
     assert_eq!(plain["health"], Value::Null);
+    // The program allowlist is a boundary too: not exposed at the top level.
+    assert_eq!(plain["clis"], Value::Null);
     let agents = plain["agents"].as_array().unwrap();
     assert!(!agents.is_empty());
     assert!(agents.iter().all(|a| a.get("host").is_none()), "{agents:?}");
@@ -454,6 +525,8 @@ async fn the_hub_map_is_shown_to_operators_only() {
                 .any(|t| t == "node_dispatch")
         );
         assert_eq!(full["health"]["hub_auth"]["gate"], "enforce_auth");
+        assert_eq!(full["clis"], full["boundaries"]["shell_allowlist"], "{}", who.label);
+        assert!(full["clis"].as_array().is_some_and(|c| !c.is_empty()), "{}", who.label);
         assert!(full["agents"].as_array().unwrap().iter().any(|a| a["host"] == "box-1.internal"));
     }
 }
