@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::UaError;
 use ua_core::identity::Transport;
-use ua_tools::families::events::EventScope;
+use ua_tools::families::events::{EventScope, labelled};
 use ua_tools::grant;
 
 use crate::AppState;
@@ -145,8 +145,10 @@ async fn event_stream(
 fn sse_json(item: StreamItem) -> Result<SseEvent, Infallible> {
     Ok(match item {
         StreamItem::Event(ev) => {
-            let data = serde_json::to_string(&ev).unwrap_or_default();
-            SseEvent::default().event(ev.channel.clone()).id(ev.seq.to_string()).data(data)
+            let (channel, seq) = (ev.channel.clone(), ev.seq);
+            // The row event_log_query returns, `trust` label included.
+            let data = labelled(*ev).map(|v| v.to_string()).unwrap_or_default();
+            SseEvent::default().event(channel).id(seq.to_string()).data(data)
         }
         StreamItem::Gap { after_seq, until_seq, reason } => SseEvent::default()
             .event("gap")

@@ -74,6 +74,7 @@ pub const SAFE_ENV: &[&str] = &[
 /// own credentials and the parent's agent socket.
 pub const DENY_ENV: &[&str] = &[
     "UA_AGENT_TOKENS",
+    "UA_MANAGED_SECRET_KEY",
     "UA_MANAGED_SECRET_KEYS",
     "UA_EXECUTOR_TOKEN",
     "UA_HTTP_BEARER",
