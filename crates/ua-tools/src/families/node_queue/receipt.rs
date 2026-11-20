@@ -167,7 +167,8 @@ pub(crate) fn cancel_for_run(
     let Some((_, id)) = rest.rsplit_once(':') else { return Ok(None) };
     let Some(item) = load_item(tx, id)? else { return Ok(Some("already_gone")) };
     if item.is_terminal() {
-        return Ok(Some("already_gone"));
+        // A lapsed lease ended the item, not the node: nothing proves it stopped.
+        return Ok(Some(if item.outcome_unknown() { "outcome_unknown" } else { "already_gone" }));
     }
     if item.status == "queued" {
         let ts = now();

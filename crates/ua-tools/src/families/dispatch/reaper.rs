@@ -37,15 +37,16 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
     let db = hub.db();
 
     // 1. Unfinished cancellations.
-    let pending = db.read(|c| {
-        runs_where(
-            c,
-            "termination_outcome = 'requested' AND (evidence_ref IS NULL OR evidence_ref NOT LIKE 'node:%')",
-        )
-    })?;
+    let pending = db.read(|c| runs_where(c, "termination_outcome = 'requested'"))?;
     let mut reconciled = Vec::new();
     for run in pending {
-        let termination = executor::terminate(&run);
+        // A node-routed run is stopped through its node work item.
+        let termination = match run.evidence_ref.as_deref().filter(|e| e.starts_with("node:")) {
+            Some(ev) => db
+                .write(|tx| crate::families::node_queue::cancel_for_run(tx, ev, ACTOR))?
+                .unwrap_or("unknown"),
+            None => executor::terminate(&run),
+        };
         let cessation = classify_termination(termination);
         let res = db.write(|tx| {
             finalize_cancellation(

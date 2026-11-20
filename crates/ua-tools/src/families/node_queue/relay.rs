@@ -428,6 +428,11 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
     // Only a human writes without a gate; an agent's follow-up is new
     // instructions to a running session and needs an approval.
     let operator = ctx.caller.is_human() || ctx.hub.cfg().is_human(&who);
+    if !operator
+        && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "node_dispatch")
+    {
+        return Err(refusal.error);
+    }
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let out = ctx
         .hub
@@ -565,6 +570,10 @@ fn permission_block(c: &Connection, item: &Item) -> UaResult<Option<String>> {
 
 async fn node_permission(ctx: ToolCtx, a: PermissionArgs) -> UaResult<Value> {
     let agent = device_agent(&ctx.caller)?;
+    // A pass approved earlier carries no call the caller may no longer make.
+    if let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "acp_permission") {
+        return Err(refusal.error);
+    }
     let id = check_item_id(&a.item_id)?;
     let session = redact_secrets(a.session_id.trim()).0;
     if session.is_empty() || session.chars().count() > 200 {

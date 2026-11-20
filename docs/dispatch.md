@@ -94,8 +94,12 @@ The run is launched as one node work item and records
 a claimed item it sets the cancel flag and records cessation `unknown`. The
 node's receipt then confirms it.
 
-The lease reaper leaves node-routed runs to the queue. `dispatch_resume`
-refuses them: dispatch the task again instead. See [nodes](nodes.md).
+Without a `prompt`, a routed run's prompt is built from the task and does
+not ask the session to report: the node's receipt does. `dispatch_report_self`
+refuses a node-routed run. The lease reaper leaves node-routed leases to the
+queue, and finishes an interrupted `dispatch_cancel` through the run's item.
+`dispatch_resume` refuses node-routed runs: dispatch the task again instead.
+See [nodes](nodes.md).
 
 ## Leases, restarts and orphans
 

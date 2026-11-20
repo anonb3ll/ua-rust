@@ -13,10 +13,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::WriteTx;
+use ua_store::{EventInput, WriteTx, ledger};
 
 use super::{
-    Item, LEASE_GRACE_S, after, before, cancel_item, check_item_id, clip, command, device_agent,
+    CHANNEL, Item, LEASE_GRACE_S, after, before, cancel_item, check_item_id, clip, command, device_agent,
     evidence_ref, items_where, load_item, now, owned_node, record, renew_run, run_gate, run_running,
     sweep_tx,
 };
@@ -397,8 +397,16 @@ pub(crate) fn on_heartbeat(
             params![item.id, lease, now()],
         )?;
         renew_run(tx, &item, &lease)?;
-        if !item.cancel_requested && run_gate(tx, &item)?.is_some() {
+        if !item.cancel_requested
+            && let Some(why) = run_gate(tx, &item)?
+        {
             tx.execute("UPDATE node_dispatch SET cancel_requested = 1 WHERE id = ?1", [&item.id])?;
+            record(
+                tx,
+                "cancel_requested",
+                json!({ "node": node, "item_id": item.id, "actor": "node-queue", "reason": why }),
+                "node-queue",
+            )?;
         }
         if let Some(p) = progress.map(str::trim).filter(|p| !p.is_empty()) {
             record(
@@ -409,15 +417,18 @@ pub(crate) fn on_heartbeat(
             )?;
         }
     }
-    let cancel: Vec<String> =
-        items_where(tx, "node = ?1 AND status = 'claimed' AND cancel_requested = 1", [node])?
-            .into_iter()
-            .map(|i| i.id)
-            .collect();
-    for id in &cancel {
-        record(tx, "cancel_relayed", json!({ "node": node, "item_id": id }), agent)?;
+    let cancel: Vec<Item> =
+        items_where(tx, "node = ?1 AND status = 'claimed' AND cancel_requested = 1", [node])?;
+    for item in &cancel {
+        // Once per claim, however many heartbeats it takes the node to stop.
+        ledger::append(
+            tx,
+            EventInput::new(CHANNEL, json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }))
+                .by(agent.to_string())
+                .dedupe(format!("cancel_relayed:{}:{}", item.id, item.attempts)),
+        )?;
     }
-    Ok(cancel)
+    Ok(cancel.into_iter().map(|i| i.id).collect())
 }
 
 // --- the tool -------------------------------------------------------------------
