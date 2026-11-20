@@ -162,11 +162,18 @@ impl Registry {
     }
 
     /// The tools `caller` can see. Profile filtering applies only when the
-    /// caller's session enforces it; legacy aliases are then hidden too.
+    /// caller's session enforces it; legacy aliases are then hidden too. A
+    /// session-credential request sees only its grant's tools.
     pub fn visible_to<'a>(&'a self, caller: &'a Caller) -> impl Iterator<Item = &'a ToolDef> + 'a {
+        let grant = crate::grant::current();
+        // `acp-session` without a grant sees nothing: the profile is only
+        // ever held by a verified session credential.
+        let orphan = grant.is_none() && caller.profile == ua_core::Profile::AcpSession;
         self.tools.values().filter(move |t| {
-            !caller.enforce_profile
-                || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name))
+            !orphan
+                && grant.as_ref().is_none_or(|g| g.allows_tool(t.name))
+                && (!caller.enforce_profile
+                    || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name)))
         })
     }
 
@@ -174,6 +181,28 @@ impl Registry {
     pub async fn call(&self, hub: &Hub, caller: &Caller, name: &str, args: Value) -> UaResult<Value> {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
+        };
+
+        // A session credential's grant is the outer limit: no profile,
+        // policy or approval can widen it. The `acp-session` profile without
+        // a grant (it can only be reached by misconfiguration) gets nothing.
+        let args = match crate::grant::current() {
+            Some(g) => match g.narrow(name, args) {
+                Ok(a) => a,
+                Err(err) => {
+                    record_decision(hub, caller, name, &err).await;
+                    return Err(err);
+                }
+            },
+            None if caller.profile == ua_core::Profile::AcpSession => {
+                let err = UaError::denied(
+                    "session_grant_required",
+                    "the acp-session profile runs only under a verified session credential",
+                );
+                record_decision(hub, caller, name, &err).await;
+                return Err(err);
+            }
+            None => args,
         };
 
         // The policy file is read once per call (cached by mtime). A file that

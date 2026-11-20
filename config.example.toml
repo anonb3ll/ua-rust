@@ -28,6 +28,13 @@ human_identities = ["operator"]
 node_max_per_agent = 8
 # node_queue_wait_s = 3600   # how long work waits for an offline node (60-604800)
 # node_wait_sweep_s = 60     # node queue sweep interval under `ua serve`; 0 = off
+# Mint short-lived session credentials (uas_...) for claimed ACP node items, so
+# the session reaches /mcp with a small read/report tool set. Off by default;
+# turning it off refuses every outstanding credential at once.
+# session_credentials_enabled = false
+# Hold real work from a node until an operator has attested its device
+# acceptance run (coordination_manage node_acceptance_start / _attest).
+# node_require_acceptance = false
 
 # Planning canvas (graph_canvas_write): new boards per agent, boards in all,
 # and prior scenes kept per board for graph_canvas_history/restore.

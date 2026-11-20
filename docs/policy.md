@@ -47,7 +47,8 @@ default, and a `profile_defaults` overlay (below) can only lower it.
 | `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, and profile switching (deny list: new tools are visible). |
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
 | `operator` | 4 | Allow list: approvals, dispatch cancellation, event log, memory and task reads, node listing. |
-| `research`, `acp-session` | 3 | Allow list: reads, memory, messages, vault, web, task and plan reads, plus listed `plan_manage` actions. |
+| `research` | 3 | Allow list: reads, memory, messages, vault, web, task and plan reads, plus listed `plan_manage` actions. |
+| `acp-session` | 3 | Allow list (`ACP_SESSION_ALLOWED_TOOLS`): memory reads and saves, task listing and comments, profile status, session packet, evidence report. The profile of a node session credential, which narrows it further (see [auth](auth.md#session-credentials)). Never assignable: `profile_activate`, config `profiles` / `oauth_profile` and policy `profile_defaults` refuse it, and without a credential's grant it reaches no tool. |
 | `remote-vault-curator` | 2 | The remote assistant surface plus vault access confined to `Wiki/` (and the daily journal). |
 | `remote-assistant` | 1 | Allow list: memory reads, messages, task listing and the agent actions of `observability_manage`. |
 | `public` | 0 | Allow list: task add and list, docs, profile status. |

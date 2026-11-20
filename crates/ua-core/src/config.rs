@@ -85,6 +85,13 @@ pub struct Config {
     /// lapsed leases, undelivered command notices). 0 turns the sweep off;
     /// claims still sweep their own node.
     pub node_wait_sweep_s: u64,
+    /// Mint session credentials (`uas_…`) for claimed ACP node items
+    /// (`POST /api/node/session_credential`). Read on every request, so
+    /// turning it off refuses every outstanding credential at once.
+    pub session_credentials_enabled: bool,
+    /// Hold real work from a node until its latest device acceptance run is
+    /// accepted (attested by an operator). Off by default.
+    pub node_require_acceptance: bool,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -336,6 +343,8 @@ impl Default for Config {
             node_max_per_agent: 8,
             node_queue_wait_s: 3600,
             node_wait_sweep_s: 60,
+            session_credentials_enabled: false,
+            node_require_acceptance: false,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
@@ -423,7 +432,28 @@ impl Config {
     }
 
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
-        Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized).map_err(Into::into)
+        let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
+        cfg.check_profiles()?;
+        Ok(cfg)
+    }
+
+    /// Refuse a profile no identity may be given (`acp-session`, which only a
+    /// verified session credential runs under) in `profiles` or
+    /// `oauth_profile`.
+    pub fn check_profiles(&self) -> anyhow::Result<()> {
+        let reserved = |name: &str| name.trim().parse::<crate::Profile>().is_ok_and(|p| !p.assignable());
+        if reserved(&self.oauth_profile) {
+            anyhow::bail!(
+                "oauth_profile = {:?}: that profile is reserved for session credentials and cannot be configured",
+                self.oauth_profile
+            );
+        }
+        if let Some((label, p)) = self.profiles.iter().find(|(_, p)| reserved(p)) {
+            anyhow::bail!(
+                "profiles.{label} = {p:?}: that profile is reserved for session credentials and cannot be configured"
+            );
+        }
+        Ok(())
     }
 
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {
@@ -668,6 +698,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_credential_profile_cannot_be_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "[profiles]\nbuilder-1 = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("profiles.builder-1"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("oauth_profile"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"research\"\n[profiles]\nbuilder-1 = \"reviewer\"\n")
+            .unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_ok());
+    }
 
     #[test]
     fn toml_layer_and_lists() {

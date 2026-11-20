@@ -306,9 +306,8 @@ fn validate_overlay(cfg: &Config, overlay: &Value) -> UaResult<Map<String, Value
         }
         let chosen: Profile = value
             .as_str()
-            .ok_or_else(|| bad(format!("unknown profile {value} for {key}")))?
-            .parse()
-            .map_err(|e: String| bad(format!("{e} for {key}")))?;
+            .ok_or_else(|| bad(format!("unknown profile {value} for {key}")))
+            .and_then(|name| Profile::parse_assignable(name).map_err(|e| bad(format!("{e} for {key}"))))?;
         let code_default: Profile =
             cfg.profiles.get(key).and_then(|p| p.parse().ok()).unwrap_or(Profile::Developer);
         if !policy::overlay_allowed(chosen, code_default, tools.iter().copied()) {

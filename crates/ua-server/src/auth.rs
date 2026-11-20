@@ -1,6 +1,12 @@
 //! HTTP authentication.
 //!
-//! Three bearer credentials, tried in order:
+//! A bearer starting `uas_` is a node session credential and is checked
+//! only as one ([`ua_tools::families::node_queue::credentials::verify`],
+//! every request, nothing cached). It is accepted on `/mcp`, `/api/tools`
+//! and `/api/whoami` only (any other path answers 403), and runs as the
+//! item's agent under the `acp-session` profile and the credential's grant.
+//!
+//! Other bearer credentials, tried in order:
 //! 1. static tokens from configuration (`UA_AGENT_TOKENS`),
 //! 2. managed tokens, stored as SHA-256 digests in `agent_tokens`,
 //! 3. OAuth access tokens (`uao_…`, digests in `oauth_tokens`), checked for
@@ -16,6 +22,8 @@
 //! without a credential run as the local anonymous identity with the full
 //! tool surface, like stdio.
 
+use std::sync::Arc;
+
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -23,7 +31,9 @@ use axum::response::{IntoResponse, Redirect, Response};
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use ua_core::ActorKind;
+use ua_core::{ActorKind, Profile};
+use ua_tools::families::node_queue::credentials;
+use ua_tools::grant::SessionGrant;
 
 use crate::AppState;
 use crate::login::{self, CSRF_HEADER};
@@ -35,6 +45,8 @@ pub struct AuthIdentity {
     pub label: String,
     pub kind: ActorKind,
     pub verified: bool,
+    /// Set for a node session credential: the request runs under this grant.
+    pub grant: Option<Arc<SessionGrant>>,
 }
 
 /// Label used for unauthenticated local callers.
@@ -89,13 +101,17 @@ fn retired(state: &AppState, label: &str) -> bool {
 /// identity resolves to nothing, whichever credential it presents (a static
 /// token in configuration cannot be revoked any other way).
 pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthIdentity> {
+    // A session credential is never a static, managed or OAuth token.
+    if credentials::is_session_token(token) {
+        return None;
+    }
     let cfg = state.hub.cfg();
     if let Some(label) = lookup_token(state, token) {
         let kind = if cfg.is_human(&label) { ActorKind::Human } else { ActorKind::Agent };
         if kind == ActorKind::Agent && retired(state, &label) {
             return None;
         }
-        return Some(AuthIdentity { label, kind, verified: true });
+        return Some(AuthIdentity { label, kind, verified: true, grant: None });
     }
     if !cfg.oauth_enabled || !token.starts_with(oauth::ACCESS_PREFIX) {
         return None;
@@ -106,8 +122,49 @@ pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthI
     let hub_wide = access.resource == oauth::issuer(cfg);
     let audience_ok = hub_wide || (access.resource == oauth::mcp_resource(cfg) && path_is(path, "/mcp"));
     // OAuth grants never act as a human, even if the configuration changed.
-    (audience_ok && !cfg.is_human(&access.subject) && !retired(state, &access.subject))
-        .then_some(AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true })
+    (audience_ok && !cfg.is_human(&access.subject) && !retired(state, &access.subject)).then_some(
+        AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true, grant: None },
+    )
+}
+
+/// The paths a session credential is accepted on: each runs its registry
+/// calls inside the credential's grant.
+fn session_credential_path(path: &str) -> bool {
+    path_is(path, "/mcp") || path_is(path, "/api/tools") || path == "/api/whoami"
+}
+
+/// Verify a `uas_` bearer for `path`: the identity, or the refusal to send.
+async fn resolve_session_credential(
+    state: &AppState,
+    token: &str,
+    path: &str,
+) -> Result<AuthIdentity, Box<Response>> {
+    if !session_credential_path(path) {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": "denied",
+            "reason_code": "session_credential_path",
+            "message": "a session credential is valid on /mcp, /api/tools and /api/whoami only",
+        });
+        return Err(Box::new((StatusCode::FORBIDDEN, axum::Json(body)).into_response()));
+    }
+    let (hub, token) = (state.hub.clone(), token.to_string());
+    match tokio::task::spawn_blocking(move || credentials::verify(&hub, &token)).await {
+        Ok(Ok(v)) => Ok(AuthIdentity {
+            label: v.subject,
+            kind: ActorKind::Agent,
+            verified: true,
+            grant: Some(Arc::new(v.grant)),
+        }),
+        Ok(Err(refused)) => Err(Box::new(unauthorized(
+            state,
+            Some("invalid_token"),
+            &format!("session credential refused: {}", refused.check),
+        ))),
+        Err(_) => {
+            Err(Box::new(unauthorized(state, Some("invalid_token"), "session credential refused: internal")))
+        }
+    }
 }
 
 fn is_public_path(path: &str) -> bool {
@@ -122,7 +179,14 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
     let path = req.uri().path().to_string();
     let public = is_public_path(&path);
     let cookie_scope = path_is(&path, "/ui") || path_is(&path, "/api");
-    let identity = if let Some(tok) = bearer(req.headers()) {
+    let identity = if let Some(tok) =
+        bearer(req.headers()).filter(|t| !public && credentials::is_session_token(t))
+    {
+        match resolve_session_credential(&state, tok, &path).await {
+            Ok(id) => id,
+            Err(resp) => return *resp,
+        }
+    } else if let Some(tok) = bearer(req.headers()) {
         match resolve_bearer(&state, tok, &path) {
             Some(id) => id,
             None if public => anonymous(),
@@ -138,7 +202,12 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
                 return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
             }
         }
-        let id = AuthIdentity { label: session.label.clone(), kind: ActorKind::Human, verified: true };
+        let id = AuthIdentity {
+            label: session.label.clone(),
+            kind: ActorKind::Human,
+            verified: true,
+            grant: None,
+        };
         req.extensions_mut().insert(session);
         id
     } else if state.hub.cfg().enforce_auth && !public {
@@ -156,7 +225,7 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
 }
 
 fn anonymous() -> AuthIdentity {
-    AuthIdentity { label: LOCAL_LABEL.into(), kind: ActorKind::Anonymous, verified: false }
+    AuthIdentity { label: LOCAL_LABEL.into(), kind: ActorKind::Anonymous, verified: false, grant: None }
 }
 
 fn unauthorized(state: &AppState, error: Option<&str>, msg: &str) -> Response {
@@ -172,6 +241,18 @@ pub fn caller_for(
     session_key: Option<String>,
     transport: ua_core::identity::Transport,
 ) -> ua_core::Caller {
+    // A session credential runs under its fixed profile; no client session
+    // key can rebind it.
+    if id.grant.is_some() {
+        return ua_core::Caller {
+            label: id.label.clone(),
+            kind: id.kind,
+            profile: Profile::AcpSession,
+            enforce_profile: true,
+            session_key: None,
+            transport,
+        };
+    }
     let profile = ua_tools::sessions::resolve_profile(&state.hub, &id.label, session_key.as_deref());
     ua_core::Caller {
         label: id.label.clone(),

@@ -78,7 +78,10 @@ pub fn register(r: &mut Registry) {
             "List tasks by status (or all), sorted by priority then age, with keyset pagination. \
              Pass query= for ranked full-text search. Parked tasks are left out unless parked=true (the parked \
              view; parking is not cancelling). Returns {tasks, truncated, next_cursor, limit}.",
-            |ctx: ToolCtx, a: ListArgs| async move { ctx.hub.db().read_async(move |c| list(c, a)).await },
+            |ctx: ToolCtx, a: ListArgs| async move {
+                let pin = crate::grant::pinned_task();
+                ctx.hub.db().read_async(move |c| list(c, a, pin)).await
+            },
         )
         .family("tasks")
         .read_only(),
@@ -173,7 +176,9 @@ fn shape(conn: &Connection, mut row: Map<String, Value>, compact_rows: bool) -> 
     Ok(row)
 }
 
-fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
+/// `pin`: a session credential's task ([`crate::grant::pinned_task`]); the
+/// listing then holds that task at most, whatever the other filters say.
+fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Value> {
     let status = a.status.clone().unwrap_or_else(|| "open".into());
     if status != "all" {
         check_one_of("status", &status, &STATUSES)?;
@@ -194,6 +199,11 @@ fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
     }
 
     let mut f = Filter { clauses: Vec::new(), values: Vec::new() };
+    match pin {
+        None => {}
+        Some(Some(id)) => f.push("id = ?", [Sql::Integer(id)]),
+        Some(None) => f.push("0", []),
+    }
     if let Some(p) = &a.project {
         f.push("project = ?", [Sql::Text(check_slug("project", p)?)]);
     }

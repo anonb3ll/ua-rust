@@ -650,7 +650,7 @@ async fn api_sessions_catalog_board_and_unbuilt_routes() {
     for uri in ["/api/runs", "/api/platform/manifest", "/api/evidence"] {
         assert_eq!(send(&app, get(uri, None)).await.status(), StatusCode::OK, "{uri}");
     }
-    for uri in ["/api/nodes/acceptance", "/api/work-products", "/api/platform/provenance-graph"] {
+    for uri in ["/api/work-products", "/api/platform/provenance-graph"] {
         let resp = send(&app, get(uri, None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
         let v = body_json(resp).await;

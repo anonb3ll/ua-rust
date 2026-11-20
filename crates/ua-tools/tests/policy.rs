@@ -166,6 +166,15 @@ async fn legacy_profile_names_keep_working_in_policy_files() {
     assert_eq!(status["profile"], "reviewer");
 }
 
+#[test]
+fn profile_defaults_may_not_name_the_session_credential_profile() {
+    let doc = json!({ "profile_defaults": { "builder-1": "acp-session" } });
+    let err = ua_tools::policy::parse_policy_value(&doc).unwrap_err();
+    assert!(err.contains("profile_defaults.builder-1") && err.contains("reserved"), "{err}");
+    let doc = json!({ "profile_defaults": { "builder-1": "research" } });
+    assert!(ua_tools::policy::parse_policy_value(&doc).is_ok());
+}
+
 #[tokio::test]
 async fn threshold_rule_denies_breaches_and_fails_closed_on_missing_values() {
     let env = setup(
