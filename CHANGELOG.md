@@ -82,6 +82,11 @@ from its commit history.
   extend and per-file-ignores settings, validated, as `--config` pairs, and
   still runs with `--isolated`, from an empty directory, on an absolute path. Its ledger event lists the files a run changed and ruff's
   fixed and reformatted counts.
+- The memory domain (schema, note model, save, search, ranking, embeddings,
+  lifecycle) moved from `ua-tools` into a new `ua-memory` crate, which does
+  not depend on the tool registry. Tool names, arguments, schema parts and
+  ledger events are unchanged; `ua-tools/embeddings` still turns on semantic
+  search.
 
 ### Security
 

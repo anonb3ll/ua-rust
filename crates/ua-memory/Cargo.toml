@@ -1,0 +1,34 @@
+[package]
+name = "ua-memory"
+description = "Memory notes for ua-rust: storage schema, note model, hybrid search, embeddings and lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# Local semantic memory search with fastembed. Off by default: without it,
+# memory search is lexical (FTS5) only. `ua-tools/embeddings` turns it on.
+embeddings = ["dep:fastembed"]
+
+[dependencies]
+ua-core = { workspace = true, features = ["rusqlite"] }
+ua-store.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+jiff.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+fastembed = { version = "7.7", optional = true, default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "onnx",
+    "ort-download-binaries-rustls-tls",
+] }

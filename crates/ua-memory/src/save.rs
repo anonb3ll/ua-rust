@@ -1,11 +1,10 @@
-//! `memory_save`.
+//! Saving a note (`memory_save`): create, update, append, a cross-author
+//! overwrite, supersede, and the compare-and-set and idempotency guards.
 
 use rusqlite::{OptionalExtension, params};
-use schemars::JsonSchema;
-use serde::Deserialize;
 use serde_json::{Value, json};
-use ua_core::{Caller, UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_core::{Caller, Config, UaError, UaResult};
+use ua_store::{Db, EventInput, WriteTx, ledger};
 
 use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for};
 use super::note::{
@@ -13,11 +12,11 @@ use super::note::{
     write_author,
 };
 use super::rank;
-use crate::registry::{Registry, ToolCtx, blocking, tool};
+use crate::blocking;
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SaveArgs {
+/// What to save. The `memory_save` tool documents each field for agents.
+#[derive(Debug, Clone, Default)]
+pub struct SaveRequest {
     /// Note text (Markdown). Must not be empty.
     pub content: String,
     /// Short title. On update, omitted keeps the stored title.
@@ -32,14 +31,11 @@ pub struct SaveArgs {
     pub author: Option<String>,
     /// Append an attributed block to an existing note instead of replacing
     /// its content. Safe on a peer's note. Needs `id`.
-    #[serde(default)]
     pub append: bool,
     /// Replace a note owned by another author. The replaced content is kept
     /// as an attributed tombstone at the end of the new content.
-    #[serde(default)]
     pub overwrite: bool,
     /// On create: only report similar existing notes, write nothing.
-    #[serde(default)]
     pub check_only: bool,
     /// Importance 0-1 (default 0.5). Above 0.8 is reserved for a verified human.
     pub salience: Option<f64>,
@@ -49,7 +45,6 @@ pub struct SaveArgs {
     /// and listing. It is never deleted.
     pub expires_at: Option<String>,
     /// Remove a stored expiry.
-    #[serde(default)]
     pub clear_expires_at: bool,
     /// Client token for retry safety: a replay returns the first receipt.
     pub idempotency_key: Option<String>,
@@ -68,7 +63,6 @@ pub struct SaveArgs {
     /// list replaces the stored links and `[]` clears them.
     pub contradicts: Option<Vec<String>>,
     /// On update: replace the stored evidence with `evidence` instead of merging.
-    #[serde(default)]
     pub evidence_replace: bool,
     /// On update: the `revision` `memory_get` returned. If the note changed
     /// since, nothing is written and the call fails with `conflict`.
@@ -109,7 +103,7 @@ fn unit_interval(v: Option<f64>, field: &str) -> UaResult<Option<f64>> {
 }
 
 impl Prepared {
-    fn new(caller: &Caller, a: SaveArgs) -> UaResult<Self> {
+    fn new(caller: &Caller, a: SaveRequest) -> UaResult<Self> {
         if a.content.trim().is_empty() {
             return Err(UaError::invalid("content must not be empty"));
         }
@@ -218,9 +212,15 @@ struct Outcome {
     embed_after: Option<(String, Option<String>, String)>,
 }
 
-async fn save(ctx: ToolCtx, a: SaveArgs) -> UaResult<Value> {
-    let p = Prepared::new(&ctx.caller, a)?;
-    let embedder = embedder_for(ctx.hub.cfg());
+/// Create a note (no `id`) or update one, as `caller`. Returns `{id, created,
+/// revision}` (and `similar` on create), or `{similar}` for `check_only`.
+///
+/// With an available embedder, a new note is embedded before the write so
+/// its vector commits with it; an updated note is re-embedded after the
+/// commit, and the vector is stored only if the note still holds that text.
+pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> UaResult<Value> {
+    let p = Prepared::new(caller, req)?;
+    let embedder = embedder_for(cfg);
     let model = embedder.model().to_string();
 
     // Create: embed first, so the vector commits with the note and the
@@ -237,18 +237,17 @@ async fn save(ctx: ToolCtx, a: SaveArgs) -> UaResult<Value> {
         }
         if let Some(v) = create_vec.clone() {
             let (m, content) = (model.clone(), p.content.clone());
-            similar = ctx.hub.db().read_async(move |c| similar_notes(c, &m, &v, &content)).await?;
+            similar = db.read_async(move |c| similar_notes(c, &m, &v, &content)).await?;
         }
     }
     if p.check_only {
         return Ok(json!({ "similar": similar }));
     }
 
-    let caller = ctx.caller.clone();
+    let caller = caller.clone();
     let m = model.clone();
     let creating = p.id.is_none();
-    let outcome =
-        ctx.hub.db().write_async(move |tx| write(tx, &caller, p, create_vec.map(|v| (m, v)))).await?;
+    let outcome = db.write_async(move |tx| write(tx, &caller, p, create_vec.map(|v| (m, v)))).await?;
     let mut result = outcome.result;
     if creating && result.get("similar").is_some() {
         result["similar"] = json!(similar);
@@ -264,9 +263,7 @@ async fn save(ctx: ToolCtx, a: SaveArgs) -> UaResult<Value> {
         let e = embedder.clone();
         match blocking(move || Ok(embed::embed_one(&*e, text))).await? {
             Ok(v) => {
-                let res = ctx
-                    .hub
-                    .db()
+                let res = db
                     .write_async(move |tx| {
                         if let Some(n) = note::fetch(tx, &id)?
                             && text_sha(&embed_text(n.title.as_deref(), &n.content)) == sha
@@ -680,20 +677,4 @@ fn create(
     }
     record_idempotency(tx, &p, &result)?;
     Ok(Outcome { result, embed_after: None })
-}
-
-pub fn register(r: &mut Registry) {
-    r.add(
-        tool(
-            "memory_save",
-            "Create a memory note (omit id) or update one (pass id). Replacing a note another author owns is \
-             refused unless overwrite=True (the old text is kept as a tombstone); append=True adds an attributed \
-             block instead. Omitted title/tags keep stored values on update. Supports salience, confidence, \
-             expires_at, supersedes (create only), contradicts, epistemic/evidence, idempotency_key and \
-             expected_revision (compare-and-set). The broadcast tag and salience above 0.8 are human-only. \
-             Every content or tag change is kept in the note's version history. Returns {id, created, revision}.",
-            save,
-        )
-        .family("memory"),
-    );
 }

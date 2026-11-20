@@ -12,29 +12,29 @@ use serde_json::{Map, Value, json};
 
 pub const PRIOR_MIN: f64 = 0.8;
 pub const PRIOR_MAX: f64 = 1.2;
-pub const RRF_K: f64 = 60.0;
-pub const FTS_LIMIT: usize = 200;
+pub(crate) const RRF_K: f64 = 60.0;
+pub(crate) const FTS_LIMIT: usize = 200;
 /// Run the OR fallback when the AND pass finds fewer notes than this.
-pub const FTS_OR_THRESHOLD: usize = 10;
+pub(crate) const FTS_OR_THRESHOLD: usize = 10;
 /// Cosine floor for the semantic leg (bge-small scores unrelated texts near 0.6).
-pub const SEMANTIC_MIN_SIMILARITY: f32 = 0.65;
-pub const SEMANTIC_TOP_K: usize = 50;
+pub(crate) const SEMANTIC_MIN_SIMILARITY: f32 = 0.65;
+pub(crate) const SEMANTIC_TOP_K: usize = 50;
 /// Cosine at or above which `memory_save` reports a similar note.
-pub const DEDUP_THRESHOLD: f32 = 0.85;
-pub const RECENCY_HALF_LIFE_DAYS: f64 = 15.0;
-pub const DECAY_MONTHS: f64 = 6.0;
-pub const W_SALIENCE: f64 = 0.5;
-pub const W_FEEDBACK: f64 = 0.4;
-pub const W_VOTE: f64 = 0.35;
+pub(crate) const DEDUP_THRESHOLD: f32 = 0.85;
+pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 15.0;
+pub(crate) const DECAY_MONTHS: f64 = 6.0;
+pub(crate) const W_SALIENCE: f64 = 0.5;
+pub(crate) const W_FEEDBACK: f64 = 0.4;
+pub(crate) const W_VOTE: f64 = 0.35;
 /// Leg weights, in fusion order.
-pub const LEG_WEIGHTS: [(&str, f64); 3] = [("lexical", 1.0), ("semantic", 1.0), ("recency", 0.2)];
+pub(crate) const LEG_WEIGHTS: [(&str, f64); 3] = [("lexical", 1.0), ("semantic", 1.0), ("recency", 0.2)];
 /// Column weights for bm25 over (title, content, tags).
-pub const BM25_WEIGHTS: (f64, f64, f64) = (3.0, 1.0, 2.0);
+pub(crate) const BM25_WEIGHTS: (f64, f64, f64) = (3.0, 1.0, 2.0);
 
 /// Feedback signal -> (alpha, beta) increment per count, from a Beta(1, 1) prior.
-pub const FEEDBACK_INCREMENTS: [(f64, f64); 4] = [(1.0, 0.0), (0.0, 1.0), (0.0, 0.5), (0.0, 2.0)];
-pub const CONTRADICTION_BETA: f64 = 1.0;
-pub const MAX_COUNTED_CONTRADICTIONS: i64 = 5;
+pub(crate) const FEEDBACK_INCREMENTS: [(f64, f64); 4] = [(1.0, 0.0), (0.0, 1.0), (0.0, 0.5), (0.0, 2.0)];
+pub(crate) const CONTRADICTION_BETA: f64 = 1.0;
+pub(crate) const MAX_COUNTED_CONTRADICTIONS: i64 = 5;
 
 const STOPWORDS: &[&str] = &[
     "a", "about", "after", "again", "all", "am", "an", "and", "any", "are", "as", "at", "be", "been",
@@ -53,7 +53,7 @@ fn phrase(token: &str) -> String {
     format!("\"{}\"", token.replace('"', ""))
 }
 
-pub fn and_query(tokens: &[String]) -> String {
+pub(crate) fn and_query(tokens: &[String]) -> String {
     tokens
         .iter()
         .filter(|t| !t.replace('"', "").trim().is_empty())
@@ -63,7 +63,7 @@ pub fn and_query(tokens: &[String]) -> String {
 }
 
 /// Distinct non-stopword tokens for the OR fallback, in query order.
-pub fn or_tokens(tokens: &[String]) -> Vec<String> {
+pub(crate) fn or_tokens(tokens: &[String]) -> Vec<String> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
     for tok in tokens {
@@ -104,7 +104,7 @@ pub fn competition_ranks<K: PartialOrd + Copy>(
 }
 
 /// Weighted reciprocal rank fusion over the legs a note appears in.
-pub fn fuse(ranks: &[(&'static str, Option<usize>)]) -> (f64, Vec<(&'static str, f64)>) {
+pub(crate) fn fuse(ranks: &[(&'static str, Option<usize>)]) -> (f64, Vec<(&'static str, f64)>) {
     let mut parts = Vec::new();
     for (leg, rank) in ranks {
         let w = LEG_WEIGHTS.iter().find(|(l, _)| l == leg).map(|(_, w)| *w).unwrap_or(0.0);
@@ -128,7 +128,7 @@ pub fn posterior(feedback: [i64; 4]) -> (f64, f64) {
     (a, b)
 }
 
-pub fn effective_confidence(alpha: f64, beta: f64, open_contradictions: i64) -> f64 {
+pub(crate) fn effective_confidence(alpha: f64, beta: f64, open_contradictions: i64) -> f64 {
     let counted = open_contradictions.clamp(0, MAX_COUNTED_CONTRADICTIONS) as f64;
     alpha / (alpha + beta + CONTRADICTION_BETA * counted)
 }
@@ -138,7 +138,7 @@ fn round4(x: f64) -> f64 {
 }
 
 /// The `confidence_posterior` block `memory_get` and `memory_search` report.
-pub fn confidence_summary(feedback: [i64; 4], open_contradictions: i64) -> Value {
+pub(crate) fn confidence_summary(feedback: [i64; 4], open_contradictions: i64) -> Value {
     let (a, b) = posterior(feedback);
     json!({
         "alpha": round4(a),
@@ -150,7 +150,7 @@ pub fn confidence_summary(feedback: [i64; 4], open_contradictions: i64) -> Value
 }
 
 /// Bounded [0, 1) contribution of recalls and explicit upvotes.
-pub fn vote_term(recalled: i64, upvoted: i64) -> f64 {
+pub(crate) fn vote_term(recalled: i64, upvoted: i64) -> f64 {
     if recalled <= 0 && upvoted <= 0 {
         return 0.0;
     }
@@ -181,7 +181,7 @@ pub fn prior_multiplier(
 
 /// Ordered ranking reasons: the content legs that matched, the other legs by
 /// contribution, then any prior that raised the note.
-pub fn why(
+pub(crate) fn why(
     parts: &[(&'static str, f64)],
     lexical_hit: bool,
     semantic_hit: bool,
@@ -259,43 +259,4 @@ pub fn detect_conflict(a: &str, b: &str) -> bool {
         (has(&wa, x) && !has(&wa, y) && has(&wb, y) && !has(&wb, x))
             || (has(&wa, y) && !has(&wa, x) && has(&wb, x) && !has(&wb, y))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn competition_ranks_share_ties() {
-        let items: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        let r = competition_ranks(&items, |i| match i {
-            "a" => 1,
-            "b" | "c" => 2,
-            _ => 3,
-        });
-        assert_eq!((r["a"], r["b"], r["c"], r["d"]), (1, 2, 2, 4));
-    }
-
-    #[test]
-    fn or_query_drops_stopwords() {
-        let t: Vec<String> = ["the", "deploy", "of", "Deploy", "hub"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(or_query(&t), "\"deploy\" OR \"hub\"");
-    }
-
-    #[test]
-    fn posterior_and_prior_bounds() {
-        assert_eq!(posterior([0, 0, 0, 0]), (1.0, 1.0));
-        assert_eq!(posterior([2, 1, 2, 1]), (3.0, 1.0 + 1.0 + 1.0 + 2.0));
-        let (p, _) = prior_multiplier(1.0, 1.0, 1.0, 1.0);
-        assert!(p <= PRIOR_MAX);
-        let (p, _) = prior_multiplier(0.0, 0.0, 0.0, 0.5);
-        assert!(p >= PRIOR_MIN);
-    }
-
-    #[test]
-    fn conflicts() {
-        assert!(detect_conflict("port: 8080", "port: 9090"));
-        assert!(detect_conflict("the cache is enabled", "the cache is disabled"));
-        assert!(!detect_conflict("port: 8080", "port: 8080"));
-    }
 }

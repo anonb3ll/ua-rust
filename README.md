@@ -35,6 +35,7 @@ a rule is written once and holds for every client.
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
 | `ua-store` | SQLite storage, migrations, repositories, the event ledger |
+| `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
