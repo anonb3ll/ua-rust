@@ -82,6 +82,7 @@
   "provider_account_disable",
   "provider_account_register",
   "provider_account_update",
+  "python_lint_and_format",
   "relay_manage",
   "routine_add",
   "routine_fire",
