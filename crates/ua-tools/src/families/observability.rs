@@ -645,7 +645,7 @@ pub struct ManageArgs {
 
 const ACTIONS: [&str; 6] = ["activity", "metrics", "anomalies", "performance", "agents", "context"];
 
-fn canonical_action(action: &str) -> UaResult<&'static str> {
+pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
     let a = action.trim().to_ascii_lowercase();
     let a = match a.as_str() {
         "agent_activity" => "activity",

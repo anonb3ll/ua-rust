@@ -58,11 +58,11 @@ async fn unknown_arguments_are_refused() {
 async fn approval_gate_round_trip() {
     let hub = hub();
     let reg = builtin_registry();
-    let cto = agent("reviewer-1", Profile::Cto);
+    let lead_agent = agent("reviewer-1", Profile::Lead);
 
     // First call parks; a retry reuses the same pending row.
-    let e1 = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
-    let e2 = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
+    let e1 = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
+    let e2 = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
     let id = match (&e1, &e2) {
         (
             ua_core::UaError::ApprovalRequired { approval_id: a, .. },
@@ -75,7 +75,7 @@ async fn approval_gate_round_trip() {
     };
 
     // An agent cannot approve; the requester cannot approve themselves.
-    let other_agent = agent("builder-1", Profile::ChiefOfStaff);
+    let other_agent = agent("builder-1", Profile::Coordinator);
     assert!(
         reg.call(&hub, &other_agent, "approval_resolve", json!({"id": id, "decision": "approve"}))
             .await
@@ -85,9 +85,9 @@ async fn approval_gate_round_trip() {
     reg.call(&hub, &human(), "approval_resolve", json!({"id": id, "decision": "approve"})).await.unwrap();
 
     // The pass is consumed exactly once.
-    let ok = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap();
+    let ok = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap();
     assert_eq!(ok["ok"], true);
-    let again = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
+    let again = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
     assert_eq!(again.code(), "approval_required");
 
     // Denial sticks to the exact call.
@@ -101,14 +101,14 @@ async fn approval_gate_round_trip() {
     )
     .await
     .unwrap();
-    let denied = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
+    let denied = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
     assert!(denied.to_string().contains("not now"), "{denied}");
 }
 
 #[tokio::test]
 async fn profile_activation_rules() {
     let mut cfg = Config::for_home(std::env::temp_dir());
-    cfg.profiles.insert("lead-1".into(), "chief-of-staff".into());
+    cfg.profiles.insert("lead-1".into(), "coordinator".into());
     let hub = Hub::in_memory(cfg).unwrap();
     let reg = builtin_registry();
 
@@ -120,22 +120,28 @@ async fn profile_activation_rules() {
     // An unfiltered local agent still cannot escalate above its default.
     let local = Caller { enforce_profile: false, ..dev.clone() };
     let err =
-        reg.call(&hub, &local, "profile_activate", json!({"profile": "chief-of-staff"})).await.unwrap_err();
+        reg.call(&hub, &local, "profile_activate", json!({"profile": "coordinator"})).await.unwrap_err();
     assert!(err.to_string().contains("only a human"), "{err}");
 
     // Downgrading is allowed and binds to this session only.
-    let lead = agent("lead-1", Profile::ChiefOfStaff);
+    let lead = agent("lead-1", Profile::Coordinator);
     reg.call(&hub, &lead, "profile_activate", json!({"profile": "research"})).await.unwrap();
     assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s1")), Profile::Research);
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("other")), Profile::ChiefOfStaff);
+    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("other")), Profile::Coordinator);
+
+    // A legacy profile name activates the profile it names.
+    let other = Caller { session_key: Some("s2".into()), ..lead.clone() };
+    let out = reg.call(&hub, &other, "profile_activate", json!({"profile": "steward"})).await.unwrap();
+    assert_eq!(out["profile"], "reviewer");
+    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s2")), Profile::Reviewer);
 }
 
 #[tokio::test]
 async fn unverified_callers_cannot_approve_by_naming_a_human() {
     let hub = hub();
     let reg = builtin_registry();
-    let cto = agent("reviewer-1", Profile::Cto);
-    let id = match reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err() {
+    let lead_agent = agent("reviewer-1", Profile::Lead);
+    let id = match reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err() {
         ua_core::UaError::ApprovalRequired { approval_id, .. } => approval_id,
         other => panic!("expected a pending approval, got {other:?}"),
     };
@@ -164,7 +170,7 @@ async fn unverified_callers_cannot_approve_by_naming_a_human() {
     assert_eq!(err.code(), "denied", "{err}");
 
     // A verified agent cannot pass a human name either.
-    let other = agent("builder-1", Profile::ChiefOfStaff);
+    let other = agent("builder-1", Profile::Coordinator);
     let err = reg
         .call(
             &hub,
@@ -177,6 +183,6 @@ async fn unverified_callers_cannot_approve_by_naming_a_human() {
     assert_eq!(err.code(), "denied", "{err}");
 
     // The request is still pending and the gated call still parks.
-    let again = reg.call(&hub, &cto, "event_log_verify", json!({})).await.unwrap_err();
+    let again = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
     assert_eq!(again.code(), "approval_required");
 }

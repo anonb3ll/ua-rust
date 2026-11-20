@@ -53,7 +53,7 @@ reached only through its public name needs no entry. Add every other name
 the hub is reached by, for example:
 
 ```toml
-public_url = "https://hub.example-tailnet.ts.net"
+public_url = "https://hub.example.com"
 allowed_hosts = ["localhost", "127.0.0.1", "::1", "hub.lan.example.com"]
 ```
 
@@ -75,17 +75,17 @@ plain HTTP on a trusted network.
 
 For remote use, keep `bind` on loopback and put TLS in front:
 
-- **`tailscale serve`** (recommended for a personal hub): HTTPS with a
-  certificate for the machine's tailnet name, reachable only from your
-  tailnet. Do not use Tailscale Funnel, which publishes the hub to the whole
-  internet.
+- **A private-network TLS terminator** such as `tailscale serve`: HTTPS
+  with a certificate for the machine's private-network name, reachable only
+  from that network. Do not use Tailscale Funnel, which publishes the hub to
+  the whole internet.
 
   ```
   tailscale serve --bg 8765
   ```
 
-  then set `public_url = "https://hub.example-tailnet.ts.net"` (your
-  machine's tailnet name). Its host is allowed automatically.
+  then set `public_url` to the https:// address it serves (the machine's
+  private-network name). Its host is allowed automatically.
 - Any other TLS-terminating reverse proxy (Caddy, nginx, ...) with the same
   `public_url` setting.
 

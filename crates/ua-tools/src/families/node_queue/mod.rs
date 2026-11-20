@@ -197,7 +197,7 @@ const PREVIEW_CHARS: usize = 80;
 
 /// Backends a node may run. `acceptance` is the hub's no-model self-test
 /// and `command` a supervised argv (queued through `node_command_start`).
-pub const NODE_BACKENDS: [&str; 17] = [
+pub const NODE_BACKENDS: [&str; 16] = [
     "codex",
     "agy",
     "pi",
@@ -212,7 +212,6 @@ pub const NODE_BACKENDS: [&str; 17] = [
     "acp:copilot",
     "acp:cursor",
     "acp:opencode",
-    "acp:hermes",
     "acceptance",
     "command",
 ];
@@ -761,11 +760,6 @@ pub(crate) fn validate_new(
     let backend = backend.trim().to_ascii_lowercase();
     if !NODE_BACKENDS.contains(&backend.as_str()) {
         return Err(UaError::invalid(format!("backend must be one of {}", NODE_BACKENDS.join(", "))));
-    }
-    if backend == "acp:hermes" {
-        return Err(UaError::invalid(
-            "acp:hermes needs a Hermes profile binding, which this hub does not serve yet; use another backend",
-        ));
     }
     if prompt.trim().is_empty() {
         return Err(UaError::invalid("prompt must not be empty"));

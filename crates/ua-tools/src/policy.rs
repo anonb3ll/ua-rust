@@ -714,6 +714,10 @@ fn principals(caller: &Caller, scope: &Scope) -> BTreeSet<String> {
         out.insert(scope.agent.clone());
     }
     out.insert(caller.profile.as_str().to_string());
+    // A policy written with a legacy profile name keeps matching.
+    if let Some(alias) = caller.profile.legacy_alias() {
+        out.insert(alias.to_string());
+    }
     out
 }
 
