@@ -130,6 +130,23 @@ autonomy_max_cost_cents = 1000.0
 # this file.
 # relay_denylist = ["project[- ]codename"]
 
+# Zulip (see docs/zulip.md). Both tools stay off until zulip_site,
+# zulip_email and the API key are set. Set the API key in the hub's
+# environment as UA_ZULIP_API_KEY, not in this file; it is never logged.
+# zulip_send_message also stays retired until zulip_retired is 0, false, no
+# or off, and every send needs a human approval of the exact text.
+# zulip_site = "https://chat.example.com"
+# zulip_email = "bot@example.com"
+# zulip_retired = "0"
+# Hosts a message may link to; every other link is refused.
+# zulip_link_hosts = ["docs.example.com"]
+# Users a message may @-mention; wildcards and groups are always refused.
+# zulip_mention_allowlist = ["Jane Doe"]
+# zulip_send_calls_per_hour = 30
+# Logical channel names agents use, mapped to Zulip stream names.
+# [zulip_channels]
+# general = "general"
+
 # Default profile per identity. Unlisted identities get "developer". Profiles:
 # coordinator, lead, developer, reviewer, operator, research, acp-session,
 # remote-vault-curator, remote-assistant, public (see docs/policy.md).

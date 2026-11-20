@@ -245,6 +245,39 @@ pub struct Config {
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.
     pub notify_max_attempts: u32,
+    /// Zulip site, for example `https://chat.example.com`. `zulip_send_message`
+    /// and `zulip_fetch_messages` stay off until this, `zulip_email` and
+    /// `zulip_api_key` are all set. `http` is accepted only for a loopback host
+    /// and only under `fetch_allow_loopback`, so a local stub can stand in for
+    /// the API. Every address the host resolves to must be public otherwise.
+    pub zulip_site: Option<String>,
+    /// Bot email used as the Zulip basic-auth user. Never logged together with the API key.
+    pub zulip_email: Option<String>,
+    /// Bot API key, from the `UA_ZULIP_API_KEY` environment variable; keep it
+    /// out of the config file. Never logged, never written to the database.
+    #[serde(skip_serializing)]
+    pub zulip_api_key: Option<SecretString>,
+    /// Outbound-send kill switch (`UA_ZULIP_RETIRED`). Unset, empty, or any
+    /// value other than `0`, `false`, `no` or `off` keeps `zulip_send_message`
+    /// retired. Fetch is unaffected.
+    pub zulip_retired: Option<String>,
+    /// Logical channel name an agent passes → Zulip stream (channel) name.
+    /// Only these channels can be sent to or fetched from. Empty (the
+    /// default) means the one channel `general` → `general`; a configured
+    /// table replaces it.
+    pub zulip_channels: BTreeMap<String, String>,
+    /// Hosts a Zulip message or topic may link to or embed an image from
+    /// (subdomains included). Empty: every link is refused.
+    #[serde(deserialize_with = "string_or_list")]
+    pub zulip_link_hosts: Vec<String>,
+    /// Zulip users (the name inside `@**name**`, case-insensitive) a message
+    /// may mention. Wildcards (`all`, `everyone`, `stream`, `channel`,
+    /// `topic`) and user groups are refused even when listed.
+    #[serde(deserialize_with = "string_or_list")]
+    pub zulip_mention_allowlist: Vec<String>,
+    /// `zulip_send_message` calls one caller may make per hour (each call
+    /// runs the gates; one approved message takes two). 0 refuses every call.
+    pub zulip_send_calls_per_hour: u32,
     /// Slack signing secret, from the `UA_SLACK_SIGNING_SECRET` environment
     /// variable; keep it out of the config file. Read by the future Slack
     /// route (docs/slack.md); no tool reads it. Never logged, never written
@@ -659,6 +692,14 @@ impl Default for Config {
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
             notify_max_attempts: 3,
+            zulip_site: None,
+            zulip_email: None,
+            zulip_api_key: None,
+            zulip_retired: None,
+            zulip_channels: BTreeMap::new(),
+            zulip_link_hosts: Vec::new(),
+            zulip_mention_allowlist: Vec::new(),
+            zulip_send_calls_per_hour: 30,
             slack_signing_secret: None,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,

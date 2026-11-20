@@ -340,6 +340,16 @@ mod tests {
     }
 
     #[test]
+    fn only_profiles_meant_to_speak_publicly_can_send_to_zulip() {
+        for tool in ["zulip_send_message", "zulip_resolve_send"] {
+            for p in Profile::ALL.into_iter().filter(|p| *p != Profile::Coordinator) {
+                assert!(!p.allows_tool(tool), "{p} must not see {tool}");
+            }
+            assert!(Profile::Coordinator.allows_tool(tool));
+        }
+    }
+
+    #[test]
     fn names_round_trip() {
         for p in Profile::ALL {
             assert_eq!(p.as_str().parse::<Profile>().unwrap(), p);
