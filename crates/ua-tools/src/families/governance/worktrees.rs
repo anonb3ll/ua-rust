@@ -2,23 +2,29 @@
 //! `.worktrees/` and remove the ones whose removal destroys nothing.
 //!
 //! - **Stale** (policy): the worktree's task (`task-<id>...` folder name) is
-//!   `done` or `blocked`, or no longer exists (`orphaned_task`), or nothing
-//!   touched the worktree for `max_idle_days` (the newest of the directory's
-//!   and its gitdir's `index`, `HEAD` and reflog mtimes). A live claim on
-//!   the task, a deploy checkout (`release-*`, `rollback-*`) and a worktree
-//!   a running process works in are never stale.
-//! - **Disposable** (safety): no uncommitted or untracked changes, and the
+//!   `done`, or no longer exists (`orphaned_task`), or nothing touched the
+//!   worktree for `max_idle_days` (at least 1; the newest of the directory's
+//!   and its gitdir's `index`, `HEAD` and reflog mtimes). A `blocked` task is
+//!   paused work, not finished work: only the idle threshold makes its
+//!   worktree stale. A live claim on the task, a deploy checkout
+//!   (`release-*`, `rollback-*`) and a worktree a running process works in
+//!   are never stale.
+//! - **Disposable** (safety): no uncommitted changes, no untracked files and
+//!   no ignored files (`git status --porcelain --ignored`; `git worktree
+//!   remove` deletes ignored files such as a local `.env` without asking, so
+//!   any ignored path, build output included, keeps the worktree), and the
 //!   base branch (`main`, else `master`) already contains everything on the
 //!   branch (merging `HEAD` into the base would not change the base's tree;
 //!   this also recognizes squash merges). Anything that cannot be
 //!   established keeps the worktree.
 //!
 //! `dry_run` defaults to true: the call reports candidates and changes
-//! nothing. Otherwise each stale candidate is re-checked (in use, then
-//! disposable) and removed with `git worktree remove` without `--force`, so
-//! git itself refuses a worktree that is dirty or locked. A stale but
-//! non-disposable worktree is reported under `retained` with the reason.
-//! Nothing is ever deleted any other way.
+//! nothing, and any caller may run it. A removal (`dry_run=false`) needs a
+//! verified human identity or a lifecycle operator. Each stale candidate is
+//! re-checked (in use, then disposable) and removed with `git worktree
+//! remove` without `--force`, so git itself refuses a worktree that is dirty
+//! or locked. A stale but non-disposable worktree is reported under
+//! `retained` with the reason. Nothing is ever deleted any other way.
 //!
 //! "In use" comes from `/proc` (working directory, executable and absolute
 //! command-line arguments of every process). Without `/proc` liveness is
@@ -44,12 +50,14 @@ const MAX_NEST_DEPTH: usize = 5;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_CAP: usize = 1024 * 1024;
 const DEPLOY_PREFIXES: [&str; 2] = ["release-", "rollback-"];
+/// The smallest idle threshold a sweep accepts, in days.
+const MIN_IDLE_DAYS: f64 = 1.0;
 const ACTIVITY_FILES: [&str; 6] = ["index", "HEAD", "logs/HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD"];
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupArgs {
-    /// Idle threshold in days (default 7).
+    /// Idle threshold in days (default 7, at least 1).
     pub max_idle_days: Option<f64>,
     /// Report candidates without removing anything (default true).
     pub dry_run: Option<bool>,
@@ -59,12 +67,13 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "cleanup_stale_worktrees",
-            "Find stale task worktrees under the workspace's .worktrees/ (task done, blocked or deleted, or idle \
-             for max_idle_days, default 7) and, with dry_run=false, remove the ones whose removal destroys \
-             nothing: no uncommitted or untracked changes and the base branch already contains the branch. \
-             Removal is `git worktree remove` without --force; a worktree with uncommitted changes, unmerged \
-             commits, a live claim, or a process using it is retained and reported. dry_run defaults to true. \
-             Returns {cleaned_count, stale_worktrees, skipped, retained, failed, dry_run, liveness_unknown}.",
+            "Find stale task worktrees under the workspace's .worktrees/ (task done or deleted, or idle for \
+             max_idle_days, default 7, at least 1) and, with dry_run=false, remove the ones whose removal \
+             destroys nothing: no uncommitted changes, no untracked or ignored files (a local .env, build \
+             output) and the base branch already contains the branch. Removal is `git worktree remove` without \
+             --force and needs a human identity or a lifecycle operator; a worktree with uncommitted changes, \
+             untracked or ignored files, unmerged commits, a live claim, or a process using it is retained and \
+             reported. dry_run defaults to true. Returns {cleaned_count, stale_worktrees, skipped, retained, failed, dry_run, liveness_unknown}.",
             cleanup_stale_worktrees,
         )
         .family("workspace"),
@@ -231,7 +240,6 @@ fn staleness(
                 }
                 match t.status.as_str() {
                     "done" => (task_id, true, Some("task_done")),
-                    "blocked" => (task_id, true, Some("task_blocked")),
                     _ if idle => (task_id, true, Some("idle_timeout")),
                     _ => (task_id, false, live_reason),
                 }
@@ -254,16 +262,34 @@ fn out_text(o: &RunOutput) -> String {
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
 
+/// Why `git status --porcelain --ignored` output keeps a worktree: tracked
+/// changes first, then untracked files, then ignored files. `None` when the
+/// output is empty.
+fn status_blocker(porcelain: &str) -> Option<&'static str> {
+    let lines: Vec<&str> = porcelain.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        None
+    } else if lines.iter().any(|l| !l.starts_with("??") && !l.starts_with("!!")) {
+        Some("uncommitted_changes")
+    } else if lines.iter().any(|l| l.starts_with("??")) {
+        Some("untracked_files")
+    } else {
+        Some("ignored_files")
+    }
+}
+
 /// `(true, "")` when removing `path` destroys nothing, else `(false, reason)`.
 async fn disposable(path: &Path) -> (bool, &'static str) {
-    let Some(status) = git(path, &["--no-optional-locks", "status", "--porcelain"]).await else {
+    // `--ignored`: `git worktree remove` deletes ignored files without
+    // asking, so an ignored `.env` or local config is work to keep too.
+    let Some(status) = git(path, &["--no-optional-locks", "status", "--porcelain", "--ignored"]).await else {
         return (false, "git_status_unavailable");
     };
     if status.exit_code != 0 {
         return (false, "git_status_unavailable");
     }
-    if !out_text(&status).is_empty() {
-        return (false, "uncommitted_changes");
+    if let Some(why) = status_blocker(&out_text(&status)) {
+        return (false, why);
     }
     let mut base = None;
     for candidate in ["main", "master"] {
@@ -306,10 +332,22 @@ fn owning_repo(path: &Path) -> Option<PathBuf> {
 
 async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value> {
     let days = a.max_idle_days.unwrap_or(7.0);
-    if !days.is_finite() || days < 0.0 {
-        return Err(UaError::invalid("max_idle_days must be a non-negative number"));
+    if !days.is_finite() || days < MIN_IDLE_DAYS {
+        return Err(UaError::invalid(format!("max_idle_days must be a number of at least {MIN_IDLE_DAYS}")));
     }
     let dry_run = a.dry_run.unwrap_or(true);
+    if !dry_run {
+        let who = super::verified_actor(&ctx.caller, "removing worktrees (dry_run=false)")?;
+        if !super::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+            return Err(UaError::denied(
+                "not_lifecycle_operator",
+                format!(
+                    "{who:?} may not remove worktrees: dry_run=false needs a human identity or a lifecycle \
+                     operator (lifecycle_operators). A dry run is open to any caller."
+                ),
+            ));
+        }
+    }
     let sb = sandbox(&ctx)?;
     let root = sb.root.clone();
     let tasks = ctx
@@ -458,6 +496,14 @@ mod tests {
         assert_eq!(task_id_from_folder("task-42-fix-the-build"), Some(42));
         assert_eq!(task_id_from_folder("release-42"), None);
         assert_eq!(task_id_from_folder("task-x"), None);
+    }
+
+    #[test]
+    fn untracked_and_ignored_files_keep_a_worktree() {
+        assert_eq!(status_blocker(""), None);
+        assert_eq!(status_blocker(" M a.rs\n?? b\n!! .env"), Some("uncommitted_changes"));
+        assert_eq!(status_blocker("?? b\n!! .env"), Some("untracked_files"));
+        assert_eq!(status_blocker("!! .env"), Some("ignored_files"));
     }
 
     #[test]

@@ -41,8 +41,10 @@ human, or run with a wider profile, to reach these tools.
 `dispatch_task` and `dispatch_resume` also run the governance claim gate
 before any approval is asked for: a paused, terminated or retired target
 agent (`agent_paused`, `agent_terminated`, `agent_retired`) or a task under
-an active subtree hold (`task_held`) is refused. See
-[policy.md](policy.md#governance-controls).
+an active subtree hold (`task_held`) is refused. A task an approved work
+proposal spawned must still match its frozen contract (`contract_mismatch`),
+and a prompt built from such a task carries the contract block only, not
+notes appended after it. See [policy.md](policy.md#governance-controls).
 
 ## The approval covers what runs
 

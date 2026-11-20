@@ -17,8 +17,8 @@
 //!
 //! [`claim_block`] is the single check every path that hands out work runs
 //! inside its own write transaction: `task_claim`, `task_update` into
-//! `doing`, `dispatch_task`, `node_dispatch` (and every other enqueue) and
-//! `node_claim`. It refuses with a stable reason code: `agent_paused`,
+//! `doing`, `dispatch_task`, `dispatch_resume`, `node_dispatch` (and every
+//! other enqueue), `node_claim` and, for the agent part, `plan_step_claim`. It refuses with a stable reason code: `agent_paused`,
 //! `agent_terminated` or `agent_retired` for the agent that would hold the
 //! work, and `task_held` for a task inside an active subtree hold.
 
@@ -42,8 +42,8 @@ pub(crate) use lifecycle::{
     agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate, agent_unretire,
 };
 pub(crate) use proposals::{
-    check_contract, work_proposal_decide, work_proposal_file, work_proposal_get, work_proposal_list,
-    work_proposal_recover, work_proposal_withdraw,
+    check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
+    work_proposal_list, work_proposal_recover, work_proposal_withdraw,
 };
 
 use super::agents::verified;
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS agent_lifecycle (
     action TEXT NOT NULL,
     reason TEXT,
     actor TEXT NOT NULL,
+    imposed_by TEXT,
     owner TEXT,
     since TEXT NOT NULL
 );

@@ -30,8 +30,11 @@
 //!
 //! Authority: a lifecycle operator (or a human identity) may change any
 //! agent. An agent may pause or terminate itself, and resume only from a
-//! state it imposed on itself. Retire and unretire are operator actions
-//! only, for an agent's own label too.
+//! stop it imposed on itself. A stop an operator imposes is recorded in
+//! `imposed_by` and survives the agent's own later transitions (an operator
+//! pause followed by a self-terminate is still the operator's stop); only an
+//! operator transition back to `active` clears it. Retire and unretire are
+//! operator actions only, for an agent's own label too.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -96,34 +99,39 @@ struct Row {
     previous: Option<String>,
     reason: Option<String>,
     actor: String,
+    /// The operator whose stop is in force, if one is: set when an operator
+    /// stops the agent, kept through the agent's own transitions, cleared
+    /// only when an operator returns it to `active`.
+    imposed_by: Option<String>,
     owner: Option<String>,
     since: String,
 }
 
+const COLUMNS: &str = "agent, state, previous, reason, actor, imposed_by, owner, since";
+
+fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    Ok(Row {
+        agent: r.get(0)?,
+        state: r.get(1)?,
+        previous: r.get(2)?,
+        reason: r.get(3)?,
+        actor: r.get(4)?,
+        imposed_by: r.get(5)?,
+        owner: r.get(6)?,
+        since: r.get(7)?,
+    })
+}
+
 fn load(c: &Connection, agent: &str) -> UaResult<Option<Row>> {
-    Ok(c.query_row(
-        "SELECT agent, state, previous, reason, actor, owner, since FROM agent_lifecycle WHERE agent = ?1",
-        [agent],
-        |r| {
-            Ok(Row {
-                agent: r.get(0)?,
-                state: r.get(1)?,
-                previous: r.get(2)?,
-                reason: r.get(3)?,
-                actor: r.get(4)?,
-                owner: r.get(5)?,
-                since: r.get(6)?,
-            })
-        },
-    )
-    .optional()?)
+    Ok(c.query_row(&format!("SELECT {COLUMNS} FROM agent_lifecycle WHERE agent = ?1"), [agent], row_from)
+        .optional()?)
 }
 
 fn state_json(agent: &str, row: Option<&Row>) -> Value {
     match row {
         None => json!({
             "agent": agent, "state": "active", "previous": null, "reason": null, "actor": null,
-            "since": null, "owner_of_record": null, "owner_source": null,
+            "imposed_by": null, "since": null, "owner_of_record": null, "owner_source": null,
         }),
         Some(r) => json!({
             "agent": r.agent,
@@ -131,6 +139,7 @@ fn state_json(agent: &str, row: Option<&Row>) -> Value {
             "previous": r.previous,
             "reason": r.reason,
             "actor": r.actor,
+            "imposed_by": r.imposed_by,
             "since": r.since,
             "owner_of_record": r.owner,
             "owner_source": r.owner.as_ref().map(|_| "explicit"),
@@ -178,7 +187,7 @@ pub(crate) fn stopped(c: &Connection, agent: &str) -> UaResult<Option<Stopped>> 
     Ok(load(c, agent.trim())?.filter(|r| r.state != "active").map(|r| Stopped {
         state: r.state,
         reason: r.reason,
-        actor: r.actor,
+        actor: r.imposed_by.unwrap_or(r.actor),
     }))
 }
 
@@ -235,24 +244,12 @@ pub(crate) async fn agent_states(ctx: ToolCtx, _a: StatesArgs) -> UaResult<Value
     ctx.hub
         .db()
         .read_async(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT agent, state, previous, reason, actor, owner, since FROM agent_lifecycle ORDER BY agent",
-            )?;
-            let changed: Vec<Row> = stmt
-                .query_map([], |r| {
-                    Ok(Row {
-                        agent: r.get(0)?,
-                        state: r.get(1)?,
-                        previous: r.get(2)?,
-                        reason: r.get(3)?,
-                        actor: r.get(4)?,
-                        owner: r.get(5)?,
-                        since: r.get(6)?,
-                    })
-                })?
+            let mut stmt = c.prepare(&format!("SELECT {COLUMNS} FROM agent_lifecycle ORDER BY agent"))?;
+            let changed: Vec<Row> = stmt.query_map([], row_from)?.collect::<Result<_, _>>()?;
+            let mut labels: Vec<String> = c
+                .prepare("SELECT label FROM agents")?
+                .query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
-            let mut labels: Vec<String> =
-                c.prepare("SELECT label FROM agents")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
             labels.extend(changed.iter().map(|r| r.agent.clone()));
             labels.sort_by_key(|l| l.to_ascii_lowercase());
             labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
@@ -294,14 +291,20 @@ fn authorize(who: &str, operator: bool, label: &str, verb: Verb, current: Option
             ),
         ));
     }
+    // An operator's stop is lifted by an operator only, whatever the agent
+    // did to itself since (a self-terminate does not make the stop its own).
     if verb == Verb::Resume
         && let Some(r) = current
-        && !r.actor.eq_ignore_ascii_case(label)
+        && r.state != "active"
     {
-        return Err(UaError::denied(
-            "resume_needs_operator",
-            format!("{label:?} was {} by {:?}; only a lifecycle operator may resume it", r.state, r.actor),
-        ));
+        let by =
+            r.imposed_by.as_deref().or((!r.actor.eq_ignore_ascii_case(label)).then_some(r.actor.as_str()));
+        if let Some(by) = by {
+            return Err(UaError::denied(
+                "resume_needs_operator",
+                format!("{label:?} was stopped by {by:?}; only a lifecycle operator may resume it"),
+            ));
+        }
     }
     Ok(())
 }
@@ -545,11 +548,23 @@ async fn change(
                 revoked = Some(revoke_credentials(tx, &label, &who, &at)?);
             }
             let stored = current.as_ref().map_or(label.clone(), |r| r.agent.clone());
+            // Who imposed the stop in force: an operator's stop is recorded
+            // and survives the agent's own transitions; a return to active
+            // (which only an operator may make over an operator's stop)
+            // clears it.
+            let imposed_by = if target == "active" {
+                None
+            } else if operator && !who.eq_ignore_ascii_case(&label) {
+                Some(who.clone())
+            } else {
+                current.as_ref().and_then(|r| r.imposed_by.clone())
+            };
             tx.execute(
-                "INSERT INTO agent_lifecycle (agent, state, previous, action, reason, actor, owner, since) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                "INSERT INTO agent_lifecycle (agent, state, previous, action, reason, actor, imposed_by, owner, since) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(agent) DO UPDATE SET state = excluded.state, previous = excluded.previous, \
                  action = excluded.action, reason = excluded.reason, actor = excluded.actor, \
+                 imposed_by = excluded.imposed_by, \
                  owner = COALESCE(excluded.owner, agent_lifecycle.owner), since = excluded.since",
                 params![
                     stored,
@@ -558,6 +573,7 @@ async fn change(
                     verb.as_str(),
                     (!reason.is_empty()).then_some(&reason),
                     who,
+                    imposed_by,
                     owner,
                     at
                 ],
@@ -570,6 +586,7 @@ async fn change(
                 "action": verb.as_str(),
                 "reason": (!reason.is_empty()).then_some(&reason),
                 "actor": who,
+                "imposed_by": imposed_by,
                 "at": at,
             });
             if verb == Verb::Retire {
@@ -673,17 +690,21 @@ mod tests {
 
     #[test]
     fn an_agent_resumes_only_from_its_own_stop() {
-        let row = |actor: &str| Row {
+        let row = |actor: &str, imposed_by: Option<&str>| Row {
             agent: "a".into(),
-            state: "paused".into(),
-            previous: None,
+            state: "terminated".into(),
+            previous: Some("paused".into()),
             reason: None,
             actor: actor.into(),
+            imposed_by: imposed_by.map(str::to_string),
             owner: None,
             since: String::new(),
         };
-        assert!(authorize("a", false, "a", Verb::Resume, Some(&row("a"))).is_ok());
-        assert!(authorize("a", false, "a", Verb::Resume, Some(&row("operator"))).is_err());
+        assert!(authorize("a", false, "a", Verb::Resume, Some(&row("a", None))).is_ok());
+        assert!(authorize("a", false, "a", Verb::Resume, Some(&row("operator", None))).is_err());
+        // The agent's own last transition does not make an operator's stop its own.
+        assert!(authorize("a", false, "a", Verb::Resume, Some(&row("a", Some("operator")))).is_err());
+        assert!(authorize("op", true, "a", Verb::Resume, Some(&row("a", Some("operator")))).is_ok());
         assert!(authorize("a", false, "b", Verb::Pause, None).is_err());
         assert!(authorize("a", false, "a", Verb::Retire, None).is_err());
         assert!(authorize("op", true, "a", Verb::Retire, None).is_ok());

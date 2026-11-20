@@ -186,9 +186,10 @@ ledger event in the same write transaction.
 
 One check, `claim_block`, runs inside the write transaction of every path
 that hands out work: `task_claim` (renewals too), `task_update` into
-`doing`, `dispatch_task`, every node enqueue (`node_dispatch`,
-`node_command_start`, a node-routed dispatch, checked before any approval is
-asked for) and `node_claim`. It refuses with a stable reason code:
+`doing`, `dispatch_task`, `dispatch_resume`, every node enqueue
+(`node_dispatch`, `node_command_start`, a node-routed dispatch, checked
+before any approval is asked for), `node_claim` and, for the agent part,
+`plan_step_claim`. It refuses with a stable reason code:
 
 | Code | When |
 |---|---|
@@ -204,7 +205,7 @@ a held task's items, which stay queued until the hold is released.
 |---|---|---|
 | `agent_state`, `agent_states` | Anyone | Read the state (`active` when never changed) and owner of record. |
 | `agent_pause` (`agent`, `reason`) | An operator, or the agent itself | New work is refused. Live dispatch runs are cancelled (the `dispatch_cancel` path) and claimed node items flagged for the node; queued node items stay queued. |
-| `agent_resume` (`agent`) | An operator, or the agent if it paused itself | Back to `active`. Cannot undo a retirement. |
+| `agent_resume` (`agent`) | An operator, or the agent if it stopped itself | Back to `active`. Cannot undo a retirement. A stop an operator imposed is recorded (`imposed_by`) and survives the agent's own later transitions: an operator pause followed by a self-terminate still needs an operator to resume. |
 | `agent_terminate` (`agent`, `reason`) | An operator, or the agent itself | As pause, and the agent's `doing` claims return to `open` and its queued node items are cancelled. |
 | `agent_retire` (`agent`, `reason`, `owner`) | Lifecycle operators only | Refused while the agent holds `doing` claims. Revokes its `agent_tokens` rows and OAuth sign-ins; the HTTP adapter refuses its static token too. |
 | `agent_unretire` (`agent`) | Lifecycle operators only | Back to `active`; re-issues nothing. |
@@ -238,10 +239,17 @@ run, and returns a `doing` task to `open`.
 An agent files `work_proposal_file` (1-50 items `{title, notes, scope:
 {repo, files}, priority}`); a human decides each item with
 `work_proposal_decide` (approve, with optional edits, or reject). Each
-approved item becomes one task whose notes carry the item's frozen contract
-digest (SHA-256 over its canonical title, notes and scope). `task_claim` and
-`task_update` into `doing` re-check it and refuse a drifted task with
-`contract_mismatch`. `work_proposal_withdraw` (the proposer, before any
+approved item becomes one task whose notes start with the contract block:
+the item notes, the markers carrying its frozen contract digest (SHA-256 over
+its canonical title, notes and scope), and a closing `[end contract]` line.
+`task_claim`, `task_update` into `doing`, `dispatch_task` (local and
+node-routed), `dispatch_resume` and every node enqueue bound to the task
+re-check the whole block and refuse a drifted task with `contract_mismatch`.
+The block is the work order: text appended after `[end contract]` (a claim
+line, a progress note) passes the check but is commentary, and a prompt the
+hub builds from the task carries the block only. Only a verified human caller
+decides (the `approval_resolve` rule); an `approver` argument grants nothing
+and must name the caller. `work_proposal_withdraw` (the proposer, before any
 decision), `work_proposal_get`, `work_proposal_list` and
 `work_proposal_recover` complete the set.
 
@@ -251,10 +259,14 @@ repository on an allowed forge host.
 
 ### Maintenance tools
 
-`cleanup_stale_worktrees` (`max_idle_days`, `dry_run`, default true) reports
-stale task worktrees under the workspace's `.worktrees/` and, when asked,
-removes only those with no uncommitted changes whose branch the base branch
-already contains, with `git worktree remove` and never `--force`.
+`cleanup_stale_worktrees` (`max_idle_days`, default 7 and at least 1;
+`dry_run`, default true) reports stale task worktrees under the workspace's
+`.worktrees/` (task `done` or deleted, or idle; a `blocked` task's worktree is
+stale only once idle) and, when a human or lifecycle operator asks with
+`dry_run=false`, removes only those with no uncommitted changes, no untracked
+files and no ignored files (`git worktree remove` would delete an ignored
+`.env` without asking) whose branch the base branch already contains, with
+`git worktree remove` and never `--force`.
 `audit_triage_tasks` runs `security_audit` and files one deduplicated task
 per group of findings; a clean audit files nothing.
 

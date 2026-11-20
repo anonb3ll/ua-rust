@@ -37,9 +37,10 @@ impl Blocked {
 ///   transaction.
 ///
 /// Every path that hands out work calls this: `task_claim`, `task_update`
-/// into `doing`, `dispatch_task`, every node enqueue (`node_dispatch`,
-/// `node_command_start`, node-routed dispatch) and `node_claim` (for the
-/// node's owner, and per queued item to skip held ones).
+/// into `doing`, `dispatch_task`, `dispatch_resume`, every node enqueue
+/// (`node_dispatch`, `node_command_start`, node-routed dispatch),
+/// `node_claim` (for the node's owner, and per queued item to skip held
+/// ones) and `plan_step_claim` (the agent only; a plan step is not a task).
 pub(crate) fn claim_block(
     tx: &mut WriteTx<'_>,
     agent: Option<&str>,
