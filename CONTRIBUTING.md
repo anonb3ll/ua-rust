@@ -43,6 +43,7 @@ Tool names, argument names and their meaning match the original Python hub
 cargo fmt --all
 cargo clippy --workspace --all-targets
 cargo test -p ua-tools --test <name>
+scripts/vocab-check.sh
 ```
 
 CI runs the full suite. Commit messages: imperative subject, a short body
@@ -53,4 +54,5 @@ saying what and why.
 This repository is public. No personal names, e-mail addresses, home
 directory paths, host names or real tokens in code, tests, docs or commits.
 Use placeholders such as `builder-1`, `operator`, `~/projects`,
-`example.com`.
+`example.com`. `scripts/vocab-check.sh` (run in CI) enforces this; list an
+intended exception in `scripts/vocab-allowlist.txt`.

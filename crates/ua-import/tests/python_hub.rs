@@ -800,3 +800,82 @@ fn a_missing_source_is_an_error() {
     let err = ua_import::dry_run(&dir.path().join("absent.db")).unwrap_err();
     assert!(err.to_string().contains("does not exist"), "{err}");
 }
+
+#[test]
+fn python_parking_moves_to_its_own_columns_and_continuity_rows_copy() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    // Python-hub shapes: parking was archived_at plus a notes line.
+    c.execute_batch(&format!(
+        "
+CREATE TABLE task_workflow (task_id INTEGER PRIMARY KEY, org_id TEXT, stage TEXT, goal TEXT,
+  done_json TEXT NOT NULL DEFAULT '[]', focus TEXT, head_sha TEXT, expected_json TEXT NOT NULL DEFAULT '[]',
+  revision INTEGER NOT NULL DEFAULT 0, updated_by TEXT, updated_at TEXT);
+CREATE TABLE task_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, org_id TEXT,
+  name TEXT NOT NULL, head_sha TEXT NOT NULL, outcome TEXT NOT NULL, grade TEXT NOT NULL, ref_kind TEXT,
+  ref TEXT, repo TEXT, ref_job TEXT, detail TEXT, verification_json TEXT, recorded_by TEXT NOT NULL,
+  recorded_at TEXT NOT NULL, verified_at TEXT, UNIQUE (task_id, name, head_sha));
+CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+  agent TEXT NOT NULL, task_id INTEGER, done TEXT NOT NULL, next_steps TEXT NOT NULL,
+  open_questions TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'draft', epoch INTEGER NOT NULL DEFAULT 0,
+  supersedes INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sealed_at TEXT, assigned_to TEXT,
+  assigned_at TEXT, delivered_to TEXT, delivered_at TEXT, acknowledged_at TEXT, failover_reason TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0, org_id TEXT);
+INSERT INTO tasks (id, title, notes, status, parent_id, created_at, updated_at, archived_at) VALUES
+  (10, 'Parked epic', 'the spec\n[parked @ 2026-02-01T00:00:00Z by operator] no movement in a month',
+   'open', NULL, '{T0}', '{T0}', '{T0}'),
+  (11, 'Folded child', '[folded-into: #10 @ 2026-02-01T00:00:00Z by operator] parent #10 parked: no movement',
+   'blocked', 10, '{T0}', '{T0}', '{T0}'),
+  (12, 'Filed work', '[parked @ 2026-02-01T00:00:00Z by operator] old', 'done', NULL, '{T0}', '{T0}', '{T0}'),
+  (13, 'Plain archive', 'archived by hand', 'open', NULL, '{T0}', '{T0}', '{T0}');
+INSERT INTO task_workflow (task_id, stage, goal, done_json, revision, updated_by, updated_at) VALUES
+  (1, 'implement', 'ship it', '[\"schema\"]', 2, 'agent-1', '{T0}');
+INSERT INTO task_checks (task_id, name, head_sha, outcome, grade, recorded_by, recorded_at) VALUES
+  (1, 'tests', 'abcdef1', 'pass', 'attested', 'agent-1', '{T0}'),
+  (99, 'lint', 'abcdef1', 'pass', 'attested', 'agent-1', '{T0}');
+INSERT INTO session_handoff_notes (session_id, agent, task_id, done, next_steps, state, created_at, updated_at,
+  sealed_at) VALUES ('s-1', 'agent-1', 1, '[\"a\"]', '[\"b\"]', 'sealed', '{T0}', '{T0}', '{T0}');
+"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    type Parking = (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>);
+    let parked: Parking = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT parked_at, parked_by, parked_reason, folded_into, archived_at FROM tasks WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        parked,
+        (
+            Some("2026-02-01T00:00:00Z".into()),
+            Some("operator".into()),
+            Some("no movement in a month".into()),
+            None,
+            None
+        )
+    );
+    assert_eq!(n(&db, "SELECT folded_into FROM tasks WHERE id = 11"), 10);
+    assert_eq!(n(&db, "SELECT archived_at IS NULL FROM tasks WHERE id = 11"), 1);
+    // Finished archived work stays filed; a plain archive stays archived.
+    assert_eq!(n(&db, "SELECT parked_at IS NULL AND archived_at IS NOT NULL FROM tasks WHERE id = 12"), 1);
+    assert_eq!(n(&db, "SELECT parked_at IS NULL AND archived_at IS NOT NULL FROM tasks WHERE id = 13"), 1);
+    assert!(r.notes.iter().any(|n| n.contains("2 parked task(s)")), "{:?}", r.notes);
+
+    // Workflow records, checks and handoff notes copy by column name.
+    assert_eq!(n(&db, "SELECT revision FROM task_workflow WHERE task_id = 1"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_checks"), 1);
+    assert_eq!(table(&r, "task_checks").skipped.get("missing_task_id"), Some(&1));
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM session_handoff_notes WHERE state = 'sealed'"), 1);
+
+    // A second run changes nothing.
+    let again = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert!(!again.notes.iter().any(|n| n.contains("parked task(s)")), "{:?}", again.notes);
+}

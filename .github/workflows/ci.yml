@@ -13,6 +13,16 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Team vocabulary and personal identifiers stay out of tracked files.
+  # VOCAB_DENYLIST (optional secret) adds private patterns.
+  vocab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/vocab-check.sh
+        env:
+          VOCAB_DENYLIST: ${{ secrets.VOCAB_DENYLIST }}
+
   check:
     runs-on: ubuntu-latest
     steps:

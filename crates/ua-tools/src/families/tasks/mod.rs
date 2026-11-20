@@ -14,6 +14,8 @@ mod graph;
 mod list;
 mod write;
 
+pub(crate) use write::{NewTask, insert_task};
+
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value, json};

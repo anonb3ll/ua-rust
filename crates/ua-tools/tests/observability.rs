@@ -57,7 +57,7 @@ async fn doctor_reports_every_capability_without_secrets() {
     std::fs::create_dir_all(cfg.workspace_root()).unwrap();
     let hub = Hub::open(cfg).unwrap();
     let reg = builtin_registry();
-    let who = agent("reviewer-1", Profile::Cto);
+    let who = agent("reviewer-1", Profile::Lead);
 
     let report = call(&reg, &hub, &who, "system_doctor", json!({ "refresh": true })).await;
     let text = report.to_string();
@@ -250,19 +250,19 @@ async fn activity_metrics_and_task_anomalies() {
 }
 
 #[tokio::test]
-async fn cloud_assistant_reaches_only_its_actions() {
+async fn remote_assistant_reaches_only_its_actions() {
     let hub = mem_hub();
     let reg = builtin_registry();
-    let cloud = agent("assistant-1", Profile::CloudAssistant);
-    let list = call(&reg, &hub, &cloud, "observability_manage", json!({ "action": "agent_list" })).await;
+    let remote = agent("assistant-1", Profile::RemoteAssistant);
+    let list = call(&reg, &hub, &remote, "observability_manage", json!({ "action": "agent_list" })).await;
     assert!(list["agents"].is_array());
-    let ctx = call(&reg, &hub, &cloud, "observability_manage", json!({ "action": "agent_context" })).await;
+    let ctx = call(&reg, &hub, &remote, "observability_manage", json!({ "action": "agent_context" })).await;
     assert!(ctx.is_object());
     let err =
-        reg.call(&hub, &cloud, "observability_manage", json!({ "action": "metrics" })).await.unwrap_err();
+        reg.call(&hub, &remote, "observability_manage", json!({ "action": "metrics" })).await.unwrap_err();
     assert_eq!(err.code(), "denied");
     // The legacy standalone tools are not on its surface.
-    let err = reg.call(&hub, &cloud, "perf_summary", json!({})).await.unwrap_err();
+    let err = reg.call(&hub, &remote, "perf_summary", json!({})).await.unwrap_err();
     assert_eq!(err.code(), "denied");
 }
 
