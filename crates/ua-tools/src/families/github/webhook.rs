@@ -6,12 +6,20 @@
 //!    Without one every delivery is refused (`not_configured`).
 //! 2. `X-Hub-Signature-256` must be `sha256=<hex>` of HMAC-SHA256(secret,
 //!    raw body), compared in constant time (`bad_signature`).
-//! 3. `X-GitHub-Delivery` must be a well-formed id that this hub has not
-//!    seen (`replayed`). Ids are kept 30 days, at most 20 000 of them.
+//! 3. The payload's own timestamps (`pull_request.merged_at` or
+//!    `updated_at`, `check_run.completed_at`, `check_suite.updated_at`,
+//!    `workflow_run.updated_at`, `repository.pushed_at`), when it has one,
+//!    must be no older than `github_webhook_max_age_hours` (default 24;
+//!    `stale`). A signed body captured long ago is not accepted again.
+//! 4. Neither `X-GitHub-Delivery` (a well-formed id) nor the SHA-256 of the
+//!    raw body may have been seen before (`replayed`). The delivery and event
+//!    headers are not covered by the signature, so a signed body re-sent
+//!    under a fresh delivery id is still a replay. Both are kept 30 days, at
+//!    most 20 000 of each, and stored in one transaction.
 //!
 //! Then the event is ledgered (`agent.github.webhook.received`) in the same
-//! transaction that stores the delivery id, and handled only when its
-//! repository is bound to a project:
+//! transaction that stores the delivery id and body hash, and handled only
+//! when its repository is bound to a project:
 //!
 //! - `pull_request` closed with `merged: true`: close the tasks it finishes
 //!   (close-on-merge rules, `task_update` with the merge commit as evidence).
@@ -27,7 +35,7 @@
 use hmac::{Hmac, KeyInit, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use ua_core::UaError;
 use ua_store::{EventInput, ledger};
 
@@ -39,6 +47,8 @@ use crate::families::continuity::merged::{MergedPr, close_merged};
 /// Delivery ids kept for replay protection.
 const KEEP_DAYS: i64 = 30;
 const KEEP_MAX: i64 = 20_000;
+/// Marks a body-hash replay inside the dedupe transaction.
+const REPLAYED_BODY: &str = "replayed_body";
 
 /// One delivery as received: the three GitHub headers and the raw body.
 #[derive(Debug, Clone, Copy)]
@@ -59,8 +69,10 @@ pub enum WebhookError {
     NotConfigured,
     /// Missing or wrong signature.
     BadSignature,
-    /// The delivery id was already processed.
+    /// The delivery id, or the same body, was already processed.
     Replayed,
+    /// The payload's own timestamp is older than `github_webhook_max_age_hours`.
+    Stale,
     BadRequest(String),
     Internal(String),
 }
@@ -71,6 +83,7 @@ impl WebhookError {
             WebhookError::NotConfigured => "not_configured",
             WebhookError::BadSignature => "bad_signature",
             WebhookError::Replayed => "replayed",
+            WebhookError::Stale => "stale",
             WebhookError::BadRequest(_) => "bad_request",
             WebhookError::Internal(_) => "internal",
         }
@@ -82,6 +95,7 @@ impl WebhookError {
             WebhookError::NotConfigured => 503,
             WebhookError::BadSignature => 401,
             WebhookError::Replayed => 409,
+            WebhookError::Stale => 409,
             WebhookError::BadRequest(_) => 400,
             WebhookError::Internal(_) => 500,
         }
@@ -93,7 +107,11 @@ impl WebhookError {
                 "no GitHub webhook secret is configured (github_webhook_secret_env)".into()
             }
             WebhookError::BadSignature => "missing or invalid X-Hub-Signature-256".into(),
-            WebhookError::Replayed => "this delivery id was already processed".into(),
+            WebhookError::Replayed => "this delivery id or payload was already processed".into(),
+            WebhookError::Stale => {
+                "the payload's timestamp is older than github_webhook_max_age_hours; a stale delivery is not processed"
+                    .into()
+            }
             WebhookError::BadRequest(m) | WebhookError::Internal(m) => m.clone(),
         }
     }
@@ -123,6 +141,30 @@ pub fn signature_valid(secret: &[u8], body: &[u8], signature: Option<&str>) -> b
     mac.verify_slice(&expected).is_ok()
 }
 
+/// A payload timestamp: RFC 3339 text or Unix seconds.
+fn ts(v: &Value) -> Option<jiff::Timestamp> {
+    match v {
+        Value::String(s) => s.parse::<jiff::Timestamp>().ok(),
+        Value::Number(n) => n.as_i64().and_then(|s| jiff::Timestamp::from_second(s).ok()),
+        _ => None,
+    }
+}
+
+/// The newest of the payload's own timestamps for `event`, if it has one.
+pub(crate) fn payload_time(event: &str, payload: &Value) -> Option<jiff::Timestamp> {
+    let fields: &[(&str, &str)] = match event {
+        "pull_request" => {
+            &[("pull_request", "merged_at"), ("pull_request", "updated_at"), ("pull_request", "closed_at")]
+        }
+        "check_run" => &[("check_run", "completed_at"), ("check_run", "started_at")],
+        "check_suite" => &[("check_suite", "updated_at"), ("check_suite", "created_at")],
+        "workflow_run" => &[("workflow_run", "updated_at"), ("workflow_run", "run_started_at")],
+        "push" => &[("repository", "pushed_at"), ("head_commit", "timestamp")],
+        _ => &[],
+    };
+    fields.iter().filter_map(|(obj, key)| ts(&payload[*obj][*key])).max()
+}
+
 fn well_formed(s: &str, max: usize, extra: &[char]) -> bool {
     (1..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
@@ -144,10 +186,23 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
     let payload: Value = serde_json::from_slice(d.body).map_err(|_| {
         WebhookError::BadRequest("the body is not JSON (set the content type to application/json)".into())
     })?;
+    let max_age = hub.cfg().github_webhook_max_age_hours;
+    if max_age > 0
+        && let Some(at) = payload_time(&event, &payload)
+    {
+        let oldest = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(max_age.min(24 * 365) as i64))
+            .unwrap_or_else(|_| jiff::Timestamp::now());
+        if at < oldest {
+            return Err(WebhookError::Stale);
+        }
+    }
     let action = payload["action"].as_str().unwrap_or_default().to_string();
     let repo = payload["repository"]["full_name"].as_str().unwrap_or_default().to_ascii_lowercase();
+    let body_hash = hex::encode(Sha256::digest(d.body));
 
-    let (dl, ev, ac, rp) = (delivery.clone(), event.clone(), action.clone(), repo.clone());
+    let (dl, ev, ac, rp, bh) =
+        (delivery.clone(), event.clone(), action.clone(), repo.clone(), body_hash.clone());
     let bound = hub
         .db()
         .write_async(move |tx| {
@@ -163,6 +218,12 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
                  ORDER BY received_at DESC LIMIT -1 OFFSET ?1)",
                 [KEEP_MAX - 1],
             )?;
+            tx.execute("DELETE FROM github_delivery_bodies WHERE received_at < ?1", [&cutoff])?;
+            tx.execute(
+                "DELETE FROM github_delivery_bodies WHERE body_sha256 IN (SELECT body_sha256 FROM \
+                 github_delivery_bodies ORDER BY received_at DESC LIMIT -1 OFFSET ?1)",
+                [KEEP_MAX - 1],
+            )?;
             let inserted = tx.execute(
                 "INSERT INTO github_deliveries (delivery_id, event, received_at) VALUES (?1, ?2, ?3) \
                  ON CONFLICT (delivery_id) DO NOTHING",
@@ -170,6 +231,16 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             )?;
             if inserted == 0 {
                 return Ok(None);
+            }
+            // The same signed body under a new delivery id is a replay too.
+            // Returning here rolls the delivery id back with the transaction.
+            let fresh_body = tx.execute(
+                "INSERT INTO github_delivery_bodies (body_sha256, delivery_id, received_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (body_sha256) DO NOTHING",
+                rusqlite::params![bh, dl, now],
+            )?;
+            if fresh_body == 0 {
+                return Err(UaError::conflict_code(REPLAYED_BODY, "this payload was already processed"));
             }
             let bound = !rp.is_empty() && BoundRepo::check(tx, &rp).is_ok();
             ledger::append(
@@ -182,16 +253,18 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             )?;
             Ok(Some(bound))
         })
-        .await?;
+        .await
+        .map_err(|e| if e.reason_code() == Some(REPLAYED_BODY) { WebhookError::Replayed } else { WebhookError::from(e) })?;
     let Some(bound) = bound else { return Err(WebhookError::Replayed) };
     let result = handle(hub, &event, &action, &repo, bound, &payload, &delivery).await;
     if let Err(WebhookError::Internal(_)) = &result {
         // Forget the id so GitHub's redelivery of this event is processed;
         // every effect is idempotent.
-        let dl = delivery.clone();
+        let (dl, bh) = (delivery.clone(), body_hash);
         let _ = hub
             .db()
             .write_async(move |tx| {
+                tx.execute("DELETE FROM github_delivery_bodies WHERE body_sha256 = ?1", [bh])?;
                 Ok(tx.execute("DELETE FROM github_deliveries WHERE delivery_id = ?1", [dl])?)
             })
             .await;
@@ -240,6 +313,12 @@ async fn handle(
                 number,
                 merge_sha,
                 head_ref: pr["head"]["ref"].as_str().map(str::to_string),
+                base_ref: pr["base"]["ref"].as_str().map(str::to_string),
+                default_branch: payload["repository"]["default_branch"]
+                    .as_str()
+                    .or_else(|| pr["base"]["repo"]["default_branch"].as_str())
+                    .map(str::to_string),
+                merged_at: pr["merged_at"].as_str().map(str::to_string),
                 url: pr["html_url"]
                     .as_str()
                     .map(str::to_string)

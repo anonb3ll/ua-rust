@@ -641,7 +641,12 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
     .await
     .unwrap();
     let task = reg
-        .call(&hub.state.hub, &human, "task_add", json!({ "title": "feature", "notes": "PR example/repo#4" }))
+        .call(
+            &hub.state.hub,
+            &human,
+            "task_add",
+            json!({ "title": "feature", "notes": "closes: example/repo#4" }),
+        )
         .await
         .unwrap()["id"]
         .as_i64()
@@ -650,8 +655,9 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
     let payload = json!({
         "action": "closed",
         "pull_request": { "number": 4, "merged": true, "merge_commit_sha": merge,
-                          "head": { "ref": "feature" }, "html_url": "https://github.com/example/repo/pull/4" },
-        "repository": { "full_name": "example/repo" },
+                          "head": { "ref": "feature" }, "base": { "ref": "main" },
+                          "html_url": "https://github.com/example/repo/pull/4" },
+        "repository": { "full_name": "example/repo", "default_branch": "main" },
     });
 
     // No bearer is needed, but the signature is.
@@ -675,6 +681,10 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
     assert_eq!(status, ("done".to_string(), Some(merge.to_string())));
     // The same delivery again is refused.
     let resp = hub.send(webhook(&payload, "delivery-1", "pull_request", WEBHOOK_SECRET)).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(resp).await["error"], "replayed");
+    // So is the same signed body under a fresh delivery id (the headers are not signed).
+    let resp = hub.send(webhook(&payload, "delivery-2", "pull_request", WEBHOOK_SECRET)).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(resp).await["error"], "replayed");
     // A form-encoded body never reaches the handler.

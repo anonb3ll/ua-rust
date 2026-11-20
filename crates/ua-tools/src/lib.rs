@@ -3,7 +3,9 @@
 //! [`Registry::call`] is the single chokepoint every adapter (MCP, HTTP, CLI,
 //! UI) goes through. In order it:
 //!
-//! 1. finds the tool,
+//! 1. finds the tool, and refuses any call outside the narrow grant of a
+//!    hub-internal identity that holds one (the GitHub connector's
+//!    `hub-github`: see [`families::github`]),
 //! 2. checks the caller's profile exposes it (and the `action`, for
 //!    consolidated `*_manage` tools); a policy-file profile overlay may lower
 //!    an agent's profile first,
