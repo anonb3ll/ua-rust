@@ -137,6 +137,34 @@ difference fails outright.
 Every later section adds its cases to the corpus in the same change, so each is
 measured from the day it lands.
 
+**External benchmark.** The fixture corpus measures what a multi-agent,
+multi-organization store needs (supersession, `as_of`, scope) and that no public
+benchmark expresses. Retrieval quality on long conversational history is
+measured against LongMemEval-S, reusing the predecessor's method and the same
+dataset file (pinned by SHA-256 `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`),
+so the numbers are comparable. It needs a download and a model, so it is a
+recorded run (`ua memory bench --longmemeval`, results committed under
+`docs/evals/`), not a CI gate. The predecessor's scorecard (2026-10-19) is the
+baseline to beat:
+
+| Configuration | Strict recall@5 |
+|---|---|
+| Hybrid, 120-question stratified sample | 0.883 (106/120); about 0.846 reweighted to all 470 |
+| Lexical legs only, all 470 | 0.826 (388/470) |
+| A leading standalone memory system, same file | 0.955 |
+
+The scorecard also names the cause of most of the gap: notes average about
+10,000 characters, the encoder reads only the first 512 tokens, and the
+evidence is rarely in the opening, so the semantic leg added two questions out
+of 120. That is why chunked embeddings (step 2) come straight after this step.
+Besides recall@5, record MRR@10, `as_of` accuracy, the share of stale results
+returned (target under 2%) and p95 search latency (target under 100 ms).
+
+**One layer at a time.** Each later step records its numbers before the next
+starts. If chunking does not move the long-document class and the LongMemEval
+score materially, the diagnosis was wrong, and the next step waits rather than
+stacking on top of it.
+
 ### 2. Chunked embeddings and a default embedder
 
 **Chunks.** Port `memory_chunks.py` so imported hubs embed the same text:
@@ -870,6 +898,22 @@ holds.
 - **No model calls from the hub.** Summaries and episodes are written by agents,
   under their budgets, and validated by the hub. This deliberately drops the
   predecessor's hub-side adjudication and unreviewed auto-apply.
+- **No cross-encoder reranking or model query rewriting** in this design.
+  Each costs latency and a model dependency, and neither addresses the measured
+  truncation gap.
+
+## Considered for later
+
+- **A second time axis.** `valid_from`/`valid_to` say when a fact was true, not
+  when the hub learned it, so "as of X" today silently means "as known now".
+  Adding `recorded_from`/`recorded_to` would make it bi-temporal, used to
+  rerank rather than filter, so history is kept. It is deferred until the
+  temporal class shows the gap.
+- **Model-based entity extraction.** Entities here are deterministic
+  identifiers and human-written `[[wikilinks]]`, so an edge is never a guess.
+  Model-extracted entities are considered only if the graph leg leaves a
+  measured relational gap, because a wrong edge silently degrades every
+  traversal through it.
 
 ## Acceptance
 
