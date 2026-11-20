@@ -342,6 +342,13 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
     }
     let cfg = load_config(&cli)?;
 
+    // Refused before the hub lock and Hub::open, which may migrate the
+    // database: a build that cannot serve MCP touches nothing.
+    #[cfg(not(feature = "mcp-server"))]
+    if let Cmd::Mcp { .. } = cli.cmd {
+        anyhow::bail!("{NO_MCP_SERVER}");
+    }
+
     if let Cmd::Config = cli.cmd {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());
@@ -448,6 +455,7 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
         #[cfg(feature = "mcp-server")]
         Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
         #[cfg(not(feature = "mcp-server"))]
+        // Refused before the hub was opened (above).
         Cmd::Mcp { .. } => anyhow::bail!("{NO_MCP_SERVER}"),
         Cmd::Tools { names } => {
             for t in registry.all() {

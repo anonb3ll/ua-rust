@@ -73,6 +73,16 @@ async fn authorize(
     assert!(!csp.contains("unsafe-inline") && !csp.contains("form-action"), "{csp}");
     let html = text_body(page).await;
     assert!(html.contains("Test client"));
+    // The page names the resource the grant reaches, and words it for MCP
+    // only when that is /mcp (never in a build without mcp-server).
+    let granted = match resource {
+        Some(r) => r.trim_end_matches('/').to_string(),
+        None if ua_server::MCP_SERVER => format!("{BASE}/mcp"),
+        None => BASE.to_string(),
+    };
+    assert!(html.contains(&format!("Resource: <code>{granted}</code>")), "{html}");
+    let wording = if granted.ends_with("/mcp") { "this hub's MCP tools" } else { "this hub's API and tools" };
+    assert!(html.contains(wording), "{html}");
     assert!(!html.contains("<style") && !html.contains("<script"), "{html}");
     assert!(html.contains("href=\"/login/assets/page.css\""));
     let (rid, csrf) = (hidden(&html, "request_id"), hidden(&html, "csrf"));
@@ -819,4 +829,27 @@ async fn an_unknown_client_and_a_wrong_secret_get_the_same_answer() {
             .await;
     assert_eq!(s3, StatusCode::UNAUTHORIZED);
     assert_eq!(public, wrong);
+}
+
+/// A build without the mcp-server feature has no /mcp resource: naming it
+/// explicitly is refused at the authorization endpoint and for
+/// client_credentials alike.
+#[cfg(not(feature = "mcp-server"))]
+#[tokio::test]
+async fn without_an_mcp_server_the_mcp_resource_is_refused() {
+    let mcp = format!("{BASE}/mcp");
+    let hub = cc_hub();
+    let client_id = public_client(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let resp = hub.send(get(&authorize_url(&client_id, VERIFIER, Some(&mcp)), Some(&cookie), None)).await;
+    assert!(resp.status().is_redirection());
+    assert_eq!(query_param(&location(&resp), "error").as_deref(), Some("invalid_target"));
+
+    let (status, e) = cc_token(&hub, "svc-1", &[("resource", &mcp)]).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "invalid_target", "{e}");
+    // Without a resource the token is hub-wide and reaches /api.
+    let (status, t) = cc_token(&hub, "svc-1", &[]).await;
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(hub.send(get("/api/whoami", None, t["access_token"].as_str())).await.status(), 200);
 }

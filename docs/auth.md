@@ -24,6 +24,10 @@ A 401 carries an RFC 9728 challenge when OAuth is on:
 WWW-Authenticate: Bearer realm="ua", resource_metadata="https://hub.example.com/.well-known/oauth-protected-resource/mcp", scope="mcp", error="invalid_token"
 ```
 
+That is a build with the `mcp-server` cargo feature (the default). Without
+it there is no `/mcp`, and `resource_metadata` points at the hub's document,
+`/.well-known/oauth-protected-resource`.
+
 ## Settings
 
 All settings are in `config.toml` or `UA_*` environment variables. The
@@ -101,7 +105,7 @@ Code: `crates/ua-server/src/oauth/`. It follows the MCP authorization spec
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the MCP endpoint (`resource` = `<public_url>/mcp`). |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the MCP endpoint (`resource` = `<public_url>/mcp`). Served only with the `mcp-server` feature (the default). |
 | `GET /.well-known/oauth-protected-resource` | Metadata for the whole hub (`resource` = `<public_url>`). |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata. |
 | `GET /oauth/authorize` | Authorization request; renders the consent page for a signed-in human. |
@@ -128,7 +132,10 @@ Rules the server enforces:
 - **Resource indicators** (RFC 8707). `resource` may be omitted (the token is
   for `/mcp`), `<public_url>/mcp`, or `<public_url>` (valid on `/mcp` and
   `/api`). Anything else is `invalid_target`. The bearer check enforces the
-  audience.
+  audience. In a build without the `mcp-server` feature there is no `/mcp`:
+  an omitted `resource` gives a hub-wide token (`<public_url>`), and
+  `<public_url>/mcp` is `invalid_target`. The consent page names the
+  resource the grant reaches.
 - **Consent needs a signed-in human.** Without a session the browser goes to
   `/login?next=...` and comes back. The human picks one of
   `oauth_identities`; the grant acts as that identity under its profile

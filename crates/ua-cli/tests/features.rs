@@ -24,6 +24,9 @@ fn ua_mcp_without_the_mcp_server_feature_names_it() {
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("built without the mcp-server feature"), "{stderr}");
     assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+    // Refused before the hub lock or the database is touched.
+    let left: Vec<_> = std::fs::read_dir(home.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "ua mcp created {left:?}");
 }
 
 /// The help lists `mcp` in every build.
