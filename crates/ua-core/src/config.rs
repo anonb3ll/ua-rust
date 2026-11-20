@@ -102,6 +102,11 @@ pub struct Config {
     /// `~/.unified_agent/harness-config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_config_root_hint: Option<String>,
+    /// Test hook: how long one harness config change-summary diff may take,
+    /// in milliseconds, instead of the built-in limit (`Some(0)` makes every
+    /// diff time out). It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub harness_config_diff_timeout_ms: Option<u64>,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -221,6 +226,15 @@ pub struct Config {
     /// cannot be set from TOML or the environment.
     #[serde(skip)]
     pub search_endpoint: Option<String>,
+    /// Test hook: directory prepended to `PATH` for `python_lint_and_format`
+    /// only, so a stub `ruff` can be found. It cannot be set from TOML or the
+    /// environment. The program name stays `ruff`; this does not add a shell.
+    #[serde(skip)]
+    pub python_lint_path_prepend: Option<PathBuf>,
+    /// Test hook: replaces the 30-second per-step timeout of
+    /// `python_lint_and_format`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub python_lint_timeout: Option<std::time::Duration>,
     /// Outbound notification webhook (`notify`, `flush_digest`). Unset keeps
     /// notifications in the outbox with status `not_configured`.
     pub notify_webhook_url: Option<String>,
@@ -264,6 +278,12 @@ pub struct Config {
     /// `zulip_send_message` calls one caller may make per hour (each call
     /// runs the gates; one approved message takes two). 0 refuses every call.
     pub zulip_send_calls_per_hour: u32,
+    /// Slack signing secret, from the `UA_SLACK_SIGNING_SECRET` environment
+    /// variable; keep it out of the config file. Read by the future Slack
+    /// route (docs/slack.md); no tool reads it. Never logged, never written
+    /// to the database.
+    #[serde(skip_serializing)]
+    pub slack_signing_secret: Option<SecretString>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
     /// Empty means dispatch only records runs and spawns nothing.
     pub harnesses: BTreeMap<String, HarnessConfig>,
@@ -625,6 +645,7 @@ impl Default for Config {
             session_credentials_enabled: false,
             node_require_acceptance: false,
             harness_config_root_hint: None,
+            harness_config_diff_timeout_ms: None,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
@@ -665,6 +686,8 @@ impl Default for Config {
             dash_docsets: Vec::new(),
             fetch_allow_loopback: false,
             search_endpoint: None,
+            python_lint_path_prepend: None,
+            python_lint_timeout: None,
             notify_webhook_url: None,
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
@@ -677,6 +700,7 @@ impl Default for Config {
             zulip_link_hosts: Vec::new(),
             zulip_mention_allowlist: Vec::new(),
             zulip_send_calls_per_hour: 30,
+            slack_signing_secret: None,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,
@@ -967,6 +991,15 @@ impl Config {
         self.human_identities.iter().any(|h| h == label)
     }
 
+    /// The profile configuration gives `label` explicitly: a `profiles` entry
+    /// naming a known, assignable profile (an `oauth_identities` label gets
+    /// `oauth_profile` that way when the config is loaded). `None` where a
+    /// caller would otherwise fall back to the broad `developer` default, so
+    /// OAuth credentials, whose identity is meant to be narrowed, require it.
+    pub fn explicit_profile(&self, label: &str) -> Option<crate::Profile> {
+        self.profiles.get(label).and_then(|p| p.parse::<crate::Profile>().ok()).filter(|p| p.assignable())
+    }
+
     /// The identities allowed to run lifecycle operator actions:
     /// `lifecycle_operators` when it is set, else `human_identities`.
     pub fn lifecycle_operators(&self) -> &[String] {
@@ -1098,6 +1131,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_python_lint_test_hooks_cannot_be_set_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "python_lint_path_prepend = \"/srv/bin\"\npython_lint_timeout = 1\n").unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert!(cfg.python_lint_path_prepend.is_none());
+        assert!(cfg.python_lint_timeout.is_none());
+    }
 
     #[test]
     fn the_session_credential_profile_cannot_be_configured() {

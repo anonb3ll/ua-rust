@@ -129,7 +129,12 @@ fn fs_read(sb: &Sandbox, a: ReadArgs) -> UaResult<Value> {
 
 /// The nearest directory at or above `p` (inside `root`) holding a `.git` entry.
 fn repository_root(p: &Path, root: &Path) -> Option<PathBuf> {
-    let mut cur = p.parent();
+    repository_at_or_above(p.parent()?, root)
+}
+
+/// The nearest directory at or above `start` itself (inside `root`) holding a `.git` entry.
+fn repository_at_or_above(start: &Path, root: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
     while let Some(dir) = cur {
         if !dir.starts_with(root) {
             return None;
@@ -142,28 +147,46 @@ fn repository_root(p: &Path, root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Refuse a write into the repository's configured `core.hooksPath`: a custom
-/// hooks directory can have any name, so the fixed hook-dir list cannot see it.
-async fn guard_configured_hooks(resolved: &Path, root: &Path, shown: &str) -> UaResult<()> {
-    let Some(repo) = repository_root(resolved, root) else { return Ok(()) };
+/// The repository's configured `core.hooksPath`, resolved, when one is set.
+async fn configured_hooks_dir(repo: &Path) -> Option<PathBuf> {
     let args: Vec<String> =
         ["config", "--path", "--get", "core.hooksPath"].iter().map(|s| s.to_string()).collect();
-    let Ok(out) = run_program("git", &args, &repo, &git_env(), Duration::from_secs(10), 64 * 1024).await
-    else {
-        return Ok(()); // git is not installed: it cannot run hooks either.
-    };
+    // git is not installed: it cannot run hooks either.
+    let out = run_program("git", &args, repo, &git_env(), Duration::from_secs(10), 64 * 1024).await.ok()?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if out.exit_code != 0 || value.is_empty() {
-        return Ok(());
+        return None;
     }
-    let hooks = canonicalize_lenient(&repo.join(&value)).unwrap_or_else(|_| repo.join(&value));
-    if resolved.starts_with(&hooks) {
-        return Err(UaError::denied(
+    Some(canonicalize_lenient(&repo.join(&value)).unwrap_or_else(|_| repo.join(&value)))
+}
+
+fn hook_dir_refusal(shown: &str) -> UaError {
+    UaError::denied("hook_dir", format!("{shown:?} is inside the repository's configured hooks directory"))
+}
+
+/// Refuse a write into the repository's configured `core.hooksPath`: a custom
+/// hooks directory can have any name, so the fixed hook-dir list cannot see it.
+pub(crate) async fn guard_configured_hooks(resolved: &Path, root: &Path, shown: &str) -> UaResult<()> {
+    let Some(repo) = repository_root(resolved, root) else { return Ok(()) };
+    match configured_hooks_dir(&repo).await {
+        Some(hooks) if resolved.starts_with(&hooks) => Err(hook_dir_refusal(shown)),
+        _ => Ok(()),
+    }
+}
+
+/// [`guard_configured_hooks`] for a directory a tool rewrites files under:
+/// refused when it lies inside the configured hooks directory of the
+/// repository holding it, or when that hooks directory lies inside it.
+pub(crate) async fn guard_configured_hooks_dir(dir: &Path, root: &Path, shown: &str) -> UaResult<()> {
+    let Some(repo) = repository_at_or_above(dir, root) else { return Ok(()) };
+    match configured_hooks_dir(&repo).await {
+        Some(hooks) if dir.starts_with(&hooks) => Err(hook_dir_refusal(shown)),
+        Some(hooks) if hooks.starts_with(dir) => Err(UaError::denied(
             "hook_dir",
-            format!("{shown:?} is inside the repository's configured hooks directory"),
-        ));
+            format!("{shown:?} contains the repository's configured hooks directory"),
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn write_file(p: &Path, a: &WriteArgs) -> UaResult<()> {

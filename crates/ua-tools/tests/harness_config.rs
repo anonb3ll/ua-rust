@@ -115,11 +115,16 @@ fn reason(e: &UaError) -> String {
 
 impl H {
     fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.human_identities = vec!["operator".into()];
         cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-bot".into()]);
         cfg.workspace = Some(ws.path().to_path_buf());
+        tweak(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), _ws: ws }
     }
 
@@ -181,6 +186,14 @@ impl H {
             self.scalar(&format!("SELECT payload FROM approvals WHERE id = {id}")).as_str().unwrap(),
         )
         .unwrap()
+    }
+
+    /// What `approval_pending` shows the approver beside a pending
+    /// approval's payload.
+    async fn approval_display(&self, id: i64) -> Value {
+        let queue = self.ok(&human(), "approval_pending", json!({})).await;
+        let row = queue["pending"].as_array().unwrap().iter().find(|a| a["id"] == id).cloned();
+        row.unwrap_or_else(|| panic!("approval {id} is not pending: {queue}"))["display"].clone()
     }
 
     /// Park the call, approve it as the human operator, and retry it.
@@ -336,19 +349,23 @@ async fn a_node_gets_reports_drift_and_applies_only_with_an_approved_pass() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM harness_config_drift"), json!(2));
     assert_eq!(h.events("harness_config_report"), 1);
 
-    // The approval binds node, surface, path, version and hash, and carries
-    // the hub's own summary of the change (nothing applied yet: all added).
+    // The approval binds node, surface, path, version, hash and the base the
+    // change starts from (nothing applied yet), all deterministic; the
+    // approver is shown the hub's own diff beside it (all added).
     let approval_id = r1["proposals"][0]["approval_id"].as_i64().unwrap();
-    let mut payload = h.approval_payload(approval_id);
-    let summary = payload.as_object_mut().unwrap().remove("change_summary").unwrap();
     assert_eq!(
-        payload,
-        json!({ "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1", "desired_hash": claude["hash"] })
+        h.approval_payload(approval_id),
+        json!({
+            "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
+            "desired_hash": claude["hash"],
+            "change_summary": { "base": "none", "from_bundle_version": null, "from_hash": null, "from_text_sha256": null },
+        })
     );
-    assert_eq!(summary["base"], "none");
-    assert_eq!(summary["lines_added"], 1);
-    assert_eq!(summary["lines_removed"], 0);
-    assert!(summary["diff"].as_str().unwrap().contains("+rules"), "{summary}");
+    let shown = h.approval_display(approval_id).await;
+    assert_eq!(shown["proposal_id"], r1["proposals"][0]["proposal_id"]);
+    assert_eq!(shown["lines_added"], 1);
+    assert_eq!(shown["lines_removed"], 0);
+    assert!(shown["diff"].as_str().unwrap().contains("+rules"), "{shown}");
 
     // Before approval, applied parks (stays pending) and writes nothing.
     let applied = json!({ "action": "applied", "surface": "claude", "desired_hash": claude["hash"] });
@@ -800,14 +817,17 @@ async fn the_apply_approval_summarizes_the_change_from_the_last_applied_content(
         )
         .await
         .unwrap();
-    let summary =
-        h.approval_payload(r["proposals"][0]["approval_id"].as_i64().unwrap())["change_summary"].clone();
+    let id = r["proposals"][0]["approval_id"].as_i64().unwrap();
+    let summary = h.approval_payload(id)["change_summary"].clone();
     assert_eq!(summary["base"], "last_applied");
     assert_eq!(summary["from_bundle_version"], "v1");
     assert_eq!(summary["from_hash"], hash);
-    assert_eq!(summary["lines_added"], 1);
-    assert_eq!(summary["lines_removed"], 1);
-    let diff = summary["diff"].as_str().unwrap();
+    assert_eq!(summary["from_text_sha256"], hash, "the SHA-256 of the text last applied");
+    assert!(summary.get("diff").is_none(), "the diff is not bound: {summary}");
+    let shown = h.approval_display(id).await;
+    assert_eq!(shown["lines_added"], 1);
+    assert_eq!(shown["lines_removed"], 1);
+    let diff = shown["diff"].as_str().unwrap();
     assert!(diff.contains("-two") && diff.contains("+three") && diff.contains("a/CLAUDE.md"), "{diff}");
 }
 
@@ -1012,6 +1032,328 @@ async fn a_large_change_is_shown_in_full_in_the_apply_approval() {
     let rules: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
     h.publish(json!({ "version": "v1", "rules": { "claude": rules } })).await;
     let (_, id) = report(&h, "v1", "claude").await;
-    let diff = h.approval_payload(id)["change_summary"]["diff"].as_str().unwrap().to_string();
+    let diff = h.approval_display(id).await["diff"].as_str().unwrap().to_string();
     assert!(diff.len() > 100_000 && diff.contains("+line 19999") && !diff.contains("truncated"));
+    // The approval row holds only the deterministic binding, not the diff.
+    let stored = h.scalar(&format!("SELECT length(payload) FROM approvals WHERE id = {id}"));
+    assert!(stored.as_i64().unwrap() < 1_000, "{stored}");
+}
+
+#[tokio::test]
+async fn an_apply_pass_does_not_depend_on_how_long_the_diff_took() {
+    // Every diff on this hub times out, so its change summary is a full
+    // replacement rather than the minimal diff.
+    let h = H::with(|c| c.harness_config_diff_timeout_ms = Some(0));
+    h.register().await;
+    h.publish(json!({ "version": "v1", "rules": { "claude": "a\nX\nb\nY\nc\n" } })).await;
+    let got = h.config(json!({})).await.unwrap();
+    let (_, id) = report(&h, "v1", "claude").await;
+    h.approve(id).await;
+    h.config(applied_args(&got, "claude")).await.unwrap();
+
+    h.publish(json!({ "version": "v2", "rules": { "claude": "a\nP\nb\nQ\nc\n" } })).await;
+    let got = h.config(json!({})).await.unwrap();
+    let (_, id) = report(&h, "v2", "claude").await;
+    // The approver still sees the whole change, as the timed-out diff gave it.
+    let diff = h.approval_display(id).await["diff"].as_str().unwrap().to_string();
+    assert!(diff.contains("-X") && diff.contains("+P") && diff.contains("+Q"), "{diff}");
+    h.approve(id).await;
+
+    // The same database seen by a hub whose diff completes: the approval was
+    // bound to deterministic values, so the approved pass still matches.
+    let mut cfg = h.hub.cfg().clone();
+    cfg.harness_config_diff_timeout_ms = None;
+    let other = Hub::new(cfg, h.hub.db().clone());
+    let (dev, get) = (device(), json!({ "node": NODE }));
+    let grants = h.reg.call(&other, &dev, "node_config", get).await.unwrap()["apply_grants"].clone();
+    assert_eq!(grants.as_array().map(Vec::len), Some(1), "{grants}");
+    assert_eq!(grants[0]["approval_id"], id);
+    let mut args = applied_args(&got, "claude");
+    args["node"] = json!(NODE);
+    let applied = h.reg.call(&other, &dev, "node_config", args).await.unwrap();
+    assert_eq!(applied["approval_id"], id, "{applied}");
+}
+
+// --- permission front matter in rules text (hub #2687) ------------------------------
+
+fn refusal(raw: Value) -> String {
+    match policy::validate(&raw) {
+        Ok(_) => panic!("{raw} should be refused"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn front_matter(key: &str) -> String {
+    format!("---\nname: helper\ndescription: Helps.\n{key}: Bash, Edit\n---\nDo the thing.\n")
+}
+
+#[test]
+fn permission_front_matter_is_refused_in_rules_text_on_the_default_surfaces() {
+    // claude, agents and cursor are rules surfaces; codex and opencode are
+    // mcp surfaces that carry rules text too.
+    for surface in ["claude", "agents", "cursor", "codex", "opencode"] {
+        let e = refusal(json!({ "version": "1", "rules": { surface: front_matter("allowed-tools") } }));
+        assert!(e.contains(&format!("rules.{surface}")) && e.contains("allowed-tools"), "{surface}: {e}");
+    }
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_a_commands_rules_surface() {
+    let surfaces = json!({ "deploy": { "path": ".claude/commands/deploy.md", "kind": "rules" } });
+    for key in ["allowed-tools", "Allowed-Tools", "hooks", "permissions", "disallowed-tools"] {
+        let e = refusal(
+            json!({ "version": "1", "surfaces": surfaces, "rules": { "deploy": front_matter(key) } }),
+        );
+        assert!(e.contains("rules.deploy") && e.contains(key), "{key}: {e}");
+    }
+    // A command's ordinary front matter is fine.
+    let ok = "---\ndescription: Deploy the site.\nargument-hint: [env]\n---\nDeploy to $ARGUMENTS.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "deploy": ok } })).unwrap();
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_an_agents_rules_surface() {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    // A subagent grants itself tools with `tools`, and widens what it may do
+    // with `disallowedTools`, `permissionMode` or `mcpServers`.
+    for key in ["tools", "disallowedTools", "permissionMode", "mcpServers"] {
+        let e = refusal(
+            json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": front_matter(key) } }),
+        );
+        assert!(e.contains("rules.helper") && e.contains(key), "{key}: {e}");
+    }
+    // Forms a strict parser would not read as front matter, but a host might.
+    for text in [
+        "---\ntools: Bash\n---",                 // no newline after the closing line
+        "---\r\ntools: Bash\r\n---\r\nbody\r\n", // CRLF
+        "---\n\"tools\": Bash\n---\nbody\n",     // a quoted key
+        "---\nname: h\ntools: Bash\n",           // never closed
+    ] {
+        let e = refusal(json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }));
+        assert!(e.contains("rules.helper") && e.contains("tools"), "{text:?}: {e}");
+    }
+    let ok = "---\nname: helper\ndescription: Reviews diffs. Use when asked.\nmodel: inherit\n---\nReview.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": ok } })).unwrap();
+    // `tools` below the front matter is just text.
+    let prose = "# Helper\n\ntools: none needed\n";
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": prose } })).unwrap();
+}
+
+/// Refused as the front matter of a `.claude/agents/*.md` rules surface,
+/// with `needle` named in the error.
+fn refused_on_agents_surface(text: &str, needle: &str) {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    let e = refusal(json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }));
+    assert!(e.contains("rules.helper") && e.contains(needle), "{text:?}: {e}");
+}
+
+fn passes_on_agents_surface(text: &str) {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }))
+        .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+}
+
+#[test]
+fn front_matter_keys_are_allowlisted() {
+    // Keys no denylist named: opencode's `permission`, Claude Code's
+    // `context` and `agent`, `mode`, and anything else.
+    for key in ["permission", "context", "agent", "mode", "skills", "anything-new"] {
+        refused_on_agents_surface(&format!("---\nname: h\n{key}: x\n---\nbody\n"), &format!("`{key}`"));
+    }
+    // Keys are read after parsing, so their spelling cannot hide them.
+    refused_on_agents_surface("---\n{name: h, tools: Bash}\n---\nbody\n", "`tools`"); // flow mapping
+    refused_on_agents_surface("---\n  name: h\n  tools: Bash\n---\nbody\n", "`tools`"); // indented mapping
+    refused_on_agents_surface("---\n\"\\x74ools\": Bash\n---\nbody\n", "`tools`"); // escaped quoted key
+    // An allowed key with a structured value is refused too.
+    refused_on_agents_surface("---\ndescription:\n  tools: Bash\n---\nbody\n", "plain value");
+    // Every allowed key passes.
+    passes_on_agents_surface(
+        "---\nname: h\ndescription: Helps.\nglobs: [\"*.rs\", \"*.md\"]\nalwaysApply: true\nargument-hint: \"[file]\"\nmodel: inherit\n---\nbody\n",
+    );
+}
+
+#[test]
+fn front_matter_that_does_not_parse_is_refused() {
+    // Deeper than the YAML parser's nesting budget.
+    let deep = format!(
+        "---\nname: h\ndescription: {}x{}\ntools: Bash\n---\nbody\n",
+        "[".repeat(100),
+        "]".repeat(100)
+    );
+    refused_on_agents_surface(&deep, "does not parse");
+    refused_on_agents_surface("---\nname: h\ntools: [Bash\n---\nbody\n", "does not parse");
+    refused_on_agents_surface("+++\nname = \"h\"\ntools = [\"Bash\"\n+++\nbody\n", "does not parse");
+}
+
+#[test]
+fn front_matter_opens_and_closes_as_hosts_read_it() {
+    // `---yaml` names the language; other languages are refused.
+    refused_on_agents_surface("---yaml\nname: h\ntools: Bash\n---\nbody\n", "`tools`");
+    refused_on_agents_surface("---js\n{ tools: 'Bash' }\n---\nbody\n", "not allowed");
+    // Leading blank lines before the opener.
+    refused_on_agents_surface("\n\n  \n---\nname: h\ntools: Bash\n---\nbody\n", "`tools`");
+    // TOML front matter.
+    refused_on_agents_surface("+++\nname = \"h\"\ntools = \"Bash\"\n+++\nbody\n", "`tools`");
+    // `...` does not close: the block runs on to the real `---`, and a
+    // block a parser cannot read as one document is refused.
+    refused_on_agents_surface("---\nname: h\n...\ntools: Bash\n---\nbody\n", "does not parse");
+    // A host that closes on a trailing `---` reads `tools` in the line.
+    refused_on_agents_surface("---\nname: h\ntools: Bash ---\nbody\n", "`tools`");
+}
+
+#[test]
+fn markdown_horizontal_rules_are_not_front_matter() {
+    // A rule in the middle of a document.
+    passes_on_agents_surface("# Notes\n\nFirst part.\n\n---\n\nSecond part.\n");
+    // A rule above prose that never closes: no host reads that as a mapping.
+    passes_on_agents_surface("---\n\nIntro paragraph without front matter.\n\nMore text.\n");
+    passes_on_agents_surface("----\nIntro.\n");
+}
+
+#[test]
+fn permission_front_matter_is_refused_on_custom_rules_and_mcp_surfaces_and_in_skills() {
+    // A Cursor rules file: its own front matter keys pass, a permission key
+    // does not.
+    let mdc = json!({ "style": { "path": ".cursor/rules/style.mdc", "kind": "rules" } });
+    let ok = "---\ndescription: Style.\nglobs: \"*.rs\"\nalwaysApply: true\n---\nUse rustfmt.\n";
+    policy::validate(&json!({ "version": "1", "surfaces": mdc, "rules": { "style": ok } })).unwrap();
+    let e = refusal(
+        json!({ "version": "1", "surfaces": mdc, "rules": { "style": front_matter("permissions") } }),
+    );
+    assert!(e.contains("rules.style"), "{e}");
+    // A custom mcp surface renders its rules text into JSON.
+    let zed = json!({ "zed": { "path": "zed/settings.json", "kind": "mcp" } });
+    let e = refusal(json!({ "version": "1", "surfaces": zed, "rules": { "zed": front_matter("tools") } }));
+    assert!(e.contains("rules.zed"), "{e}");
+    // A skill body: `tools` is refused there too.
+    let e = refusal(json!({ "version": "1", "skills": [{ "name": "s", "body": front_matter("tools") }] }));
+    assert!(e.contains("skill \"s\"") && e.contains("tools"), "{e}");
+}
+
+#[tokio::test]
+async fn an_applied_call_that_parks_a_new_approval_shows_the_diff_from_the_new_base() {
+    let h = H::new();
+    h.register().await;
+    write_skill(&h, "review-diff", "");
+    h.publish_skill("review-diff", "skills/review-diff").await;
+    h.publish(json!({ "version": "v1", "rules": { "agents": "shared rules\n" } })).await;
+    let assign =
+        json!({ "action": "assign", "params": { "skill_name": "review-diff", "target": "builder-1" } });
+    let unassign =
+        json!({ "action": "unassign", "params": { "skill_name": "review-diff", "target": "builder-1" } });
+
+    // Without the registry skill: opencode renders to A. Report it.
+    let plain = h.config(json!({})).await.unwrap();
+    let (_, id_a) = report(&h, "v1", "opencode").await;
+    // With it: opencode renders to B, reported from nothing as well.
+    h.gated(&ops(), "skill_registry", assign.clone()).await;
+    let with_skill = h.config(json!({})).await.unwrap();
+    assert_ne!(plain["rendered"]["opencode"]["hash"], with_skill["rendered"]["opencode"]["hash"]);
+    let (p_b, id_b) = report(&h, "v1", "opencode").await;
+    assert!(h.approval_display(id_b).await["diff"].as_str().unwrap().contains("+  \"ua_bundle_version\""));
+
+    // A is applied in between, so B's base moves from nothing to A.
+    h.gated(&ops(), "skill_registry", unassign).await;
+    h.approve(id_a).await;
+    h.config(applied_args(&plain, "opencode")).await.unwrap();
+    h.gated(&ops(), "skill_registry", assign).await;
+
+    // Applying B now binds the new base: the call parks a new approval, and
+    // the diff shown with it is the one from A, not the one from nothing.
+    let e = h.config(applied_args(&with_skill, "opencode")).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id: id_new, .. } = e else { panic!("{e:?}") };
+    assert_ne!(id_new, id_b);
+    let payload = h.approval_payload(id_new);
+    assert_eq!(payload["change_summary"]["base"], "last_applied");
+    let a_text = plain["rendered"]["opencode"]["content"].as_str().unwrap();
+    assert_eq!(payload["change_summary"]["from_text_sha256"], render::content_hash(a_text));
+    let shown = h.approval_display(id_new).await;
+    assert_eq!(shown["proposal_id"], p_b["proposal_id"]);
+    let diff = shown["diff"].as_str().expect("a diff from the bound base");
+    assert!(diff.contains("review-diff"), "{diff}");
+    assert!(
+        !diff.contains("+  \"ua_bundle_version\""),
+        "the unchanged lines are context, not additions: {diff}"
+    );
+}
+
+#[tokio::test]
+async fn a_diff_from_another_base_is_never_shown_with_an_approval() {
+    let h = H::new();
+    h.register().await;
+    h.publish(json!({ "version": "v1", "rules": { "claude": "one\n" } })).await;
+    let (_, id) = report(&h, "v1", "claude").await;
+    assert!(h.approval_display(id).await["diff"].is_string());
+    // The stored diff claims another base than the approval binds.
+    h.hub
+        .db()
+        .write(move |tx| Ok(tx.execute("UPDATE harness_config_proposals SET diff_base = 'ab'", [])?))
+        .unwrap();
+    let shown = h.approval_display(id).await;
+    assert!(shown["diff"].is_null(), "{shown}");
+    assert!(shown["note"].as_str().unwrap().contains("another base"), "{shown}");
+}
+
+#[tokio::test]
+async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.workspace = Some(dir.path().to_path_buf());
+    let parts: Vec<_> =
+        ua_tools::schema_parts().into_iter().filter(|p| p.name != "harness_config.v2").collect();
+    let old =
+        json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "diff": "+x\n" } });
+    let new = json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &parts).unwrap();
+        db.write(|tx| {
+            for (tool, payload, status) in [
+                ("harness_config_apply", &old, "pending"),
+                ("harness_config_apply", &old, "approved"),
+                ("harness_config_apply", &old, "consumed"),
+                ("harness_config_apply", &new, "pending"),
+                ("harness_config_publish", &old, "pending"),
+            ] {
+                tx.execute(
+                    "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
+                     VALUES (?1, ?2, 'builder-1', ?3, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![tool, payload.to_string(), status],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    let hub = Hub::open(cfg).unwrap();
+    let statuses: Vec<String> = hub
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare("SELECT status FROM approvals ORDER BY id")?;
+            Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(statuses, ["expired", "expired", "consumed", "pending", "pending"]);
+}
+
+#[test]
+fn skills_may_carry_license_version_and_plain_metadata_but_rules_text_may_not() {
+    let skill =
+        |body: &str| json!({ "version": "1", "skills": [{ "name": "s", "description": "d", "body": body }] });
+    let described =
+        "---\nname: s\ndescription: d\nlicense: MIT\nversion: 2\nmetadata: {author: x, team: y}\n---\nbody\n";
+    policy::validate(&skill(described)).unwrap();
+    // metadata holds plain values only.
+    let e = refusal(skill("---\nname: s\nmetadata: {tools: [Bash]}\n---\nbody\n"));
+    assert!(e.contains("`metadata`") && e.contains("map of plain values"), "{e}");
+    let e = refusal(skill("---\nname: s\nmetadata:\n  a:\n    tools: Bash\n---\nbody\n"));
+    assert!(e.contains("`metadata`"), "{e}");
+    // Permission-bearing keys stay refused in skills.
+    for key in ["allowed-tools", "tools", "permission", "hooks"] {
+        let e = refusal(skill(&format!("---\nname: s\nlicense: MIT\n{key}: x\n---\nbody\n")));
+        assert!(e.contains(&format!("`{key}`")), "{key}: {e}");
+    }
+    // Rules text keeps the strict list.
+    for key in ["license: MIT", "version: 1", "metadata: {author: x}"] {
+        refused_on_agents_surface(&format!("---\nname: h\n{key}\n---\nbody\n"), "not allowed");
+    }
 }
