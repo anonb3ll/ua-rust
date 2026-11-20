@@ -368,6 +368,7 @@ async fn url_verification_is_answered_only_when_signed() {
 async fn an_unmapped_user_is_refused_with_no_side_effects() {
     let h = TestHub::new(slack_config());
     // user_name says "operator"; the pair (team, user) is not mapped.
+    let ledger_before = scalar(&h, "SELECT COUNT(*) FROM event_log").await;
     let r = h.send(command(STRANGER, "/task", "write the report", "1.2.a")).await;
     assert_eq!(r.status(), 200);
     let text = json_body(r).await["text"].as_str().unwrap().to_string();
@@ -381,17 +382,7 @@ async fn an_unmapped_user_is_refused_with_no_side_effects() {
     assert_eq!(task_count(&h).await, 0);
     assert_eq!(scalar(&h, "SELECT COUNT(*) FROM tool_calls").await, 0);
     assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_deliveries").await, 0);
-    let refused = events(&h, "agent.slack.request.refused").await;
-    assert_eq!(refused.len(), 2);
-    for (who, p) in &refused {
-        assert_eq!(who, "system");
-        assert_eq!(p["reason"], "unmapped_identity");
-        assert!(
-            p.get("text").is_none() && !p.to_string().contains("write the report"),
-            "no body in the ledger"
-        );
-    }
-    assert_eq!(refused[0].1["user_id"], STRANGER);
+    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM event_log").await, ledger_before, "no ledger row");
     assert!(executed(&h).await.is_empty());
     assert!(events(&h, "agent.slack.request.accepted").await.is_empty());
 }
@@ -607,4 +598,92 @@ async fn a_response_url_off_the_slack_host_is_never_called() {
     settle(&h).await;
     assert_eq!(task_count(&h).await, 1);
     assert!(events(&h, "agent.slack.reply.failed").await.is_empty(), "nothing was attempted");
+}
+
+// --- round 1: unmapped traffic, app-posted messages --------------------------------
+
+/// An event body with extra keys on the inner event.
+fn event_with(user: &str, event_id: &str, event_type: &str, text: &str, extra: Value) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&event_body(user, event_id, event_type, text)).unwrap();
+    for (k, x) in extra.as_object().unwrap() {
+        v["event"][k] = x.clone();
+    }
+    v.to_string().into_bytes()
+}
+
+#[tokio::test]
+async fn unmapped_signed_requests_never_grow_the_ledger_and_replays_stay_refused() {
+    let h = TestHub::new(slack_config());
+    let ledger_before = scalar(&h, "SELECT COUNT(*) FROM event_log").await;
+    let ts = now();
+    let first_command = command_body(STRANGER, "/task", "write the report", "9.9.0");
+    for i in 0..20 {
+        let body = if i == 0 {
+            first_command.clone()
+        } else {
+            command_body(STRANGER, "/task", "x", &format!("9.9.{i}"))
+        };
+        let r = h.send(signed(slack_api_commands(), FORM, &body, ts)).await;
+        assert_eq!(r.status(), 200);
+        let body = event_body(STRANGER, &format!("Ev0LOOP{i}"), "app_mention", "<@U0BOT> /task x");
+        assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, ts)).await.status(), 200);
+    }
+    settle(&h).await;
+    assert_eq!(
+        scalar(&h, "SELECT COUNT(*) FROM event_log").await,
+        ledger_before,
+        "unmapped traffic is not ledgered"
+    );
+    assert_eq!(task_count(&h).await, 0);
+    // The signatures were still remembered: a replay is refused.
+    let replay = h.send(signed(slack_api_commands(), FORM, &first_command, ts)).await;
+    assert_eq!(replay.status(), 401);
+    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_signatures").await, 40);
+}
+
+#[tokio::test]
+async fn approve_never_comes_through_the_events_api() {
+    let h = TestHub::new(slack_config());
+    let id = pending_approval(&h, &agent("builder-9")).await;
+    let mention = event_body(HUMAN, "Ev0APP1", "app_mention", &format!("<@U0BOT> /approve {id}"));
+    let dm =
+        event_with(HUMAN, "Ev0APP2", "message", &format!("/approve {id}"), json!({ "channel_type": "im" }));
+    for body in [mention, dm] {
+        assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
+    }
+    settle(&h).await;
+    assert_eq!(approval(&h, id).await.0, "pending");
+    assert!(executed(&h).await.is_empty());
+    let refused = events(&h, "agent.slack.request.refused").await;
+    assert_eq!(refused.len(), 2);
+    for (who, p) in &refused {
+        assert_eq!(who, "operator");
+        assert_eq!(p["reason"], "approve_needs_slash_command", "the ledger says why");
+    }
+    // The slash command still approves.
+    h.send(command(HUMAN, "/approve", &id.to_string(), "1.2.a")).await;
+    settle(&h).await;
+    assert_eq!(approval(&h, id).await, ("approved".into(), Some("operator".into())));
+}
+
+#[tokio::test]
+async fn events_an_app_wrote_are_ignored() {
+    let h = TestHub::new(slack_config());
+    let before = total_changes(&h).await;
+    for (i, extra) in [
+        json!({ "app_id": "A0OTHERAPP" }),
+        json!({ "bot_profile": { "id": "B0BOT", "app_id": "A0OTHERAPP" } }),
+        json!({ "bot_id": "B0BOT" }),
+        json!({ "subtype": "bot_message" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body =
+            event_with(HUMAN, &format!("Ev0BOT{i}"), "app_mention", "<@U0BOT> /task from an app", extra);
+        assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
+    }
+    settle(&h).await;
+    assert_eq!(total_changes(&h).await, before);
+    assert_eq!(task_count(&h).await, 0);
 }

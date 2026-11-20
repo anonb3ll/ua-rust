@@ -11,7 +11,10 @@ the hub identity the Slack user is mapped to.
 | `POST /api/slack/events` | Events API (including the `url_verification` handshake) | JSON |
 
 Both routes exist only when `slack_enabled = true` **and**
-`UA_SLACK_SIGNING_SECRET` is set (and `slack_identities` is valid).
+`UA_SLACK_SIGNING_SECRET` is set (and `slack_identities` is valid). Like
+every other setting, `slack_enabled` can also be set from the environment
+(`UA_SLACK_ENABLED=true` turns the gate on); `slack_identities` cannot (TOML
+only), so the environment alone never lets anyone in.
 Otherwise they answer 404, and `ua serve` logs one line at startup saying
 which condition is missing. Code: `crates/ua-server/src/slack_api.rs` (the
 route) and `crates/ua-tools/src/families/slack.rs` (verifier, admission,
@@ -95,7 +98,7 @@ task ids as `task-<digits>`, approval ids as digits.
 | `assign <agent> <text>` | `delegate` (a generated Delegation Spec, `callback = none`) | the mapped identity |
 | `progress\|blocker\|review task-N <note>` | `task_update` to `doing`, `blocked` or `waiting_review`, appending the note | the mapped identity |
 | `plan <text>` | `plan_create` | the mapped identity |
-| `approve <id>` | `approval_resolve` with `decision = approve` | the mapped identity |
+| `approve <id>` | `approval_resolve` with `decision = approve` (slash commands only) | the mapped identity |
 | `status task-N` | `platform_object_get` (kind `task`) | the mapped identity |
 
 Every call goes through `Registry::call`: the identity's profile, the policy
@@ -107,10 +110,14 @@ refused; a gated call parks an approval like any other.
 rule: the approver must be a verified human (an identity in
 `human_identities`) other than the requester, and the profile must allow
 `approval_resolve`. A Slack user mapped to an agent cannot approve, whatever
-its profile.
+its profile. `approve` is accepted **only as a slash command**: sent as a
+message through the Events API it is refused (`approve_needs_slash_command`
+in the ledger), because an app holding a user's token can post messages as
+that user, while only the person can invoke a slash command.
 
 In the Events API, only an `app_mention` or a direct message (`message`
-with `channel_type = im`), written by a person (no `bot_id`, no `subtype`),
+with `channel_type = im`), written by a person (no `bot_id`, `subtype`,
+`app_id` or `bot_profile` on the event),
 whose first word after mentions starts with `/` runs anything
 (`@hub /task write the report`). Every other event is acknowledged and
 ignored without touching the database.
@@ -124,15 +131,19 @@ ignored without touching the database.
    clock; the signature `v0=` and 64 lowercase hex digits.
 3. **401 before state.** A missing, malformed, stale or wrong signature is a
    401 and no database transaction is opened. These refusals are logged by
-   reason class (`missing_signature`, `bad_signature`, `stale`) at info
-   level, never ledgered: they are unauthenticated and anyone can send them.
+   reason class (`missing_signature`, `bad_signature`, `stale`) at debug
+   level only, never ledgered: they are unauthenticated and anyone can send
+   them.
 4. **Parse.** Form fields (a repeated field is malformed) or a JSON object.
    `url_verification` is answered here. Ignored events stop here.
 5. **Admission**, one write transaction (`slack::admit`):
    - the signed base's hash goes into `slack_seen_signatures`; the same
      signed bytes a second time are a 401 (`replayed`);
    - (`team_id`, `user_id`) is looked up in `slack_identities`; unmapped
-     (or a retired agent) is refused;
+     (or a retired agent) is refused **with no ledger row** (the signature
+     is still remembered, so a replay is still refused), logged at debug
+     level only: any workspace member, or anyone in a shared channel, can
+     send signed requests in a loop, and the ledger is permanent;
    - the `trigger_id` (commands) or envelope `event_id` (events) goes into
      `slack_seen_deliveries`; a repeat is answered "Already received." and
      runs nothing. Slack retries an event it thinks timed out with a new
@@ -167,12 +178,16 @@ not implemented.
 
 | Event | When | Attributed to |
 |---|---|---|
-| `agent.slack.signature_accepted` | A verified, fresh signature (request hash and timestamp) | `system` |
-| `agent.slack.request.refused` | A verified request refused: `unmapped_identity`, `identity_retired` (with the Slack `team_id` and `user_id`), `malformed_payload`, `invalid_command` | `system`, or the mapped identity once known |
+| `agent.slack.signature_accepted` | A verified, fresh signature from a mapped identity (request hash and timestamp) | `system` |
+| `agent.slack.request.refused` | A mapped identity's request refused: `malformed_payload`, `invalid_command`, `approve_needs_slash_command` | the mapped identity |
 | `agent.slack.request.deduped` | A repeated trigger id or event id | the mapped identity |
 | `agent.slack.request.accepted` | Admitted: kind, delivery id, command | the mapped identity |
 | `agent.slack.request.executed` | After the command ran: tool, `ok`, and on failure the error code, reason code and any approval id | the mapped identity |
 | `agent.slack.reply.failed` | The `response_url` post failed: `timeout`, `transport`, `status` | the mapped identity |
+
+Requests with no mapped identity (`unmapped_identity`, `identity_retired`)
+write no ledger row at all; they are logged at debug level, with the
+reason class only.
 
 Plus the tool's own events (`agent.task.created`, `agent.approval.resolved`
 and so on) and its `tool_calls` row, attributed to the mapped identity. No
@@ -186,7 +201,11 @@ the `response_url`.
 
 - **Who can reach the routes:** anyone, since they are public. Without the
   signing secret a request gets a 401 and costs one HMAC; nothing is
-  written.
+  written and it is logged at debug level only.
+- **Signed but unmapped:** every member of the workspace (and of a shared
+  channel) can make Slack sign requests. Those add a row to the short-lived
+  replay table (pruned after 10 minutes) and nothing to the ledger, so they
+  cannot grow permanent state.
 - **Who can act:** whoever can make Slack sign a request from a mapped
   Slack account: that account's owner, a Slack workspace admin able to take
   it over, Slack itself, or anyone holding the signing secret (who can forge
@@ -200,6 +219,14 @@ the `response_url`.
 - **Replays and retries:** the same signed bytes are accepted once; a
   re-signed retry of the same event or trigger runs once; signatures older
   than 5 minutes are refused.
+- **Messages posted on someone's behalf:** an app installed with a user
+  token can post messages that look like the user's own, and Slack does not
+  always mark them. Events with `bot_id`, `subtype`, `app_id` or
+  `bot_profile` are ignored, and `/approve` is never accepted from the
+  Events API at all, only as a slash command, which only the person can
+  invoke. Other commands sent as messages run as the mapped identity, so an
+  app with a mapped user's token can create or update tasks as that user;
+  turn off Event Subscriptions if that matters to you.
 - **Spoofed identity fields:** `user_name` and display names are never used;
   the `team_id` is part of the key, so the same user id in another workspace
   is not the mapped user.

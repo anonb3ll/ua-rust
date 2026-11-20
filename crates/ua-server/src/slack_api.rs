@@ -10,16 +10,20 @@
 //! 2. The signature is checked over those bytes
 //!    ([`slack::verify_slack_signature`]) before anything parses them. A
 //!    missing, malformed, stale or wrong signature is a 401, and no database
-//!    transaction has been opened. Such refusals are logged by reason class,
-//!    not ledgered: they are unauthenticated, and anyone could send them.
+//!    transaction has been opened. Such refusals are logged by reason class
+//!    at debug level only, never ledgered: anyone could send them.
 //! 3. The body is parsed (form for commands, JSON for events). An Events API
 //!    `url_verification` answers its challenge here, with no state. Events
-//!    that are not explicit commands are acknowledged and ignored, with no
-//!    state.
+//!    that are not explicit commands, or that an app wrote (`bot_id`,
+//!    `subtype`, `app_id`, `bot_profile`), are acknowledged and ignored, with
+//!    no state.
 //! 4. One write transaction ([`slack::admit`]) records the signature (a
 //!    replay is a 401), maps (`team_id`, `user_id`) to a hub identity through
 //!    `slack_identities`, dedupes on the trigger id or event id, and ledgers
-//!    the outcome.
+//!    the outcome. A request with no mapped identity adds no ledger row (any
+//!    workspace member could send them in a loop); it is logged at debug.
+//!    `approve` arrives only as a slash command: through the Events API it
+//!    is refused, since an app holding a user's token can post as them.
 //! 5. Slack gets its answer (well inside its 3 seconds); the command then
 //!    runs on a tracked task through [`ua_tools::Registry::call`] as the
 //!    mapped identity, the same governed path as every other caller, and its
@@ -48,6 +52,9 @@ use crate::auth::{AuthIdentity, caller_for};
 pub const COMMANDS_PATH: &str = "/api/slack/commands";
 /// Events API callbacks (JSON).
 pub const EVENTS_PATH: &str = "/api/slack/events";
+
+/// Refusal reason for `approve` sent as a message (Events API).
+const APPROVE_NOT_ON_EVENTS: &str = "approve_needs_slash_command";
 
 /// Whether `path` is one of the Slack routes (public: they authenticate by
 /// signature, and the commands route takes a form body).
@@ -93,7 +100,8 @@ fn now_s() -> i64 {
 }
 
 fn unauthorized(reason: &'static str) -> Response {
-    tracing::info!(reason, "refused a Slack request");
+    // Debug only: unauthenticated traffic must not be able to grow the logs.
+    tracing::debug!(reason, "refused a Slack request");
     let body =
         json!({ "ok": false, "error": "unauthenticated", "message": "invalid Slack request signature" });
     (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
@@ -145,13 +153,20 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
     let (identity, human) = match admitted {
         Ok(Admission::Accepted { identity, human }) => (identity, human),
         Ok(Admission::Deduped { .. }) => return ack("Already received."),
-        Ok(Admission::Refused { reason, .. }) => {
+        Ok(Admission::Refused { reason, identity }) => {
+            if identity.is_none() {
+                // Not ledgered (anyone in the workspace can send these); debug only.
+                tracing::debug!(reason, "refused a signed Slack request without a mapped identity");
+            }
             return ack(match reason {
                 "unmapped_identity" | "identity_retired" => {
                     "This Slack user is not mapped to a hub identity. Ask an operator to add it to slack_identities."
                 }
                 "invalid_command" => {
                     "Unsupported or malformed command. Use contact, task, assign, progress, blocker, review, plan, approve or status."
+                }
+                APPROVE_NOT_ON_EVENTS => {
+                    "Approvals come only from the slash command (/approve), not from messages."
                 }
                 _ => "Malformed Slack request.",
             });
@@ -301,7 +316,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     }
     let ignore = || axum::Json(json!({})).into_response();
     let Ok(Value::Object(envelope)) = serde_json::from_slice::<Value>(&body) else {
-        tracing::info!("ignored a signed Slack event that is not a JSON object");
+        tracing::debug!("ignored a signed Slack event that is not a JSON object");
         return ignore();
     };
     match envelope.get("type").and_then(Value::as_str) {
@@ -330,7 +345,10 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // written by a person, and written as an explicit `/command`.
     let addressed =
         event_type == "app_mention" || (event_type == "message" && s(event, "channel_type") == "im");
-    let by_person = !event.contains_key("bot_id") && !event.contains_key("subtype");
+    // Anything an app wrote, including a message an app posted with a user's
+    // token on their behalf, is not a person typing: Slack marks such
+    // messages with some of these keys.
+    let by_person = !["bot_id", "subtype", "app_id", "bot_profile"].iter().any(|k| event.contains_key(*k));
     if !addressed || !by_person || !explicit_command(&text) {
         return ignore();
     }
@@ -348,6 +366,11 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         Some("malformed_payload")
     } else if parsed.is_none() {
         Some("invalid_command")
+    } else if parsed.as_ref().is_some_and(|p| p["command"] == "approve") {
+        // A message can be posted on a person's behalf by any app holding
+        // their user token; a slash command can only be invoked by the
+        // person. Approvals therefore never come through the Events API.
+        Some(APPROVE_NOT_ON_EVENTS)
     } else {
         None
     };

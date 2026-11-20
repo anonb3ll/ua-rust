@@ -121,6 +121,9 @@ from its commit history.
   unmapped Slack user, never use `user_name` for identity, and refuse a
   `slack_identities` table with a duplicate pair or an unknown identity at
   load.
+  A signed request from an unmapped Slack user adds no ledger row (only its
+  replay-table entry), and `/approve` is accepted only as a slash command,
+  never from an Events API message an app could post on a user's behalf.
 - OAuth `client_credentials` refuses a scope other than `mcp`, a retired
   identity, and an identity with no configured profile (it no longer falls
   back to `developer`). An authorization code exchanged after its identity

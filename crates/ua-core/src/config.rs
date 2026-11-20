@@ -286,7 +286,9 @@ pub struct Config {
     pub slack_signing_secret: Option<SecretString>,
     /// Serve the Slack routes (`/api/slack/commands`, `/api/slack/events`).
     /// Off by default; the routes are mounted only when this is on and
-    /// `UA_SLACK_SIGNING_SECRET` is set (docs/slack.md).
+    /// `UA_SLACK_SIGNING_SECRET` is set (docs/slack.md). Like other settings
+    /// it can come from the environment (`UA_SLACK_ENABLED`);
+    /// `slack_identities` cannot.
     pub slack_enabled: bool,
     /// Which Slack user acts as which hub identity: `[[slack_identities]]`
     /// tables of `team_id`, `user_id` and `identity`. A request from a pair

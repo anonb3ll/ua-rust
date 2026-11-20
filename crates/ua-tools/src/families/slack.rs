@@ -160,6 +160,14 @@ pub fn signed_request_sha(timestamp: &str, body: &[u8]) -> String {
 /// [`SEEN_RETENTION_S`] are pruned first. The body itself is not stored, and
 /// the ledger event is attributed to the `system` actor: no agent made it.
 pub fn remember_signed_request(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8], now: i64) -> UaResult<()> {
+    let sha = record_signature(tx, timestamp, body, now)?;
+    ledger_signature(tx, &sha, timestamp)
+}
+
+/// The replay table half of [`remember_signed_request`], with no ledger
+/// event: prune, then insert the signed base's hash. `Err` with `replayed`
+/// when it was recorded before. Returns the hash.
+fn record_signature(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8], now: i64) -> UaResult<String> {
     tx.execute(
         "DELETE FROM slack_seen_signatures WHERE seen_at < ?1",
         params![now.saturating_sub(SEEN_RETENTION_S)],
@@ -172,6 +180,10 @@ pub fn remember_signed_request(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8
     if inserted == 0 {
         return Err(UaError::denied("replayed", "this signed Slack request was already accepted"));
     }
+    Ok(sha)
+}
+
+fn ledger_signature(tx: &mut WriteTx<'_>, sha: &str, timestamp: &str) -> UaResult<()> {
     ledger::append(
         tx,
         EventInput::new(
@@ -258,20 +270,26 @@ pub enum Admission {
     /// Run it as `identity`.
     Accepted { identity: String, human: bool },
     /// Refused, with a reason class (`unmapped_identity`, `identity_retired`,
-    /// or the route's own refusal). Nothing runs.
+    /// or the route's own refusal). Nothing runs. `identity` is `None` for
+    /// the first two, which are not ledgered.
     Refused { reason: &'static str, identity: Option<String> },
     /// The event id or trigger id was handled before (a Slack retry).
     Deduped { identity: String },
 }
 
 /// Admit one verified request in a single write transaction: record its
-/// signature ([`remember_signed_request`]; a replay is an `Err` with
-/// `replayed` and rolls everything back), map (`team_id`, `user_id`) to a hub
-/// identity, then dedupe on the delivery id. Every outcome but a replay
-/// appends one ledger event: `agent.slack.request.refused` (attributed to
-/// `system` while the identity is unknown), `.deduped` or `.accepted`
-/// (attributed to the mapped identity). Payloads carry ids and reason
-/// classes, never the body or text.
+/// signature in the replay table (a replay is an `Err` with `replayed` and
+/// rolls everything back), map (`team_id`, `user_id`) to a hub identity,
+/// then dedupe on the delivery id.
+///
+/// A request with no usable identity (unmapped pair, retired agent) adds
+/// **no ledger row**: its signature is still remembered, so a replay is
+/// still refused, but any member of the workspace (or of a shared channel)
+/// can send such requests in a loop, and the ledger is permanent. The caller
+/// logs it by reason class. Once the identity is known, the request appends
+/// `agent.slack.signature_accepted` and one of `agent.slack.request.refused`,
+/// `.deduped` or `.accepted`, attributed to that identity. Payloads carry
+/// ids and reason classes, never the body or text.
 pub fn admit(
     tx: &mut WriteTx<'_>,
     cfg: &Config,
@@ -280,36 +298,23 @@ pub fn admit(
     now: i64,
     d: &Delivery,
 ) -> UaResult<Admission> {
-    remember_signed_request(tx, timestamp, body, now)?;
+    let sha = record_signature(tx, timestamp, body, now)?;
     let kind = d.kind.request();
-    let refuse =
-        |tx: &mut WriteTx<'_>, reason: &'static str, identity: Option<&str>| -> UaResult<Admission> {
-            let mut payload = json!({ "kind": kind, "reason": reason });
-            if identity.is_none() {
-                // Slack ids are not secrets, and the operator needs them to add
-                // a mapping. Never the user name or any other display field.
-                payload["team_id"] = json!(d.team_id);
-                payload["user_id"] = json!(d.user_id);
-            }
-            if delivery_id_ok(&d.delivery_id) {
-                payload["delivery_id"] = json!(d.delivery_id);
-            }
-            ledger::append(
-                tx,
-                EventInput::new("agent.slack.request.refused", payload)
-                    .by(identity.unwrap_or("system").to_string()),
-            )?;
-            Ok(Admission::Refused { reason, identity: identity.map(str::to_string) })
-        };
     let Some(identity) = cfg.slack_identity(&d.team_id, &d.user_id).map(str::to_string) else {
-        return refuse(tx, "unmapped_identity", None);
+        return Ok(Admission::Refused { reason: "unmapped_identity", identity: None });
     };
     let human = cfg.is_human(&identity);
     if !human && crate::families::governance::is_retired(tx, &identity)? {
-        return refuse(tx, "identity_retired", None);
+        return Ok(Admission::Refused { reason: "identity_retired", identity: None });
     }
+    ledger_signature(tx, &sha, timestamp)?;
     if let Some(reason) = d.refusal {
-        return refuse(tx, reason, Some(&identity));
+        let mut payload = json!({ "kind": kind, "reason": reason });
+        if delivery_id_ok(&d.delivery_id) {
+            payload["delivery_id"] = json!(d.delivery_id);
+        }
+        ledger::append(tx, EventInput::new("agent.slack.request.refused", payload).by(identity.clone()))?;
+        return Ok(Admission::Refused { reason, identity: Some(identity) });
     }
     if !remember_delivery(tx, d.kind, &d.delivery_id, now)? {
         ledger::append(
