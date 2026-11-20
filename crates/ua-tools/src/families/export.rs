@@ -736,53 +736,89 @@ pub struct ManifestStats {
 /// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
 /// rolling_hash}` over the whole event log, ordered by ulid.
 ///
-/// Each row's `entry_hash` is recomputed from its contents (as
-/// `event_log_verify` does), never taken as stored: the rolling hash is
-/// SHA-256 over one line per row holding the recomputed hash, or for a row
-/// without one (an imported legacy prefix), the canonical JSON of its
-/// [`ROLLING_ROW_COLUMNS`]. A stored hash that differs from its row is
-/// counted in `entry_hash_mismatches` and clears `chain_ok`.
+/// Verifies both `seq`-order linkage and `ledger_meta.unhashed_legacy_prefix`
+/// via [`ledger::verify`], and `ulid`-order `prev_hash` linkage from
+/// [`ledger::GENESIS_HASH`]. Each row's `entry_hash` is recomputed from its
+/// contents, never taken as stored: the rolling hash is SHA-256 over one line
+/// per row holding the recomputed hash, or for a row without one (an imported
+/// legacy prefix), the canonical JSON of its [`ROLLING_ROW_COLUMNS`]. Stored
+/// hashes that differ from their row (or are blank) increment
+/// `entry_hash_mismatches` and clear `chain_ok`; broken `prev_hash` links,
+/// hashless rows after hashed rows, and unrecorded legacy prefixes clear
+/// `chain_ok`.
 fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let mut hasher = Sha256::new();
     let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
-    let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
-    want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
-    for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
-        let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
-        if count == 0 {
-            first = ulid.clone();
-        }
-        last = ulid;
-        count += 1;
-        let stored = row.remove("entry_hash");
-        let dedupe_key = row.remove("dedupe_key");
-        let prev_hash = row.remove("prev_hash");
-        match stored {
-            Some(Value::String(h)) if !h.is_empty() => {
-                let text = |k: &str| row.get(k).and_then(Value::as_str);
-                let recomputed = ledger::compute_entry_hash(
-                    prev_hash.as_ref().and_then(Value::as_str),
-                    text("ulid").unwrap_or_default(),
-                    text("channel").unwrap_or_default(),
-                    text("payload").unwrap_or_default(),
-                    text("originator"),
-                    text("episode_id"),
-                    text("causal_parent_id"),
-                    text("created_at").unwrap_or_default(),
-                    dedupe_key.as_ref().and_then(Value::as_str),
-                );
-                if recomputed != h {
-                    mismatches += 1;
-                }
-                hasher.update(recomputed.as_bytes());
+    let has_log = has_table(c, "event_log")?;
+    let ledger_ok = !has_log || ledger::verify(c)?.ok;
+    let mut expected_prev = ledger::GENESIS_HASH.to_string();
+    let mut saw_hashed = false;
+    let mut ulid_chain_ok = true;
+    if has_log {
+        let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
+        want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+        for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
+            let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
+            if count == 0 {
+                first = ulid.clone();
             }
-            _ => hasher.update(py_dumps(&Value::Object(row), None).as_bytes()),
-        }
-        hasher.update(b"\n");
-        Ok(())
-    })?;
+            last = ulid;
+            count += 1;
+            let stored = row.remove("entry_hash");
+            let dedupe_key = row.remove("dedupe_key");
+            let prev_hash = row.remove("prev_hash");
+            match stored {
+                Some(Value::String(h)) if !h.is_empty() => {
+                    saw_hashed = true;
+                    let row_prev = prev_hash.as_ref().and_then(Value::as_str);
+                    if row_prev != Some(expected_prev.as_str()) {
+                        ulid_chain_ok = false;
+                    }
+                    let text = |k: &str| row.get(k).and_then(Value::as_str);
+                    let recomputed = ledger::compute_entry_hash(
+                        row_prev,
+                        text("ulid").unwrap_or_default(),
+                        text("channel").unwrap_or_default(),
+                        text("payload").unwrap_or_default(),
+                        text("originator"),
+                        text("episode_id"),
+                        text("causal_parent_id"),
+                        text("created_at").unwrap_or_default(),
+                        dedupe_key.as_ref().and_then(Value::as_str),
+                    );
+                    if recomputed != h {
+                        mismatches += 1;
+                    }
+                    hasher.update(recomputed.as_bytes());
+                    expected_prev = h;
+                }
+                Some(Value::String(_)) => {
+                    // Blank `""` entry_hash is not a NULL legacy prefix row: count it as a
+                    // mismatch and fail `chain_ok`, keeping canonical-row rolling-hash parity.
+                    saw_hashed = true;
+                    ulid_chain_ok = false;
+                    mismatches += 1;
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+                None | Some(Value::Null) => {
+                    if saw_hashed {
+                        ulid_chain_ok = false;
+                    }
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+                Some(_) => {
+                    saw_hashed = true;
+                    ulid_chain_ok = false;
+                    mismatches += 1;
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+            }
+            hasher.update(b"\n");
+            Ok(())
+        })?;
+    }
     let mut out = Map::new();
-    out.insert("chain_ok".into(), json!(mismatches == 0));
+    out.insert("chain_ok".into(), json!(ledger_ok && ulid_chain_ok && mismatches == 0));
     out.insert("count".into(), json!(count));
     out.insert("entry_hash_mismatches".into(), json!(mismatches));
     out.insert("first_ulid".into(), first);
@@ -1639,19 +1675,36 @@ pub fn register(r: &mut Registry) {
 mod tests {
     use super::*;
 
-    /// A bare database with only the columns the manifest reads.
+    /// Minimal manifest DB using the real ledger and ledger_meta schemas.
     fn db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+        let mut c = Connection::open_in_memory().unwrap();
+        ua_store::schema::apply(&mut c, &[ledger::SCHEMA, ledger::META_SCHEMA]).unwrap();
         c.execute_batch(
-            "CREATE TABLE schema_parts (name TEXT);
-             INSERT INTO schema_parts VALUES ('core.v1');
+            "INSERT INTO schema_parts (name, checksum, applied_at)
+             VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
              CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);
-             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
-             CREATE TABLE event_log (seq INTEGER PRIMARY KEY, ulid TEXT, channel TEXT, payload TEXT,
-                                     created_at TEXT, entry_hash TEXT);",
+             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);",
         )
         .unwrap();
         c
+    }
+
+    fn insert_chained(c: &Connection, rows: &[(&str, &str, &str, &str)], prev_start: &str) -> Vec<String> {
+        let mut prev = prev_start.to_string();
+        let mut hashes = Vec::with_capacity(rows.len());
+        for &(ulid, channel, payload, ts) in rows {
+            let h =
+                ledger::compute_entry_hash(Some(&prev), ulid, channel, payload, None, None, None, ts, None);
+            c.execute(
+                "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![ulid, channel, payload, ts, prev, h],
+            )
+            .unwrap();
+            prev = h.clone();
+            hashes.push(h);
+        }
+        hashes
     }
 
     fn caps(bytes: usize, memory_rows: usize) -> ManifestCaps {
@@ -1692,14 +1745,26 @@ mod tests {
         let c = db();
         c.execute("INSERT INTO tasks (title) VALUES ('caf\u{e9}')", []).unwrap();
         c.execute("INSERT INTO memory VALUES ('n1', 'note', 'body')", []).unwrap();
-        let good =
-            ua_store::ledger::compute_entry_hash(None, "01B", "agent.x", "{}", None, None, None, "t1", None);
+        let good = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01B",
+            "agent.x",
+            "{}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
         c.execute(
-            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES
-             ('01A', 'legacy', '{}', 't0', NULL), ('01B', 'agent.x', '{}', 't1', ?1)",
-            [&good],
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash) VALUES
+             ('01A', 'legacy', '{}', 't0', NULL, NULL),
+             ('01B', 'agent.x', '{}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &good],
         )
         .unwrap();
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '1')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
         let mut out = Vec::new();
         let stats = write_manifest(&c, "hub-a", Some("01A"), caps(1 << 20, 10), &mut out).unwrap();
         assert_eq!(stats.bytes, out.len());
@@ -1713,7 +1778,15 @@ mod tests {
         assert_eq!(log["last_ulid"], "01B");
         assert_eq!(log["chain_ok"], true);
         // The unhashed legacy row is hashed as its canonical JSON, the other by its recomputed hash.
-        let legacy = json!({"ulid": "01A", "channel": "legacy", "payload": "{}", "created_at": "t0"});
+        let legacy = json!({
+            "ulid": "01A",
+            "channel": "legacy",
+            "payload": "{}",
+            "originator": null,
+            "episode_id": null,
+            "causal_parent_id": null,
+            "created_at": "t0",
+        });
         let expected =
             hex::encode(Sha256::digest(format!("{}\n{good}\n", py_dumps(&legacy, None)).as_bytes()));
         assert_eq!(log["rolling_hash"], expected);
@@ -1729,8 +1802,8 @@ mod tests {
     #[test]
     fn a_tampered_payload_under_its_old_entry_hash_is_reported() {
         let c = db();
-        let hash = ua_store::ledger::compute_entry_hash(
-            None,
+        let hash = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
             "01B",
             "agent.x",
             "{\"n\":1}",
@@ -1741,8 +1814,9 @@ mod tests {
             None,
         );
         c.execute(
-            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1)",
-            [&hash],
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &hash],
         )
         .unwrap();
         let summary = |c: &Connection| event_log_summary(c).unwrap();
@@ -1750,11 +1824,204 @@ mod tests {
         assert_eq!(before["chain_ok"], true);
         assert_eq!(before["entry_hash_mismatches"], 0);
         // Rewrite the payload and keep the stored entry_hash.
+        c.execute_batch("DROP TRIGGER event_log_no_update;").unwrap();
         c.execute("UPDATE event_log SET payload = '{\"n\":2}' WHERE ulid = '01B'", []).unwrap();
         let after = summary(&c);
         assert_eq!(after["chain_ok"], false);
         assert_eq!(after["entry_hash_mismatches"], 1);
         assert_ne!(after["rolling_hash"], before["rolling_hash"]);
         assert_eq!(after["count"], before["count"]);
+    }
+
+    #[test]
+    fn missing_event_log_summarises_gracefully() {
+        let c = Connection::open_in_memory().unwrap();
+        let s = event_log_summary(&c).unwrap();
+        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["chain_ok", "count", "entry_hash_mismatches", "first_ulid", "last_ulid", "rolling_hash"]
+        );
+        assert_eq!(s["chain_ok"], true);
+        assert_eq!(s["count"], 0);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+        assert_eq!(s["first_ulid"], Value::Null);
+        assert_eq!(s["last_ulid"], Value::Null);
+        assert_eq!(s["rolling_hash"], hex::encode(Sha256::digest(b"")));
+    }
+
+    #[test]
+    fn deleted_middle_row_breaks_chain_ok() {
+        let c = db();
+        insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        assert_eq!(event_log_summary(&c).unwrap()["chain_ok"], true);
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01B'", []).unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+        assert_eq!(s["count"], 2);
+    }
+
+    #[test]
+    fn swapped_rows_seq_and_ulid_inversions_break_chain_ok() {
+        // Case 1: ulid order is valid, but seq order is inverted (ledger::verify fails).
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h2 = ledger::compute_entry_hash(Some(&h1), "01B", "b", "{}", None, None, None, "t1", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01B', 'b', '{}', 't1', ?1, ?2), (2, '01A', 'a', '{}', 't0', ?3, ?1)",
+            rusqlite::params![&h1, &h2, ledger::GENESIS_HASH],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+
+        // Case 2: seq order is valid (ledger::verify passes), but ulid order is inverted.
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01B",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h2 = ledger::compute_entry_hash(Some(&h1), "01A", "b", "{}", None, None, None, "t1", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01B', 'a', '{}', 't0', ?1, ?2), (2, '01A', 'b', '{}', 't1', ?2, ?3)",
+            rusqlite::params![ledger::GENESIS_HASH, &h1, &h2],
+        )
+        .unwrap();
+        assert!(ledger::verify(&c).unwrap().ok);
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn hashless_row_after_hashed_row_breaks_chain_ok() {
+        // Case 1: unhashed row appears in the middle (caught by both seq and ulid checks).
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h3 = ledger::compute_entry_hash(Some(&h1), "01C", "c", "{}", None, None, None, "t2", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01A', 'a', '{}', 't0', ?1, ?2),
+                    (2, '01B', 'b', '{}', 't1', NULL, NULL),
+                    (3, '01C', 'c', '{}', 't2', ?2, ?3)",
+            rusqlite::params![ledger::GENESIS_HASH, &h1, &h3],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+
+        // Case 2: seq=1 is NULL legacy prefix (ledger::verify passes), but its ulid '01Z'
+        // sorts after seq=2's hashed '01A', leaving a hashless row after a hashed row in ulid order.
+        let c = db();
+        let h = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01Z', 'legacy', '{}', 't0', NULL, NULL),
+                    (2, '01A', 'a', '{}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &h],
+        )
+        .unwrap();
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '1')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        assert!(ledger::verify(&c).unwrap().ok);
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn blank_entry_hash_increments_mismatches_and_keeps_rolling_hash_parity() {
+        let c = db();
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01A', 'agent.x', '{}', 't0', ?1, '')",
+            [ledger::GENESIS_HASH],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 1);
+        let row = json!({
+            "ulid": "01A",
+            "channel": "agent.x",
+            "payload": "{}",
+            "originator": null,
+            "episode_id": null,
+            "causal_parent_id": null,
+            "created_at": "t0",
+        });
+        let expected = hex::encode(Sha256::digest(format!("{}\n", py_dumps(&row, None)).as_bytes()));
+        assert_eq!(s["rolling_hash"], expected);
+    }
+
+    #[test]
+    fn unrecorded_vs_recorded_legacy_prefix() {
+        let c = db();
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01A', 'legacy', '{}', 't0', NULL, NULL),
+                    ('01B', 'legacy', '{}', 't1', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        insert_chained(&c, &[("01C", "a", "{}", "t2"), ("01D", "b", "{}", "t3")], ledger::GENESIS_HASH);
+        let unrecorded = event_log_summary(&c).unwrap();
+        assert_eq!(unrecorded["chain_ok"], false);
+        assert_eq!(unrecorded["entry_hash_mismatches"], 0);
+
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '2')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        let recorded = event_log_summary(&c).unwrap();
+        assert_eq!(recorded["chain_ok"], true);
+        assert_eq!(recorded["entry_hash_mismatches"], 0);
+        assert_eq!(recorded["count"], 4);
     }
 }

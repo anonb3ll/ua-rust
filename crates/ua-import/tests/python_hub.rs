@@ -957,3 +957,41 @@ INSERT INTO session_handoff_notes (session_id, agent, task_id, done, next_steps,
     let again = ua_import::import(&db, &f.path, &opts()).unwrap();
     assert!(!again.notes.iter().any(|n| n.contains("parked task(s)")), "{:?}", again.notes);
 }
+
+#[tokio::test]
+async fn imported_legacy_prefix_and_hashed_chain_export_manifest_chain_ok() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    for (rowid, ulid) in [(1, "01HZZZZZZZZZZZZZZZZZZZZZZ1"), (2, "01HZZZZZZZZZZZZZZZZZZZZZZ2")] {
+        c.execute(
+            "INSERT INTO event_log (rowid, ulid, channel, payload, created_at) \
+             VALUES (?1, ?2, 'agent.legacy', '{}', '2025-12-31T00:00:00+00:00')",
+            params![rowid, ulid],
+        )
+        .unwrap();
+    }
+    drop(c);
+
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3 && tl.unhashed_legacy_prefix == 2, "{tl:?}");
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db);
+    let caller = Caller {
+        label: "builder-1".into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some("builder-1-key".into()),
+        transport: Transport::Mcp,
+    };
+    let reg = builtin_registry();
+    let exported = reg.call(&hub, &caller, "export_migration_manifest", json!({})).await.unwrap();
+    let log = &exported["manifest"]["event_log"];
+    assert_eq!(log["chain_ok"], json!(true), "{log}");
+    assert_eq!(log["entry_hash_mismatches"], json!(0), "{log}");
+    assert_eq!(log["count"], json!(5), "{log}");
+    assert_eq!(log["first_ulid"], json!("01HZZZZZZZZZZZZZZZZZZZZZZ1"));
+    assert_eq!(log["last_ulid"], json!(EVENTS[2].ulid));
+}

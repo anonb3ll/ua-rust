@@ -720,3 +720,61 @@ async fn compare_reads_only_files_the_caller_exported() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn deleted_middle_ledger_row_sets_chain_ok_false_through_manifest_tools() {
+    let e = env();
+    let reg = builtin_registry();
+    for title in ["one", "two", "three"] {
+        call(&reg, &e.hub, "task_add", json!({"title": title})).await;
+    }
+
+    let healthy = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let healthy_log = healthy["manifest"]["event_log"].as_object().unwrap();
+    let mut keys: Vec<&str> = healthy_log.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["chain_ok", "count", "entry_hash_mismatches", "first_ulid", "last_ulid", "rolling_hash"]
+    );
+    assert_eq!(healthy_log["chain_ok"], json!(true), "{healthy}");
+    assert_eq!(healthy_log["entry_hash_mismatches"], json!(0));
+    let original_count = healthy_log["count"].as_u64().unwrap();
+    assert!(original_count >= 3);
+
+    // Drop the append-only delete trigger and remove the second row without altering
+    // the remaining rows' stored entry_hash values.
+    e.hub
+        .db()
+        .write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_delete;")?;
+            let mid_seq: i64 =
+                tx.query_row("SELECT seq FROM event_log ORDER BY seq LIMIT 1 OFFSET 1", [], |r| r.get(0))?;
+            tx.execute("DELETE FROM event_log WHERE seq = ?1", [mid_seq])?;
+            Ok(())
+        })
+        .unwrap();
+
+    let broken = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let broken_log = broken["manifest"]["event_log"].as_object().unwrap();
+    assert_eq!(broken_log["chain_ok"], json!(false), "{broken}");
+    assert_eq!(broken_log["entry_hash_mismatches"], json!(0), "{broken}");
+    assert_eq!(broken_log["count"], json!(original_count - 1));
+
+    let diff = call(
+        &reg,
+        &e.hub,
+        "compare_migration_manifests",
+        json!({"left": healthy["manifest"].clone(), "right": broken["manifest"].clone()}),
+    )
+    .await;
+    assert_eq!(diff["same"], json!(false));
+    assert!(
+        diff["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right"),
+        "{diff}"
+    );
+}
