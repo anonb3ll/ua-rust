@@ -132,11 +132,14 @@ pub struct Binding {
 }
 
 /// The child environment: [`SAFE_ENV`] names from `parent` (unless they look
-/// secret), the harness's allowlisted names, then the binding.
+/// secret), the harness's allowlisted names, its fixed `env` values (rendered
+/// with `vars`), its `path_prepend` in front of `PATH`, minus its
+/// `env_denylist`, then the binding.
 pub fn child_env(
     parent: impl IntoIterator<Item = (String, String)>,
     harness: &HarnessConfig,
     binding: &Binding,
+    vars: &[(&str, String)],
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     for (k, v) in parent {
@@ -145,6 +148,23 @@ pub fn child_env(
         if safe || listed {
             env.insert(k, v);
         }
+    }
+    for (k, v) in &harness.env {
+        if harness_may_pass(k) {
+            env.insert(k.clone(), render_one(v, vars));
+        }
+    }
+    if !harness.path_prepend.is_empty() {
+        let mut parts: Vec<String> = harness.path_prepend.iter().map(|p| p.display().to_string()).collect();
+        if let Some(path) = env.get("PATH").filter(|p| !p.is_empty()) {
+            let inherited: Vec<String> =
+                path.split(':').filter(|p| !parts.iter().any(|q| q == p)).map(str::to_string).collect();
+            parts.extend(inherited);
+        }
+        env.insert("PATH".into(), parts.join(":"));
+    }
+    for name in &harness.env_denylist {
+        env.remove(name);
     }
     env.insert("UA_DISPATCH_RUN_ID".into(), binding.run_id.clone());
     env.insert("UA_DISPATCH_TASK_ID".into(), binding.task_id.to_string());
@@ -160,16 +180,46 @@ pub fn child_env(
 /// Substitute placeholders in each argument. One template argument stays one
 /// argument whatever the values contain.
 pub fn render_argv(template: &[String], vars: &[(&str, String)]) -> Vec<String> {
-    template
-        .iter()
-        .map(|arg| {
-            let mut out = arg.clone();
-            for (k, v) in vars {
-                out = out.replace(&format!("{{{k}}}"), v);
+    template.iter().map(|arg| render_one(arg, vars)).collect()
+}
+
+/// Substitute `{name}` placeholders in one pass: a value is never scanned
+/// again, so a prompt that contains `{run_id}` stays as written.
+pub fn render_one(template: &str, vars: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let hit = vars.iter().find(|(k, _)| {
+            tail.len() > k.len() + 1 && tail[1..].starts_with(k) && tail.as_bytes()[k.len() + 1] == b'}'
+        });
+        match hit {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &tail[k.len() + 2..];
             }
-            out
-        })
-        .collect()
+            None => {
+                out.push('{');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The placeholder values of a launch.
+pub(crate) fn launch_vars(spec: &LaunchSpec) -> Vec<(&'static str, String)> {
+    vec![
+        ("run_id", spec.run_id.clone()),
+        ("task_id", spec.task_id.to_string()),
+        ("agent", spec.agent.clone()),
+        ("fence", spec.fence.to_string()),
+        ("worktree", spec.workdir.display().to_string()),
+        ("prompt_json", serde_json::to_string(&spec.prompt).unwrap_or_default()),
+        ("prompt", spec.prompt.clone()),
+    ]
 }
 
 /// The configured hub bearer of `agent`, if any.
@@ -424,18 +474,10 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         fence: spec.fence,
         agent_token: if spec.harness.pass_agent_token { agent_token(cfg, &spec.agent) } else { None },
     };
-    let env = child_env(std::env::vars(), &spec.harness, &binding);
-    let argv = render_argv(
-        &spec.harness.argv,
-        &[
-            ("run_id", spec.run_id.clone()),
-            ("task_id", spec.task_id.to_string()),
-            ("agent", spec.agent.clone()),
-            ("fence", spec.fence.to_string()),
-            ("worktree", spec.workdir.display().to_string()),
-            ("prompt", spec.prompt.clone()),
-        ],
-    );
+    let vars = launch_vars(&spec);
+    let env = child_env(std::env::vars(), &spec.harness, &binding, &vars);
+    let argv = render_argv(&spec.harness.argv, &vars);
+    let stdin_text = spec.harness.stdin.as_deref().map(|t| render_one(t, &vars));
 
     let spawned = open_log(&log, &spec).await.and_then(|file| {
         let mut cmd = tokio::process::Command::new(&argv[0]);
@@ -443,7 +485,7 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
             .current_dir(&spec.workdir)
             .env_clear()
             .envs(&env)
-            .stdin(Stdio::null())
+            .stdin(if stdin_text.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -557,6 +599,14 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         ));
     }
 
+    if let (Some(text), Some(mut input)) = (stdin_text, child.stdin.take()) {
+        // Written from its own task so a child that never reads cannot
+        // stall the launch; dropping the handle closes the pipe.
+        tokio::spawn(async move {
+            let _ = input.write_all(text.as_bytes()).await;
+            let _ = input.shutdown().await;
+        });
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let reply = json!({
@@ -762,7 +812,14 @@ async fn supervise(
             (None, Some(s)) => format!("signal:{s}"),
             _ => "exit_code:not observed".into(),
         };
-        ("failed", Some(why), Some("exit".to_string()), None)
+        // A provider's usage-limit message in the log's tail is quota
+        // evidence for the run's provider account.
+        let tail = log_tail(&log_path(hub.cfg(), &spec.run_id), LOG_TAIL_BYTES).await;
+        if crate::families::provider_accounts::quota_signal(&tail) {
+            ("failed", Some(format!("{why} (provider quota exhausted)")), Some(QUOTA_CLASS.to_string()), None)
+        } else {
+            ("failed", Some(why), Some("exit".to_string()), None)
+        }
     };
     let (rid, fence) = (spec.run_id.clone(), spec.fence);
     let res = hub
@@ -791,6 +848,23 @@ async fn supervise(
     if let Err(e) = res {
         tracing::warn!(error = %e, run_id = %spec.run_id, "could not record a dispatch exit");
     }
+}
+
+/// Bytes of a failed run's log read for a provider quota message.
+const LOG_TAIL_BYTES: u64 = 4 * 1024;
+const QUOTA_CLASS: &str = crate::families::provider_accounts::QUOTA_CLASS;
+
+/// The last `max` bytes of a file, lossily decoded; empty when unreadable.
+async fn log_tail(path: &Path, max: u64) -> String {
+    use tokio::io::AsyncSeekExt;
+    let Ok(mut f) = tokio::fs::File::open(path).await else { return String::new() };
+    let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    if f.seek(std::io::SeekFrom::Start(len.saturating_sub(max))).await.is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn split_status(st: std::process::ExitStatus) -> (Option<i64>, Option<i64>) {
@@ -832,7 +906,7 @@ mod tests {
             ("UA_DISPATCH_RUN_ID".to_string(), "forged".to_string()),
         ];
         let mut h = HarnessConfig::default();
-        let env = child_env(parent.clone(), &h, &binding());
+        let env = child_env(parent.clone(), &h, &binding(), &[]);
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
         for denied in ["UA_AGENT_TOKENS", "UA_HOME", "OPENAI_API_KEY", "RANDOM_VAR"] {
             assert!(!env.contains_key(denied), "{denied} leaked");
@@ -842,10 +916,28 @@ mod tests {
 
         // A harness may scope a provider key to itself, never a hub secret.
         h.env_allowlist = vec!["OPENAI_API_KEY".into(), "UA_AGENT_TOKENS".into(), "UA_HOME".into()];
-        let env = child_env(parent, &h, &binding());
+        let env = child_env(parent.clone(), &h, &binding(), &[]);
         assert_eq!(env.get("OPENAI_API_KEY").map(String::as_str), Some("k"));
         assert!(!env.contains_key("UA_AGENT_TOKENS"));
         assert!(!env.contains_key("UA_HOME"));
+
+        // Fixed values, a denylist that beats every other source, and PATH
+        // entries in front.
+        h.env = [
+            ("FIXED".to_string(), "run={run_id}".to_string()),
+            ("UA_HOME".to_string(), "/elsewhere".to_string()),
+            ("UA_DISPATCH_FENCE".to_string(), "9".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        h.env_denylist = vec!["OPENAI_API_KEY".into(), "FIXED_GONE".into()];
+        h.path_prepend = vec!["/opt/pi/bin".into(), "/usr/bin".into()];
+        let env = child_env(parent, &h, &binding(), &[("run_id", "run-1-ab".into())]);
+        assert_eq!(env["FIXED"], "run=run-1-ab");
+        assert!(!env.contains_key("OPENAI_API_KEY"), "denied even when allowlisted");
+        assert!(!env.contains_key("UA_HOME"), "no fixed value in the hub's namespace");
+        assert_eq!(env["UA_DISPATCH_FENCE"], "2", "the binding wins");
+        assert_eq!(env["PATH"], "/opt/pi/bin:/usr/bin");
     }
 
     #[test]
@@ -855,6 +947,9 @@ mod tests {
             &[("prompt", "a; rm -rf / && b".into()), ("run_id", "run-9".into())],
         );
         assert_eq!(argv, vec!["agent", "--print", "a; rm -rf / && b", "--run=run-9"]);
+        // One pass: a value that looks like a placeholder is not expanded.
+        let vars = [("run_id", "run-9".to_string()), ("prompt", "say {run_id} {nope".to_string())];
+        assert_eq!(render_one("{prompt}|{run_id}|{other}", &vars), "say {run_id} {nope|run-9|{other}");
     }
 
     #[test]

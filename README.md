@@ -96,7 +96,8 @@ vulnerability.
 | Memory and vault | Memory notes (FTS5, optional embeddings), Obsidian vault read/write, graph query, journal | |
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
-| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance` | [nodes](docs/nodes.md) |
+| Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance`; idle-session wakes over the node's long-poll (`/api/node/wake`, check and receipt) behind a session request and a human grant, with the original budget (debounce, floor, hourly caps, breaker) | [nodes](docs/nodes.md#idle-session-wakes) |
+| Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from run outcomes (`provider_quota_status`), `dispatch_task` refusals or same-provider fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
@@ -107,9 +108,8 @@ vulnerability.
 
 ## Not yet ported
 
-The node wake transport and harness config bundle (`/api/node/wake*`,
-`/api/node/config` answer 501), native-session resume and adopt, provider
-accounts, the Pi backend, cloud executors, ACP, Slack and Zulip
+The harness config bundle (`/api/node/config` answers 501), native-session
+resume and adopt, cloud executors, ACP, Slack and Zulip
 connectors, role workflows, the TypeScript SDK's platform routes
 (`/api/runs`, `/api/platform/*` answer 501), billing and usage ledgers, and
 tenancy (`org_id`).
