@@ -466,3 +466,209 @@ async fn dynamic_registration_rules() {
     let m = json_body(off.send(get("/.well-known/oauth-authorization-server", None, None)).await).await;
     assert!(m.get("registration_endpoint").is_none());
 }
+
+// --- client_credentials refusals (hub #2660) ----------------------------------------
+
+const CC_SECRET: &str = "test-client-secret-value";
+
+/// A hub with three configured clients: `svc-1` acts as `svc-agent`, which
+/// has a `profiles` entry; `svc-2` as `remote-agent`, an `oauth_identities`
+/// label that gets `oauth_profile`; `svc-3` as `bare-agent`, which has no
+/// profile configured at all.
+fn cc_hub() -> TestHub {
+    let mut cfg = config();
+    cfg.oauth_client_credentials = Some(
+        format!("svc-1|{CC_SECRET}|svc-agent,svc-2|{CC_SECRET}|remote-agent,svc-3|{CC_SECRET}|bare-agent")
+            .into(),
+    );
+    cfg.profiles.insert("svc-agent".into(), "reviewer".into());
+    TestHub::new(cfg)
+}
+
+/// A `client_credentials` request from `client_id` with extra parameters.
+async fn cc_token(hub: &TestHub, client_id: &str, extra: &[(&str, &str)]) -> (StatusCode, Value) {
+    let mut pairs =
+        vec![("grant_type", "client_credentials"), ("client_id", client_id), ("client_secret", CC_SECRET)];
+    pairs.extend_from_slice(extra);
+    token(hub, &pairs).await
+}
+
+/// The scope recorded on the grant and on every token of `access`'s family.
+fn recorded_scopes(hub: &TestHub, access: &str) -> (String, Vec<String>) {
+    let hash = hex::encode(Sha256::digest(access.as_bytes()));
+    hub.state
+        .hub
+        .db()
+        .read(|c| {
+            let (family, grant_scope): (String, String) = c.query_row(
+                "SELECT g.family_id, g.scope FROM oauth_tokens t JOIN oauth_grants g ON g.family_id = t.family_id \
+                 WHERE t.token_hash = ?1",
+                [&hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut stmt = c.prepare("SELECT scope FROM oauth_tokens WHERE family_id = ?1")?;
+            let scopes = stmt.query_map([&family], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok((grant_scope, scopes))
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn client_credentials_issues_the_granted_scope_under_the_configured_profile() {
+    let hub = cc_hub();
+    let (status, t) = cc_token(&hub, "svc-1", &[("scope", "mcp"), ("resource", BASE)]).await;
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["scope"], "mcp");
+    assert!(t.get("refresh_token").is_none());
+    let access = t["access_token"].as_str().unwrap();
+    assert_eq!(recorded_scopes(&hub, access), ("mcp".to_string(), vec!["mcp".to_string()]));
+    let v = json_body(hub.send(get("/api/whoami", None, Some(access))).await).await;
+    assert_eq!(v["identity"], "svc-agent");
+    assert_eq!(v["kind"], "agent");
+    assert_eq!(v["profile"], "reviewer", "the identity's configured profile, not developer: {v}");
+
+    // No scope requested: the client's allowed scope is granted.
+    let (status, t) = cc_token(&hub, "svc-1", &[]).await;
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["scope"], "mcp");
+
+    // An `oauth_identities` label gets `oauth_profile`.
+    let (status, t) = cc_token(&hub, "svc-2", &[("resource", BASE)]).await;
+    assert_eq!(status, 200, "{t}");
+    let v = json_body(hub.send(get("/api/whoami", None, t["access_token"].as_str())).await).await;
+    assert_eq!(v["identity"], "remote-agent");
+    assert_eq!(v["profile"], "public", "{v}");
+}
+
+#[tokio::test]
+async fn client_credentials_refuses_a_scope_the_client_is_not_allowed() {
+    let hub = cc_hub();
+    for scope in ["admin", "mcp admin", "MCP", "mcp offline_access"] {
+        let (status, e) = cc_token(&hub, "svc-1", &[("scope", scope)]).await;
+        assert_eq!(status, 400, "{scope}: {e}");
+        assert_eq!(e["error"], "invalid_scope", "{scope}: {e}");
+    }
+    let issued: i64 = hub
+        .state
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM oauth_tokens", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(issued, 0, "a refused scope mints nothing");
+}
+
+#[tokio::test]
+async fn client_credentials_refuses_an_identity_without_a_configured_profile() {
+    let hub = cc_hub();
+    let (status, e) = cc_token(&hub, "svc-3", &[]).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "unauthorized_client", "{e}");
+    assert!(e["error_description"].as_str().unwrap().contains("profile"), "{e}");
+
+    // A profile name the hub does not know does not count either: it would
+    // fall back to developer.
+    let mut cfg = config();
+    cfg.oauth_client_credentials = Some(format!("svc-3|{CC_SECRET}|bare-agent").into());
+    cfg.profiles.insert("bare-agent".into(), "no-such-profile".into());
+    let hub = TestHub::new(cfg);
+    let (status, e) = cc_token(&hub, "svc-3", &[]).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "unauthorized_client", "{e}");
+
+    // Opting in is explicit: a `profiles` entry, developer included.
+    let mut cfg = config();
+    cfg.oauth_client_credentials = Some(format!("svc-3|{CC_SECRET}|bare-agent").into());
+    cfg.profiles.insert("bare-agent".into(), "developer".into());
+    let hub = TestHub::new(cfg);
+    let (status, t) = cc_token(&hub, "svc-3", &[("resource", BASE)]).await;
+    assert_eq!(status, 200, "{t}");
+    let v = json_body(hub.send(get("/api/whoami", None, t["access_token"].as_str())).await).await;
+    assert_eq!(v["profile"], "developer", "{v}");
+}
+
+#[tokio::test]
+async fn client_credentials_refuses_a_retired_identity() {
+    let hub = cc_hub();
+    let operator = ua_core::Caller {
+        label: "operator".into(),
+        kind: ua_core::ActorKind::Human,
+        profile: ua_core::Profile::Developer,
+        enforce_profile: true,
+        session_key: None,
+        transport: ua_core::identity::Transport::Http,
+    };
+    let manage = |action: &'static str| json!({ "action": action, "params": { "agent": "svc-agent", "reason": "decommissioned" } });
+    hub.state
+        .registry
+        .call(&hub.state.hub, &operator, "coordination_manage", manage("agent_retire"))
+        .await
+        .unwrap();
+
+    // As for a human identity: the client may not act as this identity.
+    let (status, e) = cc_token(&hub, "svc-1", &[]).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "unauthorized_client", "{e}");
+    let grants: i64 = hub
+        .state
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM oauth_grants", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(grants, 0, "a retired identity gets no grant");
+
+    hub.state
+        .registry
+        .call(&hub.state.hub, &operator, "coordination_manage", manage("agent_unretire"))
+        .await
+        .unwrap();
+    let (status, t) = cc_token(&hub, "svc-1", &[]).await;
+    assert_eq!(status, 200, "{t}");
+}
+
+#[tokio::test]
+async fn client_credentials_refuses_a_client_not_registered_for_the_grant() {
+    let hub = cc_hub();
+    // A registered confidential client: it holds a secret but was registered
+    // for authorization_code only.
+    let (status, v) = register(
+        &hub,
+        json!({ "redirect_uris": [REDIRECT], "token_endpoint_auth_method": "client_secret_post" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let (id, secret) = (v["client_id"].as_str().unwrap(), v["client_secret"].as_str().unwrap());
+    let (status, e) =
+        token(&hub, &[("grant_type", "client_credentials"), ("client_id", id), ("client_secret", secret)])
+            .await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "unauthorized_client", "{e}");
+}
+
+#[tokio::test]
+async fn a_code_for_an_identity_retired_after_consent_is_refused() {
+    let hub = TestHub::new(config());
+    let client_id = public_client(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let code = authorize(&hub, &cookie, &client_id, VERIFIER, None).await;
+    let operator = ua_core::Caller {
+        label: "operator".into(),
+        kind: ua_core::ActorKind::Human,
+        profile: ua_core::Profile::Developer,
+        enforce_profile: true,
+        session_key: None,
+        transport: ua_core::identity::Transport::Http,
+    };
+    hub.state
+        .registry
+        .call(
+            &hub.state.hub,
+            &operator,
+            "coordination_manage",
+            json!({ "action": "agent_retire", "params": { "agent": "remote-agent", "reason": "decommissioned" } }),
+        )
+        .await
+        .unwrap();
+    let (status, e) = exchange(&hub, &client_id, &code, VERIFIER).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "invalid_grant", "{e}");
+}

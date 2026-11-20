@@ -154,6 +154,31 @@ fn finish(res: ua_core::UaResult<Outcome>) -> Response {
     }
 }
 
+/// Whether `identity` is a retired agent. The bearer check already refuses a
+/// retired identity's tokens; the token endpoint refuses to mint them at all.
+fn retired(c: &rusqlite::Connection, identity: &str) -> ua_core::UaResult<bool> {
+    ua_tools::families::governance::is_retired(c, identity)
+}
+
+/// The scope a `client_credentials` request is granted: the client's allowed
+/// scope ([`SCOPE`], the only one this hub has) when it asks for none or for
+/// exactly that, else `None` (`invalid_scope`). Tools are filtered by profile,
+/// not scope.
+fn granted_scope(requested: Option<&str>) -> Option<&'static str> {
+    match requested.map(str::split_whitespace) {
+        None => Some(SCOPE),
+        Some(mut parts) => parts.all(|s| s == SCOPE).then_some(SCOPE),
+    }
+}
+
+/// Whether `identity` has a profile of its own in configuration (a `profiles`
+/// entry naming a known profile; `oauth_identities` labels get
+/// `oauth_profile` that way). Without one a caller falls back to the broad
+/// `developer` profile, so `client_credentials` refuses to mint for it.
+fn has_configured_profile(cfg: &ua_core::Config, identity: &str) -> bool {
+    cfg.profiles.get(identity).is_some_and(|p| p.parse::<ua_core::Profile>().is_ok())
+}
+
 async fn authorization_code(state: &AppState, client: Client, form: &HashMap<String, String>) -> Response {
     if !client.allows_grant("authorization_code") {
         return token_error("unauthorized_client", "client is not registered for authorization_code");
@@ -223,6 +248,9 @@ async fn authorization_code(state: &AppState, client: Client, form: &HashMap<Str
             let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
             if !bool::from(computed.as_bytes().ct_eq(challenge.as_bytes())) {
                 return Ok(Outcome::Refused("invalid_grant", "code_verifier does not match the code_challenge".into()));
+            }
+            if retired(tx, &subject)? {
+                return Ok(Outcome::Refused("invalid_grant", "grant identity is retired".into()));
             }
             if let Some(r) = resource_param.as_deref()
                 && accepted_resource(&cfg, Some(r)).as_deref() != Some(resource.as_str())
@@ -305,6 +333,9 @@ async fn refresh(state: &AppState, client: Client, form: &HashMap<String, String
 }
 
 async fn client_credentials(state: &AppState, client: Client, form: &HashMap<String, String>) -> Response {
+    if !client.allows_grant("client_credentials") {
+        return token_error("unauthorized_client", "client is not registered for client_credentials");
+    }
     let ClientKind::Configured { identity } = client.kind.clone() else {
         return token_error("unauthorized_client", "client_credentials is limited to configured clients");
     };
@@ -312,6 +343,15 @@ async fn client_credentials(state: &AppState, client: Client, form: &HashMap<Str
     if cfg.is_human(&identity) {
         return token_error("unauthorized_client", "a client may not act as a human identity");
     }
+    if !has_configured_profile(&cfg, &identity) {
+        return token_error(
+            "unauthorized_client",
+            "the client's identity has no configured profile (set profiles.<identity>)",
+        );
+    }
+    let Some(scope) = granted_scope(form.get("scope").map(String::as_str)) else {
+        return token_error("invalid_scope", "the client may request only the scope mcp");
+    };
     let Some(resource) = accepted_resource(&cfg, form.get("resource").map(String::as_str)) else {
         return token_error("invalid_target", "resource is not served by this hub");
     };
@@ -319,12 +359,18 @@ async fn client_credentials(state: &AppState, client: Client, form: &HashMap<Str
         .hub
         .db()
         .write_async(move |tx| {
+            if retired(tx, &identity)? {
+                return Ok(Outcome::Refused(
+                    "unauthorized_client",
+                    "the client's identity is retired".into(),
+                ));
+            }
             let family = new_family_id();
             let g = GrantInfo {
                 family_id: &family,
                 client_id: &client.client_id,
                 subject: &identity,
-                scope: SCOPE,
+                scope,
                 resource: &resource,
             };
             insert_grant(tx, &g, &client.client_name, "configuration", "client_credentials")?;
