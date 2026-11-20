@@ -14,6 +14,7 @@ default = []
 embeddings = ["dep:fastembed"]
 
 [dependencies]
+subtle.workspace = true
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
 anyhow.workspace = true

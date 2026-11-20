@@ -71,6 +71,32 @@ Because the tool gates itself, adding `dispatch_task` to `approval_tools` or
 to a policy `require_approval` rule adds a second approval of the raw
 arguments.
 
+## Routing a run to a node
+
+`dispatch_task` with `node` sends the run to a registered remote node instead
+of starting a local harness. The node must belong to the run's `agent`.
+`backend` defaults to the first backend the node advertises. The working
+directory on the node is the task's worktree when it lies under one of the
+node's roots, else the node's first existing root. The approval also binds
+`node`, `backend`, `node_cwd` and `node_timeout_s`.
+
+The run is launched as one node work item and records
+`evidence_ref = node:<node>:<item>`. Only that item moves or closes the run:
+
+| Event | Run |
+|---|---|
+| The node claims the item | `running` |
+| The node's receipt reports `finished` | `finished` |
+| The node's receipt reports `failed` or `killed` | `failed` |
+| The item's wait or lease runs out | `failed` |
+
+`dispatch_cancel` cancels a queued item at once (cessation `confirmed`). For
+a claimed item it sets the cancel flag and records cessation `unknown`. The
+node's receipt then confirms it.
+
+The lease reaper leaves node-routed runs to the queue. `dispatch_resume`
+refuses them: dispatch the task again instead. See [nodes](nodes.md).
+
 ## Leases, restarts and orphans
 
 A live supervisor renews its run's lease every third of

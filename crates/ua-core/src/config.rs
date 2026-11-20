@@ -77,6 +77,14 @@ pub struct Config {
     /// Remote nodes one agent may hold in service (registered, not retired).
     /// A registration of a new node name past it is refused (`node_limit`).
     pub node_max_per_agent: u32,
+    /// How long a node work item queued for a node that is not live waits
+    /// for it before it fails (`waiting_expired_node_offline`), in seconds.
+    /// Clamped to 60-604800.
+    pub node_queue_wait_s: u64,
+    /// Seconds between node queue sweeps under `ua serve` (expired waits,
+    /// lapsed leases, undelivered command notices). 0 turns the sweep off;
+    /// claims still sweep their own node.
+    pub node_wait_sweep_s: u64,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -293,6 +301,8 @@ impl Default for Config {
             human_identities: Vec::new(),
             lifecycle_operators: None,
             node_max_per_agent: 8,
+            node_queue_wait_s: 3600,
+            node_wait_sweep_s: 60,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),

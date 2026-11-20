@@ -15,6 +15,7 @@ use super::{
     run_object, states, transition,
 };
 use crate::approvals::{self, GateOutcome};
+use crate::families::node_queue;
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -41,6 +42,19 @@ pub struct TaskArgs {
     /// Lease length in seconds (1-86400). Defaults to `dispatch_lease_seconds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_seconds: Option<i64>,
+    /// Route the run to this registered remote node instead of starting a
+    /// local harness: the node must belong to `agent`. The run is linked to
+    /// one node work item (`evidence_ref = node:<node>:<item>`), moves to
+    /// running when the node claims it, and ends with the node's receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Node backend to run (`codex`, `claude`, `acp:claude`, ...). Defaults to
+    /// the first backend the node advertises. Only with `node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Wall-clock limit on the node, 1-21600 seconds (default 3600). Only with `node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_timeout_s: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -107,8 +121,11 @@ pub fn register(r: &mut Registry) {
              human approval, bound to what will run: the approval shows the run id, resolved workdir, harness \
              argv template, env allowlist, timeout_s, output_cap_bytes, prompt_sha256 and whether the agent's \
              token is passed, and a pass \
-             is refused (approval_binding_changed) if any of them changed since. Returns {ok, run_id, state, \
-             fence, pid, log_path, spawned, stub}.",
+             is refused (approval_binding_changed) if any of them changed since. With `node` (instead of a \
+             harness) the run is routed to that registered remote node of the agent: the approval also binds \
+             the node, backend, working directory on the node and node_timeout_s, the run is launched as one \
+             node work item and ends with the node's receipt. Returns {ok, run_id, state, fence, pid, \
+             log_path, spawned, stub} (routed: {routed, node, backend, cwd, item_id, evidence_ref}).",
             |ctx: ToolCtx, a: TaskArgs| async move { dispatch_task(ctx, a).await },
         )
         // Gated in the handler, not by the registry: the approval must cover
@@ -328,8 +345,10 @@ fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
 
 /// Argument keys of a `dispatch_task` approval payload; the rest of the
 /// payload is the binding resolved from them.
-const ARG_KEYS: [&str; 5] = ["task_id", "agent", "harness", "prompt", "lease_seconds"];
-const BOUND_KEYS: [&str; 11] = [
+const ARG_KEYS: [&str; 8] =
+    ["task_id", "agent", "harness", "prompt", "lease_seconds", "node", "backend", "node_timeout_s"];
+const BOUND_KEYS: [&str; 12] = [
+    "node_cwd",
     "run_id",
     "workdir",
     "argv",
@@ -440,8 +459,135 @@ fn stale_pass(
 
 enum Gated {
     Run { run_id: String, prompt: String, workdir: Option<PathBuf> },
+    Routed(Value),
     Pending { approval_id: i64, stale: Option<(i64, Vec<String>)> },
     Denied { approval_id: i64, reason: Option<String> },
+}
+
+/// The node a run is routed to: registered, in service, owned by the run's
+/// agent and advertising the backend; the backend, and the working
+/// directory on the node (the task's worktree when it lies under one of the
+/// node's roots, else the node's first existing root).
+fn node_route(
+    tx: &rusqlite::Connection,
+    node: &str,
+    agent: &str,
+    backend: Option<&str>,
+    task: &Map<String, Value>,
+) -> UaResult<(node_queue::NodeRow, String, String)> {
+    let name = super::super::nodes::validate_node_name(node)?;
+    let Some(row) = node_queue::load_node(tx, &name)? else {
+        return Err(UaError::not_found(format!("node {name:?} is not registered")));
+    };
+    if row.agent != agent {
+        return Err(UaError::denied(
+            "node_owned_elsewhere",
+            format!("node {name:?} belongs to {:?}, not the run's agent {agent:?}", row.agent),
+        ));
+    }
+    let advertised: Vec<String> = row.backends().unwrap_or_default();
+    let backend = match backend.map(|b| b.trim().to_ascii_lowercase()).filter(|b| !b.is_empty()) {
+        Some(b) => b,
+        None => {
+            advertised.iter().find(|b| !matches!(b.as_str(), "acceptance" | "command")).cloned().ok_or_else(
+                || UaError::invalid(format!("node {name:?} advertises no backend; pass backend")),
+            )?
+        }
+    };
+    if matches!(backend.as_str(), "acceptance" | "command") {
+        return Err(UaError::invalid("a dispatch run cannot use the acceptance or command backend"));
+    }
+    let roots: Vec<(String, bool)> = row
+        .facts
+        .get("worktree_roots")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    let path = r.get("realpath").or_else(|| r.get("path")).and_then(Value::as_str)?;
+                    Some((path.to_string(), r.get("exists") != Some(&json!(false))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let inside = |p: &str, root: &str| {
+        let parts = |s: &str| {
+            s.split('/').filter(|c| !c.is_empty() && *c != ".").map(str::to_string).collect::<Vec<_>>()
+        };
+        p.starts_with('/') && !p.split('/').any(|c| c == "..") && parts(p).starts_with(&parts(root))
+    };
+    let worktree = str_field(task, "worktree_path");
+    let cwd = worktree
+        .filter(|w| roots.iter().any(|(r, exists)| *exists && inside(w, r)))
+        .map(str::to_string)
+        .or_else(|| roots.iter().find(|(_, exists)| *exists).map(|(r, _)| r.clone()))
+        .ok_or_else(|| {
+            UaError::conflict_code(
+                "node_no_worktree_root",
+                format!("node {name:?} reports no usable worktree root"),
+            )
+        })?;
+    let probe = node_queue::validate_new(&name, &backend, "probe", &cwd, None, None, None, None, None, None)?;
+    node_queue::accepting_node(tx, &probe)?;
+    Ok((row, backend, cwd))
+}
+
+/// Queue the run's node work item and mark the run launched, linked to it.
+#[allow(clippy::too_many_arguments)]
+fn route_to_node(
+    tx: &mut ua_store::WriteTx<'_>,
+    hub: &crate::hub::Hub,
+    actor: &str,
+    run_id: &str,
+    task_id: i64,
+    row: &node_queue::NodeRow,
+    backend: &str,
+    cwd: &str,
+    prompt: &str,
+    timeout_s: i64,
+) -> UaResult<Value> {
+    let mut n = node_queue::validate_new(
+        &row.node,
+        backend,
+        prompt,
+        cwd,
+        None,
+        None,
+        None,
+        Some(timeout_s),
+        Some(task_id),
+        None,
+    )?;
+    n.run_id = Some(run_id.to_string());
+    let queued = node_queue::insert_item(tx, hub, &n, row, actor)?;
+    let item_id = queued["item_id"].as_str().unwrap_or_default().to_string();
+    let evidence = node_queue::evidence_ref(&row.node, &item_id);
+    let run = load_run(tx, run_id)?.ok_or_else(|| UaError::internal("routed run vanished"))?;
+    let edge = Edge::to("launched").set("evidence_ref", evidence.clone());
+    if let Err(why) = transition(tx, &run, edge)? {
+        return Err(UaError::conflict(format!("run {run_id} could not be routed: {why}")));
+    }
+    record_transition(
+        tx,
+        run_id,
+        "launched",
+        actor,
+        json!({ "routed": "node", "node": row.node, "item_id": item_id, "backend": backend }),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "run_id": run_id,
+        "state": "launched",
+        "fence": 1,
+        "routed": "node",
+        "node": row.node,
+        "backend": backend,
+        "cwd": cwd,
+        "item_id": item_id,
+        "evidence_ref": evidence,
+        "waiting": queued.get("waiting").cloned().unwrap_or(Value::Null),
+        "spawned": false,
+    }))
 }
 
 async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
@@ -476,6 +622,17 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
     if a.prompt.as_ref().is_some_and(|p| p.len() > PROMPT_CAP) {
         return Err(UaError::invalid(format!("prompt is longer than {PROMPT_CAP} bytes")));
     }
+    let node = a.node.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    if node.is_none() && (a.backend.is_some() || a.node_timeout_s.is_some()) {
+        return Err(UaError::invalid("backend and node_timeout_s apply only with node"));
+    }
+    if node.is_some() && harness.is_some() {
+        return Err(UaError::invalid("a run goes to a local harness or to a node, not both"));
+    }
+    let node_timeout = a.node_timeout_s.unwrap_or(node_queue::DEFAULT_TIMEOUT_S);
+    if !(1..=node_queue::MAX_TIMEOUT_S).contains(&node_timeout) {
+        return Err(UaError::invalid(format!("node_timeout_s must be 1-{}", node_queue::MAX_TIMEOUT_S)));
+    }
 
     // Resolve what will run, gate on it, and mint the run, in one write
     // transaction: nothing the approval covers can change in between.
@@ -503,6 +660,10 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     Some(resolve_workdir(&raw, &hub.cfg().home)?)
                 }
             };
+            let route = match &node {
+                None => None,
+                Some(n) => Some(node_route(tx, n, &ag, a.backend.as_deref(), &task)?),
+            };
             let run_id = derive_run_id(tx, tid, &ag)?;
             let (prompt, source) = match &a.prompt {
                 Some(p) => (p.clone(), "args"),
@@ -522,6 +683,12 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             });
             if let Some(o) = payload.as_object_mut() {
                 o.extend(harness_binding(h2.as_ref(), workdir.as_deref(), &ag));
+            }
+            if let Some((row, backend, cwd)) = &route {
+                payload["node"] = json!(row.node);
+                payload["backend"] = json!(backend);
+                payload["node_cwd"] = json!(cwd);
+                payload["node_timeout_s"] = json!(node_timeout);
             }
             match &a.prompt {
                 Some(p) => payload["prompt"] = json!(p),
@@ -568,11 +735,20 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             bind_task(tx, tid, &run_id, &ag, &lease_at)?;
             link_approval_id(tx, approval_id, &run_id)?;
             record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
+            if let Some((row, backend, cwd)) = route {
+                let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
+                return Ok(Gated::Routed(out));
+            }
             Ok(Gated::Run { run_id, prompt, workdir })
         })
         .await?;
     let (run_id, prompt, workdir) = match gated {
         Gated::Run { run_id, prompt, workdir } => (run_id, prompt, workdir),
+        Gated::Routed(mut out) => {
+            out["task_id"] = json!(tid);
+            out["agent_label"] = json!(agent);
+            return Ok(out);
+        }
         Gated::Pending { approval_id, stale: None } => {
             return Err(UaError::ApprovalRequired { tool: "dispatch_task".into(), approval_id });
         }
@@ -745,8 +921,19 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     }
 
     // 2. Stop the process (re-read: a launch may have recorded a pid since).
+    // A node-routed run is stopped by its node: cessation is confirmed only
+    // by the node's receipt, unless the item was never claimed.
     let fresh = require_run(&ctx, &rid).await?;
-    let termination = blocking(move || Ok(executor::terminate(&fresh))).await?;
+    let termination = match fresh.evidence_ref.clone().filter(|e| e.starts_with("node:")) {
+        Some(ev) => {
+            let by = actor.clone();
+            ctx.hub
+                .db()
+                .write_async(move |tx| Ok(node_queue::cancel_for_run(tx, &ev, &by)?.unwrap_or("unknown")))
+                .await?
+        }
+        None => blocking(move || Ok(executor::terminate(&fresh))).await?,
+    };
     let cessation = classify_termination(termination);
 
     // 3. Commit the outcome.
@@ -922,6 +1109,11 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     check_run_owner(&ctx.caller, "dispatch_resume", &run)?;
     if let Some(why) = resume_refusal(&run) {
         return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
+    }
+    if run.evidence_ref.as_deref().is_some_and(|e| e.starts_with("node:")) {
+        return Err(UaError::conflict(
+            "dispatch resume failed: the run was routed to a node; dispatch the task to the node again",
+        ));
     }
     let cfg = ctx.hub.cfg().clone();
     let harness = match &run.harness {
