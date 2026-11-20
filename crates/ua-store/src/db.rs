@@ -3,9 +3,12 @@
 //! A file database keeps [`READERS`] read-only connections. A read takes one
 //! through an RAII guard ([`ReaderGuard`]), so a panicking closure still
 //! returns it. When every pooled reader is busy, a read opens a short-lived
-//! extra reader (at most [`OVERFLOW_READERS`] at once) and, past that, waits
-//! for one to come back (up to [`READER_WAIT`]). A read never falls back to
-//! the writer connection: reads must not queue behind, or hold up, writes.
+//! extra reader (at most [`OVERFLOW_READERS`] at once) and, past that or when
+//! that open fails, waits for one to come back (up to [`READER_WAIT`]). A
+//! pooled reader that has to be replaced and cannot be reopened leaves a
+//! vacancy that later reads try to fill again, so the pool never shrinks for
+//! good. A read never falls back to the writer connection: reads must not
+//! queue behind, or hold up, writes.
 //! An in-memory database (tests) has no readers and reads on the writer.
 
 use std::ops::{Deref, DerefMut};
@@ -40,13 +43,17 @@ struct Inner {
     writer: Mutex<Connection>,
     readers: Mutex<Pool>,
     reader_free: Condvar,
+    /// How long a read waits for a reader ([`READER_WAIT`]; tests shorten it).
+    reader_wait: Duration,
     events: broadcast::Sender<Event>,
 }
 
-/// The idle pooled readers and the count of overflow readers open now.
+/// The idle pooled readers, the count of overflow readers open now, and the
+/// pooled readers lost (closed and not yet reopened).
 struct Pool {
     idle: Vec<Connection>,
     overflow: usize,
+    vacant: usize,
 }
 
 /// Where a read connection came from, so it goes back to the right place.
@@ -85,6 +92,9 @@ impl Drop for ReaderGuard<'_> {
                     pool.idle.push(conn);
                 } else if let Some(fresh) = self.inner.path.as_deref().and_then(|p| open_reader(p).ok()) {
                     pool.idle.push(fresh);
+                } else {
+                    // A later read reopens it ([`Db::reader`]).
+                    pool.vacant += 1;
                 }
             }
             Lease::Overflow(conn) => {
@@ -109,6 +119,7 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
     r.busy_timeout(std::time::Duration::from_secs(10))?;
+    r.execute_batch("PRAGMA temp_store = MEMORY;")?;
     Ok(r)
 }
 
@@ -152,8 +163,9 @@ impl Db {
             inner: Arc::new(Inner {
                 path,
                 writer: Mutex::new(writer),
-                readers: Mutex::new(Pool { idle: readers, overflow: 0 }),
+                readers: Mutex::new(Pool { idle: readers, overflow: 0, vacant: 0 }),
                 reader_free: Condvar::new(),
+                reader_wait: READER_WAIT,
                 events,
             }),
         }
@@ -199,36 +211,52 @@ impl Db {
         f(&guard)
     }
 
-    /// Take a read connection of a file database: an idle pooled reader, else
-    /// a new overflow reader while fewer than [`OVERFLOW_READERS`] are open,
-    /// else wait up to [`READER_WAIT`] for either.
+    /// Take a read connection of a file database: an idle pooled reader;
+    /// else reopen a vacant pooled slot; else a new overflow reader while
+    /// fewer than [`OVERFLOW_READERS`] are open; else (or when those opens
+    /// fail) wait up to the reader wait for a reader to come back.
     fn reader(&self) -> UaResult<ReaderGuard<'_>> {
         let inner = &*self.inner;
         let path = inner.path.as_deref().ok_or_else(|| UaError::internal("no reader pool in memory"))?;
-        let deadline = std::time::Instant::now() + READER_WAIT;
+        let deadline = std::time::Instant::now() + inner.reader_wait;
+        // Opening failed once in this call: wait for a reader instead.
+        let mut open_failed: Option<rusqlite::Error> = None;
         let mut pool = lock_pool(inner);
         loop {
             if let Some(conn) = pool.idle.pop() {
                 return Ok(ReaderGuard { inner, lease: Some(Lease::Pooled(conn)) });
             }
-            if pool.overflow < OVERFLOW_READERS {
+            if open_failed.is_none() && (pool.vacant > 0 || pool.overflow < OVERFLOW_READERS) {
                 // Reserve the slot before opening, outside the lock.
-                pool.overflow += 1;
+                let refill = pool.vacant > 0;
+                if refill {
+                    pool.vacant -= 1;
+                } else {
+                    pool.overflow += 1;
+                }
                 drop(pool);
-                return match open_reader(path) {
-                    Ok(conn) => Ok(ReaderGuard { inner, lease: Some(Lease::Overflow(conn)) }),
+                let opened = open_reader(path);
+                pool = lock_pool(inner);
+                match opened {
+                    Ok(conn) if refill => return Ok(ReaderGuard { inner, lease: Some(Lease::Pooled(conn)) }),
+                    Ok(conn) => return Ok(ReaderGuard { inner, lease: Some(Lease::Overflow(conn)) }),
                     Err(e) => {
-                        lock_pool(inner).overflow -= 1;
-                        inner.reader_free.notify_one();
-                        Err(e.into())
+                        if refill {
+                            pool.vacant += 1;
+                        } else {
+                            pool.overflow -= 1;
+                        }
+                        open_failed = Some(e);
+                        continue;
                     }
-                };
+                }
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
+                let why = open_failed.map(|e| format!(" (opening another failed: {e})")).unwrap_or_default();
                 return Err(UaError::internal(format!(
-                    "no database reader came free within {}s",
-                    READER_WAIT.as_secs()
+                    "no database reader came free within {:?}{why}",
+                    inner.reader_wait
                 )));
             }
             pool = inner.reader_free.wait_timeout(pool, left).unwrap_or_else(|e| e.into_inner()).0;
@@ -307,6 +335,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("hub.db"), &[PART]).unwrap();
         (dir, db)
+    }
+
+    /// A file database whose reads wait at most `wait` for a reader.
+    fn file_db_waiting(wait: Duration) -> (tempfile::TempDir, Db) {
+        let (dir, db) = file_db();
+        let inner = Arc::try_unwrap(db.inner).ok().expect("only handle");
+        let db = Db { inner: Arc::new(Inner { reader_wait: wait, ..inner }) };
+        (dir, db)
+    }
+
+    /// Lend out every pooled and overflow reader on threads that hold them
+    /// until `release` is dropped. Returns once all are lent.
+    fn hold_all(db: &Db) -> (std::sync::mpsc::Sender<()>, Vec<std::thread::JoinHandle<()>>) {
+        let n = READERS + OVERFLOW_READERS;
+        let started = Arc::new(Barrier::new(n + 1));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let threads = (0..n)
+            .map(|_| {
+                let (db, started, rx) = (db.clone(), started.clone(), rx.clone());
+                std::thread::spawn(move || {
+                    db.read(|_| {
+                        started.wait();
+                        // Wait for the release (the sender dropped).
+                        let _ = rx.lock().unwrap().recv();
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        started.wait();
+        (tx, threads)
     }
 
     fn idle(db: &Db) -> usize {
@@ -426,5 +487,98 @@ mod tests {
         // In memory there is nothing to checkpoint.
         let mem = Db::open_in_memory(&[PART]).unwrap();
         assert_eq!(mem.checkpoint_truncate().unwrap(), (false, 0, 0));
+    }
+
+    #[test]
+    fn a_read_fails_after_the_reader_wait_when_none_comes_free() {
+        let (_dir, db) = file_db_waiting(Duration::from_millis(300));
+        let (release, threads) = hold_all(&db);
+        let t0 = Instant::now();
+        let err = db.read(|_| Ok(())).unwrap_err();
+        let waited = t0.elapsed();
+        assert!(err.to_string().contains("no database reader came free"), "{err}");
+        assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(5), "{waited:?}");
+        drop(release);
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(idle(&db), READERS);
+    }
+
+    /// An overflow reader that cannot be opened (here: the database file is
+    /// gone) makes the read wait for a pooled reader instead of failing.
+    #[test]
+    fn a_failed_overflow_open_waits_for_a_pooled_reader() {
+        let (dir, db) = file_db_waiting(Duration::from_secs(10));
+        // Take the four pooled readers only.
+        let started = Arc::new(Barrier::new(READERS + 1));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let holders: Vec<_> = (0..READERS)
+            .map(|_| {
+                let (db, started, rx) = (db.clone(), started.clone(), rx.clone());
+                std::thread::spawn(move || {
+                    db.read(|_| {
+                        started.wait();
+                        let _ = rx.lock().unwrap().recv();
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        started.wait();
+        // A new read-only open of a missing file fails. Move the file away
+        // while the read tries, and back before a pooled reader is released.
+        let (here, away) = (dir.path().join("hub.db"), dir.path().join("hub.db.away"));
+        std::fs::rename(&here, &away).unwrap();
+        let reader = {
+            let db = db.clone();
+            std::thread::spawn(move || db.read(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reader.is_finished(), "the read waits instead of failing on the overflow open");
+        std::fs::rename(&away, &here).unwrap();
+        drop(tx);
+        holders.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(reader.join().unwrap().unwrap(), 1);
+        assert_eq!(overflow(&db), 0);
+    }
+
+    /// A pooled reader that could not be replaced leaves a vacancy, and the
+    /// next read that finds no idle reader opens it again.
+    #[test]
+    fn a_lost_pooled_reader_is_reopened_later() {
+        let (_dir, db) = file_db();
+        {
+            let mut pool = lock_pool(&db.inner);
+            pool.idle.clear();
+            pool.vacant = READERS;
+        }
+        for _ in 0..3 {
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))?)).unwrap();
+        }
+        let pool = lock_pool(&db.inner);
+        assert_eq!((pool.idle.len(), pool.vacant, pool.overflow), (1, READERS - 1, 0));
+        drop(pool);
+        // Concurrent reads refill the rest.
+        let barrier = Arc::new(Barrier::new(READERS));
+        let threads: Vec<_> = (0..READERS)
+            .map(|_| {
+                let (db, b) = (db.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    db.read(|_| {
+                        b.wait();
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let pool = lock_pool(&db.inner);
+        assert_eq!((pool.idle.len(), pool.vacant), (READERS, 0));
+        // Readers keep temporary tables in memory.
+        drop(pool);
+        let temp: i64 = db.read(|c| Ok(c.query_row("PRAGMA temp_store", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(temp, 2, "temp_store = MEMORY");
     }
 }
