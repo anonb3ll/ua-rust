@@ -1198,16 +1198,16 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let deep = a.refresh;
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
     let cfg = ctx.hub.cfg();
-    let reg = crate::builtin_registry();
+    let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
     let (db_row, db_stats) = database_check(&facts, path);
     let checks = vec![
         hub_auth_check(cfg, &facts),
         bind_check(cfg),
-        approval_check(cfg, &reg),
+        approval_check(cfg, reg),
         vault_check(cfg),
         workspace_check(cfg),
-        search_check(&reg),
+        search_check(reg),
         embeddings_check(&facts),
         ledger_check(&facts),
         db_row,
@@ -1346,7 +1346,7 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
 }
 
 async fn mcp_health_telemetry(ctx: ToolCtx, _a: NoArgs) -> UaResult<Value> {
-    let reg = crate::builtin_registry();
+    let reg = crate::builtin_registry_shared();
     let calls = ctx.hub.db().read_async(call_counts).await?;
     let callable = || reg.visible_to(&ctx.caller);
     let callable_count = callable().count();

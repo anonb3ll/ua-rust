@@ -297,6 +297,12 @@ CREATE TABLE nodes (
   retired_reason TEXT,
   heartbeat_floor TEXT
 );
+CREATE TABLE graph_canvas_scenes (
+  board_id TEXT PRIMARY KEY,
+  scene_json TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE zulip_cursors (
   bot TEXT NOT NULL,
   last_message_id INTEGER NOT NULL
@@ -441,6 +447,8 @@ INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, 
   VALUES ('m1', 'agent-2', 'agent-1', 'inform', 'c1', '{u2}', '{T0}', NULL);
 INSERT INTO message_reads (message_id, session_id, read_at) VALUES ('m1', 's1', '{T0}');
 INSERT INTO zulip_cursors (bot, last_message_id) VALUES ('bot', 1);
+INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) VALUES
+  ('default', '{{\"elements\": []}}', 'agent-1', '{T0}');
 INSERT INTO nodes (node, agent, device_node, facts_json, version, registered_at, last_heartbeat, updated_at,
   retired_at, retired_by, retired_reason, heartbeat_floor) VALUES
   ('mac-1', 'agent-1', 'mac-1', '{{\"worktree_roots\": [\"/Users/someone/secret\"]}}', '0.9.1', '{T0}', '{T0}', '{T0}',
@@ -534,6 +542,7 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'old-box' AND retired_by = 'operator'"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
     assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes"), 1);
 
     // Self references: a forward parent is restored, a dangling one is NULL.
     assert_eq!(n(&db, "SELECT parent_id FROM tasks WHERE id = 2"), 4);
