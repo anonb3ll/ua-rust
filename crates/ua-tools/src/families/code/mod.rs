@@ -9,7 +9,9 @@
 mod dash;
 mod devservers;
 mod format;
+#[cfg(feature = "code-intel")]
 mod index;
+#[cfg(feature = "code-intel")]
 pub mod lang;
 pub mod lint;
 pub mod media;
@@ -50,6 +52,7 @@ pub fn register(r: &mut Registry) {
     dash::register(r);
     devservers::register(r);
     format::register(r);
+    #[cfg(feature = "code-intel")]
     index::register(r);
     lint::register(r);
     media::register(r);

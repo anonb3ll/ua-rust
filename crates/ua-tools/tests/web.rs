@@ -264,10 +264,15 @@ async fn extracts_readable_markdown() {
     );
     assert_eq!(page["untrusted"], true);
     assert_eq!(page["truncated"], false);
+    // The article is found with the readability feature; without it the
+    // whole page is converted, and the result says so.
+    let expected = if cfg!(feature = "readability") { "readability" } else { "full-page" };
+    assert_eq!(page["extraction"], expected, "{page}");
 
     let raw = env.call("web_fetch", json!({ "url": format!("{base}/article"), "raw": true })).await.unwrap();
     assert!(raw["content"].as_str().unwrap().starts_with("<!doctype html>"));
     assert_eq!(raw["title"], Value::Null);
+    assert_eq!(raw.get("extraction"), None, "raw bodies are not converted");
 
     let capped =
         env.call("web_fetch", json!({ "url": format!("{base}/article"), "max_chars": 10 })).await.unwrap();

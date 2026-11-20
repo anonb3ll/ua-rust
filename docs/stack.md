@@ -10,7 +10,7 @@ Re-check a row before relying on it after a few months.
 |---|---|---|---|
 | Async runtime | tokio 1.54 | — | The default; axum and rmcp both build on it. |
 | HTTP framework | axum 0.8 + tower 0.5 + tower-http 0.7 | actix-web 4.20 | rmcp's Streamable HTTP service is a Tower service and mounts with `nest_service("/mcp", …)`. The single call wrapper (auth → profile → policy → approval → ledger) is written as Tower layers plus one in-process dispatcher. |
-| MCP | rmcp 3.11 (official SDK); its client features power `mcp_gateway` | rust-mcp-sdk 2.0 | Implements spec revision 2026-07-28 (stateless, no `initialize`), with a legacy session mode for 2025-11-25 clients. We implement `list_tools`/`call_tool` by hand so the tool list is filtered per profile. rmcp has no OAuth authorization server. |
+| MCP | rmcp 3.11 (official SDK); its client features power `mcp_gateway` | rust-mcp-sdk 2.0 | Implements spec revision 2026-07-28 (stateless, no `initialize`), with a legacy session mode for 2025-11-25 clients. We implement `list_tools`/`call_tool` by hand so the tool list is filtered per profile. rmcp has no OAuth authorization server. The server side is behind the `mcp-server` cargo feature (ua-server, ua-cli) and the client side behind `mcp-gateway` (ua-tools); both are on by default. |
 | SQLite | rusqlite 0.43 (bundled SQLite 3.54, FTS5 on) | sqlx 0.9 | Full control over WAL, `BEGIN IMMEDIATE`, custom functions and virtual tables. One writer connection plus a pool of four readers, lent through an RAII guard; when all are busy a read opens a short-lived extra reader (up to four) and then waits, never taking the writer. Blocking work runs on `spawn_blocking`. `ua serve` runs `PRAGMA wal_checkpoint(TRUNCATE)` on shutdown. Storage sits behind repository traits so a Postgres backend can be added later. |
 | Migrations | Named schema parts (own code, about 50 lines) | rusqlite_migration 2.7 | Each feature module contributes idempotent parts recorded by name and checksum, so modules add tables without coordinating version numbers. |
 | Full-text search | SQLite FTS5 | tantivy 0.27 | Same transaction as the row write; no second index to keep in sync. |
@@ -39,8 +39,8 @@ Re-check a row before relying on it after a few months.
 | Logging | tracing + tracing-subscriber | — | OpenTelemetry export behind the `otel` feature (OTel traces are still Beta in Rust). |
 | Git | `git` CLI via `tokio::process` for writes; gix 0.90 for reads | git2 0.21 | gix cannot yet remove worktrees or run merges. |
 | HTTP client | reqwest 0.13 (rustls) | ureq 3 | rustls is now the default backend. |
-| Content extraction | dom_smoothie 0.19 + htmd 0.6 | trafilatura 0.6 | Readability-style main content, then Markdown. |
-| Code intelligence | tree-sitter 0.27 + tree-sitter-language-pack | ast-grep-language | Same grammar pack as the original. |
+| Content extraction | dom_smoothie 0.19 + htmd 0.6 | trafilatura 0.6 | Readability-style main content, then Markdown. dom_smoothie is behind the `readability` cargo feature (on by default); without it the whole page is converted and results say `extraction: "full-page"`. |
+| Code intelligence | tree-sitter 0.27 + tree-sitter-language-pack | ast-grep-language | Same grammar pack as the original. Behind the `code-intel` cargo feature (on by default); without it the four symbol tools are not registered. |
 | Markdown / vault | comrak 1.0 (wikilinks, front matter) | pulldown-cmark 0.13 | Mutable AST for note rewrites. |
 | YAML | serde-saphyr 2.2 | yaml_serde 0.10 | serde_yaml is deprecated; serde_yml is unsound. |
 | File watching | notify 8 + notify-debouncer-full | — | Standard. |
@@ -54,6 +54,23 @@ Re-check a row before relying on it after a few months.
 | Time | jiff 1.0 | time 0.3 | |
 | Tests and CI | cargo-nextest, insta, cargo-deny, Swatinem/rust-cache | cargo-audit | |
 | Release | dist 0.34 | cargo-zigbuild | Per-target archives and installers. |
+
+## Cargo features
+
+The heavy optional dependencies sit behind cargo features, so a smaller build
+can leave them out. Each feature is declared in `ua-tools` (or `ua-server`)
+and forwarded with the same name by `ua-server`, `ua-import` and `ua-cli`.
+`system_doctor` (`build.features`, the `build_features` row) and
+`capability_catalog` (`build_features`, `compiled_out_tools`) report what a
+build has.
+
+| Feature | Default | Pulls in | Enables | Without it |
+|---|---|---|---|---|
+| `code-intel` | on | tree-sitter and five grammars | `fs_index_symbols`, `fs_list_symbols`, `fs_search_symbols`, `fs_repo_map` | Those four tools are not registered. |
+| `readability` | on | dom_smoothie | The article pass in `web_fetch` and `dash_view` | The whole page is converted; results carry `extraction: "full-page"`. |
+| `mcp-gateway` | on | rmcp (client) | `mcp_gateway`, the downstream MCP client | No `mcp_gateway`; `mcp_server_register` refuses, and the `mcp_server_*` descriptions and results say no gateway is compiled in. |
+| `mcp-server` | on | rmcp (server) | The `/mcp` route, `ua mcp`, the `/mcp` OAuth protected resource | `ua serve` warns at startup and serves the JSON API and UI only; OAuth issues hub-wide tokens; `ua mcp` exits with an error naming the feature. |
+| `embeddings` | off | fastembed | Semantic memory search (see the Embeddings row) | Memory search is lexical (FTS5). |
 
 ## Protocol notes
 

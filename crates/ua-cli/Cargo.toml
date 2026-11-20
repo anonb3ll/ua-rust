@@ -11,14 +11,27 @@ repository.workspace = true
 name = "ua"
 path = "src/main.rs"
 
+[features]
+# On by default, so `ua` with no feature flags is the same binary as before.
+# `--no-default-features` builds it without tree-sitter, dom_smoothie and
+# rmcp. See "Build options" in the README.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+code-intel = ["ua-tools/code-intel", "ua-server/code-intel", "ua-import/code-intel"]
+readability = ["ua-tools/readability", "ua-server/readability", "ua-import/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway", "ua-server/mcp-gateway", "ua-import/mcp-gateway"]
+# `ua mcp` and the `/mcp` route of `ua serve`.
+mcp-server = ["ua-server/mcp-server"]
+# Off by default: semantic memory search with fastembed.
+embeddings = ["ua-tools/embeddings", "ua-server/embeddings", "ua-import/embeddings"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 ua-core.workspace = true
 ua-store.workspace = true
-ua-tools.workspace = true
-ua-server.workspace = true
-ua-import.workspace = true
+ua-tools = { workspace = true, default-features = false }
+ua-server = { workspace = true, default-features = false }
+ua-import = { workspace = true, default-features = false }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

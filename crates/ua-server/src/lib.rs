@@ -10,6 +10,7 @@ pub mod events;
 pub mod github_api;
 pub mod guard;
 pub mod login;
+#[cfg(feature = "mcp-server")]
 pub mod mcp;
 pub mod node_api;
 pub mod oauth;
@@ -57,14 +58,27 @@ delegation, messages, memory, vault and workspace tools behind identity, profile
 Search memory before asking the user to repeat themselves. Calls that need a human return approval_required with \
 an approval id; retry the identical call after it is approved.";
 
-/// Build the full HTTP router: `/mcp`, `/api`, health. Cancelling `ct`
-/// ends MCP sessions and open event streams.
+/// Whether this build serves MCP (`/mcp`, `ua mcp`): the `mcp-server`
+/// feature, on by default.
+pub const MCP_SERVER: bool = cfg!(feature = "mcp-server");
+
+/// What `ua serve` logs at startup when [`MCP_SERVER`] is off.
+pub const NO_MCP_SERVER_WARNING: &str = "built without the mcp-server feature: this hub serves no MCP (no /mcp \
+route, no `ua mcp`); MCP clients cannot connect. The JSON API (/api/tools), the UI and OAuth for /api still work.";
+
+/// Build the full HTTP router: `/mcp` (with the `mcp-server` feature),
+/// `/api`, health. Cancelling `ct` ends MCP sessions and open event streams.
 pub fn router(state: AppState, ct: CancellationToken) -> Router {
     let state = AppState { shutdown: ct.clone(), ..state };
-    let mcp = mcp::http_service(state.clone(), ct);
-    Router::new()
-        .nest_service("/mcp", mcp)
-        .merge(api::routes())
+    #[cfg(feature = "mcp-server")]
+    let app = Router::new().nest_service("/mcp", mcp::http_service(state.clone(), ct));
+    #[cfg(not(feature = "mcp-server"))]
+    let app = {
+        // Only the MCP service holds the token; `state.shutdown` has a clone.
+        let _ = ct;
+        Router::new()
+    };
+    app.merge(api::routes())
         .merge(oauth::routes())
         .merge(login::routes())
         .merge(compat_api::routes())
@@ -82,7 +96,10 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
     let bind = state.hub.cfg().bind;
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(%bind, tools = state.registry.len(), "hub listening");
+    tracing::info!(%bind, tools = state.registry.len(), mcp = MCP_SERVER, "hub listening");
+    if !MCP_SERVER {
+        tracing::warn!("{NO_MCP_SERVER_WARNING}");
+    }
     let app = router(state, ct.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).with_graceful_shutdown(async move { ct.cancelled_owned().await }).await?;
     Ok(())

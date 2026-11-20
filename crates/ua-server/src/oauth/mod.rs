@@ -50,13 +50,18 @@ const CODE_TTL_SECS: i64 = 120;
 const REQUEST_TTL_SECS: i64 = 600;
 
 /// Routes of the authorization server. Every handler answers 404 while
-/// `oauth_enabled` is off.
+/// `oauth_enabled` is off. Without the `mcp-server` feature there is no
+/// `/mcp`, so its protected resource metadata is not served either.
 pub fn routes() -> Router<AppState> {
-    Router::new()
+    let r = Router::new()
         .route("/.well-known/oauth-authorization-server", get(metadata::authorization_server))
-        .route("/.well-known/oauth-protected-resource", get(metadata::protected_resource_root))
-        .route("/.well-known/oauth-protected-resource/mcp", get(metadata::protected_resource_mcp))
-        .route("/oauth/authorize", get(authorize::show).post(authorize::decide))
+        .route("/.well-known/oauth-protected-resource", get(metadata::protected_resource_root));
+    let r = if crate::MCP_SERVER {
+        r.route("/.well-known/oauth-protected-resource/mcp", get(metadata::protected_resource_mcp))
+    } else {
+        r
+    };
+    r.route("/oauth/authorize", get(authorize::show).post(authorize::decide))
         .route("/oauth/token", post(token::token))
         .route("/oauth/revoke", post(token::revoke))
         .route("/oauth/register", post(register::register))
@@ -72,9 +77,20 @@ pub fn mcp_resource(cfg: &Config) -> String {
     format!("{}/mcp", issuer(cfg))
 }
 
-/// Where the protected resource metadata of `/mcp` is served.
+/// The resource a client gets when it names none: the MCP endpoint, or the
+/// whole hub in a build without the `mcp-server` feature.
+pub fn default_resource(cfg: &Config) -> String {
+    if crate::MCP_SERVER { mcp_resource(cfg) } else { issuer(cfg) }
+}
+
+/// Where the protected resource metadata of [`default_resource`] is served:
+/// `/mcp`'s, or the root document without the `mcp-server` feature.
 pub fn resource_metadata_url(cfg: &Config) -> String {
-    format!("{}/.well-known/oauth-protected-resource/mcp", issuer(cfg))
+    if crate::MCP_SERVER {
+        format!("{}/.well-known/oauth-protected-resource/mcp", issuer(cfg))
+    } else {
+        format!("{}/.well-known/oauth-protected-resource", issuer(cfg))
+    }
 }
 
 /// The `WWW-Authenticate` value for a 401. With OAuth on it carries the
@@ -102,13 +118,14 @@ pub fn canonical_resource(raw: &str) -> Option<String> {
 }
 
 /// Resource indicators this hub issues tokens for: the MCP endpoint (default)
-/// and the whole hub (also valid on `/api`).
+/// and the whole hub (also valid on `/api`). Without the `mcp-server`
+/// feature only the whole hub, which is then the default.
 pub fn accepted_resource(cfg: &Config, requested: Option<&str>) -> Option<String> {
-    let Some(raw) = requested.filter(|r| !r.trim().is_empty()) else { return Some(mcp_resource(cfg)) };
+    let Some(raw) = requested.filter(|r| !r.trim().is_empty()) else { return Some(default_resource(cfg)) };
     let want = canonical_resource(raw)?;
     let mcp = canonical_resource(&mcp_resource(cfg))?;
     let root = canonical_resource(&issuer(cfg))?;
-    if want == mcp {
+    if want == mcp && crate::MCP_SERVER {
         Some(mcp_resource(cfg))
     } else if want == root {
         Some(issuer(cfg))
@@ -194,6 +211,24 @@ mod tests {
         Config { public_url: Some("https://hub.example.com".into()), ..Config::default() }
     }
 
+    #[cfg(not(feature = "mcp-server"))]
+    #[test]
+    fn without_an_mcp_server_only_the_hub_is_a_resource() {
+        let mut c = cfg();
+        assert_eq!(accepted_resource(&c, None).as_deref(), Some("https://hub.example.com"));
+        assert_eq!(accepted_resource(&c, Some("https://hub.example.com/mcp")), None);
+        assert_eq!(
+            accepted_resource(&c, Some("https://hub.example.com/")).as_deref(),
+            Some("https://hub.example.com")
+        );
+        c.oauth_enabled = true;
+        let h = www_authenticate(&c, None);
+        assert!(
+            h.contains("resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource\"")
+        );
+    }
+
+    #[cfg(feature = "mcp-server")]
     #[test]
     fn resource_indicators() {
         let c = cfg();
@@ -210,6 +245,7 @@ mod tests {
         assert_eq!(accepted_resource(&c, Some("https://hub.example.com/mcp#x")), None);
     }
 
+    #[cfg(feature = "mcp-server")]
     #[test]
     fn challenge_header() {
         let mut c = cfg();
