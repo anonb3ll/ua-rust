@@ -69,6 +69,30 @@ is unset). Configuration is read from defaults, then `$UA_HOME/config.toml`
 [config.example.toml](config.example.toml) and [.env.example](.env.example).
 Every value in those files is a placeholder.
 
+### Build options
+
+`cargo build --release` builds everything in the table below except
+`embeddings`. To leave the heavy dependencies out, build without default
+features and add back what you want:
+
+```sh
+cargo build --release --no-default-features                          # smallest build
+cargo build --release --no-default-features --features mcp-server    # MCP clients can still connect
+cargo build --release --features embeddings                          # add semantic memory search
+```
+
+| Feature | Default | Enables | Without it |
+|---|---|---|---|
+| `code-intel` | on | tree-sitter symbol tools: `fs_index_symbols`, `fs_list_symbols`, `fs_search_symbols`, `fs_repo_map` | Those tools are not registered. |
+| `readability` | on | dom_smoothie article extraction in `web_fetch` and `dash_view` | The whole page is converted (`extraction: "full-page"`). |
+| `mcp-gateway` | on | `mcp_gateway`, the client for downstream MCP servers | `mcp_server_register` refuses. |
+| `mcp-server` | on | The hub's own MCP server: `/mcp` and `ua mcp` | `ua serve` serves the JSON API and UI only, and warns at startup. |
+| `embeddings` | off | Semantic memory search with fastembed | Memory search is lexical (FTS5). |
+
+`system_doctor` and `capability_catalog` report which features a build has
+and which tools a missing feature leaves out. See
+[docs/stack.md](docs/stack.md#cargo-features).
+
 ## First run
 
 ```sh
