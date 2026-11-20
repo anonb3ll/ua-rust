@@ -112,6 +112,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
                     failure_reason: Some(reason.into()),
                     failure_class: Some("lease".into()),
                     usage: None,
+                    quota_signal: None,
                 },
             )
         })?;

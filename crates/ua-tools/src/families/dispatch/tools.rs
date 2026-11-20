@@ -348,10 +348,11 @@ fn expect_one_link(n: usize, run_id: &str) -> UaResult<()> {
 /// payload is the binding resolved from them.
 const ARG_KEYS: [&str; 8] =
     ["task_id", "agent", "harness", "prompt", "lease_seconds", "node", "backend", "node_timeout_s"];
-const BOUND_KEYS: [&str; 18] = [
+const BOUND_KEYS: [&str; 19] = [
     "node_cwd",
-    "env",
+    "env_sha256",
     "env_denylist",
+    "program",
     "path_prepend",
     "stdin",
     "provider_account",
@@ -370,8 +371,10 @@ const BOUND_KEYS: [&str; 18] = [
 ];
 
 /// What a harness launch is bound to, as approval payload fields: the
-/// harness, resolved workdir, argv template, env allowlist, wall-clock
-/// limit, output cap and, when it is passed, whose token the child gets.
+/// harness, resolved workdir, argv template, the absolute program `argv[0]`
+/// resolves to, env allowlist, wall-clock limit, output cap and, when it is
+/// passed, whose token the child gets. Fixed `env` values are bound by their
+/// SHA-256, never shown raw.
 fn harness_binding(
     harness: Option<&(String, ua_core::config::HarnessConfig)>,
     workdir: Option<&Path>,
@@ -381,6 +384,12 @@ fn harness_binding(
     m.insert("harness".into(), json!(harness.map(|(n, _)| n.clone())));
     m.insert("workdir".into(), json!(workdir.map(|p| p.display().to_string())));
     m.insert("argv".into(), json!(harness.map(|(_, h)| h.argv.clone())));
+    m.insert(
+        "program".into(),
+        json!(
+            harness.and_then(|(_, h)| executor::resolve_program(h, workdir)).map(|p| p.display().to_string())
+        ),
+    );
     m.insert("env_allowlist".into(), json!(harness.map(|(_, h)| h.env_allowlist.clone())));
     m.insert("timeout_s".into(), json!(harness.map(|(_, h)| h.timeout_s)));
     m.insert("output_cap_bytes".into(), json!(harness.map(|(_, h)| h.output_cap_bytes)));
@@ -390,7 +399,9 @@ fn harness_binding(
     // Launch settings an approver must see, bound only when a harness sets them.
     if let Some((_, h)) = harness {
         if !h.env.is_empty() {
-            m.insert("env".into(), json!(h.env));
+            let hashed: Map<String, Value> =
+                h.env.iter().map(|(k, v)| (k.clone(), json!(sha256_hex(v)))).collect();
+            m.insert("env_sha256".into(), Value::Object(hashed));
         }
         if !h.env_denylist.is_empty() {
             m.insert("env_denylist".into(), json!(h.env_denylist));
@@ -502,6 +513,7 @@ enum Gated {
         workdir: Option<PathBuf>,
         harness: Box<Option<(String, ua_core::config::HarnessConfig)>>,
         rerouted_from: Option<Value>,
+        program: Option<PathBuf>,
     },
     Routed(Value),
     Pending {
@@ -715,6 +727,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 None => (None, None),
                 Some((name, h)) => {
                     let (name, h, from) = provider_accounts::select_harness(tx, hub.cfg(), name, h)?;
+                    provider_accounts::check_billing_env(tx, &name, &h)?;
                     (Some((name, h)), from)
                 }
             };
@@ -819,12 +832,13 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
                 return Ok(Gated::Routed(out));
             }
-            Ok(Gated::Run { run_id, prompt, workdir, harness: Box::new(h2), rerouted_from })
+            let program = payload["program"].as_str().map(PathBuf::from);
+            Ok(Gated::Run { run_id, prompt, workdir, harness: Box::new(h2), rerouted_from, program })
         })
         .await?;
-    let (run_id, prompt, workdir, harness, rerouted_from) = match gated {
-        Gated::Run { run_id, prompt, workdir, harness, rerouted_from } => {
-            (run_id, prompt, workdir, *harness, rerouted_from)
+    let (run_id, prompt, workdir, harness, rerouted_from, program) = match gated {
+        Gated::Run { run_id, prompt, workdir, harness, rerouted_from, program } => {
+            (run_id, prompt, workdir, *harness, rerouted_from, program)
         }
         Gated::Routed(mut out) => {
             out["task_id"] = json!(tid);
@@ -865,6 +879,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 workdir: workdir.unwrap_or_default(),
                 prompt,
                 actor: ctx.caller.label.clone(),
+                program,
             };
             executor::launch(&ctx.hub, spec).await?
         }
@@ -939,6 +954,7 @@ async fn report_self(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
                     failure_reason: reason,
                     failure_class: None,
                     usage: a.usage,
+                    quota_signal: None,
                 },
             )
         })
@@ -1140,9 +1156,10 @@ fn resume_refusal(run: &super::Run) -> Option<String> {
 /// An approval recorded before `timeout_s` and `output_cap_bytes` were bound
 /// lacks them, so it counts as changed and such a run must be dispatched
 /// again: the approver never saw those limits.
-const RESUME_BOUND_KEYS: [&str; 13] = [
+const RESUME_BOUND_KEYS: [&str; 14] = [
     "harness",
-    "env",
+    "env_sha256",
+    "program",
     "env_denylist",
     "path_prepend",
     "stdin",
@@ -1199,7 +1216,7 @@ fn check_resume_binding(
 }
 
 enum ResumeGate {
-    Run { fence: i64 },
+    Run { fence: i64, program: Option<PathBuf> },
     Pending { approval_id: i64 },
     Denied { approval_id: i64, reason: Option<String> },
 }
@@ -1257,6 +1274,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             // while the harness's provider account cannot take a run.
             if let Some((name, h)) = &h2 {
                 provider_accounts::check_available(tx, name, h)?;
+                provider_accounts::check_billing_env(tx, name, h)?;
             }
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
@@ -1319,11 +1337,12 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 &actor2,
                 json!({ "previous_fence": run.fence, "approval_id": approval_id }),
             )?;
-            Ok(ResumeGate::Run { fence })
+            let program = payload["program"].as_str().map(PathBuf::from);
+            Ok(ResumeGate::Run { fence, program })
         })
         .await?;
-    let fence = match gated {
-        ResumeGate::Run { fence } => fence,
+    let (fence, program) = match gated {
+        ResumeGate::Run { fence, program } => (fence, program),
         ResumeGate::Pending { approval_id } => {
             return Err(UaError::ApprovalRequired { tool: "dispatch_resume".into(), approval_id });
         }
@@ -1348,6 +1367,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 workdir: workdir.unwrap_or_default(),
                 prompt: run.prompt.clone().unwrap_or_default(),
                 actor,
+                program,
             };
             executor::launch(&ctx.hub, spec).await?
         }

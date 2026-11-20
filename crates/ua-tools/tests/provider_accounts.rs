@@ -96,12 +96,51 @@ impl H {
     }
 
     async fn register(&self, label: &str, provider: &str) -> Value {
+        self.register_billing(label, provider, "subscription").await
+    }
+
+    async fn register_billing(&self, label: &str, provider: &str, billing: &str) -> Value {
         self.ok(
             &human(),
             "provider_account_register",
-            json!({ "provider": provider, "label": label, "billing": "subscription" }),
+            json!({ "provider": provider, "label": label, "billing": billing }),
         )
         .await
+    }
+
+    /// The payload of an approval.
+    fn payload(&self, approval_id: i64) -> Value {
+        self.hub
+            .db()
+            .read(move |c| {
+                let t: String =
+                    c.query_row("SELECT payload FROM approvals WHERE id = ?1", [approval_id], |r| r.get(0))?;
+                Ok(serde_json::from_str(&t).unwrap())
+            })
+            .unwrap()
+    }
+
+    fn approvals(&self) -> i64 {
+        self.hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    }
+
+    fn event_payloads(&self, kind: &str) -> Vec<Value> {
+        let kind = kind.to_string();
+        self.hub
+            .db()
+            .read(move |c| {
+                let mut st = c.prepare(
+                    "SELECT payload FROM event_log WHERE channel = 'provider.account' \
+                     AND json_extract(payload, '$.kind') = ?1 ORDER BY seq",
+                )?;
+                let rows =
+                    st.query_map([&kind], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows.into_iter().map(|t| serde_json::from_str(&t).unwrap()).collect())
+            })
+            .unwrap()
     }
 
     async fn wait_terminal(&self, run_id: &str) -> Value {
@@ -148,8 +187,7 @@ async fn operators_manage_the_registry_and_no_secret_value_is_stored() {
         .ok(
             &human(),
             "provider_account_register",
-            json!({ "provider": "OpenAI", "label": "openai-main", "billing": "api",
-                    "secret_name": "OPENAI_KEY_MAIN", "notes": "team key" }),
+            json!({ "provider": "OpenAI", "label": "openai-main", "billing": "api", "notes": "team key" }),
         )
         .await;
     assert_eq!(v["account"]["provider"], "openai", "provider is normalized");
@@ -164,8 +202,9 @@ async fn operators_manage_the_registry_and_no_secret_value_is_stored() {
         .await
         .unwrap_err();
     assert_eq!(code(&e), "provider_account_exists");
+    // An account stores no secret and no secret name: the field is gone.
     for bad in [
-        json!({ "provider": "openai", "label": "x1", "billing": "api", "secret_name": "sk-abcdefghijklmnopqrst" }),
+        json!({ "provider": "openai", "label": "x1", "billing": "api", "secret_name": "OPENAI_KEY_MAIN" }),
         json!({ "provider": "openai", "label": "x2", "billing": "api", "notes": "api_key=abc123" }),
         json!({ "provider": "openai", "label": "x3", "billing": "metered" }),
     ] {
@@ -174,14 +213,10 @@ async fn operators_manage_the_registry_and_no_secret_value_is_stored() {
     }
 
     let v = h
-        .ok(
-            &human(),
-            "provider_account_update",
-            json!({ "label": "openai-main", "billing": "subscription", "secret_name": "" }),
-        )
+        .ok(&human(), "provider_account_update", json!({ "label": "openai-main", "billing": "subscription" }))
         .await;
-    assert_eq!(v["changed"], json!(["billing", "secret_name"]));
-    assert_eq!(v["account"]["secret_name"], Value::Null);
+    assert_eq!(v["changed"], json!(["billing"]));
+    assert!(v["account"].get("secret_name").is_none(), "{v}");
     let v = h
         .ok(&human(), "provider_account_disable", json!({ "label": "openai-main", "reason": "rotating" }))
         .await;
@@ -235,6 +270,39 @@ async fn dispatch_refuses_an_unavailable_account_before_asking_for_approval() {
     assert_eq!(acct["harnesses"], json!(["coder"]));
 }
 
+/// Review finding: a subscription account's harness passed metered API keys
+/// through its env_allowlist. Dispatch refuses it before any approval.
+#[tokio::test]
+async fn a_subscription_harness_passing_an_api_key_is_refused_before_approval() {
+    let h = H::with(|c, _| {
+        let mut a = harness(&["/bin/true"], Some("sub"));
+        a.env_allowlist = vec!["OPENAI_API_KEY".into(), "PI_HOME".into()];
+        c.harnesses.insert("leaky".into(), a);
+        let mut b = harness(&["/bin/true"], Some("sub"));
+        b.env_allowlist = vec!["OPENAI_API_KEY".into()];
+        b.env_denylist = vec!["OPENAI_API_KEY".into()];
+        c.harnesses.insert("tight".into(), b);
+        let mut m = harness(&["/bin/true"], Some("metered"));
+        m.env_allowlist = vec!["OPENAI_API_KEY".into()];
+        c.harnesses.insert("metered".into(), m);
+    });
+    h.register("sub", "openai").await;
+    h.register_billing("metered", "openai", "api").await;
+    let tid = h.task().await;
+    let e = h.dispatch(json!({ "task_id": tid, "agent": "agent-1", "harness": "leaky" })).await.unwrap_err();
+    assert_eq!(code(&e), "subscription_api_key_passthrough");
+    assert!(e.to_string().contains("OPENAI_API_KEY") && !e.to_string().contains("PI_HOME"), "{e}");
+    assert_eq!(h.approvals(), 0, "nobody is asked to approve it");
+    // Denied names, and an api account, pass the check and reach the approval.
+    for name in ["tight", "metered"] {
+        let me = agent("agent-1");
+        let e = h
+            .call(&me, "dispatch_task", json!({ "task_id": tid, "agent": "agent-1", "harness": name }))
+            .await;
+        assert!(matches!(e, Err(UaError::ApprovalRequired { .. })), "{name}: {e:?}");
+    }
+}
+
 #[cfg(unix)]
 mod spawn {
     use super::*;
@@ -264,6 +332,8 @@ mod spawn {
         let run = h.dispatch(args).await.unwrap();
         assert_eq!(run["rerouted_from"]["harness"], "coder-a", "{run}");
         assert_eq!(run["rerouted_from"]["reason"], "provider_account_disabled");
+        assert_eq!(run["rerouted_from"]["billing"], "subscription");
+        assert_eq!(run["rerouted_from"]["to_billing"], "subscription");
         let r = h.wait_terminal(run["run_id"].as_str().unwrap()).await;
         assert_eq!(r["harness"], "coder-b");
         let log = std::fs::read_to_string(r["log_path"].as_str().unwrap()).unwrap();
@@ -273,16 +343,119 @@ mod spawn {
         assert_eq!(status["accounts"][0]["recent"]["by_state"]["finished"], 1);
     }
 
+    /// Review finding: fallback ignored billing, so a subscription harness
+    /// could silently move onto a metered account. It stays within one
+    /// billing type unless the harness opts in, and the approval shows both.
+    #[tokio::test]
+    async fn fallback_keeps_the_billing_type_unless_the_harness_opts_in() {
+        let setup = |cross: bool| {
+            H::with(move |c, _| {
+                let mut a = harness(&["/bin/sh", "-c", "echo from-a"], Some("sub-a"));
+                a.provider_fallback = true;
+                a.provider_fallback_cross_billing = cross;
+                c.harnesses.insert("coder-a".into(), a);
+                c.harnesses
+                    .insert("coder-m".into(), harness(&["/bin/sh", "-c", "echo metered"], Some("api-m")));
+            })
+        };
+        for cross in [false, true] {
+            let h = setup(cross);
+            h.register("sub-a", "anthropic").await;
+            h.register_billing("api-m", "anthropic", "api").await;
+            h.ok(&human(), "provider_account_disable", json!({ "label": "sub-a" })).await;
+            let tid = h.task().await;
+            let args = json!({ "task_id": tid, "agent": "agent-1", "harness": "coder-a" });
+            if !cross {
+                let e = h.dispatch(args).await.unwrap_err();
+                assert_eq!(code(&e), "provider_account_disabled");
+                assert!(e.to_string().contains("subscription account"), "{e}");
+                continue;
+            }
+            let first = h.call(&agent("agent-1"), "dispatch_task", args.clone()).await.unwrap_err();
+            let UaError::ApprovalRequired { approval_id, .. } = first else { panic!("{first}") };
+            let p = h.payload(approval_id);
+            assert_eq!(p["harness"], "coder-m", "{p}");
+            assert_eq!(p["rerouted_from"]["billing"], "subscription", "{p}");
+            assert_eq!(p["rerouted_from"]["to_billing"], "api", "{p}");
+            assert_eq!(p["rerouted_from"]["to_provider_account"], "api-m", "{p}");
+        }
+    }
+
+    /// Review finding: a usage-limit phrase anywhere in the run log (the
+    /// model's own stdout) or in a self-reported reason rate-limited a shared
+    /// account. Only a harness-declared pattern on stderr, or a structured JSON
+    /// error event, does; the ledger keeps the matched line and its source.
+    #[tokio::test]
+    async fn only_a_declared_quota_signal_rate_limits_the_account() {
+        let h = H::with(|c, _| {
+            let mut out =
+                harness(&["/bin/sh", "-c", "echo 'Error: 5-hour limit reached'; exit 1"], Some("acct-o"));
+            out.quota_patterns = vec!["limit reached".into()];
+            c.harnesses.insert("stdout-only".into(), out);
+            c.harnesses.insert(
+                "undeclared".into(),
+                harness(&["/bin/sh", "-c", "echo 'Error: 5-hour limit reached' >&2; exit 1"], Some("acct-o")),
+            );
+            c.harnesses.insert("sleeper".into(), harness(&["/bin/sh", "-c", "sleep 3"], Some("acct-o")));
+            let mut pi = harness(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    r#"echo '{"type":"message_end","message":{"stopReason":"error","errorMessage":"429 insufficient_quota"}}'; exit 1"#,
+                ],
+                Some("acct-j"),
+            );
+            pi.quota_patterns = vec!["insufficient_quota".into()];
+            pi.quota_json_errors = true;
+            c.harnesses.insert("pi-json".into(), pi);
+        });
+        h.register("acct-o", "anthropic").await;
+        h.register("acct-j", "openai-codex").await;
+        for name in ["stdout-only", "undeclared"] {
+            let tid = h.task().await;
+            let run =
+                h.dispatch(json!({ "task_id": tid, "agent": "agent-1", "harness": name })).await.unwrap();
+            let r = h.wait_terminal(run["run_id"].as_str().unwrap()).await;
+            assert_eq!(r["failure_class"], "exit", "{name}: {r}");
+        }
+        // A self-report quoting a limit is advisory: recorded, not limiting.
+        let tid = h.task().await;
+        let run =
+            h.dispatch(json!({ "task_id": tid, "agent": "agent-1", "harness": "sleeper" })).await.unwrap();
+        let rid = run["run_id"].as_str().unwrap();
+        h.ok(
+            &agent("agent-1"),
+            "dispatch_report_self",
+            json!({ "run_id": rid, "state": "failed", "failure_reason": "usage limit reached" }),
+        )
+        .await;
+        let r = h.wait_terminal(rid).await;
+        assert_eq!(r["failure_class"], "provider_quota_reported", "{r}");
+        assert_eq!(h.events("quota_reported"), 1);
+        assert_eq!(h.events("rate_limited_observed"), 0);
+        let status = h.ok(&human(), "provider_quota_status", json!({ "label": "acct-o" })).await;
+        assert_ne!(status["accounts"][0]["availability"], "rate_limited", "{status}");
+
+        // Pi's structured error event is a declared signal.
+        let tid = h.task().await;
+        let run =
+            h.dispatch(json!({ "task_id": tid, "agent": "agent-1", "harness": "pi-json" })).await.unwrap();
+        let r = h.wait_terminal(run["run_id"].as_str().unwrap()).await;
+        assert_eq!(r["failure_class"], "provider_quota_exhausted", "{r}");
+        let ev = h.event_payloads("rate_limited_observed");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["signal"], json!({ "source": "json_error", "line": "429 insufficient_quota" }));
+    }
+
     #[tokio::test]
     async fn a_quota_failure_rate_limits_the_account() {
         let h = H::with(|c, _| {
-            c.harnesses.insert(
-                "limited".into(),
-                harness(
-                    &["/bin/sh", "-c", "echo 'Error: 5-hour limit reached - resets 3am' >&2; exit 1"],
-                    Some("acct-q"),
-                ),
+            let mut q = harness(
+                &["/bin/sh", "-c", "echo 'Error: 5-hour limit reached - resets 3am' >&2; exit 1"],
+                Some("acct-q"),
             );
+            q.quota_patterns = vec!["limit reached".into()];
+            c.harnesses.insert("limited".into(), q);
         });
         h.register("acct-q", "anthropic").await;
         let tid = h.task().await;
@@ -298,6 +471,9 @@ mod spawn {
         assert_eq!(acct["last_error_class"], "provider_quota_exhausted");
         assert_eq!(acct["recent"]["quota_failures"], 1);
         assert_eq!(h.events("rate_limited_observed"), 1);
+        let ev = &h.event_payloads("rate_limited_observed")[0];
+        assert_eq!(ev["signal"]["source"], "stderr", "{ev}");
+        assert_eq!(ev["signal"]["line"], "Error: 5-hour limit reached - resets 3am");
 
         // The task is free again, but the account is not.
         let tid = h.task().await;
@@ -314,6 +490,17 @@ mod spawn {
         .await;
         let status = h.ok(&human(), "provider_quota_status", json!({ "label": "acct-q" })).await;
         assert_eq!(status["accounts"][0]["last_error_class"], Value::Null);
+        // The operator's clear lifts the limit: dispatch reaches the approval again.
+        assert_eq!(status["accounts"][0]["rate_limited_until"], Value::Null);
+        assert_ne!(status["accounts"][0]["availability"], "rate_limited");
+        let e = h
+            .call(
+                &agent("agent-1"),
+                "dispatch_task",
+                json!({ "task_id": tid, "agent": "agent-1", "harness": "limited" }),
+            )
+            .await;
+        assert!(matches!(e, Err(UaError::ApprovalRequired { .. })), "{e:?}");
     }
 
     /// A fake `pi` that reports how it was started.
@@ -375,6 +562,16 @@ printf '{"type":"agent_end"}\n'
             })
             .unwrap();
         assert_eq!(payload["provider_account"], "pi-sub", "the approval binds the account: {payload}");
+        // Review findings: env values are bound by hash, never shown raw, and
+        // the approval binds the absolute program argv[0] resolves to.
+        use sha2::{Digest, Sha256};
+        let sha =
+            |v: &str| Sha256::digest(v.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert!(payload.get("env").is_none(), "{payload}");
+        assert_eq!(payload["env_sha256"]["PI_SKIP_VERSION_CHECK"], sha("1"));
+        assert!(!payload.to_string().contains("must-not-reach"), "{payload}");
+        let program = h.dir.path().join("pi-bin").join("pi");
+        assert_eq!(payload["program"], program.display().to_string());
         assert_eq!(payload["env_denylist"], json!(["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]));
         assert!(payload["stdin"].as_str().unwrap().contains("{prompt_json}"));
 

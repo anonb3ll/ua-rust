@@ -5098,6 +5098,7 @@ dependencies = [
  "anyhow",
  "figment",
  "jiff 1.0.1",
+ "regex",
  "rusqlite",
  "secrecy",
  "serde",

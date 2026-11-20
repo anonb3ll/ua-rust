@@ -31,12 +31,20 @@ Optional launch settings:
 
 | Key | Meaning |
 |---|---|
-| `env` | Fixed values for the child, e.g. `{ PI_SKIP_VERSION_CHECK = "1" }`. Values take the placeholders. A name in the `UA_` namespace, a hub secret or a binding name is never set. |
+| `env` | Fixed, non-secret values for the child, e.g. `{ PI_SKIP_VERSION_CHECK = "1" }`. Values take the placeholders. A name in the `UA_` namespace, a hub secret or a binding name is never set. A credential-looking name (`*TOKEN*`, `*SECRET*`, `*_KEY`, ...) or value (a provider key, a bearer or basic credential, a password assignment, a URL with a password, a private key) is refused when the config loads. |
 | `env_denylist` | Names never passed, whether inherited, allowlisted or fixed in `env`. |
-| `path_prepend` | Directories put in front of the child's `PATH` (`~` is expanded). The program in `argv[0]` is looked up on the child's `PATH`. |
+| `path_prepend` | Absolute directories put in front of the child's `PATH` (`~` is expanded). A relative or empty entry, or one containing `:`, is refused when the config loads. The program in `argv[0]` is looked up on the child's `PATH` when the run is approved, and that absolute path is what runs. |
 | `stdin` | Text written to the child's standard input, which is then closed. Takes the placeholders. Unset, standard input is empty. |
 | `provider_account` | The [provider account](#provider-accounts) the harness bills. |
-| `provider_fallback` | When that account cannot take a run, use another harness of the same provider (default `false`). |
+| `provider_fallback` | When that account cannot take a run, use another harness of the same provider and billing type (default `false`). |
+| `provider_fallback_cross_billing` | Let `provider_fallback` pick an account of another billing type too (default `false`). |
+| `quota_patterns` | Case-insensitive phrases that, on a line of the child's standard error, mark a failed run as hitting its provider's usage limit. Empty (the default), no run of the harness is a quota failure. |
+| `quota_json_errors` | Also match `quota_patterns` against structured JSON error events on standard output, as Pi's `--mode json` writes them (default `false`). |
+
+**Secrets.** A secret never goes in `env`: list its name in `env_allowlist`
+and the child inherits it from the hub's own environment. A mapping from a
+managed secret to a child environment name arrives once the managed secret
+store is merged; until then the hub's environment is the only source.
 
 ## Who may dispatch and cancel
 
@@ -72,11 +80,13 @@ call's arguments. The approval payload holds:
 | `run_id` | The run that will be minted. It is derived from the task, its number of earlier runs and the agent, so it is the same when the approved call is retried. |
 | `workdir` | The resolved, canonical directory the harness will run in. |
 | `argv`, `env_allowlist` | The harness's argv template and environment allowlist. |
+| `program` | The absolute path `argv[0]` resolves to (on the child's `PATH`, or joined to `workdir`); the launch runs exactly that file. `null` when nothing was found, which fails the launch with `failure_class = config`. |
 | `prompt_source`, `prompt_sha256` | Where the prompt came from (`args` or `task`) and the SHA-256 of the exact prompt text. |
 | `prompt_preview`, `prompt_bytes` | For a prompt the hub built from the task: its first 2,000 characters and its full length in bytes, so the approver sees what will run. |
 | `passes_token_of` | Present when the harness passes the agent's own hub bearer token to the child. |
-| `env`, `env_denylist`, `path_prepend`, `stdin`, `provider_account` | Present when the harness sets them. |
-| `rerouted_from` | Present when `provider_fallback` replaced the requested harness: `{harness, provider_account, reason}`. `harness` is then the harness that runs. |
+| `env_sha256` | Present when the harness sets `env`: each name with the SHA-256 of its value. Values are never shown raw. |
+| `env_denylist`, `path_prepend`, `stdin`, `provider_account` | Present when the harness sets them. |
+| `rerouted_from` | Present when `provider_fallback` replaced the requested harness: `{harness, provider_account, billing, reason, to_provider_account, to_billing}`, both accounts' billing included. `harness` is then the harness that runs. |
 
 The approved call is consumed only when every field still matches. If the
 task's notes, its worktree, the harness config or the task's run count
@@ -97,13 +107,14 @@ arguments.
 ## Provider accounts
 
 A provider account is a registry row an operator keeps for each model
-account harnesses bill. It is metadata only: the hub stores the name of the
-managed secret an account uses, never a value, and refuses notes or a
-secret name that read like a credential.
+account harnesses bill. It is metadata only: provider, label, billing,
+enabled, notes and cooldown. It holds no secret and no secret name (a
+harness's credentials come from its `env_allowlist`), and notes that read
+like a credential are refused.
 
 | Tool | Caller | What |
 |---|---|---|
-| `provider_account_register` (`provider, label, billing, secret_name?, enabled?, notes?, cooldown_s?`) | Operators (a human or a lifecycle operator) | Add an account. `billing` is `api`, `subscription` or `local`. `label` is what a harness names. |
+| `provider_account_register` (`provider, label, billing, enabled?, notes?, cooldown_s?`) | Operators (a human or a lifecycle operator) | Add an account. `billing` is `api`, `subscription` or `local`. `label` is what a harness names. |
 | `provider_account_update` (`label`, any field, `rate_limited_until?`, `clear_error?`) | Operators | Change it, mark it rate-limited until a time (an empty string clears the limit), or forget its last error. |
 | `provider_account_disable` (`label, reason?`) | Operators | Disable it; `provider_account_update(enabled=true)` re-enables. |
 | `provider_account_list` (`include_disabled?`) | Any caller | The registry with its observed state. |
@@ -113,17 +124,22 @@ Changes are ledgered on `provider.account`. The operator profile allowlist
 includes all five tools; the reviewer profile cannot change accounts.
 
 **What the hub observes.** Each dispatch run records its harness's account.
-When a run fails, the hub looks for a provider usage-limit message
-(`usage limit reached`, `5-hour limit reached`, `hit your limit`,
-`insufficient_quota`, ...) in the last 4 KiB of the run log, or in a
-self-reported `failure_reason`. A match gives the run `failure_class =
-provider_quota_exhausted` and marks the account rate-limited for its
-`cooldown_s` (default 3600 seconds; event `rate_limited_observed`). Any other
+When a run fails, the hub reads only the signal its harness declares: one of
+its `quota_patterns` on a line of the child's standard error (the last 8 KiB,
+kept apart from the combined log), or, with `quota_json_errors`, in the
+error text of a structured JSON error event on standard output (a JSON
+object with `type = "error"`, or whose `message.stopReason` is `"error"`).
+The model's own output is never matched. A match gives the run
+`failure_class = provider_quota_exhausted` and marks the account
+rate-limited for its `cooldown_s` (default 3600 seconds). The
+`rate_limited_observed` event carries `signal: {source, line}`: `stderr` or
+`json_error`, and the matched line, credentials redacted, at most 200
+characters. A self-reported `failure_reason` that reads like a usage limit
+is advisory: the run gets `failure_class = provider_quota_reported` and a
+`quota_reported` event, and the account is not rate-limited. Any other
 failure records the account's last error class, and a finished run its last
-success. The hub never probes a provider to measure usage. The match is
-textual, so a failed run that printed such a phrase for another reason also
-counts; an operator lifts the limit with
-`provider_account_update(rate_limited_until="")`.
+success. The hub never probes a provider to measure usage. An operator
+lifts a limit with `provider_account_update(rate_limited_until="")`.
 
 **What dispatch does with it.** Before any approval is asked for,
 `dispatch_task` checks the harness's account:
@@ -133,10 +149,13 @@ counts; an operator lifts the limit with
 | `provider_account_unknown` | The harness names an account that is not registered. |
 | `provider_account_disabled` | The account is disabled. |
 | `provider_rate_limited` | The account is rate-limited until a future time. The message says until when. |
+| `subscription_api_key_passthrough` | The account's billing is `subscription` and the harness's `env_allowlist` passes an `*_API_KEY` name its `env_denylist` does not deny, so the CLI could fall back to metered billing. |
 
 With `provider_fallback = true` on the harness, dispatch instead runs the
-first other harness (by name) whose account has the same `provider` and is
-available, and reports `rerouted_from`. The approval binds the harness that
+first other harness (by name) whose account has the same `provider` and
+`billing` (any billing with `provider_fallback_cross_billing = true`), is
+available and passes the subscription key check, and reports
+`rerouted_from` with both accounts' billing. The approval binds the harness that
 runs. With no such harness the original refusal stands. `dispatch_resume`
 never reroutes: a resume must run what was approved, so it is refused with
 the same codes.
@@ -151,11 +170,13 @@ lines, which land in the run log:
 [harnesses.pi]
 argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex",
         "--model", "gpt-5.5", "--no-session", "{prompt}"]
-env_allowlist = ["OPENAI_API_KEY", "PI_API_KEY", "OPENROUTER_API_KEY"]
-env_denylist = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+env_denylist = ["OPENAI_API_KEY", "PI_API_KEY", "OPENROUTER_API_KEY",
+                "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
 path_prepend = ["~/.local/bin"]
 timeout_s = 3600
 provider_account = "pi-subscription"
+quota_patterns = ["usage limit", "insufficient_quota", "rate_limit"]
+quota_json_errors = true
 ```
 
 The conventions carried over from the original hub's Pi runner:
@@ -163,7 +184,11 @@ The conventions carried over from the original hub's Pi runner:
 - `--provider` and `--model` are always given, so Pi never takes a provider
   from its own settings file and bills an account nobody chose.
 - Metered keys the subscription must not fall back to are denied with
-  `env_denylist`, even when the hub's own environment holds them.
+  `env_denylist`, even when the hub's own environment holds them. Dispatch
+  refuses a subscription harness whose `env_allowlist` passes an
+  `*_API_KEY` name it does not deny (`subscription_api_key_passthrough`).
+- A usage limit is read from Pi's JSON error events (`quota_json_errors`),
+  never from the model's text.
 - Pi usually lives in `~/.local/bin`, which `path_prepend` puts on the
   child's `PATH`.
 - `UA_AGENT_LABEL` is the run's agent, from the dispatch binding.
@@ -238,7 +263,8 @@ must confirm cessation.
 - The environment starts empty. The child gets the process basics (`PATH`,
   `HOME`, locale, temp and XDG directories), the harness's `env_allowlist`,
   its fixed `env` values and `path_prepend`, minus its `env_denylist`, and
-  the `UA_DISPATCH_*` binding. Hub secrets and anything in the `UA_`
+  the `UA_DISPATCH_*` binding. The program is the absolute path the
+  approval bound. Hub secrets and anything in the `UA_`
   namespace are never passed.
 - The child leads its own process group. A timeout or a cancel kills the
   whole group.

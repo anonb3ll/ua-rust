@@ -216,7 +216,7 @@ identical re-registration (a restart) keeps it.
 ## Idle-session wakes
 
 An agent session that sits idle at its prompt runs no hooks, so it does not
-see new mail until someone types. A wake has the node on the session's host
+see new mail until someone types. A wake has the session's own node
 type one fixed line into it: `You have <n> new hub messages; run
 message_inbox`. No message text ever reaches a wake; the hub hands the node
 ids and counts only.
@@ -228,9 +228,9 @@ or `agent.wake.grant`.
 
 | Action (`coordination_manage`) | Who | What |
 |---|---|---|
-| `session_wake_opt_in` (params `session_id, wake?`) | The session's own agent | Ask for wakes (`wake` defaults to `true`), or withdraw the request (`false`), which clears any outstanding offer. A request alone enables nothing. |
+| `session_wake_opt_in` (params `session_id, wake?, node?`) | The session's own agent | Ask for wakes (`wake` defaults to `true`), or withdraw the request (`false`), which clears any outstanding offer. `node` names the session's wake node, one of the agent's own nodes (else `node_owned_elsewhere`). A request alone enables nothing. |
 | `session_wake_grant` (params `session_id, grant?`) | A verified human only | Grant wakes to that one hub session, or revoke them (`grant = false`, clearing offers). A new session needs a new grant. |
-| `session_wake_decline` (params `session_id, reason?`) | A human, a lifecycle operator, or the session's own agent | Decline: revokes any grant and clears offers. The decline stays when the session asks again; only a later grant clears it. |
+| `session_wake_decline` (params `session_id, reason?`) | Any verified human, a lifecycle operator, or the session's own agent | Decline: revokes any grant and clears offers. A decline only restricts, so no grant-level authority is needed. The decline stays when the session asks again; only a later grant clears it. |
 | `session_wake_status` (params `session_id?`) | The session's agent or an operator | One session's state, or every session you may see with fleet counts (requested, granted, awaiting a grant, paused, woken). |
 
 A session is offered wakes only while it is opted in, granted, not declined,
@@ -240,9 +240,19 @@ matches to a pane), and its agent is not paused, terminated or retired.
 ### Delivery
 
 The node already holds an outbound channel to the hub, so wakes use it; the
-hub never connects to a node. The node's own host is its name: a session is
-on the node's host when the session's registered `host` and the node name
-match by short lowercase name (`Box.local` and `box` are one host).
+hub never connects to a node. A session wakes only through its *wake node*,
+which is always a live node owned by the session's own agent:
+
+1. the node the session named in `session_wake_opt_in` (`node`), and only
+   that node;
+2. else the agent's one node whose name matches the session's registered
+   `host` by short lowercase name (`Box.local` and `box` are one host);
+3. else, when several of the agent's nodes share that short name, the one
+   whose full name is the host (case-insensitively); still ambiguous, the
+   session is not woken until it names its node.
+
+Another agent's node never sees the session, however it is named, and two
+machines that share a short name never receive each other's wakes.
 
 | Route | Tool | What |
 |---|---|---|
@@ -251,14 +261,20 @@ match by short lowercase name (`Box.local` and `box` are one host).
 | `POST /api/node/wake/receipt` | `node_wake_receipt` (`node, session_id, seq, outcome, reason?, expires_at, offer_id, delivered_at?`) | Report `delivered` (with `delivered_at`, the node's unix time), `failed` or `skipped` (with a `reason` of 1-64 `[a-z0-9_:.-]`). Idempotent: a resend, or a receipt for an offer that lapsed or was superseded, answers `{recorded: false, duplicate: true}`. |
 
 Only the node's agent may call them; another agent's node is refused
-(`node_owned_elsewhere`). The registration's `hub_features` carry
-`node_wake_v3` and `node_wake_live_sessions`.
+(`node_owned_elsewhere`). A check or receipt for a session whose wake node is
+not the calling node is refused (`not_found`), and the offer must have been
+made to that node. A node holds at most 2 wake polls open at once (a third
+is refused with `wake_poll_busy`). An idle poll only reads: it takes the
+write lock only when an offer is due or a breaker reset or pause must be
+recorded. The registration's `hub_features` carry `node_wake_v3` and
+`node_wake_live_sessions`.
 
 `live_sessions` lists the native session ids that have a pane on the node's
-host (at most 64). It keeps idle granted sessions on that host open, since
-nothing else heartbeats them, and reopens one the reaper closed for lack of
-heartbeats; a session that ended any other way stays ended
-(`agent.wake.session_revived`).
+host (at most 64). It keeps idle granted sessions whose wake node is this
+node open, since nothing else heartbeats them, and reopens one the reaper
+closed for lack of heartbeats; a session that ended any other way stays
+ended (`agent.wake.session_revived`). Sessions of other agents, or of other
+nodes, are never touched.
 
 ### The budget
 

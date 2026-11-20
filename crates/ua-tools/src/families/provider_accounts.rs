@@ -2,19 +2,27 @@
 //! accounts harnesses bill, and the quota state the hub observes for them.
 //!
 //! An account is metadata only: provider, label, billing (`api`,
-//! `subscription` or `local`), the name of the managed secret it uses (a
-//! name, never a value), enabled, notes. A harness names its account with
-//! `provider_account` in `[harnesses.<name>]`.
+//! `subscription` or `local`), enabled, notes. It holds no secret and no
+//! secret name: a harness's credentials come from its `env_allowlist`,
+//! passed through from the hub's environment. A harness names its account
+//! with `provider_account` in `[harnesses.<name>]`.
 //!
 //! Observed state comes from the hub's own records, never from probing a
 //! provider: each dispatch run records its harness's account, and a failed
-//! run whose failure class is [`QUOTA_CLASS`] (a usage-limit message in the
-//! run log's tail, or a self-report saying so) marks the account
-//! rate-limited for its `cooldown_s`. `dispatch_task` refuses a harness
-//! whose account is disabled (`provider_account_disabled`) or rate-limited
-//! until a future time (`provider_rate_limited`), or, with the harness's
+//! run whose failure class is [`QUOTA_CLASS`] marks the account
+//! rate-limited for its `cooldown_s`. Only a harness-declared signal sets
+//! that class ([`quota_line`]): one of the harness's `quota_patterns` on the
+//! child's standard error, or in the error text of a structured JSON error
+//! event (`quota_json_errors`). The model's own output is never matched, and
+//! a self-reported `failure_reason` is advisory ([`QUOTA_REPORTED_CLASS`]):
+//! recorded, never rate-limiting. `dispatch_task` refuses a harness whose
+//! account is disabled (`provider_account_disabled`) or rate-limited until a
+//! future time (`provider_rate_limited`), or, with the harness's
 //! `provider_fallback`, runs another harness whose account has the same
-//! provider and is available.
+//! provider and billing type (any billing with
+//! `provider_fallback_cross_billing`) and is available. A `subscription`
+//! account's harness may not pass `*_API_KEY` names it does not deny
+//! (`subscription_api_key_passthrough`).
 //!
 //! Tools: `provider_account_register`, `provider_account_update`,
 //! `provider_account_disable` (operators), `provider_account_list` and
@@ -44,7 +52,6 @@ CREATE TABLE IF NOT EXISTS provider_accounts (
     label TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     billing TEXT NOT NULL CHECK (billing IN ('api','subscription','local')),
-    secret_name TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     notes TEXT NOT NULL DEFAULT '',
     cooldown_s INTEGER NOT NULL DEFAULT 3600,
@@ -64,8 +71,14 @@ CREATE INDEX IF NOT EXISTS idx_provider_accounts_provider ON provider_accounts(p
 };
 
 pub const CHANNEL: &str = "provider.account";
-/// The failure class of a run that hit a provider usage or quota limit.
+/// The failure class of a run that hit a provider usage or quota limit, as
+/// its harness's declared signal shows.
 pub const QUOTA_CLASS: &str = "provider_quota_exhausted";
+/// The failure class of a self-reported failure whose reason reads like a
+/// usage limit: recorded, never rate-limiting.
+pub const QUOTA_REPORTED_CLASS: &str = "provider_quota_reported";
+/// Characters of a matched quota line kept in the ledger.
+const MAX_SIGNAL_CHARS: usize = 200;
 pub const BILLING: [&str; 3] = ["api", "local", "subscription"];
 
 const DEFAULT_COOLDOWN_S: i64 = 3600;
@@ -75,7 +88,8 @@ const MAX_NOTES: usize = 500;
 const DEFAULT_RECENT: i64 = 20;
 const MAX_RECENT: i64 = 200;
 
-/// A plan or account usage ceiling, as the original hub classifies it.
+/// A plan or account usage ceiling, as the original hub classifies it. Used
+/// only to label a self-report as advisory quota evidence.
 static QUOTA_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:usage\s+limit\s+(?:has\s+been\s+)?reached|quota\s+exhausted|provider\s+quota|rate[\s_-]?limit\s+reached|\b(?:\d+[\s-]?hour|session|weekly|daily|opus|sonnet)\s+limit\s+reached|hit\s+your\s+(?:usage\s+)?limit|insufficient_quota)",
@@ -91,10 +105,103 @@ static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("secret pattern")
 });
 
-/// Whether `text` carries a provider usage-limit or quota message.
+/// Whether `text` reads like a provider usage-limit or quota message.
 pub fn quota_signal(text: &str) -> bool {
     QUOTA_RE.is_match(text)
 }
+
+/// The harness-declared quota signal of a failed run: `(source, line)` for
+/// the first of `patterns` (case-insensitive) found on a line of `stderr`
+/// (source `stderr`), else, when `json_stdout` is given, in the error text
+/// of a structured JSON error event on standard output (source
+/// `json_error`). The line is redacted and at most 200 characters. Without
+/// patterns nothing ever matches; model text on standard output is never
+/// read.
+pub fn quota_line(
+    patterns: &[String],
+    stderr: &str,
+    json_stdout: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let needles: Vec<String> =
+        patterns.iter().map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
+    if needles.is_empty() {
+        return None;
+    }
+    let hit = |text: &str| {
+        let low = text.to_lowercase();
+        needles.iter().any(|n| low.contains(n.as_str()))
+    };
+    for line in stderr.lines().rev() {
+        if hit(line) {
+            return Some(("stderr", bounded(line)));
+        }
+    }
+    for line in json_stdout?.lines().rev() {
+        if let Some(text) = json_error_text(line)
+            && hit(&text)
+        {
+            return Some(("json_error", bounded(&text)));
+        }
+    }
+    None
+}
+
+/// The error text of a structured JSON error event: a line that is a JSON
+/// object with `type = "error"` (its `error`, `message` and `code` fields), or
+/// one whose `message.stopReason` is `"error"` (its `message.errorMessage`).
+/// Anything else, including model text inside events, is `None`.
+fn json_error_text(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |x: &Value| match x {
+        Value::String(t) => parts.push(t.clone()),
+        Value::Number(n) => parts.push(n.to_string()),
+        _ => {}
+    };
+    if v.get("type").and_then(Value::as_str) == Some("error") {
+        match v.get("error") {
+            Some(Value::Object(e)) => {
+                for k in ["type", "code", "message"] {
+                    if let Some(x) = e.get(k) {
+                        push(x);
+                    }
+                }
+            }
+            Some(x) => push(x),
+            None => {}
+        }
+        for k in ["code", "message"] {
+            if let Some(x) = v.get(k) {
+                push(x);
+            }
+        }
+    } else if let Some(m) =
+        v.get("message").filter(|m| m.get("stopReason").and_then(Value::as_str) == Some("error"))
+        && let Some(x) = m.get("errorMessage")
+    {
+        push(x);
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// A matched line as the ledger keeps it: credentials redacted, trimmed and
+/// at most [`MAX_SIGNAL_CHARS`] characters.
+fn bounded(line: &str) -> String {
+    let red = SECRET_VALUE_RE.replace_all(line.trim(), "[redacted]");
+    red.chars().take(MAX_SIGNAL_CHARS).collect()
+}
+
+/// Credential-looking runs of text in a matched line.
+static SECRET_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:sk-|gh[pousr]_|xox[abprs]-|github_pat_|uas_|AKIA|AIza)[A-Za-z0-9_-]{8,}|\b(?:bearer|basic)\s+[A-Za-z0-9+/._~=-]{8,}|(?:access[_-]?token|api[_-]?key|client[_-]?secret|refresh[_-]?token|password|secret|token)\s*[:=]\s*\S+",
+    )
+    .expect("secret value pattern")
+});
 
 fn now() -> String {
     ua_core::time::now()
@@ -125,7 +232,6 @@ pub(crate) struct Account {
     pub label: String,
     pub provider: String,
     pub billing: String,
-    pub secret_name: Option<String>,
     pub enabled: bool,
     pub notes: String,
     pub cooldown_s: i64,
@@ -141,7 +247,7 @@ pub(crate) struct Account {
     pub updated_at: String,
 }
 
-const COLS: &str = "label, provider, billing, secret_name, enabled, notes, cooldown_s, disabled_reason, \
+const COLS: &str = "label, provider, billing, enabled, notes, cooldown_s, disabled_reason, \
     rate_limited_until, last_error_class, last_error_at, last_error_run, last_success_at, created_by, created_at, \
     updated_by, updated_at";
 
@@ -150,20 +256,19 @@ fn account_row(r: &Row<'_>) -> rusqlite::Result<Account> {
         label: r.get(0)?,
         provider: r.get(1)?,
         billing: r.get(2)?,
-        secret_name: r.get(3)?,
-        enabled: r.get::<_, i64>(4)? != 0,
-        notes: r.get(5)?,
-        cooldown_s: r.get(6)?,
-        disabled_reason: r.get(7)?,
-        rate_limited_until: r.get(8)?,
-        last_error_class: r.get(9)?,
-        last_error_at: r.get(10)?,
-        last_error_run: r.get(11)?,
-        last_success_at: r.get(12)?,
-        created_by: r.get(13)?,
-        created_at: r.get(14)?,
-        updated_by: r.get(15)?,
-        updated_at: r.get(16)?,
+        enabled: r.get::<_, i64>(3)? != 0,
+        notes: r.get(4)?,
+        cooldown_s: r.get(5)?,
+        disabled_reason: r.get(6)?,
+        rate_limited_until: r.get(7)?,
+        last_error_class: r.get(8)?,
+        last_error_at: r.get(9)?,
+        last_error_run: r.get(10)?,
+        last_success_at: r.get(11)?,
+        created_by: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_by: r.get(14)?,
+        updated_at: r.get(15)?,
     })
 }
 
@@ -210,7 +315,6 @@ impl Account {
             "label": self.label,
             "provider": self.provider,
             "billing": self.billing,
-            "secret_name": self.secret_name,
             "enabled": self.enabled,
             "notes": self.notes,
             "cooldown_s": self.cooldown_s,
@@ -233,8 +337,10 @@ impl Account {
 
 /// The harness a dispatch runs: `name` itself when it names no account or
 /// its account can take a run; with `provider_fallback`, the first other
-/// harness (by name) whose account has the same provider and is available.
-/// Returns the chosen harness and, when it was rerouted, what it replaced.
+/// harness (by name) whose account has the same provider and the same
+/// billing type (any billing with `provider_fallback_cross_billing`), is
+/// available, and passes [`billing_env_block`]. Returns the chosen harness
+/// and, when it was rerouted, what it replaced, with both accounts' billing.
 /// Refusals carry `provider_account_unknown`, `provider_account_disabled` or
 /// `provider_rate_limited`.
 pub(crate) fn select_harness(
@@ -255,18 +361,71 @@ pub(crate) fn select_harness(
         }
         let Some(ol) = oh.provider_account.as_deref() else { continue };
         let Some(oa) = load(c, ol)? else { continue };
-        if oa.provider == account.provider && oa.block().is_none() {
-            let from = json!({ "harness": name, "provider_account": label, "reason": code });
+        let billing_ok = oa.billing == account.billing || h.provider_fallback_cross_billing;
+        if oa.provider == account.provider
+            && billing_ok
+            && oa.block().is_none()
+            && billing_env_block(&oa, other, oh).is_none()
+        {
+            let from = json!({
+                "harness": name,
+                "provider_account": label,
+                "billing": account.billing,
+                "reason": code,
+                "to_provider_account": oa.label,
+                "to_billing": oa.billing,
+            });
             return Ok((other.clone(), oh.clone(), Some(from)));
         }
     }
+    let scope = if h.provider_fallback_cross_billing {
+        format!("{:?}", account.provider)
+    } else {
+        format!("{:?} {}", account.provider, account.billing)
+    };
     Err(UaError::conflict_code(
         code,
         format!(
-            "harness {name:?}: {message}; no other harness with an available {:?} account is configured",
-            account.provider
+            "harness {name:?}: {message}; no other harness with an available {scope} account is configured"
         ),
     ))
+}
+
+/// Why a harness billing a `subscription` account may not run: its
+/// `env_allowlist` passes a `*_API_KEY` name its `env_denylist` does not
+/// deny, so the CLI could silently fall back to metered billing.
+fn billing_env_block(account: &Account, name: &str, h: &HarnessConfig) -> Option<String> {
+    if account.billing != "subscription" {
+        return None;
+    }
+    let passed: Vec<&str> = h
+        .env_allowlist
+        .iter()
+        .filter(|n| {
+            let up = n.to_ascii_uppercase();
+            (up == "API_KEY" || up.ends_with("_API_KEY")) && !h.env_denylist.iter().any(|d| d == *n)
+        })
+        .map(String::as_str)
+        .collect();
+    (!passed.is_empty()).then(|| {
+        format!(
+            "harness {name:?} bills subscription account {:?} but its env_allowlist passes {}; move them to \
+             env_denylist so the run cannot fall back to metered billing",
+            account.label,
+            passed.join(", ")
+        )
+    })
+}
+
+/// Refuse (`subscription_api_key_passthrough`), before any approval, a
+/// harness whose `subscription` account would see a metered API key.
+pub(crate) fn check_billing_env(c: &Connection, name: &str, h: &HarnessConfig) -> UaResult<()> {
+    let Some(label) = h.provider_account.as_deref() else { return Ok(()) };
+    let Some(account) = load(c, label)? else { return Ok(()) };
+    match billing_env_block(&account, name, h) {
+        Some(why) => Err(UaError::conflict_code("subscription_api_key_passthrough", why)),
+        None => Ok(()),
+    }
 }
 
 fn require(c: &Connection, label: &str, harness: &str) -> UaResult<Account> {
@@ -289,13 +448,16 @@ pub(crate) fn check_available(c: &Connection, name: &str, h: &HarnessConfig) -> 
 }
 
 /// Note a run outcome against the run's provider account: a success time, or
-/// the error class, and for a quota failure a rate limit for the account's
-/// cooldown. Runs without an account are ignored.
+/// the error class, and for a quota failure carrying its harness-declared
+/// `signal` (`{source, line}`) a rate limit for the account's cooldown. An
+/// advisory self-report ([`QUOTA_REPORTED_CLASS`]) is ledgered and never
+/// rate-limits. Runs without an account are ignored.
 pub(crate) fn observe_outcome(
     tx: &mut WriteTx<'_>,
     run_id: &str,
     state: &str,
     class: Option<&str>,
+    signal: Option<&Value>,
     actor: &str,
 ) -> UaResult<()> {
     let label: Option<String> = tx
@@ -312,7 +474,7 @@ pub(crate) fn observe_outcome(
     if !matches!(state, "failed" | "retryable" | "blocked") {
         return Ok(());
     }
-    let quota = class == Some(QUOTA_CLASS);
+    let quota = class == Some(QUOTA_CLASS) && signal.is_some();
     let until = if quota {
         let candidate = after(account.cooldown_s);
         match account.rate_limited_until {
@@ -331,7 +493,16 @@ pub(crate) fn observe_outcome(
         record(
             tx,
             "rate_limited_observed",
-            json!({ "label": label, "provider": account.provider, "run_id": run_id, "until": until }),
+            json!({
+                "label": label, "provider": account.provider, "run_id": run_id, "until": until, "signal": signal,
+            }),
+            actor,
+        )?;
+    } else if class == Some(QUOTA_REPORTED_CLASS) {
+        record(
+            tx,
+            "quota_reported",
+            json!({ "label": label, "provider": account.provider, "run_id": run_id, "advisory": true }),
             actor,
         )?;
     }
@@ -362,22 +533,6 @@ fn billing(raw: &str) -> UaResult<String> {
     } else {
         Err(UaError::invalid(format!("billing must be one of {}", BILLING.join(", "))))
     }
-}
-
-/// A managed secret's name; empty clears it. Never a value.
-fn secret_name(raw: &str) -> UaResult<Option<String>> {
-    let v = raw.trim();
-    if v.is_empty() {
-        return Ok(None);
-    }
-    let ok =
-        v.len() <= 128 && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'));
-    if !ok || SECRET_RE.is_match(v) {
-        return Err(UaError::invalid(
-            "secret_name must be the name of a managed secret (1-128 of [A-Za-z0-9_.:-]), never its value",
-        ));
-    }
-    Ok(Some(v.to_string()))
 }
 
 fn notes(raw: &str) -> UaResult<String> {
@@ -424,8 +579,6 @@ pub struct RegisterArgs {
     pub label: String,
     /// `api` (metered key), `subscription` (a plan's sign-in) or `local`.
     pub billing: String,
-    /// Name of the managed secret this account uses, if any. A name, never a value.
-    pub secret_name: Option<String>,
     /// Whether harnesses may use it now (default true).
     pub enabled: Option<bool>,
     /// Operator notes, at most 500 characters, no secrets.
@@ -442,8 +595,6 @@ pub struct UpdateArgs {
     pub label: String,
     pub provider: Option<String>,
     pub billing: Option<String>,
-    /// A managed secret name; an empty string clears it.
-    pub secret_name: Option<String>,
     /// `true` re-enables a disabled account (clearing its reason); `false`
     /// disables it.
     pub enabled: Option<bool>,
@@ -487,7 +638,6 @@ async fn register_account(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
     let provider = slug("provider", &a.provider, true)?;
     let label = slug("label", &a.label, false)?;
     let billing = billing(&a.billing)?;
-    let secret = secret_name(a.secret_name.as_deref().unwrap_or(""))?;
     let notes = notes(a.notes.as_deref().unwrap_or(""))?;
     let cooldown_s = cooldown(a.cooldown_s.unwrap_or(DEFAULT_COOLDOWN_S))?;
     let enabled = a.enabled.unwrap_or(true);
@@ -502,14 +652,14 @@ async fn register_account(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
             }
             let ts = now();
             tx.execute(
-                "INSERT INTO provider_accounts (label, provider, billing, secret_name, enabled, notes, cooldown_s, \
-                 created_by, created_at, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8, ?9)",
-                params![label, provider, billing, secret, enabled, notes, cooldown_s, who, ts],
+                "INSERT INTO provider_accounts (label, provider, billing, enabled, notes, cooldown_s, \
+                 created_by, created_at, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?7, ?8)",
+                params![label, provider, billing, enabled, notes, cooldown_s, who, ts],
             )?;
             record(
                 tx,
                 "registered",
-                json!({ "label": label, "provider": provider, "billing": billing, "secret_name": secret, "enabled": enabled }),
+                json!({ "label": label, "provider": provider, "billing": billing, "enabled": enabled }),
                 &who,
             )?;
             let acc = load(tx, &label)?.ok_or_else(|| UaError::internal("account vanished"))?;
@@ -523,7 +673,6 @@ async fn update_account(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
     let label = slug("label", &a.label, false)?;
     let provider = a.provider.as_deref().map(|p| slug("provider", p, true)).transpose()?;
     let billing = a.billing.as_deref().map(billing).transpose()?;
-    let secret = a.secret_name.as_deref().map(secret_name).transpose()?;
     let notes = a.notes.as_deref().map(notes).transpose()?;
     let cooldown_s = a.cooldown_s.map(cooldown).transpose()?;
     let limit = match a.rate_limited_until.as_deref().map(str::trim) {
@@ -557,9 +706,6 @@ async fn update_account(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             }
             if let Some(b) = billing.filter(|b| b != &before.billing) {
                 set("billing", "billing = ?2", V::Text(b))?;
-            }
-            if let Some(s) = secret.filter(|s| s != &before.secret_name) {
-                set("secret_name", "secret_name = ?2", text(s))?;
             }
             if let Some(n) = notes.filter(|n| n != &before.notes) {
                 set("notes", "notes = ?2", V::Text(n))?;
@@ -730,8 +876,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "provider_account_register",
             "Operators: register a provider account harnesses bill: provider, unique label (named by a harness's \
-             provider_account), billing api|subscription|local, the managed secret name it uses (a name, never a \
-             value), enabled, notes and the cooldown an observed quota failure applies. Returns {account}.",
+             provider_account), billing api|subscription|local, enabled, notes and the cooldown an observed quota \
+             failure applies. No secret or secret name is stored. Returns {account}.",
             register_account,
         )
         .family("dispatch"),
@@ -739,7 +885,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "provider_account_update",
-            "Operators: change a provider account (provider, billing, secret_name, enabled, notes, cooldown_s), \
+            "Operators: change a provider account (provider, billing, enabled, notes, cooldown_s), \
              mark it rate-limited until a time or clear that (rate_limited_until), or forget its last error \
              (clear_error). Returns {account, changed}.",
             update_account,
@@ -759,8 +905,8 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "provider_account_list",
-            "List registered provider accounts: provider, label, billing, secret name, enabled, notes and \
-             observed state (rate_limited_until, last error class). No secret values are stored.",
+            "List registered provider accounts: provider, label, billing, enabled, notes and observed state \
+             (rate_limited_until, last error class). No secrets are stored.",
             list_accounts,
         )
         .read_only()
@@ -801,12 +947,36 @@ mod tests {
     }
 
     #[test]
-    fn secret_names_are_names() {
-        assert_eq!(secret_name("OPENAI_KEY_MAIN").unwrap().as_deref(), Some("OPENAI_KEY_MAIN"));
-        assert_eq!(secret_name("").unwrap(), None);
-        assert!(secret_name("sk-abcdefghijklmnop").is_err());
-        assert!(secret_name("api_key=abc").is_err());
+    fn notes_hold_no_secrets() {
         assert!(notes("rotated monthly").is_ok());
         assert!(notes("password: hunter2").is_err());
+    }
+
+    /// Review finding: a usage-limit phrase anywhere in the run log (the
+    /// model's own output) rate-limited a shared account. Only a declared
+    /// pattern on stderr, or in a structured JSON error event, counts.
+    #[test]
+    fn only_a_declared_signal_on_stderr_or_a_json_error_counts() {
+        let pats = vec!["usage limit".to_string(), "insufficient_quota".to_string()];
+        assert_eq!(quota_line(&[], "usage limit reached", None), None, "no patterns, no signal");
+        assert_eq!(
+            quota_line(&pats, "warn: x\nError: Usage limit reached for key sk-abcdefghijklmnop\n", None),
+            Some(("stderr", "Error: Usage limit reached for key [redacted]".to_string()))
+        );
+        // The model writing the phrase on stdout is not a signal.
+        let stdout =
+            r#"{"type":"message_update","message":{"role":"assistant","content":"usage limit reached"}}"#;
+        assert_eq!(quota_line(&pats, "", Some(stdout)), None);
+        assert_eq!(quota_line(&pats, "", Some("plain usage limit text")), None);
+        let pi = r#"{"type":"message_end","message":{"stopReason":"error","errorMessage":"429 insufficient_quota"}}"#;
+        assert_eq!(
+            quota_line(&pats, "", Some(pi)),
+            Some(("json_error", "429 insufficient_quota".to_string()))
+        );
+        let ev = r#"{"type":"error","error":{"type":"rate_limit","message":"Usage limit hit"}}"#;
+        assert_eq!(quota_line(&pats, "", Some(ev)).map(|(s, _)| s), Some("json_error"));
+        assert_eq!(quota_line(&pats, "", None), None);
+        let long = format!("usage limit {}", "x".repeat(500));
+        assert_eq!(quota_line(&pats, &long, None).unwrap().1.chars().count(), 200);
     }
 }
