@@ -136,7 +136,10 @@ fn an_empty_body_verifies_only_with_its_own_signature() {
     let sig = slack::slack_signature(SECRET, ts, b"");
     assert_eq!(slack::verify_slack_signature(SECRET, ts, b"", &sig, now), Ok(()));
     let other = slack::slack_signature(SECRET, ts, b"{}");
-    assert_eq!(slack::verify_slack_signature(SECRET, ts, b"", &other, now), Err(SignatureError::BadSignature));
+    assert_eq!(
+        slack::verify_slack_signature(SECRET, ts, b"", &other, now),
+        Err(SignatureError::BadSignature)
+    );
 }
 
 // --- replay table ---------------------------------------------------------------
@@ -269,8 +272,17 @@ fn parser_refuses_overlong_text_before_parsing() {
 
 #[test]
 fn parser_refuses_control_format_and_bidi_characters() {
-    for bad in ["\u{202E}", "\u{2066}", "\u{200B}", "\u{200E}", "\u{FEFF}", "\u{0007}", "\r", "\u{E0041}", "\u{061C}"]
-    {
+    for bad in [
+        "\u{202E}",
+        "\u{2066}",
+        "\u{200B}",
+        "\u{200E}",
+        "\u{FEFF}",
+        "\u{0007}",
+        "\r",
+        "\u{E0041}",
+        "\u{061C}",
+    ] {
         let text = format!("/task fix {bad}the build");
         let err = slack::parse_slack_command(&text).unwrap_err();
         assert!(err.to_string().contains("control or format"), "{bad:?}: {err}");
@@ -319,5 +331,8 @@ fn parser_validates_task_and_approval_ids() {
         let err = slack::parse_slack_command(text).unwrap_err();
         assert!(err.to_string().contains("numeric approval id"), "{text}: {err}");
     }
-    assert_eq!(slack::parse_slack_command("/approve 42 looks good").unwrap()["args"], json!(["42", "looks good"]));
+    assert_eq!(
+        slack::parse_slack_command("/approve 42 looks good").unwrap()["args"],
+        json!(["42", "looks good"])
+    );
 }
