@@ -234,3 +234,52 @@ async fn the_cookie_key_is_cached_and_invalidation_rereads_it() {
     assert!(location(&resp).starts_with("/login?next="));
     assert_eq!(key_rows(&hub), 1, "the miss re-read ui_keys and created a fresh key");
 }
+
+/// Every `<script` tag in `html` loads a file (has `src=`); none is inline.
+fn no_inline_script(html: &str) -> bool {
+    html.match_indices("<script").all(|(i, _)| html[i..].split('>').next().unwrap().contains(" src=\""))
+}
+
+fn assert_strict_csp(resp: &axum::http::Response<axum::body::Body>) {
+    let csp = resp.headers().get(header::CONTENT_SECURITY_POLICY).expect("CSP").to_str().unwrap().to_string();
+    assert!(csp.contains("script-src 'self'"), "{csp}");
+    assert!(csp.contains("style-src 'self'"), "{csp}");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(!csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"), "{csp}");
+}
+
+/// The sign-in and passkey pages run no inline script or style: the script
+/// and stylesheet are files served by the hub (without a session), and the
+/// page passes its values in data- attributes, HTML-escaped.
+#[tokio::test]
+async fn sign_in_pages_run_under_a_csp_without_inline_script() {
+    let hub = TestHub::new(config());
+    let resp = hub.send(get("/login?next=/ui/tasks%3Fx%3D1%22%3E%3Cb%3E", None, None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_strict_csp(&resp);
+    let html = text_body(resp).await;
+    assert!(no_inline_script(&html), "{html}");
+    assert!(!html.contains("<style"), "{html}");
+    assert!(html.contains("<script src=\"/login/assets/login.js\" defer></script>"), "{html}");
+    assert!(html.contains("data-next=\"/ui/tasks?x=1&quot;&gt;&lt;b&gt;\""), "{html}");
+
+    let cookie = hub.sign_in("operator").await;
+    let resp = hub.send(get("/login/passkeys", Some(&cookie), None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_strict_csp(&resp);
+    let html = text_body(resp).await;
+    assert!(no_inline_script(&html), "{html}");
+    let csrf = hub.csrf(&cookie).await;
+    assert!(html.contains(&format!("data-csrf=\"{csrf}\"")), "{html}");
+
+    for (path, mime, needle) in [
+        ("/login/assets/login.js", "text/javascript", "navigator.credentials.get"),
+        ("/login/assets/page.css", "text/css", ".card"),
+    ] {
+        let resp = hub.send(get(path, None, None)).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert!(resp.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with(mime), "{path}");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(text_body(resp).await.contains(needle), "{path}");
+    }
+}

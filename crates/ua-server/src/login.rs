@@ -83,6 +83,8 @@ pub fn routes() -> Router<AppState> {
         .route("/login/passkeys/register/start", post(passkey_register_start))
         .route("/login/passkeys/register/finish", post(passkey_register_finish))
         .route("/api/session", get(api_session))
+        .route(LOGIN_JS_PATH, get(login_js))
+        .route(PAGE_CSS_PATH, get(page_css))
 }
 
 // ---------------------------------------------------------------- sessions
@@ -807,9 +809,33 @@ async fn api_session(
 
 // ---------------------------------------------------------------- pages
 
-const B64U_JS: &str = "const b64u={dec:s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')+'==='.slice((s.length+3)%4)),c=>c.charCodeAt(0)),\
-enc:b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};\
-function say(m){document.getElementById('msg').textContent=m;}";
+/// The sign-in pages' script and the shared page style, served from the hub
+/// so the pages carry no inline script or style (see the CSP in
+/// [`crate::oauth::html_page`]).
+pub const LOGIN_JS_PATH: &str = "/login/assets/login.js";
+pub const PAGE_CSS_PATH: &str = "/login/assets/page.css";
+const LOGIN_JS: &str = include_str!("../assets/login/login.js");
+const PAGE_CSS: &str = include_str!("../assets/login/page.css");
+
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn login_js() -> Response {
+    asset("text/javascript; charset=utf-8", LOGIN_JS)
+}
+
+async fn page_css() -> Response {
+    asset("text/css; charset=utf-8", PAGE_CSS)
+}
 
 #[derive(Deserialize)]
 struct LoginQuery {
@@ -827,25 +853,12 @@ async fn login_page(
     }
     let body = format!(
         "<h1>Sign in</h1><label for=\"label\">Identity</label><input id=\"label\" autocomplete=\"username webauthn\" \
-value=\"{first}\"><button id=\"go\" type=\"button\">Sign in with a passkey</button><p id=\"msg\" class=\"hint\"></p>\
+value=\"{first}\"><button id=\"go\" type=\"button\" data-next=\"{next}\">Sign in with a passkey</button>\
+<p id=\"msg\" class=\"hint\"></p>\
 <p class=\"hint\">First sign-in on a new hub: run <code>ua login-link &lt;label&gt;</code> on the hub host and open \
-the link it prints, then register a passkey.</p>\
-<script>{B64U_JS}\
-document.getElementById('go').onclick=async()=>{{try{{\
-const label=document.getElementById('label').value.trim();\
-let r=await fetch('/login/passkey/start',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{label}})}});\
-let j=await r.json();if(!r.ok)return say(j.message||'Sign-in failed');\
-const pk=j.options.publicKey;pk.challenge=b64u.dec(pk.challenge);(pk.allowCredentials||[]).forEach(c=>c.id=b64u.dec(c.id));\
-const c=await navigator.credentials.get({{publicKey:pk}});\
-const credential={{id:c.id,rawId:b64u.enc(c.rawId),type:c.type,extensions:{{}},response:{{\
-authenticatorData:b64u.enc(c.response.authenticatorData),clientDataJSON:b64u.enc(c.response.clientDataJSON),\
-signature:b64u.enc(c.response.signature),userHandle:c.response.userHandle?b64u.enc(c.response.userHandle):null}}}};\
-r=await fetch('/login/passkey/finish',{{method:'POST',headers:{{'content-type':'application/json'}},\
-body:JSON.stringify({{state_id:j.state_id,credential,next:{next_js}}})}});\
-j=await r.json();if(!r.ok)return say(j.message||'Sign-in failed');location.href=j.next;\
-}}catch(e){{say('Sign-in was cancelled or failed.');}}}};</script>",
+the link it prints, then register a passkey.</p><script src=\"{LOGIN_JS_PATH}\" defer></script>",
         first = html_escape(state.hub.cfg().human_identities.first().map(String::as_str).unwrap_or("")),
-        next_js = serde_json::to_string(&next).unwrap_or_else(|_| "\"/ui\"".into()).replace('<', "\\u003c"),
+        next = html_escape(&next),
     );
     html_page(StatusCode::OK, "Sign in", &body)
 }
@@ -882,25 +895,12 @@ async fn passkeys_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             .collect::<Vec<_>>()
             .join("")
     };
-    let csrf_js = serde_json::to_string(&sess.csrf_token).unwrap_or_default();
     let body = format!(
         "<h1>Passkeys for {label}</h1><ul>{list}</ul><label for=\"name\">Name for a new passkey</label>\
-<input id=\"name\" placeholder=\"laptop\"><button id=\"add\" type=\"button\">Register a passkey</button>\
+<input id=\"name\" placeholder=\"laptop\"><button id=\"add\" type=\"button\" data-csrf=\"{csrf}\">Register a passkey</button>\
 <p id=\"msg\" class=\"hint\"></p><p><a href=\"/ui\">Open the Control Center</a></p>\
 <form method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-<button class=\"secondary\" type=\"submit\">Sign out</button></form>\
-<script>{B64U_JS}const csrf={csrf_js};\
-document.getElementById('add').onclick=async()=>{{try{{\
-const h={{'content-type':'application/json','X-CSRF-Token':csrf}};\
-let r=await fetch('/login/passkeys/register/start',{{method:'POST',headers:h}});let j=await r.json();\
-if(!r.ok)return say(j.message||'Could not start');const pk=j.options.publicKey;\
-pk.challenge=b64u.dec(pk.challenge);pk.user.id=b64u.dec(pk.user.id);(pk.excludeCredentials||[]).forEach(c=>c.id=b64u.dec(c.id));\
-const c=await navigator.credentials.create({{publicKey:pk}});\
-const credential={{id:c.id,rawId:b64u.enc(c.rawId),type:c.type,extensions:{{}},response:{{\
-attestationObject:b64u.enc(c.response.attestationObject),clientDataJSON:b64u.enc(c.response.clientDataJSON)}}}};\
-r=await fetch('/login/passkeys/register/finish',{{method:'POST',headers:h,body:JSON.stringify({{state_id:j.state_id,credential,\
-name:document.getElementById('name').value}})}});j=await r.json();if(!r.ok)return say(j.message||'Registration failed');\
-location.reload();}}catch(e){{say('Registration was cancelled or failed.');}}}};</script>",
+<button class=\"secondary\" type=\"submit\">Sign out</button></form><script src=\"{LOGIN_JS_PATH}\" defer></script>",
         label = html_escape(&sess.label),
         csrf = html_escape(&sess.csrf_token),
     );
