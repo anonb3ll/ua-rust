@@ -259,6 +259,21 @@ pub struct ApprovalRow {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// What the approver is shown beside the payload (in `approval_pending`
+    /// for pending requests, and in [`get`]) for a tool that keeps more than
+    /// its approval binds (the full diff of a
+    /// `harness_config_apply`). Never compared: the payload alone is the
+    /// binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<Value>,
+}
+
+/// Display-only detail for a pending approval ([`ApprovalRow::display`]).
+fn display(c: &rusqlite::Connection, row: &ApprovalRow) -> UaResult<Option<Value>> {
+    if row.tool == crate::families::harness_config::APPLY_TOOL {
+        return crate::families::harness_config::approval_display(c, row.id, &row.payload);
+    }
+    Ok(None)
 }
 
 fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
@@ -276,13 +291,20 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
         resolved_at: r.get("resolved_at")?,
         run_id: r.get("run_id")?,
         expires_at: None,
+        display: None,
     })
 }
 
+/// One approval row, with its display-only detail ([`ApprovalRow::display`])
+/// whatever its status, so every reader of one approval sees what the
+/// approver saw.
 pub fn get(conn: &rusqlite::Connection, id: i64) -> UaResult<ApprovalRow> {
-    conn.query_row("SELECT * FROM approvals WHERE id = ?1", [id], row_to_approval)
+    let mut row = conn
+        .query_row("SELECT * FROM approvals WHERE id = ?1", [id], row_to_approval)
         .optional()?
-        .ok_or_else(|| UaError::not_found(format!("approval {id}")))
+        .ok_or_else(|| UaError::not_found(format!("approval {id}")))?;
+    row.display = display(conn, &row)?;
+    Ok(row)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -329,8 +351,11 @@ fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
         let mut stmt = c.prepare(
             "SELECT * FROM approvals WHERE status = 'pending' AND (?1 IS NULL OR tool = ?1) ORDER BY id ASC LIMIT ?2",
         )?;
-        let pending: Vec<ApprovalRow> =
+        let mut pending: Vec<ApprovalRow> =
             stmt.query_map(params![tool_filter, limit as i64], row_to_approval)?.collect::<Result<_, _>>()?;
+        for a in &mut pending {
+            a.display = display(c, a)?;
+        }
         let mut stmt = c.prepare(
             "SELECT * FROM approvals WHERE status = 'approved' AND (?1 IS NULL OR tool = ?1) \
              ORDER BY id DESC LIMIT ?2",

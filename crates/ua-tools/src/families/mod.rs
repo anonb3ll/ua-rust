@@ -67,6 +67,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
     parts.push(harness_config::SCHEMA);
+    parts.push(harness_config::SCHEMA_V2);
     parts.push(managed_secrets::SCHEMA);
     parts.push(mcp::SCHEMA);
     parts.push(messaging::SCHEMA);

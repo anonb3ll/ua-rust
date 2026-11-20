@@ -102,6 +102,11 @@ pub struct Config {
     /// `~/.unified_agent/harness-config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_config_root_hint: Option<String>,
+    /// Test hook: how long one harness config change-summary diff may take,
+    /// in milliseconds, instead of the built-in limit (`Some(0)` makes every
+    /// diff time out). It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub harness_config_diff_timeout_ms: Option<u64>,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -592,6 +597,7 @@ impl Default for Config {
             session_credentials_enabled: false,
             node_require_acceptance: false,
             harness_config_root_hint: None,
+            harness_config_diff_timeout_ms: None,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
@@ -924,6 +930,15 @@ impl Config {
 
     pub fn is_human(&self, label: &str) -> bool {
         self.human_identities.iter().any(|h| h == label)
+    }
+
+    /// The profile configuration gives `label` explicitly: a `profiles` entry
+    /// naming a known, assignable profile (an `oauth_identities` label gets
+    /// `oauth_profile` that way when the config is loaded). `None` where a
+    /// caller would otherwise fall back to the broad `developer` default, so
+    /// OAuth credentials, whose identity is meant to be narrowed, require it.
+    pub fn explicit_profile(&self, label: &str) -> Option<crate::Profile> {
+        self.profiles.get(label).and_then(|p| p.parse::<crate::Profile>().ok()).filter(|p| p.assignable())
     }
 
     /// The identities allowed to run lifecycle operator actions:

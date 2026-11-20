@@ -42,7 +42,7 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 | `oauth_profile` | `public` | Profile given to each `oauth_identities` label that has no `profiles` entry. |
 | `oauth_access_ttl_secs` | `3600` | Access token lifetime (clamped to 60 s .. 30 days). |
 | `oauth_refresh_ttl_days` | `30` | Refresh token lifetime (clamped to 1 .. 365 days). |
-| `oauth_client_credentials` | none | Confidential clients for `client_credentials`: `client_id\|secret\|identity` entries separated by commas or newlines. Secret; never printed. A client id listed twice is dropped. |
+| `oauth_client_credentials` | none | Confidential clients for `client_credentials`: `client_id\|secret\|identity` entries separated by commas or newlines. Secret; never printed. A client id listed twice is dropped. Each identity needs a profile of its own (see below). |
 | `ui_cookie_secure` | `true` | Send the session cookie with `Secure`. Leave it on: browsers treat `http://localhost` and loopback addresses as secure contexts and keep `Secure` cookies there. Turning it off does not make plain `http://` to another host safe; use HTTPS instead (see "Remote access"). |
 | `ui_session_ttl_hours` | `12` | Browser session lifetime. |
 | `login_link_ttl_secs` | `600` | Lifetime of a `ua login-link` URL. |
@@ -138,9 +138,34 @@ Rules the server enforces:
 - **Refresh tokens rotate** on every use. Presenting a rotated refresh token
   revokes the whole grant (every access and refresh token of that sign-in).
 - **Client authentication:** `none` (public clients, PKCE is the proof),
-  `client_secret_basic`, `client_secret_post`. `client_credentials` is limited
-  to clients in `oauth_client_credentials`, gets no refresh token, and may not
-  act as a human identity.
+  `client_secret_basic`, `client_secret_post`.
+- **`client_credentials`** is limited to clients in
+  `oauth_client_credentials` and gets no refresh token. It is refused with
+  `unauthorized_client` when the client is not registered for the grant,
+  when its identity is a human or retired, and when its identity has no
+  configured profile. A configured profile is a `profiles` entry naming a
+  known profile; an `oauth_identities` label gets `oauth_profile` that way.
+  Without one the identity would fall back to the broad `developer` profile,
+  so the hub mints nothing for it. To give a client `developer`, say so:
+  `profiles.<identity> = "developer"`. The only scope is `mcp`: `scope` may be
+  omitted or `mcp`, anything else is `invalid_scope`. The grant and its token
+  record the scope issued.
+- **An OAuth identity never runs as `developer` by default.** The explicit
+  profile is checked on every use, not only when a token is minted: an
+  access token whose identity no longer has a `profiles` entry naming a
+  known profile is refused (401), and so are a refresh and a code exchange
+  for it (`invalid_grant`). Refreshing or exchanging a grant a human
+  approved on the consent page also needs the identity to still be in
+  `oauth_identities`. Removing an identity from the configuration therefore
+  ends its OAuth access instead of widening it.
+- **Retired identities.** A token is never minted for a retired identity:
+  `client_credentials` refuses it (`unauthorized_client`), and a code
+  exchange or refresh after the identity was retired is refused
+  (`invalid_grant`). Retiring an identity also revokes its grants, and the
+  bearer check refuses a retired identity's tokens.
+- **Client authentication failures look alike.** An unknown client id, a
+  wrong secret and a secret sent by a public client all get `401
+  invalid_client` with the same description.
 - **Client ID Metadata Documents** (`oauth_cimd_enabled`): the client id must
   be a canonical `https` URL with a DNS host and a path, no port, query,
   fragment, credentials or dot segments. Every resolved address must be
