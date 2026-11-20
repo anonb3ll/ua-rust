@@ -1,9 +1,10 @@
 //! Import a small Python-shaped hub database.
 //!
-//! The fixture's CREATE TABLE statements are copied from the Python hub's
-//! schema (including columns ua-rust does not store, such as `org_id`), and
-//! its three-event ledger is hashed with the shared hash function, the first
-//! entry against the reference value computed by the Python implementation.
+//! The fixture keeps the tables, columns and ledger rows these tests read.
+//! `org_id`, `agent_kind` and `device_node` are columns ua-rust does not store,
+//! so the unmapped-column report has something to count. The three-event
+//! ledger is hashed with the shared hash function, the first entry against
+//! the reference value computed by the original implementation.
 
 use std::path::{Path, PathBuf};
 
@@ -19,230 +20,116 @@ use ua_tools::{Hub, builtin_registry};
 const PY_SCHEMA: &str = "
 CREATE TABLE agents (
   label TEXT PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'unknown',
-  host TEXT,
-  known INTEGER NOT NULL DEFAULT 0,
-  first_seen TEXT,
-  last_seen TEXT,
-  last_seen_via TEXT,
-  pid INTEGER,
-  version TEXT,
+  kind TEXT NOT NULL,
+  known INTEGER NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  meta TEXT NOT NULL DEFAULT '{}'
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE agent_tokens (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   agent_label TEXT NOT NULL,
   token_hash TEXT NOT NULL,
-  hash_algo TEXT NOT NULL DEFAULT 'sha256',
-  status TEXT NOT NULL DEFAULT 'active'
-    CHECK (status IN ('active', 'rotated', 'revoked', 'expired')),
+  hash_algo TEXT NOT NULL,
+  status TEXT NOT NULL,
   issued_at TEXT NOT NULL,
-  expires_at TEXT,
-  rotated_from INTEGER REFERENCES agent_tokens(id) ON DELETE SET NULL,
-  rotated_at TEXT,
-  revoked_at TEXT,
-  issued_by TEXT,
-  note TEXT,
+  rotated_from INTEGER,
   org_id TEXT,
   agent_kind TEXT
 );
 CREATE TABLE tasks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   title TEXT NOT NULL,
   notes TEXT,
-  status TEXT NOT NULL DEFAULT 'open'
-    CHECK (status IN ('open','doing','waiting_review','blocked','done','cancelled')),
-  priority TEXT NOT NULL DEFAULT 'med' CHECK (priority IN ('high','med','low')),
-  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'open',
+  parent_id INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  completed_at TEXT,
   archived_at TEXT,
-  source_host TEXT,
-  claimed_by TEXT,
-  claimed_at TEXT,
-  lock_expires_at TEXT,
-  untrusted INTEGER NOT NULL DEFAULT 0,
-  worktree_path TEXT,
-  branch TEXT,
-  project TEXT NOT NULL DEFAULT 'unified-agent',
-  domain TEXT NOT NULL DEFAULT 'hobby',
-  due_at TEXT,
-  evidence_ref TEXT,
-  lane TEXT NOT NULL DEFAULT 'default' CHECK (length(lane) >= 1 AND length(lane) <= 64),
-  org_id TEXT,
-  current_run_id TEXT,
-  current_run_agent TEXT,
-  cancel_requested INTEGER NOT NULL DEFAULT 0,
-  next_owner TEXT,
-  waiting_on TEXT,
-  terminal_predicate TEXT,
-  ownership_generation INTEGER NOT NULL DEFAULT 0
+  org_id TEXT
 );
 CREATE TABLE task_dependencies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL,
+  depends_on_task_id INTEGER NOT NULL,
   created_by TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(task_id, depends_on_task_id),
-  CHECK(task_id != depends_on_task_id)
+  created_at TEXT NOT NULL
 );
 CREATE TABLE task_comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  parent_comment_id INTEGER,
+  task_id INTEGER NOT NULL,
   author TEXT NOT NULL,
   body TEXT NOT NULL,
-  mentions TEXT NOT NULL DEFAULT '[]',
-  refs TEXT NOT NULL DEFAULT '{}',
-  idempotency_key TEXT,
   thread_revision INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
 CREATE TABLE task_comment_threads (
   task_id INTEGER PRIMARY KEY,
-  revision INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE TABLE goals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   title TEXT NOT NULL,
-  statement TEXT NOT NULL DEFAULT '',
-  parent_goal_id INTEGER,
-  project TEXT NOT NULL DEFAULT 'unified-agent',
-  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','achieved','abandoned')),
-  created_by TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  org_id TEXT,
-  revision INTEGER NOT NULL DEFAULT 1
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE task_goal_links (
   task_id INTEGER PRIMARY KEY,
   goal_id INTEGER NOT NULL,
-  linked_by TEXT,
   linked_at TEXT NOT NULL
 );
 CREATE TABLE plans (
   id TEXT PRIMARY KEY,
   goal TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'default',
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','done','blocked','abandoned')),
-  author TEXT,
-  escalated INTEGER NOT NULL DEFAULT 0,
-  escalation_note TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  org_id TEXT,
-  revision INTEGER NOT NULL DEFAULT 1
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE plan_steps (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL,
   step_idx INTEGER NOT NULL,
   description TEXT NOT NULL,
-  owner TEXT,
-  depends_on TEXT NOT NULL DEFAULT '[]',
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','doing','done','failed','blocked')),
-  note TEXT,
-  retries INTEGER NOT NULL DEFAULT 0,
-  done_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  outputs TEXT NOT NULL DEFAULT '{}',
-  UNIQUE (plan_id, step_idx)
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE plan_checkpoints (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
-  context TEXT NOT NULL DEFAULT '{}',
-  note TEXT,
-  created_at TEXT NOT NULL,
-  UNIQUE (plan_id, seq)
+  created_at TEXT NOT NULL
 );
 CREATE TABLE delegations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_agent TEXT NOT NULL,
   to_agent TEXT NOT NULL,
-  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_id INTEGER NOT NULL,
   task_spec TEXT NOT NULL,
-  deadline TEXT,
-  callback TEXT NOT NULL DEFAULT 'notify' CHECK (callback IN ('notify','memory','none')),
-  status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','in_flight','completed','cancelled','failed')),
-  memory_id TEXT,
-  callback_result TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  claim_generation INTEGER NOT NULL DEFAULT 0,
-  last_attempt_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  completed_at TEXT,
-  org_id TEXT
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE memory (
   id TEXT PRIMARY KEY,
   title TEXT,
   content TEXT NOT NULL,
-  tags TEXT NOT NULL DEFAULT '[]',
+  tags TEXT NOT NULL,
   author TEXT,
-  updated_by TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  salience REAL NOT NULL DEFAULT 0.5,
-  confidence REAL,
-  last_accessed TEXT,
-  access_count INTEGER NOT NULL DEFAULT 0,
-  source_host TEXT,
-  superseded_by TEXT,
-  expires_at TEXT,
-  feedback_helpful INTEGER NOT NULL DEFAULT 0,
-  feedback_not_helpful INTEGER NOT NULL DEFAULT 0,
-  feedback_stale INTEGER NOT NULL DEFAULT 0,
-  feedback_wrong INTEGER NOT NULL DEFAULT 0,
-  org_id TEXT,
-  epistemic TEXT,
-  evidence TEXT,
-  valid_from TEXT,
-  contradicts TEXT,
-  valid_to TEXT
+  updated_at TEXT NOT NULL
 );
-CREATE VIRTUAL TABLE memory_fts USING fts5(
-  title, content, content='memory', content_rowid='rowid'
-);
+CREATE VIRTUAL TABLE memory_fts USING fts5(title, content);
 CREATE TABLE memory_versions (
-  note_id TEXT NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL CHECK (version >= 1),
+  note_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
   content TEXT NOT NULL,
   tags TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  actor TEXT,
-  recorded_at TEXT NOT NULL,
-  PRIMARY KEY (note_id, version)
+  recorded_at TEXT NOT NULL
 );
 CREATE TABLE memory_embeddings (
-  note_id TEXT PRIMARY KEY NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
-  embedding BLOB NOT NULL,
-  model TEXT
+  note_id TEXT PRIMARY KEY
 );
 CREATE TABLE approvals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   tool TEXT NOT NULL,
-  payload TEXT NOT NULL DEFAULT '{}',
   requested_by TEXT,
-  status TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','approved','denied','consumed','revoked','expired')),
-  reason TEXT,
-  resolved_by TEXT,
+  status TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  resolved_at TEXT,
-  org_id TEXT,
-  run_id TEXT
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE event_log (
   ulid TEXT PRIMARY KEY,
@@ -254,8 +141,7 @@ CREATE TABLE event_log (
   created_at TEXT NOT NULL,
   dedupe_key TEXT,
   prev_hash TEXT,
-  entry_hash TEXT,
-  org_id TEXT
+  entry_hash TEXT
 );
 CREATE TABLE message_index (
   message_id TEXT NOT NULL,
@@ -263,24 +149,14 @@ CREATE TABLE message_index (
   sender TEXT NOT NULL,
   act TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
-  reply_to TEXT,
-  expects_reply INTEGER NOT NULL DEFAULT 0,
-  task_id INTEGER,
-  delegation_id INTEGER,
   event_ulid TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  read_at TEXT,
-  acked_at TEXT,
-  target_session TEXT,
-  sender_session TEXT,
-  event_seq INTEGER,
-  org_id TEXT
+  event_seq INTEGER
 );
 CREATE TABLE message_reads (
   message_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   read_at TEXT NOT NULL,
-  acked_at TEXT,
   PRIMARY KEY (message_id, session_id)
 );
 CREATE TABLE nodes (
@@ -304,8 +180,7 @@ CREATE TABLE graph_canvas_scenes (
   updated_at TEXT NOT NULL
 );
 CREATE TABLE zulip_cursors (
-  bot TEXT NOT NULL,
-  last_message_id INTEGER NOT NULL
+  bot TEXT NOT NULL
 );
 ";
 
@@ -437,7 +312,7 @@ INSERT INTO memory (id, title, content, tags, author, created_at, updated_at) VA
   ('note-b', 'Other', 'nothing to see', '[]', 'agent-2', '{T0}', '{T0}');
 INSERT INTO memory_versions (note_id, version, content, tags, updated_at, recorded_at) VALUES
   ('note-a', 1, 'old text', '[]', '{T0}', '{T0}');
-INSERT INTO memory_embeddings (note_id, embedding, model) VALUES ('note-a', x'00000000', 'm');
+INSERT INTO memory_embeddings (note_id) VALUES ('note-a');
 INSERT INTO approvals (id, tool, requested_by, status, created_at, updated_at) VALUES
   (1, 'fs_write', 'agent-1', 'consumed', '{T0}', '{T0}'),
   (2, 'fs_write', 'agent-1', 'denied', '{T0}', '{T0}'),
@@ -446,12 +321,12 @@ INSERT INTO approvals (id, tool, requested_by, status, created_at, updated_at) V
 INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, event_ulid, created_at, event_seq)
   VALUES ('m1', 'agent-2', 'agent-1', 'inform', 'c1', '{u2}', '{T0}', NULL);
 INSERT INTO message_reads (message_id, session_id, read_at) VALUES ('m1', 's1', '{T0}');
-INSERT INTO zulip_cursors (bot, last_message_id) VALUES ('bot', 1);
+INSERT INTO zulip_cursors (bot) VALUES ('bot');
 INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) VALUES
   ('default', '{{\"elements\": []}}', 'agent-1', '{T0}');
 INSERT INTO nodes (node, agent, device_node, facts_json, version, registered_at, last_heartbeat, updated_at,
   retired_at, retired_by, retired_reason, heartbeat_floor) VALUES
-  ('mac-1', 'agent-1', 'mac-1', '{{\"worktree_roots\": [\"/Users/someone/secret\"]}}', '0.9.1', '{T0}', '{T0}', '{T0}',
+  ('mac-1', 'agent-1', 'mac-1', '{{\"k\": 1}}', '0.9.1', '{T0}', '{T0}', '{T0}',
    NULL, NULL, NULL, NULL),
   ('old-box', 'agent-2', NULL, NULL, NULL, '{T0}', '{T0}', '{T0}', '{T0}', 'operator', 'decommissioned', '{T0}');
 ",
@@ -841,19 +716,14 @@ fn python_parking_moves_to_its_own_columns_and_continuity_rows_copy() {
     // Python-hub shapes: parking was archived_at plus a notes line.
     c.execute_batch(&format!(
         "
-CREATE TABLE task_workflow (task_id INTEGER PRIMARY KEY, org_id TEXT, stage TEXT, goal TEXT,
-  done_json TEXT NOT NULL DEFAULT '[]', focus TEXT, head_sha TEXT, expected_json TEXT NOT NULL DEFAULT '[]',
-  revision INTEGER NOT NULL DEFAULT 0, updated_by TEXT, updated_at TEXT);
-CREATE TABLE task_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, org_id TEXT,
-  name TEXT NOT NULL, head_sha TEXT NOT NULL, outcome TEXT NOT NULL, grade TEXT NOT NULL, ref_kind TEXT,
-  ref TEXT, repo TEXT, ref_job TEXT, detail TEXT, verification_json TEXT, recorded_by TEXT NOT NULL,
-  recorded_at TEXT NOT NULL, verified_at TEXT, UNIQUE (task_id, name, head_sha));
+CREATE TABLE task_workflow (task_id INTEGER PRIMARY KEY, stage TEXT, goal TEXT,
+  done_json TEXT NOT NULL, revision INTEGER NOT NULL, updated_by TEXT, updated_at TEXT);
+CREATE TABLE task_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+  name TEXT NOT NULL, head_sha TEXT NOT NULL, outcome TEXT NOT NULL, grade TEXT NOT NULL,
+  recorded_by TEXT NOT NULL, recorded_at TEXT NOT NULL);
 CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
   agent TEXT NOT NULL, task_id INTEGER, done TEXT NOT NULL, next_steps TEXT NOT NULL,
-  open_questions TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'draft', epoch INTEGER NOT NULL DEFAULT 0,
-  supersedes INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sealed_at TEXT, assigned_to TEXT,
-  assigned_at TEXT, delivered_to TEXT, delivered_at TEXT, acknowledged_at TEXT, failover_reason TEXT,
-  attempts INTEGER NOT NULL DEFAULT 0, org_id TEXT);
+  state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sealed_at TEXT);
 INSERT INTO tasks (id, title, notes, status, parent_id, created_at, updated_at, archived_at) VALUES
   (10, 'Parked epic', 'the spec\n[parked @ 2026-02-01T00:00:00Z by operator] no movement in a month',
    'open', NULL, '{T0}', '{T0}', '{T0}'),

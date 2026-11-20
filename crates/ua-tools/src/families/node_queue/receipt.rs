@@ -298,7 +298,10 @@ mod tests {
 
     #[test]
     fn receipt_free_text_is_redacted() {
-        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz0123";
+        // `gh[pousr]_` plus 36 alphanumerics: the GitHub token shape in
+        // `audit::rules::secret_shapes`, which `redact_secrets` replaces with
+        // `[REDACTED_SECRET]`.
+        let token = "ghp_000000000000000000000000000000000000";
         let raw = json!({
             "status": "failed",
             "attempt": 1,
@@ -307,8 +310,11 @@ mod tests {
             "log_capture": { "state": "error", "error": format!("token {token}") },
         });
         let b = bounded(raw.as_object().unwrap(), "n1");
-        assert!(!b.to_string().contains("ghp_0123456789"), "{b}");
-        assert!(b["text"].as_str().unwrap().starts_with("pushed with "));
+        let rendered = b.to_string();
+        assert!(!rendered.contains(token), "{b}");
+        assert_eq!(b["text"], "pushed with [REDACTED_SECRET]");
+        assert_eq!(b["reason"], "auth [REDACTED_SECRET]");
+        assert_eq!(b["log_capture"]["error"], "token [REDACTED_SECRET]");
     }
 
     #[test]
