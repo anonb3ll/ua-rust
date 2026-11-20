@@ -1228,6 +1228,15 @@ fn schema_check(facts: &DbFacts) -> Value {
                 compat.unexpected_indexes_on_known_tables.join(", ")
             ));
         }
+        if !compat.reserved_name_objects.is_empty() {
+            issues.push(format!("reserved sqlite_ names: {}", compat.reserved_name_objects.join(", ")));
+        }
+        if !compat.unexpected_foreign_keys_to_known_tables.is_empty() {
+            issues.push(format!(
+                "foreign keys into known tables: {}",
+                compat.unexpected_foreign_keys_to_known_tables.join(", ")
+            ));
+        }
         if !compat.unexpected_tables.is_empty() {
             issues.push(format!("unexpected tables/views: {}", compat.unexpected_tables.join(", ")));
         }

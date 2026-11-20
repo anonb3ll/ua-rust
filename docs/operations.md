@@ -61,7 +61,7 @@ Checks performed:
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
-9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, or unowned objects without an `extra` part fail; `missing`/`extra` parts warn).
+9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, objects using the reserved `sqlite_` name prefix, unexpected tables with foreign keys into known tables, or unowned objects without an `extra` part fail; `missing`/`extra` parts warn). Only SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and automatic indexes are exempt from the comparison.
 10. `ledger`: verifies the tamper-evident `event_log` hash chain cleanly (`ledger::verify`).
 11. `pre_restore_backups`: warns when leftover `*.pre-restore-*.bak*` recovery files remain in `$UA_HOME` so they can be pruned once verified.
 12. `restore_staging`: warns when leftover `.ua.db.restore.*.d` rollback directories remain (indicating a failed rollback requiring inspection).
@@ -117,19 +117,28 @@ Key restore safeguards:
    opened once, streamed into a private `0700` staging directory beside the
    destination (`0600` file, avoiding small `/tmp` mounts even for `--dry-run`), hashed,
    and checked (`PRAGMA integrity_check`, required tables, `schema_parts` + normalized
-   table/view/index/trigger DDL compatibility, `ledger::verify`) via SQLite
-   `immutable=1`. `--allow-newer` allows snapshots containing `extra` schema parts and
+   table/view/index/trigger DDL compatibility, `sqlite_sequence` counters,
+   `ledger::verify`) via SQLite `immutable=1`. Objects named with the reserved
+   `sqlite_` prefix (which only `PRAGMA writable_schema` can create) are refused,
+   apart from SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and
+   automatic indexes. The `event_log` AUTOINCREMENT counter must equal `MAX(seq)`;
+   every other counter must lie between `MAX(rowid)` and 2^53 - 1.
+   `--allow-newer` allows snapshots containing `extra` schema parts and
    their new objects (new tables/indexes/triggers on new tables), while still refusing
    drifted parts, missing/altered known objects, broken schema dependency chains,
-   triggers or indexes on known tables, objects colliding with known schema names, or
-   unowned objects without an `extra` part.
+   triggers or indexes on known tables, new tables with foreign keys into known
+   tables, objects colliding with known schema names, or unowned objects without an
+   `extra` part.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when
    recovering a corrupt/tampered DB).
 4. **Crash-safe replace with hard-linked rollback & credential scope:** The existing DB
    and sidecars are hard-linked (or copied on cross-filesystem mounts) into private
-   rollback staging while leaving `ua.db` intact in place, then `ua.db` is replaced
+   rollback staging while leaving `ua.db` intact in place (after checkpointing any hot
+   WAL into it; the restore is refused if another process blocks that checkpoint, and
+   other checkpoint failures, such as a corrupt destination, appear in the report's
+   `warnings`), then `ua.db` is replaced
    via `fs::rename`, stale sidecars are cleared, WAL mode + `ops.restored` +
    post-install checks run, and on failure the original DB + sidecars are restored in
    place (or rollback staging is preserved on disk and reported if rollback itself

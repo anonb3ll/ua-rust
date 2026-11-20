@@ -286,6 +286,15 @@ fn check_schema(db_path: &Path) -> CheckResult {
                     c.unexpected_indexes_on_known_tables.join(", ")
                 ));
             }
+            if !c.reserved_name_objects.is_empty() {
+                parts.push(format!("reserved_name_objects=[{}]", c.reserved_name_objects.join(", ")));
+            }
+            if !c.unexpected_foreign_keys_to_known_tables.is_empty() {
+                parts.push(format!(
+                    "unexpected_foreign_keys_to_known_tables=[{}]",
+                    c.unexpected_foreign_keys_to_known_tables.join(", ")
+                ));
+            }
             check("schema", Status::Fail, parts.join(", "))
         }
         Ok(c) if !c.missing.is_empty() || !c.extra.is_empty() => check(

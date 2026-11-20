@@ -69,6 +69,14 @@ pub struct SchemaCompatibility {
     pub unexpected_triggers: Vec<String>,
     pub unexpected_triggers_on_known_tables: Vec<String>,
     pub unexpected_tables: Vec<String>,
+    /// Objects using SQLite's reserved `sqlite_` name prefix other than the
+    /// internal tables and automatic indexes SQLite creates itself. Only
+    /// `PRAGMA writable_schema` can create these, so they always fail.
+    pub reserved_name_objects: Vec<String>,
+    /// Unexpected tables declaring a foreign key into a known table. The
+    /// running build does not know about such a child table, so its writes to
+    /// the known parent could fail or cascade unexpectedly.
+    pub unexpected_foreign_keys_to_known_tables: Vec<String>,
 }
 
 impl SchemaCompatibility {
@@ -89,6 +97,8 @@ impl SchemaCompatibility {
             || !self.conflicting_objects.is_empty()
             || !self.unexpected_indexes_on_known_tables.is_empty()
             || !self.unexpected_triggers_on_known_tables.is_empty()
+            || !self.reserved_name_objects.is_empty()
+            || !self.unexpected_foreign_keys_to_known_tables.is_empty()
             || (self.extra.is_empty() && self.has_unexpected_objects())
     }
 }
@@ -141,6 +151,8 @@ pub struct RestoreReport {
     pub safety_backup_sidecars: Vec<String>,
     pub revoked_sessions: BTreeMap<String, u64>,
     pub restored_event_seq: Option<i64>,
+    /// Non-fatal problems met while installing the backup.
+    pub warnings: Vec<String>,
 }
 
 struct DirGuard {
@@ -337,12 +349,26 @@ fn normalize_sql(sql: &str) -> String {
 
 type MasterObjectMap = BTreeMap<(String, String), (String, String, String)>;
 
+/// Read every table, view, index, and trigger from `sqlite_master`.
+///
+/// Objects are NOT filtered by a `sqlite_` name prefix: SQLite skips its
+/// reserved-name check when loading a schema written through
+/// `PRAGMA writable_schema`, so a `sqlite_`-named trigger or view loads and
+/// runs like any other. Only objects SQLite itself creates are exempt:
+/// automatic indexes (`type = 'index'`, `sql IS NULL`, `sqlite_autoindex_`
+/// name), which SQLite ties to the owning table's checked DDL, and the
+/// internal tables `sqlite_sequence`, `sqlite_stat1`, and `sqlite_stat4`.
+/// Any other `sqlite_`-named object stays in the map and is reported by
+/// [`check_schema_compatibility`] as `reserved_name_objects`.
 fn read_master_objects(conn: &Connection) -> anyhow::Result<MasterObjectMap> {
     let mut map = BTreeMap::new();
     let mut stmt = conn.prepare(
         "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master \
          WHERE type IN ('table', 'view', 'index', 'trigger') \
-         AND lower(substr(name, 1, 7)) <> 'sqlite_'",
+         AND NOT (type = 'index' AND sql IS NULL \
+                  AND lower(substr(name, 1, 17)) = 'sqlite_autoindex_') \
+         AND NOT (type = 'table' \
+                  AND lower(name) IN ('sqlite_sequence', 'sqlite_stat1', 'sqlite_stat4'))",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
@@ -461,8 +487,16 @@ pub fn check_schema_compatibility(
     let mut unexpected_triggers = Vec::new();
     let mut unexpected_triggers_on_known_tables = Vec::new();
     let mut unexpected_tables = Vec::new();
+    let mut reserved_name_objects = Vec::new();
+    let mut unexpected_foreign_keys_to_known_tables = Vec::new();
 
     for ((obj_type, name_lc), (orig_name, tbl_name, sql)) in &actual_objs {
+        // `read_master_objects` already dropped the internal tables and
+        // automatic indexes SQLite creates, so any remaining `sqlite_` name was
+        // planted through `writable_schema`.
+        if name_lc.starts_with("sqlite_") {
+            reserved_name_objects.push(format!("{obj_type}:{orig_name}"));
+        }
         if let Some((_, exp_tbl, exp_sql)) = applied_objs.get(&(obj_type.clone(), name_lc.clone())) {
             if !exp_tbl.eq_ignore_ascii_case(tbl_name) || exp_sql != sql {
                 modified_objects.push(format!("{obj_type}:{orig_name}"));
@@ -475,6 +509,18 @@ pub fn check_schema_compatibility(
                     let label = format!("{obj_type}:{orig_name}");
                     if name_collides {
                         conflicting_objects.push(label.clone());
+                    }
+                    if obj_type == "table" {
+                        let mut stmt = conn.prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")?;
+                        let parents = stmt
+                            .query_map([orig_name], |r| r.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+                        for parent in parents {
+                            if known_table_names.contains(&parent.to_ascii_lowercase()) {
+                                unexpected_foreign_keys_to_known_tables
+                                    .push(format!("{orig_name} references {parent}"));
+                            }
+                        }
                     }
                     unexpected_tables.push(label);
                 }
@@ -511,7 +557,9 @@ pub fn check_schema_compatibility(
         && conflicting_objects.is_empty()
         && unexpected_indexes.is_empty()
         && unexpected_triggers.is_empty()
-        && unexpected_tables.is_empty();
+        && unexpected_tables.is_empty()
+        && reserved_name_objects.is_empty()
+        && unexpected_foreign_keys_to_known_tables.is_empty();
     Ok(SchemaCompatibility {
         ok,
         reference_error,
@@ -526,7 +574,97 @@ pub fn check_schema_compatibility(
         unexpected_triggers,
         unexpected_triggers_on_known_tables,
         unexpected_tables,
+        reserved_name_objects,
+        unexpected_foreign_keys_to_known_tables,
     })
+}
+
+/// Largest `sqlite_sequence` value accepted for an AUTOINCREMENT table other
+/// than `event_log`: 2^53 - 1, the largest integer JSON clients (JavaScript
+/// numbers, many JSON parsers) represent exactly. Ids are exposed through
+/// JSON, so a legitimate hub never gets near it, while a tampered value at or
+/// near 2^63 would make every later insert fail with "database or disk is
+/// full".
+const MAX_AUTOINCREMENT_SEQ: i64 = (1_i64 << 53) - 1;
+
+/// Check the `sqlite_sequence` rows that drive AUTOINCREMENT. Table data is
+/// not covered by the ledger hash chain, so a backup could carry a tampered
+/// counter that bricks inserts or makes deleted ids reusable.
+///
+/// Rules (returns one message per violation, empty when consistent):
+/// - every row names an existing, non-internal table exactly once, with an
+///   integer `seq` (SQLite drops a table's row when the table is dropped, and
+///   never writes duplicates or non-integers);
+/// - `event_log` is append-only (UPDATE/DELETE triggers) and nothing inserts
+///   into it with `OR IGNORE`, so its counter must equal `MAX(seq)`, or `0`
+///   for an empty ledger. A missing `event_log` row is accepted: SQLite then
+///   continues from `MAX(seq)`, which is the same result;
+/// - any other AUTOINCREMENT table may have deleted rows, so its counter may
+///   exceed `MAX(rowid)`, but it must not be below it (that would let ids of
+///   deleted rows be handed out again) nor above [`MAX_AUTOINCREMENT_SEQ`].
+pub fn check_autoincrement_sequences(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    if !table_exists(conn, "sqlite_sequence")? {
+        return Ok(Vec::new());
+    }
+    let tables: BTreeSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    let mut problems = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut stmt =
+        conn.prepare("SELECT CAST(name AS TEXT), typeof(name), seq, typeof(seq) FROM sqlite_sequence")?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: Option<String> = r.get(0)?;
+        let name_type: String = r.get(1)?;
+        let seq_type: String = r.get(3)?;
+        let Some(name) = name.filter(|_| name_type == "text") else {
+            problems.push(format!("sqlite_sequence row with a non-text name ({name_type})"));
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            problems.push(format!("sqlite_sequence has more than one row for {name}"));
+            continue;
+        }
+        if !tables.contains(&name) || name.to_ascii_lowercase().starts_with("sqlite_") {
+            problems.push(format!("sqlite_sequence row for {name}, which is not an application table"));
+            continue;
+        }
+        if seq_type != "integer" {
+            problems.push(format!("sqlite_sequence value for {name} is not an integer ({seq_type})"));
+            continue;
+        }
+        let seq: i64 = r.get(2)?;
+        let max_rowid: Option<i64> = match conn.query_row(
+            &format!("SELECT MAX(rowid) FROM \"{}\"", name.replace('"', "\"\"")),
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                problems.push(format!("cannot read MAX(rowid) of {name} for its sqlite_sequence row: {e}"));
+                continue;
+            }
+        };
+        let floor = max_rowid.unwrap_or(0);
+        if name == "event_log" {
+            if seq != floor {
+                problems.push(format!(
+                    "sqlite_sequence for event_log is {seq} but MAX(seq) is {floor}; the ledger is append-only, so they must match"
+                ));
+            }
+        } else if seq < floor {
+            problems.push(format!(
+                "sqlite_sequence for {name} is {seq}, below MAX(rowid) {floor}; ids of deleted rows could be reused"
+            ));
+        } else if seq > MAX_AUTOINCREMENT_SEQ {
+            problems.push(format!(
+                "sqlite_sequence for {name} is {seq}, above the limit {MAX_AUTOINCREMENT_SEQ}"
+            ));
+        }
+    }
+    Ok(problems)
 }
 
 fn stream_sha256_and_size(path: &Path) -> anyhow::Result<(String, u64)> {
@@ -1155,23 +1293,72 @@ fn stage_rollback_copy(orig: &Path, rb: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn quiesce_existing_wal(abs_dst: &Path) {
+/// How long [`quiesce_existing_wal`] waits for other connections to let go.
+#[cfg(not(test))]
+const QUIESCE_BUSY_TIMEOUT: std::time::Duration = BUSY_TIMEOUT;
+#[cfg(test)]
+const QUIESCE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Why the existing database's sidecars could not be folded into it.
+enum QuiesceFailure {
+    /// Another connection holds the database (busy or locked). Removing the
+    /// sidecars now would discard frames that process still depends on.
+    Busy(String),
+    /// Any other failure, for example a corrupt destination being replaced.
+    Other(String),
+}
+
+fn is_busy_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Checkpoint and truncate a hot WAL (or roll back a hot journal) into the
+/// existing database and switch it to `journal_mode = DELETE`, so the later
+/// sidecar removal discards nothing. Returns `Ok(())` when there was nothing to
+/// do or the database is now self-contained.
+fn quiesce_existing_wal(abs_dst: &Path) -> Result<(), QuiesceFailure> {
     if !fs::symlink_metadata(abs_dst).is_ok_and(|m| m.is_file()) {
-        return;
+        return Ok(());
     }
     let has_sidecar = [wal_sidecar_path(abs_dst), shm_sidecar_path(abs_dst), journal_sidecar_path(abs_dst)]
         .into_iter()
         .any(|p| fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()));
     if !has_sidecar {
-        return;
+        return Ok(());
     }
-    if let Ok(conn) = Connection::open_with_flags(
+    let classify = |what: &str, e: rusqlite::Error| {
+        let msg = format!("{what}: {e}");
+        if is_busy_error(&e) { QuiesceFailure::Busy(msg) } else { QuiesceFailure::Other(msg) }
+    };
+    let conn = Connection::open_with_flags(
         abs_dst,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        let _ = conn.busy_timeout(BUSY_TIMEOUT);
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;");
+    )
+    .map_err(|e| classify("opening existing database", e))?;
+    conn.busy_timeout(QUIESCE_BUSY_TIMEOUT).map_err(|e| classify("setting busy timeout", e))?;
+    // `wal_checkpoint` reports a reader or writer that blocked it as `busy = 1`
+    // in its result row rather than as an error.
+    let (busy, log, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| classify("checkpointing WAL", e))?;
+    if busy != 0 {
+        return Err(QuiesceFailure::Busy(format!(
+            "WAL checkpoint blocked by another connection ({checkpointed} of {log} frames checkpointed)"
+        )));
     }
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))
+        .map_err(|e| classify("switching journal_mode to DELETE", e))?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(QuiesceFailure::Busy(format!(
+            "journal_mode stayed {mode}; another connection still holds the database"
+        )));
+    }
+    Ok(())
 }
 
 fn restore_database_inner(
@@ -1281,6 +1468,12 @@ fn restore_database_with_hooks(
                     compat.modified_objects.join(", ")
                 );
             }
+            if !compat.reserved_name_objects.is_empty() {
+                bail!(
+                    "refusing restore: objects using the reserved sqlite_ name prefix ([{}])",
+                    compat.reserved_name_objects.join(", ")
+                );
+            }
             if !compat.conflicting_objects.is_empty() {
                 bail!(
                     "refusing restore: unexpected objects colliding with known schema names ([{}])",
@@ -1305,6 +1498,12 @@ fn restore_database_with_hooks(
                     compat.extra.join(", ")
                 );
             }
+            if !compat.unexpected_foreign_keys_to_known_tables.is_empty() {
+                bail!(
+                    "refusing restore: unexpected tables declare foreign keys into known tables ([{}])",
+                    compat.unexpected_foreign_keys_to_known_tables.join(", ")
+                );
+            }
             if compat.extra.is_empty() && compat.has_unexpected_objects() {
                 bail!(
                     "refusing restore: unexpected schema objects (tables=[{}], indexes=[{}], triggers=[{}])",
@@ -1317,6 +1516,10 @@ fn restore_database_with_hooks(
         } else {
             None
         };
+        let sequence_problems = check_autoincrement_sequences(&conn)?;
+        if !sequence_problems.is_empty() {
+            bail!("refusing restore: inconsistent AUTOINCREMENT counters ({})", sequence_problems.join("; "));
+        }
         let report = ledger::verify(&conn)?;
         if !report.ok {
             bail!(
@@ -1349,6 +1552,7 @@ fn restore_database_with_hooks(
             safety_backup_sidecars: Vec::new(),
             revoked_sessions: BTreeMap::new(),
             restored_event_seq: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -1365,7 +1569,26 @@ fn restore_database_with_hooks(
     // Checkpoint and truncate any hot WAL into the existing database BEFORE staging
     // rollback hard links, so SQLite unlinks `-wal`/`-shm` cleanly while keeping
     // all committed frames inside `rollback/main`.
-    quiesce_existing_wal(&abs_dst);
+    let mut warnings = Vec::new();
+    match quiesce_existing_wal(&abs_dst) {
+        Ok(()) => {}
+        Err(QuiesceFailure::Busy(msg)) => {
+            bail!(
+                "refusing restore: another process is using {} ({msg}); stop it and retry{note}",
+                abs_dst.display()
+            );
+        }
+        // The destination is unreadable (for example corrupt), which is a normal
+        // reason to restore, so carry on and report it. Opening a corrupt file can
+        // already make SQLite discard an unreadable WAL, so refusing here would
+        // protect nothing; whatever sidecars remain are staged for rollback and,
+        // unless `--no-safety-backup` was passed, copied next to the safety backup.
+        Err(QuiesceFailure::Other(msg)) => {
+            warnings.push(format!(
+                "could not checkpoint the existing database's sidecars before replacing it ({msg}){note}"
+            ));
+        }
+    }
 
     // Link (or copy on cross-FS/vfat) the existing DB and any remaining sidecars into
     // private rollback staging WITHOUT unlinking `ua.db`, so a crash before swap
@@ -1507,6 +1730,7 @@ fn restore_database_with_hooks(
         safety_backup_sidecars,
         revoked_sessions,
         restored_event_seq: Some(event_seq),
+        warnings,
     })
 }
 
@@ -2607,5 +2831,368 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items WHERE val = 'hot-wal-row'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rb_hot, 1, "rollback lost hot-wal-row from original DB");
+    }
+
+    /// A mock token table so a planted trigger has a security-relevant target.
+    const TOKENS_MOCK: SchemaPart = SchemaPart {
+        name: "tokens_mock.v1",
+        sql: "CREATE TABLE IF NOT EXISTS agent_tokens (id TEXT PRIMARY KEY, status TEXT NOT NULL);",
+    };
+
+    fn tokens_parts() -> Vec<SchemaPart> {
+        vec![LEDGER_SCHEMA, META_SCHEMA, TOKENS_MOCK]
+    }
+
+    /// Take a clean backup of a hub holding one active token and one event.
+    fn tokens_backup(dir: &Path) -> PathBuf {
+        let src = dir.join("tokens-src.db");
+        let db = Db::open(&src, &tokens_parts()).unwrap();
+        db.write(|tx| {
+            tx.execute("INSERT INTO agent_tokens (id, status) VALUES ('tok-1', 'active')", [])?;
+            ledger::append(tx, EventInput::new("seed", json!({})))?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let bak = dir.join("tokens-bak.db");
+        backup_database(&src, &bak, false).unwrap();
+        bak
+    }
+
+    /// Copy `bak` to `name` and run `sql` on the copy (rollback journal, so the
+    /// copy stays a single self-contained file).
+    fn tamper_copy(bak: &Path, name: &str, sql: &str) -> PathBuf {
+        let out = bak.with_file_name(name);
+        fs::copy(bak, &out).unwrap();
+        let conn = Connection::open(&out).unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        assert!(!wal_sidecar_path(&out).exists() && !journal_sidecar_path(&out).exists());
+        out
+    }
+
+    /// Plant a schema object through `PRAGMA writable_schema`, which bypasses
+    /// SQLite's reserved-name check for `sqlite_`-prefixed names.
+    fn plant_sql(obj_type: &str, name: &str, tbl: &str, ddl: &str) -> String {
+        format!(
+            "PRAGMA writable_schema = ON;
+             INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+             VALUES ('{obj_type}', '{name}', '{tbl}', 0, '{}');
+             PRAGMA writable_schema = OFF;",
+            ddl.replace('\'', "''")
+        )
+    }
+
+    fn restore_opts(parts: Vec<SchemaPart>, allow_newer: bool) -> RestoreOptions {
+        RestoreOptions {
+            allow_unpinned: true,
+            allow_newer,
+            expected_schema: Some((parts, Vec::new())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn writable_schema_sqlite_prefixed_trigger_and_view_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = tokens_backup(dir.path());
+
+        // A trigger that re-activates a revoked token.
+        let keepalive = plant_sql(
+            "trigger",
+            "sqlite_keepalive",
+            "agent_tokens",
+            "CREATE TRIGGER sqlite_keepalive AFTER UPDATE OF status ON agent_tokens \
+             BEGIN UPDATE agent_tokens SET status = 'active' WHERE id = NEW.id; END",
+        );
+        // Prove the planted trigger is live: revoking the token has no effect.
+        let probe = tamper_copy(&bak, "probe.db", &keepalive);
+        let conn = Connection::open(&probe).unwrap();
+        conn.execute("UPDATE agent_tokens SET status = 'revoked' WHERE id = 'tok-1'", []).unwrap();
+        let status: String =
+            conn.query_row("SELECT status FROM agent_tokens WHERE id = 'tok-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "active", "planted trigger did not load; the test would prove nothing");
+        drop(conn);
+
+        let tampered = tamper_copy(&bak, "keepalive.db", &keepalive);
+        let ro = open_read_only(&tampered).unwrap();
+        assert_eq!(run_integrity_pragma(&ro, "PRAGMA integrity_check").unwrap(), "ok");
+        let compat = check_schema_compatibility(&ro, &tokens_parts(), &[]).unwrap();
+        assert!(!compat.ok, "{compat:?}");
+        assert_eq!(compat.reserved_name_objects, vec!["trigger:sqlite_keepalive".to_string()]);
+        assert!(compat.has_tampering_or_unowned_objects(), "{compat:?}");
+        drop(ro);
+        for allow_newer in [false, true] {
+            let err = restore_database(
+                &tampered,
+                &dir.path().join(format!("dest-keepalive-{allow_newer}.db")),
+                restore_opts(tokens_parts(), allow_newer),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("reserved sqlite_ name prefix") && err.contains("sqlite_keepalive"),
+                "allow_newer={allow_newer}: {err}"
+            );
+        }
+
+        // A trigger that silently drops every ledger append (including `ops.restored`).
+        let drop_appends = tamper_copy(
+            &bak,
+            "drop-appends.db",
+            &plant_sql(
+                "trigger",
+                "sqlite_evil",
+                "event_log",
+                "CREATE TRIGGER sqlite_evil BEFORE INSERT ON event_log BEGIN SELECT RAISE(IGNORE); END",
+            ),
+        );
+        let err = restore_database(
+            &drop_appends,
+            &dir.path().join("dest-evil.db"),
+            restore_opts(tokens_parts(), false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sqlite_evil"), "{err}");
+
+        // A `sqlite_` view next to a fake newer part is refused even under --allow-newer.
+        let view = tamper_copy(
+            &bak,
+            "view.db",
+            &format!(
+                "INSERT INTO schema_parts (name, checksum, applied_at) \
+                 VALUES ('future.v1', 'abc', '2026-01-01T00:00:00Z');
+                 {}",
+                plant_sql(
+                    "view",
+                    "sqlite_shadow",
+                    "sqlite_shadow",
+                    "CREATE VIEW sqlite_shadow AS SELECT 1 AS x"
+                )
+            ),
+        );
+        let err =
+            restore_database(&view, &dir.path().join("dest-view.db"), restore_opts(tokens_parts(), true))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("reserved sqlite_ name prefix") && err.contains("view:sqlite_shadow"), "{err}");
+
+        // Control: the untampered backup (with `sqlite_sequence` and automatic
+        // indexes, which stay exempt) restores, and `ops.restored` is recorded.
+        let ok =
+            restore_database(&bak, &dir.path().join("dest-clean.db"), restore_opts(tokens_parts(), false))
+                .unwrap();
+        assert!(ok.schema.as_ref().unwrap().ok, "{:?}", ok.schema);
+        assert_eq!(ok.restored_event_seq, Some(2));
+    }
+
+    #[test]
+    fn tampered_sqlite_sequence_is_refused() {
+        const COUNTED: SchemaPart = SchemaPart {
+            name: "counted.v1",
+            sql: "CREATE TABLE IF NOT EXISTS counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);",
+        };
+        let parts = vec![LEDGER_SCHEMA, META_SCHEMA, COUNTED];
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("seq-src.db");
+
+        // A fresh hub with an empty ledger has no `sqlite_sequence` rows to check.
+        let db = Db::open(&src, &parts).unwrap();
+        db.read(|c| {
+            assert!(check_autoincrement_sequences(c).unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
+        db.write(|tx| {
+            for i in 0..5 {
+                tx.execute("INSERT INTO counted (v) VALUES (?1)", [format!("v{i}")])?;
+            }
+            // Deleted rows leave the counter above MAX(rowid); that is legitimate.
+            tx.execute("DELETE FROM counted WHERE id >= 4", [])?;
+            ledger::append(tx, EventInput::new("a", json!({})))?;
+            ledger::append(tx, EventInput::new("b", json!({})))?;
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let bak = dir.path().join("seq-bak.db");
+        backup_database(&src, &bak, false).unwrap();
+        let clean = open_read_only(&bak).unwrap();
+        assert_eq!(check_autoincrement_sequences(&clean).unwrap(), Vec::<String>::new());
+        drop(clean);
+
+        // event_log's counter pushed toward 2^63 would make every later append fail.
+        let near_max = tamper_copy(
+            &bak,
+            "seq-near-max.db",
+            "UPDATE sqlite_sequence SET seq = 9223372036854775806 WHERE name = 'event_log';",
+        );
+        let err = restore_database(
+            &near_max,
+            &dir.path().join("dest-near-max.db"),
+            restore_opts(parts.clone(), false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("AUTOINCREMENT") && err.contains("event_log"), "{err}");
+        // The same refusal applies without a schema expectation.
+        let err = restore_database(
+            &near_max,
+            &dir.path().join("dest-near-max-2.db"),
+            RestoreOptions { allow_unpinned: true, ..Default::default() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("AUTOINCREMENT"), "{err}");
+
+        let problems_for = |name: &str, sql: &str| {
+            let p = tamper_copy(&bak, name, sql);
+            let c = open_read_only(&p).unwrap();
+            check_autoincrement_sequences(&c).unwrap()
+        };
+        // event_log must match MAX(seq) exactly, in both directions.
+        let low = problems_for("seq-low.db", "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'event_log';");
+        assert!(low.iter().any(|p| p.contains("event_log")), "{low:?}");
+        let high =
+            problems_for("seq-high.db", "UPDATE sqlite_sequence SET seq = 3 WHERE name = 'event_log';");
+        assert!(high.iter().any(|p| p.contains("event_log")), "{high:?}");
+        // A missing event_log row is harmless: SQLite continues from MAX(seq).
+        let gone = problems_for("seq-gone.db", "DELETE FROM sqlite_sequence WHERE name = 'event_log';");
+        assert!(gone.is_empty(), "{gone:?}");
+        // Other counters: not below MAX(rowid), not above 2^53 - 1.
+        let reuse =
+            problems_for("seq-reuse.db", "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'counted';");
+        assert!(reuse.iter().any(|p| p.contains("counted") && p.contains("reused")), "{reuse:?}");
+        let huge = problems_for(
+            "seq-huge.db",
+            "UPDATE sqlite_sequence SET seq = 9007199254740992 WHERE name = 'counted';",
+        );
+        assert!(huge.iter().any(|p| p.contains("counted") && p.contains("limit")), "{huge:?}");
+        let at_cap = problems_for(
+            "seq-cap.db",
+            "UPDATE sqlite_sequence SET seq = 9007199254740991 WHERE name = 'counted';",
+        );
+        assert!(at_cap.is_empty(), "{at_cap:?}");
+        // Rows SQLite would never write: orphans, duplicates, non-integers.
+        let orphan =
+            problems_for("seq-orphan.db", "INSERT INTO sqlite_sequence (name, seq) VALUES ('ghost', 7);");
+        assert!(orphan.iter().any(|p| p.contains("ghost")), "{orphan:?}");
+        let dup = problems_for(
+            "seq-dup.db",
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('event_log', 9223372036854775806);",
+        );
+        assert!(dup.iter().any(|p| p.contains("more than one row")), "{dup:?}");
+        let text =
+            problems_for("seq-text.db", "UPDATE sqlite_sequence SET seq = 'x' WHERE name = 'counted';");
+        assert!(text.iter().any(|p| p.contains("not an integer")), "{text:?}");
+    }
+
+    #[test]
+    fn allow_newer_refuses_new_table_with_foreign_key_into_known_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = tokens_backup(dir.path());
+        let fk = tamper_copy(
+            &bak,
+            "fk.db",
+            "INSERT INTO schema_parts (name, checksum, applied_at) \
+             VALUES ('future.v1', 'abc', '2026-01-01T00:00:00Z');
+             CREATE TABLE future_child (id INTEGER PRIMARY KEY, token_status TEXT REFERENCES agent_tokens(status));",
+        );
+        let ro = open_read_only(&fk).unwrap();
+        let compat = check_schema_compatibility(&ro, &tokens_parts(), &[]).unwrap();
+        assert_eq!(
+            compat.unexpected_foreign_keys_to_known_tables,
+            vec!["future_child references agent_tokens".to_string()]
+        );
+        assert!(compat.has_tampering_or_unowned_objects(), "{compat:?}");
+        drop(ro);
+        let err = restore_database(&fk, &dir.path().join("dest-fk.db"), restore_opts(tokens_parts(), true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foreign keys into known tables") && err.contains("future_child"), "{err}");
+
+        // A new table whose foreign key stays among new tables is still accepted.
+        let fk_new = tamper_copy(
+            &bak,
+            "fk-new.db",
+            "INSERT INTO schema_parts (name, checksum, applied_at) \
+             VALUES ('future.v1', 'abc', '2026-01-01T00:00:00Z');
+             CREATE TABLE future_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE future_kid (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES future_parent(id));",
+        );
+        restore_database(&fk_new, &dir.path().join("dest-fk-new.db"), restore_opts(tokens_parts(), true))
+            .unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_when_existing_wal_cannot_be_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sdir, src_path, src_db) = test_db();
+        src_db.write(|tx| ledger::append(tx, EventInput::new("seed", json!({})))).unwrap();
+        drop(src_db);
+        let bak = dir.path().join("bak.db");
+        backup_database(&src_path, &bak, false).unwrap();
+
+        // 1. Another process holds a read snapshot on the live database's WAL.
+        let (_ldir, live_path, live_db) = test_db();
+        live_db
+            .write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('live-row')", [])?;
+                ledger::append(tx, EventInput::new("live", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(fs::metadata(wal_sidecar_path(&live_path)).unwrap().len() > 0);
+        let reader = Connection::open(&live_path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let before: i64 = reader.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, 1);
+
+        let err = restore_database(
+            &bak,
+            &live_path,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("another process is using"), "{err}");
+        assert!(wal_sidecar_path(&live_path).exists(), "WAL removed although the checkpoint failed");
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        live_db
+            .read(|c| {
+                let n: i64 =
+                    c.query_row("SELECT COUNT(*) FROM items WHERE val = 'live-row'", [], |r| r.get(0))?;
+                assert_eq!(n, 1, "live database lost its row");
+                Ok(())
+            })
+            .unwrap();
+        drop(live_db);
+
+        // 2. A corrupt destination with a sidecar is still replaceable (that is
+        //    what restore is for); the failed checkpoint is reported as a warning.
+        let corrupt = dir.path().join("corrupt.db");
+        fs::write(&corrupt, b"this is not a database").unwrap();
+        fs::write(wal_sidecar_path(&corrupt), b"not a wal either").unwrap();
+        let rep = restore_database(
+            &bak,
+            &corrupt,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep.warnings.len(), 1, "{rep:?}");
+        assert!(rep.warnings[0].contains("could not checkpoint"), "{rep:?}");
+        assert!(check_database(&corrupt).unwrap().ledger.unwrap().ok);
     }
 }
