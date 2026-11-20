@@ -417,8 +417,8 @@ fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResu
 
 /// The default prompt for a run routed to a node: the node's receipt
 /// reports the outcome, so the session is not asked to report it.
-fn node_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str, node: &str) -> String {
-    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+fn node_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: &str, node: &str) -> String {
+    let notes: String = notes.chars().take(8000).collect();
     format!(
         "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id} on node {node}. The hub records the \
          outcome from this session's end; do the work and leave a clear final summary.",
@@ -427,8 +427,10 @@ fn node_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str, node: &str
 }
 
 /// The default prompt: the task title and notes, and the run to report on.
-fn default_prompt(task_id: i64, task: &Map<String, Value>, run_id: &str) -> String {
-    let notes: String = str_field(task, "notes").unwrap_or_default().chars().take(8000).collect();
+/// `notes` is the task's work order: its notes, or for a task an approved
+/// work proposal spawned, the contract block alone.
+fn default_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: &str) -> String {
+    let notes: String = notes.chars().take(8000).collect();
     format!(
         "Task #{task_id}: {}\n\n{notes}\n\nYou are dispatch run {run_id}. When done, call \
          dispatch_report_self(state, run_id=\"{run_id}\", evidence=...).",
@@ -660,6 +662,16 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             check_task_free(tx, tid, &ag, None)?;
             // The one claim gate: a stopped agent or a held task takes no run.
             governance::check_claim(tx, Some(&ag), Some(tid), false)?;
+            // A proposal-spawned task must still match its frozen contract,
+            // and its work order is the contract block: notes appended after
+            // it never reach a prompt the hub builds.
+            let work_order = governance::check_contract(
+                tx,
+                tid,
+                str_field(&task, "title").unwrap_or_default(),
+                str_field(&task, "notes").unwrap_or_default(),
+            )?;
+            let notes = work_order.unwrap_or_else(|| str_field(&task, "notes").unwrap_or_default().to_string());
             let workdir = match &h2 {
                 None => None,
                 Some((name, h)) => {
@@ -682,8 +694,8 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let (prompt, source) = match &a.prompt {
                 Some(p) => (p.clone(), "args"),
                 None => match &route {
-                    Some((row, _, _)) => (node_prompt(tid, &task, &run_id, &row.node), "task"),
-                    None => (default_prompt(tid, &task, &run_id), "task"),
+                    Some((row, _, _)) => (node_prompt(tid, &task, &notes, &run_id, &row.node), "task"),
+                    None => (default_prompt(tid, &task, &notes, &run_id), "task"),
                 },
             };
             if prompt.len() > PROMPT_CAP {
@@ -1182,8 +1194,10 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             let binding = check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
             check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
-            // A resumed attempt is new work: the one claim gate applies.
+            // A resumed attempt is new work: the one claim gate applies, and
+            // a proposal-spawned task must still match its frozen contract.
             governance::check_claim(tx, Some(&run.agent_label), Some(run.task_id), false)?;
+            governance::task_contract(tx, run.task_id)?;
             // The approver sees what will run, and the attempt it replaces:
             // a pass resumes this attempt only.
             let mut payload = json!({

@@ -913,6 +913,9 @@ pub(crate) fn insert_item(
             }
             _ => {}
         }
+        // Node work bound to a proposal-spawned task (node_dispatch, a
+        // command, node-routed dispatch) fails closed on a drifted contract.
+        governance::task_contract(tx, t)?;
     }
     let id = new_item_id();
     let ts = now();
@@ -1027,8 +1030,12 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
                 return Ok(Ok(prev));
             }
             let node = accepting_node(tx, &n)?;
-            // Before the approval gate, so stopped or held work never consumes one.
+            // Before the approval gate, so stopped, held or drifted work never
+            // consumes one.
             governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+            if let Some(t) = n.task_id {
+                governance::task_contract(tx, t)?;
+            }
             match approvals::gate(tx, hub2.cfg(), &caller, "node_dispatch", &gate_payload(&n, &who))? {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => return Ok(Err(Some(approval_id))),

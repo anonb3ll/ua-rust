@@ -4,9 +4,10 @@
 //! or rejects each item; every approved item becomes one task.
 //!
 //! - **Authority**: any verified identity may file (an agent as itself; a
-//!   human for anyone). Only a human identity may decide. An unverified
-//!   local caller must name a configured human as `approver`. Only the
-//!   proposer may withdraw, and only while nothing is decided.
+//!   human for anyone). Only a verified human caller may decide (the
+//!   `approval_resolve` rule); an `approver` named by the caller grants
+//!   nothing and must match the caller when given. Only the proposer may
+//!   withdraw, and only while nothing is decided.
 //! - **Item states**: `pending` -> `approved` | `rejected` | `withdrawn`
 //!   (`approving` exists only in data from the original hub, where approval
 //!   spanned two transactions; `work_proposal_recover` settles it). The
@@ -15,13 +16,22 @@
 //!   status rolls up from its items.
 //! - **Frozen contract**: `contract_digest` is SHA-256 over the canonical
 //!   JSON of the item's title, notes and scope. The spawned task's notes
-//!   start with the item notes, then `[proposal: <id>#<index>]`,
-//!   `[contract: <digest>]`, `[scope: <json>]` and `[reporting: <mode>]`.
-//!   `task_claim` (and `task_update` into `doing`) re-checks it with
+//!   start with the contract block: the item notes, then
+//!   `[proposal: <id>#<index>]`, `[contract: <digest>]`, `[scope: <json>]`,
+//!   `[reporting: <mode>]` and the closing delimiter `[end contract]`.
+//!   Every path that hands the task out re-checks the block with
 //!   [`check_contract`] and refuses (`contract_mismatch`) when the item, the
-//!   task title or the notes prefix drifted, or when a task an approval
-//!   spawned lost its markers altogether. Lines appended later (a claim
-//!   line, a progress note) do not break it.
+//!   task title or the block drifted, or when a task an approval spawned
+//!   lost its markers altogether: `task_claim`, `task_update` into `doing`,
+//!   `dispatch_task` (local and node-routed), `dispatch_resume` and every
+//!   node enqueue bound to the task.
+//! - **The work order is the block, nothing after it.** Lines appended after
+//!   `[end contract]` (the hub's `claimed-by:` line, an `append_note`
+//!   progress note) do not break the check, but they are not part of the
+//!   approved work: a prompt the hub builds from the task (`dispatch_task`
+//!   without `prompt`) carries the block only, and a claimant reading the
+//!   notes treats anything after the delimiter as commentary, never as
+//!   instructions.
 //!
 //! An approval creates its task and marks the item approved in one write
 //! transaction. Every transition appends an `agent.work_proposal.*` event in
@@ -173,7 +183,12 @@ fn clean_item(i: &ItemIn, index: usize) -> UaResult<Clean> {
     Ok(Clean { title, notes, scope, priority, digest })
 }
 
-/// The notes a spawned task starts with: the item notes, then the markers.
+/// Closes the contract block in a spawned task's notes. Anything after it is
+/// outside the approved work order.
+pub(crate) const CONTRACT_END: &str = "[end contract]";
+
+/// The notes a spawned task starts with (the contract block): the item
+/// notes, then the markers, then [`CONTRACT_END`].
 fn compose_task_notes(
     notes: &str,
     scope_json: &str,
@@ -183,7 +198,8 @@ fn compose_task_notes(
     mode: &str,
 ) -> String {
     let markers = format!(
-        "[proposal: {proposal_id}#{index}]\n[contract: {digest}]\n[scope: {scope_json}]\n[reporting: {mode}]"
+        "[proposal: {proposal_id}#{index}]\n[contract: {digest}]\n[scope: {scope_json}]\n[reporting: {mode}]\n\
+         {CONTRACT_END}"
     );
     if notes.is_empty() { markers } else { format!("{notes}\n\n{markers}") }
 }
@@ -454,40 +470,33 @@ pub struct DecideArgs {
     pub proposal_id: String,
     /// One or more `{index, approve, edits?}`.
     pub decisions: Vec<Decision>,
-    /// For an unverified local caller only: a configured human identity.
+    /// Optional; when given it must be the verified human caller. It never
+    /// grants authority.
     pub approver: Option<String>,
 }
 
+/// The verified human deciding. The same rule as `approval_resolve`: the
+/// caller must be a verified human identity. An `approver` named in the
+/// arguments is never trusted; it must match the caller when given.
 fn approver(ctx: &ToolCtx, named: Option<&str>) -> UaResult<String> {
-    let refusal = "only a human operator may approve or reject work proposal items; agents may file proposals \
-                   but not decide them";
-    let cfg = ctx.hub.cfg();
+    let refusal = "only a verified human operator may approve or reject work proposal items; agents may file \
+                   proposals but not decide them";
     let named = named.map(str::trim).filter(|n| !n.is_empty());
-    match verified(&ctx.caller) {
-        Some(v) => {
-            if !(ctx.caller.is_human() || cfg.is_human(v)) {
-                return Err(UaError::denied(
-                    "human_required",
-                    format!("{refusal} ({v:?} is not a human identity)"),
-                ));
-            }
-            if let Some(n) = named
-                && !n.eq_ignore_ascii_case(v)
-            {
-                return Err(UaError::invalid(format!(
-                    "approver must be the verified caller {v:?}, not {n:?}"
-                )));
-            }
-            Ok(v.to_string())
-        }
-        None => match named {
-            Some(n) if cfg.is_human(n) => Ok(n.to_string()),
-            _ => Err(UaError::denied(
-                "human_required",
-                format!("{refusal}; with no verified identity, pass approver=<a human identity>"),
-            )),
-        },
+    let Some(v) = verified(&ctx.caller).filter(|_| ctx.caller.is_human()) else {
+        return Err(UaError::denied(
+            "human_required",
+            format!(
+                "{refusal} ({:?} is not a verified human identity; naming an approver does not make it one)",
+                ctx.caller.label
+            ),
+        ));
+    };
+    if let Some(n) = named
+        && !n.eq_ignore_ascii_case(v)
+    {
+        return Err(UaError::invalid(format!("approver must be the verified caller {v:?}, not {n:?}")));
     }
+    Ok(v.to_string())
 }
 
 fn apply_edits(i: &Item, edits: Option<&ItemEdits>) -> UaResult<(Clean, bool)> {
@@ -824,9 +833,29 @@ fn mismatch(msg: String) -> UaError {
     UaError::denied("contract_mismatch", msg)
 }
 
+/// [`check_contract`] over the task's stored title and notes. `None` for a
+/// task that does not exist (the caller reports that) or carries no
+/// contract.
+pub(crate) fn task_contract(c: &Connection, task_id: i64) -> UaResult<Option<String>> {
+    let row: Option<(String, Option<String>)> = c
+        .query_row("SELECT title, notes FROM tasks WHERE id = ?1", [task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    match row {
+        Some((title, notes)) => check_contract(c, task_id, &title, notes.as_deref().unwrap_or("")),
+        None => Ok(None),
+    }
+}
+
 /// Fail closed when a proposal-spawned task no longer matches its frozen
-/// contract. A task with neither a proposal nor a contract marker passes.
-pub(crate) fn check_contract(c: &Connection, task_id: i64, title: &str, notes: &str) -> UaResult<()> {
+/// contract. A task with neither a proposal nor a contract marker passes
+/// (`None`). For a task that matches, returns its contract block: the
+/// approved work order, without anything appended after [`CONTRACT_END`].
+pub(crate) fn check_contract(
+    c: &Connection,
+    task_id: i64,
+    title: &str,
+    notes: &str,
+) -> UaResult<Option<String>> {
     let (Some(prx), Some(crx)) = (PROPOSAL_MARK.as_ref(), CONTRACT_MARK.as_ref()) else {
         return Err(UaError::internal("contract marker patterns failed to compile"));
     };
@@ -845,9 +874,10 @@ pub(crate) fn check_contract(c: &Connection, task_id: i64, title: &str, notes: &
             .optional()?;
         return match owner {
             Some((pid, idx)) => Err(mismatch(format!(
-                "task {task_id} was spawned by work proposal item {pid}#{idx} but its notes lost the contract                  markers; restore the approved notes before claiming it"
+                "task {task_id} was spawned by work proposal item {pid}#{idx} but its notes lost the contract \
+                 markers; restore the approved notes before claiming it"
             ))),
-            None => Ok(()),
+            None => Ok(None),
         };
     }
     if proposals.is_empty() {
@@ -859,7 +889,7 @@ pub(crate) fn check_contract(c: &Connection, task_id: i64, title: &str, notes: &
     if proposals.len() > 1 {
         return Err(mismatch(format!("task {task_id} names more than one proposal; contract refused")));
     }
-    let Some((pid, raw_idx)) = proposals.into_iter().next() else { return Ok(()) };
+    let Some((pid, raw_idx)) = proposals.into_iter().next() else { return Ok(None) };
     let idx: i64 =
         raw_idx.parse().map_err(|_| mismatch(format!("task {task_id} names a malformed item index")))?;
     let row = c
@@ -898,11 +928,13 @@ pub(crate) fn check_contract(c: &Connection, task_id: i64, title: &str, notes: &
     if title != row.title {
         return Err(mismatch(format!("{at}: the task title differs from the approved contract")));
     }
+    // The whole block, closing delimiter included, must stand at the start
+    // of the notes; text after it is commentary outside the work order.
     let expected = compose_task_notes(&row.notes, &row.scope_json, &pid, idx, &row.contract_digest, &mode);
     if !(notes == expected || notes.starts_with(&format!("{expected}\n"))) {
         return Err(mismatch(format!("{at}: the task notes differ from the approved contract")));
     }
-    Ok(())
+    Ok(Some(expected))
 }
 
 #[cfg(test)]
@@ -923,6 +955,16 @@ mod tests {
             r#"{"notes":"n","scope":{"files":["a.rs","b.rs"],"repo":"o/r"},"title":"t"}"#
         );
         assert_eq!(contract_digest("t", "n", &scope).len(), 64);
+    }
+
+    #[test]
+    fn the_contract_block_ends_with_its_delimiter() {
+        let block = compose_task_notes("do it", "{}", "wp_0123456789ab", 0, "d", "final_only");
+        assert!(block.starts_with("do it\n\n[proposal: wp_0123456789ab#0]\n"), "{block}");
+        assert!(block.ends_with(&format!("[reporting: final_only]\n{CONTRACT_END}")), "{block}");
+        assert!(
+            compose_task_notes("", "{}", "wp_0123456789ab", 0, "d", "final_only").starts_with("[proposal:")
+        );
     }
 
     #[test]
