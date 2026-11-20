@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 209 tools are registered and the core families are ported.
+> **Status: alpha.** 210 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
