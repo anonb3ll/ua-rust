@@ -126,6 +126,11 @@ pub struct Config {
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
+    /// Test hook: directory prepended to `PATH` for `python_lint_and_format`
+    /// only, so a stub `ruff` can be found. It cannot be set from TOML or the
+    /// environment. The program name stays `ruff`; this does not add a shell.
+    #[serde(skip)]
+    pub python_lint_path_prepend: Option<PathBuf>,
     /// Cargo config files above a workspace root that `run_cmd` lets cargo
     /// read, each pinned to the SHA-256 of its content. Cargo is refused
     /// under any other ancestor cargo config, and under a listed one whose
@@ -596,6 +601,7 @@ impl Default for Config {
             evidence_append_max_per_hour: 120,
             evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),
+            python_lint_path_prepend: None,
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
             approval_pass_ttl_hours: 24.0,
