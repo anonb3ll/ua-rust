@@ -301,7 +301,7 @@ mod tests {
         // `gh[pousr]_` plus 36 alphanumerics: the GitHub token shape in
         // `audit::rules::secret_shapes`, which `redact_secrets` replaces with
         // `[REDACTED_SECRET]`.
-        let token = "ghp_000000000000000000000000000000000000";
+        let token = "ghp_FakeToken0Example1Mixed2Case3Abc4567";
         let raw = json!({
             "status": "failed",
             "attempt": 1,

@@ -59,6 +59,9 @@ In a second shell, while `ua serve` is running:
 curl -fsS http://127.0.0.1:8765/healthz
 ```
 
+Every other route needs a bearer token. Issue one for each agent with
+`./target/release/ua token issue <label>`; it prints the raw value once.
+
 The database file is `$UA_HOME/ua.db` (`$HOME/.ua-rust/ua.db` when `UA_HOME`
 is unset). Configuration is read from defaults, then `$UA_HOME/config.toml`
 (or `$UA_CONFIG`), then `UA_*` environment variables. See
