@@ -231,6 +231,10 @@ pub struct Config {
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.
     pub notify_max_attempts: u32,
+    /// Slack signing secret (`UA_SLACK_SIGNING_SECRET`). `slack_verify_request`
+    /// is off until this is set. Never logged, never written to the database.
+    #[serde(skip_serializing)]
+    pub slack_signing_secret: Option<SecretString>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
     /// Empty means dispatch only records runs and spawns nothing.
     pub harnesses: BTreeMap<String, HarnessConfig>,
@@ -633,6 +637,7 @@ impl Default for Config {
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
             notify_max_attempts: 3,
+            slack_signing_secret: None,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,

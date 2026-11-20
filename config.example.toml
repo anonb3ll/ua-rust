@@ -188,3 +188,7 @@ reviewer-1 = "reviewer"
 # search = "read"
 # get_page = "read"
 # put_page = "write"
+
+# Slack request signing. slack_verify_request stays off until this is set.
+# Prefer UA_SLACK_SIGNING_SECRET. The value is never logged.
+# slack_signing_secret = "set-me"
