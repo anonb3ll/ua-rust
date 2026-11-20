@@ -688,10 +688,10 @@ async fn a_code_for_an_identity_retired_after_consent_is_refused() {
 fn reconfigured(hub: &TestHub, tweak: impl FnOnce(&mut ua_core::Config)) -> TestHub {
     let mut cfg = hub.state.hub.cfg().clone();
     tweak(&mut cfg);
-    let state = ua_server::AppState {
-        hub: ua_tools::Hub::new(cfg, hub.state.hub.db().clone()),
-        registry: hub.state.registry.clone(),
-    };
+    let state = ua_server::AppState::new(
+        ua_tools::Hub::new(cfg, hub.state.hub.db().clone()),
+        hub.state.registry.clone(),
+    );
     let app = ua_server::router(state.clone(), tokio_util::sync::CancellationToken::new());
     TestHub { state, app }
 }
