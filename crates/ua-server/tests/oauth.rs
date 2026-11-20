@@ -672,3 +672,111 @@ async fn a_code_for_an_identity_retired_after_consent_is_refused() {
     assert_eq!(status, 400, "{e}");
     assert_eq!(e["error"], "invalid_grant", "{e}");
 }
+
+// --- profile and identity checks after the configuration changed --------------------
+
+/// The same hub database served under a changed configuration, as after a
+/// restart with an edited config file.
+fn reconfigured(hub: &TestHub, tweak: impl FnOnce(&mut ua_core::Config)) -> TestHub {
+    let mut cfg = hub.state.hub.cfg().clone();
+    tweak(&mut cfg);
+    let state = ua_server::AppState {
+        hub: ua_tools::Hub::new(cfg, hub.state.hub.db().clone()),
+        registry: hub.state.registry.clone(),
+    };
+    let app = ua_server::router(state.clone(), tokio_util::sync::CancellationToken::new());
+    TestHub { state, app }
+}
+
+/// A signed-in consent and code exchange for `remote-agent`: the tokens.
+async fn remote_agent_tokens(hub: &TestHub) -> (String, Value) {
+    let client_id = public_client(hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let code = authorize(hub, &cookie, &client_id, VERIFIER, Some(BASE)).await;
+    let (status, t) = exchange(hub, &client_id, &code, VERIFIER).await;
+    assert_eq!(status, 200, "{t}");
+    (client_id, t)
+}
+
+#[tokio::test]
+async fn refresh_is_refused_once_the_identity_left_oauth_identities() {
+    let hub = TestHub::new(config());
+    let (client_id, t) = remote_agent_tokens(&hub).await;
+    // The label keeps an explicit profile; only its OAuth eligibility ends.
+    let later = reconfigured(&hub, |c| c.oauth_identities.clear());
+    assert_eq!(later.state.hub.cfg().profiles.get("remote-agent").map(String::as_str), Some("public"));
+    let (status, e) = refresh(&later, &client_id, t["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "invalid_grant", "{e}");
+    assert!(e["error_description"].as_str().unwrap().contains("OAuth identity"), "{e}");
+}
+
+#[tokio::test]
+async fn refresh_is_refused_once_the_identity_lost_its_profile() {
+    let hub = TestHub::new(config());
+    let (client_id, t) = remote_agent_tokens(&hub).await;
+    let later = reconfigured(&hub, |c| {
+        c.profiles.remove("remote-agent");
+    });
+    let (status, e) = refresh(&later, &client_id, t["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "invalid_grant", "{e}");
+    assert!(e["error_description"].as_str().unwrap().contains("profile"), "{e}");
+    // A code exchanged after the profile was removed is refused too.
+    let client_id = public_client(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let code = authorize(&hub, &cookie, &client_id, VERIFIER, None).await;
+    let (status, e) = exchange(&later, &client_id, &code, VERIFIER).await;
+    assert_eq!(status, 400, "{e}");
+    assert_eq!(e["error"], "invalid_grant", "{e}");
+}
+
+#[tokio::test]
+async fn a_live_bearer_whose_profile_was_removed_never_resolves_to_developer() {
+    let hub = cc_hub();
+    let (status, cc) = cc_token(&hub, "svc-1", &[("resource", BASE)]).await;
+    assert_eq!(status, 200, "{cc}");
+    let (_, code) = remote_agent_tokens(&hub).await;
+    for access in [cc["access_token"].as_str().unwrap(), code["access_token"].as_str().unwrap()] {
+        let before = json_body(hub.send(get("/api/whoami", None, Some(access))).await).await;
+        assert_ne!(before["profile"], "developer", "{before}");
+
+        let later = reconfigured(&hub, |c| c.profiles.clear());
+        let resp = later.send(get("/api/whoami", None, Some(access))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{access}");
+        assert_eq!(mcp_initialize_status(&later, access).await, StatusCode::UNAUTHORIZED);
+        // An unknown profile name would fall back to developer as well.
+        let later = reconfigured(&hub, |c| {
+            for p in c.profiles.values_mut() {
+                *p = "no-such-profile".into();
+            }
+        });
+        assert_eq!(
+            later.send(get("/api/whoami", None, Some(access))).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_client_and_a_wrong_secret_get_the_same_answer() {
+    let hub = cc_hub();
+    let pairs = |id: &'static str| {
+        vec![
+            ("grant_type", "client_credentials"),
+            ("client_id", id),
+            ("client_secret", "not-the-secret-value"),
+        ]
+    };
+    let (s1, unknown) = token(&hub, &pairs("no-such-client")).await;
+    let (s2, wrong) = token(&hub, &pairs("svc-1")).await;
+    assert_eq!((s1, s2), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
+    assert_eq!(unknown, wrong);
+    // A public client presenting a secret is answered the same way.
+    let client_id = public_client(&hub).await;
+    let (s3, public) =
+        token(&hub, &[("grant_type", "refresh_token"), ("client_id", &client_id), ("client_secret", "x")])
+            .await;
+    assert_eq!(s3, StatusCode::UNAUTHORIZED);
+    assert_eq!(public, wrong);
+}

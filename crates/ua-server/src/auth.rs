@@ -121,10 +121,14 @@ pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthI
     // MCP resource covers /mcp only.
     let hub_wide = access.resource == oauth::issuer(cfg);
     let audience_ok = hub_wide || (access.resource == oauth::mcp_resource(cfg) && path_is(path, "/mcp"));
-    // OAuth grants never act as a human, even if the configuration changed.
-    (audience_ok && !cfg.is_human(&access.subject) && !retired(state, &access.subject)).then_some(
-        AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true, grant: None },
-    )
+    // OAuth grants never act as a human, even if the configuration changed,
+    // and never fall back to the `developer` default: an identity whose
+    // explicit profile was removed from configuration is refused.
+    (audience_ok
+        && !cfg.is_human(&access.subject)
+        && cfg.explicit_profile(&access.subject).is_some()
+        && !retired(state, &access.subject))
+    .then_some(AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true, grant: None })
 }
 
 /// The paths a session credential is accepted on: each runs its registry

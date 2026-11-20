@@ -147,11 +147,22 @@ Rules the server enforces:
   `profiles.<identity> = "developer"`. The only scope is `mcp`: `scope` may be
   omitted or `mcp`, anything else is `invalid_scope`. The grant and its token
   record the scope issued.
+- **An OAuth identity never runs as `developer` by default.** The explicit
+  profile is checked on every use, not only when a token is minted: an
+  access token whose identity no longer has a `profiles` entry naming a
+  known profile is refused (401), and so are a refresh and a code exchange
+  for it (`invalid_grant`). Refreshing or exchanging a grant a human
+  approved on the consent page also needs the identity to still be in
+  `oauth_identities`. Removing an identity from the configuration therefore
+  ends its OAuth access instead of widening it.
 - **Retired identities.** A token is never minted for a retired identity:
-  `client_credentials` refuses it (`unauthorized_client`) and an
-  authorization code exchanged after the identity was retired is refused
+  `client_credentials` refuses it (`unauthorized_client`), and a code
+  exchange or refresh after the identity was retired is refused
   (`invalid_grant`). Retiring an identity also revokes its grants, and the
   bearer check refuses a retired identity's tokens.
+- **Client authentication failures look alike.** An unknown client id, a
+  wrong secret and a secret sent by a public client all get `401
+  invalid_client` with the same description.
 - **Client ID Metadata Documents** (`oauth_cimd_enabled`): the client id must
   be a canonical `https` URL with a DNS host and a path, no port, query,
   fragment, credentials or dot segments. Every resolved address must be

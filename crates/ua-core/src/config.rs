@@ -928,6 +928,15 @@ impl Config {
         self.human_identities.iter().any(|h| h == label)
     }
 
+    /// The profile configuration gives `label` explicitly: a `profiles` entry
+    /// naming a known, assignable profile (an `oauth_identities` label gets
+    /// `oauth_profile` that way when the config is loaded). `None` where a
+    /// caller would otherwise fall back to the broad `developer` default, so
+    /// OAuth credentials, whose identity is meant to be narrowed, require it.
+    pub fn explicit_profile(&self, label: &str) -> Option<crate::Profile> {
+        self.profiles.get(label).and_then(|p| p.parse::<crate::Profile>().ok()).filter(|p| p.assignable())
+    }
+
     /// The identities allowed to run lifecycle operator actions:
     /// `lifecycle_operators` when it is set, else `human_identities`.
     pub fn lifecycle_operators(&self) -> &[String] {
