@@ -195,10 +195,12 @@ passkey on the page you land on.
 unless `ui_cookie_secure` is off. It has no `Max-Age`; the server-side row
 bounds its life. Removing a label from `human_identities` ends its sessions at
 once. The hub keeps the key in memory and re-reads `ui_keys` at most once a
-minute, so an authenticated request does not query it. There is no rotation
-command: deleting the `ui_keys` row makes the hub create a new key, which
-signs every browser out within a minute (at once after a restart). Code that
-replaces the key in-process must call `CookieKeyCache::invalidate`.
+minute, so reading a cookie does not query it. A sign-in always encrypts its
+new cookie with the key the table holds at that moment, and refreshes the
+cached copy. There is no rotation command: deleting the `ui_keys` row makes
+the hub create a new key, which signs every browser out within a minute (at
+once after a restart). Nothing in the hub deletes or replaces the row; code
+that ever does so in-process must call `CookieKeyCache::invalidate`.
 
 The cookie is `SameSite=Lax`, not `Strict`, on purpose. An MCP client starts
 OAuth by sending the browser from another site (the client's page or a

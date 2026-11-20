@@ -31,15 +31,36 @@ that section rather than failing the page. Approve, deny and revoke run
 self-approval, so an agent token cannot clear its own gate through the UI.
 
 A page is composed from several reads (the Work board makes six
-`task_list` calls). Those reads run inside `page_reads`
-(`ua_tools::registry`): every check applies as above, but a read-only tool
-that succeeds leaves no `tool_calls` row, so viewing a page writes nothing
-to the database. Refusals still reach the ledger, a failed read is still
-recorded, a policy file's rate-limit reservation is still taken, and any
-tool that is not read-only (a write, or a read with a side effect such as
-`session_list`, which reaps stale sessions) records as usual. `GET
-/api/board` composes its answer the same way. MCP and `/api/tools/{name}`
-calls are never inside this scope: each records one row.
+`task_list` calls). For a **verified human's browser session** (the session
+cookie) those reads run inside `page_reads` (`ua_tools::registry`): every
+check applies as above, but a *skip-eligible* call that succeeds leaves no
+`tool_calls` row, so viewing a page writes nothing to the database. A call
+is skip-eligible when the tool is read-only, no approval gate applies, it
+has no side effect for these arguments, and no policy file is loaded.
+
+Everything else records as usual:
+- refusals reach the ledger;
+- writes and gated calls record;
+- reads with a side effect record: `session_list` reaps stale sessions,
+  `memory_search` and `memory_get` (unless `count_access=false`) bump access
+  counters, and `message_list` with a `session_id` is that session's
+  heartbeat;
+- with a policy file loaded, every call reserves its `tool_calls` row up
+  front (rate limits and cooldowns must count it), so every page read is
+  recorded.
+
+A skip-eligible read that fails is recorded with `page = 1`. Error rates and
+call statistics (`metrics_snapshot`, `perf_summary`, `check_anomalies`, the
+call counts, `evidence_report`) leave those rows out, because their
+successful siblings left none.
+
+Any other caller is recorded. An agent token on a `/ui` page records every
+call. `GET /api/board` for a caller other than a human's browser session
+writes **one** summary row per view (tool `api_board`, outcome `ok` or the
+first inner failure's code) instead of its six to eight inner reads, so
+agent activity, performance and evidence reports still see the view. MCP
+and `/api/tools/{name}` calls are never inside a page scope: each records
+one row.
 
 The live feeds (`/ui/activity/stream`, and `/api/events/stream` for JSON
 clients) open with one `event_log_query` call as the caller, so a profile or
@@ -103,7 +124,7 @@ routes with the same request and response shapes:
 | `POST /api/approvals/request` | the approval gate, request only: the same grant, profile, policy and prod-action checks as a call, typed arguments, and the payload the tool's own gate binds (a secret is never stored); `409` for a tool nothing gates and for one that binds its approval when called (see [sdk.md](sdk.md)) |
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
-| `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` (page reads: no `tool_calls` rows) |
+| `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` (page reads: no rows for a browser session, one `api_board` row otherwise) |
 | `GET /api/nodes` | `node_list` |
 | `POST /api/node/register`, `POST /api/node/heartbeat` | `node_register`, `node_heartbeat` (agent token only) |
 | `GET /api/runs`, `GET /api/runs/{run_id}` | `run_list`, `run_get` |

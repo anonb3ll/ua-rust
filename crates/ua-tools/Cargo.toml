@@ -28,7 +28,7 @@ rand.workspace = true
 jiff.workspace = true
 tokio.workspace = true
 # CancellationToken: `ua serve` stops the background loops with one token.
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 globset = "0.4"
 ignore = "0.4"

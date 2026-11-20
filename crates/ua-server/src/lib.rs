@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use ua_tools::{Hub, Registry};
 
 /// Shared state for HTTP handlers.
@@ -34,6 +35,9 @@ pub struct AppState {
     /// streams) end on it so a graceful shutdown does not wait on them.
     /// [`router`] sets it to the server's token.
     pub shutdown: CancellationToken,
+    /// MCP tool calls in flight, each run as its own task so a shutdown can
+    /// wait for it even when the MCP session it came from is torn down.
+    pub calls: TaskTracker,
 }
 
 impl AppState {
@@ -43,6 +47,7 @@ impl AppState {
             registry,
             cookie_key: Arc::new(login::CookieKeyCache::new()),
             shutdown: CancellationToken::new(),
+            calls: TaskTracker::new(),
         }
     }
 }
