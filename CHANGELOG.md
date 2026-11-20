@@ -56,6 +56,15 @@ from its commit history.
 - Harness config bundles served at `/api/node/config`, and a skills registry.
 - A security contact in `SECURITY.md`, and `NOTICE`.
 - A Cloud Build runner that builds the pushed head.
+- Slack ingress, off by default: `POST /api/slack/commands` and
+  `POST /api/slack/events`, mounted only with `slack_enabled = true` and
+  `UA_SLACK_SIGNING_SECRET`. Each Slack (`team_id`, `user_id`) pair in
+  `[[slack_identities]]` runs the nine coordination commands as its hub
+  identity through the governed call path; `/approve` follows
+  `approval_resolve`'s rules. Slash-command results go to `response_url` on
+  `hooks.slack.com` only. Repeated event ids and trigger ids are dropped
+  (`slack_seen_deliveries`). Interactions and bot-token posting are not
+  included.
 
 ### Changed
 
@@ -107,6 +116,11 @@ from its commit history.
 - Agent tokens are stored as SHA-256 digests.
 - The GitHub webhook checks HMAC-SHA256 and refuses a delivery id it has
   already seen.
+- The Slack routes verify the signature over the raw body before any parsing
+  or database transaction (401 otherwise), refuse a replayed signature and an
+  unmapped Slack user, never use `user_name` for identity, and refuse a
+  `slack_identities` table with a duplicate pair or an unknown identity at
+  load.
 - OAuth `client_credentials` refuses a scope other than `mcp`, a retired
   identity, and an identity with no configured profile (it no longer falls
   back to `developer`). An authorization code exchanged after its identity

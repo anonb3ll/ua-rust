@@ -1,10 +1,12 @@
-//! Slack ingress primitives: v0 request signatures and coordination commands.
+//! Slack ingress: v0 request signatures, delivery dedupe, the identity
+//! admission step, and the coordination commands.
 //!
-//! This module does not serve HTTP. A later adapter can call
-//! [`verify_slack_signature`] on the raw body, then [`remember_signed_request`]
-//! inside its write transaction, then [`parse_slack_command`]; nothing here
-//! binds a route or dispatches a command into hub state. `docs/slack.md` lists
-//! what that route must do before it is enabled.
+//! This module does not serve HTTP; `ua-server`'s `slack_api` does, and calls
+//! these in order: [`verify_slack_signature`] on the raw body (no database),
+//! then [`admit`] in one write transaction ([`remember_signed_request`], the
+//! identity allowlist, [`remember_delivery`]), then, after acknowledging
+//! Slack, [`command_call`] through the governed `Registry::call` as the mapped
+//! identity, and [`record_executed`]. `docs/slack.md` describes the route.
 //!
 //! The signature is HMAC-SHA256 over `v0:{timestamp}:{body}`, compared in
 //! constant time. Timestamps more than five minutes from the hub clock are
@@ -25,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use ua_core::{UaError, UaResult};
+use ua_core::{Config, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use crate::registry::{Registry, ToolCtx, tool};
@@ -41,11 +43,33 @@ CREATE INDEX IF NOT EXISTS slack_seen_signatures_seen_at ON slack_seen_signature
 ",
 };
 
+/// Slack event ids and trigger ids already handled, so a retried delivery
+/// (Slack re-sends an Events API callback it thinks timed out, with a new
+/// timestamp and so a new signature) runs once.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "slack.v2",
+    sql: "
+CREATE TABLE IF NOT EXISTS slack_seen_deliveries (
+    kind TEXT NOT NULL CHECK (kind IN ('event', 'trigger')),
+    delivery_id TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    PRIMARY KEY (kind, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS slack_seen_deliveries_seen_at ON slack_seen_deliveries (seen_at);
+",
+};
+
 /// Slack's replay window: five minutes either side of the hub clock.
 pub const SIGNATURE_MAX_AGE_S: i64 = 300;
 /// Seen signatures older than this are pruned. Twice the window: a request
 /// first seen earlier than that has a timestamp the window already refuses.
 pub const SEEN_RETENTION_S: i64 = 2 * SIGNATURE_MAX_AGE_S;
+/// Delivery ids are kept this long. Slack retries an Events API callback
+/// for about an hour at most and a trigger id is good for seconds; a day
+/// covers both with room to spare.
+pub const DELIVERY_RETENTION_S: i64 = 24 * 3600;
+/// Longest event id or trigger id accepted.
+pub const MAX_DELIVERY_ID_CHARS: usize = 100;
 /// Refuse bodies larger than this before doing any other work.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Longest command text [`parse_slack_command`] reads, in characters. Slack
@@ -155,6 +179,207 @@ pub fn remember_signed_request(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8
             json!({ "request_sha": sha, "timestamp": timestamp }),
         )
         .by("system"),
+    )?;
+    Ok(())
+}
+
+/// Which Slack id a delivery is deduplicated on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryKind {
+    /// An Events API callback, by its envelope `event_id`.
+    Event,
+    /// A slash command (or, later, an interaction), by its `trigger_id`.
+    Trigger,
+}
+
+impl DeliveryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryKind::Event => "event",
+            DeliveryKind::Trigger => "trigger",
+        }
+    }
+
+    /// The request kind recorded in ledger events.
+    pub fn request(self) -> &'static str {
+        match self {
+            DeliveryKind::Event => "event",
+            DeliveryKind::Trigger => "command",
+        }
+    }
+}
+
+/// A Slack event id or trigger id this hub will store: 1 to
+/// [`MAX_DELIVERY_ID_CHARS`] of ASCII letters, digits, `.`, `_` and `-`.
+pub fn delivery_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_DELIVERY_ID_CHARS
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Record a delivery id at `now` (Unix seconds): `true` the first time,
+/// `false` for a repeat. Rows older than [`DELIVERY_RETENTION_S`] are pruned
+/// first.
+pub fn remember_delivery(tx: &mut WriteTx<'_>, kind: DeliveryKind, id: &str, now: i64) -> UaResult<bool> {
+    if !delivery_id_ok(id) {
+        return Err(UaError::invalid("malformed Slack delivery id"));
+    }
+    tx.execute(
+        "DELETE FROM slack_seen_deliveries WHERE seen_at < ?1",
+        params![now.saturating_sub(DELIVERY_RETENTION_S)],
+    )?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO slack_seen_deliveries (kind, delivery_id, seen_at) VALUES (?1, ?2, ?3)",
+        params![kind.as_str(), id, now],
+    )?;
+    Ok(inserted == 1)
+}
+
+/// One verified Slack request, as the route read it. Nothing here comes from
+/// a display field: identity is the (`team_id`, `user_id`) pair only.
+#[derive(Debug, Clone)]
+pub struct Delivery {
+    pub kind: DeliveryKind,
+    /// `event_id` or `trigger_id`; checked with [`delivery_id_ok`].
+    pub delivery_id: String,
+    pub team_id: String,
+    pub user_id: String,
+    /// The parsed command name, when the text parsed.
+    pub command: Option<String>,
+    /// A reason class the route already refused the request for after
+    /// verifying it (`malformed_payload`, `invalid_command`). Recorded once
+    /// the identity is known.
+    pub refusal: Option<&'static str>,
+}
+
+/// What [`admit`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Run it as `identity`.
+    Accepted { identity: String, human: bool },
+    /// Refused, with a reason class (`unmapped_identity`, `identity_retired`,
+    /// or the route's own refusal). Nothing runs.
+    Refused { reason: &'static str, identity: Option<String> },
+    /// The event id or trigger id was handled before (a Slack retry).
+    Deduped { identity: String },
+}
+
+/// Admit one verified request in a single write transaction: record its
+/// signature ([`remember_signed_request`]; a replay is an `Err` with
+/// `replayed` and rolls everything back), map (`team_id`, `user_id`) to a hub
+/// identity, then dedupe on the delivery id. Every outcome but a replay
+/// appends one ledger event: `agent.slack.request.refused` (attributed to
+/// `system` while the identity is unknown), `.deduped` or `.accepted`
+/// (attributed to the mapped identity). Payloads carry ids and reason
+/// classes, never the body or text.
+pub fn admit(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    timestamp: &str,
+    body: &[u8],
+    now: i64,
+    d: &Delivery,
+) -> UaResult<Admission> {
+    remember_signed_request(tx, timestamp, body, now)?;
+    let kind = d.kind.request();
+    let refuse =
+        |tx: &mut WriteTx<'_>, reason: &'static str, identity: Option<&str>| -> UaResult<Admission> {
+            let mut payload = json!({ "kind": kind, "reason": reason });
+            if identity.is_none() {
+                // Slack ids are not secrets, and the operator needs them to add
+                // a mapping. Never the user name or any other display field.
+                payload["team_id"] = json!(d.team_id);
+                payload["user_id"] = json!(d.user_id);
+            }
+            if delivery_id_ok(&d.delivery_id) {
+                payload["delivery_id"] = json!(d.delivery_id);
+            }
+            ledger::append(
+                tx,
+                EventInput::new("agent.slack.request.refused", payload)
+                    .by(identity.unwrap_or("system").to_string()),
+            )?;
+            Ok(Admission::Refused { reason, identity: identity.map(str::to_string) })
+        };
+    let Some(identity) = cfg.slack_identity(&d.team_id, &d.user_id).map(str::to_string) else {
+        return refuse(tx, "unmapped_identity", None);
+    };
+    let human = cfg.is_human(&identity);
+    if !human && crate::families::governance::is_retired(tx, &identity)? {
+        return refuse(tx, "identity_retired", None);
+    }
+    if let Some(reason) = d.refusal {
+        return refuse(tx, reason, Some(&identity));
+    }
+    if !remember_delivery(tx, d.kind, &d.delivery_id, now)? {
+        ledger::append(
+            tx,
+            EventInput::new(
+                "agent.slack.request.deduped",
+                json!({ "kind": kind, "delivery_id": d.delivery_id }),
+            )
+            .by(identity.clone()),
+        )?;
+        return Ok(Admission::Deduped { identity });
+    }
+    ledger::append(
+        tx,
+        EventInput::new(
+            "agent.slack.request.accepted",
+            json!({ "kind": kind, "delivery_id": d.delivery_id, "command": d.command }),
+        )
+        .by(identity.clone()),
+    )?;
+    Ok(Admission::Accepted { identity, human })
+}
+
+/// Ledger the outcome of a command that ran after the acknowledgement, as
+/// the identity it ran as: `agent.slack.request.executed` with the tool, `ok`
+/// and, on failure, the error code (never the error text or the arguments).
+pub fn record_executed(
+    tx: &mut WriteTx<'_>,
+    identity: &str,
+    d_kind: DeliveryKind,
+    delivery_id: &str,
+    command: &str,
+    tool: Option<&str>,
+    outcome: &UaResult<Value>,
+) -> UaResult<()> {
+    let mut payload = json!({
+        "kind": d_kind.request(),
+        "delivery_id": delivery_id,
+        "command": command,
+        "tool": tool,
+        "ok": outcome.is_ok(),
+    });
+    if let Err(e) = outcome {
+        payload["error"] = json!(e.code());
+        if let Some(code) = e.reason_code() {
+            payload["reason_code"] = json!(code);
+        }
+        if let UaError::ApprovalRequired { approval_id, .. } = e {
+            payload["approval_id"] = json!(approval_id);
+        }
+    }
+    ledger::append(tx, EventInput::new("agent.slack.request.executed", payload).by(identity.to_string()))?;
+    Ok(())
+}
+
+/// Ledger a reply that could not be delivered to Slack's `response_url`, by
+/// reason class only (never the URL: it is a short-lived credential).
+pub fn record_reply_failed(
+    tx: &mut WriteTx<'_>,
+    identity: &str,
+    delivery_id: &str,
+    reason: &'static str,
+) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new(
+            "agent.slack.reply.failed",
+            json!({ "kind": "command", "delivery_id": delivery_id, "reason": reason }),
+        )
+        .by(identity.to_string()),
     )?;
     Ok(())
 }
@@ -287,6 +512,218 @@ pub fn parse_slack_command(text: &str) -> UaResult<Value> {
         return Err(UaError::invalid("/approve needs a numeric approval id"));
     }
     Ok(json!({ "command": command, "args": args }))
+}
+
+// --- dispatch -----------------------------------------------------------------
+
+/// One governed registry call a parsed command becomes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackCall {
+    pub tool: &'static str,
+    pub args: Value,
+}
+
+/// Longest task or plan title taken from Slack text, in characters.
+const MAX_TITLE_CHARS: usize = 160;
+
+fn cut(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// A one-line title: newlines folded to spaces, cut to [`MAX_TITLE_CHARS`].
+fn title(text: &str) -> String {
+    cut(&text.split_whitespace().collect::<Vec<_>>().join(" "), MAX_TITLE_CHARS)
+}
+
+/// A Delegation Spec for `/assign`: the Slack text is the objective.
+pub fn assign_spec(text: &str, delivery_id: &str) -> String {
+    format!(
+        "### Objective\n{}\n\n### Scope\nThe work described in the objective, requested from Slack \
+         (delivery {delivery_id}).\n\n### Definition of Done\n- The receiving agent reports the result on the \
+         delegated task, and the requester can read it with the task id.\n- A request that cannot be done as \
+         written is returned with the reason instead of being guessed at.\n- Gates: the test suite, lint, format \
+         check and CI pass\n\n### TDD Constraints\nAdd or update focused tests for any behaviour that \
+         changes.\n\n### Boundaries\nDo not approve work, change credentials, or act on anything the objective \
+         does not name.\n",
+        cut(text.trim(), MAX_COMMAND_CHARS)
+    )
+}
+
+/// Map a parsed command ([`parse_slack_command`] output) to the registry call
+/// it runs. `None` for `contact`, which runs no tool. Retry tokens derive
+/// from the delivery id, so a retry that slipped past the dedupe returns the
+/// first result.
+///
+/// | Command | Tool |
+/// |---|---|
+/// | `task <text>` | `task_add` |
+/// | `assign <agent> <text>` | `delegate` |
+/// | `progress\|blocker\|review task-N <note>` | `task_update` (`doing`, `blocked`, `waiting_review`) |
+/// | `plan <text>` | `plan_create` |
+/// | `approve <id>` | `approval_resolve` (`approve`) |
+/// | `status task-N` | `platform_object_get` (`task`) |
+pub fn command_call(parsed: &Value, delivery_id: &str) -> UaResult<Option<SlackCall>> {
+    let command = parsed["command"].as_str().unwrap_or_default();
+    let args: Vec<&str> =
+        parsed["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let key = format!("slack:{delivery_id}");
+    let task_number = |s: &str| -> UaResult<i64> {
+        s.strip_prefix("task-")
+            .and_then(|n| n.parse::<i64>().ok())
+            .ok_or_else(|| UaError::invalid("a task id such as task-42 is required"))
+    };
+    let call = match command {
+        "contact" => return Ok(None),
+        "task" => SlackCall {
+            tool: "task_add",
+            args: json!({
+                "title": title(&args.join(" ")),
+                "notes": cut(&args.join(" "), MAX_COMMAND_CHARS),
+                "idempotency_key": key,
+            }),
+        },
+        "assign" => SlackCall {
+            tool: "delegate",
+            args: json!({
+                "to_agent": args.first().copied().unwrap_or_default(),
+                "task_spec": assign_spec(&args.get(1..).unwrap_or_default().join(" "), delivery_id),
+                "callback": "none",
+                "idempotency_key": key,
+            }),
+        },
+        "progress" | "blocker" | "review" => {
+            let status = match command {
+                "progress" => "doing",
+                "blocker" => "blocked",
+                _ => "waiting_review",
+            };
+            SlackCall {
+                tool: "task_update",
+                args: json!({
+                    "id": task_number(args.first().copied().unwrap_or_default())?,
+                    "status": status,
+                    "append_note": cut(args.get(1).copied().unwrap_or_default(), MAX_COMMAND_CHARS),
+                    "idempotency_key": key,
+                }),
+            }
+        }
+        "plan" => SlackCall {
+            tool: "plan_create",
+            args: json!({
+                "goal": cut(&args.join(" "), MAX_COMMAND_CHARS),
+                "steps": ["Confirm the plan and its next owner"],
+            }),
+        },
+        "approve" => {
+            let id = args
+                .first()
+                .and_then(|a| a.parse::<i64>().ok())
+                .ok_or_else(|| UaError::invalid("/approve needs a numeric approval id"))?;
+            SlackCall {
+                tool: "approval_resolve",
+                args: json!({ "id": id, "decision": "approve", "reason": "approved from Slack" }),
+            }
+        }
+        "status" => {
+            let id = task_number(args.first().copied().unwrap_or_default())?;
+            SlackCall { tool: "platform_object_get", args: json!({ "kind": "task", "id": id.to_string() }) }
+        }
+        other => return Err(UaError::invalid(format!("unsupported Slack command {other:?}"))),
+    };
+    Ok(Some(call))
+}
+
+/// Escape text for Slack: `&`, `<` and `>` become entities, so nothing a
+/// hub value contains (a task title written as `&lt;!channel&gt;`, which the
+/// parser unescapes) can turn into a mention or a link when posted back.
+pub fn slack_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// The short reply for a command's outcome: a fixed sentence per command
+/// with ids and, for `status`, the task's title and status only. Errors give
+/// their code and the client-safe message ([`UaError::to_json`]), cut short.
+/// Everything is escaped with [`slack_escape`].
+pub fn reply_text(command: &str, identity: &str, outcome: &UaResult<Value>) -> String {
+    let v = match outcome {
+        Err(UaError::ApprovalRequired { approval_id, .. }) => {
+            return format!("Waiting for a human approval (approval {approval_id}).");
+        }
+        Err(e) => {
+            let body = e.to_json();
+            let msg = body["message"].as_str().unwrap_or_default();
+            return format!("Refused ({}): {}", e.code(), slack_escape(&cut(msg, 300)));
+        }
+        Ok(v) => v,
+    };
+    let id = |v: &Value| v["id"].as_i64().map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    match command {
+        "contact" => format!("This Slack user acts as hub identity {}.", slack_escape(identity)),
+        "task" => format!("Created task-{}.", id(v)),
+        "progress" | "blocker" | "review" => format!("Updated task-{}.", id(v)),
+        "assign" => "Delegated.".to_string(),
+        "plan" => format!("Created plan {}.", slack_escape(v["plan_id"].as_str().unwrap_or("?"))),
+        "approve" => format!("Approved approval {}.", id(&v["approval"])),
+        "status" => {
+            let t = &v["task"];
+            format!(
+                "task-{} [{}] {}",
+                id(t),
+                slack_escape(t["status"].as_str().unwrap_or("?")),
+                slack_escape(&cut(t["title"].as_str().unwrap_or_default(), MAX_TITLE_CHARS))
+            )
+        }
+        _ => "Done.".to_string(),
+    }
+}
+
+// --- response_url --------------------------------------------------------------
+
+/// The only host a reply is posted to.
+pub const RESPONSE_URL_HOST: &str = "hooks.slack.com";
+/// How long one reply may take, connect included.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Slack's `response_url`, if it is safe to post to: `https`, exactly the
+/// host [`RESPONSE_URL_HOST`] on the default port, no user info, no fragment,
+/// at most 2048 bytes. Anything else is `None`.
+pub fn response_url(raw: &str) -> Option<url::Url> {
+    if raw.is_empty() || raw.len() > 2048 {
+        return None;
+    }
+    let u = url::Url::parse(raw).ok()?;
+    let host_ok = matches!(u.host(), Some(url::Host::Domain(h)) if h == RESPONSE_URL_HOST);
+    (u.scheme() == "https"
+        && host_ok
+        && u.port().is_none()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.fragment().is_none())
+    .then_some(u)
+}
+
+/// Post `text` as an ephemeral reply to a checked [`response_url`]. The
+/// client is the web tools' guarded client: no redirects, no proxy, every
+/// resolved address must be public (loopback refused here whatever
+/// `fetch_allow_loopback` says), bounded by [`REPLY_TIMEOUT`]. The response
+/// body is never read. Errors are reason classes: `timeout`, `transport`,
+/// `status`.
+pub async fn post_reply(cfg: &Config, url: &url::Url, text: &str) -> Result<(), &'static str> {
+    if response_url(url.as_str()).is_none() {
+        return Err("response_url_refused");
+    }
+    let mut guarded = cfg.clone();
+    guarded.fetch_allow_loopback = false;
+    let client = crate::families::web::http_client(&guarded).map_err(|_| "transport")?;
+    let body = json!({ "response_type": "ephemeral", "replace_original": false, "text": text });
+    let resp = client
+        .post(url.clone())
+        .timeout(REPLY_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport" })?;
+    if resp.status().is_success() { Ok(()) } else { Err("status") }
 }
 
 // --- tools --------------------------------------------------------------------
