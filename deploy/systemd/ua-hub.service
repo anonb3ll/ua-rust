@@ -1,0 +1,50 @@
+# Systemd unit template for ua-rust (copy and adapt before installing on a host).
+#
+# Recommended setup:
+#   sudo useradd --system --user-group --home-dir /var/lib/ua-rust --shell /usr/sbin/nologin ua-hub
+#   sudo install -d -m 0700 -o ua-hub -g ua-hub /var/lib/ua-rust
+#   sudo install -d -m 0750 -o root -g ua-hub /etc/ua-rust
+#   sudo -u ua-hub UA_HOME=/var/lib/ua-rust /usr/local/bin/ua init --with-policy --agent builder-1
+
+[Unit]
+Description=ua-rust agent operations hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ua-hub
+Group=ua-hub
+WorkingDirectory=/var/lib/ua-rust
+Environment=UA_HOME=/var/lib/ua-rust
+EnvironmentFile=-/etc/ua-rust/env
+ExecStart=/usr/local/bin/ua serve
+Restart=on-failure
+RestartSec=5s
+# Keep process-group children alive for ua serve's 10s graceful drain instead of
+# systemd's default KillMode=control-group killing them at once on stop.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Security hardening (see SECURITY.md: keep agents in a separate OS user).
+# RestrictNamespaces is intentionally omitted so bubblewrap harness sandboxes work.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/ua-rust
+
+[Install]
+WantedBy=multi-user.target

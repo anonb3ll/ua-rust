@@ -17,6 +17,23 @@ const TRACKING: &str = "CREATE TABLE IF NOT EXISTS schema_parts (
     applied_at TEXT NOT NULL
 )";
 
+/// Import progress, per source and table (optional; applied by `ua import`).
+pub const IMPORT_SCHEMA: SchemaPart = SchemaPart {
+    name: "import.v1",
+    sql: "
+CREATE TABLE IF NOT EXISTS import_runs (
+    source_hash TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    copied INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    last_key INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source_hash, table_name)
+);
+",
+};
+
 /// Apply every part not yet recorded. Runs in one transaction.
 pub fn apply(conn: &mut Connection, parts: &[SchemaPart]) -> anyhow::Result<Vec<&'static str>> {
     conn.execute_batch(TRACKING)?;

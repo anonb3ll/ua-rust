@@ -138,6 +138,39 @@ async fn doctor_flags_a_tampered_ledger() {
 
     let anomalies = call(&reg, &hub, &who, "check_anomalies", json!({})).await;
     assert!(anomalies["anomalies"].as_array().unwrap().iter().any(|a| a["rule"] == "ledger_chain"));
+
+    // Unexpected table with no corresponding schema_parts entry degrades `schema`.
+    exec(&hub, "CREATE TABLE rogue_table (x INTEGER);");
+    let report = call(&reg, &hub, &who, "system_doctor", json!({})).await;
+    let schema_row =
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(schema_row["status"], "DEGRADED", "{schema_row}");
+
+    // Applying optional `import.v1` must stay LIVE (matching `ua doctor`) AND must NOT mask
+    // unrelated rogue tables added afterwards.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_home(dir.path());
+    std::fs::create_dir_all(cfg.workspace_root()).unwrap();
+    drop(Hub::open(cfg.clone()).unwrap());
+    let mut all_with_import = ua_tools::schema_parts();
+    all_with_import.extend(ua_tools::optional_schema_parts());
+    drop(ua_store::Db::open(&cfg.db_path(), &all_with_import).unwrap());
+    let import_hub = Hub::open(cfg).unwrap();
+
+    let clean_report = call(&reg, &import_hub, &who, "system_doctor", json!({ "refresh": true })).await;
+    let clean_schema =
+        clean_report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(clean_schema["status"], "LIVE", "{clean_schema}");
+    assert!(
+        !clean_schema["detail"].as_str().unwrap_or("").contains("another build"),
+        "import.v1 should be recognized as optional, not extra: {clean_schema}"
+    );
+
+    exec(&import_hub, "CREATE TABLE rogue_after_import (x INTEGER);");
+    let dirty_report = call(&reg, &import_hub, &who, "system_doctor", json!({ "refresh": true })).await;
+    let dirty_schema =
+        dirty_report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(dirty_schema["status"], "DEGRADED", "{dirty_schema}");
 }
 
 fn insert_calls(hub: &Hub, tool: &str, caller: &str, durations: &[i64], errors: usize, started_at: &str) {

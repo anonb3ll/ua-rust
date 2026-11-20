@@ -306,6 +306,20 @@ pub struct WriteTx<'c> {
     pub(crate) pending: Vec<Event>,
 }
 
+/// Run `f` inside a `BEGIN IMMEDIATE` transaction on an already-opened writer
+/// connection so `ua-store` recovery paths can append hash-chained ledger
+/// events atomically without bypassing `ledger::append`.
+pub(crate) fn write_on_connection<T>(
+    conn: &mut Connection,
+    f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
+) -> UaResult<T> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut wtx = WriteTx { tx, pending: Vec::new() };
+    let out = f(&mut wtx)?;
+    wtx.tx.commit()?;
+    Ok(out)
+}
+
 impl<'c> Deref for WriteTx<'c> {
     type Target = Transaction<'c>;
     fn deref(&self) -> &Self::Target {
