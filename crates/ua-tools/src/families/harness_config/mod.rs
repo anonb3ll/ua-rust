@@ -12,11 +12,14 @@
 //!   `get` the bundle for the caller's node with every surface rendered and
 //!   the apply grants it holds; `report` drift, which parks one
 //!   `harness_config_apply` approval per surface bound to {node, surface,
-//!   path, bundle_version, desired_hash}; `applied` after the node wrote a
-//!   surface, which consumes that approved pass.
+//!   path, bundle_version, desired_hash} plus the hub's own summary of the
+//!   change from the content last applied there; `applied` after the node
+//!   wrote a surface, which consumes that approved pass.
 //!
 //! The node never writes a surface without a consumed pass (proposal mode).
-//! A drift report must name the active version (else `409`), carries at most
+//! A drift report must name the active version (else `400` when missing,
+//! `409` when another), must use the hub's rendered path for each surface
+//! (the node never chooses where a file goes), carries at most
 //! [`render::MAX_PROPOSALS_PER_REPORT`] proposals, and each `desired_hash`
 //! must equal the hub's own render of that surface (else `409`), so a node
 //! cannot have arbitrary content approved.
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS harness_config_proposals (
     desired_hash TEXT NOT NULL,
     observed_hash TEXT,
     diff_text TEXT,
+    desired_text TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     approval_id INTEGER,
     created_at TEXT NOT NULL,
@@ -169,18 +173,91 @@ fn effective(c: &Connection, hub: &Hub, agent: &str, bundle: &Bundle) -> UaResul
         }
         notes.push(note);
     }
+    // A bundle stored by an older hub may name an absolute or escaping path;
+    // nothing is served or approved for it.
+    if let Some((name, s)) = out.surfaces().into_iter().find(|(_, s)| !render::safe_path(&s.path)) {
+        return Err(UaError::conflict_code(
+            "unsafe_surface_path",
+            format!(
+                "the active bundle's surface {name:?} has an unsafe path {:?}; publish a new version",
+                s.path
+            ),
+        ));
+    }
     Ok((out, notes))
 }
 
-/// What a `harness_config_apply` approval binds.
-fn canonical(node: &str, surface: &str, path: &str, version: &str, desired_hash: &str) -> Value {
-    json!({
+/// The path the hub renders `surface` to: its declared path, else the
+/// default surface's.
+fn surface_path(bundle: &Bundle, surface: &str) -> Option<String> {
+    bundle.surfaces().get(surface).map(|s| s.path.clone()).or_else(|| {
+        render::DEFAULT_SURFACES.iter().find(|(n, _, _)| *n == surface).map(|(_, p, _)| p.to_string())
+    })
+}
+
+/// Characters of hub-computed diff an apply approval carries.
+const MAX_SUMMARY_DIFF: usize = 20_000;
+
+/// What changes on the node if `desired` is applied, computed by the hub from
+/// the content it last saw applied to this node's surface (not from anything
+/// the node sent).
+fn change_summary(c: &Connection, node: &str, surface: &str, path: &str, desired: &str) -> UaResult<Value> {
+    let last: Option<(String, String, Option<String>)> = c
+        .query_row(
+            "SELECT bundle_version, desired_hash, desired_text FROM harness_config_proposals \
+             WHERE node = ?1 AND surface = ?2 AND status = 'applied' \
+             ORDER BY resolved_at DESC, rowid DESC LIMIT 1",
+            params![node, surface],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (base, from_version, from_hash, old) = match &last {
+        None => ("none", None, None, String::new()),
+        Some((v, h, Some(text))) => ("last_applied", Some(v), Some(h), text.clone()),
+        Some((v, h, None)) => ("last_applied_text_unknown", Some(v), Some(h), String::new()),
+    };
+    let diff = similar::TextDiff::from_lines(old.as_str(), desired);
+    let (mut added, mut removed) = (0, 0);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    let mut text =
+        diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string();
+    if text.chars().count() > MAX_SUMMARY_DIFF {
+        text = text.chars().take(MAX_SUMMARY_DIFF).collect::<String>() + "\n# ... diff truncated ...\n";
+    }
+    Ok(json!({
+        "base": base,
+        "from_bundle_version": from_version,
+        "from_hash": from_hash,
+        "lines_added": added,
+        "lines_removed": removed,
+        "diff": text,
+    }))
+}
+
+/// What a `harness_config_apply` approval binds: the node, surface, path,
+/// version and hash, and the hub's summary of the change for the approver.
+fn canonical(
+    c: &Connection,
+    node: &str,
+    surface: &str,
+    path: &str,
+    version: &str,
+    desired: &str,
+) -> UaResult<Value> {
+    Ok(json!({
         "node": node,
         "surface": surface,
         "path": path,
         "bundle_version": version,
-        "desired_hash": desired_hash,
-    })
+        "desired_hash": content_hash(desired),
+        "change_summary": change_summary(c, node, surface, path, desired)?,
+    }))
 }
 
 /// Surfaces with an approved, unconsumed apply pass for this node whose
@@ -203,10 +280,8 @@ fn apply_grants(
         .collect::<Result<_, _>>()?;
     let mut grants = Vec::new();
     for (id, surface, path, hash, approval_id) in rows {
-        if current.get(&surface).is_none_or(|r| r.hash != hash) {
-            continue;
-        }
-        let payload = canonical(node, &surface, &path, version, &hash);
+        let Some(r) = current.get(&surface).filter(|r| r.hash == hash && r.path == path) else { continue };
+        let payload = canonical(c, node, &surface, &path, version, &r.content)?;
         if let Some(RequestState::Approved { approval_id: pass }) =
             approvals::peek(c, hub.cfg(), agent, APPLY_TOOL, &payload)?
         {
@@ -315,9 +390,10 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
         return Err(UaError::not_found("no active harness config bundle"));
     };
     let version = active.version.clone();
-    if let Some(v) = a.bundle_version.as_deref().filter(|v| !v.is_empty())
-        && v != version
-    {
+    let Some(v) = a.bundle_version.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Err(UaError::invalid("bundle_version is required: the version the node rendered"));
+    };
+    if v != version {
         return Err(UaError::conflict_code(
             "bundle_version_mismatch",
             format!("report targets {v:?} but active bundle is {version:?}"),
@@ -345,6 +421,15 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
         let Some(desired_hash) = field(raw, "desired_hash", 64)?.filter(|h| sha256_hex(h)) else {
             return Err(UaError::invalid("proposal.desired_hash must be sha256 hex"));
         };
+        // The file is written where the hub renders it, never a path the
+        // node chose.
+        let hub_path = surface_path(&bundle, &surface)
+            .ok_or_else(|| UaError::invalid(format!("unknown surface {surface:?}")))?;
+        if path != hub_path {
+            return Err(UaError::invalid(format!(
+                "proposal.path for {surface:?} must be the hub's rendered path {hub_path:?}"
+            )));
+        }
         // Recompute from the hub's own bundle so a node cannot invent content.
         let desired = render_surface(&bundle, &surface)?;
         if content_hash(&desired) != desired_hash {
@@ -358,7 +443,7 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
             Some(d) if !d.is_empty() => clip_diff(d.to_string()),
             _ => diff_from_empty(&path, &desired),
         };
-        let payload = canonical(&node, &surface, &path, &version, &desired_hash);
+        let payload = canonical(tx, &node, &surface, &path, &version, &desired)?;
         let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &payload)?;
         let existing: Option<String> = tx
             .query_row(
@@ -373,8 +458,8 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
             Some(id) => {
                 tx.execute(
                     "UPDATE harness_config_proposals SET observed_hash = ?2, diff_text = ?3, approval_id = ?4, \
-                     updated_at = ?5 WHERE id = ?1",
-                    params![id, observed_hash, diff, state.approval_id(), now],
+                     updated_at = ?5, desired_text = ?6 WHERE id = ?1",
+                    params![id, observed_hash, diff, state.approval_id(), now, desired],
                 )?;
                 id
             }
@@ -382,9 +467,21 @@ fn report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, a: &NodeConfigArgs) 
                 let id = new_proposal_id();
                 tx.execute(
                     "INSERT INTO harness_config_proposals (id, node, surface, path, bundle_version, desired_hash, \
-                     observed_hash, diff_text, status, approval_id, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?10)",
-                    params![id, node, surface, path, version, desired_hash, observed_hash, diff, state.approval_id(), now],
+                     observed_hash, diff_text, desired_text, status, approval_id, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?11, ?11)",
+                    params![
+                        id,
+                        node,
+                        surface,
+                        path,
+                        version,
+                        desired_hash,
+                        observed_hash,
+                        diff,
+                        desired,
+                        state.approval_id(),
+                        now
+                    ],
                 )?;
                 id
             }
@@ -442,7 +539,8 @@ fn applied(
     };
     let version = active.version.clone();
     let (bundle, _) = effective(tx, hub, agent, &active.bundle)?;
-    if content_hash(&render_surface(&bundle, &surface)?) != hash {
+    let desired = render_surface(&bundle, &surface)?;
+    if content_hash(&desired) != hash {
         return Err(UaError::conflict_code(
             "desired_hash_mismatch",
             "desired_hash does not match active bundle",
@@ -459,7 +557,13 @@ fn applied(
     let Some((proposal_id, path)) = proposal else {
         return Err(UaError::not_found("no matching pending/approved proposal"));
     };
-    let payload = canonical(&node, &surface, &path, &version, &hash);
+    if surface_path(&bundle, &surface).as_deref() != Some(path.as_str()) {
+        return Err(UaError::conflict_code(
+            "path_mismatch",
+            "the proposal's path is not the hub's rendered path",
+        ));
+    }
+    let payload = canonical(tx, &node, &surface, &path, &version, &desired)?;
     let approval_id = match approvals::gate(tx, hub.cfg(), caller, APPLY_TOOL, &payload)? {
         GateOutcome::Pass { approval_id } => approval_id,
         GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
@@ -611,10 +715,12 @@ async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
 pub struct StatusArgs {}
 
 async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
-    verified_caller(&ctx.caller, "reading the harness config status")?;
+    let who = verified_caller(&ctx.caller, "reading the harness config status")?;
+    // Operators see every node's proposals; anyone else only their own nodes'.
+    let scope: Option<String> = (!is_operator(&ctx.hub, &ctx.caller, &who)).then_some(who);
     ctx.hub
         .db()
-        .read_async(|c| {
+        .read_async(move |c| {
             let active = active(c)?.map(|a| {
                 json!({
                     "version": a.version,
@@ -623,17 +729,20 @@ async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
                     "bundle": a.bundle.to_value(),
                 })
             });
+            let filter = "(?1 IS NULL OR node IN (SELECT node FROM nodes WHERE agent = ?1))";
             let pending: i64 = c.query_row(
-                "SELECT COUNT(*) FROM harness_config_proposals WHERE status = 'pending'",
-                [],
+                &format!(
+                    "SELECT COUNT(*) FROM harness_config_proposals WHERE status = 'pending' AND {filter}"
+                ),
+                [&scope],
                 |r| r.get(0),
             )?;
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT id, node, surface, path, bundle_version, status, created_at, approval_id \
-                 FROM harness_config_proposals ORDER BY created_at DESC, id DESC LIMIT 25",
-            )?;
+                 FROM harness_config_proposals WHERE {filter} ORDER BY created_at DESC, id DESC LIMIT 25"
+            ))?;
             let recent = stmt
-                .query_map([], |r| {
+                .query_map([&scope], |r| {
                     Ok(json!({
                         "id": r.get::<_, String>(0)?,
                         "node": r.get::<_, String>(1)?,
@@ -648,6 +757,7 @@ async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({
                 "active": active,
+                "scope": if scope.is_some() { "own_nodes" } else { "all" },
                 "pending_proposals": pending,
                 "recent_proposals": recent,
                 "apply_tool": APPLY_TOOL,
@@ -677,7 +787,7 @@ pub fn register(r: &mut Registry) {
         tool(
             "harness_config_status",
             "The active harness config bundle, the count of pending drift proposals and the 25 most recent \
-             proposals. Read-only.",
+             proposals: the caller's own nodes' proposals, or every node's for an operator. Read-only.",
             status,
         )
         .read_only()
@@ -690,7 +800,8 @@ pub fn register(r: &mut Registry) {
              (plus registry skills assigned to the agent) with every surface rendered and hashed, and the apply \
              grants the node holds. action report {bundle_version, proposals}: drift, at most 32 surfaces; each \
              desired_hash must equal the hub's render, and each parks one harness_config_apply approval bound to \
-             {node, surface, path, bundle_version, desired_hash}. action applied {surface, desired_hash}: after the \
+             {node, surface, path, bundle_version, desired_hash} with the hub's diff from the content last applied. \
+             bundle_version is required and each path must be the hub's rendered path. action applied {surface, desired_hash}: after the \
              node wrote a surface, consumes that approved pass.",
             node_config,
         )

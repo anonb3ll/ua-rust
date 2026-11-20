@@ -162,20 +162,26 @@ async fn bad_reports_and_foreign_nodes_are_refused() {
 
     let cases = [
         (json!({ "action": "report", "bundle_version": "v0", "proposals": [p] }), StatusCode::CONFLICT),
+        // The version is required, and the path is the hub's, not the node's.
+        (json!({ "action": "report", "proposals": [p] }), StatusCode::BAD_REQUEST),
+        (
+            json!({ "action": "report", "bundle_version": "v1", "proposals": [{ "surface": "agents", "path": "CLAUDE.md", "desired_hash": hash }] }),
+            StatusCode::BAD_REQUEST,
+        ),
         (
             json!({ "action": "report", "bundle_version": "v1", "proposals": vec![p.clone(); 33] }),
             StatusCode::BAD_REQUEST,
         ),
         (
-            json!({ "action": "report", "proposals": [{ "surface": "agents", "path": "AGENTS.md", "desired_hash": "0".repeat(64) }] }),
+            json!({ "action": "report", "bundle_version": "v1", "proposals": [{ "surface": "agents", "path": "AGENTS.md", "desired_hash": "0".repeat(64) }] }),
             StatusCode::CONFLICT,
         ),
         (
-            json!({ "action": "report", "proposals": [{ "surface": "agents", "path": "../x", "desired_hash": hash }] }),
+            json!({ "action": "report", "bundle_version": "v1", "proposals": [{ "surface": "agents", "path": "../x", "desired_hash": hash }] }),
             StatusCode::BAD_REQUEST,
         ),
         (
-            json!({ "action": "report", "proposals": [{ "surface": "nope", "path": "x", "desired_hash": "0".repeat(64) }] }),
+            json!({ "action": "report", "bundle_version": "v1", "proposals": [{ "surface": "nope", "path": "x", "desired_hash": "0".repeat(64) }] }),
             StatusCode::BAD_REQUEST,
         ),
         (

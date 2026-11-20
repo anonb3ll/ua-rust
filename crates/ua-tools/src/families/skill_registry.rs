@@ -18,7 +18,11 @@
 //! - `drift` {surface_dir, agent_label?, profile?}: a read-only comparison of
 //!   a skills directory with the registry.
 //!
-//! Publish, assign and unassign need a verified identity and append
+//! Publish, assign and unassign are operator actions (a human or a lifecycle
+//! operator): a skill's text lands in the harness of every node it reaches,
+//! so it is a prompt-injection path. A new version (`publish`) and an
+//! assignment (`assign`) each also need a one-time human approval, bound to
+//! the content hash (and, for an assignment, the target and pin). They append
 //! `skill.published`, `skill.assigned` and `skill.unassigned` events in the
 //! same transaction.
 //!
@@ -41,7 +45,12 @@ use ua_store::{EventInput, SchemaPart, ledger};
 use super::agents::verified;
 use super::audit::resolve_target;
 use super::harness_config::render::{content_hash, py_dumps};
+use super::node_queue::is_operator;
+use crate::approvals::{self, GateOutcome};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
+
+/// The approval tool name `publish` and `assign` park under.
+pub const GATE: &str = "skill_registry";
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "skill_registry.v1",
@@ -387,6 +396,36 @@ fn author(ctx: &ToolCtx) -> UaResult<String> {
     })
 }
 
+/// An operator (a human or a lifecycle operator): what changes the skills
+/// every node of an agent or profile is served.
+fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+    let who = author(ctx)?;
+    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+        return Err(UaError::denied(
+            "operator_required",
+            format!("{what} is an operator action (a human or a lifecycle operator)"),
+        ));
+    }
+    Ok(who)
+}
+
+/// Evaluate the one-time human approval for `payload` inside `tx`.
+/// `Ok(Some(id))` when it is pending (the caller commits and reports it).
+fn gate(tx: &mut ua_store::WriteTx<'_>, ctx: &ToolCtx, payload: &Value) -> UaResult<Option<i64>> {
+    match approvals::gate(tx, ctx.hub.cfg(), &ctx.caller, GATE, payload)? {
+        GateOutcome::Pass { .. } => Ok(None),
+        GateOutcome::Pending { approval_id } => Ok(Some(approval_id)),
+        GateOutcome::Denied { approval_id, reason } => Err(UaError::denied(
+            "approval_denied",
+            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+        )),
+    }
+}
+
+fn pending(out: Result<Value, i64>) -> UaResult<Value> {
+    out.map_err(|approval_id| UaError::ApprovalRequired { tool: GATE.into(), approval_id })
+}
+
 fn positive(version: Option<i64>) -> UaResult<Option<i64>> {
     match version {
         Some(v) if v < 1 => Err(UaError::invalid("version must be a positive integer")),
@@ -437,7 +476,7 @@ fn read_bounded(md: &Path) -> UaResult<String> {
 }
 
 fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
-    let who = author(ctx)?;
+    let who = operator(ctx, "publishing a skill")?;
     let name = check_name(&p.name)?;
     let target = resolve_target(ctx, &p.path, false, false)?;
     let ws = ctx.hub.cfg().workspace_root();
@@ -483,7 +522,13 @@ fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
             )
             .optional()?;
         if let Some(skill) = existing {
-            return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
+            return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review })));
+        }
+        // A new version reaches every node its skill is assigned to: a human
+        // approves this exact content first.
+        let payload = json!({ "action": "publish", "name": name, "content_hash": hash, "source": source });
+        if let Some(id) = gate(tx, ctx, &payload)? {
+            return Ok(Err(id));
         }
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM skill_versions WHERE name = ?1",
@@ -509,8 +554,9 @@ fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
             params![name, next],
             version_row,
         )?;
-        Ok(json!({ "ok": true, "idempotent": false, "skill": skill, "review": review }))
+        Ok(Ok(json!({ "ok": true, "idempotent": false, "skill": skill, "review": review })))
     })
+    .and_then(pending)
 }
 
 fn list(ctx: &ToolCtx, p: ListParams) -> UaResult<Value> {
@@ -533,7 +579,7 @@ fn get(ctx: &ToolCtx, p: GetParams) -> UaResult<Value> {
 }
 
 fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
-    let who = author(ctx)?;
+    let who = operator(ctx, "assigning a skill")?;
     let name = check_name(p.skill_name.as_deref().or(p.name.as_deref()).unwrap_or_default())?;
     let ttype = check_target_type(p.target_type.as_deref())?;
     let mut target = p.target.trim().to_string();
@@ -545,19 +591,40 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     }
     let pin = positive(p.version)?;
     ctx.hub.db().write(|tx| {
-        let exists: Option<i64> = match pin {
+        let hash: Option<String> = match pin {
             Some(v) => tx
-                .query_row("SELECT 1 FROM skill_versions WHERE name = ?1 AND version = ?2", params![name, v], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT content_hash FROM skill_versions WHERE name = ?1 AND version = ?2",
+                    params![name, v],
+                    |r| r.get(0),
+                )
                 .optional()?,
-            None => tx.query_row("SELECT 1 FROM skill_versions WHERE name = ?1 LIMIT 1", [&name], |r| r.get(0)).optional()?,
+            None => tx
+                .query_row(
+                    "SELECT content_hash FROM skill_versions WHERE name = ?1 ORDER BY version DESC LIMIT 1",
+                    [&name],
+                    |r| r.get(0),
+                )
+                .optional()?,
         };
-        if exists.is_none() {
+        let Some(hash) = hash else {
             return Err(match pin {
                 Some(v) => UaError::not_found(format!("unknown version {v} for skill {name:?}")),
                 None => UaError::not_found(format!("skill {name:?} has no published version yet")),
             });
+        };
+        // The skill rides into the harness of every node of this agent or
+        // profile: a human approves the assignment of this content first.
+        let payload = json!({
+            "action": "assign",
+            "skill_name": name,
+            "target_type": ttype,
+            "target": target,
+            "version": pin,
+            "content_hash": hash,
+        });
+        if let Some(id) = gate(tx, ctx, &payload)? {
+            return Ok(Err(id));
         }
         let now = ua_core::time::now();
         tx.execute(
@@ -582,12 +649,13 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
             params![name, ttype, target],
             assignment_row,
         )?;
-        Ok(json!({ "assignment": row }))
+        Ok(Ok(json!({ "assignment": row })))
     })
+    .and_then(pending)
 }
 
 fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
-    let who = author(ctx)?;
+    let who = operator(ctx, "unassigning a skill")?;
     let name = check_name(p.skill_name.as_deref().or(p.name.as_deref()).unwrap_or_default())?;
     let ttype = check_target_type(p.target_type.as_deref())?;
     let target = p.target.trim().to_string();
@@ -779,7 +847,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "skill_registry",
             "The skills registry: immutable content-hash versions of agent skills, assigned to an agent label or a \
-             profile. Actions: publish {name, path} (one SKILL.md-only skill from the workspace, refused when \
+             profile. publish, assign and unassign are operator actions; publish and assign each need a \
+             one-time human approval bound to the content hash. Actions: publish {name, path} (one SKILL.md-only skill from the workspace, refused when \
              skill_review finds a high-severity issue; identical content returns the existing version), list \
              {name?}, get {name, version?}, assign {skill_name, target, target_type: agent|profile, version?} (an \
              agent assignment wins over a profile one), unassign {skill_name, target, target_type}, resolve \
@@ -788,6 +857,7 @@ pub fn register(r: &mut Registry) {
              skills resolved for its agent.",
             skill_registry,
         )
+        .gates_in_handler()
         .family("skills"),
     );
 }

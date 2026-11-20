@@ -14,7 +14,7 @@ calls out to the hub and never listens, so a node needs no inbound port.
 | `GET /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` | Any verified caller |
 | `POST /api/node/session_credential` | `node_session_credential` | The node's agent |
 | `GET\|POST /api/node/config` | `node_config` | The node's agent |
-| `GET /api/harness-config` | `harness_config_status` | Any verified caller |
+| `GET /api/harness-config` | `harness_config_status` | Any verified caller (own nodes' proposals; operators see all) |
 
 A node name belongs to the agent label that first registered it. One agent
 holds at most `node_max_per_agent` nodes in service. Host facts are bounded on
@@ -331,8 +331,17 @@ the five default ones:
 | `opencode` | `opencode/opencode.json` | MCP servers, skills, `rules.opencode` or `rules.agents` (JSON) |
 
 A rules surface without text gets a placeholder. Any other declared surface
-renders like `opencode`. MCP servers must use OAuth or `none`: bearer, token
-or header auth, and any embedded token, key or header, refuse the bundle.
+renders like `opencode`.
+
+What a publish refuses (stricter than the Python hub, never changing what an
+accepted bundle renders):
+
+- a surface path that is absolute, or has an empty, `.` or `..` segment;
+- MCP servers with bearer, token or header auth, or an embedded token, key
+  or header (OAuth or `none` only);
+- an MCP URL with user info (`user:password@`), with a credential-looking
+  query parameter (`token`, `secret`, `key`, `auth`, `signature`, ...), or
+  over plain `http` to a host that is not loopback.
 
 **Byte compatibility.** Python nodes render the served bundle themselves and
 compare each surface by SHA-256, and the hub accepts a drift report only for
@@ -353,7 +362,11 @@ once; publishing a new one makes it the active bundle.
 
 **Skills from the registry.** `skill_registry` keeps immutable skill versions
 keyed by content hash and assigns them to an agent label or a profile (an
-agent assignment wins over a profile one). The bundle a node is served is the
+agent assignment wins over a profile one). A skill's text lands in the
+harness of every node it reaches, so publishing, assigning and unassigning
+are operator actions, and a new version (`publish`) and an assignment
+(`assign`) each need a one-time human approval bound to the content hash
+(and the target and pin). The bundle a node is served is the
 active bundle plus the skills resolved for the node's agent and its default
 profile, appended after the bundle's own skills; a bundle skill of the same
 name wins. `assigned_skills` in the answer says what was included. Changing
@@ -369,17 +382,24 @@ human approves the new content.
 | `report` | `bundle_version`, `proposals: [{surface, path, desired_hash, observed_hash?, diff?}]` | `{ok, bundle_version, proposals: [{proposal_id, surface, path, approval_id, status, inbox}], apply_grants}` |
 | `applied` | `surface`, `desired_hash` | `{ok, proposal_id, surface, bundle_version, approval_id}` |
 
-A report naming another version is refused with `409`, more than 32
-proposals with `400`, and a `desired_hash` that is not the hub's own render
-of that surface with `409`. Each accepted proposal parks (or reuses) one
-`harness_config_apply` approval bound to `{node, surface, path,
-bundle_version, desired_hash}`; its `status` is `pending`, `approved` or
-`denied`. `apply_grants` lists the surfaces whose pass is approved and whose
+A report without `bundle_version` is refused with `400`, one naming another
+version with `409`, more than 32 proposals with `400`, a `path` other than
+the hub's rendered path for that surface with `400`, and a `desired_hash`
+that is not the hub's own render of that surface with `409`. Each accepted
+proposal parks (or reuses) one `harness_config_apply` approval bound to
+`{node, surface, path, bundle_version, desired_hash, change_summary}`.
+`change_summary` is computed by the hub, never taken from the node: the
+unified diff (and lines added and removed) from the content last applied to
+that node's surface (`base: last_applied`), or from nothing (`base: none`).
+A proposal's `status` is `pending`, `approved` or `denied`. `apply_grants` lists the surfaces whose pass is approved and whose
 hash is still the current render. `applied` consumes that pass and marks the
 proposal applied; while the approval is pending it answers `202
 {"status": "approval_pending", "approval_id", "code": "approval_required",
 "tool": "harness_config_apply"}`. Only the node's own agent may call: another
 label gets `403 node_owned_elsewhere`, an unregistered node `404`.
+
+`harness_config_status` lists the caller's own nodes' proposals; operators
+see every node's.
 
 Publish, report and applied are ledgered on `agent.harness_config`. The
 Python node keys on no hub feature for this route.
