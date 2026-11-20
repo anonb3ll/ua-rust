@@ -68,7 +68,11 @@ from its commit history.
   binaries on `PATH`.
 - Sign-out is a POST form that carries the session CSRF token.
 - A `run_cmd` refusal does not say whether the program is on the allowlist.
-
+- Migration manifests are version 2: the event log is a summary (count, ulid
+  range, rolling hash) with an optional `events_since_ulid` row listing, the
+  manifest is streamed against its cap, and memory is capped at 50000 notes.
+  `compare_migration_manifests` reads files under `exports/` and compares
+  event logs. Both tools are denied to developer and lead sessions.
 ### Security
 
 - `/api` and `/ui` refuse an unknown host and a cross-site write.

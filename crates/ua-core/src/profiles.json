@@ -13,9 +13,11 @@
  ],
  "DEVELOPER_DENIED_TOOLS": [
   "approval_resolve",
+  "compare_migration_manifests",
   "config_revision_manage",
   "dispatch_confirm_cancellation",
   "dispatch_retry_cancellation",
+  "export_migration_manifest",
   "git_commit_staged",
   "git_merge_task",
   "managed_secret_delete",
