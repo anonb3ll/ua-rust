@@ -86,11 +86,17 @@ routes with the same request and response shapes:
 | `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |
 | `GET /api/nodes` | `node_list` |
 | `POST /api/node/register`, `POST /api/node/heartbeat` | `node_register`, `node_heartbeat` (agent token only) |
+| `GET /api/runs`, `GET /api/runs/{run_id}` | `run_list`, `run_get` |
+| `GET /api/platform/manifest`, `GET /api/platform/objects/{kind}[/{id}]` | `platform_manifest`, `platform_object_get` |
+| `GET /api/evidence`, `POST /api/evidence` | `evidence_report`, `evidence_append` |
 
-`/api/runs`, `/api/nodes/*`, the node work-queue routes under `/api/node/`,
-`/api/work-products`, `/api/evidence` and `/api/platform/*` answer `501` with
-`{"error": "not_implemented", "capability": "..."}` until their tool
-families exist.
+The runs, platform and evidence routes and what the SDK can rely on are in
+[sdk.md](sdk.md). `/api/nodes/*` (acceptance), the node wake, config and
+session-credential routes under `/api/node/`, the provenance graph and the
+evidence export answer `501` with `{"error": "not_implemented", "capability":
+"..."}` until they are built. `/api/work-products*` answers `501` too: work
+products are not ported pending an explicit product decision (hub task
+#2658).
 
 ## Third-party files
 
