@@ -116,19 +116,27 @@ mod macos {
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
-    /// Every pid on the system, or `None` when the list cannot be read.
+    /// Every pid on the system, or `None` when the list cannot be read
+    /// whole. A buffer the call filled may have cut the list short, so it is
+    /// retried larger; still full after the retries, the scan gives up
+    /// (liveness unknown keeps every worktree).
     pub fn all_pids() -> Option<Vec<libc::pid_t>> {
         // SAFETY: a null buffer asks only for the current count.
         let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        let n = usize::try_from(n).ok().filter(|n| *n > 0)?;
-        // Room for processes started between the two calls.
-        let mut pids: Vec<libc::pid_t> = vec![0; n + 256];
-        let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::pid_t>()).ok()?;
-        // SAFETY: `pids` holds `bytes` bytes of writable, initialized memory.
-        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        let got = usize::try_from(got).ok().filter(|g| *g > 0)?;
-        pids.truncate(got.min(pids.len()));
-        Some(pids)
+        let mut room = usize::try_from(n).ok().filter(|n| *n > 0)? + 256;
+        for _ in 0..4 {
+            let mut pids: Vec<libc::pid_t> = vec![0; room];
+            let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::pid_t>()).ok()?;
+            // SAFETY: `pids` holds `bytes` bytes of writable, initialized memory.
+            let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            let got = usize::try_from(got).ok().filter(|g| *g > 0)?;
+            if got < pids.len() {
+                pids.truncate(got);
+                return Some(pids);
+            }
+            room = room.checked_mul(2)?;
+        }
+        None
     }
 
     /// A NUL-terminated path out of `vnode_info_path::vip_path`.
