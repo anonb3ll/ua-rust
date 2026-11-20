@@ -9,8 +9,11 @@
 # whitespace and an extended regex the matching line must also match. A path
 # alone allows every match in that file.
 #
-# VOCAB_DENYLIST adds patterns: newline-separated extended regexes, matched
-# case-insensitively (for example from a private CI secret). They are not
+# Only generic shapes live here (home directories, private-network addresses,
+# tailnet host names, the legacy role names). Identifiers of any particular
+# team or person (agent labels, handles, mail domains, internal tool names)
+# belong in VOCAB_DENYLIST: newline-separated extended regexes, matched
+# case-insensitively, supplied from a private CI secret. They are never
 # printed, and the allowlist does not apply to them.
 set -euo pipefail
 
@@ -21,18 +24,14 @@ self=scripts/vocab-check.sh
 
 # Case-sensitive patterns.
 sensitive=(
-  'Desktop_[A-Z]'
   '/home/[a-z]'
   '/Users/[a-z]'
 )
 # Case-insensitive patterns.
 insensitive=(
-  'cloud_t3tots'
   'chief-of-staff'
   '\bsteward\b'
-  '\bcockpit\b'
-  '@gmail\.com'
-  '\b100\.[0-9]+\.[0-9]+\.[0-9]+'
+  '\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+'
   '\.ts\.net\b'
 )
 
