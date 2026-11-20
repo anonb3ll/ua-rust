@@ -118,6 +118,7 @@ vulnerability.
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
 | Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
 | Public relay | `relay_manage`: an agent drafts a comment for an issue or pull request in an allowlisted GitHub repository; gates refuse secrets, hidden or bidirectional Unicode, private addresses and internal host names, home paths, personal data, over-long text and a private denylist, never rewriting the text; a human approves the exact text and target, the send repeats it byte for byte, and the token is a managed secret | [relay](docs/relay.md) |
+| Zulip | `zulip_send_message`: the relay's gates plus Zulip wildcard, group and unlisted mentions and unlisted link hosts, then a human approval of the exact stream, topic and text; an uncertain send blocks a duplicate until a human runs `zulip_resolve_send`. `zulip_fetch_messages`: forward-only cursor, messages labelled untrusted. Off until configured; sending retired by default | [zulip](docs/zulip.md) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
@@ -127,9 +128,9 @@ vulnerability.
 
 ## Not yet ported
 
-Native-session resume and adopt, cloud executors, ACP, Slack and Zulip
-connectors, role workflows, GitHub writes (comments, labels, held PRs, the
-GitHub App installation flow), session-handoff failover, the SDK's
+Native-session resume and adopt, cloud executors, ACP, the Slack connector,
+role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
+installation flow), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,
 `/api/action/node-session`), the provenance graph and evidence export, billing
 and usage ledgers, and tenancy (`org_id`). Work products

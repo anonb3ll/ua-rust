@@ -34,7 +34,9 @@
   "routine_list",
   "routine_pause",
   "vault_archive_plan",
-  "vault_move"
+  "vault_move",
+  "zulip_resolve_send",
+  "zulip_send_message"
  ],
  "LEAD_EXTRA_TOOLS": [
   "audit_triage_tasks",
@@ -92,7 +94,9 @@
   "vault_archive_plan",
   "vault_move",
   "vault_to_memory_ingest",
-  "workflow_run"
+  "workflow_run",
+  "zulip_resolve_send",
+  "zulip_send_message"
  ],
  "RESEARCH_ALLOWED_TOOLS": [
   "capability_catalog",

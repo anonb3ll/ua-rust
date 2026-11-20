@@ -1264,6 +1264,60 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
     }
 }
 
+/// Zulip: DORMANT until site, email and key are all set; the API key's value
+/// is never read here beyond whether it is present.
+fn zulip_check(cfg: &Config) -> Value {
+    use secrecy::ExposeSecret;
+
+    use crate::families::zulip;
+    let gate = "UA_ZULIP_SITE, UA_ZULIP_EMAIL, UA_ZULIP_API_KEY, UA_ZULIP_RETIRED, zulip_channels";
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    let site = set(cfg.zulip_site.as_deref());
+    let email = set(cfg.zulip_email.as_deref());
+    let key = cfg.zulip_api_key.as_ref().is_some_and(|k| !k.expose_secret().trim().is_empty());
+    match (site, email, key) {
+        (false, false, false) => {
+            return finding(
+                "zulip",
+                DORMANT,
+                "Zulip is not configured; zulip_* tools refuse every call",
+                gate,
+            );
+        }
+        (true, true, true) => {}
+        _ => {
+            return finding(
+                "zulip",
+                MISCONFIGURED,
+                "zulip_site, zulip_email and UA_ZULIP_API_KEY must all be set",
+                gate,
+            );
+        }
+    }
+    let raw = cfg.zulip_site.as_deref().unwrap_or("");
+    let Ok(url) = zulip::parse_site(raw, cfg.fetch_allow_loopback) else {
+        return finding(
+            "zulip",
+            MISCONFIGURED,
+            "zulip_site must be an https URL without credentials, a query or a fragment",
+            gate,
+        );
+    };
+    let host = url.host_str().unwrap_or("");
+    let channels = zulip::channels(cfg).len();
+    let send = if zulip::zulip_retired(cfg.zulip_retired.as_deref()) {
+        "send retired"
+    } else {
+        "send open behind a human approval per message"
+    };
+    finding(
+        "zulip",
+        LIVE,
+        format!("{host}; {channels} channel(s); {send}; {} link host(s) allowed", cfg.zulip_link_hosts.len()),
+        gate,
+    )
+}
+
 fn policy_check(cfg: &Config) -> Value {
     let gate = "UA_POLICY_FILE";
     match &cfg.policy_file {
@@ -1373,6 +1427,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         db_row,
         schema_check(&facts),
         notify_check(cfg, &facts),
+        zulip_check(cfg),
         policy_check(cfg),
         fleet_nodes_check(&facts),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
