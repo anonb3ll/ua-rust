@@ -46,8 +46,15 @@ pub struct ToolDef {
     /// into the handler for that call: the handler then checks an
     /// alternative authority (a policy authorization) on resolved values.
     pub handler_gate_arg: Option<&'static str>,
+    /// When set, the approval gate binds this projection of the arguments
+    /// instead of the arguments themselves, so a value that must never be
+    /// stored (a secret) is not parked in the approvals table.
+    pub gate_payload: Option<GatePayload>,
     handler: Handler,
 }
+
+/// Maps a call's arguments to the payload its approval binds.
+pub type GatePayload = fn(&ua_core::Config, &Value) -> Value;
 
 impl std::fmt::Debug for ToolDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,6 +96,11 @@ impl ToolDef {
         self.gates_in_handler
             || self.handler_gate_arg.is_some_and(|k| args.get(k).is_some_and(|v| !v.is_null()))
     }
+    /// Gate on `f(config, args)` rather than on the raw arguments.
+    pub fn gate_payload(mut self, f: GatePayload) -> Self {
+        self.gate_payload = Some(f);
+        self
+    }
 }
 
 /// Build a tool from a typed handler. `A` is the argument struct; derive
@@ -123,6 +135,7 @@ where
         always_gated: false,
         gates_in_handler: false,
         handler_gate_arg: None,
+        gate_payload: None,
         handler,
     }
 }
@@ -165,11 +178,18 @@ impl Registry {
     }
 
     /// The tools `caller` can see. Profile filtering applies only when the
-    /// caller's session enforces it; legacy aliases are then hidden too.
+    /// caller's session enforces it; legacy aliases are then hidden too. A
+    /// session-credential request sees only its grant's tools.
     pub fn visible_to<'a>(&'a self, caller: &'a Caller) -> impl Iterator<Item = &'a ToolDef> + 'a {
+        let grant = crate::grant::current();
+        // `acp-session` without a grant sees nothing: the profile is only
+        // ever held by a verified session credential.
+        let orphan = grant.is_none() && caller.profile == ua_core::Profile::AcpSession;
         self.tools.values().filter(move |t| {
-            !caller.enforce_profile
-                || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name))
+            !orphan
+                && grant.as_ref().is_none_or(|g| g.allows_tool(t.name))
+                && (!caller.enforce_profile
+                    || (caller.profile.allows_tool(t.name) && !ua_core::Profile::is_legacy_alias(t.name)))
         })
     }
 
@@ -186,6 +206,27 @@ impl Registry {
             record_decision(hub, caller, name, &err).await;
             return Err(err);
         }
+        // A session credential's grant is the outer limit: no profile,
+        // policy or approval can widen it. The `acp-session` profile without
+        // a grant (it can only be reached by misconfiguration) gets nothing.
+        let args = match crate::grant::current() {
+            Some(g) => match g.narrow(name, args) {
+                Ok(a) => a,
+                Err(err) => {
+                    record_decision(hub, caller, name, &err).await;
+                    return Err(err);
+                }
+            },
+            None if caller.profile == ua_core::Profile::AcpSession => {
+                let err = UaError::denied(
+                    "session_grant_required",
+                    "the acp-session profile runs only under a verified session credential",
+                );
+                record_decision(hub, caller, name, &err).await;
+                return Err(err);
+            }
+            None => args,
+        };
 
         // The policy file is read once per call (cached by mtime). A file that
         // cannot be loaded refuses the call below, after the profile check.
@@ -286,7 +327,11 @@ impl Registry {
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
         if gated && !def.handler_gates(&args) {
-            let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), args.clone());
+            let gate_args = match def.gate_payload {
+                Some(f) => f(hub.cfg(), &args),
+                None => args.clone(),
+            };
+            let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), gate_args);
             let outcome = match hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await
             {
                 Ok(o) => o,
@@ -377,7 +422,7 @@ async fn record_decision(hub: &Hub, caller: &Caller, tool: &str, err: &UaError) 
 
 /// Append an `agent.gateway.decision` deny event. `rule` names the policy
 /// rule that fired; it is empty for profile and approval refusals.
-async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
+pub(crate) async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
     let reason_code = match err {
         UaError::Denied { reason_code, .. } => reason_code.clone(),
         other => other.code().to_string(),

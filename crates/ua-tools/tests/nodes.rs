@@ -150,7 +150,10 @@ async fn register_heartbeat_and_list() {
     assert_eq!(out["node"], "node-a");
     assert_eq!(out["agent"], "builder-1", "the owner is the verified caller");
     assert_eq!(out["first_registration"], true);
-    assert_eq!(out["hub_features"], json!(["node_code_sha"]));
+    assert_eq!(
+        out["hub_features"],
+        json!(["node_code_sha", "acp_session_mcp", "node_wake_v3", "node_wake_live_sessions"])
+    );
     assert_eq!(out["dropped_fact_keys"], json!([]));
     assert_eq!(count_events(&hub, "agent.node.register"), 1);
 

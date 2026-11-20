@@ -315,7 +315,7 @@ pub fn parse_policy_value(data: &Value) -> Result<Policy, String> {
             let mut out = BTreeMap::new();
             for (k, v) in o {
                 let p = v.as_str().ok_or_else(|| format!("profile_defaults.{k} must be a profile name"))?;
-                p.parse::<Profile>().map_err(|e| format!("profile_defaults.{k}: {e}"))?;
+                Profile::parse_assignable(p).map_err(|e| format!("profile_defaults.{k}: {e}"))?;
                 out.insert(k.clone(), p.to_string());
             }
             out
@@ -569,6 +569,9 @@ pub fn overlay_allowed<'a>(
     code_default: Profile,
     tools: impl IntoIterator<Item = &'a str>,
 ) -> bool {
+    if !chosen.assignable() {
+        return false;
+    }
     if chosen == code_default {
         return true;
     }
@@ -964,7 +967,8 @@ pub fn prod_action(tool: &str) -> &str {
         "task_delete" => "delete",
         "deploy" => "deploy",
         "fleet_host_action" => "restart",
-        "oauth_device_manage" => "revoke",
+        "oauth_device_manage" | "mcp_server_revoke" => "revoke",
+        "managed_secret_delete" => "delete",
         "node_dispatch" | "node_followup" | "acp_permission" | "dispatch_task" | "dispatch_resume" => {
             "dispatch"
         }

@@ -23,7 +23,8 @@
 //!   in the state change's transaction, so another agent can take the work.
 //! - **Retire** is the decommission marker. It is refused while the agent
 //!   holds `doing` claims, and in the same transaction it revokes the
-//!   agent's managed tokens (`agent_tokens`) and OAuth sign-ins. The HTTP
+//!   agent's managed tokens (`agent_tokens`), OAuth sign-ins and node
+//!   session credentials. The HTTP
 //!   adapter refuses a retired identity's static token too ([`is_retired`]).
 //!   `agent_resume` cannot undo it; only `agent_unretire` can, and that
 //!   re-issues nothing.
@@ -358,6 +359,7 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
     for f in &families {
         oauth_tokens += tokens::revoke_family(tx, f, "agent_retired")?;
     }
+    let session_credentials = crate::families::node_queue::revoke_for_agent(tx, agent, "agent_retired", who)?;
     if !token_ids.is_empty() {
         ledger::append(
             tx,
@@ -383,7 +385,9 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
             .by(who.to_string()),
         )?;
     }
-    Ok(json!({ "agent_tokens": token_ids, "oauth_sessions": families }))
+    Ok(
+        json!({ "agent_tokens": token_ids, "oauth_sessions": families, "session_credentials": session_credentials }),
+    )
 }
 
 /// Return `agent`'s `doing` claims to `open` (terminate).

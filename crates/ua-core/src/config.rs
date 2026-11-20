@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
@@ -88,6 +89,13 @@ pub struct Config {
     /// lapsed leases, undelivered command notices). 0 turns the sweep off;
     /// claims still sweep their own node.
     pub node_wait_sweep_s: u64,
+    /// Mint session credentials (`uas_…`) for claimed ACP node items
+    /// (`POST /api/node/session_credential`). Read on every request, so
+    /// turning it off refuses every outstanding credential at once.
+    pub session_credentials_enabled: bool,
+    /// Hold real work from a node until its latest device acceptance run is
+    /// accepted (attested by an operator). Off by default.
+    pub node_require_acceptance: bool,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -98,6 +106,13 @@ pub struct Config {
     /// Prior scenes kept per board for `graph_canvas_history` and
     /// `graph_canvas_restore`; older revisions are dropped. 0 keeps none.
     pub graph_canvas_history_max: u32,
+    /// Client evidence events (`evidence_append`) one identity may append per
+    /// rolling hour. Past it the call is refused (`rate_limited`). Counted
+    /// from the ledger, so it holds across restarts.
+    pub evidence_append_max_per_hour: u32,
+    /// Serialized payload bytes one identity may append through
+    /// `evidence_append` per rolling hour (`rate_limited` past it).
+    pub evidence_append_max_bytes_per_hour: u64,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -299,6 +314,20 @@ pub struct Config {
     /// `github_webhook_secret_env`. It cannot be set from TOML or the environment.
     #[serde(skip)]
     pub github_webhook_secret_value: Option<SecretString>,
+    /// Key(s) that encrypt managed secrets at rest (`UA_MANAGED_SECRET_KEY`):
+    /// 32 random bytes as base64 or 64 hex characters. A comma-separated list
+    /// rotates keys: the first encrypts new writes, every key decrypts.
+    /// Unset, `managed_secret_set` refuses and stored secrets cannot be used.
+    #[serde(skip_serializing)]
+    pub managed_secret_key: Option<SecretString>,
+    /// Downstream MCP servers declared by the operator, by name
+    /// (`[mcp_servers.<name>]`, TOML only). Each entry has the shape
+    /// `mcp_server_register` takes plus `review_expires_at`; see docs/mcp.md.
+    /// A bad entry refuses only itself.
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    /// Days an `mcp_server_register` or `mcp_server_review` approval keeps a
+    /// downstream MCP server usable before it must be reviewed again (1-365).
+    pub mcp_review_ttl_days: u32,
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -337,6 +366,48 @@ pub struct HarnessConfig {
     /// `UA_AGENT_BEARER_TOKEN`, so the child can call `dispatch_report_self`.
     /// Off by default; no other agent's token is ever passed.
     pub pass_agent_token: bool,
+    /// Fixed, non-secret environment values for the child, e.g. `{
+    /// PI_SKIP_VERSION_CHECK = "1" }`. Values take the argv placeholders. A
+    /// name in the hub's `UA_` namespace, a hub secret or a binding name is
+    /// never set. A credential-looking name or value is refused at load:
+    /// secrets belong in `env_allowlist`, passed from the hub's environment.
+    /// The approval binds each value's SHA-256, never the value.
+    pub env: BTreeMap<String, String>,
+    /// Names never passed to the child, even when inherited or listed in
+    /// `env_allowlist` or `env`: e.g. metered provider keys a subscription
+    /// CLI must not fall back to.
+    pub env_denylist: Vec<String>,
+    /// Absolute directories put in front of the child's `PATH`, e.g.
+    /// `~/.local/bin`. A relative or empty entry, or one containing `:`, is
+    /// refused at load.
+    pub path_prepend: Vec<PathBuf>,
+    /// Text written to the child's standard input, then closed. Takes the
+    /// argv placeholders plus `{prompt_json}` (the prompt as a JSON string).
+    /// Unset, standard input is empty.
+    pub stdin: Option<String>,
+    /// The provider account (`provider_account_register`) this harness bills.
+    /// `dispatch_task` refuses the harness while the account is disabled or
+    /// rate-limited, and records the account on the run.
+    pub provider_account: Option<String>,
+    /// When this harness's account is disabled or rate-limited, run the
+    /// first other harness (by name) whose account has the same provider and
+    /// billing type and is available, instead of refusing. Off by default.
+    pub provider_fallback: bool,
+    /// Let `provider_fallback` also pick an account of another billing type
+    /// (e.g. a metered `api` account for a `subscription` one). Off by
+    /// default.
+    pub provider_fallback_cross_billing: bool,
+    /// Case-insensitive phrases that, on a line of the child's standard
+    /// error, mark a failed run as hitting its provider's usage limit
+    /// (`provider_quota_exhausted`), which rate-limits the harness's account.
+    /// Standard output (the model's own text) is never matched. Empty, no
+    /// run of this harness is ever classified as a quota failure.
+    pub quota_patterns: Vec<String>,
+    /// Also match `quota_patterns` against the error text of structured JSON
+    /// error events on standard output (Pi's `--mode json`): a line that is a
+    /// JSON object with `type = "error"`, or whose `message.stopReason` is
+    /// `"error"`. Only the event's error fields are read.
+    pub quota_json_errors: bool,
 }
 
 impl Default for HarnessConfig {
@@ -348,7 +419,104 @@ impl Default for HarnessConfig {
             output_cap_bytes: 1024 * 1024,
             workdir: None,
             pass_agent_token: false,
+            env: BTreeMap::new(),
+            env_denylist: Vec::new(),
+            path_prepend: Vec::new(),
+            stdin: None,
+            provider_account: None,
+            provider_fallback: false,
+            provider_fallback_cross_billing: false,
+            quota_patterns: Vec::new(),
+            quota_json_errors: false,
         }
+    }
+}
+
+/// Whether an environment name reads like a credential.
+pub fn env_name_looks_secret(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "APIKEY",
+        "API_KEY",
+        "API-KEY",
+        "PRIVATE_KEY",
+        "BEARER",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|m| up.contains(m))
+        || up.split('_').any(|part| part == "KEY" || part == "KEYS")
+}
+
+/// Credential shapes, as the security audit's secret rules know them.
+static CREDENTIAL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"sk-ant-[A-Za-z0-9_\-]{20,}",
+        r"|\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}",
+        r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+        r"|\bgh[pousr]_[A-Za-z0-9]{20,}",
+        r"|\bgithub_pat_[A-Za-z0-9_]{20,}",
+        r"|\bxox[baprs]-[A-Za-z0-9\-]{10,}",
+        r"|\bxapp-[0-9A-Za-z-]{10,}",
+        r"|\bAIza[0-9A-Za-z_\-]{35}",
+        r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}",
+        r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+        r"|\buas_[A-Za-z0-9_-]{20,}",
+        r"|(?i:\b(?:bearer|basic)\s+[A-Za-z0-9+/._~=-]{12,})",
+        r"|(?i:[a-z][a-z0-9+.-]{0,31}://[^\s/:@]+:[^\s/@]+@)",
+        r"|(?i:\b(?:api[_-]?key|secret|token|passwd|password|credential)\s*[:=])",
+        r"|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        r"|PuTTY-User-Key-File-\d+:",
+    ))
+    .expect("credential pattern")
+});
+
+/// Whether a value reads like a credential (a provider key, a token, a
+/// password assignment, a URL with a password, a private key).
+pub fn value_looks_secret(value: &str) -> bool {
+    CREDENTIAL_RE.is_match(value)
+}
+
+/// The most `quota_patterns` one harness may list.
+pub const MAX_QUOTA_PATTERNS: usize = 32;
+const QUOTA_PATTERN_CHARS: std::ops::RangeInclusive<usize> = 3..=200;
+
+impl HarnessConfig {
+    /// Refuse a harness whose `env` carries a credential, whose
+    /// `path_prepend` holds a relative, empty or `:`-containing entry, or
+    /// whose `quota_patterns` are too many, too short or too long.
+    pub fn check(&self, name: &str) -> anyhow::Result<()> {
+        for (k, v) in &self.env {
+            if env_name_looks_secret(k) || value_looks_secret(v) {
+                anyhow::bail!(
+                    "harnesses.{name}.env.{k}: looks like a credential; fixed env values are shown to approvers \
+                     as hashes but stored in config, so list the name in env_allowlist and pass it from the hub's \
+                     environment"
+                );
+            }
+        }
+        for p in &self.path_prepend {
+            let text = p.to_string_lossy();
+            if text.trim().is_empty() || text.contains(':') || !p.is_absolute() {
+                anyhow::bail!(
+                    "harnesses.{name}.path_prepend: {text:?} must be an absolute directory without ':' \
+                     (a relative entry would resolve inside the run's worktree)"
+                );
+            }
+        }
+        if self.quota_patterns.len() > MAX_QUOTA_PATTERNS {
+            anyhow::bail!("harnesses.{name}.quota_patterns: at most {MAX_QUOTA_PATTERNS} patterns");
+        }
+        if let Some(p) =
+            self.quota_patterns.iter().find(|p| !QUOTA_PATTERN_CHARS.contains(&p.trim().chars().count()))
+        {
+            anyhow::bail!("harnesses.{name}.quota_patterns: {p:?} must be 3-200 characters");
+        }
+        Ok(())
     }
 }
 
@@ -375,9 +543,13 @@ impl Default for Config {
             node_max_per_agent: 8,
             node_queue_wait_s: 3600,
             node_wait_sweep_s: 60,
+            session_credentials_enabled: false,
+            node_require_acceptance: false,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
+            evidence_append_max_per_hour: 120,
+            evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
@@ -440,6 +612,9 @@ impl Default for Config {
             github_web_host: None,
             github_token_value: None,
             github_webhook_secret_value: None,
+            managed_secret_key: None,
+            mcp_servers: BTreeMap::new(),
+            mcp_review_ttl_days: 90,
         }
     }
 }
@@ -470,7 +645,31 @@ impl Config {
     }
 
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
-        Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized).map_err(Into::into)
+        let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
+        cfg.check_profiles()?;
+        for (name, h) in &cfg.harnesses {
+            h.check(name)?;
+        }
+        Ok(cfg)
+    }
+
+    /// Refuse a profile no identity may be given (`acp-session`, which only a
+    /// verified session credential runs under) in `profiles` or
+    /// `oauth_profile`.
+    pub fn check_profiles(&self) -> anyhow::Result<()> {
+        let reserved = |name: &str| name.trim().parse::<crate::Profile>().is_ok_and(|p| !p.assignable());
+        if reserved(&self.oauth_profile) {
+            anyhow::bail!(
+                "oauth_profile = {:?}: that profile is reserved for session credentials and cannot be configured",
+                self.oauth_profile
+            );
+        }
+        if let Some((label, p)) = self.profiles.iter().find(|(_, p)| reserved(p)) {
+            anyhow::bail!(
+                "profiles.{label} = {p:?}: that profile is reserved for session credentials and cannot be configured"
+            );
+        }
+        Ok(())
     }
 
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {
@@ -487,7 +686,8 @@ impl Config {
             fig = fig.merge(Toml::file(f));
         }
         if with_env {
-            fig = fig.merge(Env::prefixed("UA_").ignore(&["config"]));
+            // MCP servers come from TOML only: no JSON-in-an-environment-variable form.
+            fig = fig.merge(Env::prefixed("UA_").ignore(&["config", "mcp_servers"]));
         }
         fig
     }
@@ -505,6 +705,7 @@ impl Config {
         self.dash_docsets = self.dash_docsets.iter().map(|p| expand_tilde(p)).collect();
         for h in self.harnesses.values_mut() {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
+            h.path_prepend = h.path_prepend.iter().map(|p| expand_tilde(p)).collect();
         }
         self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
         self.github_api_url = self.github_api_url.trim().trim_end_matches('/').to_string();
@@ -760,6 +961,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_session_credential_profile_cannot_be_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "[profiles]\nbuilder-1 = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("profiles.builder-1"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("oauth_profile"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"research\"\n[profiles]\nbuilder-1 = \"reviewer\"\n")
+            .unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_ok());
+    }
+
+    #[test]
     fn toml_layer_and_lists() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("c.toml");
@@ -804,6 +1020,81 @@ mod tests {
         let off = dir.path().join("off.toml");
         std::fs::write(&off, "dispatch_reaper_interval_s = 0\n").unwrap();
         assert_eq!(Config::load_inner(Some(&off), false).unwrap().dispatch_reaper_interval(), 0);
+    }
+
+    #[test]
+    fn a_pi_harness_table_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pi.toml");
+        std::fs::write(
+            &file,
+            r#"
+[harnesses.pi]
+argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex", "--model", "gpt-5.5", "{prompt}"]
+env_denylist = ["OPENAI_API_KEY", "PI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+env = { PI_SKIP_VERSION_CHECK = "1" }
+path_prepend = ["~/.local/bin"]
+provider_account = "pi-subscription"
+provider_fallback = true
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        let h = &cfg.harnesses["pi"];
+        assert_eq!(h.env["PI_SKIP_VERSION_CHECK"], "1");
+        assert_eq!(
+            h.env_denylist,
+            vec!["OPENAI_API_KEY", "PI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+        );
+        assert_eq!(h.provider_account.as_deref(), Some("pi-subscription"));
+        assert!(h.provider_fallback);
+        assert!(h.stdin.is_none());
+        assert!(!h.path_prepend[0].to_string_lossy().starts_with('~'), "tilde expanded");
+    }
+
+    /// Review findings: credential-looking `env` values were copied into
+    /// approvals verbatim, and a relative `path_prepend` entry resolved
+    /// inside the run's worktree. Both are refused at load.
+    #[test]
+    fn harness_env_credentials_and_relative_path_prepend_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |name: &str, body: &str| {
+            let file = dir.path().join(name);
+            std::fs::write(&file, format!("[harnesses.h]\nargv = [\"h\"]\n{body}\n")).unwrap();
+            Config::load_inner(Some(&file), false)
+        };
+        for (i, body) in [
+            "env = { OPENAI_API_KEY = \"x\" }",
+            "env = { PI_CONFIG = \"sk-proj-abcdefghijklmnopqrstuvwxyz012345\" }",
+            "env = { PROXY = \"https://user:hunter2@proxy.example.com\" }",
+            "env = { AUTH_HEADER_VALUE = \"Bearer abcdefghijklmnop\" }",
+            "env = { EXTRA = \"password=hunter2\" }",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let e = load(&format!("env{i}.toml"), body).unwrap_err().to_string();
+            assert!(e.contains("looks like a credential"), "{body}: {e}");
+            assert!(!e.contains("hunter2") && !e.contains("sk-proj"), "the value is never echoed: {e}");
+        }
+        for (i, body) in
+            ["path_prepend = [\"bin\"]", "path_prepend = [\"\"]", "path_prepend = [\"/opt/a:/opt/b\"]"]
+                .iter()
+                .enumerate()
+        {
+            let e = load(&format!("path{i}.toml"), body).unwrap_err().to_string();
+            assert!(e.contains("path_prepend"), "{body}: {e}");
+        }
+        let cfg = load(
+            "ok.toml",
+            "env = { PI_SKIP_VERSION_CHECK = \"1\" }\npath_prepend = [\"/opt/pi/bin\"]\n\
+             quota_patterns = [\"usage limit\"]\nquota_json_errors = true\nprovider_fallback_cross_billing = true",
+        )
+        .unwrap();
+        let h = &cfg.harnesses["h"];
+        assert_eq!(h.quota_patterns, vec!["usage limit"]);
+        assert!(h.quota_json_errors && h.provider_fallback_cross_billing);
+        assert!(load("q.toml", "quota_patterns = [\"ab\"]").is_err(), "a too-short pattern is refused");
     }
 
     #[test]
@@ -873,5 +1164,27 @@ mod tests {
         // A misspelled key is an error, not a silently ignored entry.
         std::fs::write(&file, "trusted_cargo_configs = [{ path = \"/x\", sha = \"ab\" }]\n").unwrap();
         assert!(Config::load_inner(Some(&file), false).is_err());
+    }
+
+    #[test]
+    fn mcp_server_tables_and_the_secret_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "managed_secret_key = \"k-one\"\n[mcp_servers.docs]\ntransport = \"streamable_http\"\n\
+             url = \"https://docs.example.com/mcp\"\n[mcp_servers.docs.tools]\nsearch = \"read\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        let docs = &cfg.mcp_servers["docs"];
+        assert_eq!(docs["url"], "https://docs.example.com/mcp");
+        assert_eq!(docs["tools"]["search"], "read");
+        assert_eq!(cfg.mcp_review_ttl_days, 90);
+        assert_eq!(
+            cfg.managed_secret_key.as_ref().map(|k| k.expose_secret().to_string()).as_deref(),
+            Some("k-one")
+        );
+        assert!(!format!("{cfg:?}").contains("k-one"), "the key must not leak through Debug");
     }
 }

@@ -130,6 +130,7 @@ fn record_events(
     let node = row.node;
     let mut item = live_item(tx, &node, id, "ACP events are accepted")?;
     let (mut recorded, mut dropped) = (0, 0);
+    let mut kinds = Vec::new();
     for ev in events {
         let Some(m) = ev.as_object() else {
             dropped += 1;
@@ -166,6 +167,7 @@ fn record_events(
         });
         record(tx, "acp_event", payload, agent)?;
         recorded += 1;
+        kinds.push(kind.clone());
         match kind.as_str() {
             "session_open" | "session_ready" => {
                 if let Some(s) = &session
@@ -190,6 +192,7 @@ fn record_events(
             _ => {}
         }
     }
+    super::acceptance::on_events(tx, &item, &kinds)?;
     Ok(json!({ "recorded": recorded, "dropped": dropped }))
 }
 

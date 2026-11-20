@@ -3,9 +3,10 @@
 //! [`Registry::call`] is the single chokepoint every adapter (MCP, HTTP, CLI,
 //! UI) goes through. In order it:
 //!
-//! 1. finds the tool, and refuses any call outside the narrow grant of a
+//! 1. finds the tool, refuses any call outside the narrow grant of a
 //!    hub-internal identity that holds one (the GitHub connector's
-//!    `hub-github`: see [`families::github`]),
+//!    `hub-github`: see [`families::github`]), and holds a session-credential
+//!    request to its grant ([`grant`]),
 //! 2. checks the caller's profile exposes it (and the `action`, for
 //!    consolidated `*_manage` tools); a policy-file profile overlay may lower
 //!    an agent's profile first,
@@ -24,6 +25,7 @@ pub mod approvals;
 pub mod ci;
 pub mod config_revisions;
 pub mod families;
+pub mod grant;
 pub mod hub;
 pub mod policy;
 pub mod registry;

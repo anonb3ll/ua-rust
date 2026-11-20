@@ -116,7 +116,7 @@ fn v4_reason(ip: Ipv4Addr) -> Option<&'static str> {
 
 /// The IPv4 destination an IPv6 address stands for (mapped, compatible,
 /// translated, NAT64 and 6to4 forms), judged instead of the wrapper.
-fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+pub(crate) fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = ip.segments();
     let from = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
     if let Some(v4) = ip.to_ipv4_mapped() {

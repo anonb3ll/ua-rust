@@ -10,18 +10,24 @@
 //! | `POST /api/node/events`    | `node_events` |
 //! | `POST /api/node/followups` | `node_followups` |
 //! | `POST /api/node/permission`| `node_permission` |
+//! | `POST /api/node/session_credential` | `node_session_credential` (201, `Cache-Control: no-store`) |
+//! | `POST /api/node/wake`      | `node_wake` (long-poll, `offer_version` 3) |
+//! | `POST /api/node/wake/check` | `node_wake_check` |
+//! | `POST /api/node/wake/receipt` | `node_wake_receipt` (200; `duplicate: true` for a resend) |
 //! | `GET  /api/nodes`          | `node_list`, plus `recent_items` from `node_items` |
+//! | `GET  /api/nodes/acceptance` | `coordination_manage` `node_acceptance_status` (`?node=`) |
 //!
 //! A node calls out with its agent's bearer token; it never listens. The
 //! node's owner is that verified agent: the tools refuse a human or
 //! unauthenticated caller and take no owner from the body. Refusals answer
 //! `{"error": message, "code": reason}`, so a retired node sees
 //! `code = "node_retired"` (403) and an unregistered one a 404 saying
-//! "not registered", which is what the node software keys on.
+//! "not registered", which is what the node software keys on. A session
+//! credential refusal also carries `reason` (the same code), which is what
+//! the node keys on there.
 //!
-//! The idle-session wake transport (`/api/node/wake*`), the harness config
-//! bundle (`/api/node/config`) and session credentials
-//! (`/api/node/session_credential`) are not built yet and answer `501`.
+//! The harness config bundle (`/api/node/config`) is not built yet and
+//! answers `501`.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -60,11 +66,22 @@ pub fn routes() -> Router<AppState> {
             "/api/node/permission",
             post(|s, i, h, b| tool_route(s, i, h, b, "node_permission", Created::Never)),
         )
+        .route("/api/node/session_credential", post(session_credential))
+        .route("/api/node/wake", post(|s, i, h, b| tool_route(s, i, h, b, "node_wake", Created::Never)))
+        .route(
+            "/api/node/wake/check",
+            post(|s, i, h, b| tool_route(s, i, h, b, "node_wake_check", Created::Never)),
+        )
+        .route(
+            "/api/node/wake/receipt",
+            post(|s, i, h, b| tool_route(s, i, h, b, "node_wake_receipt", Created::Never)),
+        )
         .route(
             "/api/node/{*rest}",
-            any(|| async { not_built("node_wake", "the node wake, config and session credential routes") }),
+            any(|| async { not_built("node_config", "the harness config bundle route") }),
         )
         .route("/api/nodes", get(list))
+        .route("/api/nodes/acceptance", get(acceptance))
 }
 
 /// `{"error", "code"}`: a denial's reason code, else the error's code. An
@@ -163,6 +180,55 @@ async fn heartbeat(
     body: Bytes,
 ) -> Response {
     call(&state, &id, &headers, "node_heartbeat", &body).await
+}
+
+/// `POST /api/node/session_credential`: the value is in this response once;
+/// it is never cached. A refusal carries `reason` for the node.
+async fn session_credential(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut resp = call(&state, &id, &headers, "node_session_credential", &body).await;
+    if resp.status() == StatusCode::OK {
+        *resp.status_mut() = StatusCode::CREATED;
+    } else if resp.status() != StatusCode::ACCEPTED {
+        let status = resp.status();
+        let bytes =
+            axum::body::to_bytes(std::mem::take(resp.body_mut()), 64 * 1024).await.unwrap_or_default();
+        let mut v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        v["reason"] = v["code"].clone();
+        resp = (status, Json(v)).into_response();
+    }
+    resp.headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    resp
+}
+
+#[derive(serde::Deserialize)]
+struct AcceptanceQuery {
+    node: Option<String>,
+}
+
+/// `GET /api/nodes/acceptance`: one node's live evaluation (`?node=`), or
+/// every node's stored summary. Read-only.
+async fn acceptance(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<AcceptanceQuery>,
+) -> Response {
+    let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
+    let mut params = json!({});
+    if let Some(n) = q.node.filter(|n| !n.trim().is_empty()) {
+        params["node"] = json!(n);
+    }
+    let args = json!({ "action": "node_acceptance_status", "params": params });
+    match state.registry.call(&state.hub, &caller, "coordination_manage", args).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => node_err(&e),
+    }
 }
 
 async fn list(
