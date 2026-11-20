@@ -720,7 +720,9 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
     let mut accepted = Vec::new();
     for item in plan.items {
         let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &item.payload)?;
-        let existing: Option<(String, Option<String>, Option<i64>, Option<String>)> = tx
+        // id, observed_hash, approval_id, diff_base
+        type Existing = (String, Option<String>, Option<i64>, Option<String>);
+        let existing: Option<Existing> = tx
             .query_row(
                 "SELECT id, observed_hash, approval_id, diff_base FROM harness_config_proposals WHERE node = ?1 \
                  AND agent = ?2 AND surface = ?3 AND bundle_version = ?4 AND desired_hash = ?5 AND path = ?6 \
