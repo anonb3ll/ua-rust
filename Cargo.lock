@@ -5196,6 +5196,7 @@ dependencies = [
  "fastembed",
  "globset",
  "hex",
+ "hmac",
  "htmd",
  "ignore",
  "jiff 1.0.1",

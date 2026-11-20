@@ -1,0 +1,305 @@
+//! Policy authorizations: a human's record that a standing policy covers
+//! merging one exact head.
+//!
+//! An approval is a human deciding one call. A policy authorization is a
+//! human saying "the policy `<policy_ref>` covers merging head X of task T in
+//! repository R, until <expiry>". It is its own kind of approval, kept in
+//! `policy_authorizations`, never in the approvals queue:
+//!
+//! - `policy_authorization_record` is for a verified human only. The task
+//!   must be unfinished and its project bound to `repo`; the head is a full
+//!   40-character SHA; the human may not be the task's claimant or next
+//!   owner (separation of duties). It expires after `expires_in_hours`
+//!   (default 24, at most 720).
+//! - `policy_authorization_list` reads them, each with `valid` (active and
+//!   unexpired).
+//! - `git_merge_task(policy_authorization_id=...)` accepts one in place of a
+//!   one-time approval when it is valid, for that task, for the task
+//!   project's bound repository and for exactly the head being merged, and
+//!   the caller is not the authorizer. A real merge consumes it; a dry run
+//!   only reports that it would cover the merge.
+//!
+//! Every write appends an `agent.github.policy_authorization.*` event.
+
+use rusqlite::{Connection, OptionalExtension, params};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use ua_core::{UaError, UaResult};
+use ua_store::WriteTx;
+
+use super::client::{BoundRepo, full_sha};
+use crate::families::continuity::same_label;
+use crate::families::governance::{bound_repo, normalize_repo};
+use crate::families::tasks::{emit, is_terminal, require_task, row_object, str_field};
+use crate::registry::{Registry, ToolCtx, tool};
+
+const DEFAULT_HOURS: u32 = 24;
+const MAX_HOURS: u32 = 720;
+const POLICY_REF_MAX: usize = 200;
+/// Rows a list scans before filtering.
+const SCAN_MAX: i64 = 2000;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordArgs {
+    /// `owner/name`: the repository the task's project is bound to.
+    pub repo: String,
+    /// The pull request number, when the head belongs to one (recorded, not matched).
+    pub pr: Option<u64>,
+    /// The exact head the policy covers: the full 40-character commit SHA.
+    pub head_sha: String,
+    /// The hub task the merge belongs to.
+    pub task_id: i64,
+    /// A short reference to the standing policy (1-200 characters, no
+    /// whitespace), e.g. `release-policy-2026-10` or `decision:42`. Never the
+    /// text of a conversation.
+    pub policy_ref: String,
+    /// Hours until it expires: default 24, 1-720.
+    pub expires_in_hours: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListArgs {
+    /// Only this repository (`owner/name`).
+    pub repo: Option<String>,
+    /// Only this pull request number.
+    pub pr: Option<u64>,
+    /// Only this task.
+    pub task_id: Option<i64>,
+    /// Only this exact head (40 hex).
+    pub head_sha: Option<String>,
+    /// Include consumed, revoked and expired rows (default: only valid ones).
+    #[serde(default)]
+    pub include_inactive: bool,
+    /// Rows to return, newest first (default 50, at most 500).
+    pub limit: Option<i64>,
+}
+
+fn policy_ref(raw: &str) -> UaResult<String> {
+    let r = raw.trim();
+    let ok = (1..=POLICY_REF_MAX).contains(&r.chars().count())
+        && r.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/#@".contains(c));
+    if ok {
+        Ok(r.to_string())
+    } else {
+        Err(UaError::invalid(format!(
+            "policy_ref must be 1-{POLICY_REF_MAX} characters of letters, digits and -_.:/#@ (a reference, not text)"
+        )))
+    }
+}
+
+fn after_hours(hours: u32) -> String {
+    let now = jiff::Timestamp::now();
+    ua_core::time::format_ts(now.checked_add(jiff::SignedDuration::from_hours(hours as i64)).unwrap_or(now))
+}
+
+fn expired(expires_at: &str) -> bool {
+    ua_core::time::parse_ts(expires_at).is_none_or(|t| t <= jiff::Timestamp::now())
+}
+
+fn public(mut row: Map<String, Value>) -> Value {
+    let status = str_field(&row, "status").unwrap_or_default().to_string();
+    let lapsed = str_field(&row, "expires_at").is_none_or(expired);
+    let state = if status == "active" && lapsed { "expired".to_string() } else { status.clone() };
+    row.insert("state".into(), json!(state));
+    row.insert("valid".into(), json!(status == "active" && !lapsed));
+    Value::Object(row)
+}
+
+fn get(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn.query_row("SELECT * FROM policy_authorizations WHERE id = ?1", [id], row_object).optional()?)
+}
+
+/// `policy_authorization_record`.
+async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
+    if !ctx.caller.is_human() {
+        return Err(UaError::denied(
+            "not_human",
+            "only a verified human records a policy authorization; an agent asks for an approval instead",
+        ));
+    }
+    let who = ctx.caller.label.clone();
+    let repo = normalize_repo(&a.repo)?;
+    let head = full_sha(&a.head_sha).ok_or_else(|| {
+        UaError::invalid("head_sha must be the full 40-character commit SHA (exact-head binding)")
+    })?;
+    let policy = policy_ref(&a.policy_ref)?;
+    let hours = a.expires_in_hours.unwrap_or(DEFAULT_HOURS);
+    if !(1..=MAX_HOURS).contains(&hours) {
+        return Err(UaError::invalid(format!("expires_in_hours must be 1-{MAX_HOURS}")));
+    }
+    let (id, pr) = (a.task_id, a.pr);
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            BoundRepo::check(tx, &repo)?;
+            let task = require_task(tx, id)?;
+            if is_terminal(str_field(&task, "status").unwrap_or("open")) {
+                return Err(UaError::conflict(format!("task {id} is closed; a policy authorization is a pre-merge step")));
+            }
+            let project = str_field(&task, "project").unwrap_or("default");
+            match bound_repo(tx, project)? {
+                Some(b) if b.eq_ignore_ascii_case(&repo) => {}
+                other => {
+                    return Err(UaError::denied(
+                        "repo_mismatch",
+                        format!(
+                            "task {id}'s project {project:?} is bound to {:?}, not {repo:?}",
+                            other.unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+            let claimant = str_field(&task, "claimed_by").map(str::to_string);
+            for holder in [claimant.as_deref(), str_field(&task, "next_owner")].into_iter().flatten() {
+                if same_label(Some(holder), &who) {
+                    return Err(UaError::denied(
+                        "self_authorization",
+                        format!("{who:?} holds task {id} and may not authorize merging its own work"),
+                    ));
+                }
+            }
+            let now = ua_core::time::now();
+            let expires = after_hours(hours);
+            tx.execute(
+                "INSERT INTO policy_authorizations (repo, pr, head_sha, task_id, policy_ref, authorized_by, \
+                 task_claimant, status, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9)",
+                params![repo, pr.map(|p| p as i64), head, id, policy, who, claimant, now, expires],
+            )?;
+            let auth_id = tx.last_insert_rowid();
+            emit(
+                tx,
+                "agent.github.policy_authorization.recorded",
+                json!({
+                    "authorization_id": auth_id, "repo": repo, "pr": pr, "head_sha": head, "task_id": id,
+                    "policy_ref": policy, "expires_at": expires,
+                }),
+                &who,
+            )?;
+            let row = get(tx, auth_id)?.unwrap_or_default();
+            Ok(json!({ "status": "recorded", "authorization": public(row) }))
+        })
+        .await
+}
+
+/// `policy_authorization_list`.
+async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
+    let repo = a.repo.as_deref().map(normalize_repo).transpose()?;
+    let head = a
+        .head_sha
+        .as_deref()
+        .map(|h| full_sha(h).ok_or_else(|| UaError::invalid("head_sha must be 40 hex")))
+        .transpose()?;
+    let limit = a.limit.unwrap_or(50).clamp(1, 500);
+    ctx.hub
+        .db()
+        .read_async(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT * FROM policy_authorizations WHERE (?1 IS NULL OR repo = ?1) AND (?2 IS NULL OR task_id = ?2) \
+                 AND (?3 IS NULL OR head_sha = ?3) AND (?5 IS NULL OR pr = ?5) ORDER BY id DESC LIMIT ?4",
+            )?;
+            let rows: Vec<Map<String, Value>> = stmt
+                .query_map(params![repo, a.task_id, head, SCAN_MAX, a.pr.map(|p| p as i64)], row_object)?
+                .collect::<Result<_, _>>()?;
+            let mut out: Vec<Value> =
+                rows.into_iter().map(public).filter(|r| a.include_inactive || r["valid"] == true).collect();
+            out.truncate(limit as usize);
+            Ok(json!({ "count": out.len(), "authorizations": out }))
+        })
+        .await
+}
+
+/// Check that authorization `auth_id` covers merging `head` of task
+/// `task_id` in `repo` for `caller`. Returns the row.
+pub(crate) fn covering(
+    conn: &Connection,
+    auth_id: i64,
+    task_id: i64,
+    repo: Option<&str>,
+    head: &str,
+    caller: &str,
+) -> UaResult<Map<String, Value>> {
+    let refuse = |why: String| UaError::denied("policy_authorization_mismatch", why);
+    let row =
+        get(conn, auth_id)?.ok_or_else(|| UaError::not_found(format!("policy authorization {auth_id}")))?;
+    if str_field(&row, "status") != Some("active") {
+        return Err(refuse(format!(
+            "policy authorization {auth_id} is {}",
+            str_field(&row, "status").unwrap_or("?")
+        )));
+    }
+    if str_field(&row, "expires_at").is_none_or(expired) {
+        return Err(refuse(format!("policy authorization {auth_id} has expired")));
+    }
+    if row.get("task_id").and_then(Value::as_i64) != Some(task_id) {
+        return Err(refuse(format!("policy authorization {auth_id} is for another task")));
+    }
+    let Some(repo) = repo else {
+        return Err(refuse(format!("task {task_id}'s project is not bound to a repository")));
+    };
+    if !str_field(&row, "repo").is_some_and(|r| r.eq_ignore_ascii_case(repo)) {
+        return Err(refuse(format!("policy authorization {auth_id} is for another repository")));
+    }
+    if str_field(&row, "head_sha") != full_sha(head).as_deref() {
+        return Err(refuse(format!(
+            "policy authorization {auth_id} covers head {}, not {head}: a new commit needs a new authorization",
+            str_field(&row, "head_sha").unwrap_or_default()
+        )));
+    }
+    if same_label(str_field(&row, "authorized_by"), caller) {
+        return Err(refuse("the authorizer may not spend its own authorization".into()));
+    }
+    Ok(row)
+}
+
+/// Spend authorization `auth_id` for a merge (inside the caller's write).
+pub(crate) fn consume(
+    tx: &mut WriteTx<'_>,
+    auth_id: i64,
+    task_id: i64,
+    head: &str,
+    caller: &str,
+) -> UaResult<()> {
+    let now = ua_core::time::now();
+    let n = tx.execute(
+        "UPDATE policy_authorizations SET status = 'consumed', consumed_at = ?2, consumed_by = ?3 \
+         WHERE id = ?1 AND status = 'active'",
+        params![auth_id, now, caller],
+    )?;
+    if n != 1 {
+        return Err(UaError::conflict(format!("policy authorization {auth_id} was spent meanwhile")));
+    }
+    emit(
+        tx,
+        "agent.github.policy_authorization.consumed",
+        json!({ "authorization_id": auth_id, "task_id": task_id, "head_sha": head, "tool": "git_merge_task" }),
+        caller,
+    )
+}
+
+pub fn register(r: &mut Registry) {
+    r.add(
+        tool(
+            "policy_authorization_record",
+            "Record that a standing policy covers merging one exact head (verified humans only): repo (the task \
+             project's bound owner/name), pr, head_sha (full 40 hex), task_id, policy_ref (a short reference), \
+             expires_in_hours (default 24, max 720). The task's claimant or next owner may not authorize its own \
+             work. git_merge_task(policy_authorization_id) then accepts it in place of a one-time approval for \
+             exactly that task, repository and head.",
+            record,
+        )
+        .family("approvals"),
+    );
+    r.add(
+        tool(
+            "policy_authorization_list",
+            "List policy authorizations newest first, each with state (active, expired, consumed, revoked) and \
+             valid. Filters: repo, pr, task_id, head_sha; include_inactive=true adds spent and expired rows.",
+            list,
+        )
+        .family("approvals")
+        .read_only(),
+    );
+}

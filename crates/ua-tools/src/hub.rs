@@ -33,7 +33,8 @@ impl Hub {
     }
 
     pub fn new(cfg: Config, db: Db) -> Self {
-        Self { inner: Arc::new(HubInner { cfg, db, ci: Arc::new(GitHubCiVerifier) }) }
+        let ci = Arc::new(GitHubCiVerifier::new(cfg.clone(), db.clone()));
+        Self { inner: Arc::new(HubInner { cfg, db, ci }) }
     }
 
     /// The same hub with another CI verifier (tests, or a forge client).

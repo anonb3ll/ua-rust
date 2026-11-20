@@ -56,6 +56,14 @@ approval_tools = ["git_merge_task"]
 # Run due cron routines from `ua serve` once a minute, and allow routine_fire.
 routines_enabled = false
 
+# GitHub connector (docs/github.md). The *_env settings name environment
+# variables; the token and secret are never written here or to the database.
+# Use names outside UA_* (those are read as configuration).
+# github_api_url = "https://api.github.com"   # or a GHES API root
+# github_token_env = "HUB_GITHUB_TOKEN"        # read-only token for the bound repositories
+# github_webhook_secret_env = "HUB_GITHUB_WEBHOOK_SECRET"
+# github_poll_interval_s = 0                   # poll open PRs under `ua serve`; 0 = off
+
 # Default autonomous-cycle budgets.
 autonomy_max_time_s = 3600.0
 autonomy_max_tokens = 100000

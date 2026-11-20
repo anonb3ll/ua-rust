@@ -27,6 +27,7 @@ event in the same transaction.
 | `queue_park` | Holder, lifecycle operator, human (see below) | Park a task and fold its open descendants |
 | `queue_fold` | Holder, lifecycle operator, human (see below) | Fold a later child into its parked root |
 | `queue_unpark` | Holder, lifecycle operator, human (see below) | Restore a parked root and its folded children |
+| `queue_close_merged` | Anyone (dry run); the `queue_park` callers to close | Close tasks whose linked pull request merged |
 
 Delegation stats are a read on `observability_manage` (see below).
 
@@ -89,9 +90,27 @@ The caller does not choose what the hub looks up:
 The hub resolves CI references through the `CiVerifier` trait
 (`crates/ua-tools/src/ci.rs`), held by the hub and replaceable with
 `Hub::with_ci_verifier`. It never shells out to a forge CLI. The built-in
-`GitHubCiVerifier` is a stub until the native GitHub client exists: every
-lookup answers `unverifiable`, so checks stay `attested` with the reason
-recorded in `verification`.
+`GitHubCiVerifier` looks the run up through the native GitHub client in the
+bound repository: an Actions workflow run, else a check run, by id. It is
+`verified` only when the run (or the named job, in every attempt) completed
+at exactly the claimed head with the claimed conclusion; another head or
+conclusion, or a missing or skipped job, is `mismatch`; a run still going,
+not found or rate limited is `insufficient`. Without a token
+(`github_token_env`) no request is made and the verdict is `unverifiable`.
+See [github](github.md#ci-verification).
+
+A completed `check_run`, `check_suite` or `workflow_run` webhook (or a new
+PR head seen by the poller) re-verifies every check recorded at that head,
+so a check recorded while CI was still running becomes `verified` without
+another call.
+
+### Review queue and `review_ready`
+
+`task_list(stage="review")` lists unfinished tasks at stage `review` (any
+stage works; pass `status` to narrow). When a task is at stage `review`,
+expects at least one check and every expected check is `verified` at the
+capsule's head, the hub sends one `review_ready` notification through the
+notify webhook, once per head. See [github](github.md#the-review-queue-and-review_ready).
 
 ## Session handoff notes
 
@@ -198,8 +217,17 @@ are all done, judged once its notes carry a `VERDICT:` line) and
 `ready_unowned` (tasks whose prerequisites are all closed and that have no
 next owner, claimant or agent lane).
 
-Close-on-merge (`queue_close_merged` in the Python hub) needs merged-PR
-evidence from the forge and waits for the native GitHub client.
+**Close-on-merge.** A task whose `evidence_ref` or notes link a pull request
+(`https://<host>/<owner>/<name>/pull/<n>` or `<owner>/<name>#<n>`) in its
+project's bound repository closes when that PR merges: `task_update` to
+`done` with the merge commit as `evidence_ref` and a
+`[github: closed-on-merge ...]` notes line, fenced on the task's
+`updated_at`. Not when it links two PRs (`ambiguous`), is live, protected
+(the park rules above), has open descendants, or names another branch than
+the PR's head (`blocked`). Merges arrive by webhook or poll, or on demand:
+`queue_close_merged` (params `dry_run`, default true, and `repo`) looks every
+linked PR up on GitHub. Each close appends `agent.github.closed_on_merge`.
+Details in [github](github.md#close-on-merge).
 
 ## Delegation stats
 
@@ -223,8 +251,9 @@ moves to the parking columns and is un-archived; its notes are kept.
 - Parking uses its own columns instead of `archived_at` plus notes markers.
 - `queue_fold` folds only into a parked root, never into a folded task, so
   unparking the root always restores the whole fold.
-- `queue_close_merged` and the sweep's close proposals wait for the GitHub
-  client; the CI verifier is a stub until then.
+- `queue_close_merged` matches a task's `evidence_ref` and notes rather than
+  the PR-watch cursor, and runs from the webhook and poller as well as on
+  demand. The sweep does not propose closes.
 - Session-handoff failover and context epochs are not ported (failover had
   no tool surface in the Python hub); an imported `assigned` note can still
   be acknowledged.

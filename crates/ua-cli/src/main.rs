@@ -227,6 +227,9 @@ async fn main() -> anyhow::Result<()> {
             // Expire waits and lapsed node leases, and retry owed command
             // notices, for every node.
             let _node_sweeper = ua_tools::families::node_queue::spawn_sweeper(&hub);
+            // Poll the bound repositories' open pull requests when no webhook
+            // can reach this hub (github_poll_interval_s; 0 = off).
+            let _github_poller = ua_tools::families::github::spawn_poller(&hub);
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {
