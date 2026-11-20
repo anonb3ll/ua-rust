@@ -1412,6 +1412,8 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
     let deep = a.refresh;
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
+    let org = ctx.hub.db().read_async(super::org::registry_health).await?;
+    let org_status = if org.live { LIVE } else { MISCONFIGURED };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
@@ -1431,6 +1433,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         zulip_check(cfg),
         policy_check(cfg),
         fleet_nodes_check(&facts),
+        finding("org_registry", org_status, org.detail, "org registry"),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
     let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]
@@ -1652,7 +1655,7 @@ pub fn register(r: &mut Registry) {
             "Read-only LIVE/DORMANT/DEGRADED/MISCONFIGURED/UNKNOWN report over every config-gated capability of \
              this build: hub auth and token sources, HTTP bind, approval gating, vault, workspace root, search \
              provider, semantic search (embeddings feature), ledger chain, database size and WAL, schema parts, \
-             notification webhook and policy file. Each finding names the setting that gates it. Never returns \
+             notification webhook, policy file and the org registry. Each finding names the setting that gates it. Never returns \
              secret values. refresh=true adds SQLite quick_check.",
             system_doctor,
         )

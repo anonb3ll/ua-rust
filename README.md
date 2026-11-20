@@ -12,7 +12,7 @@ existing MCP client can point at this process unchanged. That program is a
 separate codebase. Building and running this repository does not require it.
 The storage schema and some of the user interface are new.
 
-> **Status: alpha.** 214 tools are registered and the core families are ported.
+> **Status: alpha.** 219 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -36,6 +36,7 @@ a rule is written once and holds for every client.
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
 | `ua-store` | SQLite storage, migrations, repositories, the event ledger |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
+| `ua-org` | Organization registry: offices, roles and seats |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
@@ -157,7 +158,8 @@ role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
 installation flow), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,
 `/api/action/node-session`), the provenance graph and evidence export, billing
-and usage ledgers, and tenancy (`org_id`). Work products
+and usage ledgers, and tenancy beyond the org registry (`org_id` on the
+existing tables, memberships, teams). Work products
 (`/api/work-products*`) are not ported pending an explicit product decision
 (hub task #2658) and answer 501.
 

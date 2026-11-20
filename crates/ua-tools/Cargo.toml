@@ -18,6 +18,7 @@ subtle.workspace = true
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
 ua-memory.workspace = true
+ua-org.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
