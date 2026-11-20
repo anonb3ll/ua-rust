@@ -1,35 +1,10 @@
-//! Memory notes: persistent, searchable notes shared by every agent session.
+//! Storage schema of the memory domain: the notes table with its FTS5 index
+//! and triggers, the version history and the note vectors.
 //!
-//! Tools: `memory_save`, `memory_search`, `memory_list`, `memory_get`,
-//! `memory_delete`, `memory_restore`, `memory_feedback`,
-//! `memory_prune_candidates` and `recall_maintenance`.
-//!
-//! Storage: the `memory` table, an FTS5 index over title, content and tags
-//! (`memory_fts`), prior versions captured by a trigger (`memory_versions`),
-//! and optional note vectors (`memory_embeddings`, little-endian f32 BLOBs).
-//!
-//! Search fuses a lexical leg (FTS5 bm25), an optional semantic leg (cosine
-//! over stored vectors, see [`embed`]) and a recency leg with reciprocal rank
-//! fusion, then applies a bounded prior from salience, feedback confidence
-//! and upvotes. Without the `embeddings` cargo feature the semantic leg is
-//! off and search is lexical only.
-
-mod embed;
-mod lifecycle;
-mod maintenance;
-mod note;
-mod rank;
-mod save;
-mod search;
-
-pub use embed::{
-    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
-};
-pub(crate) use note::mark_untrusted;
+//! Released parts are checksum-locked by `ua-store` (SHA-256 of `sql`): never
+//! edit one; add a new versioned part (`"memory.v2"`) instead.
 
 use ua_store::SchemaPart;
-
-use crate::registry::Registry;
 
 /// Notes, their full-text index and the triggers that keep it current.
 ///
@@ -153,11 +128,4 @@ CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(mode
 
 pub fn schema_parts() -> Vec<SchemaPart> {
     vec![SCHEMA, VERSIONS_SCHEMA, EMBEDDINGS_SCHEMA]
-}
-
-pub fn register(r: &mut Registry) {
-    save::register(r);
-    search::register(r);
-    lifecycle::register(r);
-    maintenance::register(r);
 }

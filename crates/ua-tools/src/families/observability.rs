@@ -1102,7 +1102,7 @@ fn search_check(reg: &Registry) -> Value {
 
 fn embeddings_check(facts: &DbFacts) -> Value {
     let gate = "cargo feature `embeddings`, UA_EMBED_MODEL";
-    if !cfg!(feature = "embeddings") {
+    if !ua_memory::EMBEDDINGS_ENABLED {
         return finding(
             "semantic_search",
             DORMANT,
@@ -1455,7 +1455,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         "build": {
             "name": "ua-rust",
             "version": env!("CARGO_PKG_VERSION"),
-            "features": { "embeddings": cfg!(feature = "embeddings") },
+            "features": { "embeddings": ua_memory::EMBEDDINGS_ENABLED },
             "tool_count": reg.len(),
         },
     }))
