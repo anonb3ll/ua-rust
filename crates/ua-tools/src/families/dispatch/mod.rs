@@ -416,7 +416,7 @@ pub(crate) fn insert_receipt(
     body.insert("reported_by".into(), json!(reported_by));
     body.insert("event_ulid".into(), json!(event_ulid));
     body.insert("created_at".into(), json!(created_at));
-    let hash = hex::encode(Sha256::digest(Value::Object(body).to_string().as_bytes()));
+    let hash = hex::encode(Sha256::digest(ua_core::canonical::to_string(&Value::Object(body)).as_bytes()));
     tx.execute(
         "INSERT INTO dispatch_receipts (run_id, fence, task_id, agent_label, state, source, reported_by, \
          evidence_ref, failure_reason, exit_code, termination_outcome, event_ulid, receipt_hash, created_at) \

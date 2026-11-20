@@ -187,7 +187,7 @@ pub async fn show(
     // Unknown scopes are dropped; the hub grants `mcp` (tools are filtered by profile).
     let _ = q.scope;
 
-    let Some(session) = session_from_headers(&state, &headers) else {
+    let Some(session) = session_from_headers(&state, &headers).await else {
         let next = uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_default();
         let target = url::form_urlencoded::Serializer::new(String::new()).append_pair("next", &next).finish();
         return Redirect::to(&format!("/login?{target}")).into_response();
@@ -276,7 +276,7 @@ pub async fn decide(
         return not_enabled();
     }
     let iss = issuer(cfg);
-    let Some(session) = session_from_headers(&state, &headers) else {
+    let Some(session) = session_from_headers(&state, &headers).await else {
         return error_page(StatusCode::UNAUTHORIZED, "your session has ended; sign in and start again");
     };
     if !csrf_matches(&session, Some(&f.csrf)) {

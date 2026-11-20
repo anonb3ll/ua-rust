@@ -1415,8 +1415,12 @@ pub(crate) fn sweep_tx(tx: &mut WriteTx<'_>, node: Option<&str>, actor: &str) ->
     Ok(json!({ "waits_expired": expired, "leases_failed": failed }))
 }
 
-/// Run [`sweep`] every `node_wait_sweep_s` seconds (0: never).
-pub fn spawn_sweeper(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
+/// Run [`sweep`] every `node_wait_sweep_s` seconds (0: never), until `ct` is
+/// cancelled; a sweep in progress finishes first.
+pub fn spawn_sweeper(
+    hub: &Hub,
+    ct: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let every = hub.cfg().node_wait_sweep_s;
     if every == 0 {
         return None;
@@ -1426,7 +1430,11 @@ pub fn spawn_sweeper(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(every));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return,
+                _ = tick.tick() => {}
+            }
             let h = hub.clone();
             match tokio::task::spawn_blocking(move || sweep(&h, None)).await {
                 Ok(Ok(_)) => {}

@@ -37,7 +37,7 @@ pub struct TestHub {
 impl TestHub {
     pub fn new(cfg: Config) -> Self {
         let hub = Hub::in_memory(cfg).unwrap();
-        let state = AppState { hub, registry: Arc::new(builtin_registry()) };
+        let state = AppState::new(hub, Arc::new(builtin_registry()));
         let app = ua_server::router(state.clone(), CancellationToken::new());
         Self { state, app }
     }

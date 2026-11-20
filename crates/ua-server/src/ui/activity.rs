@@ -1,9 +1,13 @@
-//! Activity: the ledger as a live feed, with the hash-chain check.
+//! Activity: the ledger as a live feed, with the hash-chain check on demand.
 //!
 //! The page backfills recent events through `event_log_query`, then the
 //! htmx SSE extension appends rendered rows from `/ui/activity/stream`, which
 //! uses the same scoped stream as `/api/events/stream` ([`crate::events`])
 //! but sends HTML fragments (event name `ledger`) instead of JSON.
+//!
+//! `event_log_verify` recomputes the whole chain, O(ledger size), so the page
+//! runs it only when asked (`?verify=1`, the "Verify the hash chain" button),
+//! never on an ordinary render or reload.
 
 use std::convert::Infallible;
 
@@ -70,6 +74,8 @@ struct EventRowTpl<'a> {
 #[derive(Debug, Default, Deserialize)]
 pub struct ActivityQuery {
     pub channel_prefix: Option<String>,
+    /// `1`: run `event_log_verify` for this render.
+    pub verify: Option<String>,
 }
 
 pub struct ChainStatus {
@@ -86,7 +92,8 @@ pub struct ActivityPage {
     pub prefix: String,
     pub stream_url: String,
     pub events: Result<Vec<EventRow>, String>,
-    pub chain: Result<ChainStatus, String>,
+    /// `None` until the operator asks for the check.
+    pub chain: Option<Result<ChainStatus, String>>,
     pub presets: [&'static str; 7],
 }
 
@@ -107,12 +114,15 @@ fn clean_prefix(p: &Option<String>) -> String {
 pub async fn page(ui: Ui, Query(q): Query<ActivityQuery>) -> ActivityPage {
     let prefix = clean_prefix(&q.channel_prefix);
     let events = backfill(&ui, &prefix).await;
-    let chain = ui.read("event_log_verify", json!({})).await.map(|v| ChainStatus {
-        ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        checked: text(&v, "checked"),
-        first_bad_seq: text(&v, "first_bad_seq"),
-        reason: text(&v, "reason"),
-    });
+    let chain = match q.verify.as_deref() {
+        Some("1") => Some(ui.read("event_log_verify", json!({})).await.map(|v| ChainStatus {
+            ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            checked: text(&v, "checked"),
+            first_bad_seq: text(&v, "first_bad_seq"),
+            reason: text(&v, "reason"),
+        })),
+        _ => None,
+    };
     let stream_url = if prefix.is_empty() {
         "/ui/activity/stream".to_string()
     } else {

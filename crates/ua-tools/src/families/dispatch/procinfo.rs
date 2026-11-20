@@ -137,3 +137,21 @@ pub fn kill_group(pgid: Option<u32>) {
 
 #[cfg(not(unix))]
 pub fn kill_group(_pgid: Option<u32>) {}
+
+/// SIGTERM the process group `pgid` (ids 0 and 1 are ignored): ask it to
+/// stop before [`kill_group`].
+#[cfg(unix)]
+pub fn term_group(pgid: Option<u32>) {
+    if let Some(g) = pgid.and_then(|p| libc::pid_t::try_from(p).ok())
+        && g > 1
+    {
+        // SAFETY: killpg only sends a signal. Callers pass the group of a
+        // child this hub spawned as group leader.
+        unsafe {
+            libc::killpg(g, libc::SIGTERM);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn term_group(_pgid: Option<u32>) {}
