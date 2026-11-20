@@ -16,6 +16,12 @@
 //! - The program is the absolute path the approval bound
 //!   ([`resolve_program`]), not a name looked up again at launch.
 //! - The run log directory is created 0700 and each log 0600.
+//! - Every supervisor runs in one [`TaskTracker`]. On a hub shutdown
+//!   ([`drain_supervisors`]) runs get until shortly before the deadline to
+//!   finish; then each live child's group gets SIGTERM, SIGKILL after
+//!   [`TERM_GRACE`], a final SIGKILL sweep for any grandchild left in the
+//!   group, and the run is recorded `retryable` with failure reason and
+//!   receipt source `hub_shutdown`, so it can be resumed.
 //! - Children this process started are kept in an in-process registry keyed
 //!   by run id and are signalled directly. A process group recorded by an
 //!   earlier hub process is signalled only when it is proven to be that
@@ -29,6 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -40,11 +47,12 @@ use ua_core::config::HarnessConfig;
 use ua_core::{Config, UaError, UaResult};
 
 pub use super::procinfo::{ProcIdentity, proc_identity};
-use super::procinfo::{group_alive, kill_group, pid_alive};
+use super::procinfo::{group_alive, kill_group, pid_alive, term_group};
 use super::{
     Edge, ExitInfo, Outcome, Run, after_seconds, load_run, now, record_transition, refusal, transition,
 };
 use crate::hub::Hub;
+use tokio_util::task::TaskTracker;
 
 /// Parent environment names any child may inherit.
 pub const SAFE_ENV: &[&str] = &[
@@ -234,6 +242,81 @@ struct LiveChild {
 }
 
 static LIVE: LazyLock<Mutex<HashMap<String, LiveChild>>> = LazyLock::new(Mutex::default);
+
+/// Every supervisor task this process started.
+static SUPERVISORS: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);
+
+/// Set once the hub stops its runs for a shutdown: a supervisor woken then
+/// stops its child gracefully and records `hub_shutdown`.
+static HUB_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// How long a child's group has after SIGTERM before SIGKILL.
+pub const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Time kept back before the shutdown deadline to stop runs and record them.
+const STOP_BUDGET: Duration = Duration::from_secs(3);
+
+/// What [`drain_supervisors`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Runs still going when stopping began, stopped and recorded.
+    pub stopped: usize,
+    /// Supervisors still running at the deadline.
+    pub unfinished: usize,
+}
+
+/// Drain the dispatch supervisors for a hub shutdown ending at `deadline`.
+/// Runs may finish on their own until [`STOP_BUDGET`] before it; then every
+/// live child is stopped (SIGTERM to its group, SIGKILL after
+/// [`TERM_GRACE`], a SIGKILL sweep of the group) and its run recorded
+/// `retryable` with a `hub_shutdown` receipt.
+pub async fn drain_supervisors(deadline: tokio::time::Instant) -> DrainReport {
+    SUPERVISORS.close();
+    let stop_at = deadline.checked_sub(STOP_BUDGET).unwrap_or(deadline).max(tokio::time::Instant::now());
+    if tokio::time::timeout_at(stop_at, SUPERVISORS.wait()).await.is_ok() {
+        return DrainReport::default();
+    }
+    HUB_SHUTDOWN.store(true, Ordering::SeqCst);
+    let kills: Vec<Arc<Notify>> =
+        LIVE.lock().map(|m| m.values().map(|c| c.kill.clone()).collect()).unwrap_or_default();
+    for k in &kills {
+        // A permit is stored when the supervisor is not waiting yet.
+        k.notify_one();
+    }
+    let finished = tokio::time::timeout_at(deadline, SUPERVISORS.wait()).await.is_ok();
+    DrainReport { stopped: kills.len(), unfinished: if finished { 0 } else { SUPERVISORS.len() } }
+}
+
+/// SIGKILL every live child's group at once, recording nothing: the last
+/// resort of a forced exit (a second shutdown signal). The next hub
+/// process's startup sweep reconciles the runs.
+pub fn kill_live_groups() -> usize {
+    let groups: Vec<Option<u32>> =
+        LIVE.lock().map(|m| m.values().map(|c| c.pgid).collect()).unwrap_or_default();
+    for g in &groups {
+        kill_group(*g);
+    }
+    groups.len()
+}
+
+/// Stop a child for a hub shutdown: SIGTERM its group, SIGKILL after
+/// [`TERM_GRACE`], then sweep the group so no grandchild outlives the run.
+async fn stop_for_shutdown(
+    pid: Option<u32>,
+    child: &mut tokio::process::Child,
+) -> Option<std::process::ExitStatus> {
+    term_group(pid);
+    let status = match tokio::time::timeout(TERM_GRACE, child.wait()).await {
+        Ok(st) => st.ok(),
+        Err(_) => {
+            kill_group(pid);
+            let _ = child.start_kill();
+            child.wait().await.ok()
+        }
+    };
+    kill_group(pid);
+    status
+}
 
 fn live_insert(run_id: &str, fence: i64, pgid: Option<u32>, kill: Arc<Notify>) {
     if let Ok(mut m) = LIVE.lock() {
@@ -654,7 +737,7 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         "stub": false,
     });
     let hub2 = hub.clone();
-    tokio::spawn(async move {
+    SUPERVISORS.spawn(async move {
         supervise(hub2, spec, child, stdout, stderr, file, pid, kill).await;
     });
     Ok(reply)
@@ -798,6 +881,7 @@ async fn supervise(
     let renew_every = Duration::from_secs((lease / 3).max(1));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(spec.harness.timeout_s.max(1));
     let mut timed_out = false;
+    let mut hub_shutdown = false;
     let status = loop {
         tokio::select! {
             st = child.wait() => break st.ok(),
@@ -808,6 +892,10 @@ async fn supervise(
                 break child.wait().await.ok();
             }
             _ = kill.notified() => {
+                if HUB_SHUTDOWN.load(Ordering::SeqCst) {
+                    hub_shutdown = true;
+                    break stop_for_shutdown(pid, &mut child).await;
+                }
                 kill_group(pid);
                 let _ = child.start_kill();
                 break child.wait().await.ok();
@@ -867,7 +955,11 @@ async fn supervise(
         output_truncated: total > written,
     };
     let mut quota_signal = None;
-    let (state, reason, class, evidence) = if timed_out {
+    let source = if hub_shutdown { "hub_shutdown" } else { "supervisor" };
+    let (state, reason, class, evidence) = if hub_shutdown {
+        // Not the run's failure: hand it back for a resume.
+        ("retryable", Some("hub_shutdown".to_string()), Some("hub_shutdown".to_string()), None)
+    } else if timed_out {
         (
             "failed",
             Some(format!("timeout_after_{}s", spec.harness.timeout_s)),
@@ -914,7 +1006,7 @@ async fn supervise(
                     fence: Some(fence),
                     state,
                     actor: "dispatch-supervisor",
-                    source: "supervisor",
+                    source,
                     evidence,
                     failure_reason: reason,
                     failure_class: class,

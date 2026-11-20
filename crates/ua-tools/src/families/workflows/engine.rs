@@ -159,8 +159,17 @@ pub(crate) struct Definition {
 
 impl Definition {
     /// Content digest; a resumed run must find the same definition.
+    ///
+    /// Struct fields serialize in declaration order; the step arguments are
+    /// rebuilt in canonical key order first ([`ua_core::canonical::sorted`]),
+    /// so the digest does not depend on serde_json's map order (or on the key
+    /// order of the YAML a definition came from once `preserve_order` is on).
     pub(crate) fn digest(&self) -> String {
-        sha256_hex(&serde_json::to_string(self).unwrap_or_default())
+        let mut canon = self.clone();
+        for step in &mut canon.steps {
+            step.args = ua_core::canonical::sorted(&step.args);
+        }
+        sha256_hex(&serde_json::to_string(&canon).unwrap_or_default())
     }
 
     /// Check names, references and tools. `curated` restricts tools to
