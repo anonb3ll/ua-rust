@@ -4,12 +4,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{holds, lifecycle};
+use crate::families::continuity;
 
 /// Why work may not be handed out right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Blocked {
     /// Stable reason code: `agent_paused`, `agent_terminated`,
-    /// `agent_retired` or `task_held`.
+    /// `agent_retired`, `task_held` or `task_parked`.
     pub code: &'static str,
     pub message: String,
 }
@@ -35,6 +36,9 @@ impl Blocked {
 ///   lets through so an in-flight run can finish and report). A due
 ///   `after_active_runs_finish` hold is released here first, in this
 ///   transaction.
+/// - `task_id`: refused while the task is parked or folded into a parked
+///   root (`queue_park`), renewals included: parking refuses a task with a
+///   live claim, so nothing parked has one to renew.
 ///
 /// Every path that hands out work calls this: `task_claim`, `task_update`
 /// into `doing`, `dispatch_task`, `dispatch_resume`, every node enqueue
@@ -51,6 +55,11 @@ pub(crate) fn claim_block(
         && let Some(stopped) = lifecycle::stopped(tx, agent)?
     {
         return Ok(Some(Blocked { code: stopped.code(), message: stopped.refusal(agent) }));
+    }
+    if let Some(task_id) = task_id
+        && let Some(message) = continuity::parked_block(tx, task_id)?
+    {
+        return Ok(Some(Blocked { code: "task_parked", message }));
     }
     if let Some(task_id) = task_id
         && !renewal

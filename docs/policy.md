@@ -195,6 +195,7 @@ before any approval is asked for), `node_claim` and, for the agent part,
 |---|---|
 | `agent_paused`, `agent_terminated`, `agent_retired` | The agent that would hold the work (the claimant, the dispatch target, or the node's owner) is in that state. |
 | `task_held` | The task is a member of an active subtree hold. A live renewal by the current claimant passes. |
+| `task_parked` | The task is parked or folded into a parked root (`queue_park`, see [continuity](continuity.md#queue-closure)). Unpark it first. |
 
 `node_claim` refuses a stopped owner after its sweep has committed, and skips
 a held task's items, which stay queued until the hold is released.

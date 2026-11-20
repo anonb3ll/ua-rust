@@ -19,6 +19,7 @@
 //! Refusals are written to the ledger as `agent.gateway.decision` events.
 
 pub mod approvals;
+pub mod ci;
 pub mod config_revisions;
 pub mod families;
 pub mod hub;
