@@ -219,7 +219,10 @@ async fn journal_export_reads_every_namespace() {
     .await;
     assert_eq!(mine["rows"], 1);
 
-    let err = reg.call(&e.hub, &who, "export_data", json!({ "action": "manifest" })).await.unwrap_err();
+    let err = reg.call(&e.hub, &who, "export_data", json!({ "action": "import" })).await.unwrap_err();
+    assert_eq!(err.code(), "invalid_argument");
+    assert!(err.to_string().contains("not implemented"), "{err}");
+    let err = reg.call(&e.hub, &who, "export_data", json!({ "action": "rollback" })).await.unwrap_err();
     assert_eq!(err.code(), "invalid_argument");
     let err = reg.call(&e.hub, &who, "export_data", json!({ "action": "nope" })).await.unwrap_err();
     assert_eq!(err.code(), "invalid_argument");

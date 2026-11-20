@@ -316,6 +316,9 @@ pub struct Config {
     /// The web host pull request links must name (`https://<host>/owner/name/pull/n`).
     /// Unset: `github.com` for the public API, else the host of `github_api_url`.
     pub github_web_host: Option<String>,
+    /// The origin label stamped on migration manifests
+    /// (`export_migration_manifest`). Unset: `local`.
+    pub source_host: Option<String>,
     /// Test hook: a GitHub token handed in directly instead of through
     /// `github_token_env`. It cannot be set from TOML or the environment.
     #[serde(skip)]
@@ -655,6 +658,7 @@ impl Default for Config {
             github_webhook_max_age_hours: 24,
             github_merge_branches: BTreeMap::new(),
             github_web_host: None,
+            source_host: None,
             github_token_value: None,
             github_webhook_secret_value: None,
             managed_secret_key: None,
