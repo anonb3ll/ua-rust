@@ -710,3 +710,29 @@ async fn run_cmd_runs_cargo_under_a_trusted_ancestor_cargo_config_while_it_is_un
     assert!(reason.contains(&other.display().to_string()), "{reason}");
     assert!(!reason.contains(&planted.display().to_string()), "the trusted file is not named: {reason}");
 }
+
+#[tokio::test]
+async fn allowlist_refusals_do_not_reveal_membership_to_non_operators() {
+    let env = setup_with(|c| c.shell_allowlist = vec!["echo".into(), "git".into()]);
+    let dev = agent("builder-2", Profile::Developer);
+    // Not allowlisted, and allowlisted but refused for its arguments: the
+    // same answer, which names no program.
+    let mut texts = Vec::new();
+    for cmd in ["rm notes.txt", "git reset --hard", "git -c core.pager=x log"] {
+        let e = env.reg.call(&env.hub, &dev, "run_cmd", json!({ "command": cmd })).await.unwrap_err();
+        assert_eq!(reason(&e), "command_refused", "{cmd}");
+        texts.push(e.to_string());
+        let r = env.reg.call(&env.hub, &dev, "run_cmd_check", json!({ "command": cmd })).await.unwrap();
+        let text = r.to_string();
+        assert!(
+            !text.contains("not in the command allowlist") && !text.contains("destructive command"),
+            "{text}"
+        );
+    }
+    assert!(texts.windows(2).all(|w| w[0] == w[1]), "{texts:?}");
+    // An operator still sees why.
+    let e = env.call("run_cmd", json!({ "command": "rm notes.txt" })).await.unwrap_err();
+    assert_eq!(reason(&e), "program_not_allowed");
+    let e = env.call("run_cmd", json!({ "command": "git reset --hard" })).await.unwrap_err();
+    assert_eq!(reason(&e), "destructive");
+}

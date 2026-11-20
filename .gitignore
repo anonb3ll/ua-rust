@@ -7,3 +7,11 @@
 .claude/
 /.worktrees/
 .ruff_cache/
+# Credentials and key material never belong in the repository.
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json

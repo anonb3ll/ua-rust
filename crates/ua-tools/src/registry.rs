@@ -50,7 +50,35 @@ pub struct ToolDef {
     /// instead of the arguments themselves, so a value that must never be
     /// stored (a secret) is not parked in the approvals table.
     pub gate_payload: Option<GatePayload>,
+    /// Calls whose handler may ask the approval gate itself, on values it
+    /// resolves, besides any registry gate: such a call cannot be requested
+    /// ahead (`POST /api/approvals/request` answers 409). Unlike
+    /// [`ToolDef::gates_in_handler`] it does not change the call path.
+    pub handler_may_gate: HandlerGate,
+    /// An argument carries a secret (a token or credential value). Gating
+    /// such a tool needs a `gate_payload` projection; without one the gate
+    /// refuses rather than park the secret (`secret_args_unprojected`).
+    pub secret_args: bool,
+    /// Deserializes arguments into the tool's typed argument struct, so a
+    /// request can be checked without running the handler.
+    check: Checker,
     handler: Handler,
+}
+
+type Checker = Arc<dyn Fn(&Value) -> UaResult<()> + Send + Sync>;
+
+/// Which calls of a tool may gate inside its handler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HandlerGate {
+    /// Never: only the registry gate applies.
+    #[default]
+    Never,
+    /// Any call.
+    Always,
+    /// Calls whose `action` argument is one of these.
+    Actions(&'static [&'static str]),
+    /// Calls that carry this argument (not null).
+    WithArg(&'static str),
 }
 
 /// Maps a call's arguments to the payload its approval binds.
@@ -96,6 +124,40 @@ impl ToolDef {
         self.gates_in_handler
             || self.handler_gate_arg.is_some_and(|k| args.get(k).is_some_and(|v| !v.is_null()))
     }
+
+    /// The handler may gate this call itself (see [`ToolDef::handler_may_gate`]).
+    pub fn handler_may_gate(mut self, when: HandlerGate) -> Self {
+        self.handler_may_gate = when;
+        self
+    }
+
+    /// An argument carries a secret (see [`ToolDef::secret_args`]).
+    pub fn secret_args(mut self) -> Self {
+        self.secret_args = true;
+        self
+    }
+
+    /// Whether this call's approval is (or may be) decided inside the
+    /// handler on values only it resolves, so it cannot be requested ahead.
+    pub fn handler_decides(&self, args: &Value) -> bool {
+        self.handler_gates(args)
+            || match self.handler_may_gate {
+                HandlerGate::Never => false,
+                HandlerGate::Always => true,
+                HandlerGate::Actions(list) => {
+                    args.get("action").and_then(Value::as_str).is_some_and(|a| list.contains(&a.trim()))
+                }
+                HandlerGate::WithArg(k) => {
+                    args.get(k).is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+                }
+            }
+    }
+
+    /// Check `args` against the tool's typed arguments (unknown fields are
+    /// refused) without running it.
+    pub fn check_args(&self, args: &Value) -> UaResult<()> {
+        (self.check)(args)
+    }
     /// Gate on `f(config, args)` rather than on the raw arguments.
     pub fn gate_payload(mut self, f: GatePayload) -> Self {
         self.gate_payload = Some(f);
@@ -117,6 +179,10 @@ where
         obj.entry("type").or_insert(json!("object"));
         obj.entry("properties").or_insert(json!({}));
     }
+    let check: Checker = Arc::new(|raw: &Value| {
+        let raw = if raw.is_null() { json!({}) } else { raw.clone() };
+        serde_json::from_value::<A>(raw).map(drop).map_err(|e| UaError::invalid(e.to_string()))
+    });
     let f = Arc::new(f);
     let handler: Handler = Arc::new(move |ctx, raw| {
         let f = f.clone();
@@ -136,6 +202,9 @@ where
         gates_in_handler: false,
         handler_gate_arg: None,
         gate_payload: None,
+        handler_may_gate: HandlerGate::Never,
+        secret_args: false,
+        check,
         handler,
     }
 }
@@ -198,137 +267,18 @@ impl Registry {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
-
-        // A hub-internal identity with a narrow grant may make only the calls
-        // the grant names, whatever its profile or enforce_profile say.
-        if let Some(why) = crate::families::github::grant_refusal(caller, name, &args) {
-            let err = UaError::denied("grant_denied", why);
-            record_decision(hub, caller, name, &err).await;
-            return Err(err);
-        }
-        // A session credential's grant is the outer limit: no profile,
-        // policy or approval can widen it. The `acp-session` profile without
-        // a grant (it can only be reached by misconfiguration) gets nothing.
-        let args = match crate::grant::current() {
-            Some(g) => match g.narrow(name, args) {
-                Ok(a) => a,
-                Err(err) => {
-                    record_decision(hub, caller, name, &err).await;
-                    return Err(err);
-                }
-            },
-            None if caller.profile == ua_core::Profile::AcpSession => {
-                let err = UaError::denied(
-                    "session_grant_required",
-                    "the acp-session profile runs only under a verified session credential",
-                );
-                record_decision(hub, caller, name, &err).await;
-                return Err(err);
-            }
-            None => args,
-        };
-
-        // The policy file is read once per call (cached by mtime). A file that
-        // cannot be loaded refuses the call below, after the profile check.
-        let loaded = hub.cfg().policy_file.as_deref().map(policy::load);
-
-        // A policy overlay may lower an agent's profile below its default.
-        let clamped;
-        let caller = match &loaded {
-            Some(Ok(p)) if caller.enforce_profile && caller.kind != ActorKind::Human => {
-                let code_default = crate::sessions::default_profile(hub, &caller.label);
-                match policy::overlay_profile(p, &caller.label, code_default, self.tools.keys().copied()) {
-                    Some(overlay) if caller.profile.rank() > overlay.rank() => {
-                        clamped = Caller { profile: overlay, ..caller.clone() };
-                        &clamped
-                    }
-                    _ => caller,
-                }
-            }
-            _ => caller,
-        };
-
-        if caller.enforce_profile {
-            if !caller.profile.allows_tool(name) {
-                let err = UaError::denied(
-                    "profile_denied",
-                    format!("tool {name} is not available to profile {}", caller.profile),
-                );
-                record_decision(hub, caller, name, &err).await;
-                return Err(err);
-            }
-            if let Some(action) = args.get("action").and_then(Value::as_str)
-                && !caller.profile.allows_action(name, action)
-            {
-                let err = UaError::denied(
-                    "action_denied",
-                    format!("action {action} of {name} is not available to profile {}", caller.profile),
-                );
-                record_decision(hub, caller, name, &err).await;
-                return Err(err);
-            }
-        }
-
-        let mut policy_gated = false;
-        let mut reservation: Option<i64> = None;
-        match loaded {
-            None => {}
-            Some(Err(reason)) => {
-                let err =
-                    UaError::denied("policy_unavailable", format!("policy gate failed closed: {reason}"));
-                record_decision_rule(hub, caller, name, &err, "").await;
-                return Err(err);
-            }
-            Some(Ok(p)) => {
-                // Evaluate and reserve the `tool_calls` row in one write
-                // transaction. The single writer serializes concurrent calls,
-                // so rate limits and cooldowns count calls still in flight.
-                let (c, n, a) = (caller.clone(), name.to_string(), args.clone());
-                let verdict = hub
-                    .db()
-                    .write_async(move |tx| match policy::evaluate(tx, &p, &c, &n, &a) {
-                        Ok(v) => {
-                            let id = reserve_call(tx, &c, &n)?;
-                            Ok(Ok((v, id)))
-                        }
-                        Err(r) => Ok(Err(r)),
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        Err(policy::Refusal {
-                            error: UaError::denied(
-                                "policy_unavailable",
-                                format!("policy gate failed closed: {e}"),
-                            ),
-                            rule: String::new(),
-                        })
-                    });
-                match verdict {
-                    Ok((Verdict::Allow, id)) => reservation = Some(id),
-                    Ok((Verdict::RequireApproval(_), id)) => {
-                        reservation = Some(id);
-                        policy_gated = true;
-                    }
-                    Err(refusal) => {
-                        record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
-                        return Err(refusal.error);
-                    }
-                }
-            }
-        }
-
-        if def.always_gated
-            && let Err(refusal) = policy::check_prod_action(hub.cfg(), caller, name)
-        {
-            record_decision_rule(hub, caller, name, &refusal.error, &refusal.rule).await;
-            release_reservation(hub, reservation).await;
-            return Err(refusal.error);
-        }
+        let Admitted { caller, args, policy_gated, reservation } =
+            self.admit(hub, caller, name, args, true).await?;
+        let caller = &caller;
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
         if gated && !def.handler_gates(&args) {
             let gate_args = match def.gate_payload {
                 Some(f) => f(hub.cfg(), &args),
+                None if def.secret_args => {
+                    release_reservation(hub, reservation).await;
+                    return Err(unprojected_secret(name));
+                }
                 None => args.clone(),
             };
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), gate_args);
@@ -366,6 +316,226 @@ impl Registry {
         record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation).await;
         result
     }
+
+    /// What an approval requested ahead of a call (`POST
+    /// /api/approvals/request`) may bind: the same grant, profile, policy
+    /// and prod-action checks as [`Registry::call`], then the payload the
+    /// call's own gate would bind (the tool's `gate_payload` projection, so a
+    /// secret value is never parked). Nothing runs and no call is reserved.
+    ///
+    /// A tool that evaluates its gate in its handler binds values only the
+    /// handler resolves, so it cannot be requested ahead and answers
+    /// [`ApprovalRequest::GatesInHandler`]; a call no rule gates answers
+    /// [`ApprovalRequest::NotGated`].
+    pub async fn approval_request(
+        &self,
+        hub: &Hub,
+        caller: &Caller,
+        name: &str,
+        args: Value,
+    ) -> UaResult<ApprovalRequest> {
+        let Some(def) = self.tools.get(name) else {
+            return Err(UaError::not_found(format!("unknown tool {name:?}")));
+        };
+        let Admitted { args, policy_gated, .. } = self.admit(hub, caller, name, args, false).await?;
+        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
+        if !gated {
+            return Ok(ApprovalRequest::NotGated);
+        }
+        if def.handler_decides(&args) {
+            return Ok(ApprovalRequest::GatesInHandler);
+        }
+        // The arguments must be a call the tool would accept: what a human
+        // approves is exactly what can run.
+        def.check_args(&args)?;
+        Ok(ApprovalRequest::Payload(match def.gate_payload {
+            Some(f) => f(hub.cfg(), &args),
+            None if def.secret_args => return Err(unprojected_secret(name)),
+            None => args,
+        }))
+    }
+
+    /// Every check before the approval gate: the session grant, the profile
+    /// (after a policy overlay), the policy rules and, for an always-gated
+    /// tool, the prod-action identity check. With `reserve`, the policy
+    /// verdict and a `tool_calls` reservation are taken in one write
+    /// transaction; without, the policy is evaluated on a read.
+    async fn admit(
+        &self,
+        hub: &Hub,
+        caller: &Caller,
+        name: &str,
+        args: Value,
+        reserve: bool,
+    ) -> UaResult<Admitted> {
+        let Some(def) = self.tools.get(name) else {
+            return Err(UaError::not_found(format!("unknown tool {name:?}")));
+        };
+
+        // A hub-internal identity with a narrow grant may make only the calls
+        // the grant names, whatever its profile or enforce_profile say.
+        if let Some(why) = crate::families::github::grant_refusal(caller, name, &args) {
+            let err = UaError::denied("grant_denied", why);
+            record_decision(hub, caller, name, &err).await;
+            return Err(err);
+        }
+        // A session credential's grant is the outer limit: no profile,
+        // policy or approval can widen it. The `acp-session` profile without
+        // a grant (it can only be reached by misconfiguration) gets nothing.
+        let args = match crate::grant::current() {
+            Some(g) => match g.narrow(name, args) {
+                Ok(a) => a,
+                Err(err) => {
+                    record_decision(hub, caller, name, &err).await;
+                    return Err(err);
+                }
+            },
+            None if caller.profile == ua_core::Profile::AcpSession => {
+                let err = UaError::denied(
+                    "session_grant_required",
+                    "the acp-session profile runs only under a verified session credential",
+                );
+                record_decision(hub, caller, name, &err).await;
+                return Err(err);
+            }
+            None => args,
+        };
+
+        // The policy file is read once per call (cached by mtime). A file that
+        // cannot be loaded refuses the call below, after the profile check.
+        let loaded = hub.cfg().policy_file.as_deref().map(policy::load);
+
+        // A policy overlay may lower an agent's profile below its default.
+        let caller = match &loaded {
+            Some(Ok(p)) if caller.enforce_profile && caller.kind != ActorKind::Human => {
+                let code_default = crate::sessions::default_profile(hub, &caller.label);
+                match policy::overlay_profile(p, &caller.label, code_default, self.tools.keys().copied()) {
+                    Some(overlay) if caller.profile.rank() > overlay.rank() => {
+                        Caller { profile: overlay, ..caller.clone() }
+                    }
+                    _ => caller.clone(),
+                }
+            }
+            _ => caller.clone(),
+        };
+
+        if caller.enforce_profile {
+            if !caller.profile.allows_tool(name) {
+                let err = UaError::denied(
+                    "profile_denied",
+                    format!("tool {name} is not available to profile {}", caller.profile),
+                );
+                record_decision(hub, &caller, name, &err).await;
+                return Err(err);
+            }
+            if let Some(action) = args.get("action").and_then(Value::as_str)
+                && !caller.profile.allows_action(name, action)
+            {
+                let err = UaError::denied(
+                    "action_denied",
+                    format!("action {action} of {name} is not available to profile {}", caller.profile),
+                );
+                record_decision(hub, &caller, name, &err).await;
+                return Err(err);
+            }
+        }
+
+        let mut policy_gated = false;
+        let mut reservation: Option<i64> = None;
+        match loaded {
+            None => {}
+            Some(Err(reason)) => {
+                let err =
+                    UaError::denied("policy_unavailable", format!("policy gate failed closed: {reason}"));
+                record_decision_rule(hub, &caller, name, &err, "").await;
+                return Err(err);
+            }
+            Some(Ok(p)) => {
+                // Evaluate and reserve the `tool_calls` row in one write
+                // transaction. The single writer serializes concurrent calls,
+                // so rate limits and cooldowns count calls still in flight.
+                let (c, n, a) = (caller.clone(), name.to_string(), args.clone());
+                let verdict = if reserve {
+                    hub.db()
+                        .write_async(move |tx| match policy::evaluate(tx, &p, &c, &n, &a) {
+                            Ok(v) => {
+                                let id = reserve_call(tx, &c, &n)?;
+                                Ok(Ok((v, Some(id))))
+                            }
+                            Err(r) => Ok(Err(r)),
+                        })
+                        .await
+                } else {
+                    hub.db()
+                        .read_async(move |c2| Ok(policy::evaluate(c2, &p, &c, &n, &a).map(|v| (v, None))))
+                        .await
+                }
+                .unwrap_or_else(|e| {
+                    Err(policy::Refusal {
+                        error: UaError::denied(
+                            "policy_unavailable",
+                            format!("policy gate failed closed: {e}"),
+                        ),
+                        rule: String::new(),
+                    })
+                });
+                match verdict {
+                    Ok((Verdict::Allow, id)) => reservation = id,
+                    Ok((Verdict::RequireApproval(_), id)) => {
+                        reservation = id;
+                        policy_gated = true;
+                    }
+                    Err(refusal) => {
+                        record_decision_rule(hub, &caller, name, &refusal.error, &refusal.rule).await;
+                        return Err(refusal.error);
+                    }
+                }
+            }
+        }
+
+        if def.always_gated
+            && let Err(refusal) = policy::check_prod_action(hub.cfg(), &caller, name)
+        {
+            record_decision_rule(hub, &caller, name, &refusal.error, &refusal.rule).await;
+            release_reservation(hub, reservation).await;
+            return Err(refusal.error);
+        }
+
+        Ok(Admitted { caller, args, policy_gated, reservation })
+    }
+}
+
+/// A gated call of a tool whose arguments carry a secret and that has no
+/// projection: refused rather than park the secret in the approvals table.
+fn unprojected_secret(name: &str) -> UaError {
+    UaError::denied(
+        "secret_args_unprojected",
+        format!("tool {name} carries a secret argument and has no approval projection; it cannot be gated"),
+    )
+}
+
+/// A call that passed every check before the approval gate.
+struct Admitted {
+    /// The caller, with any policy overlay applied.
+    caller: Caller,
+    /// The arguments after the session grant's narrowing.
+    args: Value,
+    /// A policy `require_approval` rule matched.
+    policy_gated: bool,
+    /// The reserved `tool_calls` row, when a policy was evaluated.
+    reservation: Option<i64>,
+}
+
+/// What [`Registry::approval_request`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApprovalRequest {
+    /// The approval would bind this payload.
+    Payload(Value),
+    /// No rule gates the call, so there is nothing to approve.
+    NotGated,
+    /// The tool evaluates its gate in its handler on values it resolves;
+    /// call the tool itself to park its approval.
+    GatesInHandler,
 }
 
 /// One row per completed call in `tool_calls` (no arguments, no results).

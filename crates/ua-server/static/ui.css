@@ -78,6 +78,16 @@ header.top nav a {
 }
 header.top nav a[aria-current="page"] { background: var(--accent); color: var(--accent-ink); }
 header.top .who { margin-left: auto; color: var(--muted); font-size: 0.9em; }
+/* Sign out is a POST form (the route takes no GET), styled as a link. */
+header.top .who form.signout { display: inline; margin: 0; }
+header.top .who button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+  font-size: inherit;
+}
 
 main { padding: 16px 20px 48px; max-width: 1400px; margin: 0 auto; }
 

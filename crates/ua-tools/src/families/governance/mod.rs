@@ -27,6 +27,7 @@ mod block;
 mod claim_release;
 mod holds;
 mod lifecycle;
+mod procscan;
 mod proposals;
 mod worktrees;
 

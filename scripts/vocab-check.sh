@@ -14,7 +14,9 @@
 # team or person (agent labels, handles, mail domains, internal tool names)
 # belong in VOCAB_DENYLIST: newline-separated extended regexes, matched
 # case-insensitively, supplied from a private CI secret. They are never
-# printed, and the allowlist does not apply to them.
+# printed, and the allowlist does not apply to them. In CI (CI set) without
+# VOCAB_DENYLIST, a ::warning:: line says the private list was not applied;
+# the exit status is unchanged, so fork PRs (which get no secrets) still pass.
 set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
@@ -87,6 +89,12 @@ report() { # case(-i or -I) pattern
 # -I (skip binary files) stands in for "no extra flag" in the sensitive pass.
 for p in "${sensitive[@]}"; do report "-I" "$p"; done
 for p in "${insensitive[@]}"; do report "-i" "$p"; done
+
+if [[ -z ${VOCAB_DENYLIST:-} && -n ${CI:-} ]]; then
+  # A fork PR gets no secrets, so this must not fail the job; say loudly that
+  # only the generic patterns ran.
+  echo "::warning title=vocab-check::VOCAB_DENYLIST is empty: the private denylist was NOT applied; only the generic patterns were checked."
+fi
 
 if [[ -n ${VOCAB_DENYLIST:-} ]]; then
   while IFS= read -r p || [[ -n $p ]]; do

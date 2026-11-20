@@ -48,7 +48,9 @@ UI prints JSON.
 
 ## Signing in
 
-The header links to `/login` and `/logout`. The UI uses the same
+The header links to `/login`; signing out is a small form that posts to
+`/logout` with the browser session's CSRF token (the route takes no GET, and
+the page runs no inline script). The UI uses the same
 authentication as the rest of the hub: with `enforce_auth` on (the default)
 every `/ui` request needs a signed-in identity; with it off, a request without
 credentials runs as the local anonymous caller, which suits a hub bound to
@@ -80,7 +82,7 @@ routes with the same request and response shapes:
 | `POST /api/action/task` | `task_update` |
 | `POST /api/action/approval` | `approval_resolve` (verified human only) |
 | `GET /api/approvals`, `GET /api/approvals/{id}` | `approval_pending`, one approval row |
-| `POST /api/approvals/request` | the approval gate, request only |
+| `POST /api/approvals/request` | the approval gate, request only: the same grant, profile, policy and prod-action checks as a call, typed arguments, and the payload the tool's own gate binds (a secret is never stored); `409` for a tool nothing gates and for one that binds its approval when called (see [sdk.md](sdk.md)) |
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
 | `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |

@@ -301,6 +301,11 @@ mod tests {
         assert!(Profile::AcpSession.allows_tool("task_comment"));
         assert!(!Profile::AcpSession.allows_tool("task_add"));
         assert!(!Profile::AcpSession.allows_tool("profile_activate"));
+        // A node session credential must not read other agents' notes or
+        // write notes in its owner's name.
+        for t in ["memory_get", "memory_list", "memory_save", "memory_search"] {
+            assert!(!Profile::AcpSession.allows_tool(t), "{t}");
+        }
     }
 
     #[test]

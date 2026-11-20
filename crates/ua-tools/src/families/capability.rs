@@ -251,7 +251,8 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 }
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
-fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
+/// Whether `caller` may see hub boundaries (the program allowlist among them).
+pub(crate) fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
     if caller.is_human() || matches!(caller.profile, Profile::Coordinator | Profile::Operator) {
         return true;
     }
@@ -349,8 +350,11 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         });
         (health(&cfg), boundaries, json!([]))
     } else {
-        (Value::Null, Value::Null, json!(["boundaries", "health", "agents.host"]))
+        (Value::Null, Value::Null, json!(["boundaries", "health", "agents.host", "clis"]))
     };
+    // The program allowlist is `boundaries.shell_allowlist` again: the same
+    // redaction applies.
+    let clis = if operator { json!(clis) } else { Value::Null };
     Ok(json!({
         "read_only": true,
         "install_is_explicit": true,
@@ -389,10 +393,11 @@ pub fn register(r: &mut Registry) {
             "capability_catalog",
             "Read-only inventory of this hub: agents, every tool by family, allowlisted programs, harnesses, \
              workflows, workspace skills, configuration health, boundaries (workspace, vault write dirs, \
-             approval-gated tools) and what the MCP server supports per client. Boundaries, health and agent \
-             hosts are shown to operators only; for everyone else they are null or absent and named in \
-             `redacted`. With task_id and agent_label it also reports whether that agent is ready for that task: \
-             prerequisites {capable, ready, missing_config: [{gate, action, detail}]}, where gate is \
+             approval-gated tools) and what the MCP server supports per client. Boundaries, health, agent \
+             hosts and the allowlisted programs (clis) are shown to operators only; for everyone else they \
+             are null or absent and named in `redacted`. With task_id and agent_label it also reports whether \
+             that agent is ready for that task: prerequisites {capable, ready, missing_config: [{gate, action, \
+             detail}]}, where gate is \
              agent_identity (no active token or profile) or executor (no harness and no live owned node). Never \
              installs, writes or opens an approval.",
             capability_catalog,

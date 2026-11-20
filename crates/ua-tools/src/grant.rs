@@ -8,10 +8,10 @@
 //! through [`current`]. The caller's profile is `acp-session` as well, so
 //! a call outside a scope is still held to that profile's tool list.
 //!
-//! The grant narrows, never widens: a tool must be in `tools`;
-//! `task_comment` may only `append` to or `list` the credential's own task;
-//! `session_packet`, `evidence_report` and `task_list` read that task only
-//! (see [`SessionGrant::narrow`]). A caller under the `acp-session` profile
+//! The grant narrows, never widens: a tool must be in `tools` and have its
+//! own rule in [`SessionGrant::narrow`]; `task_comment` may only `append` to
+//! or `list` the credential's own task; `session_packet`, `evidence_report`
+//! and `task_list` read that task only. A caller under the `acp-session` profile
 //! with no grant bound is refused every tool.
 
 use std::collections::BTreeSet;
@@ -69,6 +69,9 @@ impl SessionGrant {
     ///   refused.
     /// - `task_list` is confined to the grant's task by the tool itself
     ///   (see [`pinned_task`]).
+    /// - `profile_status` passes unchanged.
+    /// - Any other tool is refused (`session_tool_unscoped`), even when the
+    ///   grant lists it: each tool needs its own rule here.
     ///
     /// A grant without a task refuses all three task-reading tools.
     pub fn narrow(&self, tool: &str, mut args: Value) -> UaResult<Value> {
@@ -116,7 +119,20 @@ impl SessionGrant {
                     }
                 }
             }
-            _ => {}
+            // Confined by the tool itself to the grant's task (see
+            // [`pinned_task`]).
+            "task_list" => {}
+            // Reports only the caller's own identity and profile.
+            "profile_status" => {}
+            // Every tool needs an arm here saying how the grant confines it.
+            // A tool without one is refused, so adding a name to the
+            // `acp-session` list cannot by itself widen a credential.
+            _ => {
+                return Err(UaError::denied(
+                    "session_tool_unscoped",
+                    format!("tool {tool} has no session-credential scope rule"),
+                ));
+            }
         }
         Ok(args)
     }
@@ -190,6 +206,33 @@ mod tests {
             g.narrow("evidence_report", json!({ "since": "2026-01-01" })).unwrap(),
             json!({ "since": "2026-01-01", "task_id": 7 })
         );
+    }
+
+    /// Every tool the `acp-session` profile lists has its own arm in
+    /// [`SessionGrant::narrow`]; a tool without one is refused there.
+    #[test]
+    fn every_acp_session_tool_has_a_narrowing_rule() {
+        let (_, acp) = ua_core::Profile::tool_lists()
+            .into_iter()
+            .find(|(name, _)| *name == "ACP_SESSION_ALLOWED_TOOLS")
+            .expect("the acp-session list");
+        let g = SessionGrant { tools: acp.clone(), ..grant(Some(7)) };
+        for tool in acp {
+            let args = json!({ "action": "list", "params": { "task_id": 7 } });
+            if let Err(e) = g.narrow(tool, args) {
+                assert_ne!(e.reason_code(), Some("session_tool_unscoped"), "{tool} has no narrowing rule");
+            }
+        }
+    }
+
+    #[test]
+    fn a_granted_tool_without_a_narrowing_rule_is_refused() {
+        let mut g = grant(Some(7));
+        for tool in ["memory_get", "memory_save", "task_add"] {
+            g.tools.insert(tool.to_string());
+            let e = g.narrow(tool, json!({})).unwrap_err();
+            assert_eq!(e.reason_code(), Some("session_tool_unscoped"), "{tool}");
+        }
     }
 
     #[tokio::test]

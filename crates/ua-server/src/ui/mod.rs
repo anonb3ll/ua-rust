@@ -75,6 +75,9 @@ pub struct PageCtx {
     pub kind: String,
     pub profile: String,
     pub csrf: String,
+    /// The browser session's own CSRF token, for the sign-out form; `None`
+    /// without a cookie session (a bearer token has nothing to sign out).
+    pub session_csrf: Option<String>,
     pub flash: Option<String>,
     pub error: Option<String>,
 }
@@ -85,6 +88,7 @@ pub struct Ui {
     pub caller: Caller,
     pub verified: bool,
     pub csrf: String,
+    pub session_csrf: Option<String>,
     pub flash: Option<String>,
 }
 
@@ -107,7 +111,8 @@ impl FromRequestParts<AppState> for Ui {
             Query::try_from_uri(&parts.uri).map(|Query(q)| q).unwrap_or_default();
         let approval = q.get("approval").and_then(|a| a.parse::<i64>().ok());
         let flash = q.get("flash").and_then(|f| flash_text(f, approval));
-        Ok(Self { state: state.clone(), caller, verified: id.verified, csrf, flash })
+        let session_csrf = crate::login::csrf_token(&parts.extensions).map(str::to_string);
+        Ok(Self { state: state.clone(), caller, verified: id.verified, csrf, session_csrf, flash })
     }
 }
 
@@ -139,6 +144,7 @@ impl Ui {
                 .unwrap_or_default(),
             profile: self.caller.profile.as_str().to_string(),
             csrf: self.csrf.clone(),
+            session_csrf: self.session_csrf.clone(),
             flash: self.flash.clone(),
             error,
         }

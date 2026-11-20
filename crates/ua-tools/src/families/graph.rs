@@ -18,7 +18,9 @@
 //! `graph_canvas_max_boards`; updating an existing board is never capped.
 //! Every overwrite first copies the scene it replaces into
 //! `graph_canvas_revisions`, keeping the newest `graph_canvas_history_max`
-//! per board, so an overwrite can be undone with `graph_canvas_restore`.
+//! per board within `graph_canvas_history_max_bytes` of scenes per board
+//! (the oldest go first), so an overwrite can be undone with
+//! `graph_canvas_restore`.
 
 use std::collections::HashMap;
 
@@ -97,14 +99,17 @@ fn title(text: &str) -> String {
 /// Parse labeled shapes into task suggestions and bound arrows between them
 /// into dependency suggestions (`to` depends on `from`). Standalone text is
 /// annotation; unlabeled shapes and unbound arrows are counted as unparsed,
-/// so nothing silently disappears.
+/// so nothing silently disappears. Elements the editor deleted
+/// (`isDeleted: true`, kept in the export as tombstones) are not on the
+/// board and are skipped, though they still count toward the element bound.
 pub fn parse(scene: &Value) -> UaResult<Value> {
-    let els = elements(scene);
+    let mut els = elements(scene);
     if els.len() > SCENE_MAX_ELEMENTS {
         return Err(UaError::invalid(format!(
             "scene exceeds {SCENE_MAX_ELEMENTS} elements; split the board"
         )));
     }
+    els.retain(|el| el.get("isDeleted").and_then(Value::as_bool) != Some(true));
     let mut label_of: HashMap<&str, &str> = HashMap::new();
     let mut unparsed = 0usize;
     for el in &els {
@@ -249,6 +254,7 @@ struct Limits {
     per_agent: i64,
     total: i64,
     history: i64,
+    history_bytes: i64,
 }
 
 impl Limits {
@@ -257,6 +263,7 @@ impl Limits {
             per_agent: i64::from(cfg.graph_canvas_max_boards_per_agent),
             total: i64::from(cfg.graph_canvas_max_boards),
             history: i64::from(cfg.graph_canvas_history_max),
+            history_bytes: i64::try_from(cfg.graph_canvas_history_max_bytes).unwrap_or(i64::MAX),
         }
     }
 }
@@ -372,7 +379,25 @@ fn store(
             "DELETE FROM graph_canvas_revisions WHERE board_id = ?1 AND revision <= ?2",
             params![board, rev - lim.history],
         )?;
-        kept_revision = Some(rev);
+        // The byte budget: keep the newest revisions whose scenes fit in it
+        // together; drop the rest, oldest first.
+        tx.execute(
+            "DELETE FROM graph_canvas_revisions WHERE board_id = ?1 AND revision IN ( \
+               SELECT revision FROM ( \
+                 SELECT revision, SUM(length(CAST(scene_json AS BLOB))) OVER (ORDER BY revision DESC) AS kept \
+                 FROM graph_canvas_revisions WHERE board_id = ?1 \
+               ) WHERE kept > ?2 \
+             )",
+            params![board, lim.history_bytes],
+        )?;
+        let still: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM graph_canvas_revisions WHERE board_id = ?1 AND revision = ?2",
+                params![board, rev],
+                |r| r.get(0),
+            )
+            .optional()?;
+        kept_revision = still;
     }
     tx.execute(
         "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at, created_by) \
@@ -436,6 +461,7 @@ pub struct HistoryArgs {
 async fn graph_canvas_history(ctx: ToolCtx, a: HistoryArgs) -> UaResult<Value> {
     let board = board_id(a.board_id.as_deref())?;
     let keep = ctx.hub.cfg().graph_canvas_history_max;
+    let keep_bytes = ctx.hub.cfg().graph_canvas_history_max_bytes;
     ctx.hub
         .db()
         .read_async(move |c| {
@@ -492,6 +518,7 @@ async fn graph_canvas_history(ctx: ToolCtx, a: HistoryArgs) -> UaResult<Value> {
                 "exists": current.is_some(),
                 "updated_at": current,
                 "history_max": keep,
+                "history_max_bytes": keep_bytes,
                 "revisions": revisions,
             }))
         })

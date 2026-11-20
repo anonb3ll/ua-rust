@@ -291,7 +291,9 @@ pub struct HoldArgs {
     pub release_policy: Option<String>,
     /// Guard: refuse unless this is the root's active hold.
     pub hold_id: Option<i64>,
-    /// Attribution for an unverified caller; ignored when the caller is verified.
+    /// Attribution for an unverified caller; ignored when the caller is
+    /// verified. It grants no authority: releasing needs a verified creator
+    /// or operator.
     pub actor: Option<String>,
 }
 
@@ -351,13 +353,14 @@ pub(crate) async fn task_hold_get(ctx: ToolCtx, a: HoldGetArgs) -> UaResult<Valu
 
 // --- the action -----------------------------------------------------------------
 
-/// Who may release `h`: its creator or an operator. Returns whether the
-/// releaser is an operator.
+/// Who may release `h`: its creator or an operator, both verified. An
+/// unverified caller's `actor` is attribution only, so naming the creator
+/// grants nothing. Returns whether the releaser is an operator.
 fn release_authority(h: &Hold, who: &str, verified: bool, operator: bool) -> UaResult<bool> {
     if verified && operator {
         return Ok(true);
     }
-    if who == h.created_by {
+    if verified && who == h.created_by {
         return Ok(false);
     }
     Err(UaError::denied(

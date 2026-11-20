@@ -633,6 +633,7 @@ pub fn register(r: &mut Registry) {
              resumed, duplicate, events, output}.",
             langgraph_run,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workflows"),
     );
     r.add(
@@ -645,6 +646,7 @@ pub fn register(r: &mut Registry) {
              Returns run metadata, status, pending_hop, interrupted_by and, when completed, output.",
             langgraph_workflow_run,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workflows"),
     );
     r.add(
@@ -656,6 +658,7 @@ pub fn register(r: &mut Registry) {
              Runs on the hub's durable workflow engine (no LangGraph runtime).",
             langgraph_progress_note,
         )
+        .handler_may_gate(crate::HandlerGate::Always)
         .family("workflows"),
     );
     r.add(

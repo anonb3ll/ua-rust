@@ -112,6 +112,10 @@ pub struct Config {
     /// Prior scenes kept per board for `graph_canvas_history` and
     /// `graph_canvas_restore`; older revisions are dropped. 0 keeps none.
     pub graph_canvas_history_max: u32,
+    /// Total bytes of prior scenes kept per board. Past it the oldest
+    /// revisions are dropped first, whatever `graph_canvas_history_max`
+    /// allows; a single revision larger than the budget is not kept.
+    pub graph_canvas_history_max_bytes: u64,
     /// Client evidence events (`evidence_append`) one identity may append per
     /// rolling hour. Past it the call is refused (`rate_limited`). Counted
     /// from the ledger, so it holds across restarts.
@@ -588,6 +592,7 @@ impl Default for Config {
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,
+            graph_canvas_history_max_bytes: 10_000_000,
             evidence_append_max_per_hour: 120,
             evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),

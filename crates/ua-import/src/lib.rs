@@ -1008,18 +1008,20 @@ fn copy_ledger(
                     )));
                 }
                 let mut n = 0u64;
+                let mut unhashed = 0u64;
                 for row in &rows {
                     let ev = row.as_ref().map_err(|(seq, why)| {
                         UaError::conflict(format!(
                             "source event seq {seq}: {why}; refusing to rewrite history"
                         ))
                     })?;
-                    chain.check(ev).map_err(|why| {
+                    let hashed = chain.check(ev).map_err(|why| {
                         UaError::conflict(format!(
                             "source event seq {}: {why}; refusing to rewrite history",
                             ev.seq
                         ))
                     })?;
+                    unhashed += u64::from(!hashed);
                     let mut vals: Vec<SqlValue> = vec![SqlValue::Integer(ev.seq)];
                     vals.extend(ev.f.iter().map(|v| v.clone().map_or(SqlValue::Null, SqlValue::Text)));
                     tx.execute(&insert, params_from_iter(vals.iter())).map_err(|e| {
@@ -1027,6 +1029,9 @@ fn copy_ledger(
                     })?;
                     n += 1;
                 }
+                // The legacy prefix is part of the record verify checks it
+                // against, written with the rows it counts.
+                ledger::record_legacy_prefix(tx, unhashed)?;
                 save_state(tx, source_hash, "event_log", batch_last, n, 0)?;
                 Ok(n)
             })

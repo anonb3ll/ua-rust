@@ -15,6 +15,8 @@ use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
 use ua_server::AppState;
 use ua_tools::{Hub, builtin_registry};
 
+mod common;
+
 const OPERATOR_TOKEN: &str = "operator-test-token-0001";
 const BUILDER_TOKEN: &str = "builder-test-token-0002";
 
@@ -604,7 +606,7 @@ async fn api_approvals_resolve_detail_and_request() {
         post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "no_such_tool" })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no enumeration through the request route");
     // A tool the requester's profile hides cannot be queued for a human.
     let resp = send(
         &app,
@@ -697,4 +699,318 @@ async fn unknown_hosts_are_refused_for_api_and_ui() {
     let mut req = get("/healthz", None);
     req.headers_mut().insert(header::HOST, "rebound.example.com".parse().unwrap());
     assert_eq!(send(&app, req).await.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Approval requests go through the same checks and projection as a call
+
+const SECRET_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+fn approvals_containing(state: &AppState, needle: &str) -> i64 {
+    let pattern = format!("%{needle}%");
+    state
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM approvals WHERE payload LIKE ?1 OR tool LIKE ?1",
+                [pattern],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_approval_request_never_parks_a_secret_value() {
+    let mut cfg = config();
+    cfg.approval_tools = vec!["agent_token_issue".into(), "managed_secret_set".into()];
+    cfg.managed_secret_key = Some(SECRET_KEY.to_string().into());
+    // agent_token_issue is outside the operator allow list.
+    cfg.profiles.insert("operator".into(), "coordinator".into());
+    let (app, state) = app(cfg);
+    let value = "plain-token-value-0001-0123456789abcdef";
+    let req = json!({
+        "tool": "agent_token_issue",
+        "payload": { "agent_label": "builder-2", "value": value, "note": "for the bench" },
+    });
+    let resp = send(&app, post_json("/api/approvals/request", Some(OPERATOR_TOKEN), req)).await;
+    let status = resp.status();
+    let text = body_text(resp).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    assert!(!text.contains(value), "the response echoes the secret: {text}");
+    assert_eq!(approvals_containing(&state, "builder-2"), 1, "the request is parked");
+    assert_eq!(approvals_containing(&state, value), 0, "a secret value landed in the approvals table");
+    // It binds the projection the tool's own gate binds: a keyed
+    // fingerprint and the length, never the value.
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["payload"]["agent_label"], "builder-2");
+    assert!(v["payload"].get("value").is_none(), "{v}");
+    assert_eq!(v["payload"]["value_bytes"], value.len());
+    assert!(v["payload"]["value_fingerprint"].as_str().is_some_and(|f| f.len() == 32), "{v}");
+
+    // A tool that gates in its handler binds values only it resolves; so
+    // does managed_secret_set (a replacement is gated in the handler).
+    for (tool, payload) in [
+        ("managed_secret_delete", json!({ "name": "docs-token", "consumer": "mcp:docs" })),
+        ("managed_secret_set", json!({ "name": "docs-token", "consumer": "mcp:docs", "value": value })),
+    ] {
+        let resp = send(
+            &app,
+            post_json(
+                "/api/approvals/request",
+                Some(OPERATOR_TOKEN),
+                json!({ "tool": tool, "payload": payload }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{tool}");
+        assert!(body_text(resp).await.contains("call the tool"), "{tool}");
+    }
+    assert_eq!(approvals_containing(&state, value), 0);
+}
+
+#[tokio::test]
+async fn an_approval_request_needs_a_gated_tool_and_valid_arguments() {
+    let (app, state) = app(gated_config());
+    // Nothing gates task_update: the settled contract is 409.
+    let resp = send(
+        &app,
+        post_json(
+            "/api/approvals/request",
+            Some(BUILDER_TOKEN),
+            json!({ "tool": "task_update", "payload": { "id": 1, "append_note": "x" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // The payload must be a call the tool accepts: unknown fields and
+    // missing ones are refused before anything is parked.
+    for payload in [json!({ "title": "x", "bogus": 1 }), json!({})] {
+        let resp = send(
+            &app,
+            post_json(
+                "/api/approvals/request",
+                Some(BUILDER_TOKEN),
+                json!({ "tool": "task_add", "payload": payload }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{payload}");
+    }
+    // At most 16 KiB of payload.
+    let big = json!({ "tool": "task_add", "payload": { "title": "x".repeat(17 * 1024) } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), big)).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // An unknown tool reads like a hidden one for a profile-bound caller.
+    let resp = send(
+        &app,
+        post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "no_such_tool" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(approvals_containing(&state, "%"), 0, "nothing was parked");
+
+    // The SDK's conformance tool: always gated with no configuration, gated
+    // by the registry, and open to a developer token.
+    let (app, state) = self::app(config());
+    let req = json!({ "tool": "crew_intervene", "payload": { "session_id": "s-1", "message": "pause" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let v = body_json(resp).await;
+    assert_eq!(v["status"], "pending");
+    assert_eq!(approval_status(&state, v["approval_id"].as_i64().unwrap()), "pending");
+}
+
+#[tokio::test]
+async fn a_requested_pass_is_consumed_by_the_identical_call_and_not_by_its_requester() {
+    let mut cfg = gated_config();
+    cfg.approval_tools = vec!["task_add".into(), "task_list".into()];
+    let (app, state) = app(cfg);
+    let req = json!({ "tool": "task_add", "payload": { "title": "Planned ahead" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["approval_id"].as_i64().unwrap();
+    let approve = json!({ "id": id, "decision": "approve" });
+    assert_eq!(
+        send(&app, post_json("/api/action/approval", Some(OPERATOR_TOKEN), approve)).await.status(),
+        StatusCode::OK
+    );
+    call(&state, &builder(), "task_add", json!({ "title": "Planned ahead" })).await.unwrap();
+    assert_eq!(approval_status(&state, id), "consumed");
+
+    // Self-approval is refused: the operator's own request needs another human.
+    let req = json!({ "tool": "task_list", "payload": {} });
+    let resp = send(&app, post_json("/api/approvals/request", Some(OPERATOR_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let own = body_json(resp).await["approval_id"].as_i64().unwrap();
+    let approve = json!({ "id": own, "decision": "approve" });
+    assert_eq!(
+        send(&app, post_json("/api/action/approval", Some(OPERATOR_TOKEN), approve)).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(approval_status(&state, own), "pending");
+}
+
+#[tokio::test]
+async fn request_caps_name_the_cap_that_refused() {
+    let (app, state) = app(gated_config());
+    for i in 0..20 {
+        let req = json!({ "tool": "task_add", "payload": { "title": format!("t{i}") } });
+        let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{i}");
+    }
+    let req = json!({ "tool": "task_add", "payload": { "title": "one more" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req.clone())).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(body_text(resp).await.contains("already open"));
+    // An identical open request still answers with its row.
+    let again = json!({ "tool": "task_add", "payload": { "title": "t0" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), again)).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Requests the requester withdrew itself count toward the hourly cap.
+    state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "UPDATE approvals SET status = 'denied', resolved_by = requested_by WHERE requested_by = 'builder-1'",
+                [],
+            )?;
+            for i in 0..40 {
+                tx.execute(
+                    "INSERT INTO approvals (tool, payload, requested_by, status, resolved_by, created_at, updated_at) \
+                     VALUES ('task_add', ?1, 'builder-1', 'denied', 'builder-1', ?2, ?2)",
+                    rusqlite::params![format!("{{\"title\":\"w{i}\"}}"), ua_core::time::now()],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(body_text(resp).await.contains("last hour"));
+}
+
+#[tokio::test]
+async fn an_approval_request_meets_the_same_identity_checks_as_a_call() {
+    let dir = std::env::temp_dir().join(format!(
+        "ua-ui-overlay-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("policy.yaml");
+    // The overlay lowers builder-1 to research, which cannot update tasks.
+    std::fs::write(
+        &policy,
+        "version: 1\nenabled: true\nprofile_defaults:\n  builder-1: research\nrules: []\n",
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.policy_file = Some(policy);
+    cfg.approval_tools = vec!["task_update".into(), "task_add".into()];
+    let (app, _state) = app(cfg);
+    let req = json!({ "tool": "task_update", "payload": { "id": 1, "append_note": "x" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["reason_code"], "profile_denied");
+    // Research may still add tasks, so the overlay is what refused above.
+    let req = json!({ "tool": "task_add", "payload": { "title": "x" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The prod-action check: a revoked agent cannot queue an always-gated call.
+    let mut cfg = config();
+    cfg.revoked_agents = vec!["builder-1".into()];
+    let (app, state) = self::app(cfg);
+    let req = json!({ "tool": "crew_intervene", "payload": { "session_id": "s-1", "message": "stop" } });
+    let resp = send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), req)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["reason_code"], "agent_revoked");
+    assert_eq!(approvals_containing(&state, "%"), 0);
+}
+
+#[tokio::test]
+async fn an_approval_request_honours_policy_rules() {
+    let dir = std::env::temp_dir().join(format!(
+        "ua-ui-policy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "version: 1\nenabled: true\nrules:\n  - name: lists-need-a-human\n    type: tool\n    tool: task_list\n    \
+         action: require_approval\n  - name: no-adds\n    type: tool\n    tool: task_add\n    action: deny\n",
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.policy_file = Some(policy);
+    cfg.approval_tools = vec!["task_add".into()];
+    let (app, _state) = app(cfg);
+
+    // A policy require_approval rule gates the call, so it can be requested.
+    let resp =
+        send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "task_list" })))
+            .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    // A policy deny refuses the request, even for a tool in approval_tools.
+    let resp = send(
+        &app,
+        post_json(
+            "/api/approvals/request",
+            Some(BUILDER_TOKEN),
+            json!({ "tool": "task_add", "payload": { "title": "x" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["reason_code"], "policy_deny");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Sign out
+
+/// The value of the `name` attribute's sibling `value` in the first
+/// `<input ... name="{name}" ... value="...">` of `html`.
+fn hidden_input(html: &str, name: &str) -> Option<String> {
+    let at = html.find(&format!("name=\"{name}\""))?;
+    let tag_start = html[..at].rfind('<')?;
+    let tag_end = at + html[at..].find('>')?;
+    let tag = &html[tag_start..tag_end];
+    let v = tag.find("value=\"")? + "value=\"".len();
+    Some(tag[v..v + tag[v..].find('"')?].to_string())
+}
+
+#[tokio::test]
+async fn sign_out_is_a_post_form_with_the_session_csrf_token() {
+    let hub = common::TestHub::new(common::config());
+    let cookie = hub.sign_in("operator").await;
+    let page = hub.send(common::get("/ui/inbox", Some(&cookie), None)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = common::text_body(page).await;
+
+    // No GET link to /logout (the route is POST-only), and no inline script.
+    assert!(!html.contains("href=\"/logout\""), "sign out is still a GET link");
+    assert!(!html.contains("onclick") && !html.contains("<script>"), "inline script in the layout");
+    let form_at = html.find("action=\"/logout\"").expect("a sign-out form");
+    let form = &html[html[..form_at].rfind("<form").unwrap()..];
+    let form = &form[..form.find("</form>").unwrap()];
+    assert!(form.contains("method=\"post\""), "{form}");
+    assert!(form.contains("type=\"submit\""), "{form}");
+
+    // The form carries the session's CSRF token, and submitting it ends the
+    // session.
+    let token = hidden_input(form, "csrf").expect("a csrf field");
+    assert_eq!(token, hub.csrf(&cookie).await);
+    let out = hub.send(common::form("/logout", &[("csrf", &token)], Some(&cookie))).await;
+    assert!(out.status().is_redirection(), "{}", out.status());
+    assert_eq!(common::location(&out), "/login");
+    let after = hub.send(common::get("/api/whoami", Some(&cookie), None)).await;
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
 }

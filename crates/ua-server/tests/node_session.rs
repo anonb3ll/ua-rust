@@ -117,6 +117,20 @@ async fn a_minted_credential_reaches_only_its_paths_and_tools() {
     assert_eq!(json_body(resp).await["reason_code"], "session_credential_path");
     let (status, _, _) = post(&hub, "/api/node/heartbeat", &cred, json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // Including the approval request route: a credential parks nothing.
+    let approvals = || -> i64 {
+        hub.state
+            .hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))?))
+            .unwrap()
+    };
+    let before = approvals();
+    let (status, v, _) =
+        post(&hub, "/api/approvals/request", &cred, json!({ "tool": "task_list", "payload": {} })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["reason_code"], "session_credential_path");
+    assert_eq!(approvals(), before);
 
     // MCP accepts it.
     let init = json!({

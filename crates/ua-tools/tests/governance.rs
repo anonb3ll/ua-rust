@@ -408,6 +408,12 @@ async fn a_held_subtree_refuses_new_work_while_a_live_renewal_passes() {
     // Only the creator or an operator releases it.
     let e = h.act_err(&builder(), "task_hold", json!({ "root_task_id": root, "mode": "resume" })).await;
     assert_eq!(reason(&e), "not_hold_owner");
+    // An unverified caller cannot release it by naming the creator.
+    let anon = Caller { enforce_profile: true, ..caller("someone", ActorKind::Anonymous) };
+    let e = h
+        .act_err(&anon, "task_hold", json!({ "root_task_id": root, "mode": "resume", "actor": "lead-1" }))
+        .await;
+    assert_eq!(reason(&e), "not_hold_owner");
     let released = h.act_ok(&lead(), "task_hold", json!({ "root_task_id": root, "mode": "resume" })).await;
     assert_eq!(released["released"], true);
     assert_eq!(released["hold"]["status"], "released");
@@ -768,18 +774,22 @@ async fn the_contract_block_is_the_work_order_on_every_dispatch_path() {
 async fn project_repos_bind_normalized_and_unbind() {
     let h = H::new();
     let e = h
-        .act_err(&lead(), "project_repo_bind", json!({ "project": "web", "repo": "https://example.com/o/r" }))
+        .act_err(
+            &human(),
+            "project_repo_bind",
+            json!({ "project": "web", "repo": "https://example.com/o/r" }),
+        )
         .await;
     assert_eq!(e.code(), "invalid_argument");
     let b = h
         .act_ok(
-            &lead(),
+            &human(),
             "project_repo_bind",
             json!({ "project": "web", "repo": "git@github.com:Owner/Web.git", "default_branch": "main" }),
         )
         .await;
     assert_eq!(b["binding"]["repo"], "owner/web");
-    assert_eq!(b["binding"]["bound_by"], "lead-1");
+    assert_eq!(b["binding"]["bound_by"], "operator");
     assert_eq!(
         h.act_ok(&lead(), "project_repo_get", json!({ "project": "web" })).await["binding"]["repo"],
         "owner/web"
@@ -789,7 +799,7 @@ async fn project_repos_bind_normalized_and_unbind() {
     let projects: Vec<&str> =
         list["projects"].as_array().unwrap().iter().map(|p| p["project"].as_str().unwrap()).collect();
     assert_eq!(projects, ["default", "web"]);
-    let u = h.act_ok(&lead(), "project_repo_unbind", json!({ "project": "web" })).await;
+    let u = h.act_ok(&human(), "project_repo_unbind", json!({ "project": "web" })).await;
     assert_eq!(u["unbound"], true);
     assert_eq!(
         h.act_ok(&lead(), "project_repo_get", json!({ "project": "web" })).await["binding"],
@@ -797,6 +807,38 @@ async fn project_repos_bind_normalized_and_unbind() {
     );
     assert_eq!(h.events("project.repo.bound"), 1);
     assert_eq!(h.events("project.repo.unbound"), 1);
+}
+
+#[tokio::test]
+async fn project_repo_bindings_are_for_operators_under_their_own_name() {
+    let h = H::new();
+    let anon = Caller { enforce_profile: true, ..caller("someone", ActorKind::Anonymous) };
+    let bind = json!({ "project": "web", "repo": "owner/web" });
+    // An ordinary agent may not bind or unbind: the binding decides which
+    // repository a task's CI checks are verified against.
+    let e = h.act_err(&lead(), "project_repo_bind", bind.clone()).await;
+    assert_eq!(reason(&e), "not_lifecycle_operator");
+    // An unverified caller cannot borrow an operator's name.
+    let spoof = json!({ "project": "web", "repo": "owner/web", "bound_by": "operator" });
+    let e = h.act_err(&anon, "project_repo_bind", spoof).await;
+    assert_eq!(reason(&e), "identity_required");
+    // A verified operator's attribution is its own.
+    let other = json!({ "project": "web", "repo": "owner/web", "bound_by": "lead-1" });
+    let e = h.act_err(&human(), "project_repo_bind", other).await;
+    assert_eq!(reason(&e), "identity_mismatch");
+    assert_eq!(h.events("project.repo.bound"), 0);
+
+    h.act_ok(&human(), "project_repo_bind", bind).await;
+    let e = h.act_err(&lead(), "project_repo_unbind", json!({ "project": "web" })).await;
+    assert_eq!(reason(&e), "not_lifecycle_operator");
+    let e =
+        h.act_err(&anon, "project_repo_unbind", json!({ "project": "web", "unbound_by": "operator" })).await;
+    assert_eq!(reason(&e), "identity_required");
+    assert_eq!(
+        h.act_ok(&lead(), "project_repo_get", json!({ "project": "web" })).await["binding"]["repo"],
+        "owner/web"
+    );
+    assert_eq!(h.events("project.repo.unbound"), 0);
 }
 
 // --- stale worktrees ------------------------------------------------------------

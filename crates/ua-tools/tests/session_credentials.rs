@@ -180,7 +180,8 @@ async fn a_credential_is_minted_once_and_runs_under_its_grant() {
     assert_eq!(cid.len(), 16);
     assert_eq!(out["mcp_server_name"], "unified-agent");
     let tools: Vec<&str> = out["tools"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
-    assert!(tools.contains(&"task_comment") && tools.contains(&"memory_search"), "{tools:?}");
+    assert!(tools.contains(&"task_comment") && tools.contains(&"task_list"), "{tools:?}");
+    assert!(!tools.iter().any(|t| t.starts_with("memory_")), "{tools:?}");
     assert!(!tools.contains(&"task_add") && !tools.contains(&"node_session_credential"), "{tools:?}");
 
     // Only the digest is stored, and no event carries the value.

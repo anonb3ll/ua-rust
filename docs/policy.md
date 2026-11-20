@@ -32,6 +32,22 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+### Requesting an approval ahead of a call
+
+`POST /api/approvals/request` runs steps 1-3 for the named tool and its
+arguments (a refusal is the same `403` a call would get), checks the
+arguments against the tool's typed argument struct, and parks the payload
+the tool's gate would bind, without running anything or consuming a pass.
+It answers `409` for a tool step 4 would not gate: only approval-gated tools
+can be requested. It also answers `409` for a tool whose handler asks the
+gate itself on values it resolves (marked `gates_in_handler`,
+`handler_gates_with` or `handler_may_gate`; a test walks every
+`approvals::gate` call site and fails for an unmarked tool). A tool with a
+secret argument is marked `secret_args` and must bind a `gate_payload`
+projection; without one, gating it is refused (`secret_args_unprojected`)
+rather than store the secret. The full status table is in
+[sdk.md](sdk.md#not-supported).
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client
@@ -48,7 +64,7 @@ default, and a `profile_defaults` overlay (below) can only lower it.
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
 | `operator` | 4 | Allow list: approvals, dispatch cancellation, event log, memory and task reads, node listing. |
 | `research` | 3 | Allow list: reads, memory, messages, vault, web, task and plan reads, plus listed `plan_manage` actions. |
-| `acp-session` | 3 | Allow list (`ACP_SESSION_ALLOWED_TOOLS`): memory reads and saves, task listing and comments, profile status, session packet, evidence report. The profile of a node session credential, which narrows it further (see [auth](auth.md#session-credentials)). Never assignable: `profile_activate`, config `profiles` / `oauth_profile` and policy `profile_defaults` refuse it, and without a credential's grant it reaches no tool. |
+| `acp-session` | 3 | Allow list (`ACP_SESSION_ALLOWED_TOOLS`): task listing and comments, profile status, session packet, evidence report (no memory tools). The profile of a node session credential, which narrows it further (see [auth](auth.md#session-credentials)). Never assignable: `profile_activate`, config `profiles` / `oauth_profile` and policy `profile_defaults` refuse it, and without a credential's grant it reaches no tool. |
 | `remote-vault-curator` | 2 | The remote assistant surface plus vault access confined to `Wiki/` (and the daily journal). |
 | `remote-assistant` | 1 | Allow list: memory reads, messages, task listing and the agent actions of `observability_manage`. |
 | `public` | 0 | Allow list: task add and list, docs, profile status. |
@@ -234,7 +250,8 @@ requester, node agent, task claimant or an operator); `resume` releases;
 `restore` releases once every run the cancel stopped has closed.
 `release_policy: after_active_runs_finish` releases the hold by itself once
 nothing in the subtree is running. Holding needs `task_update` in the
-caller's profile; releasing needs the hold's creator or an operator.
+caller's profile; releasing needs the hold's creator or an operator, verified
+either way (an unverified caller's `actor` names nobody).
 `task_holds` and `task_hold_get` read.
 
 `task_claim_release` (`task_id`, `expected_claimant`, `reason`,
@@ -264,7 +281,11 @@ decision), `work_proposal_get`, `work_proposal_list` and
 
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
-repository on an allowed forge host.
+repository on an allowed forge host. The binding is the repository a task's
+CI checks are verified against, so bind and unbind are for a verified
+lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
+attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+it. Get and list are open.
 
 ### Maintenance tools
 
@@ -275,7 +296,10 @@ stale only once idle) and, when a human or lifecycle operator asks with
 `dry_run=false`, removes only those with no uncommitted changes, no untracked
 files and no ignored files (`git worktree remove` would delete an ignored
 `.env` without asking) whose branch the base branch already contains, with
-`git worktree remove` and never `--force`.
+`git worktree remove` and never `--force`. A worktree a running process
+uses is never stale; the process table is read from `/proc` on Linux and
+through `proc_pidinfo` on macOS, and where it cannot be read every worktree
+is kept.
 `audit_triage_tasks` runs `security_audit` and files one deduplicated task
 per group of findings; a clean audit files nothing.
 

@@ -28,7 +28,9 @@
   <div class="who">
     {% if page.verified %}
       Signed in as <strong>{{ page.who }}</strong> <span class="chip">{{ page.kind }}</span> <span class="chip">{{ page.profile }}</span>
-      · <a href="/logout" hx-boost="false">Sign out</a>
+      {% if let Some(token) = page.session_csrf %}
+      · <form class="signout" method="post" action="/logout" hx-boost="false"><input type="hidden" name="csrf" value="{{ token }}"><button type="submit" class="link">Sign out</button></form>
+      {% endif %}
     {% else %}
       Local, not signed in <span class="chip">{{ page.profile }}</span>
       · <a href="/login" hx-boost="false">Sign in</a>
