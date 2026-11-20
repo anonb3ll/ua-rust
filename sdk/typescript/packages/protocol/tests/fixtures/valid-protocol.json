@@ -118,7 +118,7 @@
   "Principal": {
     "label": "builder-2",
     "kind": "agent",
-    "host": "desktopubuntu"
+    "host": "host-2"
   },
   "Profile": {
     "name": "developer",
@@ -133,7 +133,7 @@
     "principal": {
       "label": "builder-2",
       "kind": "agent",
-      "host": "desktopubuntu"
+      "host": "host-2"
     },
     "tool": "task_list"
   },
@@ -171,7 +171,7 @@
   "Agent": {
     "label": "builder-2",
     "profile": "developer",
-    "host": "desktopubuntu",
+    "host": "host-2",
     "online": true
   },
   "MemoryRecord": {
