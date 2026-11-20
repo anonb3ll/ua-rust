@@ -77,5 +77,15 @@ from its commit history.
 - Agent tokens are stored as SHA-256 digests.
 - The GitHub webhook checks HMAC-SHA256 and refuses a delivery id it has
   already seen.
+- OAuth `client_credentials` refuses a scope other than `mcp`, a retired
+  identity, and an identity with no configured profile (it no longer falls
+  back to `developer`). An authorization code exchanged after its identity
+  was retired is refused.
+- A `harness_config_apply` approval binds deterministic values only; the diff
+  the approver reads is shown beside it, so an approved pass no longer stops
+  matching when the diff timed out.
+- Harness config rules text on any surface, like skill bodies, may not carry
+  front matter that grants tools or permissions (`allowed-tools`, `tools`,
+  `permissionMode`, ...).
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main
