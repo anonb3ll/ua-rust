@@ -24,8 +24,19 @@
 //! **Protected** rows are never proposed for parking: the human-only lanes
 //! (`operator-only`, `interactive-only`), `waiting_review`, a
 //! `[waiting-for: ...]` marker, a red-tier row and the `tracking` lane.
-//! `queue_park` parks a gated row only when `approved_by` names who
-//! approved it (a recorded attestation, not a credential).
+//! `queue_park` parks a gated row only for a verified human or lifecycle
+//! operator caller; the approval recorded is that caller's identity.
+//! `approved_by` is free text and never authority: only such a caller may
+//! pass it, and it is recorded as a note beside the approval.
+//!
+//! **Authority.** Park, fold and unpark need a verified caller. A task
+//! someone holds (a non-empty `claimed_by` or `next_owner`) is written by
+//! its claimant, its next owner, a lifecycle operator or a human, the same
+//! rule as the task workflow record. A task nobody holds may be parked,
+//! folded or unparked by any verified caller on the coordinator, lead or
+//! developer profile. Parking also folds every open descendant, so each
+//! descendant held by someone other than the caller needs an operator too.
+//! Unpark is judged on the root alone: restoring a fold hides nothing.
 //!
 //! Close-on-merge (`queue_close_merged` in the Python hub) needs merged-PR
 //! evidence from the forge and waits for the native GitHub client.
@@ -36,10 +47,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use ua_core::{UaError, UaResult};
+use ua_core::{Profile, UaError, UaResult};
 use ua_store::WriteTx;
 
+use super::same_label;
 use crate::families::dispatch::live_run_for_task;
+use crate::families::governance;
 use crate::families::tasks::{
     acting_identity, ancestors, emit, has_marker, int_field, next_revision, require_task, row_object,
     str_field, subtree_ids,
@@ -57,6 +70,8 @@ const CHANNEL_PARKED: &str = "agent.queue.parked";
 const CHANNEL_FOLDED: &str = "agent.queue.folded";
 const CHANNEL_UNPARKED: &str = "agent.queue.unparked";
 const PARK_FIELDS: [&str; 4] = ["parked_at", "parked_by", "parked_reason", "folded_into"];
+/// Profiles that may park, fold or unpark a task nobody holds.
+const QUEUE_WRITER_PROFILES: [Profile; 3] = [Profile::Coordinator, Profile::Lead, Profile::Developer];
 
 // --- arguments ----------------------------------------------------------------------
 
@@ -83,13 +98,15 @@ pub struct ParkArgs {
     pub task_id: i64,
     /// Why (required, at most 500 characters).
     pub reason: String,
-    /// Who approved parking a protected row (operator-only lane, human gate,
-    /// red-tier). Recorded with the park; required only for such a row.
+    /// A note on the approval, recorded with the park. Not authority: a
+    /// protected row (operator-only lane, human gate, red-tier) is parked
+    /// only by a verified human or lifecycle operator, and only such a
+    /// caller may pass this.
     pub approved_by: Option<String>,
     /// Fold open descendants into this task (default true). False refuses
     /// when any are open instead of leaving them under a parked root.
     pub fold_children: Option<bool>,
-    /// Acting identity for an unverified caller; a verified caller acts as itself.
+    /// Must name the caller when given: these writes need a verified caller.
     pub actor: Option<String>,
     /// Check and report without writing.
     #[serde(default)]
@@ -105,7 +122,7 @@ pub struct FoldArgs {
     pub into: i64,
     /// Why (required, at most 500 characters).
     pub reason: String,
-    /// Acting identity for an unverified caller; a verified caller acts as itself.
+    /// Must name the caller when given: these writes need a verified caller.
     pub actor: Option<String>,
     /// Check and report without writing.
     #[serde(default)]
@@ -119,11 +136,63 @@ pub struct UnparkArgs {
     pub task_id: i64,
     /// Why (required, at most 500 characters).
     pub reason: String,
-    /// Acting identity for an unverified caller; a verified caller acts as itself.
+    /// Must name the caller when given: these writes need a verified caller.
     pub actor: Option<String>,
     /// Check and report without writing.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+// --- authority ----------------------------------------------------------------------
+
+/// A verified caller allowed to write the queue, and whether it holds
+/// operator authority (a human or a lifecycle operator).
+struct Writer {
+    who: String,
+    operator: bool,
+}
+
+fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> UaResult<Writer> {
+    acting_identity(&ctx.caller, actor)?;
+    let who = governance::verified_actor(&ctx.caller, verb)?;
+    let operator = governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    if !operator && !QUEUE_WRITER_PROFILES.contains(&ctx.caller.profile) {
+        return Err(UaError::denied(
+            "profile_denied",
+            format!(
+                "{verb} needs the coordinator, lead or developer profile, a lifecycle operator or a human"
+            ),
+        ));
+    }
+    Ok(Writer { who, operator })
+}
+
+/// The agents holding a task: its claimant and next owner, when set.
+fn holders(row: &Row) -> Vec<&str> {
+    ["claimed_by", "next_owner"]
+        .into_iter()
+        .filter_map(|k| s(row, k).map(str::trim))
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// Refuse a write to a task someone other than the caller holds, unless the
+/// caller is an operator. A task nobody holds is open to any queue writer.
+fn require_holder(w: &Writer, row: &Row, verb: &str) -> UaResult<()> {
+    let held = holders(row);
+    if w.operator || held.is_empty() || held.iter().any(|h| same_label(Some(h), &w.who)) {
+        return Ok(());
+    }
+    let id = int_field(row, "id").unwrap_or_default();
+    Err(UaError::denied(
+        "not_task_owner",
+        format!(
+            "{:?} may not {verb} task {id}: it is held by {}; only its claimant, its next owner, a lifecycle \
+             operator or a human may",
+            w.who,
+            held.join(" and ")
+        ),
+    ))
 }
 
 // --- helpers ------------------------------------------------------------------------
@@ -378,9 +447,21 @@ pub(crate) fn parked_block(conn: &Connection, task_id: i64) -> UaResult<Option<S
 /// `coordination_manage(action="queue_park")`.
 pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
     let reason = clean_reason(&a.reason)?;
-    let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
-    let approver = a.approved_by.as_deref().map(|x| x.split_whitespace().collect::<Vec<_>>().join(" "));
-    let approver = approver.filter(|x| !x.is_empty());
+    let writer = queue_writer(&ctx, a.actor.as_deref(), "parking a task")?;
+    let note = a.approved_by.as_deref().map(|x| x.split_whitespace().collect::<Vec<_>>().join(" "));
+    let note = note.filter(|x| !x.is_empty());
+    if let Some(n) = &note
+        && n.chars().count() > REASON_MAX
+    {
+        return Err(UaError::invalid(format!("approved_by must be at most {REASON_MAX} characters")));
+    }
+    if note.is_some() && !writer.operator {
+        return Err(UaError::denied(
+            "operator_required",
+            "approved_by is recorded only for a verified human or lifecycle operator; it is a note, not authority",
+        ));
+    }
+    let who = writer.who.clone();
     let fold = a.fold_children.unwrap_or(true);
     let (id, dry_run) = (a.task_id, a.dry_run);
     ctx.hub
@@ -408,15 +489,16 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 ));
             }
             let gated = gate_reasons(&row);
-            if !gated.is_empty() && approver.is_none() {
+            if !gated.is_empty() && !writer.operator {
                 return Err(UaError::denied(
                     "protected_task",
                     format!(
-                        "task {id} is protected ({}); pass approved_by naming who approved parking it",
+                        "task {id} is protected ({}); only a verified human or lifecycle operator may park it",
                         gated.join("; ")
                     ),
                 ));
             }
+            require_holder(&writer, &row, "park")?;
             let open: Vec<Row> = descendants(tx, id)?.into_iter().filter(is_active).collect();
             for child in &open {
                 let child_live = live_reasons(tx, child, now)?;
@@ -431,6 +513,9 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                     ));
                 }
             }
+            for child in &open {
+                require_holder(&writer, child, "fold")?;
+            }
             if !open.is_empty() && !fold {
                 return Err(UaError::conflict(format!(
                     "task {id} has {} open child task(s); parking it would leave them open under a parked root. \
@@ -440,9 +525,13 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
             }
             let folded: Vec<i64> = open.iter().filter_map(|c| int_field(c, "id")).collect();
             let stamp = iso(now);
-            let recorded = match &approver {
-                Some(by) => format!("{reason} (approved by {by})"),
-                None => reason.clone(),
+            // The approval is the operator's own identity; the note rides along.
+            let approver = (!gated.is_empty()).then(|| who.clone());
+            let recorded = match (&approver, &note) {
+                (Some(by), Some(n)) => format!("{reason} (approved by {by}: {n})"),
+                (Some(by), None) => format!("{reason} (approved by {by})"),
+                (None, Some(n)) => format!("{reason} (note: {n})"),
+                (None, None) => reason.clone(),
             };
             if !dry_run {
                 write_parking(tx, &row, Some((&stamp, &who, &recorded, None)))?;
@@ -453,7 +542,10 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 emit(
                     tx,
                     CHANNEL_PARKED,
-                    json!({ "task_id": id, "reason": reason, "approved_by": approver, "folded": folded, "actor": who }),
+                    json!({
+                        "task_id": id, "reason": reason, "approved_by": approver, "approval_note": note,
+                        "protected": gated, "folded": folded, "actor": who,
+                    }),
                     &who,
                 )?;
             }
@@ -463,6 +555,8 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 "folded": folded,
                 "reason": reason,
                 "approved_by": approver,
+                "approval_note": note,
+                "protected": gated,
                 "actor": who,
                 "reversible_with": "queue_unpark",
             }))
@@ -474,7 +568,8 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
 /// its already-parked root, for a child that appeared after the park.
 pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
     let reason = clean_reason(&a.reason)?;
-    let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
+    let writer = queue_writer(&ctx, a.actor.as_deref(), "folding a task")?;
+    let who = writer.who.clone();
     let (id, into, dry_run) = (a.task_id, a.into, a.dry_run);
     ctx.hub
         .db()
@@ -503,6 +598,7 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
                     format!("task {id} cannot be folded: {}", live.join("; ")),
                 ));
             }
+            require_holder(&writer, &row, "fold")?;
             if !dry_run {
                 let stamp = ua_core::time::now();
                 write_parking(tx, &row, Some((&stamp, &who, &reason, Some(into))))?;
@@ -523,7 +619,8 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
 /// restarts.
 pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value> {
     let reason = clean_reason(&a.reason)?;
-    let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
+    let writer = queue_writer(&ctx, a.actor.as_deref(), "unparking a task")?;
+    let who = writer.who.clone();
     let (id, dry_run) = (a.task_id, a.dry_run);
     ctx.hub
         .db()
@@ -532,6 +629,7 @@ pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value>
             if !is_parked(&row) {
                 return Err(UaError::conflict(format!("task {id} is not parked")));
             }
+            require_holder(&writer, &row, "unpark")?;
             let mut parked_above = Vec::new();
             if let Some(root) = int_field(&row, "folded_into") {
                 parked_above.push(root);

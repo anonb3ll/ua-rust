@@ -31,6 +31,11 @@
 //! in the Python hub with no tool surface; it is not ported. An imported
 //! `assigned` note can still be acknowledged by its receiver.
 //!
+//! `session_handoff_recover` is for the session's owner (or the note's
+//! author), the agent the note was assigned or delivered to, a lifecycle
+//! operator or a human, all verified. Anyone else, unverified callers
+//! included, reads `not_found`, as for a session that does not exist.
+//!
 //! Every state change appends one `agent.lifecycle.handoff` event in the
 //! same transaction, with the session as its episode, so the session packet's
 //! `lifecycle` section shows it.
@@ -42,7 +47,9 @@ use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
+use crate::families::agents::verified;
 use crate::families::audit::rules::redact_secrets;
+use crate::families::governance;
 use crate::families::injection::mark_untrusted;
 use crate::families::tasks::{acting_identity, row_object};
 use crate::registry::ToolCtx;
@@ -433,15 +440,35 @@ pub(crate) async fn session_handoff_seal(ctx: ToolCtx, a: NoteArgs) -> UaResult<
 }
 
 /// `coordination_manage(action="session_handoff_recover")`: the latest
-/// sealed, assigned or delivered note, never a draft.
+/// sealed, assigned or delivered note, never a draft. Only the session's
+/// owner, the note's author or receiver, a lifecycle operator or a human
+/// sees it; anyone else reads `not_found`.
 pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaResult<Value> {
     let sid = a.session_id.trim().to_string();
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
     }
+    let who = verified(&ctx.caller).map(str::to_string);
+    let operator = who.as_deref().is_some_and(|w| governance::is_operator(ctx.hub.cfg(), &ctx.caller, w));
     ctx.hub
         .db()
-        .read_async(move |c| Ok(json!({ "session_id": sid, "note": latest_committed_note(c, &sid)? })))
+        .read_async(move |c| {
+            let owner: Option<String> = c
+                .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [&sid], |r| r.get(0))
+                .optional()?;
+            let note = latest_committed_note(c, &sid)?;
+            let allowed = operator
+                || who.as_deref().is_some_and(|w| {
+                    owner.as_deref() == Some(w)
+                        || note.as_ref().is_some_and(|n| {
+                            ["agent", "assigned_to", "delivered_to"].iter().any(|k| n[*k].as_str() == Some(w))
+                        })
+                });
+            if !allowed {
+                return Err(UaError::not_found(format!("session {sid} not found")));
+            }
+            Ok(json!({ "session_id": sid, "note": note }))
+        })
         .await
 }
 

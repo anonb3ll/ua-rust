@@ -11,6 +11,8 @@ use ua_tools::{Hub, Registry, builtin_registry};
 
 const HEAD: &str = "abcdef1234567";
 const OTHER_HEAD: &str = "1234567abcdef";
+/// A full 40-hex head: only a check at a full SHA may be graded verified.
+const FULL: &str = "abcdef1234567abcdef1234567abcdef12345678";
 
 fn caller(label: &str, kind: ActorKind, profile: Profile) -> Caller {
     Caller {
@@ -37,6 +39,19 @@ fn researcher() -> Caller {
 
 fn human() -> Caller {
     Caller { enforce_profile: false, ..caller("operator", ActorKind::Human, Profile::Operator) }
+}
+
+/// A configured lifecycle operator that is an agent, not a human.
+fn lifecycle_op() -> Caller {
+    caller("lead-op", ActorKind::Agent, Profile::Lead)
+}
+
+fn outsider() -> Caller {
+    caller("builder-3", ActorKind::Agent, Profile::Developer)
+}
+
+fn unverified() -> Caller {
+    Caller::local("builder-1", Transport::Mcp)
 }
 
 fn reason(e: &UaError) -> String {
@@ -91,6 +106,7 @@ impl H {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(dir.path().join("home"));
         cfg.human_identities = vec!["operator".into()];
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "lead-op".into()]);
         let mut hub = Hub::in_memory(cfg).unwrap();
         if let Some(ci) = ci {
             hub = hub.with_ci_verifier(ci);
@@ -147,6 +163,11 @@ impl H {
 
     fn events(&self, channel: &str) -> i64 {
         self.n(&format!("SELECT COUNT(*) FROM event_log WHERE channel = '{channel}'"))
+    }
+
+    /// Bind the default project stream (every test task's) to `repo`.
+    async fn bind(&self, repo: &str) {
+        self.act_ok(&human(), "project_repo_bind", json!({ "project": "default", "repo": repo })).await;
     }
 }
 
@@ -238,13 +259,14 @@ async fn checks_are_graded_attested_verified_or_unknown_at_a_head() {
     let h = H::with_ci(Some(ci.clone()));
     let t = h.task("Grade me", None).await;
     h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    h.bind("example/repo").await;
 
     // No reference: attested, and the verifier is never asked.
     let v = h
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "lint", "outcome": "pass", "head_sha": HEAD }),
+            json!({ "task_id": t, "name": "lint", "outcome": "pass", "head_sha": FULL }),
         )
         .await;
     assert_eq!(check(&v, "lint")["grade"], "attested");
@@ -255,21 +277,21 @@ async fn checks_are_graded_attested_verified_or_unknown_at_a_head() {
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "ci", "outcome": "pass", "head_sha": HEAD,
+            json!({ "task_id": t, "name": "ci", "outcome": "pass", "head_sha": FULL,
                     "ref": { "kind": "ci_run", "ref": "#4242", "repo": "example/repo" } }),
         )
         .await;
     let c = check(&v, "ci");
     assert_eq!((c["grade"].as_str(), c["verified_scope"].as_str()), (Some("verified"), Some("run")), "{c}");
     assert_eq!(v["summary"]["verified_run_only"], json!(["ci"]));
-    assert_eq!(ci.calls.lock().unwrap()[0], format!("run example/repo 4242 {HEAD} success"));
+    assert_eq!(ci.calls.lock().unwrap()[0], format!("run example/repo 4242 {FULL} success"));
 
     // A named job: graded on the job.
     let v = h
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": HEAD,
+            json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": FULL,
                     "ref": { "kind": "ci_run", "ref": 4243, "repo": "example/repo", "job": "unit" } }),
         )
         .await;
@@ -283,14 +305,14 @@ async fn checks_are_graded_attested_verified_or_unknown_at_a_head() {
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "tests", "outcome": "fail", "head_sha": HEAD, "verify": false,
+            json!({ "task_id": t, "name": "tests", "outcome": "fail", "head_sha": FULL, "verify": false,
                     "ref": { "kind": "ci_run", "ref": "4243", "repo": "example/repo", "job": "unit" } }),
         )
         .await;
     assert_eq!(check(&v, "tests")["grade"], "attested");
     assert_eq!(v["summary"]["failing"], json!(["tests"]));
     let v = h
-        .act_ok(&other(), "task_check_verify", json!({ "task_id": t, "name": "tests", "head_sha": HEAD }))
+        .act_ok(&other(), "task_check_verify", json!({ "task_id": t, "name": "tests", "head_sha": FULL }))
         .await;
     assert_eq!(check(&v, "tests")["grade"], "verified", "anyone may ask for a re-verify");
     assert!(ci.calls.lock().unwrap().iter().any(|c| c.ends_with("failure")), "a fail expects a failed run");
@@ -298,26 +320,26 @@ async fn checks_are_graded_attested_verified_or_unknown_at_a_head() {
     // At another head every check is unknown, with the head it was seen at.
     let v = h.act_ok(&builder(), "task_workflow_get", json!({ "task_id": t, "head_sha": OTHER_HEAD })).await;
     let c = check(&v, "lint");
-    assert_eq!((c["grade"].as_str(), c["stale_head"].as_str()), (Some("unknown"), Some(HEAD)), "{c}");
+    assert_eq!((c["grade"].as_str(), c["stale_head"].as_str()), (Some("unknown"), Some(FULL)), "{c}");
 
     // Writers only; a check never recorded cannot be verified.
     let e = h
         .act_err(
             &other(),
             "task_check_record",
-            json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": HEAD }),
+            json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": FULL }),
         )
         .await;
     assert_eq!(reason(&e), "not_task_owner");
     let e = h
-        .act_err(&builder(), "task_check_verify", json!({ "task_id": t, "name": "nope", "head_sha": HEAD }))
+        .act_err(&builder(), "task_check_verify", json!({ "task_id": t, "name": "nope", "head_sha": FULL }))
         .await;
     assert_eq!(e.code(), "not_found");
     for bad in [
-        json!({ "task_id": t, "name": "x", "outcome": "maybe", "head_sha": HEAD }),
-        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": HEAD, "ref": { "kind": "pr", "ref": "1" } }),
-        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": HEAD, "ref": { "kind": "ci_run", "ref": "abc" } }),
-        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": HEAD,
+        json!({ "task_id": t, "name": "x", "outcome": "maybe", "head_sha": FULL }),
+        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": FULL, "ref": { "kind": "pr", "ref": "1" } }),
+        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": FULL, "ref": { "kind": "ci_run", "ref": "abc" } }),
+        json!({ "task_id": t, "name": "x", "outcome": "pass", "head_sha": FULL,
                 "ref": { "kind": "ci_run", "ref": "1", "repo": "no-slash" } }),
     ] {
         assert_eq!(h.act_err(&builder(), "task_check_record", bad).await.code(), "invalid_argument");
@@ -330,11 +352,12 @@ async fn a_contradiction_stays_attested_and_the_default_verifier_cannot_verify()
     let h = H::with_ci(Some(ci));
     let t = h.task("Contradicted", None).await;
     h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    h.bind("example/repo").await;
     let v = h
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": HEAD,
+            json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": FULL,
                     "ref": { "kind": "ci_run", "ref": "7", "repo": "example/repo", "job": "unit" } }),
         )
         .await;
@@ -345,11 +368,12 @@ async fn a_contradiction_stays_attested_and_the_default_verifier_cannot_verify()
     let h = H::new();
     let t = h.task("Stubbed", None).await;
     h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    h.bind("example/repo").await;
     let v = h
         .act_ok(
             &builder(),
             "task_check_record",
-            json!({ "task_id": t, "name": "ci", "outcome": "pass", "head_sha": HEAD,
+            json!({ "task_id": t, "name": "ci", "outcome": "pass", "head_sha": FULL,
                     "ref": { "kind": "ci_run", "ref": "7", "repo": "example/repo" } }),
         )
         .await;
@@ -479,7 +503,7 @@ async fn a_handoff_note_is_drafted_edited_sealed_and_recovered() {
     }
     let e = h.act_err(&builder(), "session_handoff_update", json!({ "note_id": id, "done": ["x"] })).await;
     assert_eq!(e.code(), "conflict");
-    let r = h.act_ok(&researcher(), "session_handoff_recover", json!({ "session_id": sid })).await;
+    let r = h.act_ok(&builder(), "session_handoff_recover", json!({ "session_id": sid })).await;
     assert_eq!(r["note"]["id"], id);
     assert_eq!(r["note"]["trust"]["level"], "untrusted");
 
@@ -589,8 +613,8 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
         .act_err(&outsider, "conversation_handoff", json!({ "conversation_id": "conv-1", "title": "x" }))
         .await;
     assert_eq!(e.code(), "not_found");
-    let listed = h.act_ok(&outsider, "conversation_handoffs", json!({ "conversation_id": "conv-1" })).await;
-    assert_eq!(listed["handoffs"], json!([]));
+    let e = h.act_err(&outsider, "conversation_handoffs", json!({ "conversation_id": "conv-1" })).await;
+    assert_eq!(e.code(), "not_found", "missing and not yours read alike");
 
     let created = h
         .act_ok(
@@ -773,13 +797,7 @@ async fn live_work_and_protected_rows_are_not_parked_silently() {
     h.ok(&builder(), "task_update", json!({ "id": gated, "append_note": "[waiting-for: operator]" })).await;
     let e = h.act_err(&other(), "queue_park", json!({ "task_id": gated, "reason": "stale" })).await;
     assert_eq!(reason(&e), "protected_task");
-    let v = h
-        .act_ok(
-            &other(),
-            "queue_park",
-            json!({ "task_id": gated, "reason": "stale", "approved_by": "operator" }),
-        )
-        .await;
+    let v = h.act_ok(&human(), "queue_park", json!({ "task_id": gated, "reason": "stale" })).await;
     assert_eq!(v["approved_by"], "operator");
     assert_eq!(
         h.n(&format!("SELECT parked_reason = 'stale (approved by operator)' FROM tasks WHERE id = {gated}")),
@@ -961,4 +979,291 @@ async fn a_large_handoff_note_keeps_the_packet_bounded() {
     assert!(p.to_string().len() <= 16_384, "{} bytes", p.to_string().len());
     assert_eq!(p["labels"]["truncated"], true);
     assert_eq!(p["handoff_note"]["id"], note["id"], "the note is trimmed before it is dropped");
+}
+
+// --- review regressions -------------------------------------------------------------
+
+#[tokio::test]
+async fn a_protected_park_needs_a_verified_operator_not_a_named_approver() {
+    let h = H::new();
+    let red = h.task("Rotate the red-tier keys", None).await;
+    let lane = h.task("Human lane", None).await;
+    h.ok(&builder(), "task_update", json!({ "id": lane, "lane": "operator-only" })).await;
+
+    // Free text naming an approver is not authority, for any agent.
+    for id in [red, lane] {
+        let e = h
+            .act_err(
+                &builder(),
+                "queue_park",
+                json!({ "task_id": id, "reason": "idle", "approved_by": "operator" }),
+            )
+            .await;
+        assert_eq!(reason(&e), "operator_required", "{e:?}");
+        let e = h.act_err(&builder(), "queue_park", json!({ "task_id": id, "reason": "idle" })).await;
+        assert_eq!(reason(&e), "protected_task");
+    }
+    // An unprotected row cannot carry a self-attested approval either.
+    let plain = h.task("Plain", None).await;
+    let e = h
+        .act_err(
+            &builder(),
+            "queue_park",
+            json!({ "task_id": plain, "reason": "idle", "approved_by": "operator" }),
+        )
+        .await;
+    assert_eq!(reason(&e), "operator_required");
+    assert_eq!(h.n("SELECT COUNT(*) FROM tasks WHERE parked_at IS NOT NULL"), 0);
+
+    // A lifecycle operator parks; the approval recorded is its own identity
+    // and approved_by rides along as a note.
+    let v = h
+        .act_ok(
+            &lifecycle_op(),
+            "queue_park",
+            json!({ "task_id": red, "reason": "idle", "approved_by": "agreed in standup" }),
+        )
+        .await;
+    assert_eq!(
+        (v["approved_by"].as_str(), v["approval_note"].as_str()),
+        (Some("lead-op"), Some("agreed in standup"))
+    );
+    assert_eq!(
+        h.n(&format!(
+            "SELECT parked_reason = 'idle (approved by lead-op: agreed in standup)' FROM tasks WHERE id = {red}"
+        )),
+        1
+    );
+    let v = h.act_ok(&human(), "queue_park", json!({ "task_id": lane, "reason": "idle" })).await;
+    assert_eq!(v["approved_by"], "operator");
+}
+
+#[tokio::test]
+async fn park_fold_and_unpark_need_writer_authority() {
+    let h = H::new();
+    // An unverified caller cannot park at all.
+    let free = h.task("Nobody holds this", None).await;
+    let e = h.act_err(&unverified(), "queue_park", json!({ "task_id": free, "reason": "idle" })).await;
+    assert_eq!(reason(&e), "identity_required", "{e:?}");
+
+    // A task someone else holds: only the holder or an operator parks it.
+    let held = h.task("Next up for builder-2", None).await;
+    h.ok(&builder(), "task_update", json!({ "id": held, "next_owner": "builder-2" })).await;
+    let e = h.act_err(&builder(), "queue_park", json!({ "task_id": held, "reason": "idle" })).await;
+    assert_eq!(reason(&e), "not_task_owner");
+    h.act_ok(&other(), "queue_park", json!({ "task_id": held, "reason": "idle", "dry_run": true })).await;
+    h.act_ok(&lifecycle_op(), "queue_park", json!({ "task_id": held, "reason": "idle", "dry_run": true }))
+        .await;
+
+    // A lapsed claim still names a holder.
+    let lapsed = h.task("Claim lapsed", None).await;
+    h.sql(&format!("UPDATE tasks SET claimed_by = 'builder-2' WHERE id = {lapsed}"));
+    let e = h.act_err(&outsider(), "queue_park", json!({ "task_id": lapsed, "reason": "idle" })).await;
+    assert_eq!(reason(&e), "not_task_owner");
+
+    // An unowned root whose subtree holds someone else's task needs an operator.
+    let root = h.task("Epic", None).await;
+    let kid = h.task("Kid for builder-2", Some(root)).await;
+    h.ok(&builder(), "task_update", json!({ "id": kid, "next_owner": "builder-2" })).await;
+    let e = h.act_err(&builder(), "queue_park", json!({ "task_id": root, "reason": "idle" })).await;
+    assert_eq!(reason(&e), "not_task_owner", "{e:?}");
+    assert_eq!(h.n("SELECT COUNT(*) FROM tasks WHERE parked_at IS NOT NULL"), 0);
+    let v = h.act_ok(&human(), "queue_park", json!({ "task_id": root, "reason": "idle" })).await;
+    assert_eq!(v["folded"], json!([kid]));
+
+    // Folding a held late child: the holder or an operator, not a bystander.
+    let late = h.task("Late, for builder-2", Some(root)).await;
+    h.ok(&builder(), "task_update", json!({ "id": late, "next_owner": "builder-2" })).await;
+    let e =
+        h.act_err(&builder(), "queue_fold", json!({ "task_id": late, "into": root, "reason": "late" })).await;
+    assert_eq!(reason(&e), "not_task_owner");
+    h.act_ok(&other(), "queue_fold", json!({ "task_id": late, "into": root, "reason": "late" })).await;
+
+    // Unpark is judged on the root.
+    h.act_ok(&human(), "queue_park", json!({ "task_id": held, "reason": "idle" })).await;
+    let e = h.act_err(&builder(), "queue_unpark", json!({ "task_id": held, "reason": "back" })).await;
+    assert_eq!(reason(&e), "not_task_owner");
+    h.act_ok(&other(), "queue_unpark", json!({ "task_id": held, "reason": "back" })).await;
+    // An unowned root is any queue writer's.
+    h.act_ok(&builder(), "queue_unpark", json!({ "task_id": root, "reason": "back" })).await;
+    assert_eq!(h.n("SELECT COUNT(*) FROM tasks WHERE parked_at IS NOT NULL"), 0);
+}
+
+#[tokio::test]
+async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
+    let h = H::new();
+    let sid = session(&h, &builder()).await;
+    let note = h
+        .act_ok(
+            &builder(),
+            "session_handoff_propose",
+            json!({ "session_id": sid, "done": ["a"], "next_steps": ["b"] }),
+        )
+        .await;
+    let id = note["id"].as_i64().unwrap();
+    h.act_ok(&builder(), "session_handoff_seal", json!({ "note_id": id })).await;
+
+    let params = json!({ "session_id": sid });
+    for who in [researcher(), other(), unverified()] {
+        let e = h.act_err(&who, "session_handoff_recover", params.clone()).await;
+        assert_eq!(e.code(), "not_found", "{} {e:?}", who.label);
+    }
+    // The same answer as for a session that does not exist.
+    let e = h.act_err(&other(), "session_handoff_recover", json!({ "session_id": "no-such" })).await;
+    assert_eq!(e.code(), "not_found");
+
+    for who in [builder(), human(), lifecycle_op()] {
+        let r = h.act_ok(&who, "session_handoff_recover", params.clone()).await;
+        assert_eq!(r["note"]["id"], id, "{}", who.label);
+    }
+    // The receiver of an assigned note may read it.
+    h.sql(&format!(
+        "UPDATE session_handoff_notes SET state = 'assigned', assigned_to = 'builder-2' WHERE id = {id}"
+    ));
+    let r = h.act_ok(&other(), "session_handoff_recover", params.clone()).await;
+    assert_eq!(r["note"]["id"], id);
+    assert_eq!(h.act_err(&outsider(), "session_handoff_recover", params).await.code(), "not_found");
+}
+
+#[tokio::test]
+async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_links() {
+    let h = H::new();
+    h.ok(
+        &builder(),
+        "message_send",
+        json!({ "act": "request", "to_agent": "builder-2", "body": "hi", "conversation_id": "conv-9" }),
+    )
+    .await;
+    let params = json!({ "conversation_id": "conv-9" });
+    let e = h.act_err(&unverified(), "conversation_handoffs", params.clone()).await;
+    assert_eq!(reason(&e), "identity_required", "{e:?}");
+
+    let real = h
+        .act_ok(&builder(), "conversation_handoff", json!({ "conversation_id": "conv-9", "title": "Real" }))
+        .await["task_id"]
+        .as_i64()
+        .unwrap();
+    // A notes line typed by hand is not a handoff.
+    let forged = h.task("Typed the marker", None).await;
+    h.ok(
+        &outsider(),
+        "task_update",
+        json!({ "id": forged, "append_note": "[conversation: conv-9] handed off from the agent conversation" }),
+    )
+    .await;
+
+    let listed = h.act_ok(&other(), "conversation_handoffs", params.clone()).await;
+    let ids = |key: &str| -> Vec<i64> {
+        listed[key].as_array().unwrap().iter().map(|r| r["task_id"].as_i64().unwrap()).collect()
+    };
+    assert_eq!(ids("handoffs"), vec![real]);
+    assert_eq!(ids("unaudited"), vec![forged]);
+    assert_eq!(listed["handoffs"][0]["by"], "builder-1");
+    assert_eq!(listed["handoffs"][0]["note_reference"], true);
+    // The coordinator sees every conversation; an outsider sees none.
+    let coord = caller("coord-1", ActorKind::Agent, Profile::Coordinator);
+    h.act_ok(&coord, "conversation_handoffs", params.clone()).await;
+    assert_eq!(h.act_err(&outsider(), "conversation_handoffs", params).await.code(), "not_found");
+}
+
+#[tokio::test]
+async fn a_check_is_verified_only_against_the_bound_repo_a_full_head_and_its_job() {
+    let ci = FakeCi::new(Verdict::Verified, Verdict::Verified);
+    let h = H::with_ci(Some(ci.clone()));
+    let t = h.task("Hardened", None).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let record = |name: &str, head: &str, reference: Value| json!({ "task_id": t, "name": name, "outcome": "pass", "head_sha": head, "ref": reference });
+    let run = |extra: Value| {
+        let mut r = json!({ "kind": "ci_run", "ref": "77" });
+        r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        r
+    };
+
+    // No binding: the reference is kept, never verified, and CI is not asked.
+    let v = h
+        .act_ok(&builder(), "task_check_record", record("ci", FULL, run(json!({ "repo": "example/repo" }))))
+        .await;
+    let c = check(&v, "ci");
+    assert_eq!(
+        (c["grade"].as_str(), c["verification"]["verdict"].as_str()),
+        (Some("attested"), Some("unverifiable"))
+    );
+    assert!(c["verification"]["detail"].as_str().unwrap().contains("no bound repository"), "{c}");
+    assert!(ci.calls.lock().unwrap().is_empty());
+
+    h.bind("Example/Repo").await;
+    // A caller-chosen repo is refused; an omitted one comes from the binding.
+    let e = h
+        .act_err(&builder(), "task_check_record", record("ci", FULL, run(json!({ "repo": "attacker/repo" }))))
+        .await;
+    assert_eq!(reason(&e), "repo_mismatch");
+    let v = h.act_ok(&builder(), "task_check_record", record("ci", FULL, run(json!({})))).await;
+    let c = check(&v, "ci");
+    assert_eq!(
+        (c["grade"].as_str(), c["ref"]["repo"].as_str()),
+        (Some("verified"), Some("example/repo")),
+        "{c}"
+    );
+
+    // An abbreviated head cannot carry a reference; a bare attestation still can.
+    let e = h.act_err(&builder(), "task_check_record", record("ci", HEAD, run(json!({})))).await;
+    assert_eq!(e.code(), "invalid_argument");
+    h.act_ok(
+        &builder(),
+        "task_check_record",
+        json!({ "task_id": t, "name": "lint", "outcome": "pass", "head_sha": HEAD }),
+    )
+    .await;
+
+    // A check bound to a job: another job is refused; no job means that job.
+    h.act_ok(
+        &builder(),
+        "task_workflow_set",
+        json!({ "task_id": t, "expected_checks": ["lint", { "name": "tests", "job": "unit" }] }),
+    )
+    .await;
+    let e = h
+        .act_err(&builder(), "task_check_record", record("tests", FULL, run(json!({ "job": "lint" }))))
+        .await;
+    assert_eq!(reason(&e), "job_mismatch");
+    ci.calls.lock().unwrap().clear();
+    let v = h.act_ok(&builder(), "task_check_record", record("tests", FULL, run(json!({})))).await;
+    let c = check(&v, "tests");
+    assert_eq!((c["grade"].as_str(), c["verified_scope"].as_str()), (Some("verified"), Some("job")), "{c}");
+    assert_eq!(c["ref"]["job"], "unit");
+    assert!(ci.calls.lock().unwrap().contains(&"job 77 unit".to_string()), "{:?}", ci.calls.lock().unwrap());
+    assert_eq!(v["expected_jobs"], json!({ "tests": "unit" }));
+
+    // A binding set after recording is applied when the check is verified.
+    h.act_ok(&builder(), "task_check_record", record("smoke", FULL, run(json!({ "job": "e2e" })))).await;
+    h.act_ok(
+        &builder(),
+        "task_workflow_set",
+        json!({ "task_id": t, "expected_checks": [{ "name": "smoke", "job": "smoke-suite" }] }),
+    )
+    .await;
+    let v = h
+        .act_ok(&other(), "task_check_verify", json!({ "task_id": t, "name": "smoke", "head_sha": FULL }))
+        .await;
+    let c = check(&v, "smoke");
+    assert_eq!(
+        (c["grade"].as_str(), c["verification"]["verdict"].as_str()),
+        (Some("attested"), Some("unverifiable"))
+    );
+
+    // So is a binding moved to another repository.
+    h.bind("example/other").await;
+    let v = h
+        .act_ok(&other(), "task_check_verify", json!({ "task_id": t, "name": "ci", "head_sha": FULL }))
+        .await;
+    assert_eq!(check(&v, "ci")["grade"], "attested");
+
+    let e = h
+        .act_err(
+            &builder(),
+            "task_workflow_set",
+            json!({ "task_id": t, "expected_checks": [{ "name": "a", "job": "x" }, { "name": "a", "job": "y" }] }),
+        )
+        .await;
+    assert_eq!(e.code(), "invalid_argument");
 }
