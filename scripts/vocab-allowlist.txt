@@ -14,6 +14,8 @@ docs/policy.md                           ^\| `[a-z-]+` \| `[a-z-]+` \|$
 crates/ua-server/src/oauth/cimd.rs       100\.64\.0\.0/10|"100\.100\.100\.100"
 crates/ua-tools/src/families/web.rs      "100\.64\.0\.1"
 crates/ua-tools/tests/web.rs             "http://100\.64\.0\.1/"
+crates/ua-tools/src/families/mcp/scope.rs  100\.64\.0\.0/10|"100\.64\.0\.1"
+docs/mcp.md                              `100\.64\.0\.0/10`
 
 # A placeholder macOS path in the import test's fixture.
 crates/ua-import/tests/python_hub.rs     /Users/someone/secret
