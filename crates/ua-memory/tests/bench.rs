@@ -28,6 +28,6 @@ async fn longmemeval_absent_file_names_the_pin_and_the_command() {
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"), "{msg}");
-    assert!(msg.contains("ua memory bench --longmemeval"), "{msg}");
+    assert!(msg.contains("cargo run -p ua-memory --bin memory-bench -- --longmemeval"), "{msg}");
     assert!(msg.contains("curl"), "{msg}");
 }

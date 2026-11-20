@@ -397,9 +397,9 @@ fn dataset_help(pin: &Pin) -> String {
          mkdir -p ~/.cache/ua-longmemeval/{short}\n  \
          curl -fsSL -o ~/.cache/ua-longmemeval/{short}/{} \\\n    \
          {}\n\
-         Then run: ua memory bench --longmemeval\n\
+         Then run: cargo run -p ua-memory --bin memory-bench -- --longmemeval\n\
          Or pass --data PATH to a copy that already has this hash. \
-         When --data is omitted, ua memory bench --longmemeval downloads the file on demand.",
+         When --data is omitted, that command downloads the file on demand.",
         pin.file,
         pin.sha256,
         pin.repo,

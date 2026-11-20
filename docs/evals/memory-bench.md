@@ -1,8 +1,12 @@
 # Memory retrieval bench
 
-Baseline for the current `memory_search` path, measured by `ua memory bench`.
-The fixture corpus is the CI gate (`crates/ua-memory/bench/floor.json`).
-LongMemEval-S is a recorded run, not a CI gate. Ranking is unchanged.
+Baseline for the current `memory_search` path. The fixture corpus is the CI
+gate (`crates/ua-memory/bench/floor.json`). LongMemEval-S is a recorded run,
+not a CI gate. Ranking is unchanged.
+
+`ua memory bench` is the command in the design. It is not wired in this
+change: `crates/ua-cli` belongs to another lane. Until that lands, run the
+`memory-bench` binary in `ua-memory`.
 
 ## Fixture corpus
 
@@ -29,12 +33,13 @@ The paraphrase class is the gap this floor records. Porter stemming matches
 finds a token past the first 512 tokens because FTS indexes the whole note.
 
 ```sh
-ua memory bench
+cargo run -p ua-memory --bin memory-bench
 ```
 
-The command prints this table and a JSON report. It exits non-zero when a
-class is below `bench/floor.json`. `crates/ua-memory/tests/bench.rs` runs the
-fixture twice and requires the same report.
+The binary prints this table on stderr and a JSON report on stdout. It exits
+non-zero when a class is below `bench/floor.json`.
+`crates/ua-memory/tests/bench.rs` runs the fixture twice and requires the same
+report.
 
 ## LongMemEval-S
 
@@ -48,7 +53,7 @@ predecessor scored:
 | File | `longmemeval_s_cleaned.json` |
 | sha256 | `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442` |
 
-`ua memory bench --longmemeval` downloads that file on demand into
+`cargo run -p ua-memory --bin memory-bench -- --longmemeval` downloads that file on demand into
 `~/.cache/ua-longmemeval/98d7416c/` (or `UA_LONGMEMEVAL_CACHE`), checks the
 hash, and refuses a mismatch. `--data PATH` uses a local copy and still checks
 the hash. The file is not committed.
@@ -73,7 +78,7 @@ git repository does not contain this cleaned file.
 mkdir -p ~/.cache/ua-longmemeval/98d7416c
 curl -fsSL -o ~/.cache/ua-longmemeval/98d7416c/longmemeval_s_cleaned.json \
   https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json
-ua memory bench --longmemeval
+cargo run -p ua-memory --bin memory-bench -- --longmemeval
 ```
 
 A default build scores the lexical path (no embedding model). `--limit N`

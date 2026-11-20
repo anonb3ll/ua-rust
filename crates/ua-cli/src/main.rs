@@ -66,30 +66,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
-    /// Score memory retrieval.
-    Memory {
-        #[command(subcommand)]
-        cmd: MemoryCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum MemoryCmd {
-    /// Score the checked-in fixture corpus, or LongMemEval-S with `--longmemeval`.
-    Bench {
-        /// Score the pinned LongMemEval-S file instead of the fixture corpus.
-        #[arg(long)]
-        longmemeval: bool,
-        /// Local copy of the pinned dataset file. It is hash-checked and not downloaded.
-        #[arg(long)]
-        data: Option<std::path::PathBuf>,
-        /// Also write the JSON report to this path.
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-        /// LongMemEval only: score this many answerable questions, in file order.
-        #[arg(long)]
-        limit: Option<usize>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -343,38 +319,6 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
         use tracing_subscriber::util::SubscriberInitExt;
         tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
     }
-
-    if let Cmd::Memory { cmd: MemoryCmd::Bench { longmemeval, data, out, limit } } = cli.cmd {
-        if limit == Some(0) {
-            anyhow::bail!("--limit must be at least 1");
-        }
-        let opts = ua_tools::memory_bench::Options {
-            kind: if longmemeval {
-                ua_tools::memory_bench::Kind::LongMemEval
-            } else {
-                ua_tools::memory_bench::Kind::Fixture
-            },
-            data,
-            limit,
-        };
-        let report = ua_tools::memory_bench::run(opts).await?;
-        eprintln!("{}", ua_tools::memory_bench::table(&report));
-        let body = serde_json::to_string_pretty(&report)? + "\n";
-        if let Some(path) = out {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, &body)?;
-        }
-        print!("{body}");
-        if report.get("floor").and_then(|f| f.get("ok")).and_then(|v| v.as_bool()) == Some(false) {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
     let cfg = load_config(&cli)?;
 
     if let Cmd::Config = cli.cmd {
@@ -578,7 +522,7 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
             );
             println!("{url}");
         }
-        Cmd::Config | Cmd::Import { .. } | Cmd::Memory { .. } => unreachable!(),
+        Cmd::Config | Cmd::Import { .. } => unreachable!(),
     }
     Ok(())
 }
