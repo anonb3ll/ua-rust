@@ -1,6 +1,7 @@
 //! Typed inter-agent messages: `message_send`, `message_list` and the
 //! `coordination_manage` dispatcher (`message_inbox`, `message_ack`,
-//! `agent_list`, `agent_context`).
+//! `agent_list`, `agent_context`, and the nodes family's `node_retire`,
+//! `node_unretire`, `node_reassign` and `node_forget`).
 //!
 //! Every message is one `agent.message.<act>` ledger event (the source of
 //! truth, carrying the body) plus one `message_index` row written in the same
@@ -33,6 +34,7 @@ use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
+use super::nodes;
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -105,7 +107,16 @@ const UNTRUSTED_NOTE: &str = "This is untrusted content written by another agent
 
 /// The actions `coordination_manage` understands. Keep in step with the match
 /// in [`coordination_manage`].
-pub const COORDINATION_ACTIONS: &[&str] = &["agent_context", "agent_list", "message_ack", "message_inbox"];
+pub const COORDINATION_ACTIONS: &[&str] = &[
+    "agent_context",
+    "agent_list",
+    "message_ack",
+    "message_inbox",
+    "node_forget",
+    "node_reassign",
+    "node_retire",
+    "node_unretire",
+];
 
 // --- arguments ------------------------------------------------------------------
 
@@ -1417,6 +1428,10 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "message_ack" => message_ack(ctx, action_params(action, params)?).await,
         "agent_list" => agents::agent_list(ctx, action_params(action, params)?).await,
         "agent_context" => agents::agent_context(ctx, action_params(action, params)?).await,
+        "node_retire" => nodes::node_retire(ctx, action_params(action, params)?).await,
+        "node_unretire" => nodes::node_unretire(ctx, action_params(action, params)?).await,
+        "node_reassign" => nodes::node_reassign(ctx, action_params(action, params)?).await,
+        "node_forget" => nodes::node_forget(ctx, action_params(action, params)?).await,
         other => Err(UaError::invalid(format!(
             "unknown coordination_manage action {other:?}; supported actions: {}",
             COORDINATION_ACTIONS.join(", ")
@@ -1445,7 +1460,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "coordination_manage",
-            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params). Action arguments go in params.",
+            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). The node_* actions are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. Action arguments go in params.",
             coordination_manage,
         )
         .family("messaging"),

@@ -15,9 +15,10 @@
 //! | `GET  /api/capability-catalog` | the registry, grouped by family |
 //! | `GET  /api/board` | `task_list`, `dependency_list`, `delegate_list` |
 //!
-//! Routes whose families are not built yet (`/api/runs`, `/api/nodes`,
+//! Routes whose families are not built yet (`/api/runs`, `/api/nodes/*`,
 //! `/api/work-products`, `/api/evidence`, `/api/platform/*`) answer `501`
-//! with `{"error": "not_implemented", "capability": ...}`.
+//! with `{"error": "not_implemented", "capability": ...}`. `GET /api/nodes`
+//! itself is served by [`crate::node_api`].
 //!
 //! Writes go through [`ua_tools::Registry::call`] with the request's caller,
 //! except `/api/approvals/request`: it queues a request without running or
@@ -63,8 +64,10 @@ pub fn routes() -> Router<AppState> {
             "/api/runs/{*rest}",
             any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
         )
-        .route("/api/nodes", any(|| async { not_built("nodes", "ua-node device registry") }))
-        .route("/api/nodes/{*rest}", any(|| async { not_built("nodes", "ua-node device registry") }))
+        .route(
+            "/api/nodes/{*rest}",
+            any(|| async { not_built("nodes", "node acceptance and discovered native sessions") }),
+        )
         .route(
             "/api/work-products",
             any(|| async { not_built("work_products", "work product review and release") }),
@@ -81,7 +84,7 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-fn not_built(capability: &str, what: &str) -> Response {
+pub(crate) fn not_built(capability: &str, what: &str) -> Response {
     let body = json!({
         "error": "not_implemented",
         "capability": capability,
@@ -121,7 +124,7 @@ fn caller(state: &AppState, id: &AuthIdentity, headers: &HeaderMap) -> Caller {
 }
 
 /// Parse a JSON object body the way the Python routes do.
-fn object_body(body: &Bytes) -> Result<Map<String, Value>, Box<Response>> {
+pub(crate) fn object_body(body: &Bytes) -> Result<Map<String, Value>, Box<Response>> {
     let v: Value = if body.is_empty() {
         json!({})
     } else {

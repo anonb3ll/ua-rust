@@ -21,6 +21,11 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 
 # Who counts as a human operator. Only humans resolve approvals.
 human_identities = ["operator"]
+# Who may retire and un-retire remote nodes (coordination_manage node_retire,
+# node_unretire). Unset means human_identities; setting it replaces that list.
+# lifecycle_operators = ["operator"]
+# Remote nodes one agent may hold in service (registered, not retired).
+node_max_per_agent = 8
 
 # Tools that always need a one-time human approval.
 approval_tools = ["git_merge_task"]

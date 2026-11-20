@@ -17,6 +17,7 @@ pub mod export;
 pub mod injection;
 pub mod memory;
 pub mod messaging;
+pub mod nodes;
 pub mod notify;
 pub mod observability;
 pub mod plans;
@@ -46,6 +47,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(cycles::SCHEMA);
     parts.push(delegation::SCHEMA);
     parts.push(messaging::SCHEMA);
+    parts.push(nodes::SCHEMA);
     parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
     parts.push(routines::SCHEMA);
@@ -68,6 +70,7 @@ pub fn register(r: &mut Registry) {
     injection::register(r);
     memory::register(r);
     messaging::register(r);
+    nodes::register(r);
     notify::register(r);
     observability::register(r);
     plans::register(r);

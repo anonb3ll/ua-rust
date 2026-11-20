@@ -10,6 +10,7 @@ pub mod events;
 pub mod guard;
 pub mod login;
 pub mod mcp;
+pub mod node_api;
 pub mod oauth;
 pub mod ui;
 
@@ -40,6 +41,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(oauth::routes())
         .merge(login::routes())
         .merge(compat_api::routes())
+        .merge(node_api::routes())
         .merge(ui::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), guard::protect))

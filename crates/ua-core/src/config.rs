@@ -69,6 +69,14 @@ pub struct Config {
     /// Identities that are humans (operators). Only humans resolve approvals.
     #[serde(deserialize_with = "string_or_list")]
     pub human_identities: Vec<String>,
+    /// Identities that may run lifecycle operator actions (`node_retire`,
+    /// `node_unretire`). Unset means `human_identities`; an empty list means
+    /// nobody. Setting it replaces that default rather than adding to it.
+    #[serde(default, deserialize_with = "opt_string_or_list", skip_serializing_if = "Option::is_none")]
+    pub lifecycle_operators: Option<Vec<String>>,
+    /// Remote nodes one agent may hold in service (registered, not retired).
+    /// A registration of a new node name past it is refused (`node_limit`).
+    pub node_max_per_agent: u32,
     /// Programs `run_cmd` may run. Setting it replaces the default list.
     #[serde(deserialize_with = "string_or_list")]
     pub shell_allowlist: Vec<String>,
@@ -283,6 +291,8 @@ impl Default for Config {
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             agent_tokens: None,
             human_identities: Vec::new(),
+            lifecycle_operators: None,
+            node_max_per_agent: 8,
             shell_allowlist: Vec::new(),
             trusted_cargo_configs: Vec::new(),
             approval_tools: Vec::new(),
@@ -491,6 +501,16 @@ impl Config {
         self.human_identities.iter().any(|h| h == label)
     }
 
+    /// The identities allowed to run lifecycle operator actions:
+    /// `lifecycle_operators` when it is set, else `human_identities`.
+    pub fn lifecycle_operators(&self) -> &[String] {
+        self.lifecycle_operators.as_deref().unwrap_or(&self.human_identities)
+    }
+
+    pub fn is_lifecycle_operator(&self, label: &str) -> bool {
+        self.lifecycle_operators().iter().any(|o| o == label)
+    }
+
     /// Parse the static token list into `(label, token)` pairs.
     ///
     /// Accepts `label:token` entries separated by commas or newlines, or a
@@ -545,6 +565,15 @@ where
         OneOrMany::Many(v) => v,
     };
     Ok(items.into_iter().map(T::from).collect())
+}
+
+/// [`string_or_list`] for a setting whose absence means something other
+/// than an empty list.
+fn opt_string_or_list<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    string_or_list(d).map(Some)
 }
 
 /// Deserialize either a list or a colon/newline separated string. Paths can
@@ -612,6 +641,27 @@ mod tests {
         let off = dir.path().join("off.toml");
         std::fs::write(&off, "dispatch_reaper_interval_s = 0\n").unwrap();
         assert_eq!(Config::load_inner(Some(&off), false).unwrap().dispatch_reaper_interval(), 0);
+    }
+
+    #[test]
+    fn lifecycle_operators_default_to_humans_and_replace_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |name: &str, body: &str| {
+            let file = dir.path().join(name);
+            std::fs::write(&file, body).unwrap();
+            Config::load_inner(Some(&file), false).unwrap()
+        };
+        let cfg = load("unset.toml", "human_identities = [\"operator\"]\n");
+        assert!(cfg.is_lifecycle_operator("operator"));
+        assert!(!cfg.is_lifecycle_operator("ops-bot"));
+
+        let cfg =
+            load("set.toml", "human_identities = [\"operator\"]\nlifecycle_operators = \"ops-bot, ops-2\"\n");
+        assert_eq!(cfg.lifecycle_operators(), ["ops-bot", "ops-2"]);
+        assert!(!cfg.is_lifecycle_operator("operator"), "setting the list replaces the default");
+
+        let cfg = load("empty.toml", "human_identities = [\"operator\"]\nlifecycle_operators = []\n");
+        assert!(!cfg.is_lifecycle_operator("operator"), "an empty list means nobody");
     }
 
     #[test]
