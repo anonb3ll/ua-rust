@@ -728,7 +728,7 @@ mod tests {
     fn strings_are_redacted_deeply() {
         // Same GitHub token shape `redact_secrets` matches: `gh[pousr]_` and
         // 36 alphanumerics, replaced by `[REDACTED_SECRET]`.
-        let token = "ghp_FakeToken0Example1Mixed2Case3Abc4567";
+        let token = "ghp_FakeToken0Sample1Mixed2Case3Abc45678";
         let v = redact(&json!({ "a": [format!("token {token}")] }));
         assert!(!v.to_string().contains(token), "{v}");
         assert_eq!(v["a"][0], "token [REDACTED_SECRET]");

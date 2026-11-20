@@ -300,8 +300,9 @@ mod tests {
     fn receipt_free_text_is_redacted() {
         // `gh[pousr]_` plus 36 alphanumerics: the GitHub token shape in
         // `audit::rules::secret_shapes`, which `redact_secrets` replaces with
-        // `[REDACTED_SECRET]`.
-        let token = "ghp_FakeToken0Example1Mixed2Case3Abc4567";
+        // `[REDACTED_SECRET]`. It avoids the placeholder hint words
+        // ("example", "dummy", ...) that `redact_secrets` leaves alone.
+        let token = "ghp_FakeToken0Sample1Mixed2Case3Abc45678";
         let raw = json!({
             "status": "failed",
             "attempt": 1,
