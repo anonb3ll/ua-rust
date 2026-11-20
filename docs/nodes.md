@@ -157,5 +157,16 @@ These routes answer `501`:
 These are not ported either:
 
 - device acceptance runs;
-- resuming or adopting native sessions;
-- the agent lifecycle (pause and terminate) that the original queue consults.
+- resuming or adopting native sessions.
+
+## Agent lifecycle and holds
+
+The queue consults the governance controls (see
+[policy.md](policy.md#governance-controls)). Queuing work for a node whose
+owner is paused, terminated or retired, or for a task under an active
+subtree hold, is refused before any approval is asked for. `node_claim`
+refuses a stopped owner (`agent_paused`, `agent_terminated`,
+`agent_retired`) after the claim's sweep has committed, and skips a held
+task's items, which stay queued. Pausing an agent flags its claimed items
+for the node to stop and leaves its queued items queued for the resume;
+terminating or retiring it cancels both.
