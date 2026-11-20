@@ -1633,7 +1633,9 @@ pub fn register(r: &mut Registry) {
             message_list,
         )
         .family("messaging")
-        .read_only(),
+        .read_only()
+        // A session_id is that session's heartbeat, a write.
+        .side_effects(|a| a.get("session_id").is_some_and(|v| !v.is_null())),
     );
     r.add(
         tool(

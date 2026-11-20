@@ -5,6 +5,7 @@
 //! tool returns, and the path and command resolvers that keep tools inside
 //! their sandbox.
 
+pub mod canonical;
 pub mod config;
 pub mod error;
 pub mod identity;

@@ -409,6 +409,16 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
         .unwrap_or_default();
     let caller = owner_caller(hub, &owner, attended);
     let actor_kind = caller.kind;
+    // Mark the fire before its workflow starts, so a hub that stops midway
+    // leaves `running` (reconciled as interrupted at the next start), never
+    // a fire that looks unstarted and would run twice.
+    let _ = hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute("UPDATE routine_runs SET workflow_status = 'running' WHERE id = ?1", [run_row])?;
+            Ok(())
+        })
+        .await;
     let (status, run_id, error) = match workflows::run_as(hub, &caller, &workflow, inputs).await {
         Ok(report) => (report.status.clone(), Some(report.run_id.clone()), report.error.clone()),
         Err(e) => ("error".to_string(), None, Some(e.to_string())),
@@ -432,6 +442,66 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
         "error": error,
         "actor_kind": actor_kind,
     }))
+}
+
+/// Fires with a workflow younger than this that never started are run at
+/// the next start; older ones are marked `not_run`.
+const RERUN_WINDOW_S: i64 = 24 * 3600;
+
+/// Reconcile routine fires a previous hub process left behind (`ua serve`
+/// runs it at startup, before the ticker):
+/// - a fire whose workflow was running (`workflow_status = 'running'`) is
+///   marked `interrupted`: part of it may have run, so it is not repeated;
+/// - a `created` fire of a routine with a workflow that never started
+///   (`workflow_status` unset) runs its workflow now when it is less than a
+///   day old, and is marked `not_run` otherwise.
+///
+/// Each mark is ledgered as `agent.routine.fire_reconciled`.
+pub async fn reconcile_fires(hub: &Hub) -> UaResult<Value> {
+    let cutoff = ua_core::time::format_ts(
+        jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(RERUN_WINDOW_S))
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH),
+    );
+    let (interrupted, stale, rerun) = hub
+        .db()
+        .write_async(move |tx| {
+            let ids = |tx: &WriteTx<'_>, sql: &str, p: &[&dyn rusqlite::ToSql]| -> UaResult<Vec<i64>> {
+                let mut stmt = tx.prepare(sql)?;
+                Ok(stmt.query_map(p, |r| r.get(0))?.collect::<Result<_, _>>()?)
+            };
+            let interrupted =
+                ids(tx, "SELECT id FROM routine_runs WHERE workflow_status = 'running' ORDER BY id", &[])?;
+            let unstarted = "SELECT rr.id FROM routine_runs rr JOIN routines r ON r.id = rr.routine_id \
+                 WHERE rr.status = 'created' AND rr.workflow_status IS NULL AND r.workflow IS NOT NULL";
+            let stale = ids(tx, &format!("{unstarted} AND rr.created_at < ?1 ORDER BY rr.id"), &[&cutoff])?;
+            let rerun = ids(tx, &format!("{unstarted} AND rr.created_at >= ?1 ORDER BY rr.id"), &[&cutoff])?;
+            for (list, status) in [(&interrupted, "interrupted"), (&stale, "not_run")] {
+                for id in list {
+                    tx.execute(
+                        "UPDATE routine_runs SET workflow_status = ?2 WHERE id = ?1",
+                        params![id, status],
+                    )?;
+                    ledger::append(
+                        tx,
+                        EventInput::new(
+                            "agent.routine.fire_reconciled",
+                            json!({ "routine_run_id": id, "workflow_status": status }),
+                        )
+                        .by("routines"),
+                    )?;
+                }
+            }
+            Ok((interrupted, stale, rerun))
+        })
+        .await?;
+    let mut runs = Vec::new();
+    for id in &rerun {
+        if let Some(r) = run_fire_workflow(hub, *id, false).await {
+            runs.push(r);
+        }
+    }
+    Ok(json!({ "interrupted": interrupted, "not_run": stale, "rerun": rerun, "workflows": runs }))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,13 +635,18 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
     Ok(result)
 }
 
-/// Tick once a minute, on the minute, forever. Spawned by `ua serve` when
-/// `routines_enabled` is set.
-pub async fn run_ticker(hub: Hub) {
+/// Tick once a minute, on the minute, until `ct` is cancelled. Spawned by
+/// `ua serve` when `routines_enabled` is set. Cancellation is honoured
+/// between ticks: a tick in progress runs to the end.
+pub async fn run_ticker(hub: Hub, ct: tokio_util::sync::CancellationToken) {
     loop {
         let now = jiff::Timestamp::now();
         let wait = 60 - now.as_second().rem_euclid(60);
-        tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+        tokio::select! {
+            biased;
+            _ = ct.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait as u64)) => {}
+        }
         if let Err(e) = tick(&hub, jiff::Timestamp::now(), false).await {
             tracing::warn!(error = %e, "routine tick failed");
         }

@@ -21,7 +21,8 @@ reproduce. You will get an acknowledgement within a week.
   client-supplied `resolved_by` is never trusted.
 - **Auth is on by default** (`enforce_auth = true`). `/api` and `/ui` refuse
   hosts outside `allowed_hosts` and the host of `public_url`, as protection
-  against DNS rebinding. They also refuse state-changing requests that are
+  against DNS rebinding; both the `Host` header and an HTTP/2 `:authority`
+  are checked. They also refuse state-changing requests that are
   cross-site or have non-JSON bodies.
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,

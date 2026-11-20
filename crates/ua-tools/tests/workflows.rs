@@ -638,3 +638,83 @@ async fn a_humans_routine_never_runs_unattended_with_human_authority() {
     let fired = h.ok(&op, "routine_fire", json!({ "routine_id": api, "idempotency_key": "evt-1" })).await;
     assert_eq!(fired["workflow"]["actor_kind"], "human", "{fired}");
 }
+
+/// Routine fires a stopped hub left behind are reconciled at the next start:
+/// a workflow that was running is marked interrupted (never repeated), an
+/// unstarted fire runs its workflow, and an old unstarted one is marked
+/// not_run. Each mark is ledgered.
+#[tokio::test]
+async fn routine_fires_left_by_a_stopped_hub_are_reconciled_at_startup() {
+    let h = H::with(|c| c.routines_enabled = true);
+    h.def(
+        "list-tasks",
+        "inputs: [status]\nsteps:\n  - name: list\n    tool: task_list\n    args: { status: \"{{ inputs.status }}\" }\n",
+    );
+    let l = lead("lead-1");
+    let id = h
+        .ok(
+            &l,
+            "routine_add",
+            json!({ "title": "On event", "trigger": "api", "workflow": "list-tasks", "inputs": { "status": "open" } }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    // What a stopped hub leaves: one fire mid-workflow, two never started
+    // (one of them old).
+    h.hub
+        .db()
+        .write(move |tx| {
+            for (key, wf, created) in [
+                ("api:running", Some("running"), "2099-01-01T00:00:00Z"),
+                ("api:unstarted", None, "2099-01-01T00:00:00Z"),
+                ("api:old", None, "2000-01-01T00:00:00Z"),
+            ] {
+                tx.execute(
+                    "INSERT INTO routine_runs (routine_id, fire_key, scheduled_for, status, created_at, workflow_status) \
+                     VALUES (?1, ?2, ?3, 'created', ?3, ?4)",
+                    rusqlite::params![id, key, created, wf],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let status = |key: &str| -> Option<String> {
+        let key = format!("api:{key}");
+        h.hub
+            .db()
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT workflow_status FROM routine_runs WHERE fire_key = ?1",
+                    [&key],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    };
+    assert_eq!(status("unstarted"), None, "fire keys: the fixture must match the stored keys");
+
+    let out = routines::reconcile_fires(&h.hub).await.unwrap();
+    assert_eq!(out["interrupted"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["not_run"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["rerun"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(status("running").as_deref(), Some("interrupted"));
+    assert_eq!(status("unstarted").as_deref(), Some("done"), "the unstarted fire ran its workflow");
+    assert_eq!(status("old").as_deref(), Some("not_run"));
+    let events: i64 = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM event_log WHERE channel = 'agent.routine.fire_reconciled'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(events, 2);
+    // A second start finds nothing left.
+    let again = routines::reconcile_fires(&h.hub).await.unwrap();
+    assert_eq!(again["rerun"], json!([]), "{again}");
+    assert_eq!(again["interrupted"], json!([]), "{again}");
+}

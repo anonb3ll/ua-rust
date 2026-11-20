@@ -258,6 +258,37 @@ other platforms, the run is reported as `not_ours`. Nothing is signalled,
 the expired run fails with `lease_expired_outcome_unknown`, and an operator
 must confirm cessation.
 
+## Hub shutdown
+
+On SIGINT or SIGTERM, `ua serve` drains against one 10-second deadline (see
+`serve_until_shutdown` in `crates/ua-cli/src/main.rs`):
+
+1. Every supervisor runs in one task tracker. Runs may finish on their own
+   until 3 seconds before the deadline.
+2. Each run still going then has its child's process group sent SIGTERM,
+   SIGKILL after 2 seconds if it has not exited, and a final SIGKILL sweep
+   so no grandchild outlives the run.
+3. The run is recorded `retryable`, with failure reason and failure class
+   `hub_shutdown` and a receipt whose source is `hub_shutdown`.
+   `dispatch_resume` starts it again under a new fence.
+
+A second signal exits at once. It SIGKILLs every live run's group and
+records nothing; the next start's reaper sweep reconciles those runs as
+described below. Runs left by a hub that was killed outright (SIGKILL, a
+crash) are reconciled the same way.
+
+MCP tool calls in flight run as their own tracked tasks, so the drain waits
+for them (up to the deadline) even when the MCP session that asked is torn
+down. A call still running at the deadline is dropped with the process; a
+call that changes state does so inside its own transactions, so nothing is
+half-written, but its client gets no answer.
+
+Routine fires are marked `running` before their workflow starts. At the
+next start, a fire left `running` is marked `interrupted` and not repeated
+(part of it may have run). A fire whose workflow never started runs it then
+if the fire is less than a day old; an older one is marked `not_run`. Each
+mark is ledgered as `agent.routine.fire_reconciled`.
+
 ## The child's boundary
 
 - The environment starts empty. The child gets the process basics (`PATH`,

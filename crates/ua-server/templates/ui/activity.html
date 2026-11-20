@@ -2,13 +2,20 @@
 {% block content %}
 <h1>Activity</h1>
 {% match chain %}
-{% when Err(e) %}<p class="error" role="alert">Ledger check unavailable: {{ e }}</p>
-{% when Ok(c) %}
+{% when Some(Err(e)) %}<p class="error" role="alert">Ledger check unavailable: {{ e }}</p>
+{% when Some(Ok(c)) %}
 {% if c.ok %}
 <p class="flash" role="status">Ledger hash chain verified: {{ c.checked }} events checked.</p>
 {% else %}
 <p class="error" role="alert">Ledger hash chain broken at sequence {{ c.first_bad_seq }}: {{ c.reason }}</p>
 {% endif %}
+{% when None %}
+<form class="filters" method="get" action="/ui/activity" aria-label="Verify the ledger">
+  {% if !prefix.is_empty() %}<input type="hidden" name="channel_prefix" value="{{ prefix }}">{% endif %}
+  <input type="hidden" name="verify" value="1">
+  <button type="submit">Verify the hash chain</button>
+  <span class="muted">Recomputes every ledger entry; run it when you need the check.</span>
+</form>
 {% endmatch %}
 
 <form class="filters" method="get" action="/ui/activity" aria-label="Filter by channel">

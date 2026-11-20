@@ -65,8 +65,16 @@ async fn authorize(
     let page = hub.send(get(&authorize_url(client_id, verifier, resource), Some(cookie), None)).await;
     assert_eq!(page.status(), 200);
     assert_eq!(page.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    // The consent page runs under the strict page CSP: no inline style or
+    // script (its style is the hub's stylesheet), and its form may still
+    // redirect to the client.
+    let csp = page.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap().to_string();
+    assert!(csp.contains("script-src 'self'") && csp.contains("style-src 'self'"), "{csp}");
+    assert!(!csp.contains("unsafe-inline") && !csp.contains("form-action"), "{csp}");
     let html = text_body(page).await;
     assert!(html.contains("Test client"));
+    assert!(!html.contains("<style") && !html.contains("<script"), "{html}");
+    assert!(html.contains("href=\"/login/assets/page.css\""));
     let (rid, csrf) = (hidden(&html, "request_id"), hidden(&html, "csrf"));
     let resp = hub
         .send(form(
