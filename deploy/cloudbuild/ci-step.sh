@@ -44,8 +44,8 @@ vocab)
         VOCAB_DENYLIST="$denylist" scripts/vocab-check.sh
     elif grep -qE 'NOT_FOUND|SERVICE_DISABLED|has not been used in project' "$err"; then
         rm -f "$err"
-        echo "vocab: Secret Manager has no secret $DENYLIST_SECRET in this project;" \
-            "checking generic patterns only (no private denylist)"
+        echo "vocab: no Secret Manager secret $DENYLIST_SECRET in this project (not found," \
+            "or the Secret Manager API is not enabled); checking generic patterns only"
         env -u VOCAB_DENYLIST scripts/vocab-check.sh
     else
         # The secret may exist but cannot be read: fail rather than silently
