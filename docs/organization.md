@@ -126,11 +126,18 @@ of a label is not treated as confidential.
 
 **Reserved labels.** Every label named in hub configuration —
 `human_identities`, `lifecycle_operators`, static `UA_AGENT_TOKENS` labels and
-the `[profiles]` map — is **reserved**. Every label writer, `touch_agent`'s
-auto-create included, refuses a reserved label unless a hub owner writes it,
-and then only into `'default'`. A tenant admin therefore cannot pre-create a
-row for a label the hub's own config will later trust, and the config's trust
-never lands in a tenant.
+the `[profiles]` map — is **reserved**. A reserved label's row may be created
+only in `'default'`, and only by a hub owner or by that label's own verified
+credential resolving to `'default'` (so a static-token or `[profiles]` agent's
+first `session_start` or heartbeat still creates its own row, exactly as
+today). Every other writer — a tenant admin, an unverified named caller,
+`touch_agent` acting for anyone else — refuses it in any letter case. A tenant
+admin therefore cannot pre-create a row for a label the hub's own config will
+later trust, and the config's trust never lands in a tenant. Reservation is
+checked at write time, so a label added to the config after a tenant already
+holds it is reported `MISCONFIGURED` by `system_doctor` and refused at startup
+until the operator resolves it; the `'default'` binding of static tokens and
+`LifecycleOperator` already keeps such a label from carrying hub authority.
 
 ## People
 
@@ -303,7 +310,10 @@ the `operator` profile), `dispatch/tools.rs`, `vault_move`, `messaging.rs`,
 `config_revisions.rs`, `nodes.rs`, `node_queue/command.rs`,
 `continuity/mod.rs`, and in `crates/ua-memory` (extracted by #49) the
 `fn is_human` in `note.rs` and its uses in `lifecycle.rs` (delete, restore,
-privileged fields).
+privileged fields). `ua-core` is the one other exemption: it defines the
+primitives (`Caller::is_human` in `identity.rs`, `Config::is_human` and
+`Config::is_lifecycle_operator` in `config.rs`) and tests them; the guard
+allows those definitions and `ua-core`'s own unit tests, and nothing else.
 
 **Tool scope.** Each registered tool declares `scope: Hub | Tenant`, an
 approval authority class, and whether its approvals are `team_routable`. A
@@ -393,10 +403,13 @@ backfills for exactly the listed tables, so the rules are written once.
 | Kind | Body | Checksum covers |
 |---|---|---|
 | `Static` | a `&'static str` of SQL | that SQL, as today |
-| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name, the `version`, and the SQL text the procedure generated on this database, recorded at apply |
+| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name and the `version` |
 
-A procedure that changes must bump its `version`, which makes it a new part, so
-immutability holds for both kinds. The seed (whose timestamp is bound from
+An applied procedure is checked by name and `version` only, because the SQL it
+generates may depend on the database it ran on; that generated SQL is stored
+beside the checksum for audit and is never regenerated or compared on later
+starts. A procedure that changes must bump its `version`, which makes it a new
+part, so immutability holds for both kinds. The seed (whose timestamp is bound from
 `ua_core::time::now()`), the helper-generated tenant parts and the rebuild are
 procedures; the rebuild is the only `standalone` one.
 
@@ -547,7 +560,7 @@ global key in the tree is classified:
 | `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`. |
-| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. |
+| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`. |
@@ -794,6 +807,13 @@ Writer rules the schema cannot express, each with an acceptance test:
   (that narrows), never set it to someone else. Memory uses this link to decide
   which agent may summarize that person's private notes, so an admin who holds
   an agent's tokens must not be able to aim it at another person.
+- **An owned agent's credentials belong to its owner.** Claiming an agent
+  revokes every live credential for it that someone other than the claiming
+  user issued (agent tokens, managed tokens, OAuth grants, node session
+  credentials). While `owner_user_id` is set, issuing any new credential for
+  that agent needs the owner user's own approval; an `org_admin` cannot mint
+  one alone. Otherwise an admin could take over an agent its owner had
+  enabled for private consolidation and read that person's private notes.
 - `org_memberships.consolidate_private` is changed only by the member
   themselves (default off); see `docs/memory.md`.
 - `offices.profiles` and `agents.default_profile` must be within the
@@ -1153,7 +1173,7 @@ CREATE TABLE IF NOT EXISTS import_org_map (
 CREATE TABLE IF NOT EXISTS import_finalized (
     source_hash  TEXT PRIMARY KEY,
     finalized_at TEXT NOT NULL,
-    event_ulid   TEXT NOT NULL
+    event_ulid   TEXT            -- NULL only for the legacy backfill marker
 );
 ```
 
@@ -1164,9 +1184,18 @@ CREATE TABLE IF NOT EXISTS import_finalized (
 - `ua import python-hub --finalize` is the explicit last run: it imports any
   remaining rows, appends the completion event — which records the full mapping
   — as the first `hash_v = 2` row, and writes `import_finalized`.
-- After finalization every further import into that target is refused.
+- Finalization is **target-wide**: `--finalize` finalizes every source
+  imported into that target at once, so a hub built from two sources imports
+  both, then finalizes once. After finalization every further import into that
+  target is refused.
 - `ua serve` refuses to start on a store with an import recorded but not
   finalized, so the hub cannot append `hash_v = 2` rows ahead of a catch-up.
+- **Stores imported before this design** already hold `import_runs` rows and
+  hub-written events. The `ua-import` part of `organization.v1` backfills
+  `import_finalized` with a legacy marker (`event_ulid` NULL) for every
+  `source_hash` already recorded, so those hubs keep starting and are treated
+  as finalized; their chain is already `hash_v = 1` throughout and verifies as
+  today.
 
 `verify()` therefore always sees the order it requires. The migration manifest
 compare records the mapping in its fingerprint.
@@ -1244,8 +1273,10 @@ Parity and isolation
    committed and the parts after it apply.
 7a. **Schema parts.** Each crate's test database applies its own
    `organization.v1.<crate>` part without the other crates' tables; a
-   procedure part whose generated SQL or `version` changes is refused as a
-   changed part; the `agents` label index part refuses to apply while two
+   procedure part whose `version` changes is refused as a changed part, while
+   one that generated different SQL on a different database is not; a crate
+   whose parts read organization tables (e.g. `memory.scope.v1` reads `users`)
+   applies the organization parts in its test database first; the `agents` label index part refuses to apply while two
    agent labels differ only in case, and names them.
 
 People and authority
@@ -1295,14 +1326,20 @@ People and authority
     in any letter case, is refused; creating agent `Builder-1` in B while
     `builder-1` exists in A is refused, including through `touch_agent`'s
     auto-create, so B cannot overwrite A's `agent_lifecycle` row.
-17a. **Reserved labels.** A tenant admin, and `touch_agent`, cannot create an
-    agent or user whose label is in `human_identities`, `lifecycle_operators`,
-    a static token or the `[profiles]` map, in any case; a hub owner can, only
-    in `'default'`.
+17a. **Reserved labels.** A tenant admin, an unverified named caller, and
+    `touch_agent` acting for another label cannot create an agent or user whose
+    label is in `human_identities`, `lifecycle_operators`, a static token or
+    the `[profiles]` map, in any case; a hub owner can, only in `'default'`; a
+    static-token agent's own first `session_start` creates its row in
+    `'default'` as today; a label added to the config while a tenant holds it
+    makes `system_doctor` report `MISCONFIGURED` and startup refuse.
 17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` to
     another user, and can clear it; the named user can set it by claiming the
     agent or accepting a request; only the member can turn
-    `consolidate_private` on or off.
+    `consolidate_private` on or off; claiming an agent revokes credentials for
+    it that another person issued, including one minted before the claim; with
+    an owner set, an `org_admin` cannot issue an agent token, managed token,
+    OAuth grant or node session credential for it without the owner's approval.
 18. **Resolution.** For each credential row of the resolution table, the caller
     gets the stated organization — including a static token, which resolves to
     `'default'` even if a same-named agent row exists elsewhere, and an
@@ -1394,4 +1431,6 @@ Importer
     mapping imports only new rows and a different mapping is refused;
     `--finalize` appends one completion event after the imported chain, after
     which `verify()` reports a valid chain and any further import is refused;
-    `ua serve` refuses to start on an imported but unfinalized store.
+    `ua serve` refuses to start on an imported but unfinalized store; a store
+    imported before this design starts after the upgrade (legacy marker) and
+    still verifies; two sources imported into one target finalize together.
