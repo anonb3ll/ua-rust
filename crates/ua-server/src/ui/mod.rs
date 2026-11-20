@@ -117,9 +117,16 @@ impl Ui {
         self.state.registry.call(&self.state.hub, &self.caller, tool, args).await
     }
 
-    /// Like [`Ui::call`], with the error flattened to display text.
+    /// A read that composes a page: [`Ui::call`] inside
+    /// [`ua_tools::registry::page_reads`], so a successful read-only tool
+    /// leaves no `tool_calls` row.
+    pub async fn call_read(&self, tool: &str, args: Value) -> UaResult<Value> {
+        ua_tools::registry::page_reads(self.call(tool, args)).await
+    }
+
+    /// Like [`Ui::call_read`], with the error flattened to display text.
     pub async fn read(&self, tool: &str, args: Value) -> Result<Value, String> {
-        self.call(tool, args).await.map_err(|e| describe(tool, &e))
+        self.call_read(tool, args).await.map_err(|e| describe(tool, &e))
     }
 
     /// Whether the caller's profile exposes `tool` (for direct reads).

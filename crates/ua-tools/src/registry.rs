@@ -140,6 +140,28 @@ where
     }
 }
 
+tokio::task_local! {
+    static PAGE_READS: ();
+}
+
+/// Run `f` as the composition of one page the hub renders itself (the
+/// Control Center's `GET` pages, `GET /api/board`). Every call made inside
+/// passes every check exactly as [`Registry::call`] always does, but a
+/// read-only tool that succeeds without a policy reservation leaves no
+/// `tool_calls` row: a page built from six or eight reads would otherwise
+/// serialise six or eight writes through the single writer per view.
+/// Refusals still reach the ledger, failed reads are still recorded, and a
+/// call that changes state (not `read_only`) is recorded as usual. MCP and
+/// HTTP tool calls never run inside this scope.
+pub async fn page_reads<F: Future>(f: F) -> F::Output {
+    PAGE_READS.scope((), f).await
+}
+
+/// Whether a finished call skips its `tool_calls` row (see [`page_reads`]).
+fn unrecorded_page_read(def: &ToolDef, result: &UaResult<Value>, reservation: Option<i64>) -> bool {
+    def.read_only && result.is_ok() && reservation.is_none() && PAGE_READS.try_with(|_| ()).is_ok()
+}
+
 /// Run blocking work (SQLite, filesystem) off the async runtime.
 pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> UaResult<T> + Send + 'static) -> UaResult<T> {
     tokio::task::spawn_blocking(f)
@@ -363,7 +385,9 @@ impl Registry {
         let started_at = ua_core::time::now();
         let clock = std::time::Instant::now();
         let result = (def.handler)(ctx, args).await;
-        record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation).await;
+        if !unrecorded_page_read(def, &result, reservation) {
+            record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation).await;
+        }
         result
     }
 }

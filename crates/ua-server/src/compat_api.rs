@@ -909,7 +909,19 @@ impl BoardFilters {
     }
 }
 
+/// `GET /api/board` composes its answer from several reads (five or six
+/// `task_list` pages, `dependency_list`, `delegate_list`); they run inside
+/// [`ua_tools::registry::page_reads`], so a view writes no `tool_calls` rows.
 async fn board(
+    state: State<AppState>,
+    id: Extension<AuthIdentity>,
+    headers: HeaderMap,
+    q: Query<HashMap<String, String>>,
+) -> Response {
+    ua_tools::registry::page_reads(board_view(state, id, headers, q)).await
+}
+
+async fn board_view(
     State(state): State<AppState>,
     Extension(id): Extension<AuthIdentity>,
     headers: HeaderMap,
