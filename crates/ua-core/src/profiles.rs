@@ -327,6 +327,19 @@ mod tests {
     }
 
     #[test]
+    fn migration_manifests_are_denied_to_developer_and_lead() {
+        for tool in ["export_migration_manifest", "compare_migration_manifests"] {
+            assert!(!Profile::Developer.allows_tool(tool), "developer must not see {tool}");
+            // Lead inherits the developer deny list.
+            assert!(!Profile::Lead.allows_tool(tool), "lead must not see {tool}");
+            assert!(!Profile::Reviewer.allows_tool(tool), "reviewer must not see {tool}");
+            assert!(Profile::Coordinator.allows_tool(tool), "coordinator must see {tool}");
+        }
+        // The plain exports stay available to developers.
+        assert!(Profile::Developer.allows_tool("export_data"));
+    }
+
+    #[test]
     fn only_profiles_meant_to_speak_publicly_can_send_to_zulip() {
         for tool in ["zulip_send_message", "zulip_resolve_send"] {
             for p in Profile::ALL.into_iter().filter(|p| *p != Profile::Coordinator) {

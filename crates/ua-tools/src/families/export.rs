@@ -3,7 +3,8 @@
 //! Tools: `export_tasks`, `export_memory`, `export_journal`, the read-only
 //! migration manifest (`export_migration_manifest`, `compare_migration_manifests`)
 //! and the consolidated `export_data(action, params)`. Import and rollback are
-//! not implemented.
+//! not implemented. The manifest tools are denied to developer and lead
+//! sessions, through `export_data` too.
 //!
 //! An export is returned inline (capped at 2 MB) or, with
 //! `write_to_vault=true` (the default, kept for compatibility), written as a
@@ -11,9 +12,14 @@
 //! file name carries a UTC timestamp and a counter, and is created exclusively
 //! so concurrent exports never overwrite each other. Writes are recorded on
 //! `agent.export.written`. No redaction: review an export before sharing it.
+//!
+//! A migration manifest is streamed from one read transaction: rows go to
+//! the fingerprint hash and to the output as they are read, the output is
+//! counted against its cap as it grows, and the event log is summarised
+//! (count, ulid range, rolling hash) rather than listed.
 
-use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
@@ -62,23 +68,29 @@ fn export_root(ctx: &ToolCtx) -> UaResult<PathBuf> {
     Ok(sandbox(ctx)?.root)
 }
 
-fn create_exclusive(dir: &Path, stem: &str, ext: &str, data: &[u8]) -> UaResult<PathBuf> {
+/// Create a new file `<stem>.<ext>` (or `<stem>-<n>.<ext>`) in `dir`, never
+/// opening one that exists.
+fn open_exclusive(dir: &Path, stem: &str, ext: &str) -> UaResult<(std::fs::File, PathBuf)> {
     for n in 1..=NAME_ATTEMPTS {
         let name = if n == 1 { format!("{stem}.{ext}") } else { format!("{stem}-{n}.{ext}") };
         let path = dir.join(name);
-        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f) => f,
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((f, path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(UaError::internal(format!("cannot create the export file: {e}"))),
-        };
-        let written = f.write_all(data).and_then(|_| f.sync_all());
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&path);
-            return Err(UaError::internal(format!("export write failed: {e}")));
         }
-        return Ok(path);
     }
     Err(UaError::conflict("could not claim a free export name; retry in a second"))
+}
+
+fn create_exclusive(dir: &Path, stem: &str, ext: &str, data: &[u8]) -> UaResult<PathBuf> {
+    let (mut f, path) = open_exclusive(dir, stem, ext)?;
+    let written = f.write_all(data).and_then(|_| f.sync_all());
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(UaError::internal(format!("export write failed: {e}")));
+    }
+    Ok(path)
 }
 
 /// Return the export inline or write it to the workspace.
@@ -513,7 +525,19 @@ const MANIFEST_MEMORY_COLUMNS: &[&str] = &[
     "contradicts",
     "valid_to",
 ];
-const MANIFEST_EVENT_COLUMNS: &[&str] =
+/// Columns of an event row listed after `events_since_ulid`.
+const MANIFEST_EVENT_COLUMNS: &[&str] = &[
+    "ulid",
+    "channel",
+    "payload",
+    "originator",
+    "episode_id",
+    "causal_parent_id",
+    "created_at",
+    "entry_hash",
+];
+/// Columns an unhashed event row is hashed over in the rolling hash.
+const ROLLING_ROW_COLUMNS: &[&str] =
     &["ulid", "channel", "payload", "originator", "episode_id", "causal_parent_id", "created_at"];
 /// Columns, then the composite key. `actor` may be null; the other link fields may not.
 const GRAPH_TABLES: &[(&str, &[&str], &[&str])] = &[
@@ -522,6 +546,13 @@ const GRAPH_TABLES: &[(&str, &[&str], &[&str])] = &[
 ];
 /// Manifest fields outside the fingerprinted payload.
 const UNHASHED_FIELDS: [&str; 2] = ["generated_at", "fingerprint"];
+/// `event_log` fields outside it: the listing after a cursor, and the cursor.
+const UNHASHED_EVENT_LOG_FIELDS: [&str; 2] = ["rows", "since_ulid"];
+/// The manifest layout this hub writes and compares. Version 2 summarises the
+/// event log instead of listing it.
+pub const MANIFEST_VERSION: u64 = 2;
+/// Memory notes one manifest may carry.
+pub const MANIFEST_MEMORY_MAX_ROWS: usize = 50_000;
 
 fn manifest_hash(payload: &Value) -> String {
     hex::encode(Sha256::digest(py_dumps(payload, None).as_bytes()))
@@ -533,6 +564,11 @@ fn manifest_fingerprint(manifest: &Map<String, Value>) -> String {
     let mut payload = manifest.clone();
     for field in UNHASHED_FIELDS {
         payload.remove(field);
+    }
+    if let Some(Value::Object(log)) = payload.get_mut("event_log") {
+        for field in UNHASHED_EVENT_LOG_FIELDS {
+            log.remove(field);
+        }
     }
     manifest_hash(&Value::Object(payload))
 }
@@ -551,19 +587,34 @@ fn table_columns(c: &Connection, table: &str) -> UaResult<Vec<String>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn manifest_rows(c: &Connection, table: &str, want: &[&str], order_by: &str) -> UaResult<Vec<Value>> {
+/// Visit the rows of `table` one at a time, ordered by `order_by`, with the
+/// columns of `want` the table has. `filter` is an extra `WHERE` clause on
+/// `order_by` (`> ?1`) when a cursor is given. Nothing is collected.
+fn for_each_row(
+    c: &Connection,
+    table: &str,
+    want: &[&str],
+    order_by: &str,
+    after: Option<&str>,
+    mut f: impl FnMut(Map<String, Value>) -> UaResult<()>,
+) -> UaResult<()> {
     if !has_table(c, table)? {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let available = table_columns(c, table)?;
     let cols: Vec<&str> = want.iter().copied().filter(|col| available.iter().any(|n| n == col)).collect();
     if cols.is_empty() || !available.iter().any(|n| n == order_by) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let sql = format!("SELECT {} FROM {table} ORDER BY {order_by}", cols.join(", "));
+    let filter = if after.is_some() { format!(" WHERE {order_by} > ?1") } else { String::new() };
+    let sql = format!("SELECT {} FROM {table}{filter} ORDER BY {order_by}", cols.join(", "));
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map([], row_map)?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().map(Value::Object).collect())
+    let params: Vec<SqlValue> = after.map(|a| SqlValue::Text(a.to_string())).into_iter().collect();
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        f(row_map(row)?)?;
+    }
+    Ok(())
 }
 
 /// The origin label stamped on a manifest: `source_host` from the config
@@ -588,43 +639,272 @@ fn label_event_row(row: &mut Value) {
     mark_untrusted(row, CLIENT_EVIDENCE_SOURCE, originator.as_deref());
 }
 
-fn build_manifest(c: &Connection, source_host: &str) -> UaResult<Value> {
+/// The limits one manifest build runs under.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestCaps {
+    /// Largest output, in bytes; the build stops as soon as it would pass it.
+    pub bytes: usize,
+    /// `inline` or `file`, for the refusal.
+    pub kind: &'static str,
+    /// Largest number of memory notes.
+    pub memory_rows: usize,
+}
+
+impl ManifestCaps {
+    pub const INLINE: ManifestCaps =
+        ManifestCaps { bytes: INLINE_MAX_BYTES, kind: "inline", memory_rows: MANIFEST_MEMORY_MAX_ROWS };
+    pub const FILE: ManifestCaps =
+        ManifestCaps { bytes: FILE_MAX_BYTES, kind: "file", memory_rows: MANIFEST_MEMORY_MAX_ROWS };
+
+    fn bytes_refusal(&self) -> UaError {
+        let hint = if self.kind == "inline" {
+            "pass write_to_vault=true for a file, or a later events_since_ulid"
+        } else {
+            "pass a later events_since_ulid, or prune memory"
+        };
+        UaError::invalid(format!("manifest is over the {} byte {} cap; {hint}", self.bytes, self.kind))
+    }
+}
+
+/// Writes the manifest as it is read: the canonical payload goes to the
+/// fingerprint hash and to `out` in one pass, and the output is counted
+/// against the cap as it grows, so nothing larger than the cap is built.
+struct Emitter<'o> {
+    hasher: Sha256,
+    /// Off while writing a part outside the fingerprinted payload.
+    hashing: bool,
+    out: &'o mut dyn std::io::Write,
+    bytes: usize,
+    caps: ManifestCaps,
+}
+
+impl Emitter<'_> {
+    fn write(&mut self, s: &str, hashed: bool, written: bool) -> UaResult<()> {
+        if hashed && self.hashing {
+            self.hasher.update(s.as_bytes());
+        }
+        if written {
+            self.bytes += s.len();
+            if self.bytes > self.caps.bytes {
+                return Err(self.caps.bytes_refusal());
+            }
+            self.out
+                .write_all(s.as_bytes())
+                .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Payload text: hashed and written.
+    fn put(&mut self, s: &str) -> UaResult<()> {
+        self.write(s, true, true)
+    }
+
+    fn key(&mut self, first: bool, key: &str) -> UaResult<()> {
+        let sep = if first { "" } else { "," };
+        self.put(&format!("{sep}{}:", py_dumps(&json!(key), None)))
+    }
+
+    /// One JSON array whose items `fill` emits through the closure it is given.
+    fn array(
+        &mut self,
+        fill: impl FnOnce(&mut dyn FnMut(&mut Self, &Value) -> UaResult<()>, &mut Self) -> UaResult<()>,
+    ) -> UaResult<()> {
+        self.put("[")?;
+        let mut first = true;
+        let mut item = |em: &mut Self, v: &Value| -> UaResult<()> {
+            if !first {
+                em.put(",")?;
+            }
+            first = false;
+            em.put(&py_dumps(v, None))
+        };
+        fill(&mut item, self)?;
+        self.put("]")
+    }
+}
+
+/// What a manifest build produced.
+#[derive(Debug)]
+pub struct ManifestStats {
+    pub tasks: usize,
+    pub memory: usize,
+    pub fingerprint: String,
+    pub bytes: usize,
+}
+
+/// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
+/// rolling_hash}` over the whole event log, ordered by ulid.
+///
+/// Each row's `entry_hash` is recomputed from its contents (as
+/// `event_log_verify` does), never taken as stored: the rolling hash is
+/// SHA-256 over one line per row holding the recomputed hash, or for a row
+/// without one (an imported legacy prefix), the canonical JSON of its
+/// [`ROLLING_ROW_COLUMNS`]. A stored hash that differs from its row is
+/// counted in `entry_hash_mismatches` and clears `chain_ok`.
+fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
+    let mut hasher = Sha256::new();
+    let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
+    let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
+    want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+    for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
+        let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
+        if count == 0 {
+            first = ulid.clone();
+        }
+        last = ulid;
+        count += 1;
+        let stored = row.remove("entry_hash");
+        let dedupe_key = row.remove("dedupe_key");
+        let prev_hash = row.remove("prev_hash");
+        match stored {
+            Some(Value::String(h)) if !h.is_empty() => {
+                let text = |k: &str| row.get(k).and_then(Value::as_str);
+                let recomputed = ledger::compute_entry_hash(
+                    prev_hash.as_ref().and_then(Value::as_str),
+                    text("ulid").unwrap_or_default(),
+                    text("channel").unwrap_or_default(),
+                    text("payload").unwrap_or_default(),
+                    text("originator"),
+                    text("episode_id"),
+                    text("causal_parent_id"),
+                    text("created_at").unwrap_or_default(),
+                    dedupe_key.as_ref().and_then(Value::as_str),
+                );
+                if recomputed != h {
+                    mismatches += 1;
+                }
+                hasher.update(recomputed.as_bytes());
+            }
+            _ => hasher.update(py_dumps(&Value::Object(row), None).as_bytes()),
+        }
+        hasher.update(b"\n");
+        Ok(())
+    })?;
+    let mut out = Map::new();
+    out.insert("chain_ok".into(), json!(mismatches == 0));
+    out.insert("count".into(), json!(count));
+    out.insert("entry_hash_mismatches".into(), json!(mismatches));
+    out.insert("first_ulid".into(), first);
+    out.insert("last_ulid".into(), last);
+    out.insert("rolling_hash".into(), json!(hex::encode(hasher.finalize())));
+    Ok(out)
+}
+
+/// Stream one manifest into `out`. Keys are emitted in sorted order, so the
+/// hashed text is exactly `py_dumps(payload)`; `generated_at` and
+/// `fingerprint` follow, outside the hash.
+fn write_manifest(
+    c: &Connection,
+    source_host: &str,
+    since_ulid: Option<&str>,
+    caps: ManifestCaps,
+    out: &mut dyn std::io::Write,
+) -> UaResult<ManifestStats> {
     // One read transaction: every table comes from the same snapshot, so a
     // write landing mid-export cannot leave a task without its events.
     let tx = c.unchecked_transaction()?;
-    let tasks = manifest_rows(&tx, "tasks", MANIFEST_TASK_COLUMNS, "id")?;
-    let memory: Vec<Value> = manifest_rows(&tx, "memory", MANIFEST_MEMORY_COLUMNS, "id")?
-        .into_iter()
-        .filter(|row| row.get("id").and_then(Value::as_str).is_none_or(|id| !is_index_id(id)))
-        .collect();
-    let note_ids: Vec<String> =
-        memory.iter().filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string)).collect();
-    let mut payload = Map::new();
-    payload.insert("manifest_version".into(), json!(1));
-    payload.insert("source_host".into(), json!(source_host));
-    payload.insert("schema_version".into(), json!(schema_version_label(&tx)?));
-    payload.insert("tasks".into(), Value::Array(tasks));
-    payload.insert("memory".into(), Value::Array(memory));
-    for (table, columns, _) in GRAPH_TABLES {
-        let mut rows = manifest_rows(&tx, table, columns, columns[0])?;
-        rows.retain(|row| graph_row_in_notes(row, &note_ids));
-        payload.insert((*table).into(), Value::Array(rows));
+    let mut em = Emitter { hasher: Sha256::new(), hashing: true, out, bytes: 0, caps };
+    em.put("{")?;
+
+    // event_log: the summary, then the rows after the cursor.
+    em.key(true, "event_log")?;
+    let summary = event_log_summary(&tx)?;
+    em.put("{")?;
+    for (i, (k, v)) in summary.iter().enumerate() {
+        em.key(i == 0, k)?;
+        em.put(&py_dumps(v, None))?;
     }
-    let mut events = manifest_rows(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid")?;
-    events.iter_mut().for_each(label_event_row);
-    payload.insert("event_log".into(), Value::Array(events));
+    if let Some(since) = since_ulid {
+        // The listing depends on the cursor, not on the data: it stays out of
+        // the fingerprint, so exports of the same data with different
+        // cursors compare equal.
+        em.hashing = false;
+        em.key(false, "rows")?;
+        em.array(|item, em| {
+            for_each_row(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid", Some(since), |row| {
+                let mut row = Value::Object(row);
+                label_event_row(&mut row);
+                item(em, &row)
+            })
+        })?;
+        em.key(false, "since_ulid")?;
+        em.put(&py_dumps(&json!(since), None))?;
+        em.hashing = true;
+    }
+    em.put("}")?;
+
+    em.key(false, "manifest_version")?;
+    em.put(&MANIFEST_VERSION.to_string())?;
+
+    em.key(false, "memory")?;
+    let mut note_ids: HashSet<String> = HashSet::new();
+    em.array(|item, em| {
+        for_each_row(&tx, "memory", MANIFEST_MEMORY_COLUMNS, "id", None, |row| {
+            let id = row.get("id").and_then(Value::as_str).map(str::to_string);
+            if id.as_deref().is_some_and(is_index_id) {
+                return Ok(());
+            }
+            if note_ids.len() >= caps.memory_rows {
+                return Err(UaError::invalid(format!(
+                    "memory holds more than {} notes, over the manifest memory cap of {} rows",
+                    caps.memory_rows, caps.memory_rows
+                )));
+            }
+            // A row without an id still counts toward the cap.
+            note_ids.insert(id.unwrap_or_else(|| format!("\0row{}", note_ids.len())));
+            item(em, &Value::Object(row))
+        })
+    })?;
+    let memory = note_ids.len();
+
+    for (table, columns, _) in GRAPH_TABLES {
+        em.key(false, table)?;
+        em.array(|item, em| {
+            for_each_row(&tx, table, columns, columns[0], None, |row| {
+                let row = Value::Object(row);
+                if graph_row_in_notes(&row, &note_ids) { item(em, &row) } else { Ok(()) }
+            })
+        })?;
+    }
+
+    em.key(false, "schema_version")?;
+    em.put(&py_dumps(&json!(schema_version_label(&tx)?), None))?;
+    em.key(false, "source_host")?;
+    em.put(&py_dumps(&json!(source_host), None))?;
+
+    em.key(false, "tasks")?;
+    let mut tasks = 0usize;
+    em.array(|item, em| {
+        for_each_row(&tx, "tasks", MANIFEST_TASK_COLUMNS, "id", None, |row| {
+            tasks += 1;
+            item(em, &Value::Object(row))
+        })
+    })?;
     tx.finish()?;
-    let fingerprint = manifest_fingerprint(&payload);
-    payload.insert("generated_at".into(), json!(ua_core::time::now()));
-    payload.insert("fingerprint".into(), json!(fingerprint));
-    Ok(Value::Object(payload))
+
+    // The closing brace ends the hashed payload; the written object goes on.
+    em.write("}", true, false)?;
+    let fingerprint = hex::encode(std::mem::take(&mut em.hasher).finalize());
+    em.write(
+        &format!(
+            ",{}:{},{}:{}}}",
+            py_dumps(&json!("fingerprint"), None),
+            py_dumps(&json!(fingerprint), None),
+            py_dumps(&json!("generated_at"), None),
+            py_dumps(&json!(ua_core::time::now()), None),
+        ),
+        false,
+        true,
+    )?;
+    Ok(ManifestStats { tasks, memory, fingerprint, bytes: em.bytes })
 }
 
-fn graph_row_in_notes(row: &Value, note_ids: &[String]) -> bool {
+fn graph_row_in_notes(row: &Value, note_ids: &HashSet<String>) -> bool {
     let Some(obj) = row.as_object() else { return false };
     for key in ["note_id", "src_id", "dst_id"] {
         if let Some(id) = obj.get(key).and_then(Value::as_str)
-            && !note_ids.iter().any(|n| n == id)
+            && !note_ids.contains(id)
         {
             return false;
         }
@@ -637,31 +917,96 @@ fn graph_row_in_notes(row: &Value, note_ids: &[String]) -> bool {
 pub struct ManifestArgs {
     /// Write `exports/migration-manifest-<UTC>.json` in the workspace. Default false: return the manifest inline.
     pub write_to_vault: Option<bool>,
+    /// A ulid: also list the event-log rows after it (`event_log.rows`). The summary always covers the whole log.
+    pub events_since_ulid: Option<String>,
+}
+
+fn parse_cursor(raw: Option<&str>) -> UaResult<Option<String>> {
+    let Some(raw) = raw.map(str::trim) else { return Ok(None) };
+    ulid::Ulid::from_string(raw)
+        .map(|u| Some(u.to_string()))
+        .map_err(|_| UaError::invalid(format!("events_since_ulid must be a ulid, got {raw:?}")))
 }
 
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
     let source_host = source_host_label(ctx.hub.cfg());
-    let manifest = ctx.hub.db().read_async(move |c| build_manifest(c, &source_host)).await?;
-    let tasks = manifest.get("tasks").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    let memory = manifest.get("memory").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    let rows = tasks + memory;
-    let fingerprint = manifest.get("fingerprint").cloned().unwrap_or(Value::Null);
-    if a.write_to_vault.unwrap_or(false) {
-        // The file holds the manifest; the result only points at it.
-        let content = format!("{}\n", py_dumps(&manifest, Some(2)));
-        let mut out = deliver(&ctx, "migration-manifest", "json", content, rows, true).await?;
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("fingerprint".into(), fingerprint);
-        }
-        return Ok(out);
+    let since = parse_cursor(a.events_since_ulid.as_deref())?;
+    if !a.write_to_vault.unwrap_or(false) {
+        let (stats, text) = ctx
+            .hub
+            .db()
+            .read_async(move |c| {
+                let mut buf: Vec<u8> = Vec::new();
+                let stats =
+                    write_manifest(c, &source_host, since.as_deref(), ManifestCaps::INLINE, &mut buf)?;
+                Ok((stats, buf))
+            })
+            .await?;
+        let manifest: Value = serde_json::from_slice(&text)?;
+        return Ok(json!({
+            "manifest": manifest,
+            "fingerprint": stats.fingerprint,
+            "rows": stats.tasks + stats.memory,
+            "bytes": stats.bytes,
+        }));
     }
-    let bytes = py_dumps(&manifest, None).len();
-    if bytes > INLINE_MAX_BYTES {
-        return Err(UaError::invalid(format!(
-            "manifest is {bytes} bytes, over the {INLINE_MAX_BYTES} byte inline cap; pass write_to_vault=true"
-        )));
-    }
-    Ok(json!({ "manifest": manifest, "fingerprint": fingerprint, "rows": rows, "bytes": bytes }))
+    // The file is written as the rows are read; the result only points at it.
+    let root = export_root(&ctx)?;
+    let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+    let (rel, stats) = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            let dir = ua_core::safety::resolve_in_root(EXPORT_DIR, std::slice::from_ref(&root), true)?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| UaError::internal(format!("cannot create {EXPORT_DIR}/: {e}")))?;
+            let (file, path) = open_exclusive(&dir, &format!("migration-manifest-{stamp}"), "json")?;
+            let mut out = std::io::BufWriter::new(file);
+            let written = write_manifest(c, &source_host, since.as_deref(), ManifestCaps::FILE, &mut out)
+                .and_then(|stats| {
+                    out.write_all(b"\n")
+                        .and_then(|_| out.flush())
+                        .and_then(|_| out.get_ref().sync_all())
+                        .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
+                    Ok(stats)
+                });
+            match written {
+                Ok(mut stats) => {
+                    stats.bytes += 1;
+                    let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().into_owned();
+                    Ok((rel, stats))
+                }
+                Err(e) => {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    Err(e)
+                }
+            }
+        })
+        .await?;
+    let rows = stats.tasks + stats.memory;
+    let (by, path, bytes) = (ctx.caller.label.clone(), rel.clone(), stats.bytes);
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "agent.export.written",
+                    json!({ "kind": "migration-manifest", "path": path, "rows": rows, "bytes": bytes }),
+                )
+                .by(by),
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(json!({
+        "path": rel,
+        "rows": rows,
+        "bytes": stats.bytes,
+        "root": "workspace",
+        "fingerprint": stats.fingerprint,
+    }))
 }
 
 fn object_rows(value: Option<&Value>, what: &str) -> UaResult<Vec<Map<String, Value>>> {
@@ -769,10 +1114,245 @@ fn manifest_origin<'m>(side: &str, m: &'m Value) -> UaResult<&'m str> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompareArgs {
-    /// Manifest object from `export_migration_manifest` (the `manifest` field, not the wrapper).
-    pub left: Value,
-    /// Manifest object to compare against `left`. It must come from the same origin (`source_host`).
-    pub right: Value,
+    /// Manifest object from `export_migration_manifest` (the `manifest` field, not the wrapper). Give this or `left_path`.
+    pub left: Option<Value>,
+    /// Manifest object to compare against `left`. It must come from the same origin (`source_host`). Give this or `right_path`.
+    pub right: Option<Value>,
+    /// A manifest file your own `export_migration_manifest` wrote under `exports/`, as it returned its `path`.
+    pub left_path: Option<String>,
+    /// A manifest file your own `export_migration_manifest` wrote, compared against the left side.
+    pub right_path: Option<String>,
+}
+
+/// Read a manifest file this caller's `export_migration_manifest` wrote. The
+/// path must resolve inside `exports/` in the caller's workspace (the sandbox
+/// check every workspace read gets), and an `agent.export.written` entry by
+/// the same caller must name it: `exports/` is shared by every agent without
+/// its own workspace, so being there is not enough. The file is opened
+/// without following a symlink and checked through the open handle.
+async fn read_export_file(ctx: &ToolCtx, field: &str, path: String) -> UaResult<Value> {
+    let root = export_root(ctx)?;
+    let field = field.to_string();
+    let (f, p) = (field.clone(), path.clone());
+    let (resolved, rel) = blocking(move || {
+        let roots = std::slice::from_ref(&root);
+        let exports = ua_core::safety::resolve_in_root(EXPORT_DIR, roots, false)?;
+        let resolved = ua_core::safety::resolve_in_root(&p, roots, false)?;
+        if resolved == exports || !resolved.starts_with(&exports) {
+            return Err(UaError::denied(
+                "outside_exports",
+                format!("{f} {p:?} is not a file under {EXPORT_DIR}/ in the workspace"),
+            ));
+        }
+        let rel = resolved.strip_prefix(&root).unwrap_or(&resolved).to_string_lossy().into_owned();
+        Ok((resolved, rel))
+    })
+    .await?;
+    let who = ctx.caller.label.clone();
+    let recorded: bool = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM event_log WHERE channel = 'agent.export.written' \
+                 AND originator = ?1 AND json_extract(payload, '$.kind') = 'migration-manifest' \
+                 AND json_extract(payload, '$.path') = ?2)",
+                rusqlite::params![who, rel],
+                |r| r.get(0),
+            )?)
+        })
+        .await?;
+    if !recorded {
+        return Err(UaError::denied(
+            "not_your_export",
+            format!("{field} {path:?} is not a manifest your export_migration_manifest wrote"),
+        ));
+    }
+    blocking(move || {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = opts.open(&resolved).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => UaError::not_found(format!("{field} {path:?} does not exist")),
+            kind => UaError::invalid(format!("cannot open {field} {path:?}: {kind}")),
+        })?;
+        let meta =
+            file.metadata().map_err(|e| UaError::invalid(format!("cannot read {field} {path:?}: {e}")))?;
+        if !meta.is_file() {
+            return Err(UaError::invalid(format!("{field} {path:?} is not a file")));
+        }
+        if meta.len() > FILE_MAX_BYTES as u64 {
+            return Err(UaError::invalid(format!(
+                "{field} {path:?} is over the {FILE_MAX_BYTES} byte file cap"
+            )));
+        }
+        let reader = std::io::BufReader::new(file.take(FILE_MAX_BYTES as u64 + 1));
+        serde_json::from_reader(reader)
+            .map_err(|e| UaError::invalid(format!("{field} {path:?} is not a JSON manifest: {e}")))
+    })
+    .await
+}
+
+/// One side's manifest: given inline, or read from the caller's exports.
+async fn side_manifest(
+    ctx: &ToolCtx,
+    side: &str,
+    inline: Option<Value>,
+    path: Option<String>,
+) -> UaResult<Value> {
+    match (inline, path) {
+        (Some(v), None) => Ok(v),
+        (None, Some(p)) => read_export_file(ctx, &format!("{side}_path"), p).await,
+        (Some(_), Some(_)) => Err(UaError::invalid(format!("give {side} or {side}_path, not both"))),
+        (None, None) => Err(UaError::invalid(format!("{side} or {side}_path is required"))),
+    }
+}
+
+/// One side's event-log summary, checked.
+struct EventLog {
+    count: u64,
+    first: Option<String>,
+    last: Option<String>,
+    rolling_hash: String,
+    /// `chain_ok` as the export stated it (absent: not stated).
+    chain_ok: Option<bool>,
+    /// The cursor and, per ulid listed after it, a hash of the row.
+    rows: Option<(String, BTreeMap<String, String>)>,
+}
+
+fn opt_ulid(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
+    match log.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(UaError::invalid(format!("{side} event_log.{key} must be a string or null"))),
+    }
+}
+
+fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
+    let Some(raw) = m.get("event_log") else { return Ok(None) };
+    let Some(log) = raw.as_object() else {
+        return Err(UaError::invalid(format!(
+            "{side} event_log must be a summary object {{count, first_ulid, last_ulid, rolling_hash}}"
+        )));
+    };
+    let count = log
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| UaError::invalid(format!("{side} event_log.count must be a non-negative integer")))?;
+    let rolling_hash = log
+        .get("rolling_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| UaError::invalid(format!("{side} event_log.rolling_hash must be a string")))?
+        .to_string();
+    let first = opt_ulid(side, log, "first_ulid")?;
+    let last = opt_ulid(side, log, "last_ulid")?;
+    let rows = match (log.get("rows"), opt_ulid(side, log, "since_ulid")?) {
+        (None, None) => None,
+        (Some(rows), Some(since)) => {
+            let rows = object_rows(Some(rows), &format!("{side} event_log.rows"))?;
+            let mut ulids = BTreeMap::new();
+            for row in &rows {
+                let Some(ulid) = row.get("ulid").and_then(Value::as_str) else {
+                    return Err(UaError::invalid(format!("{side} event_log.rows require a ulid")));
+                };
+                let hash = manifest_hash(&Value::Object(row.clone()));
+                if ulids.insert(ulid.to_string(), hash).is_some() {
+                    return Err(UaError::invalid(format!(
+                        "{side} event_log.rows contains duplicate ulid {ulid}"
+                    )));
+                }
+            }
+            Some((since, ulids))
+        }
+        _ => {
+            return Err(UaError::invalid(format!(
+                "{side} event_log has rows without since_ulid, or the reverse"
+            )));
+        }
+    };
+    let chain_ok = match log.get("chain_ok") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(UaError::invalid(format!("{side} event_log.chain_ok must be a boolean"))),
+    };
+    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, rows }))
+}
+
+/// Compare the two event-log summaries and, when both sides listed rows,
+/// the rows after the later of the two cursors, by ulid.
+fn compare_event_logs(
+    left: Option<EventLog>,
+    right: Option<EventLog>,
+    summary: &mut Map<String, Value>,
+    conflicts: &mut Vec<Value>,
+) {
+    let (l, r) = match (left, right) {
+        (None, None) => return,
+        (Some(l), Some(r)) => (l, r),
+        (l, _) => {
+            let side = if l.is_none() { "left" } else { "right" };
+            summary.insert("event_log".into(), json!({"compared": false}));
+            conflicts.push(json!({"kind": "event_log", "side": side, "type": "event_log_missing"}));
+            return;
+        }
+    };
+    let count_match = l.count == r.count;
+    let range_match = l.first == r.first && l.last == r.last;
+    let rolling_hash_match = l.rolling_hash == r.rolling_hash;
+    let side = |e: &EventLog| json!({"count": e.count, "first_ulid": e.first, "last_ulid": e.last, "chain_ok": e.chain_ok});
+    let mut out = json!({
+        "count_match": count_match,
+        "range_match": range_match,
+        "rolling_hash_match": rolling_hash_match,
+        "left": side(&l),
+        "right": side(&r),
+    });
+    let mut rows_differ = false;
+    if let (Some((l_since, l_rows)), Some((r_since, r_rows))) = (&l.rows, &r.rows) {
+        // Both sides list every row after their own cursor, so compare only
+        // the range both cover.
+        let since = std::cmp::max(l_since, r_since);
+        let after = |rows: &'_ BTreeMap<String, String>| -> BTreeMap<String, String> {
+            rows.iter()
+                .filter(|(u, _)| u.as_str() > since.as_str())
+                .map(|(u, h)| (u.clone(), h.clone()))
+                .collect()
+        };
+        let (l_after, r_after) = (after(l_rows), after(r_rows));
+        let left_only = l_after.keys().filter(|u| !r_after.contains_key(*u)).count();
+        let right_only = r_after.keys().filter(|u| !l_after.contains_key(*u)).count();
+        let both = l_after.keys().filter(|u| r_after.contains_key(*u)).count();
+        // The same ulid with other contents: an edited or forged row.
+        let content_differs =
+            l_after.iter().filter(|(u, h)| r_after.get(*u).is_some_and(|rh| rh != *h)).count();
+        rows_differ = left_only + right_only + content_differs > 0;
+        out["rows"] = json!({
+            "since_ulid": since,
+            "left_only": left_only,
+            "right_only": right_only,
+            "both": both,
+            "content_differs": content_differs,
+        });
+    }
+    for (name, e) in [("left", &l), ("right", &r)] {
+        if e.chain_ok == Some(false) {
+            conflicts.push(json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"}));
+        }
+    }
+    if !(count_match && range_match && rolling_hash_match) || rows_differ {
+        conflicts.push(json!({
+            "kind": "event_log",
+            "type": "event_log_mismatch",
+            "count_match": count_match,
+            "range_match": range_match,
+            "rolling_hash_match": rolling_hash_match,
+        }));
+    }
+    summary.insert("event_log".into(), out);
 }
 
 fn compare_kind(
@@ -847,24 +1427,36 @@ fn missing_parents(side: &str, tasks: &BTreeMap<String, &Map<String, Value>>, co
     }
 }
 
-async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
-    let (Some(left), Some(right)) = (a.left.as_object(), a.right.as_object()) else {
+async fn compare_migration_manifests(ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
+    let left = side_manifest(&ctx, "left", a.left, a.left_path).await?;
+    let right = side_manifest(&ctx, "right", a.right, a.right_path).await?;
+    compare_manifests(&left, &right)
+}
+
+fn compare_manifests(left_m: &Value, right_m: &Value) -> UaResult<Value> {
+    let (Some(left), Some(right)) = (left_m.as_object(), right_m.as_object()) else {
         return Err(UaError::invalid("left and right must be manifest objects"));
     };
-    if a.left.get("manifest_version") != Some(&json!(1)) || a.right.get("manifest_version") != Some(&json!(1))
-    {
-        return Err(UaError::invalid("unsupported migration manifest version"));
+    let version = json!(MANIFEST_VERSION);
+    for (side, m) in [("left", left), ("right", right)] {
+        if m.get("manifest_version") != Some(&version) {
+            return Err(UaError::invalid(format!(
+                "unsupported migration manifest version on the {side} side: {}; this hub compares version \
+                 {MANIFEST_VERSION} manifests (re-export older ones)",
+                m.get("manifest_version").unwrap_or(&Value::Null)
+            )));
+        }
     }
-    let (left_origin, right_origin) =
-        (manifest_origin("left", &a.left)?, manifest_origin("right", &a.right)?);
+    let (left_origin, right_origin) = (manifest_origin("left", left_m)?, manifest_origin("right", right_m)?);
     if left_origin != right_origin {
         return Err(UaError::invalid(format!(
             "the manifests come from different origins ({left_origin:?} and {right_origin:?}); rows are keyed by \
              id, which only identifies a row within one origin"
         )));
     }
-    validate_graph("left", &a.left)?;
-    validate_graph("right", &a.right)?;
+    validate_graph("left", left_m)?;
+    validate_graph("right", right_m)?;
+    let (left_log, right_log) = (event_log_of("left", left_m)?, event_log_of("right", right_m)?);
 
     // The stated fingerprints are not trusted: recompute both from the payloads.
     let left_fingerprint = manifest_fingerprint(left);
@@ -884,8 +1476,8 @@ async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<
         kinds.push((name, keys));
     }
     for (kind, keys) in kinds {
-        let left_rows = object_rows(a.left.get(kind), kind)?;
-        let right_rows = object_rows(a.right.get(kind), kind)?;
+        let left_rows = object_rows(left_m.get(kind), kind)?;
+        let right_rows = object_rows(right_m.get(kind), kind)?;
         let left_index = index_rows("left", kind, keys, &left_rows)?;
         let right_index = index_rows("right", kind, keys, &right_rows)?;
         compare_kind(kind, keys, &left_index, &right_index, &mut summary, &mut conflicts);
@@ -894,6 +1486,7 @@ async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<
             missing_parents("right", &right_index, &mut conflicts);
         }
     }
+    compare_event_logs(left_log, right_log, &mut summary, &mut conflicts);
     let same = left_fingerprint == right_fingerprint && conflicts.is_empty();
     Ok(json!({
         "source_host": left_origin,
@@ -912,10 +1505,24 @@ async fn compare_migration_manifests(_ctx: ToolCtx, a: CompareArgs) -> UaResult<
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DataArgs {
-    /// tasks, memory, journal, manifest or compare. Import and rollback are not available.
+    /// tasks, memory, journal, manifest or compare (the last two need a profile that may call
+    /// export_migration_manifest / compare_migration_manifests). Import and rollback are not available.
     pub action: String,
     /// The action's arguments, as for export_tasks / export_memory / export_journal.
     pub params: Option<Value>,
+}
+
+/// The registry `export_data` hands its manifest actions to.
+fn inner_registry() -> &'static Registry {
+    static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::builtin_registry)
+}
+
+fn inner_params(params: Option<Value>) -> Value {
+    match params {
+        None | Some(Value::Null) => json!({}),
+        Some(v) => v,
+    }
 }
 
 async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
@@ -924,11 +1531,17 @@ async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
         "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", &action, a.params)?).await,
         "memory" | "export_memory" => export_memory(ctx, parse_params("export", &action, a.params)?).await,
         "journal" | "export_journal" => export_journal(ctx, parse_params("export", &action, a.params)?).await,
+        // A full governed call under the inner tool's name: its profile entry,
+        // policy rules, approval_tools and grants apply, not export_data's.
         "manifest" | "export_migration_manifest" => {
-            export_migration_manifest(ctx, parse_params("export", &action, a.params)?).await
+            inner_registry()
+                .call(&ctx.hub, &ctx.caller, "export_migration_manifest", inner_params(a.params))
+                .await
         }
         "compare" | "compare_migration_manifests" => {
-            compare_migration_manifests(ctx, parse_params("export", &action, a.params)?).await
+            inner_registry()
+                .call(&ctx.hub, &ctx.caller, "compare_migration_manifests", inner_params(a.params))
+                .await
         }
         "import" | "rollback" => Err(UaError::invalid(format!(
             "export action {action:?} is not available: migration import and rollback are not implemented"
@@ -983,13 +1596,19 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "export_migration_manifest",
-            "Read-only migration snapshot of tasks, memory notes, memory graph rows when those tables exist, \
-             and the event log, read in one transaction. Stable ids, claims, source hosts and provenance are \
-             preserved; client evidence events (sdk. channels) carry a trust label. The manifest's origin is \
-             the `source_host` config value (default `local`). Does not import, rewrite or delete anything. \
-             write_to_vault (default false) writes exports/migration-manifest-<UTC>.json in the workspace and \
-             returns {path, rows, bytes, fingerprint}; otherwise returns {manifest, fingerprint, rows, bytes} \
-             (2 MB cap). Fingerprint is SHA-256 of the canonical payload and excludes generated_at.",
+            "Read-only migration snapshot of tasks, memory notes and memory graph rows when those tables \
+             exist, read in one transaction. The event log is summarised as {chain_ok, count, \
+             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: each row's entry hash is recomputed \
+             from its contents, and the rolling hash is SHA-256 over the ulid-ordered recomputed hashes (the \
+             canonical row where a row has none). events_since_ulid also lists the rows after that ulid, with \
+             client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
+             the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
+             The manifest's origin is the `source_host` config value (default `local`). Does not import, \
+             rewrite or delete anything. The manifest is streamed and refused as soon as it would pass a cap: \
+             2 MB inline, 32 MB as a file, 50000 memory notes. write_to_vault (default false) writes \
+             exports/migration-manifest-<UTC>.json in the workspace and returns {path, rows, bytes, \
+             fingerprint}; otherwise returns {manifest, fingerprint, rows, bytes}. Fingerprint is SHA-256 of \
+             the canonical payload and excludes generated_at. Coordinator profile only.",
             export_migration_manifest,
         )
         .family("export"),
@@ -997,15 +1616,145 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "compare_migration_manifests",
-            "Diff two migration manifests from the same origin (`source_host`); rows are keyed by id. \
+            "Diff two migration manifests (version 2) from the same origin (`source_host`); rows are keyed \
+             by id. Each side is an inline manifest (left / right) or a file your own export_migration_manifest \
+             wrote under exports/ (left_path / right_path, as it returned the path; the ledger must record it \
+             as yours); other paths are refused. \
              Reports left-only, right-only and changed rows, claim conflicts, duplicate title/body candidates, \
-             tasks whose parent is missing on either side and stated fingerprints that do not match the \
-             payload. Refuses duplicate ids. Fingerprints are recomputed; `same` needs equal fingerprints and \
-             no conflicts. Does not change either source or the local database. Returns {same, summary, \
-             conflicts, requires_human_disposition}.",
+             tasks whose parent is missing on either side, stated fingerprints that do not match the payload, \
+             whether the event-log count, ulid range and rolling hash match, a side whose chain_ok is false, \
+             and, when both exports used events_since_ulid, left-only, right-only and content-differs counts \
+             by ulid after the later cursor. Refuses duplicate ids. \
+             Fingerprints are recomputed; `same` needs equal fingerprints and no conflicts. Does not change \
+             either source or the local database. Returns {same, summary, conflicts, \
+             requires_human_disposition}. Coordinator profile only.",
             compare_migration_manifests,
         )
         .family("export")
         .read_only(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare database with only the columns the manifest reads.
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE schema_parts (name TEXT);
+             INSERT INTO schema_parts VALUES ('core.v1');
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);
+             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
+             CREATE TABLE event_log (seq INTEGER PRIMARY KEY, ulid TEXT, channel TEXT, payload TEXT,
+                                     created_at TEXT, entry_hash TEXT);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn caps(bytes: usize, memory_rows: usize) -> ManifestCaps {
+        ManifestCaps { bytes, kind: "test", memory_rows }
+    }
+
+    #[test]
+    fn the_memory_cap_is_named_when_exceeded() {
+        let c = db();
+        for id in ["masterindex", "n1", "n2", "n3"] {
+            c.execute("INSERT INTO memory VALUES (?1, 't', 'c')", [id]).unwrap();
+        }
+        let mut out = Vec::new();
+        let err = write_manifest(&c, "local", None, caps(1 << 20, 2), &mut out).unwrap_err().to_string();
+        assert!(err.contains("memory cap of 2 rows"), "{err}");
+        // Index notes do not count: three real notes fit a cap of three.
+        let mut out = Vec::new();
+        let stats = write_manifest(&c, "local", None, caps(1 << 20, 3), &mut out).unwrap();
+        assert_eq!(stats.memory, 3);
+    }
+
+    #[test]
+    fn the_byte_cap_stops_the_build_before_it_is_passed() {
+        let c = db();
+        let title = "x".repeat(1000);
+        for _ in 0..2000 {
+            c.execute("INSERT INTO tasks (title) VALUES (?1)", [&title]).unwrap();
+        }
+        let mut out = Vec::new();
+        let err = write_manifest(&c, "local", None, caps(10_000, 10), &mut out).unwrap_err().to_string();
+        assert!(err.contains("over the 10000 byte test cap"), "{err}");
+        // Nothing past the cap was produced: about 2 MB of tasks were never serialised.
+        assert!(out.len() <= 10_000, "{}", out.len());
+    }
+
+    #[test]
+    fn the_streamed_manifest_matches_its_fingerprint_and_rolling_hash() {
+        let c = db();
+        c.execute("INSERT INTO tasks (title) VALUES ('caf\u{e9}')", []).unwrap();
+        c.execute("INSERT INTO memory VALUES ('n1', 'note', 'body')", []).unwrap();
+        let good =
+            ua_store::ledger::compute_entry_hash(None, "01B", "agent.x", "{}", None, None, None, "t1", None);
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES
+             ('01A', 'legacy', '{}', 't0', NULL), ('01B', 'agent.x', '{}', 't1', ?1)",
+            [&good],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let stats = write_manifest(&c, "hub-a", Some("01A"), caps(1 << 20, 10), &mut out).unwrap();
+        assert_eq!(stats.bytes, out.len());
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        let m = parsed.as_object().unwrap();
+        assert_eq!(manifest_fingerprint(m), stats.fingerprint);
+        assert_eq!(m["fingerprint"], json!(stats.fingerprint));
+        let log = &m["event_log"];
+        assert_eq!(log["count"], 2);
+        assert_eq!(log["first_ulid"], "01A");
+        assert_eq!(log["last_ulid"], "01B");
+        assert_eq!(log["chain_ok"], true);
+        // The unhashed legacy row is hashed as its canonical JSON, the other by its recomputed hash.
+        let legacy = json!({"ulid": "01A", "channel": "legacy", "payload": "{}", "created_at": "t0"});
+        let expected =
+            hex::encode(Sha256::digest(format!("{}\n{good}\n", py_dumps(&legacy, None)).as_bytes()));
+        assert_eq!(log["rolling_hash"], expected);
+        assert_eq!(log["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(log["rows"][0]["ulid"], "01B");
+
+        // The cursor listing is outside the fingerprint.
+        let mut plain = Vec::new();
+        let without = write_manifest(&c, "hub-a", None, caps(1 << 20, 10), &mut plain).unwrap();
+        assert_eq!(without.fingerprint, stats.fingerprint);
+    }
+
+    #[test]
+    fn a_tampered_payload_under_its_old_entry_hash_is_reported() {
+        let c = db();
+        let hash = ua_store::ledger::compute_entry_hash(
+            None,
+            "01B",
+            "agent.x",
+            "{\"n\":1}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1)",
+            [&hash],
+        )
+        .unwrap();
+        let summary = |c: &Connection| event_log_summary(c).unwrap();
+        let before = summary(&c);
+        assert_eq!(before["chain_ok"], true);
+        assert_eq!(before["entry_hash_mismatches"], 0);
+        // Rewrite the payload and keep the stored entry_hash.
+        c.execute("UPDATE event_log SET payload = '{\"n\":2}' WHERE ulid = '01B'", []).unwrap();
+        let after = summary(&c);
+        assert_eq!(after["chain_ok"], false);
+        assert_eq!(after["entry_hash_mismatches"], 1);
+        assert_ne!(after["rolling_hash"], before["rolling_hash"]);
+        assert_eq!(after["count"], before["count"]);
+    }
 }
