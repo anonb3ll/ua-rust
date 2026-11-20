@@ -12,7 +12,7 @@ existing MCP client can point at this process unchanged. That program is a
 separate codebase. Building and running this repository does not require it.
 The storage schema and some of the user interface are new.
 
-> **Status: alpha.** 209 tools are registered and the core families are ported.
+> **Status: alpha.** 210 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together

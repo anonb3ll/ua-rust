@@ -226,6 +226,15 @@ pub struct Config {
     /// cannot be set from TOML or the environment.
     #[serde(skip)]
     pub search_endpoint: Option<String>,
+    /// Test hook: directory prepended to `PATH` for `python_lint_and_format`
+    /// only, so a stub `ruff` can be found. It cannot be set from TOML or the
+    /// environment. The program name stays `ruff`; this does not add a shell.
+    #[serde(skip)]
+    pub python_lint_path_prepend: Option<PathBuf>,
+    /// Test hook: replaces the 30-second per-step timeout of
+    /// `python_lint_and_format`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub python_lint_timeout: Option<std::time::Duration>,
     /// Outbound notification webhook (`notify`, `flush_digest`). Unset keeps
     /// notifications in the outbox with status `not_configured`.
     pub notify_webhook_url: Option<String>,
@@ -638,6 +647,8 @@ impl Default for Config {
             dash_docsets: Vec::new(),
             fetch_allow_loopback: false,
             search_endpoint: None,
+            python_lint_path_prepend: None,
+            python_lint_timeout: None,
             notify_webhook_url: None,
             notify_webhook_header: "Authorization".into(),
             notify_webhook_secret: None,
@@ -1072,6 +1083,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_python_lint_test_hooks_cannot_be_set_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "python_lint_path_prepend = \"/srv/bin\"\npython_lint_timeout = 1\n").unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert!(cfg.python_lint_path_prepend.is_none());
+        assert!(cfg.python_lint_timeout.is_none());
+    }
 
     #[test]
     fn the_session_credential_profile_cannot_be_configured() {
