@@ -9,8 +9,8 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{
-    check_item_id, clip, close_linked_run, command, device_agent, evidence_ref, load_item, now, owned_node,
-    record, relay,
+    acceptance, check_item_id, clip, close_linked_run, command, credentials, device_agent, evidence_ref,
+    load_item, now, owned_node, record, relay,
 };
 use crate::families::audit::rules::redact_secrets;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -78,7 +78,14 @@ pub(crate) fn bounded(m: &Map<String, Value>, node: &str) -> Value {
 /// `Ok(Err(refusal))` is a refusal whose ledger record must still commit.
 type Posted = UaResult<Result<Value, UaError>>;
 
-fn post(tx: &mut WriteTx<'_>, agent: &str, node: &str, id: &str, receipt: &Map<String, Value>) -> Posted {
+fn post(
+    tx: &mut WriteTx<'_>,
+    cfg: &ua_core::Config,
+    agent: &str,
+    node: &str,
+    id: &str,
+    receipt: &Map<String, Value>,
+) -> Posted {
     let row = owned_node(tx, node, agent)?;
     let node = row.node;
     let Some(item) = load_item(tx, id)?.filter(|i| i.node == node) else {
@@ -149,7 +156,9 @@ fn post(tx: &mut WriteTx<'_>, agent: &str, node: &str, id: &str, receipt: &Map<S
         agent,
     )?;
     relay::drop_open_followups(tx, id, "session_ended_before_delivery")?;
+    credentials::revoke_for_item(tx, id, "session_end", agent)?;
     let run = close_linked_run(tx, &item, status, stored["reason"].as_str(), agent, true)?;
+    acceptance::on_receipt(tx, cfg, &item)?;
     Ok(Ok(json!({
         "item_id": id,
         "duplicate": false,
@@ -205,6 +214,7 @@ pub(crate) fn cancel_for_run(
             actor,
         )?;
     }
+    credentials::revoke_for_item(tx, &item.id, "cancelled", actor)?;
     Ok(Some("node_cancel_requested"))
 }
 
@@ -239,7 +249,9 @@ async fn node_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
         return Err(UaError::invalid("receipt.attempt is required"));
     }
     let id2 = id.clone();
-    let out = ctx.hub.db().write_async(move |tx| post(tx, &agent, &a.node, &id2, &receipt)).await??;
+    let hub = ctx.hub.clone();
+    let out =
+        ctx.hub.db().write_async(move |tx| post(tx, hub.cfg(), &agent, &a.node, &id2, &receipt)).await??;
     let hub = ctx.hub.clone();
     let _ =
         tokio::task::spawn_blocking(move || command::deliver_pending(&hub, command::NoticeScope::Item(&id)))

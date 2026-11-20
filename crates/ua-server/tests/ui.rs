@@ -647,14 +647,10 @@ async fn api_sessions_catalog_board_and_unbuilt_routes() {
     assert_eq!(cols[5]["hidden_by_default"], true);
     assert_eq!(v["filters"]["lane"], "dispatch-ready");
 
-    for uri in [
-        "/api/runs",
-        "/api/runs/abc",
-        "/api/nodes/acceptance",
-        "/api/work-products",
-        "/api/evidence",
-        "/api/platform/manifest",
-    ] {
+    for uri in ["/api/runs", "/api/platform/manifest", "/api/evidence"] {
+        assert_eq!(send(&app, get(uri, None)).await.status(), StatusCode::OK, "{uri}");
+    }
+    for uri in ["/api/work-products", "/api/platform/provenance-graph"] {
         let resp = send(&app, get(uri, None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
         let v = body_json(resp).await;

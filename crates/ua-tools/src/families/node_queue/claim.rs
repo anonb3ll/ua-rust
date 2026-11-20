@@ -16,9 +16,9 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::{
-    CHANNEL, Item, LEASE_GRACE_S, after, before, cancel_item, check_item_id, clip, command, device_agent,
-    evidence_ref, items_where, load_item, now, owned_node, record, renew_run, run_gate, run_running,
-    sweep_tx,
+    CHANNEL, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip, command,
+    credentials, device_agent, evidence_ref, items_where, load_item, now, owned_node, record, renew_run,
+    run_gate, run_running, sweep_tx,
 };
 use crate::families::{governance, nodes};
 use crate::hub::Hub;
@@ -321,13 +321,15 @@ fn claim_once(
     // The oldest runnable item.
     let candidates = items_where(
         tx,
-        "node = ?1 AND status = 'queued' AND cancel_requested = 0 AND backend != 'acceptance' \
-         ORDER BY created_at, rowid LIMIT 50",
+        "node = ?1 AND status = 'queued' AND cancel_requested = 0 ORDER BY created_at, rowid LIMIT 50",
         [&node],
     )?;
+    // Acceptance items run only for the node's live acceptance run; real
+    // work waits while acceptance is required and not yet passed.
+    let gate = acceptance::claim_gate(tx, hub.cfg(), &row)?;
     let mut chosen = None;
     for item in candidates {
-        if run_gate(tx, &item)?.is_some() {
+        if !gate.admits(&item) || run_gate(tx, &item)?.is_some() {
             continue;
         }
         // A held task keeps its item queued: skipped now, claimable once the
@@ -425,10 +427,12 @@ pub(crate) fn on_heartbeat(
             params![item.id, lease, now()],
         )?;
         renew_run(tx, &item, &lease)?;
+        credentials::slide_idle(tx, &item.id, node)?;
         if !item.cancel_requested
             && let Some(why) = run_gate(tx, &item)?
         {
             tx.execute("UPDATE node_dispatch SET cancel_requested = 1 WHERE id = ?1", [&item.id])?;
+            credentials::revoke_for_item(tx, &item.id, "cancelled", "node-queue")?;
             record(
                 tx,
                 "cancel_requested",

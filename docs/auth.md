@@ -1,6 +1,6 @@
 # Authentication
 
-The hub accepts four kinds of credential. Every credential the hub mints is
+The hub accepts five kinds of credential. Every credential the hub mints is
 stored only as a SHA-256 digest, and every comparison is constant time.
 
 | Credential | Who uses it | Accepted on | Stored in |
@@ -9,8 +9,10 @@ stored only as a SHA-256 digest, and every comparison is constant time.
 | Managed bearer token | agents | `/mcp`, `/api` | `agent_tokens` (digest) |
 | OAuth access token (`uao_…`) | remote MCP clients | `/mcp`; also `/api` when issued for the whole hub | `oauth_tokens` (digest) |
 | Browser session cookie (`ua_session`) | humans in the Control Center | `/ui`, `/api` only, **never `/mcp`** | `ui_sessions` (digest) |
+| Session credential (`uas_…`) | the ACP session a node runs for one claimed item | `/mcp`, `/api/tools`, `/api/whoami` only | `session_credentials` (digest) |
 
-The auth middleware (`crates/ua-server/src/auth.rs`) tries a bearer token
+The auth middleware (`crates/ua-server/src/auth.rs`) checks a `uas_` bearer
+only as a session credential (below). It tries any other bearer token
 first, then (for `/ui` and `/api` only) the session cookie. With
 `enforce_auth` on, a request with neither gets a 401 (a `GET /ui/...` is
 redirected to `/login?next=...` instead). With `enforce_auth` off, a request
@@ -230,6 +232,102 @@ Two ways to get the token:
 
 The handler also receives `Extension<AuthIdentity>` (kind `human`) as for any
 other authenticated request.
+
+## Session credentials
+
+A node that launches an ACP session for a claimed item can give that one
+session its own short-lived hub credential, so the harness reaches the hub
+without the node agent's token. Off unless `session_credentials_enabled =
+true`; the setting is read on every request, so turning it off refuses every
+outstanding credential at once.
+
+**Minting.** The node's agent calls `POST /api/node/session_credential`
+(tool `node_session_credential`) with `{node, item_id, attempt}`. The answer
+(`201`, `Cache-Control: no-store`) is `{credential, credential_id,
+expires_at, idle_expires_at, tools, mcp_server_name}`. The value is `uas_`
+plus 43 base64url characters (32 random bytes). It is returned once and is
+never stored, logged or put in an event; the table holds its SHA-256, and
+events name the public `credential_id` (16 hex). A refusal answers `{error,
+code, reason}`; `reason` is one of:
+
+| Reason | Status | When |
+|---|---|---|
+| `disabled` | 403 | `session_credentials_enabled` is off |
+| `node_binding` | 403 / 409 | the node is not registered, retired, or another agent's, or the item's agent is not the node's |
+| `node_feature_missing` | 409 | the node did not advertise `acp_session_mcp` |
+| `item_not_found` | 409 | no such item on this node |
+| `not_acp` | 409 | the item's backend is not `acp:*` |
+| `item_not_claimed` | 409 | the item is not claimed |
+| `stale_attempt` | 409 | `attempt` is not the item's current claim |
+| `lease_expired` | 409 | the claim's lease has lapsed |
+| `cancel_requested` | 409 | the item, or its dispatch run, is being cancelled |
+| `agent_retired` | 403 | the item's agent is retired |
+| `label_refused` | 403 | the item's agent is in `revoked_agents` |
+| `human_subject` | 403 | the item's agent is a human identity |
+| `task_closed` | 409 | the item's task is done, cancelled or missing |
+
+**Binding.** Everything comes from rows the hub owns: the subject is the
+item's agent, and the credential is bound to the node, the item and the
+claim's attempt (and so to the item's task and run). It expires at the
+claim's lease deadline, `claimed_at + timeout_s + 300`. An idle window of
+`min(now + 600 s, expiry)` is slid forward by each node heartbeat that names
+the item as `running`; it never moves past the expiry or revives a lapsed
+window. A second mint for the same item and attempt revokes the first
+(`superseded`).
+
+**Each request** re-reads the row (nothing is cached) and refuses with 401
+unless: the setting is on; the credential is not revoked and inside both
+windows; the item is still claimed by that node under the same attempt and
+not being cancelled; its task (if any) is open; the node is registered to
+the same agent, not retired and live (heartbeat within 90 s); and the agent
+is not retired, revoked or a human. A lapsed window, a closed or deleted
+task and a retired agent are written as a revocation on that request. Any
+path other than `/mcp`, `/api/tools`, `/api/tools/{name}` and `/api/whoami`
+answers 403 (`session_credential_path`).
+
+**Authority.** The request runs as the subject with kind `agent` under the
+`acp-session` profile, whatever session key the client sends, and inside the
+credential's grant. The grant is the `acp-session` tool list
+(`ACP_SESSION_ALLOWED_TOOLS`: `evidence_report`, `memory_get`, `memory_list`,
+`memory_save`, `memory_search`, `profile_status`, `session_packet`,
+`task_comment`, `task_list`), narrowed to what the subject's own default
+profile exposes. The task tools reach the item's own task only, and a
+refusal names `session_task_scope`:
+
+- `task_comment` may only `append` to or `list` that task's comments.
+- `session_packet` and `evidence_report` read that task: an omitted
+  `task_id` is filled in with it and any other `task_id` is refused, as are
+  `session_id` (`session_packet`) and `project_id` (`evidence_report`),
+  which would reach other rows.
+- `task_list` lists that task at most, whatever its filters say.
+
+An item without a task reads and comments on no task. A tool outside the
+grant is refused (`profile_denied`) before any policy or approval is looked
+at, and is not listed. A session credential cannot mint another one.
+
+`acp-session` exists only for this: `profile_activate` refuses it
+(`profile_reserved`), config loading refuses it in `profiles` and
+`oauth_profile`, and a policy `profile_defaults` entry or profile overlay
+naming it is invalid. A caller under that profile with no verified grant
+(reachable only through a stale stored binding or a bug) is refused every
+tool (`session_grant_required`) and sees none.
+
+**Revocation.** The receipt for the item (`session_end`), cancelling the item
+or its run (`cancelled`), a lapsed lease (`lease_expired`, by the sweep),
+retiring the agent (`agent_retired`), an operator
+(`coordination_manage` action `session_credential_revoke`, params exactly one
+of `credential_id`, `item_id` or `node`; it answers the revoked ids and their
+metadata, never a value), and on use a lapsed window (`expired`,
+`idle_expired`) or a closed or deleted task (`task_closed`, `task_deleted`).
+
+Events: `hub.session_credential.minted`, `hub.session_credential.revoked`
+(one per credential, with its reason) and `hub.session_credential.refused`
+(the failed check, at most once a minute per check and credential: the
+credential id when the value matched one, else a prefix of the presented
+value's SHA-256; at most 32 a minute per check in all).
+
+A managed token may not start with `uas_` (nor `uao_`, `uar_`), and a static
+token that does is never matched.
 
 ## Tools
 
