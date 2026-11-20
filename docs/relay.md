@@ -24,8 +24,11 @@ draft --gates fail--> blocked (stored without its text)
    The hub first runs the gates again under the current configuration and
    checks that the repository is still allowed and the credential is stored,
    so a request that would fail never reaches a human. It then parks a
-   one-time approval bound to the draft id, channel, target and exact text.
-   The human sees all of it in `approval_pending`.
+   one-time approval bound to the draft id, channel, target, exact text and
+   the credential it will post with (its managed-secret name and keyed
+   fingerprint, never the value). The human sees all of it in
+   `approval_pending`. A token replaced after the approval no longer matches,
+   so nothing is posted under another account.
 3. A human runs `approval_resolve(id, "approve")`. The approver must be a
    verified human other than the requester.
 4. **`send`** `{draft_id, text}`: the requester repeats the exact text. The
