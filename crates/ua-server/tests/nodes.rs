@@ -145,13 +145,87 @@ async fn a_retired_node_is_refused_with_node_retired() {
 }
 
 #[tokio::test]
-async fn queue_routes_are_not_built_yet() {
+async fn work_round_trips_through_the_device_plane() {
     let hub = TestHub::new(config());
-    let (status, v) = post(&hub, "/api/node/claim", Some(BUILDER), json!({ "node": "node-a" })).await;
+    let facts = json!({ "backends": ["codex"], "worktree_roots": [{ "path": "/srv/work", "realpath": "/srv/work" }] });
+    let (status, _) =
+        post(&hub, "/api/node/register", Some(BUILDER), json!({ "node": "node-a", "facts": facts })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another agent asks for work on the node: parked for a human.
+    let ask =
+        json!({ "node": "node-a", "backend": "codex", "prompt": "run the tests", "cwd": "/srv/work/repo" });
+    let (status, v) = post(&hub, "/api/node/dispatch", Some(OTHER), ask.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["tool"], "node_dispatch");
+    let human = Caller {
+        label: "operator".into(),
+        kind: ActorKind::Human,
+        profile: Profile::Operator,
+        enforce_profile: false,
+        session_key: None,
+        transport: Transport::Http,
+    };
+    hub.state
+        .registry
+        .call(
+            &hub.state.hub,
+            &human,
+            "approval_resolve",
+            json!({ "id": v["approval_id"], "decision": "approve" }),
+        )
+        .await
+        .unwrap();
+    let (status, v) = post(&hub, "/api/node/dispatch", Some(OTHER), ask).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let id = v["item_id"].as_str().unwrap().to_string();
+
+    // Another agent cannot take the node's work.
+    let (status, v) = post(&hub, "/api/node/claim", Some(OTHER), json!({ "node": "node-a" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["code"], "node_owned_elsewhere");
+    let (status, v) =
+        post(&hub, "/api/node/claim", Some(BUILDER), json!({ "node": "node-a", "wait_s": 0 })).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["item"]["item_id"], id);
+
+    // A receipt must name the attempt it reports.
+    let (status, v) = post(
+        &hub,
+        "/api/node/receipt",
+        Some(BUILDER),
+        json!({ "node": "node-a", "item_id": id, "receipt": { "status": "finished" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let receipt =
+        json!({ "node": "node-a", "item_id": id, "receipt": { "status": "finished", "attempt": 1 } });
+    let (status, v) = post(&hub, "/api/node/receipt", Some(BUILDER), receipt.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let (status, v) = post(&hub, "/api/node/receipt", Some(BUILDER), receipt).await;
+    assert_eq!(status, StatusCode::OK, "a retried receipt is not new: {v}");
+    assert_eq!(v["duplicate"], true);
+
+    // The listing carries the requester's recent work.
+    let v = json_body(hub.send(get("/api/nodes", None, Some(OTHER))).await).await;
+    assert_eq!(v["recent_items"][0]["item_id"], id, "{v}");
+
+    // Routes not built yet still say so.
+    let (status, v) = post(&hub, "/api/node/wake", Some(BUILDER), json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{v}");
-    assert_eq!(v["capability"], "node_queue");
     let resp = hub.send(get("/api/nodes/acceptance", None, Some(BUILDER))).await;
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn a_coded_conflict_keeps_its_code_over_http() {
+    let hub = TestHub::new(config());
+    let facts = json!({ "backends": ["codex"] });
+    post(&hub, "/api/node/register", Some(BUILDER), json!({ "node": "node-a", "facts": facts })).await;
+    let ask = json!({ "node": "node-a", "backend": "claude", "prompt": "p", "cwd": "/srv" });
+    let (status, v) = post(&hub, "/api/node/dispatch", Some(OTHER), ask).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "backend_unavailable");
 }
 
 #[tokio::test]

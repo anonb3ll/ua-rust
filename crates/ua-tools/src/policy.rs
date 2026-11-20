@@ -946,7 +946,9 @@ pub fn prod_action(tool: &str) -> &str {
         "deploy" => "deploy",
         "fleet_host_action" => "restart",
         "oauth_device_manage" => "revoke",
-        "node_dispatch" | "acp_permission" | "dispatch_task" | "dispatch_resume" => "dispatch",
+        "node_dispatch" | "node_followup" | "acp_permission" | "dispatch_task" | "dispatch_resume" => {
+            "dispatch"
+        }
         other => other,
     }
 }

@@ -13,6 +13,10 @@
 //!    proven ours is still alive (a resume would overlap it); otherwise hands
 //!    it back as `retryable` (`lease_expired`) for `dispatch_resume`.
 //!
+//! A run routed to a remote node (`evidence_ref` `node:<node>:<item>`) is
+//! left to the node queue: its node's receipt, or the queue's own lease and
+//! wait sweep, ends it.
+//!
 //! `ua serve` runs one sweep at startup, so runs a previous hub process left
 //! behind are reconciled before new work arrives, then [`spawn_reaper`] runs
 //! it every `Config::dispatch_reaper_interval()` seconds (a third of the
@@ -36,7 +40,13 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
     let pending = db.read(|c| runs_where(c, "termination_outcome = 'requested'"))?;
     let mut reconciled = Vec::new();
     for run in pending {
-        let termination = executor::terminate(&run);
+        // A node-routed run is stopped through its node work item.
+        let termination = match run.evidence_ref.as_deref().filter(|e| e.starts_with("node:")) {
+            Some(ev) => db
+                .write(|tx| crate::families::node_queue::cancel_for_run(tx, ev, ACTOR))?
+                .unwrap_or("unknown"),
+            None => executor::terminate(&run),
+        };
         let cessation = classify_termination(termination);
         let res = db.write(|tx| {
             finalize_cancellation(
@@ -57,7 +67,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
         runs_where(
             c,
             "state IN ('claimed','launched','running') AND lease_expires_at IS NOT NULL \
-             AND termination_outcome IS NULL",
+             AND termination_outcome IS NULL AND (evidence_ref IS NULL OR evidence_ref NOT LIKE 'node:%')",
         )
     })?;
     let now_ts = jiff::Timestamp::now();

@@ -224,6 +224,9 @@ async fn main() -> anyhow::Result<()> {
             // stdio session must not judge another process's children.
             ua_tools::families::dispatch::startup_sweep(&hub).await;
             let _reaper = ua_tools::families::dispatch::spawn_reaper(&hub);
+            // Expire waits and lapsed node leases, and retry owed command
+            // notices, for every node.
+            let _node_sweeper = ua_tools::families::node_queue::spawn_sweeper(&hub);
             let ct = CancellationToken::new();
             let ct2 = ct.clone();
             tokio::spawn(async move {

@@ -5211,6 +5211,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "similar",
+ "subtle",
  "tempfile",
  "tokio",
  "toml",
