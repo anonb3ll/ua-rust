@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1099,6 +1099,103 @@ fn compact_timestamp_for_filename() -> String {
     clean
 }
 
+/// Compute SQLite's cumulative WAL frame checksum over 8-byte chunks.
+fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, big_endian: bool) -> (u32, u32) {
+    let word = |chunk: &[u8]| -> u32 {
+        let arr: [u8; 4] = chunk.try_into().expect("4-byte chunk");
+        if big_endian { u32::from_be_bytes(arr) } else { u32::from_le_bytes(arr) }
+    };
+    for pair in data.as_chunks::<8>().0 {
+        s0 = s0.wrapping_add(word(&pair[0..4])).wrapping_add(s1);
+        s1 = s1.wrapping_add(word(&pair[4..8])).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+
+fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match reader.read(&mut buf[pos..]) {
+            Ok(0) => break,
+            Ok(n) => pos += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pos)
+}
+
+/// Inspect a staged raw `-wal` copy strictly from disk without opening SQLite.
+/// Returns `Ok(true)` if the WAL is empty or its active checksum chain is valid
+/// through the last frame of the current salt generation, or `Ok(false)` if any
+/// active header/frame is truncated or corrupt.
+fn wal_file_is_clean(path: &Path) -> anyhow::Result<bool> {
+    let file = File::open(path).with_context(|| format!("opening staged WAL {}", path.display()))?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    if len < 32 {
+        return Ok(false);
+    }
+
+    let mut reader = BufReader::with_capacity(STREAM_BUF_BYTES, file);
+    let mut hdr = [0u8; 32];
+    if read_up_to(&mut reader, &mut hdr)? != 32 {
+        return Ok(false);
+    }
+    let magic = u32::from_be_bytes(hdr[0..4].try_into().expect("4 bytes"));
+    let big_endian = match magic {
+        0x377f_0682 => false,
+        0x377f_0683 => true,
+        _ => return Ok(false),
+    };
+    let format = u32::from_be_bytes(hdr[4..8].try_into().expect("4 bytes"));
+    let page_size = u32::from_be_bytes(hdr[8..12].try_into().expect("4 bytes")) as usize;
+    if format != 3_007_000 || !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Ok(false);
+    }
+
+    let hdr_cksum1 = u32::from_be_bytes(hdr[24..28].try_into().expect("4 bytes"));
+    let hdr_cksum2 = u32::from_be_bytes(hdr[28..32].try_into().expect("4 bytes"));
+    let (mut s0, mut s1) = wal_checksum(&hdr[0..24], 0, 0, big_endian);
+    if (s0, s1) != (hdr_cksum1, hdr_cksum2) {
+        return Ok(false);
+    }
+
+    let hdr_salt = &hdr[16..24];
+    let mut frame = vec![0u8; 24 + page_size];
+    loop {
+        let n = read_up_to(&mut reader, &mut frame)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        if n < frame.len() {
+            return Ok(false);
+        }
+        if &frame[8..16] != hdr_salt {
+            // Prior-generation tail frame; SQLite stops replaying here cleanly.
+            return Ok(true);
+        }
+        (s0, s1) = wal_checksum(&frame[0..8], s0, s1, big_endian);
+        (s0, s1) = wal_checksum(&frame[24..], s0, s1, big_endian);
+        let frame_cksum1 = u32::from_be_bytes(frame[16..20].try_into().expect("4 bytes"));
+        let frame_cksum2 = u32::from_be_bytes(frame[20..24].try_into().expect("4 bytes"));
+        if (s0, s1) != (frame_cksum1, frame_cksum2) {
+            return Ok(false);
+        }
+    }
+}
+
+/// Inspect a staged raw `-journal` copy strictly from disk without opening SQLite.
+fn journal_file_is_clean(path: &Path) -> anyhow::Result<bool> {
+    const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let mut file = File::open(path).with_context(|| format!("opening staged journal {}", path.display()))?;
+    let mut magic = [0u8; 8];
+    let n = read_up_to(&mut file, &mut magic)?;
+    Ok(n == 0 || (n == 8 && magic == JOURNAL_MAGIC))
+}
+
 fn create_safety_backup(existing_dest: &Path) -> anyhow::Result<(PathBuf, Vec<String>)> {
     let stamp = compact_timestamp_for_filename();
     let candidate_base = append_suffix(existing_dest, &format!(".pre-restore-{stamp}.bak"));
@@ -1109,34 +1206,64 @@ fn create_safety_backup(existing_dest: &Path) -> anyhow::Result<(PathBuf, Vec<St
         idx += 1;
     }
 
-    // Prefer a clean online SQLite snapshot if the existing DB is healthy; when
-    // recovering a corrupt or ledger-tampered DB, fall back to copying the raw
-    // main file AND its `-wal`/`-shm`/`-journal` sidecars (`0600`) so uncheckpointed
-    // WAL frames are never lost.
-    if backup_database(existing_dest, &safety_path, false).is_ok() {
-        return Ok((safety_path, Vec::new()));
-    }
-
+    // Capture raw main and sidecar bytes FIRST so existing_dest is never opened by
+    // SQLite before preservation. Every SQLite open (read-only included) runs ONLY
+    // on the isolated `probe/` copy, never on `existing_dest` or `raw/`.
     let stage_dir = DirGuard::create_private_sibling(&safety_path, "safety")?;
-    let mut main_ro = open_file_no_follow_ro(existing_dest, "pre-restore database")?;
-    let staged_main = stage_dir.file("main.bak");
-    stream_fd_to_new_file_hashed(&mut main_ro, &staged_main)?;
-    install_file(&staged_main, &safety_path, false)?;
+    let raw_dir = stage_dir.file("raw");
+    fs::create_dir(&raw_dir).with_context(|| format!("creating raw safety dir {}", raw_dir.display()))?;
 
-    let mut sidecars = Vec::new();
+    let mut main_ro = open_file_no_follow_ro(existing_dest, "pre-restore database")?;
+    let raw_main = raw_dir.join("main");
+    stream_fd_to_new_file_hashed(&mut main_ro, &raw_main)?;
+    drop(main_ro);
+
+    let mut captured_sidecars: Vec<(&'static str, PathBuf)> = Vec::new();
     for suffix in ["-wal", "-shm", "-journal"] {
         let side_src = append_suffix(existing_dest, suffix);
         if let Ok(meta) = fs::symlink_metadata(&side_src)
             && !meta.file_type().is_symlink()
             && meta.is_file()
         {
-            let side_dst = append_suffix(&safety_path, suffix);
             let mut side_ro = open_file_no_follow_ro(&side_src, "pre-restore sidecar")?;
-            let staged_side = stage_dir.file(&format!("side{suffix}"));
-            stream_fd_to_new_file_hashed(&mut side_ro, &staged_side)?;
-            install_file(&staged_side, &side_dst, false)?;
-            sidecars.push(side_dst.display().to_string());
+            let raw_side = raw_dir.join(format!("main{suffix}"));
+            stream_fd_to_new_file_hashed(&mut side_ro, &raw_side)?;
+            captured_sidecars.push((suffix, raw_side));
         }
+    }
+
+    let sidecars_clean = captured_sidecars.iter().all(|(suffix, raw_side)| match *suffix {
+        "-wal" => wal_file_is_clean(raw_side).unwrap_or(false),
+        "-journal" => journal_file_is_clean(raw_side).unwrap_or(false),
+        _ => true,
+    });
+
+    if sidecars_clean {
+        let probe_dir = stage_dir.file("probe");
+        fs::create_dir(&probe_dir)
+            .with_context(|| format!("creating probe safety dir {}", probe_dir.display()))?;
+        let probe_main = probe_dir.join("main");
+        let mut raw_main_ro = open_file_no_follow_ro(&raw_main, "staged pre-restore database")?;
+        stream_fd_to_new_file_hashed(&mut raw_main_ro, &probe_main)?;
+        for (suffix, raw_side) in &captured_sidecars {
+            let mut raw_side_ro = open_file_no_follow_ro(raw_side, "staged pre-restore sidecar")?;
+            let probe_side = probe_dir.join(format!("main{suffix}"));
+            stream_fd_to_new_file_hashed(&mut raw_side_ro, &probe_side)?;
+        }
+        if backup_database(&probe_main, &safety_path, false).is_ok() {
+            return Ok((safety_path, Vec::new()));
+        }
+    }
+
+    File::open(&raw_main)?.sync_all()?;
+    install_file(&raw_main, &safety_path, false)?;
+
+    let mut sidecars = Vec::new();
+    for (suffix, raw_side) in &captured_sidecars {
+        let side_dst = append_suffix(&safety_path, suffix);
+        File::open(raw_side)?.sync_all()?;
+        install_file(raw_side, &side_dst, false)?;
+        sidecars.push(side_dst.display().to_string());
     }
 
     Ok((safety_path, sidecars))
@@ -2406,6 +2533,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM event_log WHERE channel = 'ops.restored'", [], |r| r.get(0))
             .unwrap();
         assert_eq!((extra_cnt, ops_cnt), (1, 0));
+        // Release the read-only verification connection before invoking restore again;
+        // quiesce_existing_wal rightly refuses while any SQLite handle still holds the DB open.
+        drop(c);
         let stray_staging: Vec<_> = fs::read_dir(live_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -3429,5 +3559,143 @@ mod tests {
         assert_eq!(rep.warnings.len(), 1, "{rep:?}");
         assert!(rep.warnings[0].contains("could not checkpoint"), "{rep:?}");
         assert!(check_database(&corrupt).unwrap().ledger.unwrap().ok);
+    }
+
+    #[test]
+    fn safety_backup_preserves_corrupt_db_and_corrupt_wal_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sdir, src_path, src_db) = test_db();
+        src_db
+            .write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
+                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+        drop(src_db);
+        let bak = dir.path().join("clean.bak");
+        backup_database(&src_path, &bak, false).unwrap();
+
+        let corrupt = dir.path().join("corrupt.db");
+        let raw_main = b"this is not a database";
+        let raw_wal = b"not a wal either";
+        fs::write(&corrupt, raw_main).unwrap();
+        fs::write(wal_sidecar_path(&corrupt), raw_wal).unwrap();
+
+        let rep = restore_database(
+            &bak,
+            &corrupt,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let safety_main = PathBuf::from(rep.safety_backup.as_deref().unwrap());
+        assert_eq!(fs::read(&safety_main).unwrap(), raw_main);
+        assert_eq!(rep.safety_backup_sidecars.len(), 1, "{:?}", rep.safety_backup_sidecars);
+        let safety_wal = PathBuf::from(&rep.safety_backup_sidecars[0]);
+        assert_eq!(fs::read(&safety_wal).unwrap(), raw_wal);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&safety_main).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&safety_wal).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn safety_backup_preserves_corrupt_wal_on_valid_db_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sdir, src_path, src_db) = test_db();
+        src_db
+            .write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
+                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+        drop(src_db);
+        let bak = dir.path().join("clean.bak");
+        backup_database(&src_path, &bak, false).unwrap();
+
+        // Sub-case A: valid WAL-mode hub DB with unparseable garbage `-wal`.
+        let (_adir, a_seed, a_db) = test_db();
+        a_db.write(|tx| {
+            tx.execute("INSERT INTO items (val) VALUES ('a-row')", [])?;
+            ledger::append(tx, EventInput::new("a.seed", json!({})))?;
+            Ok(())
+        })
+        .unwrap();
+        drop(a_db);
+        let a_dest = dir.path().join("valid-garbage-wal.db");
+        fs::copy(&a_seed, &a_dest).unwrap();
+        let garbage_wal = b"not a valid wal header";
+        fs::write(wal_sidecar_path(&a_dest), garbage_wal).unwrap();
+
+        let rep_a = restore_database(
+            &bak,
+            &a_dest,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep_a.safety_backup_sidecars.len(), 1, "{:?}", rep_a.safety_backup_sidecars);
+        let a_bak_wal = PathBuf::from(&rep_a.safety_backup_sidecars[0]);
+        assert_eq!(fs::read(&a_bak_wal).unwrap(), garbage_wal);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&a_bak_wal).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // Sub-case B: valid WAL-mode hub DB captured hot with a corrupted frame-0 payload byte.
+        let (_bdir, b_seed, b_db) = test_db();
+        let b_dest = dir.path().join("valid-corrupt-frame-wal.db");
+        b_db.read(|_| {
+            b_db.write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('hot-frame-row')", [])?;
+                ledger::append(tx, EventInput::new("b.hot", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+            fs::copy(&b_seed, &b_dest).unwrap();
+            fs::copy(wal_sidecar_path(&b_seed), wal_sidecar_path(&b_dest)).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        drop(b_db);
+
+        let mut modified_wal = fs::read(wal_sidecar_path(&b_dest)).unwrap();
+        assert!(modified_wal.len() > 32 + 24, "expected at least one WAL frame");
+        modified_wal[32 + 24] ^= 0xff;
+        fs::write(wal_sidecar_path(&b_dest), &modified_wal).unwrap();
+
+        let rep_b = restore_database(
+            &bak,
+            &b_dest,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep_b.safety_backup_sidecars.len(), 1, "{:?}", rep_b.safety_backup_sidecars);
+        let b_bak_wal = PathBuf::from(&rep_b.safety_backup_sidecars[0]);
+        assert_eq!(fs::read(&b_bak_wal).unwrap(), modified_wal);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&b_bak_wal).unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 }
