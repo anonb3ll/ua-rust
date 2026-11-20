@@ -129,7 +129,10 @@ of a label is not treated as confidential.
 the `[profiles]` map — is **reserved**. A reserved label's row may be created
 only in `'default'`, and only by a hub owner, by that label's own verified
 credential resolving to `'default'`, or by a local stdio or CLI caller on the
-hub host (which already carries hub-host trust, see Resolution). So a
+hub host (which already carries hub-host trust, see Resolution). The check
+keys on the transport (`Transport::Stdio` / CLI), never on
+`ActorKind::Anonymous`, because anonymous HTTP with `enforce_auth` off has the
+same actor kind and must stay refused. So a
 static-token, `[profiles]` or local agent's first `session_start` or heartbeat
 still creates its own row, exactly as today. Every other writer — a tenant
 admin, an unverified remote caller, `touch_agent` acting for anyone else —
@@ -606,7 +609,7 @@ the adapter from the verified credential and from nothing else:
 
 | Credential | Organization | User |
 |---|---|---|
-| Static config token (`UA_AGENT_TOKENS`) | always `'default'` — it is hub configuration, and its label is reserved, so no tenant row can claim it | the users row, when the label is human |
+| Static config token (`UA_AGENT_TOKENS`) | always `'default'` — it is hub configuration and its label is reserved. If an organization other than `'default'` held the label before it was added to the config, the token is **refused** (it does not authenticate) until the operator resolves the `MISCONFIGURED` row | the users row, when the label is human |
 | Agent token row (`agent_tokens`) | `agent_tokens.org_id`, set at issue to the agent's organization | none — refused for human labels |
 | Node session credential (`uas_…`) | `session_credentials.org_id`, the organization of the work item it was minted for | none |
 | OAuth grant | `oauth_grants.org_id`, which must equal the subject agent's organization — checked at grant creation and on every use | none — OAuth never acts as a human |
@@ -811,9 +814,15 @@ Writer rules the schema cannot express, each with an acceptance test:
 - A human `principal` must have a membership in the team's organization; an
   agent `principal` must be an agent of that organization.
 - `agents.owner_user_id` must be a member of the agent's organization, and is
-  set **only by the named user's own act**: the user claims the agent, or
-  accepts an `org_admin`'s request to link it. An `org_admin` may clear it
-  (that narrows), never set it to someone else. Memory uses this link to decide
+  set only with **both** parties: the named user's own act **and** an
+  `org_admin`'s. Either the user requests a claim and an `org_admin` approves
+  it, or an `org_admin` offers the link and the user accepts. Neither can set
+  it alone, and only an agent with no current owner can be claimed. An
+  `org_admin` may clear it (that narrows), never set it to someone else.
+  Clearing the link immediately ends the agent's eligibility for that
+  person's private notes, so an admin who clears it and then issues the agent
+  a token, or whose pending `agent_owner` approval falls back to `org_admin`,
+  gains nothing over those notes. Memory uses this link to decide
   which agent may summarize that person's private notes, so an admin who holds
   an agent's tokens must not be able to aim it at another person.
 - **An owned agent's credentials belong to its owner.** Claiming an agent
@@ -1209,7 +1218,8 @@ CREATE TABLE IF NOT EXISTS import_finalized (
   finalized, so the hub cannot append `hash_v = 2` rows ahead of a catch-up.
 - **Stores imported before this design** already hold `import_runs` rows and
   hub-written events. `import_finalized` and `import_org_map` are created by a
-  `ua-store` procedure part, `organization.v1.import-marker`, which both
+  `ua-store` procedure part, `organization.v1.import-marker`, ordered after
+  `organization.v1.store` (`import_org_map` references `orgs`), which both
   `ua serve` (`Hub::open`) and `ua import` apply, so the check `ua serve` makes
   never depends on a part only the importer applies. When `import_runs` exists,
   that part backfills a legacy marker (`event_ulid` NULL) for every
@@ -1353,14 +1363,18 @@ People and authority
     label is in `human_identities`, `lifecycle_operators`, a static token or
     the `[profiles]` map, in any case; a hub owner can, only in `'default'`; a
     static-token agent's own first `session_start` creates its row in
-    `'default'` as today, and so does a local stdio caller's; a label added to
-    the config while a non-default organization holds it makes `system_doctor`
-    report `MISCONFIGURED`, the hub still starts, and the label gets none of
-    its configured authority until resolved; a reserved label already in
-    `'default'` raises nothing.
-17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` to
-    another user, and can clear it; the named user can set it by claiming the
-    agent or accepting a request; only the member can turn
+    `'default'` as today, and so do a local stdio caller's and a local CLI
+    caller's, while an anonymous HTTP caller (`enforce_auth` off) with the same
+    label is refused; a label added to the config while a non-default
+    organization holds it makes `system_doctor` report `MISCONFIGURED`, the hub
+    still starts, the label gets none of its configured authority, and a static
+    token for it does not authenticate, until resolved; a reserved label already
+    in `'default'` raises nothing.
+17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` alone
+    and can clear it; a `member` cannot claim an agent alone; a claim needs the
+    user's request plus an `org_admin`'s approval (or the reverse offer and
+    acceptance); an agent that already has an owner cannot be claimed; only the
+    member can turn
     `consolidate_private` on or off; claiming an agent revokes credentials for
     it that another person issued, including one minted before the claim; with
     an owner set, an `org_admin` cannot issue or rotate an agent token, or
@@ -1371,7 +1385,8 @@ People and authority
     per-dispatch session credentials with no approval.
 18. **Resolution.** For each credential row of the resolution table, the caller
     gets the stated organization — including a static token, which resolves to
-    `'default'` even if a same-named agent row exists elsewhere, and an
+    `'default'`, and is refused outright while its label is held by another
+    organization (17a), and an
     `agent_tokens` row of B; an OAuth grant whose `org_id` differs from
     its subject agent's organization is refused at creation and on use; a UI
     session whose membership is removed is refused on its next request;
