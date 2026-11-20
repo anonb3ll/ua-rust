@@ -238,6 +238,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
             ),
         ),
         ("families/workspace/shell.rs", (1, vec![("run_cmd", json!({}))])),
+        ("families/zulip.rs", (1, vec![("zulip_send_message", json!({}))])),
     ])
 }
 
