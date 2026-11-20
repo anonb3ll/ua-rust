@@ -24,6 +24,9 @@ pub const DEFAULT_SHELL_ALLOWLIST: &[&str] = &[
     "ruff", "diff", "sort", "uniq", "which", "echo", "date", "cargo",
 ];
 
+/// The public GitHub REST API.
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+
 /// Vault directories agents may write to by default.
 pub const DEFAULT_VAULT_WRITE_DIRS: &[&str] = &["Inbox", "Logs", "Wiki"];
 
@@ -239,6 +242,32 @@ pub struct Config {
     /// credential-looking names are never passed, even when listed.
     #[serde(deserialize_with = "string_or_list")]
     pub cycle_validation_env: Vec<String>,
+    /// GitHub REST API base URL: `https://api.github.com` (default) or a
+    /// GitHub Enterprise Server API root such as `https://ghe.example.com/api/v3`.
+    /// Every GitHub request goes to this host and nowhere else.
+    pub github_api_url: String,
+    /// Name of the environment variable holding the GitHub token the hub
+    /// reads CI runs and pull requests with (read access to checks, actions,
+    /// pull requests and metadata of the bound repositories). The token is
+    /// never stored in the database or the config file and never logged.
+    /// Unset: no GitHub lookups at all.
+    pub github_token_env: Option<String>,
+    /// Name of the environment variable holding the secret that
+    /// `POST /api/github/webhook` verifies `X-Hub-Signature-256` with.
+    /// Unset: the endpoint refuses every delivery.
+    pub github_webhook_secret_env: Option<String>,
+    /// Seconds between polls of the bound repositories' open pull requests
+    /// under `ua serve` (a fallback for hubs GitHub cannot reach). 0 (the
+    /// default) turns polling off.
+    pub github_poll_interval_s: u64,
+    /// Test hook: a GitHub token handed in directly instead of through
+    /// `github_token_env`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub github_token_value: Option<SecretString>,
+    /// Test hook: a webhook secret handed in directly instead of through
+    /// `github_webhook_secret_env`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub github_webhook_secret_value: Option<SecretString>,
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -367,6 +396,12 @@ impl Default for Config {
             autonomy_max_cost_cents: 1000.0,
             cycle_validation_command: Vec::new(),
             cycle_validation_env: Vec::new(),
+            github_api_url: DEFAULT_GITHUB_API_URL.into(),
+            github_token_env: None,
+            github_webhook_secret_env: None,
+            github_poll_interval_s: 0,
+            github_token_value: None,
+            github_webhook_secret_value: None,
         }
     }
 }
@@ -434,11 +469,27 @@ impl Config {
             h.workdir = h.workdir.as_deref().map(expand_tilde);
         }
         self.workflow_dir = self.workflow_dir.map(|p| expand_tilde(&p));
+        self.github_api_url = self.github_api_url.trim().trim_end_matches('/').to_string();
+        if self.github_api_url.is_empty() {
+            self.github_api_url = DEFAULT_GITHUB_API_URL.into();
+        }
         for t in &mut self.trusted_cargo_configs {
             t.path = expand_tilde(&t.path);
             t.sha256 = t.sha256.trim().to_ascii_lowercase();
         }
         self
+    }
+
+    /// The GitHub token: the test hook, else the variable `github_token_env`
+    /// names (trimmed; empty means none). Never logged.
+    pub fn github_token(&self) -> Option<SecretString> {
+        secret_from(&self.github_token_value, self.github_token_env.as_deref())
+    }
+
+    /// The GitHub webhook secret: the test hook, else the variable
+    /// `github_webhook_secret_env` names (trimmed; empty means none).
+    pub fn github_webhook_secret(&self) -> Option<SecretString> {
+        secret_from(&self.github_webhook_secret_value, self.github_webhook_secret_env.as_deref())
     }
 
     /// Seconds between lease-reaper sweeps; 0 means off. See
@@ -586,6 +637,17 @@ impl Config {
     }
 }
 
+/// A secret handed in directly, else read from the environment variable `name`.
+fn secret_from(direct: &Option<SecretString>, name: Option<&str>) -> Option<SecretString> {
+    if let Some(s) = direct.as_ref().filter(|s| !s.expose_secret().trim().is_empty()) {
+        return Some(s.clone());
+    }
+    let name = name.map(str::trim).filter(|n| !n.is_empty())?;
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| SecretString::from(value.to_string()))
+}
+
 /// Deserialize either a list or a comma/whitespace separated string.
 fn string_or_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
@@ -708,6 +770,28 @@ mod tests {
 
         let cfg = load("empty.toml", "human_identities = [\"operator\"]\nlifecycle_operators = []\n");
         assert!(!cfg.is_lifecycle_operator("operator"), "an empty list means nobody");
+    }
+
+    #[test]
+    fn github_settings_name_variables_and_never_print_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "github_api_url = \"https://ghe.example.com/api/v3/\"\ngithub_token_env = \"UA_TEST_UNSET_GITHUB_TOKEN_VAR\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert_eq!(cfg.github_api_url, "https://ghe.example.com/api/v3", "trailing slash trimmed");
+        assert!(cfg.github_token().is_none(), "an unset variable means no token");
+        assert_eq!(cfg.github_poll_interval_s, 0, "polling is off by default");
+        cfg.github_token_value = Some(SecretString::from("token-test-value-not-real".to_string()));
+        assert!(cfg.github_token().is_some());
+        assert!(
+            !format!("{cfg:?}").contains("token-test-value-not-real"),
+            "the token must not leak through Debug"
+        );
+        assert!(Config::default().github_webhook_secret().is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod dispatch;
 pub mod events;
 pub mod evidence;
 pub mod export;
+pub mod github;
 pub mod governance;
 pub mod graph;
 pub mod injection;
@@ -52,6 +53,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.extend(vault::schema_parts());
     parts.push(cycles::SCHEMA);
     parts.push(delegation::SCHEMA);
+    parts.push(github::SCHEMA);
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
     parts.push(messaging::SCHEMA);
@@ -77,6 +79,7 @@ pub fn register(r: &mut Registry) {
     events::register(r);
     evidence::register(r);
     export::register(r);
+    github::register(r);
     governance::register(r);
     graph::register(r);
     injection::register(r);

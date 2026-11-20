@@ -621,7 +621,8 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
     }
     let expected_revision = a.expected_revision;
     let ctx2 = ctx.clone();
-    ctx.hub
+    let out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let task = require_task(tx, id)?;
@@ -675,7 +676,9 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
             )?;
             view(tx, id, None)
         })
-        .await
+        .await?;
+    review_ready(&ctx.hub, id).await;
+    Ok(out)
 }
 
 /// `coordination_manage(action="task_check_record")`.
@@ -874,7 +877,8 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
     };
 
     let (who, n, h) = (who.to_string(), name.to_string(), head.to_string());
-    ctx.hub
+    let out = ctx
+        .hub
         .db()
         .write_async(move |tx| {
             let verified_at = (grade == VERIFIED).then(now_micros);
@@ -902,5 +906,73 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
             }
             view(tx, id, Some(&h))
         })
-        .await
+        .await?;
+    if grade == VERIFIED {
+        review_ready(&ctx.hub, id).await;
+    }
+    Ok(out)
 }
+
+// --- review-ready notification ------------------------------------------------------
+
+/// Notify once per head when a task sits at stage `review`, expects at least
+/// one check, and every expected check is `verified` at the capsule's head.
+/// Best effort: a failure is logged, never returned to the writer.
+pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
+    let claimed = hub
+        .db()
+        .write_async(move |tx| {
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT stage, head_sha, review_notified_head FROM task_workflow WHERE task_id = ?1",
+                    [task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((Some(stage), Some(head), notified)) = row else { return Ok(None) };
+            if stage != "review" || notified.as_deref() == Some(head.as_str()) {
+                return Ok(None);
+            }
+            let v = view(tx, task_id, None)?;
+            let expected: Vec<String> = json_list(Some(v["expected_checks"].to_string()));
+            let checks = v["checks"].as_array().cloned().unwrap_or_default();
+            let verified = |name: &str| checks.iter().any(|c| c["name"] == name && c["grade"] == VERIFIED);
+            if expected.is_empty() || !expected.iter().all(|n| verified(n)) {
+                return Ok(None);
+            }
+            tx.execute(
+                "UPDATE task_workflow SET review_notified_head = ?1 WHERE task_id = ?2",
+                params![head, task_id],
+            )?;
+            let title: String = tx
+                .query_row("SELECT title FROM tasks WHERE id = ?1", [task_id], |r| r.get(0))
+                .unwrap_or_default();
+            emit(
+                tx,
+                CHANNEL,
+                json!({ "kind": "review_ready", "task_id": task_id, "head_sha": head, "checks": expected }),
+                REVIEW_READY_AGENT,
+            )?;
+            let short: String = head.chars().take(12).collect();
+            Ok(Some(format!(
+                "Task #{task_id} is ready for review: {} (head {short}; verified checks: {})",
+                title.lines().next().unwrap_or_default().chars().take(200).collect::<String>(),
+                expected.join(", ")
+            )))
+        })
+        .await;
+    match claimed {
+        Ok(Some(message)) => {
+            if let Err(e) =
+                crate::families::notify::send_event(hub, "review_ready", REVIEW_READY_AGENT, &message).await
+            {
+                tracing::warn!(task_id, error = %e, "review_ready notification failed");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(task_id, error = %e, "review_ready check failed"),
+    }
+}
+
+/// The identity review-ready notifications are attributed to.
+const REVIEW_READY_AGENT: &str = "hub";

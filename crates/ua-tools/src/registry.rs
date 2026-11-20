@@ -42,6 +42,10 @@ pub struct ToolDef {
     /// bound to values it resolves (config, task, run), so the registry does
     /// not gate on the bare arguments.
     pub gates_in_handler: bool,
+    /// An argument that, when present (not null), moves the approval gate
+    /// into the handler for that call: the handler then checks an
+    /// alternative authority (a policy authorization) on resolved values.
+    pub handler_gate_arg: Option<&'static str>,
     handler: Handler,
 }
 
@@ -72,6 +76,18 @@ impl ToolDef {
     pub fn gates_in_handler(mut self) -> Self {
         self.gates_in_handler = true;
         self
+    }
+
+    /// When a call carries argument `arg`, the handler gates itself (see
+    /// [`ToolDef::handler_gate_arg`]); without it the registry gate applies.
+    pub fn handler_gates_with(mut self, arg: &'static str) -> Self {
+        self.handler_gate_arg = Some(arg);
+        self
+    }
+
+    fn handler_gates(&self, args: &Value) -> bool {
+        self.gates_in_handler
+            || self.handler_gate_arg.is_some_and(|k| args.get(k).is_some_and(|v| !v.is_null()))
     }
 }
 
@@ -106,6 +122,7 @@ where
         read_only: false,
         always_gated: false,
         gates_in_handler: false,
+        handler_gate_arg: None,
         handler,
     }
 }
@@ -260,7 +277,7 @@ impl Registry {
         }
 
         let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if gated && !def.gates_in_handler {
+        if gated && !def.handler_gates(&args) {
             let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), args.clone());
             let outcome = match hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await
             {

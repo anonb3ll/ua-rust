@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# GitHub webhook signatures (HMAC-SHA256).
+hmac = "0.13"
 jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true

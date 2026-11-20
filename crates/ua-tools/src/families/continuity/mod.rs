@@ -17,12 +17,15 @@
 //!   `queue_park`, `queue_fold`, `queue_unpark`. Parking is recorded in its
 //!   own task columns (`parked_at`, `parked_by`, `parked_reason`,
 //!   `folded_into`), separate from archiving.
+//! - Close-on-merge ([`merged`]): `queue_close_merged`, and the same rules
+//!   applied to merges the GitHub webhook and poller report.
 //!
 //! All of these are `coordination_manage` actions. Every write appends a
 //! ledger event in its own write transaction. See `docs/continuity.md`.
 
 mod conversation;
 mod handoff;
+pub(crate) mod merged;
 mod queue;
 mod workflow;
 
@@ -34,11 +37,12 @@ pub(crate) use handoff::{
     latest_committed_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
     session_handoff_recover, session_handoff_seal, session_handoff_update,
 };
+pub(crate) use merged::queue_close_merged;
 pub(crate) use queue::{
     parked_block, queue_fold, queue_health, queue_park, queue_stale, queue_sweep, queue_unpark,
 };
 pub(crate) use workflow::{
-    packet_section, task_check_record, task_check_verify, task_workflow_get, task_workflow_set,
+    STAGES, packet_section, task_check_record, task_check_verify, task_workflow_get, task_workflow_set,
 };
 
 /// The workflow record, task checks and session handoff notes. Column names
@@ -157,8 +161,17 @@ ALTER TABLE task_workflow ADD COLUMN expected_jobs_json TEXT NOT NULL DEFAULT '{
 ",
 };
 
+/// The head a `review_ready` notification was last sent for, so each head
+/// is announced once.
+pub const REVIEW_READY_SCHEMA: SchemaPart = SchemaPart {
+    name: "continuity.review_ready.v1",
+    sql: "
+ALTER TABLE task_workflow ADD COLUMN review_notified_head TEXT;
+",
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA, PARKING_SCHEMA, CHECK_JOBS_SCHEMA]
+    vec![SCHEMA, PARKING_SCHEMA, CHECK_JOBS_SCHEMA, REVIEW_READY_SCHEMA]
 }
 
 // --- shared helpers ---------------------------------------------------------------

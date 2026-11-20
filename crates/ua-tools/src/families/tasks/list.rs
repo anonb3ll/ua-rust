@@ -17,6 +17,8 @@ const W_LEXICAL: f64 = 0.5;
 const W_RECENCY: f64 = 0.3;
 const RECENCY_HALF_LIFE_DAYS: f64 = 15.0;
 const REVIEW_MARKER: &str = "[waiting-for: review]";
+/// The implicit status filter with `stage`: every unfinished status.
+const UNFINISHED: &str = "unfinished";
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +71,11 @@ pub struct ListArgs {
     /// Ranked mode: relevance search over title and notes within the same
     /// filters. Exclusive with `notes_contain` and `cursor`.
     pub query: Option<String>,
+    /// Only tasks whose workflow record (`task_workflow_set`) is at this
+    /// stage: plan, implement, verify, review, merge, deploy, prove or done.
+    /// Without `status`, every unfinished status is listed.
+    /// `stage="review"` is the review queue.
+    pub stage: Option<String>,
 }
 
 pub fn register(r: &mut Registry) {
@@ -77,7 +84,9 @@ pub fn register(r: &mut Registry) {
             "task_list",
             "List tasks by status (or all), sorted by priority then age, with keyset pagination. \
              Pass query= for ranked full-text search. Parked tasks are left out unless parked=true (the parked \
-             view; parking is not cancelling). Returns {tasks, truncated, next_cursor, limit}.",
+             view; parking is not cancelling). stage= filters on the workflow stage (stage=review is the \
+             review queue; without status it lists every unfinished status). Returns {tasks, truncated, \
+             next_cursor, limit}.",
             |ctx: ToolCtx, a: ListArgs| async move { ctx.hub.db().read_async(move |c| list(c, a)).await },
         )
         .family("tasks")
@@ -174,8 +183,9 @@ fn shape(conn: &Connection, mut row: Map<String, Value>, compact_rows: bool) -> 
 }
 
 fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
-    let status = a.status.clone().unwrap_or_else(|| "open".into());
-    if status != "all" {
+    let default_status = if a.stage.is_some() { UNFINISHED } else { "open" };
+    let status = a.status.clone().unwrap_or_else(|| default_status.into());
+    if status != "all" && status != UNFINISHED {
         check_one_of("status", &status, &STATUSES)?;
     }
     if let Some(p) = &a.priority {
@@ -223,8 +233,20 @@ fn list(conn: &Connection, a: ListArgs) -> UaResult<Value> {
             [Sql::Text(now())],
         );
     }
-    if status != "all" {
+    if status == UNFINISHED {
+        f.push("status NOT IN ('done', 'cancelled')", []);
+    } else if status != "all" {
         f.push("status = ?", [Sql::Text(status)]);
+    }
+    if let Some(stage) = &a.stage {
+        let stage = stage.trim();
+        if !crate::families::continuity::STAGES.contains(&stage) {
+            return Err(UaError::invalid(format!(
+                "stage must be one of {:?}",
+                crate::families::continuity::STAGES
+            )));
+        }
+        f.push("id IN (SELECT task_id FROM task_workflow WHERE stage = ?)", [Sql::Text(stage.to_string())]);
     }
     if let Some(p) = a.parent_id {
         f.push("parent_id = ?", [Sql::Integer(p)]);

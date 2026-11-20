@@ -18,6 +18,8 @@ use serde_json::{Map, Value, json};
 use ua_core::safety::resolve_in_root;
 use ua_core::{UaError, UaResult};
 
+use crate::families::github::authz;
+
 use super::{RunOutput, Sandbox, git_env, record, run_program, sandbox};
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -94,6 +96,12 @@ pub struct MergeArgs {
     /// Accept a task that is still `doing` or `blocked` (status check only).
     #[serde(default)]
     pub allow_in_flight: bool,
+    /// Merge under this policy authorization (`policy_authorization_record`)
+    /// instead of a one-time human approval. It must be valid, for this task,
+    /// for the task project's bound repository and for exactly the head being
+    /// merged, and recorded by someone other than the caller. A merge spends
+    /// it; a dry run only reports that it covers the merge.
+    pub policy_authorization_id: Option<i64>,
 }
 
 async fn git(args: &[&str], cwd: &Path) -> UaResult<RunOutput> {
@@ -325,6 +333,8 @@ struct TaskRow {
     status: String,
     branch: Option<String>,
     worktree_path: Option<String>,
+    /// The repository the task's project is bound to.
+    repo: Option<String>,
 }
 
 async fn rev_parse(dir: &Path, rev: &str) -> UaResult<Option<String>> {
@@ -349,7 +359,8 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         .db()
         .read_async(move |c| {
             Ok(c.query_row(
-                "SELECT title, status, branch, worktree_path FROM tasks WHERE id = ?1",
+                "SELECT t.title, t.status, t.branch, t.worktree_path, b.repo FROM tasks t \
+                 LEFT JOIN project_repo_bindings b ON b.project = t.project WHERE t.id = ?1",
                 [id],
                 |r| {
                     Ok(TaskRow {
@@ -357,6 +368,7 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
                         status: r.get(1)?,
                         branch: r.get(2)?,
                         worktree_path: r.get(3)?,
+                        repo: r.get(4)?,
                     })
                 },
             )
@@ -440,6 +452,23 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         "worktree_clean": worktree_clean,
         "already_merged": already_merged,
     });
+    // A policy authorization stands in for the one-time approval (the
+    // registry skipped its gate because the argument is present).
+    if let Some(auth_id) = a.policy_authorization_id {
+        let (repo, h, who) = (row.repo.clone(), head.clone(), ctx.caller.label.clone());
+        let dry = a.dry_run;
+        ctx.hub
+            .db()
+            .write_async(move |tx| {
+                authz::covering(tx, auth_id, id, repo.as_deref(), &h, &who)?;
+                if !dry {
+                    authz::consume(tx, auth_id, id, &h, &who)?;
+                }
+                Ok(())
+            })
+            .await?;
+        report["policy_authorization_id"] = json!(auth_id);
+    }
     if a.dry_run {
         report["dry_run"] = json!(true);
         return Ok(report);
@@ -566,11 +595,14 @@ pub fn register(r: &mut Registry) {
             "git_merge_task",
             "Merge a task's recorded branch into main of the workspace repository after checking the task \
              status and a clean worktree, then remove the worktree and delete the branch (expected-SHA). \
-             dry_run=true only reports. Always needs a one-time human approval. Returns {success, \
-             commit_hash, task_id, branch} plus cleanup_skipped / branch_retained when the source was kept.",
+             dry_run=true only reports. Always needs a one-time human approval, or policy_authorization_id: a \
+             human's policy authorization for exactly this task, its project's bound repository and the head being \
+             merged (spent by the merge). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / \
+             branch_retained when the source was kept.",
             git_merge_task,
         )
         .family("workspace")
-        .always_gated(),
+        .always_gated()
+        .handler_gates_with("policy_authorization_id"),
     );
 }
