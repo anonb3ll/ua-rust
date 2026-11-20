@@ -200,7 +200,7 @@ async fn workflow_and_node_runs_are_opt_in_and_node_items_stay_private() {
     // builder-1 neither queued the item nor owns the node: not visible.
     let (_, v) = read(&hub, "/api/runs?kind=node", BUILDER).await;
     assert_eq!(v["count"], 0, "{v}");
-    let (status, _) = read(&hub, "/api/runs/nd-0123456789abcdef", BUILDER).await;
+    let (status, _) = read(&hub, "/api/runs/nd-0123456789abcdef?kind=node", BUILDER).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     // The requester and the operator see it.
     for token in [OTHER, OPERATOR] {
@@ -226,8 +226,28 @@ async fn one_run_reads_by_id_and_unknown_ids_are_404() {
         assert_eq!(v["run"]["run_id"], id);
         assert_sdk_run(&v["run"]);
     }
+    // getRun only ever receives a kind its schema accepts: a workflow run or
+    // node item is 404 unless the caller names its kind.
     let (status, v) = read(&hub, "/api/runs/wf-1", BUILDER).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    let (status, _) = read(&hub, "/api/runs/nd-0123456789abcdef", OTHER).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for q in ["kind=workflow", "kind=all"] {
+        let (status, v) = read(&hub, &format!("/api/runs/wf-1?{q}"), BUILDER).await;
+        assert_eq!(status, StatusCode::OK, "{q}: {v}");
+        assert_eq!(v["run"]["kind"], "workflow");
+    }
+    let (status, v) = read(&hub, "/api/runs/nd-0123456789abcdef?kind=node", OTHER).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["run"]["kind"], "node");
+    // A kind filter that excludes the run's store is 404 too.
+    let (status, _) = read(&hub, "/api/runs/run-1-aa?kind=session", BUILDER).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = read(&hub, "/api/runs/run-1-aa?kind=bogus", BUILDER).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The platform run object still resolves every kind.
+    let (status, v) = read(&hub, "/api/platform/objects/run/wf-1", BUILDER).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["run"]["kind"], "workflow");
     let (status, v) = read(&hub, "/api/runs/run-404", BUILDER).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -328,6 +348,7 @@ async fn evidence_appends_attributed_and_deduplicated_per_caller() {
     assert_eq!(v["evidence_event"]["originator"], "builder-1");
     assert_eq!(v["evidence_event"]["channel"], "sdk.conformance");
     assert_eq!(v["evidence_event"]["payload_parsed"]["fixture"], true);
+    assert_eq!(v["evidence_event"]["trust"]["level"], "untrusted", "a client payload is labelled");
     assert!(v["evidence_event"]["entry_hash"].is_string());
 
     for (bad, why) in [
@@ -417,7 +438,7 @@ async fn cookie_writes_need_csrf_and_unported_routes_say_so() {
     let (status, v) = post(&hub, "/api/work-products", Some(BUILDER), json!({ "source_path": "/x" })).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(v["capability"], "work_products");
-    assert!(v["message"].as_str().unwrap().contains("not being ported"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("not ported"), "{v}");
     let (status, _) = post(&hub, "/api/work-products/3/release", Some(BUILDER), json!({})).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     for path in ["/api/platform/provenance-graph", "/api/evidence/export"] {
@@ -425,4 +446,21 @@ async fn cookie_writes_need_csrf_and_unported_routes_say_so() {
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}: {v}");
         assert_eq!(v["error"], "not_implemented");
     }
+}
+
+#[tokio::test]
+async fn the_evidence_budget_refuses_appends_past_it() {
+    let mut cfg = config();
+    cfg.evidence_append_max_per_hour = 2;
+    let hub = TestHub::new(cfg);
+    let body = json!({ "channel": "sdk.burst", "payload": { "n": 1 } });
+    for _ in 0..2 {
+        let (status, v) = post(&hub, "/api/evidence", Some(BUILDER), body.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+    }
+    let (status, v) = post(&hub, "/api/evidence", Some(BUILDER), body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["reason_code"], "rate_limited");
+    let (status, _) = post(&hub, "/api/evidence", Some(OTHER), body).await;
+    assert_eq!(status, StatusCode::CREATED, "another identity has its own budget");
 }

@@ -40,7 +40,7 @@ A human credential for `resolveApproval` is a token whose label is in
 | `capabilityCatalog` | `GET /api/capability-catalog` | the registry |
 | `listSessions`, `listNodes` | `GET /api/sessions`, `GET /api/nodes` | `session_list`, `node_list` |
 | `listRuns` | `GET /api/runs` | `run_list` |
-| `getRun` | `GET /api/runs/{run_id}` | `run_get` |
+| `getRun` | `GET /api/runs/{run_id}` | `run_get` (SDK kinds unless `kind` is given) |
 | `platformManifest` | `GET /api/platform/manifest` | `platform_manifest` |
 | `platformObject` | `GET /api/platform/objects/{kind}/{id}` | `platform_object_get` |
 | `createEvidence` | `POST /api/evidence` | `evidence_append` |
@@ -77,8 +77,12 @@ The SDK's `Run` schema accepts only the kinds `dispatch`, `selfpickup` and
 rows. `kind=workflow`, `kind=node` and `kind=all` are opt-in for other HTTP
 clients (the `run_list` tool lists every kind by default). This hub records
 no self-pickup runs: `kind=selfpickup` is an empty page. `GET
-/api/runs/{run_id}` answers for any kind, so `getRun` on a workflow run or
-node item id fails the SDK's schema check rather than returning 404.
+/api/runs/{run_id}` looks in the same kinds, so `getRun` on a workflow run
+or node item id is 404 rather than a row the SDK's schema rejects; pass
+`?kind=workflow`, `?kind=node` or `?kind=all` to read one. The `run_get`
+tool takes the same `kind` (or `kinds`) and, like `run_list`, looks in
+every store when it is omitted. The platform `run` object resolves every
+kind.
 
 Node items are visible only to their requester, the node's agent, a
 command's owner and operators, as with `node_items`; another caller gets 404.
@@ -94,9 +98,17 @@ fields (`kind`, `uri`, `id_param`, `id_pattern`, `profile_tool`,
 
 A read answers `{uri, <kind>: {...}}` (`{uri, tasks, count, truncated}` for
 the board). Each kind is gated by its own `profile_tool` before storage is
-read, so the call needs `platform_object_get` and that tool. Approval
-payloads have secret-shaped fields redacted; an evidence event carries its
-stored `payload` text verbatim plus `payload_parsed`. An unknown kind, an
+read, as if the caller had called that tool: the profile must allow it, and
+the policy file's tool, role, bind and `default_action` rules for it apply,
+with the refusal codes a direct call would get (`role_denied`,
+`policy_deny`, `default_deny`, ...). A tool that a `require_approval` rule
+or `approval_tools` sends through the gate is refused here
+(`approval_required`); call it directly. So the call needs
+`platform_object_get` and that tool. Approval payloads have secret-shaped
+fields redacted; an evidence event carries its stored `payload` text
+verbatim plus `payload_parsed`, and an `sdk.` event adds a `trust` label
+(`level: untrusted`, `source: sdk_evidence`, `author`): its payload is data
+a client wrote, not instructions. An unknown kind, an
 unserved kind, an id that does not fit the kind's pattern and a missing row
 are all 404; an id on a collection or none on an id kind is 400.
 
@@ -109,8 +121,39 @@ caller: a repeat appends nothing and returns the first event's ulid with
 event. The route answers `201` for a new event and `200` for a repeat (the
 SDK accepts both). Payloads are capped at 64 KiB.
 
+Appends are budgeted per identity over a rolling hour:
+`evidence_append_max_per_hour` events (default 120) and
+`evidence_append_max_bytes_per_hour` serialized payload bytes (default 2
+MiB). Past either, the append is refused with `403` and `reason_code:
+"rate_limited"`. The budget is counted from the ledger (the caller's `sdk.`
+events in the last hour), so a restart does not reset it. A deduplicated
+repeat appends nothing and is never refused.
+
 `GET /api/evidence` returns `evidence_report` as JSON (`task_id`,
 `project_id`, `since`, `until`, `agent`, `project`, `pr`, `item`, `limit`).
+
+Client evidence never attributes a task. An `sdk.` event's `task_id` is
+whatever the client wrote, so the report leaves those events out of a
+record's `events`, `participants`, `proof` and tool-call window, and the
+`agent` filter does not match on them. Each record lists them apart under
+`client_asserted`:
+
+```json
+{
+  "asserted_by": "client", "verified": false, "counts_as_attribution": false,
+  "total": 1, "truncated": false,
+  "events": [{ "ulid": "...", "channel": "sdk.claim", "originator": "builder-2",
+               "created_at": "...", "entry_hash": "...", "payload_bytes": 52,
+               "payload_inline": true, "payload": { "task_id": 41 },
+               "platform": { "kind": "evidence_event", "uri": "unified-agent://evidence/..." },
+               "trust": { "level": "untrusted", "source": "sdk_evidence", "author": "builder-2" } }]
+}
+```
+
+At most 20 events are listed per record; a payload over 4 KiB is not
+inlined (`payload_inline: false`) and is read through its `platform`
+reference. `event_log_query` and `GET /api/events/stream` label `sdk.`
+events the same way.
 
 ## Not supported
 
@@ -118,10 +161,15 @@ SDK accepts both). Payloads are capped at 64 KiB.
 |---|---|
 | `queueHealth` (`GET /api/queue-health`) | not served (404) |
 | `startNodeSession`, `cancelNodeSession`, `restartNodeSession` (`POST /api/action/node-session`) | not served; queue node work with the `node_dispatch` tool |
-| `submitWorkProduct`, `releaseWorkProduct` (`/api/work-products*`) | `501`: work products are not being ported |
+| `submitWorkProduct`, `releaseWorkProduct` (`/api/work-products*`) | `501`: not ported (see below) |
 | `GET /api/evidence?format=csv\|markdown\|text\|pdf`, `cursor` | `400`: JSON only, no keyset paging |
 | `GET /api/evidence/export`, `GET /api/platform/provenance-graph` | `501` |
 | `org_unit`, `org_proposal`, `agent_token` platform objects | not declared |
+
+Work products (submit, named-reviewer approval, release) are not ported
+pending an explicit product decision; hub task #2658 lists the options.
+Until that decision, `/api/work-products*` answers `501` and the manifest
+lists `work_product` with `served: false`.
 
 `requestApproval` queues a request only for a tool that is gated (always
 gated, `approval_tools`, or a policy rule); for any other tool it answers

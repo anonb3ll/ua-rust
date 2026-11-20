@@ -5,7 +5,7 @@
 //! | Route | Tool |
 //! |---|---|
 //! | `GET  /api/runs` | `run_list` (SDK kinds unless `kind` says otherwise) |
-//! | `GET  /api/runs/{run_id}` | `run_get` |
+//! | `GET  /api/runs/{run_id}` | `run_get` (SDK kinds unless `kind` says otherwise) |
 //! | `GET  /api/platform/manifest` | `platform_manifest` |
 //! | `GET  /api/platform/objects/{kind}` | `platform_object_get` (collection kinds) |
 //! | `GET  /api/platform/objects/{kind}/{id}` | `platform_object_get` |
@@ -15,11 +15,14 @@
 //! `GET /api/runs` without `kind` lists `dispatch` and `session` runs: the
 //! SDK's `Run` schema accepts only those kinds (and `selfpickup`, which this
 //! hub does not record), so the other stores are opt-in with `kind=workflow`,
-//! `kind=node` or `kind=all`. `GET /api/runs/{id}` answers for any kind.
+//! `kind=node` or `kind=all`. `GET /api/runs/{id}` looks in the same kinds:
+//! a workflow run or node item id is 404 there unless `kind` names its kind
+//! (or `all`), so `getRun` never receives a row its schema rejects.
 //!
 //! Not built: the provenance graph (`/api/platform/provenance-graph`) and the
 //! evidence export (`/api/evidence/export`) answer `501`. Work products are
-//! not being ported; `/api/work-products*` answers `501` and says so.
+//! not ported pending an explicit product decision (hub task #2658);
+//! `/api/work-products*` answers `501` and says so.
 //!
 //! Every route is behind the same middleware as the rest of `/api` (bearer or
 //! session cookie, host check, cross-site and CSRF checks on writes) and
@@ -60,13 +63,14 @@ pub fn routes() -> Router<AppState> {
         .route("/api/work-products/{*rest}", any(|| async { not_ported() }))
 }
 
-/// Work products are deliberately not part of this hub.
+/// Work products are not part of this hub until a product decision says
+/// otherwise (hub task #2658).
 fn not_ported() -> Response {
     let body = json!({
         "error": "not_implemented",
         "capability": "work_products",
-        "message": "work products (submit, review and release) are not being ported to this hub; \
-                    use the Python hub for them",
+        "message": "work products (submit, review and release) are not ported to this hub pending a \
+                    product decision (hub task #2658); use the Python hub for them",
     });
     (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }
@@ -105,13 +109,10 @@ fn text_param(q: &HashMap<String, String>, name: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Runs
 
-async fn runs(
-    State(state): State<AppState>,
-    Extension(id): Extension<AuthIdentity>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    let kinds: Vec<&str> = match text_param(&q, "kind").as_deref() {
+/// The run kinds a `kind` query parameter selects: the SDK's kinds when it
+/// is absent.
+fn route_kinds(q: &HashMap<String, String>) -> Result<Vec<&'static str>, Box<Response>> {
+    Ok(match text_param(q, "kind").as_deref() {
         None => SDK_KINDS.to_vec(),
         Some("all") => KINDS.to_vec(),
         // The SDK names it; this hub records no self-pickup runs.
@@ -119,12 +120,24 @@ async fn runs(
         Some(k) => match KINDS.iter().find(|x| **x == k) {
             Some(x) => vec![*x],
             None => {
-                return err(
+                return Err(Box::new(err(
                     StatusCode::BAD_REQUEST,
                     "kind must be dispatch, selfpickup, session, workflow, node or all",
-                );
+                )));
             }
         },
+    })
+}
+
+async fn runs(
+    State(state): State<AppState>,
+    Extension(id): Extension<AuthIdentity>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let kinds = match route_kinds(&q) {
+        Ok(k) => k,
+        Err(r) => return *r,
     };
     let task_id = match int_param(&q, "task_id") {
         Ok(t) => t,
@@ -159,9 +172,15 @@ async fn run_detail(
     Extension(id): Extension<AuthIdentity>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    let kinds = match route_kinds(&q) {
+        Ok(k) => k,
+        Err(r) => return *r,
+    };
     let caller = caller(&state, &id, &headers);
-    match state.registry.call(&state.hub, &caller, "run_get", json!({ "run_id": run_id })).await {
+    let args = json!({ "run_id": run_id, "kinds": kinds });
+    match state.registry.call(&state.hub, &caller, "run_get", args).await {
         Ok(v) => Json(v).into_response(),
         Err(UaError::NotFound(_)) => err(StatusCode::NOT_FOUND, "unknown run"),
         Err(e) => tool_err(&e),

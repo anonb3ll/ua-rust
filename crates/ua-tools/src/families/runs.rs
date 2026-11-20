@@ -98,6 +98,10 @@ pub struct ListArgs {
 pub struct GetArgs {
     /// A dispatch run id, session id, workflow run id or node item id.
     pub run_id: String,
+    /// Look the id up only in this kind's store. Omitted: every kind, or `kinds`.
+    pub kind: Option<String>,
+    /// Look the id up only in these kinds' stores (ignored when `kind` is set).
+    pub kinds: Option<Vec<String>>,
 }
 
 /// Who is reading, for node-item visibility.
@@ -554,22 +558,27 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
     }))
 }
 
-/// One run row by id, from whichever store holds it, else `None`.
-fn get(c: &Connection, viewer: &Viewer, run_id: &str) -> UaResult<Option<Value>> {
+/// One run row by id from the first of `kinds`' stores that holds it, else
+/// `None`.
+fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaResult<Option<Value>> {
     let rid = run_id.trim();
     if rid.is_empty() || rid.len() > 128 {
         return Ok(None);
     }
     let f = Filter { agent: None, task_id: None, after: None, run_id: Some(rid), limit: 1 };
     let now = ua_core::time::now();
-    let mut rows = dispatch_rows(c, &f, &now)?;
-    if rows.is_empty() {
+    let has = |k: &str| kinds.iter().any(|w| w == k);
+    let mut rows = Vec::new();
+    if has("dispatch") {
+        rows = dispatch_rows(c, &f, &now)?;
+    }
+    if rows.is_empty() && has("session") {
         rows = session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?;
     }
-    if rows.is_empty() {
+    if rows.is_empty() && has("workflow") {
         rows = workflow_rows(c, &f, &now)?;
     }
-    if rows.is_empty() {
+    if rows.is_empty() && has("node") {
         rows = node_rows(c, &f, viewer, &now)?;
     }
     attach_links(c, &mut rows)?;
@@ -583,7 +592,8 @@ pub(crate) fn read_one(
     conn: &Connection,
     run_id: &str,
 ) -> UaResult<Option<Value>> {
-    get(conn, &Viewer::of(hub, caller), run_id)
+    let all: Vec<String> = KINDS.iter().map(|k| k.to_string()).collect();
+    get(conn, &Viewer::of(hub, caller), run_id, &all)
 }
 
 pub fn register(r: &mut Registry) {
@@ -610,11 +620,14 @@ pub fn register(r: &mut Registry) {
         tool(
             "run_get",
             "Read one run by id (dispatch run, session, workflow run or node item) in the run_list row shape. \
-             Returns {run}; an unknown id, or a node item not visible to you, is not found.",
+             kind or kinds limit the stores looked in (default: every kind, as run_list). Returns {run}; an \
+             unknown id, a run of a kind not asked for, or a node item not visible to you, is not found.",
             |ctx: ToolCtx, a: GetArgs| async move {
+                let kinds = resolve_kinds(a.kind.as_deref(), a.kinds.as_deref())?;
                 let viewer = Viewer::of(&ctx.hub, &ctx.caller);
                 let rid = a.run_id;
-                let row = ctx.hub.db().read_async(move |c| get(c, &viewer, &rid).map(|r| (r, rid))).await?;
+                let row =
+                    ctx.hub.db().read_async(move |c| get(c, &viewer, &rid, &kinds).map(|r| (r, rid))).await?;
                 match row {
                     (Some(run), _) => Ok(json!({ "run": run })),
                     (None, rid) => Err(UaError::not_found(format!("unknown run {rid:?}"))),
