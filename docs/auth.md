@@ -42,7 +42,7 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 | `oauth_profile` | `public` | Profile given to each `oauth_identities` label that has no `profiles` entry. |
 | `oauth_access_ttl_secs` | `3600` | Access token lifetime (clamped to 60 s .. 30 days). |
 | `oauth_refresh_ttl_days` | `30` | Refresh token lifetime (clamped to 1 .. 365 days). |
-| `oauth_client_credentials` | none | Confidential clients for `client_credentials`: `client_id\|secret\|identity` entries separated by commas or newlines. Secret; never printed. A client id listed twice is dropped. |
+| `oauth_client_credentials` | none | Confidential clients for `client_credentials`: `client_id\|secret\|identity` entries separated by commas or newlines. Secret; never printed. A client id listed twice is dropped. Each identity needs a profile of its own (see below). |
 | `ui_cookie_secure` | `true` | Send the session cookie with `Secure`. Leave it on: browsers treat `http://localhost` and loopback addresses as secure contexts and keep `Secure` cookies there. Turning it off does not make plain `http://` to another host safe; use HTTPS instead (see "Remote access"). |
 | `ui_session_ttl_hours` | `12` | Browser session lifetime. |
 | `login_link_ttl_secs` | `600` | Lifetime of a `ua login-link` URL. |
@@ -50,7 +50,10 @@ defaults are safe: OAuth is off, cookies are `Secure`.
 
 `allowed_hosts` (default `localhost`, `127.0.0.1`, `::1`) lists the `Host`
 headers `/mcp`, `/api` and `/ui` answer, as protection against DNS
-rebinding. The host of `public_url` is always allowed as well, so a hub
+rebinding. An HTTP/2 request names its host in the `:authority`
+pseudo-header and may send no `Host`; `/api` and `/ui` check the authority
+against the same list, and when a request carries both, both must be
+allowed. The host of `public_url` is always allowed as well, so a hub
 reached only through its public name needs no entry. Add every other name
 the hub is reached by, for example:
 
@@ -135,9 +138,34 @@ Rules the server enforces:
 - **Refresh tokens rotate** on every use. Presenting a rotated refresh token
   revokes the whole grant (every access and refresh token of that sign-in).
 - **Client authentication:** `none` (public clients, PKCE is the proof),
-  `client_secret_basic`, `client_secret_post`. `client_credentials` is limited
-  to clients in `oauth_client_credentials`, gets no refresh token, and may not
-  act as a human identity.
+  `client_secret_basic`, `client_secret_post`.
+- **`client_credentials`** is limited to clients in
+  `oauth_client_credentials` and gets no refresh token. It is refused with
+  `unauthorized_client` when the client is not registered for the grant,
+  when its identity is a human or retired, and when its identity has no
+  configured profile. A configured profile is a `profiles` entry naming a
+  known profile; an `oauth_identities` label gets `oauth_profile` that way.
+  Without one the identity would fall back to the broad `developer` profile,
+  so the hub mints nothing for it. To give a client `developer`, say so:
+  `profiles.<identity> = "developer"`. The only scope is `mcp`: `scope` may be
+  omitted or `mcp`, anything else is `invalid_scope`. The grant and its token
+  record the scope issued.
+- **An OAuth identity never runs as `developer` by default.** The explicit
+  profile is checked on every use, not only when a token is minted: an
+  access token whose identity no longer has a `profiles` entry naming a
+  known profile is refused (401), and so are a refresh and a code exchange
+  for it (`invalid_grant`). Refreshing or exchanging a grant a human
+  approved on the consent page also needs the identity to still be in
+  `oauth_identities`. Removing an identity from the configuration therefore
+  ends its OAuth access instead of widening it.
+- **Retired identities.** A token is never minted for a retired identity:
+  `client_credentials` refuses it (`unauthorized_client`), and a code
+  exchange or refresh after the identity was retired is refused
+  (`invalid_grant`). Retiring an identity also revokes its grants, and the
+  bearer check refuses a retired identity's tokens.
+- **Client authentication failures look alike.** An unknown client id, a
+  wrong secret and a secret sent by a public client all get `401
+  invalid_client` with the same description.
 - **Client ID Metadata Documents** (`oauth_cimd_enabled`): the client id must
   be a canonical `https` URL with a DNS host and a path, no port, query,
   fragment, credentials or dot segments. Every resolved address must be
@@ -165,6 +193,15 @@ Code: `crates/ua-server/src/login.rs`.
 | `POST /login/passkeys/register/start`, `/finish` | Passkey registration (session + CSRF header). |
 | `POST /logout` | Ends the session (CSRF token in the header or a `csrf` form field). |
 | `GET /api/session` | The CSRF helper (below). |
+| `GET /login/assets/login.js`, `/login/assets/page.css` | The sign-in pages' script and style, public. |
+
+The sign-in, passkey and consent pages run no inline script or style. They
+send `Content-Security-Policy: default-src 'none'; script-src 'self';
+style-src 'self'; ...` with no `'unsafe-inline'`, load their script and
+stylesheet from the routes above, and pass values to the script in
+HTML-escaped `data-` attributes (`data-next`, `data-csrf`). The policy has no
+`form-action`: the consent form's answer redirects to the client's
+`redirect_uri`, which browsers check against `form-action`.
 
 **First sign-in on a fresh install.** There is no passkey yet. On the hub
 host run:
@@ -182,7 +219,13 @@ passkey on the page you land on.
 `ui_keys` table) and set with `HttpOnly; SameSite=Lax; Path=/` plus `Secure`
 unless `ui_cookie_secure` is off. It has no `Max-Age`; the server-side row
 bounds its life. Removing a label from `human_identities` ends its sessions at
-once.
+once. The hub keeps the key in memory and re-reads `ui_keys` at most once a
+minute, so reading a cookie does not query it. A sign-in always encrypts its
+new cookie with the key the table holds at that moment, and refreshes the
+cached copy. There is no rotation command: deleting the `ui_keys` row makes
+the hub create a new key, which signs every browser out within a minute (at
+once after a restart). Nothing in the hub deletes or replaces the row; code
+that ever does so in-process must call `CookieKeyCache::invalidate`.
 
 The cookie is `SameSite=Lax`, not `Strict`, on purpose. An MCP client starts
 OAuth by sending the browser from another site (the client's page or a

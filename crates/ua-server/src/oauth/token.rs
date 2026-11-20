@@ -104,16 +104,24 @@ async fn authenticate_client(
             None => return Err(token_error("invalid_client", "client authentication is required")),
         },
     };
+    // An unknown client id and a wrong secret get the same answer, so the
+    // endpoint does not tell which client ids exist. An unknown id still
+    // hashes the presented secret, as a known confidential client would.
+    let failed = || token_error("invalid_client", "client authentication failed");
     let client = match load_client(state, &client_id).await {
         Ok(ClientLookup::Found(c)) => c,
-        Ok(_) => return Err(token_error("invalid_client", "unknown client")),
+        Ok(_) => {
+            if let Some(s) = &secret {
+                let _ = digest(s);
+            }
+            return Err(failed());
+        }
         Err(_) => return Err(token_error("server_error", "the client registry is unavailable")),
     };
     match (&secret, client.is_public()) {
         (None, true) => Ok(client),
         (Some(s), false) if client.secret_matches(s) => Ok(client),
-        (Some(_), true) => Err(token_error("invalid_client", "public clients do not use a secret")),
-        _ => Err(token_error("invalid_client", "client authentication failed")),
+        _ => Err(failed()),
     }
 }
 
@@ -151,6 +159,39 @@ fn finish(res: ua_core::UaResult<Outcome>) -> Response {
             tracing::warn!(error = %e, "token endpoint failed");
             token_error("server_error", "the token could not be issued")
         }
+    }
+}
+
+/// Whether `identity` is a retired agent. The bearer check already refuses a
+/// retired identity's tokens; the token endpoint refuses to mint them at all.
+fn retired(c: &rusqlite::Connection, identity: &str) -> ua_core::UaResult<bool> {
+    ua_tools::families::governance::is_retired(c, identity)
+}
+
+/// The scope a `client_credentials` request is granted: the client's allowed
+/// scope ([`SCOPE`], the only one this hub has) when it asks for none or for
+/// exactly that, else `None` (`invalid_scope`). Tools are filtered by profile,
+/// not scope.
+fn granted_scope(requested: Option<&str>) -> Option<&'static str> {
+    match requested.map(str::split_whitespace) {
+        None => Some(SCOPE),
+        Some(mut parts) => parts.all(|s| s == SCOPE).then_some(SCOPE),
+    }
+}
+
+/// Why a token may not be minted for `subject` of a grant, if it may not:
+/// a human, an identity without an explicit profile (it would run as the
+/// `developer` default), and, for a grant a human approved on the consent
+/// page, an identity no longer in `oauth_identities`.
+fn identity_refusal(cfg: &ua_core::Config, subject: &str, consented: bool) -> Option<&'static str> {
+    if cfg.is_human(subject) {
+        Some("grant identity is not allowed")
+    } else if cfg.explicit_profile(subject).is_none() {
+        Some("grant identity has no configured profile")
+    } else if consented && !cfg.oauth_identities.iter().any(|l| l == subject) {
+        Some("grant identity is no longer an OAuth identity")
+    } else {
+        None
     }
 }
 
@@ -224,6 +265,12 @@ async fn authorization_code(state: &AppState, client: Client, form: &HashMap<Str
             if !bool::from(computed.as_bytes().ct_eq(challenge.as_bytes())) {
                 return Ok(Outcome::Refused("invalid_grant", "code_verifier does not match the code_challenge".into()));
             }
+            if let Some(why) = identity_refusal(&cfg, &subject, true) {
+                return Ok(Outcome::Refused("invalid_grant", why.into()));
+            }
+            if retired(tx, &subject)? {
+                return Ok(Outcome::Refused("invalid_grant", "grant identity is retired".into()));
+            }
             if let Some(r) = resource_param.as_deref()
                 && accepted_resource(&cfg, Some(r)).as_deref() != Some(resource.as_str())
             {
@@ -256,17 +303,30 @@ async fn refresh(state: &AppState, client: Client, form: &HashMap<String, String
         .hub
         .db()
         .write_async(move |tx| {
-            type Row = (String, String, String, String, String, String, String, Option<String>);
+            type Row = (String, String, String, String, String, String, String, Option<String>, String);
             let row: Option<Row> = tx
                 .query_row(
-                    "SELECT t.family_id, t.client_id, t.subject, t.scope, t.resource, t.status, t.expires_at, g.revoked_at \
-                     FROM oauth_tokens t JOIN oauth_grants g ON g.family_id = t.family_id \
+                    "SELECT t.family_id, t.client_id, t.subject, t.scope, t.resource, t.status, t.expires_at, g.revoked_at, \
+                     g.grant_type FROM oauth_tokens t JOIN oauth_grants g ON g.family_id = t.family_id \
                      WHERE t.token_hash = ?1 AND t.kind = 'refresh'",
                     [&hash],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((family, token_client, subject, scope, resource, status, expires, revoked)) = row else {
+            let Some((family, token_client, subject, scope, resource, status, expires, revoked, grant_type)) = row
+            else {
                 return Ok(Outcome::Refused("invalid_grant", "refresh token is not valid".into()));
             };
             if token_client != client_id {
@@ -288,8 +348,11 @@ async fn refresh(state: &AppState, client: Client, form: &HashMap<String, String
             if status != "active" || revoked.is_some() || expires <= ua_core::time::now() {
                 return Ok(Outcome::Refused("invalid_grant", "refresh token is not valid".into()));
             }
-            if cfg.is_human(&subject) {
-                return Ok(Outcome::Refused("invalid_grant", "grant identity is not allowed".into()));
+            if let Some(why) = identity_refusal(&cfg, &subject, grant_type == "authorization_code") {
+                return Ok(Outcome::Refused("invalid_grant", why.into()));
+            }
+            if retired(tx, &subject)? {
+                return Ok(Outcome::Refused("invalid_grant", "grant identity is retired".into()));
             }
             if let Some(r) = resource_param.as_deref()
                 && accepted_resource(&cfg, Some(r)).as_deref() != Some(resource.as_str())
@@ -305,6 +368,9 @@ async fn refresh(state: &AppState, client: Client, form: &HashMap<String, String
 }
 
 async fn client_credentials(state: &AppState, client: Client, form: &HashMap<String, String>) -> Response {
+    if !client.allows_grant("client_credentials") {
+        return token_error("unauthorized_client", "client is not registered for client_credentials");
+    }
     let ClientKind::Configured { identity } = client.kind.clone() else {
         return token_error("unauthorized_client", "client_credentials is limited to configured clients");
     };
@@ -312,6 +378,15 @@ async fn client_credentials(state: &AppState, client: Client, form: &HashMap<Str
     if cfg.is_human(&identity) {
         return token_error("unauthorized_client", "a client may not act as a human identity");
     }
+    if cfg.explicit_profile(&identity).is_none() {
+        return token_error(
+            "unauthorized_client",
+            "the client's identity has no configured profile (set profiles.<identity>)",
+        );
+    }
+    let Some(scope) = granted_scope(form.get("scope").map(String::as_str)) else {
+        return token_error("invalid_scope", "the client may request only the scope mcp");
+    };
     let Some(resource) = accepted_resource(&cfg, form.get("resource").map(String::as_str)) else {
         return token_error("invalid_target", "resource is not served by this hub");
     };
@@ -319,12 +394,18 @@ async fn client_credentials(state: &AppState, client: Client, form: &HashMap<Str
         .hub
         .db()
         .write_async(move |tx| {
+            if retired(tx, &identity)? {
+                return Ok(Outcome::Refused(
+                    "unauthorized_client",
+                    "the client's identity is retired".into(),
+                ));
+            }
             let family = new_family_id();
             let g = GrantInfo {
                 family_id: &family,
                 client_id: &client.client_id,
                 subject: &identity,
-                scope: SCOPE,
+                scope,
                 resource: &resource,
             };
             insert_grant(tx, &g, &client.client_name, "configuration", "client_credentials")?;

@@ -172,3 +172,56 @@ async fn at_most_one_hundred_skills_are_reviewed() {
     assert_eq!(r["skills_reviewed"].as_array().unwrap().len(), 100);
     assert_eq!(r["truncated"], true);
 }
+
+#[tokio::test]
+async fn front_matter_that_grants_tools_is_flagged() {
+    let e = Env::new();
+    let desc = "Reviews a pull request diff for correctness bugs. Use when the user asks for a code review.";
+    // Only allowlisted keys pass: a skill's own grant key, the keys a
+    // subagent grants itself tools with, and any other key.
+    for (dir, key) in [
+        ("allowed", "allowed-tools: Bash"),
+        ("tools", "tools: Bash, Edit"),
+        ("disallowed", "disallowedTools: Read"),
+        ("mode", "permissionMode: bypassPermissions"),
+        ("servers", "mcpServers: [hub]"),
+        ("permission", "permission: allow"),
+        ("context", "context: fork"),
+        ("agent", "agent: general-purpose"),
+    ] {
+        e.skill(dir, &format!("---\nname: {dir}\ndescription: {desc}\n{key}\n---\n{BODY}"));
+    }
+    let r = e.review(json!({ "path": "skills" })).await.unwrap();
+    assert_eq!(r["status"], "fail", "{r}");
+    for dir in ["allowed", "tools", "disallowed", "mode", "servers", "permission", "context", "agent"] {
+        assert!(has(&r, "SKILL-PERMISSIONS", &format!("{dir}/SKILL.md")), "{dir}: {r}");
+    }
+}
+
+#[tokio::test]
+async fn agent_skills_descriptive_fields_pass_but_metadata_stays_plain() {
+    let e = Env::new();
+    let desc = "Reviews a pull request diff for correctness bugs. Use when the user asks for a code review.";
+    e.skill(
+        "described",
+        &format!("---\nname: described\ndescription: {desc}\nlicense: MIT\nversion: 1.2.0\nmetadata: {{author: x}}\n---\n{BODY}"),
+    );
+    let r = e.review(json!({ "path": "skills/described" })).await.unwrap();
+    assert_eq!(r["status"], "pass", "{r}");
+
+    for (dir, meta) in
+        [("nested-list", "metadata: {tools: [Bash]}"), ("nested-map", "metadata:\n  x:\n    tools: Bash")]
+    {
+        e.skill(dir, &format!("---\nname: {dir}\ndescription: {desc}\n{meta}\n---\n{BODY}"));
+        let r = e.review(json!({ "path": format!("skills/{dir}") })).await.unwrap();
+        assert_eq!(r["status"], "fail", "{dir}: {r}");
+        assert!(has(&r, "SKILL-PERMISSIONS", "SKILL.md"), "{dir}: {r}");
+    }
+    // A permission-bearing key next to them is still refused.
+    e.skill(
+        "granting",
+        &format!("---\nname: granting\ndescription: {desc}\nlicense: MIT\nallowed-tools: Bash\n---\n{BODY}"),
+    );
+    let r = e.review(json!({ "path": "skills/granting" })).await.unwrap();
+    assert!(has(&r, "SKILL-PERMISSIONS", "SKILL.md"), "{r}");
+}

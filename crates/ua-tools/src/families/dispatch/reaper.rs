@@ -151,8 +151,12 @@ pub async fn startup_sweep(hub: &Hub) {
     }
 }
 
-/// Start the background reaper unless `dispatch_reaper_interval_s` is 0.
-pub fn spawn_reaper(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
+/// Start the background reaper unless `dispatch_reaper_interval_s` is 0. It
+/// stops when `ct` is cancelled, after any sweep in progress finishes.
+pub fn spawn_reaper(
+    hub: &Hub,
+    ct: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let secs = hub.cfg().dispatch_reaper_interval();
     if secs == 0 {
         return None;
@@ -165,7 +169,11 @@ pub fn spawn_reaper(hub: &Hub) -> Option<tokio::task::JoinHandle<()>> {
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return,
+                _ = tick.tick() => {}
+            }
             let h = hub.clone();
             match tokio::task::spawn_blocking(move || reap_expired_leases(&h)).await {
                 Ok(Ok(_)) => {}

@@ -58,7 +58,7 @@ use ua_tools::families::events::EventScope;
 use ua_tools::policy::{self, Policy, RuleKind, Verdict};
 
 use crate::AppState;
-use crate::auth::{AuthIdentity, caller_for, resolve_bearer};
+use crate::auth::{AuthIdentity, caller_for, resolve_bearer_blocking};
 
 /// Rows one backfill page reads.
 pub const BACKFILL_PAGE: usize = 1000;
@@ -195,9 +195,9 @@ impl StreamAuth {
                 AuthIdentity { label: self.label.clone(), kind: self.kind, verified: false, grant: None }
             }
             Credential::Bearer(t) => {
-                resolve_bearer(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
+                resolve_bearer_blocking(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
             }
-            Credential::Cookie(h) => match crate::login::session_from_headers(state, h) {
+            Credential::Cookie(h) => match crate::login::session_from_headers_blocking(state, h) {
                 Some(s) => {
                     AuthIdentity { label: s.label, kind: ActorKind::Human, verified: true, grant: None }
                 }
@@ -473,7 +473,11 @@ impl Cursor {
                 return None;
             }
             let due = self.recheck_due;
+            let shutdown = self.state.shutdown.clone();
             tokio::select! {
+                // The server is shutting down: end the stream (a client
+                // reconnects with Last-Event-ID to the next hub process).
+                _ = shutdown.cancelled() => self.closed = true,
                 _ = sleep_until_due(due), if due.is_some() => self.run_recheck().await,
                 _ = self.recheck.tick() => self.run_recheck().await,
                 recv = self.rx.recv() => match recv {
@@ -576,7 +580,7 @@ mod tests {
 
     fn state() -> AppState {
         let hub = Hub::in_memory(Config::for_home(std::env::temp_dir())).unwrap();
-        AppState { hub, registry: Arc::new(builtin_registry()) }
+        AppState::new(hub, Arc::new(builtin_registry()))
     }
 
     fn append(state: &AppState, channel: &str) -> i64 {
@@ -670,7 +674,7 @@ mod tests {
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.policy_file = Some(path.clone());
         let hub = Hub::in_memory(cfg).unwrap();
-        (AppState { hub, registry: Arc::new(builtin_registry()) }, path)
+        (AppState::new(hub, Arc::new(builtin_registry())), path)
     }
 
     /// A private directory under the system temp dir, removed on drop.

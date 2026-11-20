@@ -6,11 +6,13 @@ tool surface: shared tasks, plans, delegation, messaging, memory and a
 knowledge vault, behind one identity, policy and approval gate, with a
 tamper-evident event ledger.
 
-ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
-contract (tool names, argument shapes and HTTP routes) so existing MCP clients
-can point at it unchanged; the storage schema and some of the UX are new.
+ua-rust keeps the tool contract of the original implementation, the Python
+unified-agent hub: the same tool names, argument shapes and HTTP routes, so an
+existing MCP client can point at this process unchanged. That program is a
+separate codebase. Building and running this repository does not require it.
+The storage schema and some of the user interface are new.
 
-> **Status: alpha.** 207 tools are registered and the core families are ported.
+> **Status: alpha.** 214 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -42,14 +44,27 @@ Library choices and the reasons for them are in [docs/stack.md](docs/stack.md).
 
 ## Quick start
 
+Build the `ua` binary, start the hub, and check liveness. The process listens
+on `127.0.0.1:8765`. Auth is on by default. `GET /healthz` does not need a
+token.
+
 ```sh
 cargo build --release
-cp config.example.toml ~/.ua-rust/config.toml   # optional
-./target/release/ua --help
+./target/release/ua serve
 ```
 
-Configuration comes from defaults, then `$UA_HOME/config.toml` (or
-`$UA_CONFIG`), then `UA_*` environment variables. See
+In a second shell, while `ua serve` is running:
+
+```sh
+curl -fsS http://127.0.0.1:8765/healthz
+```
+
+Every other route needs a bearer token. Issue one for each agent with
+`./target/release/ua token issue <label>`; it prints the raw value once.
+
+The database file is `$UA_HOME/ua.db` (`$HOME/.ua-rust/ua.db` when `UA_HOME`
+is unset). Configuration is read from defaults, then `$UA_HOME/config.toml`
+(or `$UA_CONFIG`), then `UA_*` environment variables. See
 [config.example.toml](config.example.toml) and [.env.example](.env.example).
 Every value in those files is a placeholder.
 
@@ -60,6 +75,14 @@ ua token issue agent-1          # prints a token once; give it to that agent
 ua serve                        # http://127.0.0.1:8765 (/mcp, /api, /ui)
 ua login-link operator          # on the hub host, at a terminal: a browser sign-in link
 ```
+
+`ua serve` stops cleanly on Ctrl-C (SIGINT) or SIGTERM. Open requests, MCP
+tool calls, dispatch runs and the background loops share a 10-second grace
+period, and event streams end. Dispatch runs still going 3 seconds before
+the deadline are stopped (SIGTERM, then SIGKILL) and recorded `retryable`
+with a `hub_shutdown` receipt. The WAL is then checkpointed into the
+database file. A second signal exits at once, killing the run process
+groups. See [docs/dispatch.md](docs/dispatch.md#hub-shutdown).
 
 Auth is on by default. Agents connect over MCP with their bearer token, or
 over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
@@ -118,6 +141,7 @@ vulnerability.
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
 | Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
 | Public relay | `relay_manage`: an agent drafts a comment for an issue or pull request in an allowlisted GitHub repository; gates refuse secrets, hidden or bidirectional Unicode, private addresses and internal host names, home paths, personal data, over-long text and a private denylist, never rewriting the text; a human approves the exact text and target, the send repeats it byte for byte, and the token is a managed secret | [relay](docs/relay.md) |
+| Zulip | `zulip_send_message`: the relay's gates plus Zulip wildcard, group and unlisted mentions and unlisted link hosts, then a human approval of the exact stream, topic and text; an uncertain send blocks a duplicate until a human runs `zulip_resolve_send`. `zulip_fetch_messages`: forward-only cursor, messages labelled untrusted. Off until configured; sending retired by default | [zulip](docs/zulip.md) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
 | TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
@@ -127,9 +151,9 @@ vulnerability.
 
 ## Not yet ported
 
-Native-session resume and adopt, cloud executors, ACP, Slack and Zulip
-connectors, role workflows, GitHub writes (comments, labels, held PRs, the
-GitHub App installation flow), session-handoff failover, the SDK's
+Native-session resume and adopt, cloud executors, ACP, the Slack connector,
+role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
+installation flow), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,
 `/api/action/node-session`), the provenance graph and evidence export, billing
 and usage ledgers, and tenancy (`org_id`). Work products

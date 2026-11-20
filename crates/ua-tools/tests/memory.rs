@@ -569,3 +569,39 @@ async fn hybrid_search_with_an_embedder() {
     let r = t.ok(&b1, "memory_search", json!({ "query": "postgres" })).await;
     assert_eq!(r["results"][0]["id"], car.as_str());
 }
+
+/// `memory_search` and `memory_get` are registered read-only: the only write
+/// is the best-effort access telemetry, which moves neither the note's
+/// revision nor the ledger. The graph leg says it is disabled, and why.
+#[tokio::test]
+async fn search_and_get_are_reads_with_access_telemetry_only() {
+    let t = T::new(hub());
+    for name in ["memory_search", "memory_get", "memory_list"] {
+        assert!(t.reg.get(name).unwrap().read_only, "{name} is read-only");
+    }
+    let b1 = agent("builder-1");
+    let id =
+        t.save(&b1, json!({ "title": "Cache rule", "content": "Keep the shared build cache warm." })).await;
+    let first = t.ok(&b1, "memory_get", json!({ "id": id, "count_access": false })).await;
+    let ledger = || async {
+        let r = t.ok(&human(), "event_log_query", json!({ "channel_prefix": "agent.memory." })).await;
+        r["count"].as_u64().unwrap()
+    };
+    let ledger_before = ledger().await;
+    assert!(ledger_before > 0, "the save was ledgered");
+
+    let r = t.ok(&b1, "memory_search", json!({ "query": "build cache" })).await;
+    assert_eq!(r["results"][0]["id"], id.as_str());
+    assert_eq!(r["retrieval"]["graph"]["status"], "disabled");
+    assert!(r["retrieval"]["graph"]["reason"].as_str().unwrap().contains("vault_query"), "{r}");
+    let counted = t.ok(&b1, "memory_get", json!({ "id": id })).await;
+
+    // Two accesses counted, nothing else moved.
+    assert_eq!(counted["access_count"].as_i64().unwrap(), first["access_count"].as_i64().unwrap() + 2);
+    assert_eq!(counted["revision"], first["revision"]);
+    assert_eq!(counted["updated_at"], first["updated_at"]);
+    assert_eq!(ledger().await, ledger_before, "reads append no memory events");
+
+    // A missing note is still an error, and counts nothing.
+    assert_eq!(t.err(&b1, "memory_get", json!({ "id": "missing" })).await.code(), "not_found");
+}
