@@ -15,7 +15,7 @@ Re-check a row before relying on it after a few months.
 | Migrations | Named schema parts (own code, about 50 lines) | rusqlite_migration 2.7 | Each feature module contributes idempotent parts recorded by name and checksum, so modules add tables without coordinating version numbers. |
 | Full-text search | SQLite FTS5 | tantivy 0.27 | Same transaction as the row write; no second index to keep in sync. |
 | Vector search | Vectors stored as BLOBs, brute-force cosine behind a `VectorIndex` trait | sqlite-vec 0.1.9 (optional) | sqlite-vec has had no release since 2026-05 and has open bugs; a brute-force scan is fast enough at 10⁵ notes and carries no dependency risk. |
-| Embeddings | fastembed 7.7 (`BAAI/bge-small-en-v1.5`), behind the `embeddings` cargo feature | model2vec-rs 0.4 | Same model catalog as the Python fastembed, so vectors stay comparable. Off by default to keep the build small; lexical search works without it. |
+| Embeddings | fastembed 7.7 (`BAAI/bge-small-en-v1.5`), behind the `embeddings` cargo feature of `ua-memory` (`ua-tools/embeddings` forwards to it) | model2vec-rs 0.4 | Same model catalog as the Python fastembed, so vectors stay comparable. Off by default to keep the build small; lexical search works without it. |
 | Ledger hashing | sha2 0.11 | aws-lc-rs 1.19 | Pure Rust. |
 | Ledger signing | ed25519-dalek 3.0 (`verify_strict`) | — | Signed producer events. |
 | Timestamp anchors | sigstore-tsa 0.16 (RFC 3161) | x509-tsp + cms (RCs) | Optional anchor backend. |

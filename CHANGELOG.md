@@ -68,6 +68,11 @@ from its commit history.
   binaries on `PATH`.
 - Sign-out is a POST form that carries the session CSRF token.
 - A `run_cmd` refusal does not say whether the program is on the allowlist.
+- The memory domain (schema, note model, save, search, ranking, embeddings,
+  lifecycle) moved from `ua-tools` into a new `ua-memory` crate, which does
+  not depend on the tool registry. Tool names, arguments, schema parts and
+  ledger events are unchanged; `ua-tools/embeddings` still turns on semantic
+  search.
 
 ### Security
 

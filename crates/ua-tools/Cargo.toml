@@ -10,13 +10,14 @@ repository.workspace = true
 [features]
 default = []
 # Local semantic memory search with fastembed. Off by default: without it,
-# memory search is lexical (FTS5) only.
-embeddings = ["dep:fastembed"]
+# memory search is lexical (FTS5) only. The feature lives in ua-memory.
+embeddings = ["ua-memory/embeddings"]
 
 [dependencies]
 subtle.workspace = true
 ua-core = { workspace = true, features = ["rusqlite"] }
 ua-store.workspace = true
+ua-memory.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
@@ -46,11 +47,6 @@ comrak = { version = "1.0", default-features = false }
 # Vault family: the Obsidian Local REST API client (loopback only). rustls
 # with the ring provider keeps the C toolchain out of the build.
 uuid = { workspace = true, features = ["v4"] }
-fastembed = { version = "7.7", optional = true, default-features = false, features = [
-    "hf-hub-rustls-tls",
-    "onnx",
-    "ort-download-binaries-rustls-tls",
-] }
 
 # web and code families
 # Shared HTTP client (web, vault/Obsidian, notify webhooks). ring as the rustls provider: no C

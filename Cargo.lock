@@ -5132,6 +5132,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-memory"
+version = "0.1.0"
+dependencies = [
+ "fastembed",
+ "hex",
+ "jiff 1.0.1",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "tracing",
+ "ua-core",
+ "ua-store",
+ "uuid",
+]
+
+[[package]]
 name = "ua-server"
 version = "0.1.0"
 dependencies = [
@@ -5201,7 +5218,6 @@ dependencies = [
  "dom_query",
  "dom_smoothie",
  "encoding_rs",
- "fastembed",
  "globset",
  "hex",
  "hmac",
@@ -5238,6 +5254,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ua-core",
+ "ua-memory",
  "ua-store",
  "ulid",
  "url",
