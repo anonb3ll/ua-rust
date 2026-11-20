@@ -30,6 +30,10 @@ pub(crate) enum Kind {
     MessageIndex,
     /// The hash-chained event ledger, copied byte-exactly.
     Ledger,
+    /// Remote nodes: owner, version, timestamps and retirement move across,
+    /// host facts do not. ua-rust stores only facts it bounded on write, so
+    /// `facts_json` starts empty and the node's next registration fills it.
+    Nodes,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +89,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { rowid_to: Some("seq"), ..plain("memory") },
     TableMap { refs: &[Ref { col: "note_id", table: "memory", key: "id" }], ..plain("memory_versions") },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
+    TableMap { kind: Kind::Nodes, ..plain("nodes") },
     TableMap { kind: Kind::Ledger, ..plain("event_log") },
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },
     TableMap {
