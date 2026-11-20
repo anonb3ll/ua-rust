@@ -1,0 +1,224 @@
+{
+  "notes": [
+    {
+      "key": "exact-key",
+      "title": "Harbor signing key",
+      "content": "The harbor release is signed with token quartz-falcon-17.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "exact-noise",
+      "title": "Harbor status",
+      "content": "The harbor build finished on schedule.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "para-stem",
+      "title": "Nightly archive",
+      "content": "The batch job runs nightly after the archive closes.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "para-auto",
+      "title": "Depot commute",
+      "content": "The commuter drives an automobile to the depot each morning.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "temporal-old",
+      "title": "Badge maple",
+      "content": "The office badge code is maple-2024 for the east wing.",
+      "valid_from": "2024-01-01T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "temporal-new",
+      "title": "Badge cedar",
+      "content": "The office badge code is cedar-2025 for the east wing.",
+      "valid_from": "2025-06-01T00:00:00+00:00",
+      "supersedes": "temporal-old",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "contra-old",
+      "title": "Listen port retired",
+      "content": "The gateway listens on token port-umbra-77.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "contra-new",
+      "title": "Listen port current",
+      "content": "The gateway listens on token port-umbra-77 after the cutover.",
+      "valid_from": "2026-02-01T00:00:00+00:00",
+      "supersedes": "contra-old",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "contra-redis",
+      "title": "Cache redis",
+      "content": "The session store uses ledger-color redis.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "contra-memcached",
+      "title": "Cache memcached",
+      "content": "The session store uses ledger-color memcached.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "contradicts": [
+        "contra-redis"
+      ],
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "long-note",
+      "title": "Recovery notes",
+      "content": "The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The recovery phrase is violet-orchid-88.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "long-noise",
+      "title": "Recovery preface",
+      "content": "The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. ",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "id": "exact-token",
+      "class": "exact-term",
+      "query": "quartz-falcon-17",
+      "must": [
+        "exact-key"
+      ],
+      "must_not": [
+        "exact-noise"
+      ],
+      "as_of": null
+    },
+    {
+      "id": "exact-title",
+      "class": "exact-term",
+      "query": "signing key",
+      "must": [
+        "exact-key"
+      ],
+      "must_not": [
+        "exact-noise"
+      ],
+      "as_of": null
+    },
+    {
+      "id": "para-stem",
+      "class": "paraphrase",
+      "query": "running nightly",
+      "must": [
+        "para-stem"
+      ],
+      "must_not": [
+        "para-auto"
+      ],
+      "as_of": null
+    },
+    {
+      "id": "para-gap",
+      "class": "paraphrase",
+      "query": "sedan",
+      "must": [
+        "para-auto"
+      ],
+      "must_not": [],
+      "as_of": null
+    },
+    {
+      "id": "temporal-early",
+      "class": "temporal",
+      "query": "badge code",
+      "as_of": "2024-06-01T00:00:00+00:00",
+      "must": [
+        "temporal-old"
+      ],
+      "must_not": [
+        "temporal-new"
+      ]
+    },
+    {
+      "id": "temporal-late",
+      "class": "temporal",
+      "query": "badge code",
+      "as_of": "2025-07-01T00:00:00+00:00",
+      "must": [
+        "temporal-new"
+      ],
+      "must_not": [
+        "temporal-old"
+      ]
+    },
+    {
+      "id": "contra-supersede",
+      "class": "contradiction",
+      "query": "port-umbra-77",
+      "must": [
+        "contra-new"
+      ],
+      "must_not": [
+        "contra-old"
+      ],
+      "as_of": null
+    },
+    {
+      "id": "contra-open",
+      "class": "contradiction",
+      "query": "ledger-color",
+      "must": [
+        "contra-redis",
+        "contra-memcached"
+      ],
+      "must_not": [],
+      "as_of": null
+    },
+    {
+      "id": "long-tail",
+      "class": "long-document",
+      "query": "violet-orchid-88",
+      "must": [
+        "long-note"
+      ],
+      "must_not": [
+        "long-noise"
+      ],
+      "as_of": null
+    }
+  ]
+}

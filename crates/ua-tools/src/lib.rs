@@ -27,6 +27,7 @@ pub mod config_revisions;
 pub mod families;
 pub mod grant;
 pub mod hub;
+pub mod memory_bench;
 pub mod policy;
 pub mod registry;
 pub mod sessions;
