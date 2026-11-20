@@ -970,7 +970,7 @@ const ACTIONS: [&str; 13] = [
 
 /// Canonical action name; legacy tool names (`delegate`, `delegate_claim`,
 /// `delegation_spec_check`, ...) are accepted too.
-fn canonical_action(action: &str) -> UaResult<&'static str> {
+pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
     let a = action.trim().to_ascii_lowercase();
     let a = match a.as_str() {
         "delegate" => "create",

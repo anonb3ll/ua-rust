@@ -32,6 +32,43 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+## Profiles
+
+A profile is a capability tier bound to the verified identity and the client
+session. `profiles` in the hub config sets each identity's default
+(unlisted identities get `developer`, OAuth identities get `oauth_profile`);
+`profile_activate` moves a session to a profile no more privileged than that
+default, and a `profile_defaults` overlay (below) can only lower it.
+
+| Profile | Rank | Surface |
+|---|---|---|
+| `coordinator` | 8 | Every tool. Holds config authority: a profile overlay may not demote the last identity configured with it. Moves vault notes, reads every mailbox. |
+| `lead` | 7 | The developer surface plus `LEAD_EXTRA_TOOLS` (today all of those are already visible to developer), ranked above it. |
+| `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, and profile switching (deny list: new tools are visible). |
+| `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
+| `operator` | 4 | Allow list: approvals, dispatch cancellation, event log, memory and task reads, node listing. |
+| `research`, `acp-session` | 3 | Allow list: reads, memory, messages, vault, web, task and plan reads, plus listed `plan_manage` actions. |
+| `remote-vault-curator` | 2 | The remote assistant surface plus vault access confined to `Wiki/` (and the daily journal). |
+| `remote-assistant` | 1 | Allow list: memory reads, messages, task listing and the agent actions of `observability_manage`. |
+| `public` | 0 | Allow list: task add and list, docs, profile status. |
+
+The lists live in `crates/ua-core/src/profiles.json`; a test fails if a list
+names a tool the hub does not register.
+
+Five profiles had other names in the Python hub. Those names are accepted
+for compatibility wherever a profile name is read (config `profiles` and
+`oauth_profile`, `profile_activate`, `profile_defaults`, `roles`, profile
+config revisions, stored session bindings). The hub always reports the
+current name, and config revisions store it.
+
+| Current name | Accepted alias |
+|---|---|
+| `coordinator` | `chief-of-staff` |
+| `lead` | `cto` |
+| `reviewer` | `steward` |
+| `remote-assistant` | `cloud-assistant` |
+| `remote-vault-curator` | `cloud-vault-steward` |
+
 ## Format
 
 ```yaml
@@ -42,7 +79,7 @@ default_action: allow        # or deny: refuse tools no permission rule matches
 # Identity -> profile. Applied only when it lowers the identity's configured
 # default profile; it can never widen access.
 profile_defaults:
-  example_agent: observer
+  example_agent: research
 
 rules:
   - name: no-shell-for-bench
@@ -60,7 +97,7 @@ rules:
   - name: admins-only
     type: role
     tool: "config_revision_manage"
-    roles: [admin, example_lead_agent]   # profile names or identity labels
+    roles: [coordinator, example_lead_agent]   # profile names or identity labels
 
   - name: big-budgets
     type: threshold
@@ -94,7 +131,7 @@ rules:
 | `type` | Fields | Behaviour |
 |---|---|---|
 | `tool` | `tool`, `action` | Applies `action` to matching tools. `action` defaults to `deny`. |
-| `role` | `tool`, `roles` | Allow-list: callers whose identity label or profile is not in `roles` are refused (`role_denied`). |
+| `role` | `tool`, `roles` | Allow-list: callers whose identity label or profile is not in `roles` are refused (`role_denied`). An entry `agent:<label>` names an identity, `profile:<name>` a profile; a bare entry is a profile when it is a profile name (current or legacy), else an identity label, so a label that equals a profile name never stands in for that profile. |
 | `threshold` | `tool`, `field`, `max` and/or `min`, `action` | Applies `action` when the argument at `field` is above `max` or below `min` (`threshold_breached`). A missing or non-numeric value refuses the call (`threshold_invalid`). |
 | `rate_limit` | `tool`, `max_calls`, `window_seconds` | At most `max_calls` completed calls of the tool by the same caller within the window, counted from the `tool_calls` table (`rate_limited`). Checked after every deny and before any approval is parked. Rule names must be unique among rate-limit rules. |
 | `cooldown` | `tool`, `cooldown_seconds` | Minimum gap between two calls of the tool by the same caller (`episode_limited`). |

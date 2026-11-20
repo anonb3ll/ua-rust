@@ -75,7 +75,7 @@ pub struct NoArgs {}
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActivateArgs {
-    /// Profile name, e.g. `research` or `steward`.
+    /// Profile name, e.g. `research` or `reviewer`. Legacy names are accepted.
     pub profile: String,
 }
 

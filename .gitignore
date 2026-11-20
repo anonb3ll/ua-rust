@@ -6,3 +6,4 @@
 .ua/
 .claude/
 /.worktrees/
+.ruff_cache/

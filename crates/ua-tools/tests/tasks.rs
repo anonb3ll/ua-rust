@@ -65,8 +65,8 @@ fn agent(label: &str) -> Caller {
     }
 }
 
-fn steward(label: &str) -> Caller {
-    Caller { profile: Profile::Steward, ..agent(label) }
+fn reviewer(label: &str) -> Caller {
+    Caller { profile: Profile::Reviewer, ..agent(label) }
 }
 
 fn human() -> Caller {
@@ -359,9 +359,9 @@ async fn claims_conflicts_and_expiry() {
 }
 
 #[tokio::test]
-async fn steward_cannot_update_another_agents_claim() {
+async fn reviewer_cannot_update_another_agents_claim() {
     let h = H::new();
-    let (b1, st) = (agent("builder-1"), steward("steward-1"));
+    let (b1, st) = (agent("builder-1"), reviewer("reviewer-1"));
     let claimed = h.add(&b1, json!({ "title": "Claimed" })).await;
     let free = h.add(&b1, json!({ "title": "Free" })).await;
     h.ok(&b1, "task_claim", json!({ "id": claimed })).await;
@@ -369,12 +369,12 @@ async fn steward_cannot_update_another_agents_claim() {
     let e = h.err(&st, "task_update", json!({ "id": claimed, "priority": "high" })).await;
     assert_eq!(e.code(), "denied");
     h.ok(&st, "task_update", json!({ "id": free, "priority": "high" })).await;
-    // Steward may not claim at all (profile), but may release an expired claim.
+    // Reviewer may not claim at all (profile), but may release an expired claim.
     assert_eq!(h.err(&st, "task_claim", json!({ "id": free })).await.code(), "denied");
     h.expire_lease(claimed);
     let row = h.ok(&st, "task_update", json!({ "id": claimed, "release_claim": true })).await;
     assert!(row["claimed_by"].is_null());
-    // A developer is unaffected by the steward rule.
+    // A developer is unaffected by the reviewer rule.
     h.ok(&b1, "task_claim", json!({ "id": claimed })).await;
     h.ok(&agent("builder-2"), "task_update", json!({ "id": claimed, "append_note": "fyi" })).await;
 }

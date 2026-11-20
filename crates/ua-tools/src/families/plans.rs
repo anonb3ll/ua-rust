@@ -1316,7 +1316,7 @@ const ACTIONS: [&str; 16] = [
 
 /// Canonical action name. Accepts the short forms `retry`/`claim` and the
 /// legacy tool names (`plan_create`, `plan_step_claim`, ...).
-fn canonical_action(action: &str) -> UaResult<&'static str> {
+pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
     let a = action.trim().to_ascii_lowercase();
     let a = a.strip_prefix("plan_").unwrap_or(&a);
     let a = match a {
