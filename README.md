@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 203 tools are registered and the core families are ported.
+> **Status: alpha.** 207 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -109,6 +109,7 @@ vulnerability.
 | Workspace | `fs_*`, `run_cmd`, `git_*`, worktrees, code intelligence (tree-sitter), web search and fetch | |
 | Execution | Dispatch with leases and fences, harness executor, workflows with checkpoints, cron routines, autonomous cycles | [dispatch](docs/dispatch.md) |
 | Remote nodes | Node registry with derived liveness and operator retire, reassign and forget; a work queue: approval-bound `node_dispatch`, long-poll claims with attempt fences, leases and durable claim operations, idempotent receipts, cancel and restart, waits for offline nodes, supervised commands with fence tokens and owner notices, ACP events, follow-ups and permission prompts; `dispatch_task` runs routed to a node; per-item session credentials (`uas_…`) for ACP sessions; device acceptance runs with operator attestation and `node_require_acceptance`; idle-session wakes over the session's own agent's node long-poll (`/api/node/wake`, check and receipt) behind a session request and a human grant, with the original budget (debounce, floor, hourly caps, breaker) | [nodes](docs/nodes.md#idle-session-wakes) |
+| Harness config | Versioned bundles of rules, skills and OAuth MCP servers published behind a human approval (`harness_config_publish`), served at `/api/node/config` rendered byte-for-byte as the Python hub renders them; drift reports park one `harness_config_apply` approval per surface, and a node writes only after consuming it; bundles are checked against TOML injection, hidden text, unsafe paths and unclean MCP URLs; the skills registry (`skill_registry`: immutable content-hash versions, staged and approved in full, pinned assignments to agents and profiles) feeds each node's bundle | [nodes](docs/nodes.md#harness-config-bundle) |
 | Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from harness-declared signals (`quota_patterns` on stderr, Pi's JSON error events; `provider_quota_status`), `dispatch_task` refusals or same-provider, same-billing fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`), close-on-merge (`queue_close_merged`); the review queue (`task_list(stage="review")`) and a `review_ready` notification; delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
@@ -126,10 +127,9 @@ vulnerability.
 
 ## Not yet ported
 
-The harness config bundle (`/api/node/config` answers 501), native-session
-resume and adopt, cloud executors, ACP, Slack and Zulip connectors, role
-workflows, GitHub writes (comments, labels, held PRs, the GitHub App
-installation flow), session-handoff failover, the SDK's
+Native-session resume and adopt, cloud executors, ACP, Slack and Zulip
+connectors, role workflows, GitHub writes (comments, labels, held PRs, the
+GitHub App installation flow), session-handoff failover, the SDK's
 queue-health and node-session routes (`/api/queue-health`,
 `/api/action/node-session`), the provenance graph and evidence export, billing
 and usage ledgers, and tenancy (`org_id`). Work products

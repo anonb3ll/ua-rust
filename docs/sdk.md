@@ -182,7 +182,7 @@ settled contract:
 | `400` | A malformed body, or a `payload` the tool's typed arguments refuse (unknown or missing fields). A caller without a profile limit also gets `400` for an unknown tool. |
 | `401` | No verified identity. |
 | `403` | The same refusal a call would get: the caller's profile cannot call the tool (or `approval_pending`), the session grant, a policy rule or the prod-action check refuses it. An unknown tool reads the same for a profile-bound caller, so the route cannot enumerate tools. |
-| `409` | The tool is not approval-gated (always gated, `approval_tools`, or a policy `require_approval` rule): there is nothing to approve. Also for a tool whose handler binds its approval to values it resolves when called (dispatch and node work, `run_cmd`, workflows and routines, cycle transitions, audit remediation, OAuth revoke, config revisions, managed secrets, MCP registrations and gateway writes, relay sends): call the tool instead. |
+| `409` | The tool is not approval-gated (always gated, `approval_tools`, or a policy `require_approval` rule): there is nothing to approve. Also for a tool whose handler binds its approval to values it resolves when called (dispatch and node work, `run_cmd`, workflows and routines, cycle transitions, audit remediation, OAuth revoke, config revisions, managed secrets, MCP registrations and gateway writes, relay sends, the skill registry, harness config publishing and node config reports): call the tool instead. |
 | `413` | `payload` over 16 KiB. |
 | `429` | The requester holds 20 open requests, or filed 60 in the last hour that are still open or that it withdrew itself; the message names which. |
 

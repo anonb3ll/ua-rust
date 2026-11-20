@@ -190,6 +190,10 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
             "families/managed_secrets.rs",
             (2, vec![("managed_secret_set", json!({})), ("managed_secret_delete", json!({}))]),
         ),
+        (
+            "families/harness_config/mod.rs",
+            (2, vec![("harness_config_publish", json!({})), ("node_config", action("applied"))]),
+        ),
         ("families/mcp/gateway.rs", (1, vec![("mcp_gateway", json!({}))])),
         (
             "families/mcp/mod.rs",
@@ -218,6 +222,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
             (2, vec![("node_followup", json!({})), ("node_permission", json!({}))]),
         ),
         ("families/relay/mod.rs", (2, vec![("relay_manage", action("send"))])),
+        ("families/skill_registry.rs", (1, vec![("skill_registry", action("publish"))])),
         ("families/tokens.rs", (1, vec![("oauth_device_manage", action("revoke"))])),
         (
             "families/workflows/engine.rs",

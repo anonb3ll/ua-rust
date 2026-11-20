@@ -210,12 +210,13 @@ async fn work_round_trips_through_the_device_plane() {
     let v = json_body(hub.send(get("/api/nodes", None, Some(OTHER))).await).await;
     assert_eq!(v["recent_items"][0]["item_id"], id, "{v}");
 
-    // The wake poll needs the current offer protocol; the config bundle is
-    // not built yet and says so.
+    // The wake poll needs the current offer protocol; the config bundle
+    // answers with no bundle until one is published.
     let (status, v) = post(&hub, "/api/node/wake", Some(BUILDER), json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     let (status, v) = post(&hub, "/api/node/config", Some(BUILDER), json!({ "node": "node-a" })).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{v}");
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["bundle"], serde_json::Value::Null);
 }
 
 #[tokio::test]

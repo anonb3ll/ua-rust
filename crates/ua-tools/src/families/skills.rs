@@ -286,6 +286,65 @@ fn check_description(skill: &Skill, out: &mut Vec<Finding>) {
     }
 }
 
+/// Front-matter keys that grant a skill tools, hooks or permissions on the
+/// host. A distributed skill must not carry them.
+pub(crate) const PERMISSION_KEYS: [&str; 5] =
+    ["allowed-tools", "allowed_tools", "hooks", "permissions", "disallowed-tools"];
+
+/// Code points that hide or reorder text from a human reader: Unicode tag
+/// characters (U+E0000-E007F), zero-width characters and bidi controls.
+pub(crate) fn hidden_char(c: char) -> bool {
+    matches!(c,
+        '\u{E0000}'..='\u{E007F}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{061C}'
+        | '\u{180E}'
+        | '\u{FEFF}')
+}
+
+/// Hidden code points in `text`: (1-based line, code point), at most 10.
+pub(crate) fn hidden_chars(text: &str) -> Vec<(usize, char)> {
+    text.lines()
+        .enumerate()
+        .flat_map(|(i, l)| l.chars().filter(|c| hidden_char(*c)).map(move |c| (i + 1, c)))
+        .take(10)
+        .collect()
+}
+
+/// Permission-bearing keys of a front-matter mapping.
+pub(crate) fn permission_keys(meta: &Map<String, Value>) -> Vec<String> {
+    meta.keys().filter(|k| PERMISSION_KEYS.contains(&k.to_ascii_lowercase().as_str())).cloned().collect()
+}
+
+/// Security checks: a skill reaches every host it is distributed to, so it
+/// may not grant itself tools or hooks, or carry text a reviewer cannot see.
+fn check_security(skill: &Skill, out: &mut Vec<Finding>) {
+    for key in permission_keys(&skill.meta) {
+        out.push(finding(
+            skill,
+            "SKILL-PERMISSIONS",
+            "high",
+            skill.meta_line(&key),
+            format!("frontmatter key `{key}` grants the skill tools, hooks or permissions on the host"),
+            "remove it; a distributed skill gets no permissions of its own",
+        ));
+    }
+    let text = format!("{}\n{}", skill.fm_lines.join("\n"), skill.body);
+    for (line, c) in hidden_chars(&text) {
+        out.push(finding(
+            skill,
+            "SKILL-HIDDEN-TEXT",
+            "high",
+            Some(line + 1),
+            format!("invisible or bidi control code point U+{:04X}", c as u32),
+            "remove it; text a reviewer cannot see must not reach an agent",
+        ));
+    }
+}
+
 fn check_body(skill: &Skill, out: &mut Vec<Finding>) {
     let lines: Vec<&str> = skill.body.lines().collect();
     let content = lines.iter().filter(|l| !l.trim().is_empty()).count();
@@ -407,7 +466,7 @@ fn collect_skill_dirs(root: &Path, shown: &str) -> UaResult<(Vec<PathBuf>, PathB
     Ok((children, root.to_path_buf()))
 }
 
-fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &str) -> Value {
+pub(crate) fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &str) -> Value {
     let truncated = skill_dirs.len() > MAX_SKILLS;
     let skill_dirs: Vec<PathBuf> = skill_dirs.into_iter().take(MAX_SKILLS).collect();
     let rel = |d: &Path| -> String {
@@ -424,6 +483,7 @@ fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &str) -> Val
         check_name(skill, &mut findings);
         check_description(skill, &mut findings);
         check_body(skill, &mut findings);
+        check_security(skill, &mut findings);
     }
 
     if skills.len() > 1 {

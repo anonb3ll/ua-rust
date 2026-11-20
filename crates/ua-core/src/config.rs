@@ -96,6 +96,12 @@ pub struct Config {
     /// Hold real work from a node until its latest device acceptance run is
     /// accepted (attested by an operator). Off by default.
     pub node_require_acceptance: bool,
+    /// The harness-config root a node is told about in `GET /api/node/config`
+    /// (`config_root_hint`). Advisory only: a node writes under its own
+    /// configured root. Unset reports the node default,
+    /// `~/.unified_agent/harness-config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_config_root_hint: Option<String>,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -582,6 +588,7 @@ impl Default for Config {
             node_wait_sweep_s: 60,
             session_credentials_enabled: false,
             node_require_acceptance: false,
+            harness_config_root_hint: None,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,

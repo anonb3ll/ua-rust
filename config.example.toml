@@ -35,6 +35,9 @@ node_max_per_agent = 8
 # Hold real work from a node until an operator has attested its device
 # acceptance run (coordination_manage node_acceptance_start / _attest).
 # node_require_acceptance = false
+# The harness-config root nodes are told about (config_root_hint in
+# GET /api/node/config). Advisory: each node writes under its own root.
+# harness_config_root_hint = "~/.unified_agent/harness-config"
 
 # Planning canvas (graph_canvas_write): new boards per agent, boards in all,
 # and prior scenes kept per board for graph_canvas_history/restore, by count

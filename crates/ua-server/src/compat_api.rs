@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, UaError};
 use ua_tools::ApprovalRequest;
-use ua_tools::approvals::{self, GateOutcome};
+use ua_tools::approvals::{self, RequestState};
 
 use crate::AppState;
 use crate::api::status_for;
@@ -595,9 +595,7 @@ async fn approval_detail(
 }
 
 enum RequestOutcome {
-    Pending(i64),
-    Approved(i64),
-    Denied(i64, Option<String>),
+    Recorded(RequestState),
     TooMany(Cap),
 }
 
@@ -699,11 +697,11 @@ async fn approval_request(
         .db()
         .write_async(move |tx| {
             let cfg = hub.cfg();
-            let canon = approvals::canonical_payload(&p);
-            // An identical pending request answers as it stands, whatever
-            // the caps say.
-            if let Some(id) = approvals::pending_id(tx, &t, &canon, &c.label)? {
-                return Ok(RequestOutcome::Pending(id));
+            // A request already on record for this exact call (denied, a
+            // live pass, or pending) answers as it stands, whatever the caps
+            // say. Read-only: nothing is consumed.
+            if let Some(state) = approvals::peek(tx, cfg, &c.label, &t, &p)? {
+                return Ok(RequestOutcome::Recorded(state));
             }
             // Bound the human inbox: one requester cannot queue more than
             // MAX_PENDING_PER_REQUESTER open requests, nor file more than
@@ -723,17 +721,22 @@ async fn approval_request(
                 return Ok(RequestOutcome::TooMany(Cap::Hourly));
             }
             // Never consumes a pass: this route runs nothing.
-            Ok(match approvals::request(tx, cfg, &c, &t, &p)? {
-                GateOutcome::Pending { approval_id } => RequestOutcome::Pending(approval_id),
-                GateOutcome::Denied { approval_id, reason } => RequestOutcome::Denied(approval_id, reason),
-                GateOutcome::Pass { approval_id } => RequestOutcome::Approved(approval_id),
-            })
+            Ok(RequestOutcome::Recorded(approvals::request(tx, cfg, &c, &t, &p)?))
         })
         .await;
     let (status, approval_id, decision, reason) = match res {
-        Ok(RequestOutcome::Pending(a)) => (StatusCode::ACCEPTED, a, "pending", None),
-        Ok(RequestOutcome::Approved(a)) => (StatusCode::OK, a, "approved", None),
-        Ok(RequestOutcome::Denied(a, r)) => (StatusCode::OK, a, "denied", r),
+        Ok(RequestOutcome::Recorded(state)) => {
+            let code = if matches!(state, RequestState::Pending { .. }) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            let reason = match &state {
+                RequestState::Denied { reason, .. } => reason.clone(),
+                _ => None,
+            };
+            (code, state.approval_id(), state.status(), reason)
+        }
         Ok(RequestOutcome::TooMany(Cap::Open)) => {
             return err(
                 StatusCode::TOO_MANY_REQUESTS,
