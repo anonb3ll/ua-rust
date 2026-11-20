@@ -186,3 +186,40 @@ async fn unverified_callers_cannot_approve_by_naming_a_human() {
     let again = reg.call(&hub, &lead_agent, "event_log_verify", json!({})).await.unwrap_err();
     assert_eq!(again.code(), "approval_required");
 }
+
+/// The approval binds the canonical payload: a pass approved for arguments
+/// built in one key order is consumed by the identical call built in another
+/// order, and the stored payload is the sorted compact form.
+#[tokio::test]
+async fn an_approval_binds_arguments_whatever_their_key_order() {
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.human_identities = vec!["operator".into()];
+    cfg.approval_tools = vec!["event_log_query".into()];
+    let hub = Hub::in_memory(cfg).unwrap();
+    let reg = builtin_registry();
+    let lead_agent = agent("reviewer-1", Profile::Lead);
+    let ordered = |pairs: &[(&str, serde_json::Value)]| {
+        let mut m = serde_json::Map::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        serde_json::Value::Object(m)
+    };
+    let fwd = ordered(&[("limit", json!(5)), ("channel_prefix", json!("agent.task."))]);
+    let rev = ordered(&[("channel_prefix", json!("agent.task.")), ("limit", json!(5))]);
+
+    let id = match reg.call(&hub, &lead_agent, "event_log_query", fwd).await.unwrap_err() {
+        ua_core::UaError::ApprovalRequired { approval_id, .. } => approval_id,
+        other => panic!("expected a pending approval, got {other:?}"),
+    };
+    let payload: String = hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT payload FROM approvals WHERE id = ?1", [id], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(payload, r#"{"channel_prefix":"agent.task.","limit":5}"#);
+    assert_eq!(ua_tools::approvals::canonical_payload(&rev), payload);
+
+    reg.call(&hub, &human(), "approval_resolve", json!({"id": id, "decision": "approve"})).await.unwrap();
+    let ok = reg.call(&hub, &lead_agent, "event_log_query", rev).await.unwrap();
+    assert!(ok["events"].is_array(), "{ok}");
+}

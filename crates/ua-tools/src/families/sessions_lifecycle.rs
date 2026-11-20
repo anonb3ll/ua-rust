@@ -746,7 +746,7 @@ fn fingerprint(candidates: &[Value]) -> String {
             })
         })
         .collect();
-    let blob = serde_json::to_string(&items).unwrap_or_default();
+    let blob = ua_core::canonical::to_string(&Value::Array(items));
     hex::encode(Sha256::digest(blob.as_bytes()))[..16].to_string()
 }
 

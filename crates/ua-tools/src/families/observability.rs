@@ -1398,18 +1398,6 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // mcp_health_telemetry
 
-/// JSON with every object's keys sorted, so equal schemas hash equally.
-fn canonical(v: &Value) -> Value {
-    match v {
-        Value::Object(m) => {
-            let sorted: BTreeMap<&String, Value> = m.iter().map(|(k, v)| (k, canonical(v))).collect();
-            Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
-        }
-        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
-        other => other.clone(),
-    }
-}
-
 /// Version 1: tool names plus required and optional argument keys, 16 hex.
 pub(crate) fn schema_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::ToolDef>) -> String {
     let mut lines: Vec<String> = tools
@@ -1439,7 +1427,7 @@ pub(crate) fn schema_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::Tool
 /// Version 2: names plus the full canonical input schemas, full SHA-256.
 pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::ToolDef>) -> String {
     let mut entries: Vec<(String, String)> =
-        tools.map(|t| (t.name.to_string(), canonical(&t.input_schema).to_string())).collect();
+        tools.map(|t| (t.name.to_string(), ua_core::canonical::to_string(&t.input_schema))).collect();
     entries.sort();
     let mut h = Sha256::new();
     for (name, schema) in entries {
