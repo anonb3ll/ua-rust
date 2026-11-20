@@ -113,7 +113,8 @@ acceptance, cloud executors, ACP, Slack and Zulip
 connectors, role workflows, the SDK's queue-health and node-session routes
 (`/api/queue-health`, `/api/action/node-session`), the provenance graph and
 evidence export, billing and usage ledgers, and tenancy (`org_id`). Work
-products (`/api/work-products*`) are not being ported and answer 501.
+products (`/api/work-products*`) are not ported pending an explicit product
+decision (hub task #2658) and answer 501.
 
 ## License
 

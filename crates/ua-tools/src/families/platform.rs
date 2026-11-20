@@ -10,10 +10,16 @@
 //! them here. `GET /api/platform/manifest` and `GET
 //! /api/platform/objects/{kind}/{id}` are these two tools over HTTP.
 //!
-//! Every read checks the object's `profile_tool` against the caller's
-//! profile before it touches storage, so a profile that cannot call
+//! Every read checks the object's `profile_tool` as if the caller had called
+//! it, before it touches storage: the caller's profile must allow it, and the
+//! policy file's tool, role, bind and default rules are evaluated for it (a
+//! rule that would park that tool for approval refuses the read, as does
+//! listing it in `approval_tools`). So a caller that could not call
 //! `task_list` cannot read a task object either. A declared kind with no
 //! reader is listed with `served: false` and reads as not found.
+//!
+//! An `sdk.` evidence event's payload is client-written: its read carries a
+//! `trust` label marking it untrusted.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -25,12 +31,15 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
+use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
+use super::injection;
 use super::memory::mark_untrusted;
 use super::plans::row_map;
 use super::runs;
 use crate::approvals;
 use crate::hub::Hub;
-use crate::registry::{Registry, ToolCtx, tool};
+use crate::policy::{self, Verdict};
+use crate::registry::{Registry, ToolCtx, record_decision_rule, tool};
 
 /// Bumped when a manifest field changes meaning or disappears.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
@@ -399,8 +408,8 @@ pub static OBJECT_TYPES: &[ObjectType] = &[
         envelope: "work_product",
         required: &["id", "title", "status"],
         writers: &[],
-        notes: "Not ported to ua-rust: work products are not part of this hub, so this kind is never served \
-                and /api/work-products answers 501.",
+        notes: "Not ported to ua-rust pending an explicit product decision (hub task #2658), so this kind is \
+                never served and /api/work-products answers 501.",
     },
 ];
 
@@ -443,6 +452,74 @@ pub fn manifest() -> Value {
 /// Whether `caller`'s profile may read objects gated by `tool`.
 pub fn may_read(caller: &Caller, tool: &str) -> bool {
     !caller.enforce_profile || caller.profile.allows_tool(tool)
+}
+
+/// Refuse a read of `kind` unless `caller` could call `tool` (the kind's
+/// `profile_tool`): the profile allow-list, then the policy file's rules for
+/// that tool, evaluated as the caller with no arguments. The refusal codes are
+/// the ones a direct call of `tool` would get. A tool the policy or
+/// `approval_tools` sends through the approval gate cannot be read around it.
+/// A refusal is recorded as a gateway decision on `platform_object_get`.
+pub async fn check_read(hub: &Hub, caller: &Caller, kind: &str, tool: &'static str) -> UaResult<()> {
+    match read_gate(hub, caller, kind, tool).await {
+        Ok(()) => Ok(()),
+        Err((err, rule)) => {
+            record_decision_rule(hub, caller, "platform_object_get", &err, &rule).await;
+            Err(err)
+        }
+    }
+}
+
+/// [`check_read`] without the recording: the refusal and the rule that fired.
+async fn read_gate(
+    hub: &Hub,
+    caller: &Caller,
+    kind: &str,
+    tool: &'static str,
+) -> Result<(), (UaError, String)> {
+    let refuse = |code: &str, msg: String| (UaError::denied(code, msg), String::new());
+    if !may_read(caller, tool) {
+        return Err(refuse(
+            "profile_denied",
+            format!("{kind} objects need {tool} permission, which profile {} does not have", caller.profile),
+        ));
+    }
+    let gated = |why: String| {
+        refuse(
+            "approval_required",
+            format!("{kind} objects are read through {tool}, which {why}; call {tool} itself"),
+        )
+    };
+    if let Some(path) = hub.cfg().policy_file.as_deref() {
+        let p = policy::load(path)
+            .map_err(|reason| refuse("policy_unavailable", format!("policy gate failed closed: {reason}")))?;
+        let c = caller.clone();
+        let verdict = hub
+            .db()
+            .read_async(move |conn| Ok(policy::evaluate(conn, &p, &c, tool, &json!({}))))
+            .await
+            .map_err(|e| refuse("policy_unavailable", format!("policy gate failed closed: {e}")))?;
+        match verdict {
+            Ok(Verdict::Allow) => {}
+            Ok(Verdict::RequireApproval(rules)) => {
+                return Err(gated(format!("policy rule(s) {} send through approval", rules.join(", "))));
+            }
+            Err(refusal) => {
+                let err = match refusal.error {
+                    UaError::Denied { reason_code, reason } => UaError::denied(
+                        reason_code,
+                        format!("{kind} objects are read through {tool}: {reason}"),
+                    ),
+                    other => other,
+                };
+                return Err((err, refusal.rule));
+            }
+        }
+    }
+    if hub.cfg().approval_tools.iter().any(|t| t == tool) {
+        return Err(gated("is in approval_tools".into()));
+    }
+    Ok(())
 }
 
 const SECRET_HINTS: [&str; 8] =
@@ -531,7 +608,13 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             row.map(|mut r| {
                 let parsed = r.get("payload").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok());
                 r.insert("payload_parsed".into(), parsed.unwrap_or(Value::Null));
-                Value::Object(r)
+                let client = r.get("channel").and_then(Value::as_str).is_some_and(is_client_channel);
+                let originator = r.get("originator").and_then(Value::as_str).map(str::to_string);
+                let mut v = Value::Object(r);
+                if client {
+                    injection::mark_untrusted(&mut v, CLIENT_EVIDENCE_SOURCE, originator.as_deref());
+                }
+                v
             })
         }
         "plan" => match one_row(c, "SELECT * FROM plans WHERE id = ?1", id)? {
@@ -594,15 +677,7 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
     if !t.served {
         return Err(UaError::not_found(format!("object kind {kind:?} is not served by this hub")));
     }
-    if !may_read(caller, t.profile_tool) {
-        return Err(UaError::denied(
-            "profile_denied",
-            format!(
-                "{kind} objects need {} permission, which profile {} does not have",
-                t.profile_tool, caller.profile
-            ),
-        ));
-    }
+    check_read(hub, caller, kind, t.profile_tool).await?;
     let id = id.map(str::to_string).filter(|i| !i.is_empty());
     if t.collection {
         if id.is_some() {
@@ -659,7 +734,7 @@ pub fn register(r: &mut Registry) {
             "Read one platform object by kind and id (see platform_manifest): {uri, <kind>: {...}}, or {uri, \
              tasks} for the board. Each kind is gated by its own profile_tool, so this reads nothing your \
              profile could not read through that tool. An unknown kind, an unserved kind or a missing id is not \
-             found.",
+             found. Policy rules for that profile_tool apply to the read as they would to a call of it.",
             |ctx: ToolCtx, a: GetArgs| async move {
                 read_object(&ctx.hub, &ctx.caller, a.kind.trim(), a.id.as_deref().map(str::trim)).await
             },

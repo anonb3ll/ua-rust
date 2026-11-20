@@ -95,7 +95,8 @@ The runs, platform and evidence routes and what the SDK can rely on are in
 session-credential routes under `/api/node/`, the provenance graph and the
 evidence export answer `501` with `{"error": "not_implemented", "capability":
 "..."}` until they are built. `/api/work-products*` answers `501` too: work
-products are not being ported.
+products are not ported pending an explicit product decision (hub task
+#2658).
 
 ## Third-party files
 

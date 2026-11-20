@@ -35,6 +35,12 @@ node_max_per_agent = 8
 # graph_canvas_max_boards = 1000
 # graph_canvas_history_max = 20
 
+# Client evidence (evidence_append, POST /api/evidence) per identity per
+# rolling hour: events and serialized payload bytes. Past either the append
+# is refused with rate_limited.
+# evidence_append_max_per_hour = 120
+# evidence_append_max_bytes_per_hour = 2097152
+
 # Tools that always need a one-time human approval.
 approval_tools = ["git_merge_task"]
 
