@@ -80,13 +80,17 @@ operation and reports what the operation became.
 `node_receipt` (or `POST /api/node/receipt`) reports `finished`, `failed` or
 `killed`, and returns `201`.
 
+- Every receipt names the claim's `attempt`, an integer. A receipt without
+  one is refused (`400`, `receipt.attempt is required`).
 - The first receipt wins. A retry returns it with `duplicate: true` and
   `200`.
 - A receipt that names an earlier `attempt` is refused (`stale_attempt`).
 - A receipt for an item the hub already failed is refused
   (`outcome_unknown`).
 
-Only known fields are stored, and each is bounded.
+Only known fields are stored, and each is bounded. Free text (`text`,
+`reason`, `log_capture.error`) is redacted before it is stored, as session
+events are.
 
 ### Cancel and restart
 
@@ -118,9 +122,9 @@ to the owner's label instead.
 | Tool (route) | What |
 |---|---|
 | `node_events` (`/api/node/events`) | Up to 200 session events per call. Strings are redacted. `session_open` binds the session id. `turn_end` on a task item writes one turn summary. |
-| `node_followup` | Sends a follow-up into a running ACP session, as `queue` (after the current turn) or `steer` (into it). A human needs no approval. The item's requester needs a one-time approval of the exact text. |
+| `node_followup` | Sends a follow-up into a running ACP session, as `queue` (after the current turn) or `steer` (into it). A human needs no approval. The item's requester needs a one-time approval under the tool name `node_followup` (prod action `dispatch`). It binds the node, backend, `cwd`, task, run, the follow-up's item, mode and key, and the exact text, with a `summary` such as `follow-up (queue) into <item> on <node>`. |
 | `node_followups` (`/api/node/followups`) | The node fetches queued follow-ups and acknowledges the ids it will deliver. Delivery is confirmed by a `followup_delivered` event. When the item ends, open follow-ups are dropped. |
-| `node_permission` (`/api/node/permission`) | The session asks a human to decide a tool call. The answer is `pending`, `approved` (with the chosen `option_id`) or `denied`. An approval answers one prompt. A cancelled item's prompts are denied without asking anyone. |
+| `node_permission` (`/api/node/permission`) | The session asks a human to decide a tool call. The answer is `pending`, `approved` (with the chosen `option_id`) or `denied`. An approval answers one prompt. A cancelled item's prompts are denied without asking anyone, and so is a prompt with no option whose `kind` starts with `allow` (`no_allow_option`): there would be nothing to apply. |
 
 ### Dispatch runs routed to a node
 
@@ -137,7 +141,9 @@ turns it off). Each sweep does three things:
 - fails lapsed leases;
 - retries owed command notices.
 
-Every claim also runs the sweep for its own node.
+Every claim also runs the sweep for its own node. A claim that finds no
+work retries only the notices owed for its own node's items; a receipt
+retries only its item's.
 
 ## Not yet ported
 

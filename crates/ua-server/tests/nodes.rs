@@ -189,6 +189,15 @@ async fn work_round_trips_through_the_device_plane() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["item"]["item_id"], id);
 
+    // A receipt must name the attempt it reports.
+    let (status, v) = post(
+        &hub,
+        "/api/node/receipt",
+        Some(BUILDER),
+        json!({ "node": "node-a", "item_id": id, "receipt": { "status": "finished" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     let receipt =
         json!({ "node": "node-a", "item_id": id, "receipt": { "status": "finished", "attempt": 1 } });
     let (status, v) = post(&hub, "/api/node/receipt", Some(BUILDER), receipt.clone()).await;
