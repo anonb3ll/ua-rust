@@ -391,6 +391,54 @@ async fn warn_if_locked_out(state: &ua_server::AppState) {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'w self) -> Buf {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn rmcp_never_logs_below_info() {
+        for directive in [
+            "debug",
+            "info,rmcp=trace",
+            "info,rmcp::service=trace",
+            "info,rmcp::service::server=debug",
+            "trace",
+        ] {
+            let buf = Buf::default();
+            let filter = tracing_subscriber::EnvFilter::new(directive);
+            use tracing_subscriber::layer::SubscriberExt;
+            let sub = tracing_subscriber::registry().with(log_layer(filter, buf.clone()));
+            tracing::subscriber::with_default(sub, || {
+                tracing::debug!(target: "rmcp::service::server", "body uas_secret_debug");
+                tracing::trace!(target: "rmcp::service", "body uas_secret_trace");
+                let span = tracing::debug_span!(target: "rmcp::service", "serve", req = "uas_secret_span");
+                span.in_scope(|| tracing::info!(target: "ua_server", "inside the rmcp span"));
+                tracing::info!(target: "rmcp::service", "rmcp info kept");
+                tracing::debug!(target: "ua_server", "own debug");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("uas_secret"), "{directive}: {out}");
+            assert!(out.contains("rmcp info kept"), "{directive}: {out}");
+            assert!(out.contains("inside the rmcp span"), "{directive}: {out}");
+        }
+    }
+
     fn cfg() -> Config {
         let mut c = Config::for_home(std::env::temp_dir());
         c.human_identities = vec!["operator".into()];

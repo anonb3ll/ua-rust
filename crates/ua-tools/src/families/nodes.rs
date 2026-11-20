@@ -121,7 +121,9 @@ const HEARTBEAT_KEYS: [&str; 5] = ["code_sha", "harness_config", "native_session
 const SHED_ORDER: [&str; 4] = ["native_sessions", "repos", "worktree_roots", "harnesses"];
 /// Protocol features this hub serves to nodes, returned at registration.
 /// `node_code_sha`: heartbeats may carry a `code_sha` fact.
-const HUB_FEATURES: [&str; 1] = ["node_code_sha"];
+/// `acp_session_mcp`: the hub mints session credentials for ACP items (code
+/// support; whether it is switched on is checked per call).
+const HUB_FEATURES: [&str; 2] = ["node_code_sha", super::node_queue::credentials::FEATURE];
 
 /// Lists the ids of queued or claimed work items assigned to a node.
 pub(crate) type OpenWork = fn(&Connection, &str) -> UaResult<Vec<String>>;
@@ -751,6 +753,24 @@ fn identity_facts(version: Option<&str>, facts: &Map<String, Value>) -> Map<Stri
     out
 }
 
+/// Facts a device acceptance vouches for: a registration that changes one
+/// voids the node's acceptance.
+const ACCEPTANCE_FACTS: [&str; 3] = ["code_sha", "backends", "harnesses"];
+
+/// The acceptance facts that differ between `old` and `new`. `code_sha` may
+/// arrive by heartbeat only, so a registration (or heartbeat) without one
+/// leaves it unjudged; `backends` and `harnesses` (every field of each
+/// harness) change only by registering.
+fn moved_acceptance_facts(old: &Map<String, Value>, new: &Map<String, Value>) -> Vec<&'static str> {
+    ACCEPTANCE_FACTS
+        .into_iter()
+        .filter(|k| match *k {
+            "code_sha" => new.get(*k).is_some_and(|n| old.get(*k).is_some_and(|o| o != n)),
+            _ => old.get(*k) != new.get(*k),
+        })
+        .collect()
+}
+
 fn read_nodes(c: &Connection, now: Timestamp) -> UaResult<Vec<Value>> {
     let mut stmt = c.prepare("SELECT * FROM nodes ORDER BY node")?;
     let rows = stmt.query_map([], |r| node_json(r, now))?;
@@ -916,6 +936,15 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
                     new_identity.iter().filter(|(k, v)| old.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect()
                 }
             };
+            // A device acceptance vouched for the code and harnesses the node
+            // had: a registration that changes them ends it.
+            if let Some((_, _, _, old_facts)) = &existing {
+                let moved = moved_acceptance_facts(&load_facts(old_facts), &facts);
+                if !moved.is_empty() {
+                    let why = format!("node_changed ({})", moved.join(", "));
+                    super::node_queue::acceptance::void_tx(tx, &name, &why, false)?;
+                }
+            }
             let now = ua_core::time::now();
             let facts_json = Value::Object(facts.clone()).to_string();
             // A registration is a fresh beat, so the fence set by retire or
@@ -989,8 +1018,14 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             let mut dropped = Vec::new();
             if let Some(update) = update.filter(|u| !u.is_empty()) {
-                let (facts, d) = heartbeat_facts(load_facts(&stored), &update);
+                let old = load_facts(&stored);
+                let (facts, d) = heartbeat_facts(old.clone(), &update);
                 dropped = d;
+                let moved = moved_acceptance_facts(&old, &facts);
+                if !moved.is_empty() {
+                    let why = format!("node_changed ({})", moved.join(", "));
+                    super::node_queue::acceptance::void_tx(tx, &name, &why, false)?;
+                }
                 tx.execute(
                     "UPDATE nodes SET facts_json = ?2 WHERE node = ?1",
                     params![name, Value::Object(facts).to_string()],
@@ -1148,6 +1183,9 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
         )?;
     }
     let kind = if retire { "retire" } else { "unretire" };
+    if retire {
+        super::node_queue::acceptance::void_tx(tx, name, "node_retired", false)?;
+    }
     let event = ledger::append(
         tx,
         EventInput::new(
@@ -1214,6 +1252,7 @@ fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str)
         "UPDATE nodes SET agent = ?2, heartbeat_floor = last_heartbeat, updated_at = ?3 WHERE node = ?1",
         params![name, to, now],
     )?;
+    super::node_queue::acceptance::void_tx(tx, name, "node_reassigned", false)?;
     let event = ledger::append(
         tx,
         EventInput::new(
@@ -1259,6 +1298,7 @@ fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult
         )));
     }
     refuse_open_work(tx, name, "forgetting")?;
+    super::node_queue::acceptance::void_tx(tx, name, "node_forgotten", true)?;
     tx.execute("DELETE FROM nodes WHERE node = ?1", [name])?;
     let now = ua_core::time::now();
     let event = ledger::append(

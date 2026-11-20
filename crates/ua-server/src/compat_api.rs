@@ -56,10 +56,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sessions", get(sessions))
         .route("/api/capability-catalog", get(capability_catalog))
         .route("/api/board", get(board))
-        .route(
-            "/api/nodes/{*rest}",
-            any(|| async { not_built("nodes", "node acceptance and discovered native sessions") }),
-        )
+        .route("/api/nodes/{*rest}", any(|| async { not_built("nodes", "discovered native sessions") }))
 }
 
 pub(crate) fn not_built(capability: &str, what: &str) -> Response {
