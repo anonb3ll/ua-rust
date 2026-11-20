@@ -79,11 +79,22 @@ fn path_is(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Resolve any bearer credential for a request to `path`.
+/// Whether `label` is a retired agent identity. Fails closed: an unreadable
+/// lifecycle state refuses the credential for now.
+fn retired(state: &AppState, label: &str) -> bool {
+    state.hub.db().read(|c| ua_tools::families::governance::is_retired(c, label)).unwrap_or(true)
+}
+
+/// Resolve any bearer credential for a request to `path`. A retired agent
+/// identity resolves to nothing, whichever credential it presents (a static
+/// token in configuration cannot be revoked any other way).
 pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthIdentity> {
     let cfg = state.hub.cfg();
     if let Some(label) = lookup_token(state, token) {
         let kind = if cfg.is_human(&label) { ActorKind::Human } else { ActorKind::Agent };
+        if kind == ActorKind::Agent && retired(state, &label) {
+            return None;
+        }
         return Some(AuthIdentity { label, kind, verified: true });
     }
     if !cfg.oauth_enabled || !token.starts_with(oauth::ACCESS_PREFIX) {
@@ -95,11 +106,8 @@ pub fn resolve_bearer(state: &AppState, token: &str, path: &str) -> Option<AuthI
     let hub_wide = access.resource == oauth::issuer(cfg);
     let audience_ok = hub_wide || (access.resource == oauth::mcp_resource(cfg) && path_is(path, "/mcp"));
     // OAuth grants never act as a human, even if the configuration changed.
-    (audience_ok && !cfg.is_human(&access.subject)).then_some(AuthIdentity {
-        label: access.subject,
-        kind: ActorKind::Agent,
-        verified: true,
-    })
+    (audience_ok && !cfg.is_human(&access.subject) && !retired(state, &access.subject))
+        .then_some(AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true })
 }
 
 fn is_public_path(path: &str) -> bool {

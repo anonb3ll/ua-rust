@@ -32,7 +32,7 @@ fn agent(label: &str) -> Caller {
 }
 
 fn human() -> Caller {
-    Caller { kind: ActorKind::Human, profile: Profile::ChiefOfStaff, ..agent("operator") }
+    Caller { kind: ActorKind::Human, profile: Profile::Coordinator, ..agent("operator") }
 }
 
 fn anon() -> Caller {

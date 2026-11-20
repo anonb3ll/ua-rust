@@ -55,8 +55,8 @@ fn human() -> Caller {
 
 impl Env {
     async fn call(&self, tool: &str, args: Value) -> Result<Value, UaError> {
-        // Chief of staff sees every tool, including git_commit_staged and git_merge_task.
-        self.reg.call(&self.hub, &agent("builder-1", Profile::ChiefOfStaff), tool, args).await
+        // Coordinator sees every tool, including git_commit_staged and git_merge_task.
+        self.reg.call(&self.hub, &agent("builder-1", Profile::Coordinator), tool, args).await
     }
 
     async fn ok(&self, tool: &str, args: Value) -> Value {
@@ -560,7 +560,7 @@ async fn run_cmd_caches_are_per_caller_and_cargo_home_is_the_hubs() {
     let vars = async |label: &str| -> std::collections::HashMap<String, String> {
         let r = env
             .reg
-            .call(&env.hub, &agent(label, Profile::ChiefOfStaff), "run_cmd", json!({ "command": "env" }))
+            .call(&env.hub, &agent(label, Profile::Coordinator), "run_cmd", json!({ "command": "env" }))
             .await
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         assert_eq!(r["exit_code"], 0, "{r}");

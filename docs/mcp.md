@@ -16,7 +16,7 @@ pieces make this work:
 | Tool | Who | What |
 |---|---|---|
 | `managed_secret_set` | A human, or an agent whose identity is in `human_identities` or `lifecycle_operators` | Store a value for one consumer. Returns metadata and a fingerprint, never the value. Replacing an existing value needs a one-time human approval. |
-| `managed_secret_list` | Profiles that see it (not `developer` or `steward`) | Name, consumer, fingerprint, size, key id, who set it. |
+| `managed_secret_list` | Profiles that see it (not `developer` or `reviewer`) | Name, consumer, fingerprint, size, key id, who set it. |
 | `managed_secret_delete` | As for `set`, plus a one-time human approval | The approval binds the name, consumer and current fingerprint. |
 
 - **Admin is an identity, not a profile.** Who may set, delete, register,
@@ -73,7 +73,7 @@ the approval queue.
     "address_scope": "public",
     "secrets": [{ "secret": "docs-token", "inject": "bearer" }],
     "tools": { "search": "read", "get_page": "read", "put_page": "write" },
-    "read_profiles": ["developer", "steward"],
+    "read_profiles": ["developer", "reviewer"],
     "timeout_s": 30
   },
   "review_days": 90

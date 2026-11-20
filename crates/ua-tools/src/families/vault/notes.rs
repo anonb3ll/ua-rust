@@ -374,10 +374,10 @@ fn vault_write(v: &Vault, a: WriteArgs, require_revision: bool) -> UaResult<Writ
 // ── move ───────────────────────────────────────────────────────────────────
 
 fn vault_move(v: &Vault, a: MoveArgs) -> UaResult<Value> {
-    if v.caller.profile != ua_core::Profile::ChiefOfStaff && !v.caller.is_human() {
+    if v.caller.profile != ua_core::Profile::Coordinator && !v.caller.is_human() {
         return Err(UaError::denied(
             "profile_denied",
-            "vault_move requires the chief-of-staff profile or a verified human",
+            "vault_move requires the coordinator profile or a verified human",
         ));
     }
     require_human_force(v, a.force)?;
@@ -595,7 +595,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "vault_move",
-            "Move or rename one note inside the vault write directories (chief-of-staff profile or a verified human). A locked source or an existing destination is refused unless a verified human passes force=true. Returns {source, destination, bytes_moved}.",
+            "Move or rename one note inside the vault write directories (coordinator profile or a verified human). A locked source or an existing destination is refused unless a verified human passes force=true. Returns {source, destination, bytes_moved}.",
             |ctx: ToolCtx, a: MoveArgs| async move {
                 let v = vault(&ctx)?;
                 let out = blocking(move || vault_move(&v, a)).await?;
