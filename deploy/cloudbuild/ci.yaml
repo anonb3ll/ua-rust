@@ -7,15 +7,24 @@
 # both passed. There is no cargo cache: every build compiles from scratch, which
 # keeps the build free of state from earlier runs.
 substitutions:
-  # Pinned to the stable toolchain the GitHub workflow's dtolnay/rust-toolchain
-  # resolves to; bump it with that toolchain. The workspace needs >= 1.88.
-  _RUST_IMAGE: rust:1.100.0-trixie
+  # Pinned by digest to the stable toolchain the GitHub workflow's
+  # dtolnay/rust-toolchain resolves to; bump both together. The workspace needs
+  # >= 1.88. Resolve a new digest with
+  #   docker buildx imagetools inspect rust:<version>-trixie
+  _RUST_IMAGE: rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
+  # The step that can read the private denylist; pinned for the same reason.
+  _GCLOUD_IMAGE: gcr.io/cloud-builders/gcloud@sha256:dc291205504ce8fdb830e55cae4905c7880c7978b03e54b5bcdabe7cab5f8e2e
+  # The build's identity, `projects/<project>/serviceAccounts/<email>`, from
+  # UA_CI_SERVICE_ACCOUNT. Empty (cloud-ci.sh --default-sa) runs as the
+  # project's default build account.
+  _CI_SA: ''
   _SOURCE_SHA: unknown
+serviceAccount: ${_CI_SA}
 steps:
 - id: vocab
   waitFor: ['-']
   allowFailure: true
-  name: gcr.io/cloud-builders/gcloud
+  name: ${_GCLOUD_IMAGE}
   entrypoint: bash
   env:
   - UA_CI_SOURCE_SHA=${_SOURCE_SHA}
@@ -63,6 +72,7 @@ options:
   # same or less overall. E2_HIGHCPU_32 would cut wall time further at about
   # four times this rate.
   machineType: E2_HIGHCPU_8
+  # Required for a user-specified service account, which has no logs bucket.
   logging: CLOUD_LOGGING_ONLY
 timeout: 3600s
 # A build may wait behind others in the project's queue.
