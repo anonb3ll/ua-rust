@@ -650,7 +650,6 @@ async fn api_sessions_catalog_board_and_unbuilt_routes() {
     for uri in [
         "/api/runs",
         "/api/runs/abc",
-        "/api/nodes/acceptance",
         "/api/work-products",
         "/api/evidence",
         "/api/platform/manifest",
