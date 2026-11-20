@@ -179,6 +179,14 @@ impl Registry {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
 
+        // A hub-internal identity with a narrow grant may make only the calls
+        // the grant names, whatever its profile or enforce_profile say.
+        if let Some(why) = crate::families::github::grant_refusal(caller, name, &args) {
+            let err = UaError::denied("grant_denied", why);
+            record_decision(hub, caller, name, &err).await;
+            return Err(err);
+        }
+
         // The policy file is read once per call (cached by mtime). A file that
         // cannot be loaded refuses the call below, after the profile check.
         let loaded = hub.cfg().policy_file.as_deref().map(policy::load);

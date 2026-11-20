@@ -63,6 +63,13 @@ routines_enabled = false
 # github_token_env = "HUB_GITHUB_TOKEN"        # read-only token for the bound repositories
 # github_webhook_secret_env = "HUB_GITHUB_WEBHOOK_SECRET"
 # github_poll_interval_s = 0                   # poll open PRs under `ua serve`; 0 = off
+# github_ci_apps = ["github-actions"]          # apps whose check runs count as CI (slug or app id)
+# github_require_default_branch_workflow = false  # true: the workflow file must match the default branch
+# github_ci_latest_attempt_only = false        # true: judge a re-run job on its latest attempt only
+# github_webhook_max_age_hours = 24            # refuse webhook payloads older than this; 0 = off
+# github_web_host = "github.com"               # host PR links must name (default from github_api_url)
+# github_check_workflows = { tests = ".github/workflows/ci.yml", lint = "Lint" }  # check -> workflow name or file
+# github_merge_branches = { default = "main" } # project -> merge branch; unlisted: the repo's default branch
 
 # Default autonomous-cycle budgets.
 autonomy_max_time_s = 3600.0

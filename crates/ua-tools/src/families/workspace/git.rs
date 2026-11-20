@@ -99,8 +99,11 @@ pub struct MergeArgs {
     /// Merge under this policy authorization (`policy_authorization_record`)
     /// instead of a one-time human approval. It must be valid, for this task,
     /// for the task project's bound repository and for exactly the head being
-    /// merged, and recorded by someone other than the caller. A merge spends
-    /// it; a dry run only reports that it covers the merge.
+    /// merged, and recorded by someone other than the caller who is still a
+    /// human identity. `force` is refused on this path, and `allow_in_flight`
+    /// unless the authorization allows it. A successful merge spends it (a
+    /// failed one leaves it active); a dry run only reports that it covers
+    /// the merge.
     pub policy_authorization_id: Option<i64>,
 }
 
@@ -351,6 +354,26 @@ async fn is_clean(dir: &Path, untracked: bool) -> UaResult<bool> {
     Ok(text(&out.stdout).trim().is_empty())
 }
 
+/// Check out `target` and merge `head` into it. Returns the new HEAD.
+async fn run_merge(top: &Path, target: &str, id: i64, title: &str, head: &str) -> UaResult<String> {
+    let current = git(&["rev-parse", "--abbrev-ref", "HEAD"], top).await?;
+    if text(&current.stdout).trim() != target {
+        let co = git(&["checkout", target], top).await?;
+        if co.exit_code != 0 {
+            return Err(git_failure(&format!("git checkout {target}"), &co));
+        }
+    }
+    let title: String = title.lines().next().unwrap_or("").chars().take(120).collect();
+    let message = format!("feat(merge): merge task {id}: {title}");
+    // Merge the commit checked above, not a name that may have moved since.
+    let merged = git(&["merge", "--no-edit", "-m", &message, head], top).await?;
+    if merged.exit_code != 0 {
+        let _ = git(&["merge", "--abort"], top).await;
+        return Err(git_failure("git merge", &merged));
+    }
+    Ok(rev_parse(top, "HEAD").await?.unwrap_or_default())
+}
+
 async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
     let sb = sandbox(&ctx)?;
     let id = a.task_id;
@@ -377,6 +400,13 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         .await?
         .ok_or_else(|| UaError::not_found(format!("task {id}")))?;
 
+    if a.policy_authorization_id.is_some() && a.force {
+        return Err(UaError::denied(
+            "policy_authorization_force",
+            "force=true is refused under a policy authorization: it covers a clean merge only; ask for a one-time \
+             approval instead",
+        ));
+    }
     let status_ok =
         row.status == "done" || (a.allow_in_flight && ["doing", "blocked"].contains(&row.status.as_str()));
     if !status_ok && !a.force {
@@ -453,20 +483,32 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         "already_merged": already_merged,
     });
     // A policy authorization stands in for the one-time approval (the
-    // registry skipped its gate because the argument is present).
+    // registry skipped its gate because the argument is present). It is
+    // reserved (consumed, fenced on the head) right before the merge and put
+    // back to active if the merge does not happen, so a failure does not burn it.
+    let mut spent: Option<(i64, String)> = None;
     if let Some(auth_id) = a.policy_authorization_id {
-        let (repo, h, who) = (row.repo.clone(), head.clone(), ctx.caller.label.clone());
-        let dry = a.dry_run;
-        ctx.hub
+        let (repo, h, who, cfg) =
+            (row.repo.clone(), head.clone(), ctx.caller.label.clone(), ctx.hub.cfg().clone());
+        let (dry, in_flight, status) = (a.dry_run, a.allow_in_flight, row.status.clone());
+        let stamp = ctx
+            .hub
             .db()
             .write_async(move |tx| {
-                authz::covering(tx, auth_id, id, repo.as_deref(), &h, &who)?;
-                if !dry {
-                    authz::consume(tx, auth_id, id, &h, &who)?;
+                let auth = authz::covering(tx, &cfg, auth_id, id, repo.as_deref(), &h, &who)?;
+                if in_flight && status != "done" && !authz::allows_in_flight(&auth) {
+                    return Err(UaError::denied(
+                        "policy_authorization_mismatch",
+                        format!(
+                            "policy authorization {auth_id} does not cover merging task {id} while it is {status}; \
+                             record one with allow_in_flight=true"
+                        ),
+                    ));
                 }
-                Ok(())
+                if dry { Ok(None) } else { authz::consume(tx, auth_id, id, &h, &who).map(Some) }
             })
             .await?;
+        spent = stamp.map(|s| (auth_id, s));
         report["policy_authorization_id"] = json!(auth_id);
     }
     if a.dry_run {
@@ -474,22 +516,24 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         return Ok(report);
     }
 
-    let current = git(&["rev-parse", "--abbrev-ref", "HEAD"], &top).await?;
-    if text(&current.stdout).trim() != target {
-        let co = git(&["checkout", target], &top).await?;
-        if co.exit_code != 0 {
-            return Err(git_failure(&format!("git checkout {target}"), &co));
+    let merge_result = run_merge(&top, target, id, &row.title, &head).await;
+    let commit_hash = match merge_result {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some((auth_id, stamp)) = spent {
+                let (h, who, why) = (head.clone(), ctx.caller.label.clone(), e.to_string());
+                let restored = ctx
+                    .hub
+                    .db()
+                    .write_async(move |tx| authz::restore(tx, auth_id, &h, &who, &stamp, &why))
+                    .await;
+                if let Err(re) = restored {
+                    tracing::warn!(auth_id, error = %re, "could not restore a policy authorization after a failed merge");
+                }
+            }
+            return Err(e);
         }
-    }
-    let title: String = row.title.lines().next().unwrap_or("").chars().take(120).collect();
-    let message = format!("feat(merge): merge task {id}: {title}");
-    // Merge the commit checked above, not a name that may have moved since.
-    let merged = git(&["merge", "--no-edit", "-m", &message, &head], &top).await?;
-    if merged.exit_code != 0 {
-        let _ = git(&["merge", "--abort"], &top).await;
-        return Err(git_failure("git merge", &merged));
-    }
-    let commit_hash = rev_parse(&top, "HEAD").await?.unwrap_or_default();
+    };
     let short: String = commit_hash.chars().take(12).collect();
 
     // Cleanup: only when the source did not move after the checks.
@@ -597,7 +641,7 @@ pub fn register(r: &mut Registry) {
              status and a clean worktree, then remove the worktree and delete the branch (expected-SHA). \
              dry_run=true only reports. Always needs a one-time human approval, or policy_authorization_id: a \
              human's policy authorization for exactly this task, its project's bound repository and the head being \
-             merged (spent by the merge). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / \
+             merged (spent only by a successful merge; force is refused on that path). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / \
              branch_retained when the source was kept.",
             git_merge_task,
         )

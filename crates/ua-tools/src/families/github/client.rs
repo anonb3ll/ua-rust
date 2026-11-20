@@ -14,6 +14,9 @@
 //!   (`project_repo_bind`). Paths are built from the normalized `owner/name`
 //!   and numeric ids, never from caller text.
 //! - **Bounded.** 20 seconds per request, 8 MiB per body, JSON only.
+//! - **One connection pool per API base.** The HTTP client for a base URL
+//!   is built once and reused by every later request (connections and TLS
+//!   sessions are kept), never rebuilt per call.
 //! - **Rate-limit aware.** `x-ratelimit-remaining: 0` (or a 403/429 that says
 //!   so) blocks further requests to that host until `x-ratelimit-reset`
 //!   (or `retry-after`), without touching the network.
@@ -135,6 +138,42 @@ pub(crate) struct GitHub {
     token: SecretString,
 }
 
+/// The HTTP clients built so far, one per (API base, loopback test hook).
+fn clients() -> &'static Mutex<HashMap<(String, bool), reqwest::Client>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<(String, bool), reqwest::Client>>> = OnceLock::new();
+    CLIENTS.get_or_init(Mutex::default)
+}
+
+/// The shared client for `base`, built on first use. The second value says
+/// whether this call built it.
+fn shared_client(base: &Url, allow_loopback: bool) -> Result<(reqwest::Client, bool), GhError> {
+    let key = (base.as_str().to_string(), allow_loopback);
+    let mut map =
+        clients().lock().map_err(|_| GhError::NotConfigured("HTTP client cache poisoned".into()))?;
+    if let Some(c) = map.get(&key) {
+        return Ok((c.clone(), false));
+    }
+    install_crypto_provider();
+    let public_api = base.host_str().is_some_and(|h| h.eq_ignore_ascii_case("api.github.com"));
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(Duration::from_secs(10));
+    if public_api {
+        builder = builder.dns_resolver(GuardedResolver { allow_loopback });
+    }
+    let http =
+        builder.build().map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
+    if map.len() >= 16 {
+        // Only a reconfigured base adds entries; keep the cache bounded anyway.
+        map.clear();
+    }
+    map.insert(key, http.clone());
+    Ok((http, true))
+}
+
 /// Hosts blocked by a rate limit, until a Unix second.
 fn blocks() -> &'static Mutex<HashMap<String, i64>> {
     static BLOCKS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
@@ -182,20 +221,7 @@ impl GitHub {
     pub(crate) fn from_config(cfg: &Config) -> Result<Option<GitHub>, GhError> {
         let Some(token) = cfg.github_token() else { return Ok(None) };
         let base = api_base(cfg)?;
-        install_crypto_provider();
-        let public_api = base.host_str().is_some_and(|h| h.eq_ignore_ascii_case("api.github.com"));
-        let mut builder = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(Duration::from_secs(10));
-        if public_api {
-            builder = builder.dns_resolver(GuardedResolver { allow_loopback: cfg.fetch_allow_loopback });
-        }
-        let http = builder
-            .build()
-            .map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
+        let (http, _) = shared_client(&base, cfg.fetch_allow_loopback)?;
         Ok(Some(GitHub { base, http, token }))
     }
 
@@ -213,7 +239,12 @@ impl GitHub {
     }
 
     fn url(&self, repo: &BoundRepo, path: &str) -> Result<Url, GhError> {
-        let raw = format!("{}/repos/{}/{}", self.base.as_str().trim_end_matches('/'), repo.as_str(), path);
+        let base = self.base.as_str().trim_end_matches('/');
+        let raw = if path.is_empty() {
+            format!("{base}/repos/{}", repo.as_str())
+        } else {
+            format!("{base}/repos/{}/{path}", repo.as_str())
+        };
         let url = Url::parse(&raw).map_err(|e| GhError::NotConfigured(format!("bad request URL: {e}")))?;
         if url.host_str() != self.base.host_str()
             || url.port_or_known_default() != self.base.port_or_known_default()
@@ -331,6 +362,22 @@ mod tests {
         cfg.fetch_allow_loopback = true;
         cfg.github_api_url = "http://127.0.0.1:9".into();
         assert!(api_base(&cfg).is_ok(), "loopback http only under the test hook");
+    }
+
+    #[test]
+    fn the_http_client_is_built_once_per_base() {
+        let base = Url::parse("https://ghe-client-cache.example.com/api/v3").unwrap();
+        let (_, built) = shared_client(&base, false).unwrap();
+        assert!(built, "the first request to a base builds its client");
+        for _ in 0..3 {
+            let (_, built) = shared_client(&base, false).unwrap();
+            assert!(!built, "later requests reuse it");
+        }
+        let mut cfg = Config { github_api_url: base.to_string(), ..Config::default() };
+        cfg.github_token_value = Some("t".to_string().into());
+        GitHub::from_config(&cfg).unwrap().unwrap();
+        let (_, built) = shared_client(&api_base(&cfg).unwrap(), false).unwrap();
+        assert!(!built, "from_config shares the cached client");
     }
 
     #[test]

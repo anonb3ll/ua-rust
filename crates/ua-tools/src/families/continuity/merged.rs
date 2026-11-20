@@ -1,12 +1,25 @@
 //! Close-on-merge: a task whose work merged closes with the merge commit as
 //! its evidence.
 //!
-//! A task is matched to a merged pull request when its `evidence_ref` or its
-//! notes link that PR (`https://<host>/<owner>/<name>/pull/<n>` or
-//! `<owner>/<name>#<n>`) and the task's project is bound to the PR's
-//! repository. It closes only when nothing argues against it:
+//! A task is matched to a merged pull request only by an explicit link:
 //!
-//! - it links exactly one pull request (two links are `ambiguous`),
+//! - its `evidence_ref` names the PR (`https://<host>/<owner>/<name>/pull/<n>`
+//!   or `<owner>/<name>#<n>`), or
+//! - its notes carry a `closes: <owner>/<name>#<n>` marker (or `closes:`
+//!   followed by the PR URL). Free text such as "blocked by owner/name#3"
+//!   is never a match.
+//!
+//! A URL must name the configured GitHub web host (`github_web_host`, by
+//! default `github.com` or the GHES host). Only links into the task
+//! project's bound repository count, and the task's project must be bound to
+//! the PR's repository. It closes only when nothing argues against it:
+//!
+//! - it links exactly one pull request in that repository (two are `ambiguous`),
+//! - the PR merged into the project's merge branch: `github_merge_branches`
+//!   for the project, else the repository's default branch. A PR merged
+//!   anywhere else (a stacked PR into a feature branch) is ledgered as
+//!   `agent.github.merged_to_non_default` and the task stays open,
+//! - the PR did not merge before the task was created,
 //! - it is unfinished and nobody is working it (no live claim, open or live
 //!   dispatch run, pending delegation or node work),
 //! - it is not human-gated (`operator-only`/`interactive-only` lane,
@@ -26,7 +39,8 @@
 //! merged), the poller (an open PR that left the open list and is merged),
 //! and `coordination_manage(action="queue_close_merged")`, which looks every
 //! PR that an unfinished task links up on GitHub. `dry_run` defaults to true
-//! there and only reports.
+//! there and only reports; `dry_run=false` is for a lifecycle operator or a
+//! human.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -37,13 +51,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
-use super::queue::{Row, descendants, is_active, protection, queue_writer, task_rows};
+use super::queue::{Row, descendants, is_active, protection, task_rows};
 use crate::Hub;
 use crate::families::github::client::{BoundRepo, GitHub, full_sha};
 use crate::families::tasks::{emit, int_field, str_field};
 use crate::registry::ToolCtx;
 
 const CHANNEL: &str = "agent.github.closed_on_merge";
+const OFF_BRANCH_CHANNEL: &str = "agent.github.merged_to_non_default";
 /// Pull requests one on-demand pass looks up.
 const LOOKUP_CAP: usize = 50;
 
@@ -57,7 +72,28 @@ pub(crate) struct MergedPr {
     pub merge_sha: String,
     /// The PR's head branch, when known.
     pub head_ref: Option<String>,
+    /// The branch the PR merged into (`pull_request.base.ref`).
+    pub base_ref: Option<String>,
+    /// The repository's default branch, as the payload or API reported it.
+    pub default_branch: Option<String>,
+    /// When it merged (RFC 3339), when known.
+    pub merged_at: Option<String>,
     pub url: String,
+}
+
+/// The configuration close-on-merge matches with.
+#[derive(Debug, Clone)]
+struct Rules {
+    /// Lowercase web host PR URLs must name.
+    host: String,
+    /// Merge branch by project.
+    branches: std::collections::BTreeMap<String, String>,
+}
+
+impl Rules {
+    fn of(cfg: &ua_core::Config) -> Self {
+        Rules { host: cfg.github_web_host(), branches: cfg.github_merge_branches.clone() }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -72,9 +108,15 @@ pub struct CloseMergedArgs {
 fn url_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)(?:https?://)?[a-z0-9.-]+\.[a-z]{2,}/([a-z0-9_.-]+/[a-z0-9_.-]+)/pull/(\d{1,9})\b")
+        Regex::new(r"(?i)(?:https?://)?([a-z0-9.-]+\.[a-z]{2,}|localhost)(?::\d+)?/([a-z0-9_.-]+/[a-z0-9_.-]+)/pull/(\d{1,9})\b")
             .expect("valid regex")
     })
+}
+
+/// A `closes: <link>` marker in task notes.
+fn marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)(?:^|[^a-z0-9_-])closes:[ \t]*(\S+)").expect("valid regex"))
 }
 
 fn short_re() -> &'static Regex {
@@ -84,23 +126,48 @@ fn short_re() -> &'static Regex {
     })
 }
 
-/// Every pull request `text` links, as `(owner/name, number)`.
-pub(crate) fn pr_links(text: &str) -> BTreeSet<(String, u64)> {
+/// Pull requests as `(owner/name, number)`.
+type PrLinks = BTreeSet<(String, u64)>;
+
+/// Every pull request `text` links, as `(owner/name, number)`. A URL counts
+/// only when it names `host`.
+pub(crate) fn pr_links(text: &str, host: &str) -> BTreeSet<(String, u64)> {
     let mut out = BTreeSet::new();
-    for re in [url_re(), short_re()] {
-        for c in re.captures_iter(text) {
-            if let (Some(repo), Some(n)) = (c.get(1), c.get(2).and_then(|n| n.as_str().parse::<u64>().ok())) {
-                out.insert((repo.as_str().to_ascii_lowercase(), n));
-            }
+    for c in url_re().captures_iter(text) {
+        if let (Some(h), Some(repo), Some(n)) =
+            (c.get(1), c.get(2), c.get(3).and_then(|n| n.as_str().parse::<u64>().ok()))
+            && h.as_str().eq_ignore_ascii_case(host)
+        {
+            out.insert((repo.as_str().to_ascii_lowercase(), n));
+        }
+    }
+    for c in short_re().captures_iter(text) {
+        if let (Some(repo), Some(n)) = (c.get(1), c.get(2).and_then(|n| n.as_str().parse::<u64>().ok())) {
+            out.insert((repo.as_str().to_ascii_lowercase(), n));
         }
     }
     out
 }
 
-fn task_links(row: &Row) -> BTreeSet<(String, u64)> {
-    let mut links = pr_links(str_field(row, "evidence_ref").unwrap_or_default());
-    links.extend(pr_links(str_field(row, "notes").unwrap_or_default()));
-    links
+/// The pull requests `closes:` markers in `notes` name.
+pub(crate) fn closes_markers(notes: &str, host: &str) -> BTreeSet<(String, u64)> {
+    let mut out = BTreeSet::new();
+    for c in marker_re().captures_iter(notes) {
+        if let Some(target) = c.get(1) {
+            // The marker names one link: the token right after `closes:`.
+            let token = target.as_str().trim_end_matches(['.', ',', ';', ')', ']']);
+            out.extend(pr_links(&format!(" {token}"), host));
+        }
+    }
+    out
+}
+
+/// The links that tie a task to a PR: its `evidence_ref` and its notes'
+/// `closes:` markers, each marked with where it was found.
+fn task_links(row: &Row, host: &str) -> (PrLinks, PrLinks) {
+    let evidence = pr_links(str_field(row, "evidence_ref").unwrap_or_default(), host);
+    let markers = closes_markers(str_field(row, "notes").unwrap_or_default(), host);
+    (evidence, markers)
 }
 
 /// Unfinished tasks in projects bound to `repo`.
@@ -119,14 +186,19 @@ fn assess(
     row: &Row,
     pr: &MergedPr,
     now: jiff::Timestamp,
+    rules: &Rules,
 ) -> UaResult<Option<Value>> {
-    let links = task_links(row);
+    let (evidence, markers) = task_links(row, &rules.host);
+    // Only links into the PR's (the project's bound) repository count, so a
+    // mention of another repository's PR never makes a task ambiguous.
+    let links: BTreeSet<(String, u64)> =
+        evidence.union(&markers).filter(|(r, _)| *r == pr.repo).cloned().collect();
     let key = (pr.repo.clone(), pr.number);
     if !links.contains(&key) {
         return Ok(None);
     }
     let id = int_field(row, "id").unwrap_or_default();
-    let in_evidence = pr_links(str_field(row, "evidence_ref").unwrap_or_default()).contains(&key);
+    let in_evidence = evidence.contains(&key);
     let mut entry = json!({
         "task_id": id,
         "title": str_field(row, "title"),
@@ -135,9 +207,10 @@ fn assess(
         "pr": pr.number,
         "pr_url": pr.url,
         "merge_sha": pr.merge_sha,
-        "matched_by": if in_evidence { "evidence_ref" } else { "notes" },
+        "matched_by": if in_evidence { "evidence_ref" } else { "closes_marker" },
         "prior_evidence_ref": str_field(row, "evidence_ref"),
         "task_revision": str_field(row, "updated_at"),
+        "base_ref": pr.base_ref,
     });
     if links.len() > 1 {
         entry["outcome"] = json!("ambiguous");
@@ -145,7 +218,27 @@ fn assess(
         entry["candidates"] = json!(links.iter().map(|(r, n)| format!("{r}#{n}")).collect::<Vec<_>>());
         return Ok(Some(entry));
     }
+    // The PR must have merged into the project's merge branch.
+    let project = str_field(row, "project").unwrap_or("default");
+    let want = rules.branches.get(project).cloned().or_else(|| pr.default_branch.clone());
+    entry["merge_branch"] = json!(want);
+    if want.is_none() || pr.base_ref.is_none() || want != pr.base_ref {
+        entry["outcome"] = json!("merged_to_non_default");
+        entry["reason"] = json!(format!(
+            "the PR merged into {:?}, not the merge branch {:?}; the merge commit is not on it, so the task stays open",
+            pr.base_ref.as_deref().unwrap_or("unknown"),
+            want.as_deref().unwrap_or("unknown")
+        ));
+        return Ok(Some(entry));
+    }
     let mut reasons = protection(conn, row, now)?;
+    if let (Some(merged), Some(created)) = (
+        pr.merged_at.as_deref().and_then(ua_core::time::parse_ts),
+        str_field(row, "created_at").and_then(ua_core::time::parse_ts),
+    ) && merged < created
+    {
+        reasons.push("the pull request merged before the task was created".into());
+    }
     let open_children: Vec<String> = descendants(conn, id)?
         .iter()
         .filter(|c| is_active(c))
@@ -182,6 +275,7 @@ pub(crate) async fn close_merged(
     dry_run: bool,
 ) -> UaResult<Value> {
     let considered = prs.len();
+    let rules = Rules::of(hub.cfg());
     let matches: Vec<Value> = hub
         .db()
         .read_async(move |c| {
@@ -189,7 +283,7 @@ pub(crate) async fn close_merged(
             let mut out = Vec::new();
             for pr in &prs {
                 for row in candidates(c, &pr.repo)? {
-                    if let Some(m) = assess(c, &row, pr, now)? {
+                    if let Some(m) = assess(c, &row, pr, now, &rules)? {
                         out.push(m);
                     }
                 }
@@ -199,11 +293,13 @@ pub(crate) async fn close_merged(
         .await?;
     let (mut ambiguous, mut blocked, mut would_close, mut closed, mut skipped) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut off_branch = Vec::new();
     let mut seen = BTreeSet::new();
     for m in matches {
         match m["outcome"].as_str() {
             Some("ambiguous") => ambiguous.push(m),
             Some("blocked") => blocked.push(m),
+            Some("merged_to_non_default") => off_branch.push(m),
             _ if !seen.insert(m["task_id"].as_i64()) => {}
             _ if dry_run => would_close.push(m),
             _ => match close_one(hub, actor, &m).await {
@@ -217,6 +313,21 @@ pub(crate) async fn close_merged(
             },
         }
     }
+    if !dry_run && !off_branch.is_empty() {
+        let (events, by) = (off_branch.clone(), actor.label.clone());
+        hub.db()
+            .write_async(move |tx| {
+                for m in &events {
+                    let payload = json!({
+                        "task_id": m["task_id"], "repo": m["repo"], "pr": m["pr"], "merge_sha": m["merge_sha"],
+                        "base_ref": m["base_ref"], "merge_branch": m["merge_branch"],
+                    });
+                    emit(tx, OFF_BRANCH_CHANNEL, payload, &by)?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
     Ok(json!({
         "dry_run": dry_run,
         "prs_considered": considered,
@@ -225,6 +336,7 @@ pub(crate) async fn close_merged(
         "skipped": skipped,
         "ambiguous": ambiguous,
         "blocked": blocked,
+        "merged_to_non_default": off_branch,
     }))
 }
 
@@ -263,10 +375,17 @@ async fn close_one(hub: &Hub, actor: &Caller, m: &Value) -> UaResult<()> {
 pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaResult<Value> {
     let dry_run = a.dry_run.unwrap_or(true);
     if !dry_run {
-        // The same callers as park: a verified coordinator, lead or developer,
-        // a lifecycle operator or a human. Each close is a task_update as them.
-        queue_writer(&ctx, None, "close merged tasks")?;
+        // Closing other agents' tasks in bulk is an operator act: a lifecycle
+        // operator or a human. Each close is a task_update as them.
+        let who = crate::families::governance::verified_actor(&ctx.caller, "close merged tasks")?;
+        if !crate::families::governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+            return Err(UaError::denied(
+                "operator_required",
+                "queue_close_merged with dry_run=false is for a lifecycle operator or a human; a dry run is open to all",
+            ));
+        }
     }
+    let host = ctx.hub.cfg().github_web_host();
     let only = a.repo.as_deref().map(crate::families::governance::normalize_repo).transpose()?;
     let gh = GitHub::require(ctx.hub.cfg()).map_err(|e| UaError::invalid(e.detail()))?;
     // Every PR an unfinished task in a bound project links, in that repository.
@@ -280,7 +399,8 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
                     continue;
                 }
                 for row in candidates(c, repo.as_str())? {
-                    for (r, n) in task_links(&row) {
+                    let (evidence, markers) = task_links(&row, &host);
+                    for (r, n) in evidence.into_iter().chain(markers) {
                         if r == repo.as_str() {
                             out.insert((repo.clone(), n));
                         }
@@ -320,22 +440,39 @@ pub(crate) fn merged_from_api(repo: &str, pr: &Value) -> Option<MergedPr> {
         number,
         merge_sha: full_sha(pr["merge_commit_sha"].as_str()?)?,
         head_ref: pr["head"]["ref"].as_str().map(str::to_string),
+        base_ref: pr["base"]["ref"].as_str().map(str::to_string),
+        default_branch: pr["base"]["repo"]["default_branch"].as_str().map(str::to_string),
+        merged_at: pr["merged_at"].as_str().map(str::to_string),
         url: pr["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("{repo}#{number}")),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pr_links;
+    use super::{closes_markers, pr_links};
 
     #[test]
     fn links_are_urls_or_short_references() {
         let found = pr_links(
             "see https://github.com/Owner/Repo/pull/12 and owner/other#7, not #9 or a/b/c#4 or path/x#\n\
              github.com/owner/repo/pull/12/files",
+            "github.com",
         );
         let want: Vec<(String, u64)> = vec![("owner/other".into(), 7), ("owner/repo".into(), 12)];
         assert_eq!(found.into_iter().collect::<Vec<_>>(), want);
-        assert!(pr_links("owner/repo#12345678901").is_empty(), "absurd numbers are not links");
+        assert!(pr_links("owner/repo#12345678901", "github.com").is_empty(), "absurd numbers are not links");
+    }
+
+    #[test]
+    fn a_url_must_name_the_configured_host() {
+        assert!(pr_links("https://evil.example.com/owner/repo/pull/3", "github.com").is_empty());
+        assert_eq!(pr_links("https://GHE.example.com/owner/repo/pull/3", "ghe.example.com").len(), 1);
+    }
+
+    #[test]
+    fn only_closes_markers_count_in_notes() {
+        let notes = "blocked by owner/repo#3; see owner/repo#4\ncloses: owner/repo#5.\nCloses: https://github.com/owner/repo/pull/6\nencloses: owner/repo#8";
+        let got: Vec<u64> = closes_markers(notes, "github.com").into_iter().map(|(_, n)| n).collect();
+        assert_eq!(got, vec![5, 6]);
     }
 }

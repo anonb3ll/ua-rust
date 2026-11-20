@@ -170,8 +170,24 @@ ALTER TABLE task_workflow ADD COLUMN review_notified_head TEXT;
 ",
 };
 
+/// Every `review_ready` notice sent, one row per task and head, so a head
+/// is announced at most once (even when the task returns to it) and a task's
+/// notices can be rate limited.
+pub const REVIEW_NOTICES_SCHEMA: SchemaPart = SchemaPart {
+    name: "continuity.review_notices.v1",
+    sql: "
+CREATE TABLE IF NOT EXISTS review_ready_notices (
+    task_id INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    notified_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, head_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_review_ready_notices_task ON review_ready_notices(task_id, notified_at);
+",
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
-    vec![SCHEMA, PARKING_SCHEMA, CHECK_JOBS_SCHEMA, REVIEW_READY_SCHEMA]
+    vec![SCHEMA, PARKING_SCHEMA, CHECK_JOBS_SCHEMA, REVIEW_READY_SCHEMA, REVIEW_NOTICES_SCHEMA]
 }
 
 // --- shared helpers ---------------------------------------------------------------

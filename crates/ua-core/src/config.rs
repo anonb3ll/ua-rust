@@ -260,6 +260,37 @@ pub struct Config {
     /// under `ua serve` (a fallback for hubs GitHub cannot reach). 0 (the
     /// default) turns polling off.
     pub github_poll_interval_s: u64,
+    /// GitHub Apps whose check runs count as CI, by app slug or numeric app
+    /// id. A check run from any other app is never graded `verified`; a
+    /// workflow run (GitHub Actions) always may be. Default `["github-actions"]`.
+    #[serde(deserialize_with = "string_or_list")]
+    pub github_ci_apps: Vec<String>,
+    /// Which workflow verifies which check, by check name: a workflow name
+    /// (`"CI"`) or a workflow file path (`".github/workflows/ci.yml"`, which
+    /// pins the run to that file). Unmapped, a check with no bound job is
+    /// verified only by a run whose name is the check's name (ASCII case-blind).
+    pub github_check_workflows: BTreeMap<String, String>,
+    /// Require the workflow file at the run's head to be the same blob as on
+    /// the repository's default branch before a check is graded `verified`,
+    /// so a branch cannot rewrite the workflow that grades it. Off by default:
+    /// the comparison is still recorded (`observed.workflow_unchanged`), but a
+    /// branch that legitimately changes its workflow can still verify.
+    pub github_require_default_branch_workflow: bool,
+    /// Judge a bound job on its latest attempt only, keeping earlier attempts
+    /// in `observed`. Off by default: every attempt must agree, so a
+    /// rerun-to-green stays a mismatch and a flaky failure cannot be retried
+    /// away unnoticed.
+    pub github_ci_latest_attempt_only: bool,
+    /// Hours a webhook payload's own timestamp (`merged_at`, `updated_at`,
+    /// `completed_at`, ...) may lag behind the hub clock before the delivery
+    /// is refused as stale. 0 turns the check off. Default 24.
+    pub github_webhook_max_age_hours: u64,
+    /// The branch a merged pull request must target to close its task, by
+    /// project. Unlisted projects use the repository's default branch.
+    pub github_merge_branches: BTreeMap<String, String>,
+    /// The web host pull request links must name (`https://<host>/owner/name/pull/n`).
+    /// Unset: `github.com` for the public API, else the host of `github_api_url`.
+    pub github_web_host: Option<String>,
     /// Test hook: a GitHub token handed in directly instead of through
     /// `github_token_env`. It cannot be set from TOML or the environment.
     #[serde(skip)]
@@ -400,6 +431,13 @@ impl Default for Config {
             github_token_env: None,
             github_webhook_secret_env: None,
             github_poll_interval_s: 0,
+            github_ci_apps: vec!["github-actions".into()],
+            github_check_workflows: BTreeMap::new(),
+            github_require_default_branch_workflow: false,
+            github_ci_latest_attempt_only: false,
+            github_webhook_max_age_hours: 24,
+            github_merge_branches: BTreeMap::new(),
+            github_web_host: None,
             github_token_value: None,
             github_webhook_secret_value: None,
         }
@@ -487,6 +525,23 @@ impl Config {
     }
 
     /// The GitHub webhook secret: the test hook, else the variable
+    /// The host pull request links must name: `github_web_host`, else
+    /// `github.com` for the public API, else the API host (GHES serves the
+    /// web UI and `/api/v3` on one host). Lowercase.
+    pub fn github_web_host(&self) -> String {
+        if let Some(h) = self.github_web_host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            return h.to_ascii_lowercase();
+        }
+        let host = self
+            .github_api_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if host.is_empty() || host == "api.github.com" { "github.com".into() } else { host }
+    }
+
     /// `github_webhook_secret_env` names (trimmed; empty means none).
     pub fn github_webhook_secret(&self) -> Option<SecretString> {
         secret_from(&self.github_webhook_secret_value, self.github_webhook_secret_env.as_deref())
@@ -792,6 +847,12 @@ mod tests {
             "the token must not leak through Debug"
         );
         assert!(Config::default().github_webhook_secret().is_none());
+        assert_eq!(cfg.github_web_host(), "ghe.example.com", "GHES serves links on the API host");
+        let d = Config::default();
+        assert_eq!(d.github_web_host(), "github.com");
+        assert_eq!(d.github_ci_apps, vec!["github-actions".to_string()]);
+        assert_eq!(d.github_webhook_max_age_hours, 24);
+        assert!(!d.github_require_default_branch_workflow && !d.github_ci_latest_attempt_only);
     }
 
     #[test]

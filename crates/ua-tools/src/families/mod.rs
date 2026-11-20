@@ -54,6 +54,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(cycles::SCHEMA);
     parts.push(delegation::SCHEMA);
     parts.push(github::SCHEMA);
+    parts.push(github::HARDENING_SCHEMA);
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
     parts.push(messaging::SCHEMA);

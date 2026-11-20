@@ -20,6 +20,7 @@
   "git_merge_task",
   "notify",
   "policy_authorization_record",
+  "policy_authorization_revoke",
   "profile_activate",
   "routine_add",
   "routine_fire",
@@ -63,6 +64,7 @@
   "plan_step_retry",
   "plan_update",
   "policy_authorization_record",
+  "policy_authorization_revoke",
   "profile_activate",
   "routine_add",
   "routine_fire",
@@ -145,6 +147,7 @@
   "node_list",
   "policy_authorization_list",
   "policy_authorization_record",
+  "policy_authorization_revoke",
   "profile_status",
   "session_list",
   "task_list"
