@@ -995,3 +995,82 @@ async fn imported_legacy_prefix_and_hashed_chain_export_manifest_chain_ok() {
     assert_eq!(log["first_ulid"], json!("01HZZZZZZZZZZZZZZZZZZZZZZ1"));
     assert_eq!(log["last_ulid"], json!(EVENTS[2].ulid));
 }
+
+#[tokio::test]
+async fn an_out_of_order_ulid_keeps_manifest_chain_ok() {
+    // The Python hub minted ULIDs outside the write lock, so a later rowid can
+    // carry a ULID that sorts between two earlier rows. The hash chain is in
+    // rowid order and stays valid.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch(PY_SCHEMA).unwrap();
+    let events = [
+        PyEvent {
+            rowid: 5,
+            ulid: "01J0000000000000000000000",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: T0,
+            dedupe_key: None,
+        },
+        PyEvent {
+            rowid: 6,
+            ulid: "01J0000000000000000000002",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: "2026-01-01T00:00:01+00:00",
+            dedupe_key: None,
+        },
+        PyEvent {
+            rowid: 7,
+            ulid: "01J0000000000000000000001",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: "2026-01-01T00:00:02+00:00",
+            dedupe_key: None,
+        },
+    ];
+    let mut prev: Option<String> = None;
+    for e in &events {
+        prev = Some(insert_event(&c, e, prev.as_deref()));
+    }
+    // The last rowid's ULID really sorts between the first two.
+    let by_ulid: Vec<String> = c
+        .prepare("SELECT ulid FROM event_log ORDER BY ulid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(by_ulid, [events[0].ulid, events[2].ulid, events[1].ulid]);
+    drop(c);
+
+    let db = target();
+    let r = ua_import::import(&db, &path, &opts()).unwrap();
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3, "{tl:?}");
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db);
+    let caller = Caller {
+        label: "builder-1".into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some("builder-1-key".into()),
+        transport: Transport::Mcp,
+    };
+    let reg = builtin_registry();
+    let verified = reg.call(&hub, &operator(), "event_log_verify", json!({})).await.unwrap();
+    assert_eq!(verified["ok"], json!(true), "{verified}");
+    let exported = reg.call(&hub, &caller, "export_migration_manifest", json!({})).await.unwrap();
+    let log = &exported["manifest"]["event_log"];
+    assert_eq!(log["chain_ok"], json!(true), "{log}");
+    assert_eq!(log["entry_hash_mismatches"], json!(0), "{log}");
+}

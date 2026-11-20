@@ -736,24 +736,27 @@ pub struct ManifestStats {
 /// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
 /// rolling_hash}` over the whole event log, ordered by ulid.
 ///
-/// Verifies both `seq`-order linkage and `ledger_meta.unhashed_legacy_prefix`
-/// via [`ledger::verify`], and `ulid`-order `prev_hash` linkage from
-/// [`ledger::GENESIS_HASH`]. Each row's `entry_hash` is recomputed from its
-/// contents, never taken as stored: the rolling hash is SHA-256 over one line
-/// per row holding the recomputed hash, or for a row without one (an imported
-/// legacy prefix), the canonical JSON of its [`ROLLING_ROW_COLUMNS`]. Stored
-/// hashes that differ from their row (or are blank) increment
-/// `entry_hash_mismatches` and clear `chain_ok`; broken `prev_hash` links,
-/// hashless rows after hashed rows, and unrecorded legacy prefixes clear
-/// `chain_ok`.
+/// `chain_ok` is [`ledger::verify`] (seq-order `prev_hash` linkage from
+/// [`ledger::GENESIS_HASH`], no hashless row after a hashed one, and a legacy
+/// prefix exactly as long as `ledger_meta.unhashed_legacy_prefix` records)
+/// plus zero `entry_hash` mismatches. Each row's `entry_hash` is recomputed
+/// from its contents, never taken as stored: the rolling hash is SHA-256 over
+/// one line per row holding the recomputed hash, or for a row without one (an
+/// imported legacy prefix), the canonical JSON of its [`ROLLING_ROW_COLUMNS`].
+/// Stored hashes that differ from their row (or are blank) increment
+/// `entry_hash_mismatches` and clear `chain_ok`. The ulid order used for the
+/// rolling hash is not checked for linkage: an imported hub can hold ULIDs
+/// minted out of write order.
+///
+/// The summary has no anchor: it records count, the ulid range and the
+/// rolling hash, not the head `entry_hash`, so a truncated or rewritten tail
+/// still reports `chain_ok: true`. Only comparing the summary against an
+/// earlier manifest catches that.
 fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let mut hasher = Sha256::new();
     let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
     let has_log = has_table(c, "event_log")?;
     let ledger_ok = !has_log || ledger::verify(c)?.ok;
-    let mut expected_prev = ledger::GENESIS_HASH.to_string();
-    let mut saw_hashed = false;
-    let mut ulid_chain_ok = true;
     if has_log {
         let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
         want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
@@ -769,14 +772,9 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
             let prev_hash = row.remove("prev_hash");
             match stored {
                 Some(Value::String(h)) if !h.is_empty() => {
-                    saw_hashed = true;
-                    let row_prev = prev_hash.as_ref().and_then(Value::as_str);
-                    if row_prev != Some(expected_prev.as_str()) {
-                        ulid_chain_ok = false;
-                    }
                     let text = |k: &str| row.get(k).and_then(Value::as_str);
                     let recomputed = ledger::compute_entry_hash(
-                        row_prev,
+                        prev_hash.as_ref().and_then(Value::as_str),
                         text("ulid").unwrap_or_default(),
                         text("channel").unwrap_or_default(),
                         text("payload").unwrap_or_default(),
@@ -790,25 +788,17 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
                         mismatches += 1;
                     }
                     hasher.update(recomputed.as_bytes());
-                    expected_prev = h;
                 }
                 Some(Value::String(_)) => {
                     // Blank `""` entry_hash is not a NULL legacy prefix row: count it as a
                     // mismatch and fail `chain_ok`, keeping canonical-row rolling-hash parity.
-                    saw_hashed = true;
-                    ulid_chain_ok = false;
                     mismatches += 1;
                     hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
                 }
                 None | Some(Value::Null) => {
-                    if saw_hashed {
-                        ulid_chain_ok = false;
-                    }
                     hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
                 }
                 Some(_) => {
-                    saw_hashed = true;
-                    ulid_chain_ok = false;
                     mismatches += 1;
                     hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
                 }
@@ -818,7 +808,7 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
         })?;
     }
     let mut out = Map::new();
-    out.insert("chain_ok".into(), json!(ledger_ok && ulid_chain_ok && mismatches == 0));
+    out.insert("chain_ok".into(), json!(ledger_ok && mismatches == 0));
     out.insert("count".into(), json!(count));
     out.insert("entry_hash_mismatches".into(), json!(mismatches));
     out.insert("first_ulid".into(), first);
@@ -1634,9 +1624,13 @@ pub fn register(r: &mut Registry) {
             "export_migration_manifest",
             "Read-only migration snapshot of tasks, memory notes and memory graph rows when those tables \
              exist, read in one transaction. The event log is summarised as {chain_ok, count, \
-             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: each row's entry hash is recomputed \
+             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: chain_ok covers seq-order prev_hash \
+             linkage from genesis and zero entry-hash mismatches, plus a legacy unhashed prefix whose length \
+             must match the length the import recorded in ledger_meta (stores imported before that record \
+             existed report false, as event_log_verify does); each row's entry hash is recomputed \
              from its contents, and the rolling hash is SHA-256 over the ulid-ordered recomputed hashes (the \
-             canonical row where a row has none). events_since_ulid also lists the rows after that ulid, with \
+             canonical row where a row has none). The summary has no anchor: compare against an earlier \
+             manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
              client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \
@@ -1869,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn swapped_rows_seq_and_ulid_inversions_break_chain_ok() {
+    fn seq_inversion_breaks_chain_ok_but_ulid_inversion_does_not() {
         // Case 1: ulid order is valid, but seq order is inverted (ledger::verify fails).
         let c = db();
         let h1 = ledger::compute_entry_hash(
@@ -1895,6 +1889,8 @@ mod tests {
         assert_eq!(s["entry_hash_mismatches"], 0);
 
         // Case 2: seq order is valid (ledger::verify passes), but ulid order is inverted.
+        // The Python hub minted ULIDs outside the write lock, so an inverted ulid order is
+        // not a broken chain: only seq order carries linkage.
         let c = db();
         let h1 = ledger::compute_entry_hash(
             Some(ledger::GENESIS_HASH),
@@ -1916,7 +1912,7 @@ mod tests {
         .unwrap();
         assert!(ledger::verify(&c).unwrap().ok);
         let s = event_log_summary(&c).unwrap();
-        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["chain_ok"], true);
         assert_eq!(s["entry_hash_mismatches"], 0);
     }
 
@@ -1947,9 +1943,12 @@ mod tests {
         let s = event_log_summary(&c).unwrap();
         assert_eq!(s["chain_ok"], false);
         assert_eq!(s["entry_hash_mismatches"], 0);
+    }
 
-        // Case 2: seq=1 is NULL legacy prefix (ledger::verify passes), but its ulid '01Z'
-        // sorts after seq=2's hashed '01A', leaving a hashless row after a hashed row in ulid order.
+    #[test]
+    fn legacy_prefix_row_with_a_later_ulid_is_ok() {
+        // seq=1 is a NULL legacy prefix (ledger::verify passes), but its ulid '01Z'
+        // sorts after seq=2's hashed '01A'. Ulid order is not checked for linkage.
         let c = db();
         let h = ledger::compute_entry_hash(
             Some(ledger::GENESIS_HASH),
@@ -1973,8 +1972,54 @@ mod tests {
             .unwrap();
         assert!(ledger::verify(&c).unwrap().ok);
         let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], true);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn deleted_first_hashed_row_breaks_chain_ok() {
+        let c = db();
+        insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        assert_eq!(event_log_summary(&c).unwrap()["chain_ok"], true);
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01A'", []).unwrap();
+        let s = event_log_summary(&c).unwrap();
         assert_eq!(s["chain_ok"], false);
         assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn truncated_or_rewritten_tail_keeps_chain_ok_without_an_anchor() {
+        // The summary records count, the ulid range and the rolling hash, not the head
+        // entry_hash, so chain_ok alone cannot see a missing or rewritten tail; only
+        // comparing the summary against an earlier manifest catches it.
+        let c = db();
+        let hashes = insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        let before = event_log_summary(&c).unwrap();
+        assert_eq!(before["chain_ok"], true);
+
+        // A truncated tail.
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01C'", []).unwrap();
+        let truncated = event_log_summary(&c).unwrap();
+        assert_eq!(truncated["chain_ok"], true);
+        assert_eq!(truncated["count"], 2);
+        assert_eq!(truncated["last_ulid"], "01B");
+        assert_ne!(truncated["rolling_hash"], before["rolling_hash"]);
+
+        // A rewritten tail: a different valid row chained from 01B's entry_hash.
+        insert_chained(&c, &[("01D", "d", "{}", "t3")], &hashes[1]);
+        let rewritten = event_log_summary(&c).unwrap();
+        assert_eq!(rewritten["chain_ok"], true);
+        assert_ne!(rewritten["rolling_hash"], before["rolling_hash"]);
     }
 
     #[test]
