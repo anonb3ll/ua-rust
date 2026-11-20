@@ -581,6 +581,7 @@ async fn approval_detail(
         "resolved_at": row.resolved_at,
         "gate": gate,
         "payload": crate::ui::redact(&row.payload),
+        "display": row.display,
         "payload_complete": true,
         "payload_omissions": [],
         "pass": {

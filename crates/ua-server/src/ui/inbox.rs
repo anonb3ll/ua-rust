@@ -27,6 +27,8 @@ pub struct ApprovalView {
     pub change: String,
     /// "+added −removed" for `change`.
     pub change_counts: String,
+    /// Why no change is shown (the stored diff is from another base).
+    pub change_note: String,
 }
 
 impl ApprovalView {
@@ -41,9 +43,10 @@ impl ApprovalView {
             expires_at: text(v, "expires_at"),
             payload: pretty(v.get("payload").unwrap_or(&Value::Null)),
             change: v.get("display").map(|d| text(d, "diff")).unwrap_or_default(),
+            change_note: v.get("display").map(|d| text(d, "note")).unwrap_or_default(),
             change_counts: v
                 .get("display")
-                .filter(|d| d.get("diff").is_some())
+                .filter(|d| d.get("diff").is_some_and(Value::is_string))
                 .map(|d| format!("+{} \u{2212}{}", text(d, "lines_added"), text(d, "lines_removed")))
                 .unwrap_or_default(),
         }

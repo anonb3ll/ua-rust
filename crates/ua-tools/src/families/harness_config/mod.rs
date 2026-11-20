@@ -129,13 +129,26 @@ CREATE TABLE IF NOT EXISTS harness_config_report_window (
 ",
 };
 
-/// Looks up the proposal behind an apply approval, for the diff shown with
-/// it ([`approval_display`]).
+/// The diff shown with an apply approval ([`approval_display`]): the base it
+/// was computed from (`diff_base`, the SHA-256 of the text last applied, or
+/// `none`) and a lookup by approval. Apply approvals in the payload shape
+/// that bound the diff itself, pending or approved but unused, are expired:
+/// they could stop matching on their own, and a node's next report parks a
+/// new one.
 pub const SCHEMA_V2: SchemaPart = SchemaPart {
     name: "harness_config.v2",
     sql: "
+ALTER TABLE harness_config_proposals ADD COLUMN diff_base TEXT;
 CREATE INDEX IF NOT EXISTS idx_harness_config_proposals_approval
     ON harness_config_proposals(approval_id);
+UPDATE approvals
+   SET status = 'expired',
+       reason = COALESCE(reason, 'superseded: the harness_config_apply payload changed shape'),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')
+ WHERE tool = 'harness_config_apply'
+   AND status IN ('pending', 'approved')
+   AND json_valid(payload)
+   AND json_type(payload, '$.change_summary.diff') IS NOT NULL;
 ",
 };
 
@@ -306,6 +319,16 @@ fn change_diff(hub: &Hub, last: &LastApplied, path: &str, desired: &str) -> Stri
     diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string()
 }
 
+/// The base a change diff is computed from, as stored beside it: the
+/// SHA-256 of the text last applied, or `none` (the diff is from nothing).
+/// Equals `change_summary.from_text_sha256` of the approval, `none` for null.
+fn diff_base(last: &LastApplied) -> String {
+    match last {
+        Some((_, _, _, Some(text))) => content_hash(text),
+        _ => "none".into(),
+    }
+}
+
 /// Lines added and removed in a unified diff (hunk bodies only).
 fn diff_counts(diff: &str) -> (usize, usize) {
     let (mut added, mut removed, mut in_hunk) = (0, 0, false);
@@ -346,20 +369,31 @@ fn canonical(
 
 /// What the approver of a `harness_config_apply` approval is shown beside
 /// its payload: the hub's full diff, kept on the proposal row, with lines
-/// added and removed. Not part of what the approval binds.
-pub(crate) fn approval_display(c: &Connection, approval_id: i64) -> UaResult<Option<Value>> {
-    let row: Option<(String, Option<String>)> = c
-        .query_row(
-            "SELECT id, diff_text FROM harness_config_proposals WHERE approval_id = ?1 \
-             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-            [approval_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.map(|(proposal_id, diff)| {
-        let diff = diff.unwrap_or_default();
-        let (added, removed) = diff_counts(&diff);
-        json!({ "proposal_id": proposal_id, "lines_added": added, "lines_removed": removed, "diff": diff })
+/// added and removed. Not part of what the approval binds. A diff computed
+/// from another base than the one `payload` binds
+/// (`change_summary.from_text_sha256`) is never shown in its place.
+pub(crate) fn approval_display(c: &Connection, approval_id: i64, payload: &Value) -> UaResult<Option<Value>> {
+    let bound = payload["change_summary"]["from_text_sha256"].as_str().unwrap_or("none").to_string();
+    let mut stmt = c.prepare(
+        "SELECT id, diff_text, diff_base FROM harness_config_proposals WHERE approval_id = ?1 \
+         ORDER BY updated_at DESC, rowid DESC",
+    )?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map([approval_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let Some(first) = rows.first().map(|r| r.0.clone()) else { return Ok(None) };
+    Ok(Some(match rows.into_iter().find(|r| r.2.as_deref() == Some(bound.as_str())) {
+        Some((proposal_id, diff, _)) => {
+            let diff = diff.unwrap_or_default();
+            let (added, removed) = diff_counts(&diff);
+            json!({ "proposal_id": proposal_id, "lines_added": added, "lines_removed": removed, "diff": diff })
+        }
+        None => json!({
+            "proposal_id": first,
+            "diff": null,
+            "note": "the stored diff was computed from another base than this approval binds; the node's next \
+                     report shows the current one",
+        }),
     }))
 }
 
@@ -544,6 +578,8 @@ struct Planned {
     payload: Value,
     /// The hub's diff for the approver (display only, not in `payload`).
     diff: String,
+    /// What `diff` was computed from ([`diff_base`]).
+    diff_base: String,
     /// The last applied proposal the change summary was computed from.
     base: Option<String>,
 }
@@ -621,6 +657,7 @@ fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> Ua
             observed_hash,
             payload,
             diff,
+            diff_base: diff_base(&last),
             base: last.map(|l| l.0),
         });
     }
@@ -683,23 +720,27 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
     let mut accepted = Vec::new();
     for item in plan.items {
         let state = approvals::request(tx, hub.cfg(), caller, APPLY_TOOL, &item.payload)?;
-        let existing: Option<(String, Option<String>, Option<i64>)> = tx
+        let existing: Option<(String, Option<String>, Option<i64>, Option<String>)> = tx
             .query_row(
-                "SELECT id, observed_hash, approval_id FROM harness_config_proposals WHERE node = ?1 AND agent = ?2 \
-                 AND surface = ?3 AND bundle_version = ?4 AND desired_hash = ?5 AND path = ?6 \
+                "SELECT id, observed_hash, approval_id, diff_base FROM harness_config_proposals WHERE node = ?1 \
+                 AND agent = ?2 AND surface = ?3 AND bundle_version = ?4 AND desired_hash = ?5 AND path = ?6 \
                  AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
                 params![node, agent, item.surface, version, item.desired_hash, item.path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         let proposal_id = match existing {
-            Some((id, observed, approval)) => {
-                if observed != item.observed_hash || approval != Some(state.approval_id()) {
-                    // A new approval means a new base: refresh the diff shown with it.
+            Some((id, observed, approval, stored_base)) => {
+                if observed != item.observed_hash
+                    || approval != Some(state.approval_id())
+                    || stored_base.as_deref() != Some(item.diff_base.as_str())
+                {
+                    // The diff shown always comes from the base the
+                    // approval binds.
                     tx.execute(
                         "UPDATE harness_config_proposals SET observed_hash = ?2, approval_id = ?3, updated_at = ?4, \
-                         diff_text = CASE WHEN approval_id IS ?3 THEN diff_text ELSE ?5 END WHERE id = ?1",
-                        params![id, item.observed_hash, state.approval_id(), now, item.diff],
+                         diff_text = ?5, diff_base = ?6 WHERE id = ?1",
+                        params![id, item.observed_hash, state.approval_id(), now, item.diff, item.diff_base],
                     )?;
                     changed = true;
                 }
@@ -710,7 +751,8 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
                 tx.execute(
                     "INSERT INTO harness_config_proposals (id, node, agent, surface, path, bundle_version, \
                      desired_hash, observed_hash, diff_text, desired_text, status, approval_id, created_at, \
-                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?12)",
+                     updated_at, diff_base) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, \
+                     ?12, ?13)",
                     params![
                         id,
                         node,
@@ -723,7 +765,8 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
                         item.diff,
                         item.desired,
                         state.approval_id(),
-                        now
+                        now,
+                        item.diff_base
                     ],
                 )?;
                 changed = true;
@@ -801,6 +844,10 @@ struct AppliedPlan {
     proposal_id: String,
     path: String,
     payload: Value,
+    /// The diff from the current base, shown with a new approval if the
+    /// call parks one, and that base ([`diff_base`]).
+    diff: String,
+    diff_base: String,
     base: Option<String>,
 }
 
@@ -846,7 +893,19 @@ fn plan_applied(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> U
     }
     let last = last_applied(c, &node, agent, &surface)?;
     let payload = canonical(&node, &surface, &path, &version, &desired, &last);
-    Ok(AppliedPlan { node, version, surface, hash, proposal_id, path, payload, base: last.map(|l| l.0) })
+    let diff = change_diff(hub, &last, &path, &desired);
+    Ok(AppliedPlan {
+        node,
+        version,
+        surface,
+        hash,
+        proposal_id,
+        path,
+        payload,
+        diff,
+        diff_base: diff_base(&last),
+        base: last.map(|l| l.0),
+    })
 }
 
 /// Why an `applied` call did not apply, committed with its bookkeeping.
@@ -881,9 +940,11 @@ fn commit_applied(
     let approval_id = match approvals::gate(tx, hub.cfg(), caller, APPLY_TOOL, &p.payload)? {
         GateOutcome::Pass { approval_id } => approval_id,
         GateOutcome::Pending { approval_id } => {
+            // The approval parked now binds the current base: show its diff.
             tx.execute(
-                "UPDATE harness_config_proposals SET approval_id = ?2 WHERE id = ?1",
-                params![p.proposal_id, approval_id],
+                "UPDATE harness_config_proposals SET approval_id = ?2, diff_text = ?3, diff_base = ?4, \
+                 updated_at = ?5 WHERE id = ?1",
+                params![p.proposal_id, approval_id, p.diff, p.diff_base, now],
             )?;
             return Ok(Err(NotApplied::Pending(approval_id)));
         }

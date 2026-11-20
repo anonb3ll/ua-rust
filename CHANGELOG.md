@@ -81,11 +81,19 @@ from its commit history.
   identity, and an identity with no configured profile (it no longer falls
   back to `developer`). An authorization code exchanged after its identity
   was retired is refused.
+- OAuth identities never fall back to the `developer` profile: an access
+  token, a refresh and a code exchange are refused once the identity has no
+  explicit `profiles` entry, and refreshing a consented grant needs the
+  identity to still be in `oauth_identities`. An unknown client id and a
+  wrong client secret get the same error.
 - A `harness_config_apply` approval binds deterministic values only; the diff
-  the approver reads is shown beside it, so an approved pass no longer stops
-  matching when the diff timed out.
-- Harness config rules text on any surface, like skill bodies, may not carry
-  front matter that grants tools or permissions (`allowed-tools`, `tools`,
-  `permissionMode`, ...).
+  the approver reads is shown beside it (and only when it was computed from
+  the base the approval binds), so an approved pass no longer stops matching
+  when the diff timed out. Upgrading expires apply approvals in the old
+  payload shape, pending or approved but unused; nodes report again.
+- Front matter in harness config rules text and skills may carry only
+  allowlisted keys (`name`, `description`, `globs`, `alwaysApply`,
+  `argument-hint`, `model`) with plain values; front matter that does not
+  parse is refused.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

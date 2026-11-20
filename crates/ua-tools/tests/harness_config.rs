@@ -1229,3 +1229,108 @@ fn permission_front_matter_is_refused_on_custom_rules_and_mcp_surfaces_and_in_sk
     let e = refusal(json!({ "version": "1", "skills": [{ "name": "s", "body": front_matter("tools") }] }));
     assert!(e.contains("skill \"s\"") && e.contains("tools"), "{e}");
 }
+
+#[tokio::test]
+async fn an_applied_call_that_parks_a_new_approval_shows_the_diff_from_the_new_base() {
+    let h = H::new();
+    h.register().await;
+    write_skill(&h, "review-diff", "");
+    h.publish_skill("review-diff", "skills/review-diff").await;
+    h.publish(json!({ "version": "v1", "rules": { "agents": "shared rules\n" } })).await;
+    let assign =
+        json!({ "action": "assign", "params": { "skill_name": "review-diff", "target": "builder-1" } });
+    let unassign =
+        json!({ "action": "unassign", "params": { "skill_name": "review-diff", "target": "builder-1" } });
+
+    // Without the registry skill: opencode renders to A. Report it.
+    let plain = h.config(json!({})).await.unwrap();
+    let (_, id_a) = report(&h, "v1", "opencode").await;
+    // With it: opencode renders to B, reported from nothing as well.
+    h.gated(&ops(), "skill_registry", assign.clone()).await;
+    let with_skill = h.config(json!({})).await.unwrap();
+    assert_ne!(plain["rendered"]["opencode"]["hash"], with_skill["rendered"]["opencode"]["hash"]);
+    let (p_b, id_b) = report(&h, "v1", "opencode").await;
+    assert!(h.approval_display(id_b).await["diff"].as_str().unwrap().contains("+  \"ua_bundle_version\""));
+
+    // A is applied in between, so B's base moves from nothing to A.
+    h.gated(&ops(), "skill_registry", unassign).await;
+    h.approve(id_a).await;
+    h.config(applied_args(&plain, "opencode")).await.unwrap();
+    h.gated(&ops(), "skill_registry", assign).await;
+
+    // Applying B now binds the new base: the call parks a new approval, and
+    // the diff shown with it is the one from A, not the one from nothing.
+    let e = h.config(applied_args(&with_skill, "opencode")).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id: id_new, .. } = e else { panic!("{e:?}") };
+    assert_ne!(id_new, id_b);
+    let payload = h.approval_payload(id_new);
+    assert_eq!(payload["change_summary"]["base"], "last_applied");
+    let a_text = plain["rendered"]["opencode"]["content"].as_str().unwrap();
+    assert_eq!(payload["change_summary"]["from_text_sha256"], render::content_hash(a_text));
+    let shown = h.approval_display(id_new).await;
+    assert_eq!(shown["proposal_id"], p_b["proposal_id"]);
+    let diff = shown["diff"].as_str().expect("a diff from the bound base");
+    assert!(diff.contains("review-diff"), "{diff}");
+    assert!(
+        !diff.contains("+  \"ua_bundle_version\""),
+        "the unchanged lines are context, not additions: {diff}"
+    );
+}
+
+#[tokio::test]
+async fn a_diff_from_another_base_is_never_shown_with_an_approval() {
+    let h = H::new();
+    h.register().await;
+    h.publish(json!({ "version": "v1", "rules": { "claude": "one\n" } })).await;
+    let (_, id) = report(&h, "v1", "claude").await;
+    assert!(h.approval_display(id).await["diff"].is_string());
+    // The stored diff claims another base than the approval binds.
+    h.hub
+        .db()
+        .write(move |tx| Ok(tx.execute("UPDATE harness_config_proposals SET diff_base = 'ab'", [])?))
+        .unwrap();
+    let shown = h.approval_display(id).await;
+    assert!(shown["diff"].is_null(), "{shown}");
+    assert!(shown["note"].as_str().unwrap().contains("another base"), "{shown}");
+}
+
+#[tokio::test]
+async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.workspace = Some(dir.path().to_path_buf());
+    let parts: Vec<_> =
+        ua_tools::schema_parts().into_iter().filter(|p| p.name != "harness_config.v2").collect();
+    let old =
+        json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "diff": "+x\n" } });
+    let new = json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &parts).unwrap();
+        db.write(|tx| {
+            for (tool, payload, status) in [
+                ("harness_config_apply", &old, "pending"),
+                ("harness_config_apply", &old, "approved"),
+                ("harness_config_apply", &old, "consumed"),
+                ("harness_config_apply", &new, "pending"),
+                ("harness_config_publish", &old, "pending"),
+            ] {
+                tx.execute(
+                    "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
+                     VALUES (?1, ?2, 'builder-1', ?3, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![tool, payload.to_string(), status],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    let hub = Hub::open(cfg).unwrap();
+    let statuses: Vec<String> = hub
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare("SELECT status FROM approvals ORDER BY id")?;
+            Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(statuses, ["expired", "expired", "consumed", "pending", "pending"]);
+}

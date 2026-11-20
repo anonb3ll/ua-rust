@@ -20,6 +20,7 @@
   <h3 id="approval-{{ a.id }}-h">#{{ a.id }} <code>{{ a.tool }}</code></h3>
   <p class="muted">Requested by <strong>{{ a.requested_by }}</strong> at <time>{{ a.created_at }}</time></p>
   {% if !a.change.is_empty() %}<details open><summary>Change ({{ a.change_counts }} lines)</summary><pre class="diff">{{ a.change }}</pre></details>{% endif %}
+  {% if !a.change_note.is_empty() %}<p class="muted">Change: {{ a.change_note }}</p>{% endif %}
   <details><summary>Arguments</summary><pre>{{ a.payload }}</pre></details>
   <form class="inline" method="post" action="/ui/approvals/{{ a.id }}/resolve">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">

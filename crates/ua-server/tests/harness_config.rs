@@ -248,4 +248,28 @@ async fn the_inbox_shows_the_whole_diff_of_an_apply_approval() {
     assert!(!card.contains("<0>"), "the diff is escaped");
     // The arguments the approval binds carry no diff.
     assert!(!card.contains("\\n+rule"), "the diff is not in the payload: {card}");
+
+    // Every reader of the one approval sees the diff too: the approval
+    // detail route and the platform object, before and after approval.
+    for approved in [false, true] {
+        if approved {
+            approve(&hub, approval_id).await;
+        }
+        let resp = hub.send(get(&format!("/api/approvals/{approval_id}"), Some(&cookie), None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let detail = json_body(resp).await;
+        let diff = detail["display"]["diff"].as_str().unwrap_or_else(|| panic!("{detail}"));
+        assert!(diff.contains("+rule <299>"), "{detail}");
+        assert_eq!(detail["display"]["lines_added"], 300);
+        let human = as_caller("operator", ActorKind::Human);
+        let obj = tool(
+            &hub,
+            &human,
+            "platform_object_get",
+            json!({ "kind": "approval", "id": approval_id.to_string() }),
+        )
+        .await
+        .unwrap();
+        assert!(obj["approval"]["display"]["diff"].as_str().unwrap().contains("+rule <0>"), "{obj}");
+    }
 }

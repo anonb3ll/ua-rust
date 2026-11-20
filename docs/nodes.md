@@ -449,11 +449,21 @@ checked always equals the approved one.
 The diff itself is not bound: it is computed with a time limit, and past the
 limit its exact output depends on wall time. The hub computes the full
 unified diff (never truncated; surfaces are capped instead) from that base,
-keeps it on the proposal row, and shows it to the approver beside the
-payload: `approval_pending` adds `display: {proposal_id, lines_added,
-lines_removed, diff}` to each pending `harness_config_apply` request, and the
-Control Center inbox shows the diff above the arguments. The approval row
-itself stays small.
+keeps it on the proposal row with the base it was computed from, and shows
+it to the approver beside the payload: `approval_pending` adds `display:
+{proposal_id, lines_added, lines_removed, diff}` to each pending
+`harness_config_apply` request, one approval read (`GET
+/api/approvals/{id}`, `platform_object_get`) carries it whatever the
+approval's status, and the Control Center inbox shows the diff above the
+arguments. Whenever an approval is parked on a new base (a report, or an
+`applied` call after another change was applied to that surface), the
+diff is recomputed from that base. A stored diff whose base is not the
+`from_text_sha256` the approval binds is never shown in its place
+(`diff: null` with a `note`). The approval row itself stays small.
+
+Upgrading expires `harness_config_apply` approvals, pending or approved but
+unused, that still carry the diff in their payload (schema part
+`harness_config.v2`); the node's next report parks new ones.
 
 A proposal is `pending` until it is `applied`, or `denied`, `expired` (its
 pass was revoked or outlived its TTL) or `closed` (the node was reassigned
