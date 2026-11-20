@@ -68,6 +68,20 @@ from its commit history.
   binaries on `PATH`.
 - Sign-out is a POST form that carries the session CSRF token.
 - A `run_cmd` refusal does not say whether the program is on the allowlist.
+- Migration manifests are version 2: the event log is a summary (count, ulid
+  range, a rolling hash over recomputed entry hashes, `chain_ok`) with an
+  optional `events_since_ulid` row listing kept out of the fingerprint, the
+  manifest is streamed against its cap, and memory is capped at 50000 notes.
+  `compare_migration_manifests` reads the caller's own recorded exports under
+  `exports/` and compares event logs, row content included. Both tools are
+  denied to developer and lead sessions, and `export_data` runs them as
+  governed calls under their own names.
+- `python_lint_and_format` keeps the project's ruff style: it forwards
+  line-length, indent-width, target-version, quote style, excludes
+  (relative globs, anchored at the project) and the lint select, ignore,
+  extend and per-file-ignores settings, validated, as `--config` pairs, and
+  still runs with `--isolated`, from an empty directory, on an absolute path. Its ledger event lists the files a run changed and ruff's
+  fixed and reformatted counts.
 - The memory domain (schema, note model, save, search, ranking, embeddings,
   lifecycle) moved from `ua-tools` into a new `ua-memory` crate, which does
   not depend on the tool registry. Tool names, arguments, schema parts and
