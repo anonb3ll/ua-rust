@@ -39,6 +39,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, UaError};
+use ua_tools::ApprovalRequest;
 use ua_tools::approvals::{self, GateOutcome};
 
 use crate::AppState;
@@ -634,22 +635,33 @@ async fn approval_request(
         Some(Value::Object(m)) => Value::Object(m.clone()),
         Some(_) => return err(StatusCode::BAD_REQUEST, "payload must be a JSON object"),
     };
-    let Some(def) = state.registry.get(&tool) else {
+    if state.registry.get(&tool).is_none() {
         return err(StatusCode::BAD_REQUEST, format!("unknown tool: {tool}"));
-    };
+    }
     let caller = caller(&state, &id, &headers);
     if !may(&caller, "approval_pending") {
         return err(StatusCode::FORBIDDEN, "approval requests are not exposed by the active profile");
     }
-    // Only for a tool the caller could actually run: no inbox spam for tools
-    // its profile hides.
-    if !may(&caller, &tool) {
-        return err(StatusCode::FORBIDDEN, format!("tool {tool:?} is not available to the active profile"));
-    }
-    let gated = def.always_gated || state.hub.cfg().approval_tools.contains(&tool);
-    if !gated {
-        return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
-    }
+    // The checks a call of the tool would pass before its gate (grant,
+    // profile, policy rules, prod-action identity), then the payload its gate
+    // would bind: a `gate_payload` projection, never the raw arguments, so a
+    // secret value is not parked in the approvals table.
+    let payload = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
+        Ok(ApprovalRequest::Payload(p)) => p,
+        Ok(ApprovalRequest::NotGated) => {
+            return err(StatusCode::CONFLICT, format!("tool {tool:?} is not configured to require approval"));
+        }
+        Ok(ApprovalRequest::GatesInHandler) => {
+            return err(
+                StatusCode::CONFLICT,
+                format!(
+                    "tool {tool:?} binds its approval to values it resolves when called; call the tool to \
+                     request its approval"
+                ),
+            );
+        }
+        Err(e) => return tool_err(&e),
+    };
     let (hub, c, t, p) = (state.hub.clone(), caller.clone(), tool.clone(), payload.clone());
     let res = state
         .hub

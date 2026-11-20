@@ -80,7 +80,7 @@ routes with the same request and response shapes:
 | `POST /api/action/task` | `task_update` |
 | `POST /api/action/approval` | `approval_resolve` (verified human only) |
 | `GET /api/approvals`, `GET /api/approvals/{id}` | `approval_pending`, one approval row |
-| `POST /api/approvals/request` | the approval gate, request only |
+| `POST /api/approvals/request` | the approval gate, request only: the same grant, profile, policy and prod-action checks as a call, and the payload the tool's own gate binds (a secret is never stored); `409` for a tool nothing gates and for one that binds its approval when called (`managed_secret_delete`, dispatch and node work, MCP registrations) |
 | `GET /api/sessions` | `session_list` |
 | `GET /api/capability-catalog` | the tool registry, grouped by family |
 | `GET /api/board` | `task_list`, `dependency_list`, `delegate_list` |

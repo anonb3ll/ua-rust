@@ -30,7 +30,7 @@ pub mod registry;
 pub mod sessions;
 
 pub use hub::Hub;
-pub use registry::{Registry, ToolCtx, ToolDef, tool};
+pub use registry::{ApprovalRequest, Registry, ToolCtx, ToolDef, tool};
 
 use ua_store::SchemaPart;
 

@@ -698,3 +698,107 @@ async fn unknown_hosts_are_refused_for_api_and_ui() {
     req.headers_mut().insert(header::HOST, "rebound.example.com".parse().unwrap());
     assert_eq!(send(&app, req).await.status(), StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Approval requests go through the same checks and projection as a call
+
+const SECRET_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+fn approvals_containing(state: &AppState, needle: &str) -> i64 {
+    let pattern = format!("%{needle}%");
+    state
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM approvals WHERE payload LIKE ?1 OR tool LIKE ?1",
+                [pattern],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_approval_request_never_parks_a_secret_value() {
+    let mut cfg = config();
+    cfg.approval_tools = vec!["managed_secret_set".into()];
+    cfg.managed_secret_key = Some(SECRET_KEY.to_string().into());
+    let (app, state) = app(cfg);
+    let value = "plain-secret-value-0001";
+    let req = json!({
+        "tool": "managed_secret_set",
+        "payload": { "name": "docs-token", "consumer": "mcp:docs", "value": value },
+    });
+    let resp = send(&app, post_json("/api/approvals/request", Some(OPERATOR_TOKEN), req)).await;
+    let status = resp.status();
+    let text = body_text(resp).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    assert!(!text.contains(value), "the response echoes the secret: {text}");
+    let total: i64 = state
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(total, 1, "the request is parked");
+    assert_eq!(approvals_containing(&state, value), 0, "a secret value landed in the approvals table");
+
+    // The parked payload is the one the tool's own gate binds, so the call
+    // after approval matches it.
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["payload"]["name"], "docs-token");
+    assert!(v["payload"].get("value").is_none(), "{v}");
+
+    // A tool that gates in its handler binds values only it resolves.
+    let resp = send(
+        &app,
+        post_json(
+            "/api/approvals/request",
+            Some(OPERATOR_TOKEN),
+            json!({ "tool": "managed_secret_delete", "payload": { "name": "docs-token", "consumer": "mcp:docs" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(body_text(resp).await.contains("call the tool"));
+}
+
+#[tokio::test]
+async fn an_approval_request_honours_policy_rules() {
+    let dir = std::env::temp_dir().join(format!(
+        "ua-ui-policy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "version: 1\nenabled: true\nrules:\n  - name: lists-need-a-human\n    type: tool\n    tool: task_list\n    \
+         action: require_approval\n  - name: no-adds\n    type: tool\n    tool: task_add\n    action: deny\n",
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.policy_file = Some(policy);
+    cfg.approval_tools = vec!["task_add".into()];
+    let (app, _state) = app(cfg);
+
+    // A policy require_approval rule gates the call, so it can be requested.
+    let resp =
+        send(&app, post_json("/api/approvals/request", Some(BUILDER_TOKEN), json!({ "tool": "task_list" })))
+            .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    // A policy deny refuses the request, even for a tool in approval_tools.
+    let resp = send(
+        &app,
+        post_json(
+            "/api/approvals/request",
+            Some(BUILDER_TOKEN),
+            json!({ "tool": "task_add", "payload": { "title": "x" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["reason_code"], "policy_deny");
+    let _ = std::fs::remove_dir_all(&dir);
+}
