@@ -1124,12 +1124,10 @@ fn permission_front_matter_is_refused_on_an_agents_rules_surface() {
     }
     // Forms a strict parser would not read as front matter, but a host might.
     for text in [
-        "---\ntools: Bash\n---",                  // no newline after the closing line
-        "---\r\ntools: Bash\r\n---\r\nbody\r\n",  // CRLF
-        "---\ntools: [Bash\n---\nbody\n",         // YAML that does not parse
-        "---\n\"tools\": Bash\n---\nbody\n",      // a quoted key
-        "---\nname: h\ntools: Bash\n...\nbody\n", // closed with `...`
-        "---\nname: h\ntools: Bash\n",            // never closed
+        "---\ntools: Bash\n---",                 // no newline after the closing line
+        "---\r\ntools: Bash\r\n---\r\nbody\r\n", // CRLF
+        "---\n\"tools\": Bash\n---\nbody\n",     // a quoted key
+        "---\nname: h\ntools: Bash\n",           // never closed
     ] {
         let e = refusal(json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }));
         assert!(e.contains("rules.helper") && e.contains("tools"), "{text:?}: {e}");
@@ -1139,6 +1137,77 @@ fn permission_front_matter_is_refused_on_an_agents_rules_surface() {
     // `tools` below the front matter is just text.
     let prose = "# Helper\n\ntools: none needed\n";
     policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": prose } })).unwrap();
+}
+
+/// Refused as the front matter of a `.claude/agents/*.md` rules surface,
+/// with `needle` named in the error.
+fn refused_on_agents_surface(text: &str, needle: &str) {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    let e = refusal(json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }));
+    assert!(e.contains("rules.helper") && e.contains(needle), "{text:?}: {e}");
+}
+
+fn passes_on_agents_surface(text: &str) {
+    let surfaces = json!({ "helper": { "path": ".claude/agents/helper.md", "kind": "rules" } });
+    policy::validate(&json!({ "version": "1", "surfaces": surfaces, "rules": { "helper": text } }))
+        .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+}
+
+#[test]
+fn front_matter_keys_are_allowlisted() {
+    // Keys no denylist named: opencode's `permission`, Claude Code's
+    // `context` and `agent`, `mode`, and anything else.
+    for key in ["permission", "context", "agent", "mode", "skills", "anything-new"] {
+        refused_on_agents_surface(&format!("---\nname: h\n{key}: x\n---\nbody\n"), &format!("`{key}`"));
+    }
+    // Keys are read after parsing, so their spelling cannot hide them.
+    refused_on_agents_surface("---\n{name: h, tools: Bash}\n---\nbody\n", "`tools`"); // flow mapping
+    refused_on_agents_surface("---\n  name: h\n  tools: Bash\n---\nbody\n", "`tools`"); // indented mapping
+    refused_on_agents_surface("---\n\"\\x74ools\": Bash\n---\nbody\n", "`tools`"); // escaped quoted key
+    // An allowed key with a structured value is refused too.
+    refused_on_agents_surface("---\ndescription:\n  tools: Bash\n---\nbody\n", "plain value");
+    // Every allowed key passes.
+    passes_on_agents_surface(
+        "---\nname: h\ndescription: Helps.\nglobs: [\"*.rs\", \"*.md\"]\nalwaysApply: true\nargument-hint: \"[file]\"\nmodel: inherit\n---\nbody\n",
+    );
+}
+
+#[test]
+fn front_matter_that_does_not_parse_is_refused() {
+    // Deeper than the YAML parser's nesting budget.
+    let deep = format!(
+        "---\nname: h\ndescription: {}x{}\ntools: Bash\n---\nbody\n",
+        "[".repeat(100),
+        "]".repeat(100)
+    );
+    refused_on_agents_surface(&deep, "does not parse");
+    refused_on_agents_surface("---\nname: h\ntools: [Bash\n---\nbody\n", "does not parse");
+    refused_on_agents_surface("+++\nname = \"h\"\ntools = [\"Bash\"\n+++\nbody\n", "does not parse");
+}
+
+#[test]
+fn front_matter_opens_and_closes_as_hosts_read_it() {
+    // `---yaml` names the language; other languages are refused.
+    refused_on_agents_surface("---yaml\nname: h\ntools: Bash\n---\nbody\n", "`tools`");
+    refused_on_agents_surface("---js\n{ tools: 'Bash' }\n---\nbody\n", "not allowed");
+    // Leading blank lines before the opener.
+    refused_on_agents_surface("\n\n  \n---\nname: h\ntools: Bash\n---\nbody\n", "`tools`");
+    // TOML front matter.
+    refused_on_agents_surface("+++\nname = \"h\"\ntools = \"Bash\"\n+++\nbody\n", "`tools`");
+    // `...` does not close: the block runs on to the real `---`, and a
+    // block a parser cannot read as one document is refused.
+    refused_on_agents_surface("---\nname: h\n...\ntools: Bash\n---\nbody\n", "does not parse");
+    // A host that closes on a trailing `---` reads `tools` in the line.
+    refused_on_agents_surface("---\nname: h\ntools: Bash ---\nbody\n", "`tools`");
+}
+
+#[test]
+fn markdown_horizontal_rules_are_not_front_matter() {
+    // A rule in the middle of a document.
+    passes_on_agents_surface("# Notes\n\nFirst part.\n\n---\n\nSecond part.\n");
+    // A rule above prose that never closes: no host reads that as a mapping.
+    passes_on_agents_surface("---\n\nIntro paragraph without front matter.\n\nMore text.\n");
+    passes_on_agents_surface("----\nIntro.\n");
 }
 
 #[test]

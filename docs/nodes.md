@@ -358,15 +358,21 @@ node unseen. The renderer is never changed; the bundle is refused instead.
   `signature`, ...) or path segment (long and random-looking), or plain
   `http` to a host that is not loopback.
 - Hidden text: invisible, bidi or tag code points (U+E0000-E007F,
-  zero-width characters, bidi overrides) in rules or skills, and
-  permission-bearing front matter in a skill body or in any rules text: a
-  rules surface may be a host's command or subagent file
-  (`.claude/commands/*.md`, `.claude/agents/*.md`). The keys are
-  `allowed-tools` (skills and commands), `tools`, `disallowedTools`,
-  `permissionMode` and `mcpServers` (subagents), `hooks`, `permissions` and
-  `disallowed-tools`, in any case. Front matter is read leniently: a first
-  line `---` opens it whether or not a strict parser would accept the block
-  (CRLF, a block that is not valid YAML, no closing line).
+  zero-width characters, bidi overrides) in rules or skills.
+- Front matter in a skill body or in any rules text (a rules surface may be
+  a host's command or subagent file, `.claude/commands/*.md` or
+  `.claude/agents/*.md`) with a key outside the allowlist `name`,
+  `description`, `globs`, `alwaysApply`, `argument-hint`, `model`, or with a
+  value that is not a scalar or a list of scalars. Hosts grant tools, hooks,
+  permissions and forked agents through other keys (`allowed-tools`, `tools`,
+  `permission`, `permissionMode`, `context`, `agent`, ...), so the hub lists
+  what is safe instead of what is not; the error names the key. Front matter
+  opens on the first non-blank line starting with `---` (`---yaml`) or
+  `+++` (TOML) and closes on the next line starting with the same
+  delimiter; a line ending in `---` is also read as a close, as some hosts
+  do. A closed block that does not parse is refused; an unclosed one is
+  front matter only if the rest parses as a mapping, so a markdown rule
+  above prose is not. Other front-matter languages are refused.
 - Surfaces: more than 16; a `kind` other than `rules` or `mcp`, or a default
   surface with another kind than its default; a path that is absolute, has
   an empty, `.` or `..` segment, lies in a git or hooks directory, is

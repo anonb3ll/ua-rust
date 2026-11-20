@@ -286,22 +286,17 @@ fn check_description(skill: &Skill, out: &mut Vec<Finding>) {
     }
 }
 
-/// Front-matter keys (lower case) that grant a skill, command or subagent
-/// tools, hooks or permissions on the host. A distributed skill or rules text
-/// must not carry them. `tools`, `disallowedTools`, `permissionMode` and
-/// `mcpServers` are a subagent's (`.claude/agents/*.md`); `allowed-tools` a
-/// skill's or a command's (`.claude/commands/*.md`).
-pub(crate) const PERMISSION_KEYS: [&str; 9] = [
-    "allowed-tools",
-    "allowed_tools",
-    "hooks",
-    "permissions",
-    "disallowed-tools",
-    "tools",
-    "disallowedtools",
-    "permissionmode",
-    "mcpservers",
-];
+/// The only front-matter keys a distributed skill or harness rules text may
+/// carry: what the repo's surfaces use (skills: `name`, `description`;
+/// Cursor rules: `description`, `globs`, `alwaysApply`; commands and
+/// subagents: `description`, `argument-hint`, `model`). Hosts grant tools,
+/// hooks, permissions, MCP servers or forked agents through other keys
+/// (`allowed-tools`, `tools`, `hooks`, `permission`, `permissionMode`,
+/// `context`, `agent`, `mode`, ...), and new ones appear, so every other key
+/// is refused rather than a list of dangerous ones. Matched exactly, as hosts
+/// read them.
+pub const SAFE_FRONT_MATTER_KEYS: [&str; 6] =
+    ["name", "description", "globs", "alwaysApply", "argument-hint", "model"];
 
 /// Code points that hide or reorder text from a human reader: Unicode tag
 /// characters (U+E0000-E007F), zero-width characters and bidi controls.
@@ -326,21 +321,25 @@ pub(crate) fn hidden_chars(text: &str) -> Vec<(usize, char)> {
         .collect()
 }
 
-/// Permission-bearing keys of a front-matter mapping.
-pub(crate) fn permission_keys(meta: &Map<String, Value>) -> Vec<String> {
-    meta.keys().filter(|k| PERMISSION_KEYS.contains(&k.to_ascii_lowercase().as_str())).cloned().collect()
+/// Keys of a front-matter mapping outside [`SAFE_FRONT_MATTER_KEYS`].
+pub(crate) fn disallowed_keys(meta: &Map<String, Value>) -> Vec<String> {
+    meta.keys().filter(|k| !SAFE_FRONT_MATTER_KEYS.contains(&k.as_str())).cloned().collect()
 }
 
 /// Security checks: a skill reaches every host it is distributed to, so it
 /// may not grant itself tools or hooks, or carry text a reviewer cannot see.
 fn check_security(skill: &Skill, out: &mut Vec<Finding>) {
-    for key in permission_keys(&skill.meta) {
+    for key in disallowed_keys(&skill.meta) {
         out.push(finding(
             skill,
             "SKILL-PERMISSIONS",
             "high",
             skill.meta_line(&key),
-            format!("frontmatter key `{key}` grants the skill tools, hooks or permissions on the host"),
+            format!(
+                "frontmatter key `{key}` is not one a distributed skill may carry (allowed: {}); hosts grant \
+                 tools, hooks and permissions through such keys",
+                SAFE_FRONT_MATTER_KEYS.join(", ")
+            ),
             "remove it; a distributed skill gets no permissions of its own",
         ));
     }
