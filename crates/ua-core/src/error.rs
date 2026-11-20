@@ -20,6 +20,10 @@ pub enum UaError {
     ApprovalRequired { tool: String, approval_id: i64 },
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A conflict a client branches on by `reason_code` (for example
+    /// `stale_fence` or `node_retired`). Its `code` is still `conflict`.
+    #[error("conflict: {reason}")]
+    ConflictCode { reason: String, reason_code: String },
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
     #[error("internal error: {0}")]
@@ -43,6 +47,19 @@ impl UaError {
         Self::Conflict(msg.into())
     }
 
+    /// A conflict with a machine-readable reason code.
+    pub fn conflict_code(reason_code: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ConflictCode { reason: reason.into(), reason_code: reason_code.into() }
+    }
+
+    /// The reason code of a denial or coded conflict, if any.
+    pub fn reason_code(&self) -> Option<&str> {
+        match self {
+            Self::Denied { reason_code, .. } | Self::ConflictCode { reason_code, .. } => Some(reason_code),
+            _ => None,
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
@@ -54,7 +71,7 @@ impl UaError {
             Self::NotFound(_) => "not_found",
             Self::Denied { .. } => "denied",
             Self::ApprovalRequired { .. } => "approval_required",
-            Self::Conflict(_) => "conflict",
+            Self::Conflict(_) | Self::ConflictCode { .. } => "conflict",
             Self::Unauthenticated(_) => "unauthenticated",
             Self::Internal(_) => "internal",
         }
@@ -64,7 +81,9 @@ impl UaError {
     pub fn to_json(&self) -> Value {
         let mut body = json!({ "ok": false, "error": self.code(), "message": self.to_string() });
         match self {
-            Self::Denied { reason_code, .. } => body["reason_code"] = json!(reason_code),
+            Self::Denied { reason_code, .. } | Self::ConflictCode { reason_code, .. } => {
+                body["reason_code"] = json!(reason_code)
+            }
             Self::ApprovalRequired { approval_id, tool } => {
                 body["approval_id"] = json!(approval_id);
                 body["tool"] = json!(tool);
