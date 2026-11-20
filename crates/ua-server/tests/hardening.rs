@@ -475,6 +475,29 @@ async fn the_public_url_host_is_allowed_without_listing_it() {
     }
 }
 
+/// An HTTP/2 request carries the host in `:authority` (the URI) and may send
+/// no `Host` header: the guard applies the same allowlist to it.
+#[tokio::test]
+async fn an_http2_authority_outside_the_allowlist_is_refused() {
+    let mut cfg = stream_config();
+    cfg.public_url = Some("https://hub.example.net".into());
+    let hub = TestHub::new(cfg);
+    for (uri, status) in [
+        ("https://hub.example.net/api/whoami", StatusCode::OK),
+        ("https://localhost:8765/api/whoami", StatusCode::OK),
+        ("https://rebound.example.com/api/whoami", StatusCode::FORBIDDEN),
+        ("https://rebound.example.com/ui/work", StatusCode::FORBIDDEN),
+    ] {
+        let req = Request::get(uri)
+            .version(axum::http::Version::HTTP_2)
+            .header(header::AUTHORIZATION, format!("Bearer {AGENT_A}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(req.headers().get(header::HOST).is_none());
+        assert_eq!(hub.send(req).await.status(), status, "{uri}");
+    }
+}
+
 // ---------------------------------------------------------------- registration
 
 fn register_from(addr: &str, body: &Value) -> Request<Body> {
