@@ -46,7 +46,7 @@ use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::verified;
-use super::nodes;
+use super::{governance, nodes};
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -901,6 +901,8 @@ pub(crate) fn insert_item(
     node: &NodeRow,
     created_by: &str,
 ) -> UaResult<Value> {
+    // The one claim gate, again at the enqueue itself (every path queues here).
+    governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
     if let Some(t) = n.task_id {
         let exists: Option<String> =
             tx.query_row("SELECT status FROM tasks WHERE id = ?1", [t], |r| r.get(0)).optional()?;
@@ -911,6 +913,9 @@ pub(crate) fn insert_item(
             }
             _ => {}
         }
+        // Node work bound to a proposal-spawned task (node_dispatch, a
+        // command, node-routed dispatch) fails closed on a drifted contract.
+        governance::task_contract(tx, t)?;
     }
     let id = new_item_id();
     let ts = now();
@@ -1025,6 +1030,12 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
                 return Ok(Ok(prev));
             }
             let node = accepting_node(tx, &n)?;
+            // Before the approval gate, so stopped, held or drifted work never
+            // consumes one.
+            governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+            if let Some(t) = n.task_id {
+                governance::task_contract(tx, t)?;
+            }
             match approvals::gate(tx, hub2.cfg(), &caller, "node_dispatch", &gate_payload(&n, &who))? {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => return Ok(Err(Some(approval_id))),
