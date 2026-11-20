@@ -268,6 +268,39 @@ pub struct Config {
     /// Days an `mcp_server_register` or `mcp_server_review` approval keeps a
     /// downstream MCP server usable before it must be reviewed again (1-365).
     pub mcp_review_ttl_days: u32,
+    /// GitHub repositories (`owner/repo`) the public relay (`relay_manage`)
+    /// may comment on. Empty means the relay sends nowhere.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_github_repos: Vec<String>,
+    /// Name of the managed secret, bound to consumer `relay:github`, holding
+    /// the token the relay posts GitHub comments with.
+    pub relay_github_secret: Option<String>,
+    /// GitHub REST API base URL (https). Change it only for GitHub Enterprise.
+    pub relay_github_api_url: String,
+    /// Host names the relay treats as internal, besides the built-in private
+    /// suffixes (`.internal`, `.local`, `.lan`, ...): machine names, intranet
+    /// domains.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_internal_hosts: Vec<String>,
+    /// Private denylist for the relay: regular expressions (matched
+    /// case-insensitively) a public message must not match. A TOML list, or
+    /// one pattern per line in `UA_RELAY_DENYLIST`. Never serialized, logged
+    /// or returned; a draft that matches is told only that it matched.
+    #[serde(skip_serializing, deserialize_with = "lines_or_list")]
+    pub relay_denylist: Vec<SecretString>,
+    /// Longest relay message, in characters (1-65000).
+    pub relay_max_chars: usize,
+    /// GitHub accounts and teams (`user` or `org/team`, case-insensitive) a
+    /// relay message may @-mention. Every other mention is refused.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_mention_allowlist: Vec<String>,
+    /// Link shorteners and redirectors the relay refuses to link to: a
+    /// shortened link hides where it leads from the human who approves it.
+    #[serde(deserialize_with = "string_or_list")]
+    pub relay_redirector_hosts: Vec<String>,
+    /// Gate runs (`check` and `draft`) one caller may make per hour, so the
+    /// private denylist cannot be probed term by term. 0 refuses every run.
+    pub relay_checks_per_hour: u32,
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -542,9 +575,38 @@ impl Default for Config {
             managed_secret_key: None,
             mcp_servers: BTreeMap::new(),
             mcp_review_ttl_days: 90,
+            relay_github_repos: Vec::new(),
+            relay_github_secret: None,
+            relay_github_api_url: "https://api.github.com".into(),
+            relay_internal_hosts: Vec::new(),
+            relay_denylist: Vec::new(),
+            relay_max_chars: 10_000,
+            relay_mention_allowlist: Vec::new(),
+            relay_redirector_hosts: DEFAULT_REDIRECTOR_HOSTS.iter().map(|h| h.to_string()).collect(),
+            relay_checks_per_hour: 60,
         }
     }
 }
+
+/// Link shorteners and redirectors the relay refuses by default.
+pub const DEFAULT_REDIRECTOR_HOSTS: [&str; 16] = [
+    "bit.ly",
+    "buff.ly",
+    "cutt.ly",
+    "goo.gl",
+    "is.gd",
+    "lnkd.in",
+    "ow.ly",
+    "rb.gy",
+    "rebrand.ly",
+    "shorturl.at",
+    "t.co",
+    "t.ly",
+    "tiny.cc",
+    "tinyurl.com",
+    "v.gd",
+    "href.li",
+];
 
 fn default_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".ua-rust")
@@ -808,6 +870,26 @@ where
     Ok(items.into_iter().map(T::from).collect())
 }
 
+/// Deserialize either a list or a newline separated string. For values that
+/// may hold commas and spaces themselves (regular expressions).
+fn lines_or_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: From<String>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let items = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => s.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        OneOrMany::Many(v) => v,
+    };
+    Ok(items.into_iter().map(T::from).collect())
+}
+
 /// [`string_or_list`] for a setting whose absence means something other
 /// than an empty list.
 fn opt_string_or_list<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
@@ -1041,5 +1123,31 @@ provider_fallback = true
             Some("k-one")
         );
         assert!(!format!("{cfg:?}").contains("k-one"), "the key must not leak through Debug");
+    }
+
+    #[test]
+    fn relay_settings_and_a_private_denylist() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(
+            &file,
+            "relay_github_repos = \"acme/widgets, acme/docs\"\nrelay_github_secret = \"relay-gh\"\n\
+             relay_denylist = [\"project[- ]falcon\", \"a, b\"]\nrelay_max_chars = 500\n",
+        )
+        .unwrap();
+        let cfg = Config::load_inner(Some(&file), false).unwrap();
+        assert_eq!(cfg.relay_github_repos, vec!["acme/widgets", "acme/docs"]);
+        assert_eq!(cfg.relay_github_secret.as_deref(), Some("relay-gh"));
+        assert_eq!(cfg.relay_github_api_url, "https://api.github.com");
+        assert_eq!(cfg.relay_max_chars, 500);
+        assert_eq!(cfg.relay_checks_per_hour, 60);
+        assert!(cfg.relay_redirector_hosts.iter().any(|h| h == "bit.ly"));
+        assert!(cfg.relay_mention_allowlist.is_empty());
+        let deny: Vec<&str> = cfg.relay_denylist.iter().map(|p| p.expose_secret()).collect();
+        assert_eq!(deny, vec!["project[- ]falcon", "a, b"], "list items are not split on commas");
+        assert!(!format!("{cfg:?}").contains("falcon"), "the denylist must not leak through Debug");
+        let one: Vec<SecretString> =
+            lines_or_list(serde_json::Value::String("x y\n\n z,w \n".into())).unwrap();
+        assert_eq!(one.iter().map(|p| p.expose_secret()).collect::<Vec<_>>(), vec!["x y", "z,w"]);
     }
 }

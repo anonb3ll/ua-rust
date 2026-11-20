@@ -50,7 +50,7 @@ pub fn canonical_payload(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
 }
 
-fn pass_expired(cfg: &Config, resolved_at: Option<&str>) -> bool {
+pub(crate) fn pass_expired(cfg: &Config, resolved_at: Option<&str>) -> bool {
     let Some(ts) = resolved_at.and_then(ua_core::time::parse_ts) else { return true };
     let age_s = (jiff_now_s() - ts.as_second()) as f64;
     age_s > cfg.approval_pass_ttl_hours * 3600.0
@@ -320,6 +320,11 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
              WHERE id = ?1",
             params![row.id, new_status, args.reason, resolver, now],
         )?;
+        if row.tool == crate::families::relay::TOOL {
+            // The relay keeps a message's text in its approval only while
+            // the approval is pending, and drops a withdrawn draft's text.
+            crate::families::relay::approval_decided(tx, &caller, &row, new_status)?;
+        }
         ledger::append(
             tx,
             EventInput::new(
