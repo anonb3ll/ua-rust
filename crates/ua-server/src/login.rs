@@ -95,20 +95,34 @@ pub fn routes() -> Router<AppState> {
 pub const COOKIE_KEY_TTL: Duration = Duration::from_secs(60);
 
 /// The cookie encryption key, cached in [`AppState`] so an authenticated UI
-/// request does not query `ui_keys`. The key is created on first use; it is
-/// re-read at most every [`COOKIE_KEY_TTL`], and at once after
-/// [`CookieKeyCache::invalidate`], which any code that replaces the key must
-/// call. (The hub has no in-process rotation command: rotating means
-/// deleting the `ui_keys` row, which signs every browser out once the
-/// cached copy lapses.)
-#[derive(Default)]
+/// request does not query `ui_keys` to *read* a cookie. The key is created
+/// on first use and re-read at most every [`COOKIE_KEY_TTL`], at once after
+/// [`CookieKeyCache::invalidate`], and on every sign-in: a new cookie is
+/// always encrypted with the key `ui_keys` holds now, never a cached copy
+/// the table no longer has.
+///
+/// Nothing in the hub deletes or replaces the row; rotating means deleting
+/// it outside the hub (the next read creates a new key). Code that ever
+/// does so in-process must call [`CookieKeyCache::invalidate`].
 pub struct CookieKeyCache {
     slot: RwLock<Option<(Key, Instant)>>,
+    ttl: Duration,
+}
+
+impl Default for CookieKeyCache {
+    fn default() -> Self {
+        Self::with_ttl(COOKIE_KEY_TTL)
+    }
 }
 
 impl CookieKeyCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A cache whose copy lapses after `ttl` (tests use a short one).
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self { slot: RwLock::new(None), ttl }
     }
 
     /// Drop the cached key; the next request reads `ui_keys` again.
@@ -118,7 +132,7 @@ impl CookieKeyCache {
 
     fn fresh(&self) -> Option<Key> {
         let slot = self.slot.read().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref().filter(|(_, at)| at.elapsed() < COOKIE_KEY_TTL).map(|(k, _)| k.clone())
+        slot.as_ref().filter(|(_, at)| at.elapsed() < self.ttl).map(|(k, _)| k.clone())
     }
 
     fn store(&self, key: &Key) {
@@ -161,6 +175,12 @@ async fn cookie_key(state: &AppState) -> UaResult<Key> {
     if let Some(k) = state.cookie_key.fresh() {
         return Ok(k);
     }
+    stored_cookie_key(state).await
+}
+
+/// The key `ui_keys` holds now (created if missing), read off the async
+/// runtime; it replaces the cached copy. Used to encrypt every new cookie.
+async fn stored_cookie_key(state: &AppState) -> UaResult<Key> {
     let hub = state.hub.clone();
     let key = tokio::task::spawn_blocking(move || load_cookie_key(&hub))
         .await
@@ -290,7 +310,7 @@ fn session_cookie(state: &AppState, raw: String) -> Cookie<'static> {
 
 /// A response that sets a fresh session cookie.
 async fn with_session(state: &AppState, raw: String, resp: Response) -> Response {
-    match cookie_key(state).await {
+    match stored_cookie_key(state).await {
         Ok(key) => (PrivateCookieJar::new(key).add(session_cookie(state, raw)), resp).into_response(),
         Err(e) => server_error(e),
     }

@@ -283,3 +283,49 @@ async fn sign_in_pages_run_under_a_csp_without_inline_script() {
         assert!(text_body(resp).await.contains(needle), "{path}");
     }
 }
+
+/// The cached copy lapses after its TTL: a key deleted outside the hub
+/// stops decrypting cookies then. A sign-in never encrypts with a cached
+/// copy the table no longer holds.
+#[tokio::test]
+async fn the_cached_cookie_key_lapses_and_sign_in_uses_the_stored_key() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let hub = TestHub::new(config());
+    let mut state = hub.state.clone();
+    state.cookie_key = Arc::new(ua_server::login::CookieKeyCache::with_ttl(Duration::from_millis(200)));
+    let app = ua_server::router(state, tokio_util::sync::CancellationToken::new());
+    let send = |req| {
+        let app = app.clone();
+        async move { tower::ServiceExt::oneshot(app, req).await.unwrap() }
+    };
+    let cookie = hub.sign_in("operator").await;
+    assert_eq!(send(get("/api/session", Some(&cookie), None)).await.status(), 200);
+    let delete_key = || {
+        hub.state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute("DELETE FROM ui_keys", [])?;
+                Ok(())
+            })
+            .unwrap()
+    };
+    delete_key();
+    // Within the TTL the cached copy still reads the cookie.
+    assert_eq!(json_body(send(get("/api/session", Some(&cookie), None)).await).await["auth"], "cookie");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // After it, the table is read again: a new key, the old cookie is gone.
+    assert_ne!(json_body(send(get("/api/session", Some(&cookie), None)).await).await["auth"], "cookie");
+
+    // A sign-in right after the row is deleted again (the cache still holds
+    // the previous key) encrypts with the key the table holds now, so the
+    // new cookie keeps working once the cache lapses.
+    let url = ua_server::login::create_login_link(&hub.state.hub, "operator", "test").unwrap();
+    let token = query_param(&url, "token").unwrap();
+    delete_key();
+    let resp = send(form("/login/link", &[("token", &token)], None)).await;
+    let fresh = session_cookie(&resp).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(json_body(send(get("/api/session", Some(&fresh), None)).await).await["auth"], "cookie");
+}
