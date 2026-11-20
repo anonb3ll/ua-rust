@@ -10,7 +10,7 @@ ua-rust is a Rust rebuild of the Python `unified-agent` hub. It keeps the tool
 contract (tool names, argument shapes and HTTP routes) so existing MCP clients
 can point at it unchanged; the storage schema and some of the UX are new.
 
-> **Status: alpha.** 175 tools are registered and the core families are ported.
+> **Status: alpha.** 180 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -100,6 +100,7 @@ vulnerability.
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries and agent hosts for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
+| TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
 | Auth | OAuth 2.1 authorization server, passkeys, browser sessions | [auth](docs/auth.md) |
 | Migration | `ua import python-hub` with a dry run, resumable and chain-verified | |
@@ -109,9 +110,10 @@ vulnerability.
 The node wake transport, harness config bundle and session credentials
 (`/api/node/wake*`, `/config`, `/session_credential` answer 501), device
 acceptance, cloud executors, ACP, Slack and Zulip
-connectors, role workflows, the TypeScript SDK's platform routes
-(`/api/runs`, `/api/platform/*` answer 501), billing and usage ledgers, and
-tenancy (`org_id`).
+connectors, role workflows, the SDK's queue-health and node-session routes
+(`/api/queue-health`, `/api/action/node-session`), the provenance graph and
+evidence export, billing and usage ledgers, and tenancy (`org_id`). Work
+products (`/api/work-products*`) are not being ported and answer 501.
 
 ## License
 

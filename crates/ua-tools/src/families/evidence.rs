@@ -1,6 +1,10 @@
 //! Evidence reports and state consistency checks.
 //!
-//! Tools: `evidence_report` and `state_sync_verify`.
+//! Tools: `evidence_report`, `evidence_append` and `state_sync_verify`.
+//!
+//! `evidence_append` is the canonical writer for client evidence: one ledger
+//! event on an `sdk.` channel, attributed to the verified caller (never to a
+//! label in the body), deduplicated per caller by an optional key.
 //!
 //! `evidence_report` assembles, per task, the ledger events that mention it
 //! (with their hashes), the task row, its approvals and delegations, and the
@@ -651,6 +655,88 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Client evidence.
+
+/// Channels `evidence_append` may write: a client cannot forge hub events.
+pub const CLIENT_CHANNEL_PREFIX: &str = "sdk.";
+const CHANNEL_MAX: usize = 120;
+const DEDUPE_MAX: usize = 256;
+/// Largest serialized payload `evidence_append` stores.
+const PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppendArgs {
+    /// Channel in the `sdk.` namespace, at most 120 characters.
+    pub channel: String,
+    /// The event body (a JSON object, at most 64 KiB serialized).
+    pub payload: Map<String, Value>,
+    /// Idempotency key (1-256 characters): a repeat with the same key from the
+    /// same caller appends nothing and returns the first event.
+    pub dedupe_key: Option<String>,
+}
+
+/// The stored dedupe key: namespaced by caller, so one identity can neither
+/// observe nor pre-empt another's keys.
+fn client_dedupe_key(label: &str, key: &str) -> String {
+    format!("sdk-evidence:{label}:{key}")
+}
+
+async fn evidence_append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
+    if !matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human) {
+        return Err(UaError::denied(
+            "identity_required",
+            "evidence_append requires an authenticated identity; evidence is attributed to it",
+        ));
+    }
+    let channel = a.channel.trim().to_string();
+    if !channel.starts_with(CLIENT_CHANNEL_PREFIX)
+        || channel.len() <= CLIENT_CHANNEL_PREFIX.len()
+        || channel.chars().count() > CHANNEL_MAX
+        || channel.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(UaError::invalid(format!(
+            "channel must use the {CLIENT_CHANNEL_PREFIX} namespace (at most {CHANNEL_MAX} characters, no spaces)"
+        )));
+    }
+    let dedupe = match a.dedupe_key {
+        None => None,
+        Some(k) if !k.trim().is_empty() && k.chars().count() <= DEDUPE_MAX => Some(k.trim().to_string()),
+        Some(_) => {
+            return Err(UaError::invalid(format!(
+                "dedupe_key must be a non-empty string of at most {DEDUPE_MAX} characters"
+            )));
+        }
+    };
+    let payload = Value::Object(a.payload);
+    if serde_json::to_vec(&payload)?.len() > PAYLOAD_MAX_BYTES {
+        return Err(UaError::invalid(format!("payload is larger than {PAYLOAD_MAX_BYTES} bytes")));
+    }
+    let label = ctx.caller.label.clone();
+    let stored_key = dedupe.as_deref().map(|k| client_dedupe_key(&label, k));
+    let (ulid, inserted) = ctx
+        .hub
+        .db()
+        .write_async(move |tx| {
+            let mut input = EventInput::new(channel, payload).by(label);
+            if let Some(k) = &stored_key {
+                input = input.dedupe(k.clone());
+            }
+            match ledger::append(tx, input)? {
+                Some(ev) => Ok((ev.ulid, true)),
+                None => {
+                    let k = stored_key.unwrap_or_default();
+                    let ulid: String =
+                        tx.query_row("SELECT ulid FROM event_log WHERE dedupe_key = ?1", [&k], |r| r.get(0))?;
+                    Ok((ulid, false))
+                }
+            }
+        })
+        .await?;
+    Ok(json!({ "event_ulid": ulid, "inserted": inserted }))
+}
+
+// ---------------------------------------------------------------------------
 // Registration.
 
 pub fn register(r: &mut Registry) {
@@ -666,6 +752,17 @@ pub fn register(r: &mut Registry) {
         )
         .family("evidence")
         .read_only(),
+    );
+    r.add(
+        tool(
+            "evidence_append",
+            "Append one client evidence event to the tamper-evident ledger: channel in the sdk. namespace, a \
+             JSON object payload (at most 64 KiB), optional dedupe_key. The originator is always the verified \
+             caller. A repeat with the same dedupe_key from the same caller appends nothing. Returns \
+             {event_ulid, inserted}.",
+            evidence_append,
+        )
+        .family("evidence"),
     );
     r.add(
         tool(
