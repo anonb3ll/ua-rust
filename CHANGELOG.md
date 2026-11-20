@@ -73,6 +73,12 @@ from its commit history.
   manifest is streamed against its cap, and memory is capped at 50000 notes.
   `compare_migration_manifests` reads files under `exports/` and compares
   event logs. Both tools are denied to developer and lead sessions.
+- `python_lint_and_format` keeps the project's ruff style: it forwards
+  line-length, indent-width, target-version, quote style and the lint
+  select/ignore lists, validated, as `--config` pairs, and still runs with
+  `--isolated`. Its ledger event lists the files a run changed and ruff's
+  fixed and reformatted counts.
+
 ### Security
 
 - `/api` and `/ui` refuse an unknown host and a cross-site write.

@@ -22,13 +22,18 @@ struct Env {
 
 /// A hub whose `ruff` is a fake that logs its argv (and, with `sleep`, hangs).
 fn env_with(sleep: Option<u32>, tweak: impl FnOnce(&mut Config)) -> Env {
+    env_script(sleep, "", tweak)
+}
+
+/// As [`env_with`], with `extra` shell appended to the fake ruff (run in the workspace).
+fn env_script(sleep: Option<u32>, extra: &str, tweak: impl FnOnce(&mut Config)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let bin = dir.path().join("bin");
     let log = dir.path().join("ruff.log");
     let env_log = dir.path().join("ruff-env.log");
-    install_fake_ruff(&bin, &log, &env_log, sleep);
+    install_fake_ruff(&bin, &log, &env_log, sleep, extra);
     let mut cfg = Config::for_home(dir.path());
     cfg.workspace = Some(workspace.clone());
     cfg.python_lint_path_prepend = Some(bin);
@@ -102,11 +107,11 @@ impl Env {
     }
 }
 
-fn install_fake_ruff(bin: &Path, log: &Path, env_log: &Path, sleep: Option<u32>) {
+fn install_fake_ruff(bin: &Path, log: &Path, env_log: &Path, sleep: Option<u32>, extra: &str) {
     std::fs::create_dir_all(bin).unwrap();
     let pause = sleep.map(|s| format!("sleep {s}\n")).unwrap_or_default();
     let script = format!(
-        "#!/bin/sh\n{pause}printf '%s\\0' \"$@\" >> {log}\nprintf '\\n' >> {log}\nprintf '%s\\n' \"$RUFF_NO_CACHE\" >> {env_log}\n",
+        "#!/bin/sh\n{pause}printf '%s\\0' \"$@\" >> {log}\nprintf '\\n' >> {log}\nprintf '%s\\n' \"$RUFF_NO_CACHE\" >> {env_log}\n{extra}\n",
         log = shell_quote(log),
         env_log = shell_quote(env_log),
     );
@@ -144,6 +149,60 @@ fn allowlist_is_only_the_two_fixed_invocations() {
     no(&["ruff", "check", "--isolated", "--fix", "-src/app.py"]);
     no(&["ruff", "format", "--isolated", "--config=x.toml"]);
     no(&["bash", "-c", "ruff format --isolated src/app.py"]);
+
+    // Project style arrives as --config pairs, only for the allowlisted keys.
+    ok(&["ruff", "check", "--isolated", "--config", "line-length=120", "--fix", "src/app.py"]);
+    ok(&[
+        "ruff",
+        "check",
+        "--isolated",
+        "--config",
+        "target-version=\"py311\"",
+        "--config",
+        "lint.select=[\"E\",\"F\",\"UP\"]",
+        "--config",
+        "lint.ignore=[\"E501\"]",
+        "--fix",
+        "src/app.py",
+    ]);
+    ok(&["ruff", "format", "--isolated", "--config", "format.quote-style=\"single\"", "src/app.py"]);
+    ok(&["ruff", "format", "--isolated", "--config", "indent-width=2", "src/app.py"]);
+    for pair in [
+        "extend=\"/etc/hostname\"",
+        "cache-dir=\"/var/tmp/x\"",
+        "unsafe-fixes=true",
+        "lint.unsafe-fixes=true",
+        "src=[\"/\"]",
+        "include=[\"*.py\"]",
+        "exclude=[]",
+        "extend-exclude=[]",
+        "lint.extend-select=[\"E\"]",
+        "fix=true",
+        "line-length=0",
+        "line-length=999",
+        "line-length=120 ",
+        "line-length=\"120\"",
+        "line-length=1_20",
+        "indent-width=0",
+        "target-version=\"py27\"",
+        "target-version=py311",
+        "format.quote-style=\"preserve\"",
+        "format.quote-style='single'",
+        "lint.select=[\"E\";\"F\"]",
+        "lint.select=[\"e501\"]",
+        "lint.select=[\"E\",]",
+        "lint.select=\"E\"",
+        "line-length",
+        "=120",
+    ] {
+        no(&["ruff", "format", "--isolated", "--config", pair, "src/app.py"]);
+        no(&["ruff", "check", "--isolated", "--config", pair, "--fix", "src/app.py"]);
+    }
+    // The pairs go between --isolated and the step's own flag, as separate elements.
+    no(&["ruff", "check", "--isolated", "--fix", "--config", "line-length=120", "src/app.py"]);
+    no(&["ruff", "format", "--config", "line-length=120", "--isolated", "src/app.py"]);
+    no(&["ruff", "format", "--isolated", "--config=line-length=120", "src/app.py"]);
+    no(&["ruff", "format", "--isolated", "--config", "src/app.py"]);
 }
 
 #[tokio::test]
@@ -373,4 +432,201 @@ async fn a_real_ruff_ignores_the_project_config() {
     assert!(!cache.exists(), "cache-dir from the project config was honoured");
     assert!(!e.workspace.join(".ruff_cache").exists(), "RUFF_NO_CACHE was not honoured");
     assert_eq!(std::fs::read_to_string(e.workspace.join("app.py")).unwrap(), "x = 1\n");
+}
+
+/// The forwarded `--config` pairs of each run, in order.
+fn config_pairs(run: &[String]) -> Vec<String> {
+    run.windows(2).filter(|w| w[0] == "--config").map(|w| w[1].clone()).collect()
+}
+
+#[tokio::test]
+async fn the_project_style_is_forwarded_as_config_pairs() {
+    let e = env();
+    e.write(
+        "proj/pyproject.toml",
+        "[project]\nname = \"demo\"\n\n[tool.ruff]\nline-length = 120\nindent-width = 4\ntarget-version = \"py311\"\n\n\
+         [tool.ruff.format]\nquote-style = \"single\"\n\n[tool.ruff.lint]\nselect = [\"E\", \"F\", \"UP\"]\nignore = [\"E501\"]\n",
+    );
+    e.write("proj/src/app.py", "x = 'a'\n");
+    let ran = e.call(json!({"path": "proj/src/app.py"})).await.unwrap();
+    assert_eq!(ran["success"], true, "{ran}");
+    let runs = e.runs();
+    assert_eq!(
+        runs[0],
+        argv(&[
+            "check",
+            "--isolated",
+            "--config",
+            "line-length=120",
+            "--config",
+            "indent-width=4",
+            "--config",
+            "target-version=\"py311\"",
+            "--config",
+            "lint.select=[\"E\",\"F\",\"UP\"]",
+            "--config",
+            "lint.ignore=[\"E501\"]",
+            "--fix",
+            "proj/src/app.py",
+        ])
+    );
+    assert_eq!(
+        runs[1],
+        argv(&[
+            "format",
+            "--isolated",
+            "--config",
+            "line-length=120",
+            "--config",
+            "indent-width=4",
+            "--config",
+            "target-version=\"py311\"",
+            "--config",
+            "format.quote-style=\"single\"",
+            "proj/src/app.py",
+        ])
+    );
+    assert_eq!(ran["config"]["source"], "proj/pyproject.toml", "{ran}");
+    let events = e.lint_events().await;
+    assert_eq!(events[0]["payload"]["config"]["source"], "proj/pyproject.toml");
+}
+
+#[tokio::test]
+async fn ruff_toml_is_found_from_the_target_and_wins_over_pyproject() {
+    let e = env();
+    e.write("pyproject.toml", "[tool.ruff]\nline-length = 88\n");
+    e.write("svc/ruff.toml", "line-length = 100\n[format]\nquote-style = \"double\"\n");
+    e.write("svc/pyproject.toml", "[tool.ruff]\nline-length = 70\n");
+    e.write("svc/.ruff.toml", "line-length = 110\n");
+    e.write("svc/pkg/mod.py", "x = 1\n");
+    e.write("other/mod.py", "x = 1\n");
+    // .ruff.toml beats ruff.toml beats pyproject.toml in one directory, as in ruff.
+    e.call(json!({"path": "svc/pkg"})).await.unwrap();
+    assert_eq!(config_pairs(&e.runs()[0]), vec!["line-length=110"]);
+    std::fs::remove_file(e.workspace.join("svc/.ruff.toml")).unwrap();
+    e.call(json!({"path": "svc/pkg/mod.py"})).await.unwrap();
+    assert_eq!(config_pairs(&e.runs()[3]), vec!["line-length=100", "format.quote-style=\"double\""]);
+    // A target with no config of its own uses the nearest one above it.
+    e.call(json!({"path": "other/mod.py"})).await.unwrap();
+    assert_eq!(config_pairs(&e.runs()[4]), vec!["line-length=88"]);
+    // A pyproject.toml without [tool.ruff] is skipped, as ruff skips it.
+    e.write("other/pyproject.toml", "[project]\nname = \"x\"\n");
+    e.call(json!({"path": "other/mod.py"})).await.unwrap();
+    assert_eq!(config_pairs(&e.runs()[6]), vec!["line-length=88"]);
+}
+
+#[tokio::test]
+async fn hostile_config_keys_are_never_forwarded() {
+    let e = env();
+    e.write(
+        "pyproject.toml",
+        "[tool.ruff]\nextend = \"/etc/hostname\"\ncache-dir = \"/var/tmp/ruff-cache\"\nunsafe-fixes = true\n\
+         src = [\"/\"]\ninclude = [\"*.py\"]\nexclude = []\nline-length = 100\n\n[tool.ruff.lint]\n\
+         extend-select = [\"ALL\"]\nunsafe-fixes = true\nselect = [\"F\"]\n",
+    );
+    e.write("app.py", "x = 1\n");
+    let ran = e.call(json!({"path": "app.py"})).await.unwrap();
+    let runs = e.runs();
+    assert_eq!(config_pairs(&runs[0]), vec!["line-length=100", "lint.select=[\"F\"]"]);
+    assert_eq!(config_pairs(&runs[1]), vec!["line-length=100"]);
+    let notes = ran["config"]["notes"].to_string();
+    for key in ["extend", "cache-dir", "unsafe-fixes", "src", "include", "exclude", "lint.extend-select"] {
+        assert!(notes.contains(key), "no note for {key}: {notes}");
+    }
+}
+
+#[tokio::test]
+async fn bad_config_values_are_ignored_with_a_note() {
+    let e = env();
+    e.write(
+        "pyproject.toml",
+        "[tool.ruff]\nline-length = 0\nindent-width = \"4\"\ntarget-version = \"py27\"\n\n[tool.ruff.format]\n\
+         quote-style = \"preserve\"\n\n[tool.ruff.lint]\nselect = [\"E\", \"F; rm -rf /\"]\nignore = \"E501\"\n",
+    );
+    e.write("app.py", "x = 1\n");
+    let ran = e.call(json!({"path": "app.py"})).await.unwrap();
+    for run in e.runs() {
+        assert!(config_pairs(&run).is_empty(), "{run:?}");
+    }
+    let notes = ran["config"]["notes"].to_string();
+    for key in
+        ["line-length", "indent-width", "target-version", "format.quote-style", "lint.select", "lint.ignore"]
+    {
+        assert!(notes.contains(key), "no note for {key}: {notes}");
+    }
+    // A file that is not valid TOML is skipped with a note; the run goes ahead on ruff's defaults.
+    e.write("pyproject.toml", "[tool.ruff\nline-length = 100\n");
+    let ran = e.call(json!({"path": "app.py"})).await.unwrap();
+    assert!(ran["config"]["notes"].to_string().contains("pyproject.toml"), "{ran}");
+    assert!(config_pairs(&e.runs()[2]).is_empty());
+}
+
+#[tokio::test]
+async fn a_config_file_symlinked_out_of_the_workspace_is_not_read() {
+    let e = env();
+    let outside = e.dir.path().join("ruff.toml");
+    std::fs::write(&outside, "line-length = 100\n").unwrap();
+    std::os::unix::fs::symlink(&outside, e.workspace.join("ruff.toml")).unwrap();
+    e.write("app.py", "x = 1\n");
+    let ran = e.call(json!({"path": "app.py"})).await.unwrap();
+    assert!(config_pairs(&e.runs()[0]).is_empty(), "{:?}", e.runs());
+    assert!(ran["config"]["notes"].to_string().contains("ruff.toml"), "{ran}");
+}
+
+#[tokio::test]
+async fn the_ledger_records_changed_files_and_counts() {
+    let script = "case \"$1\" in\n\
+        check) echo 'Found 3 errors (2 fixed, 1 remaining).' ;;\n\
+        format) printf 'y = 2\\n' > pkg/b.py; echo '1 file reformatted, 1 file left unchanged' ;;\n\
+        esac";
+    let e = env_script(None, script, |_| {});
+    e.write("pkg/a.py", "x = 1\n");
+    e.write("pkg/b.py", "y=2\n");
+    e.write("pkg/notes.txt", "not python\n");
+    let ran = e.call(json!({"path": "pkg"})).await.unwrap();
+    assert_eq!(ran["changed_files"], json!(["pkg/b.py"]), "{ran}");
+    let events = e.lint_events().await;
+    let p = &events[0]["payload"];
+    assert_eq!(p["changed_files"], json!(["pkg/b.py"]), "{p}");
+    assert_eq!(p["files_scanned"], 2, "{p}");
+    assert_eq!(p["files_truncated"], false, "{p}");
+    assert_eq!(p["fixed"], 2, "{p}");
+    assert_eq!(p["remaining"], 1, "{p}");
+    assert_eq!(p["reformatted"], 1, "{p}");
+    // No absolute path reaches the ledger.
+    let text = p.to_string();
+    assert!(!text.contains(&*e.workspace.to_string_lossy()), "{text}");
+    assert!(!text.contains(&*e.dir.path().to_string_lossy()), "{text}");
+
+    // Output ruff did not print leaves the counts null; nothing changed is an empty list.
+    let quiet = env();
+    quiet.write("app.py", "x = 1\n");
+    quiet.call(json!({"path": "app.py"})).await.unwrap();
+    let p = &quiet.lint_events().await[0]["payload"];
+    assert_eq!(p["changed_files"], json!([]), "{p}");
+    assert_eq!(p["fixed"], Value::Null, "{p}");
+    assert_eq!(p["reformatted"], Value::Null, "{p}");
+}
+
+/// With a real ruff on PATH, the project's own style survives a run: a
+/// 100-column line with single quotes is left as it is under line-length 120
+/// and quote-style single, where ruff's defaults would rewrite both.
+#[tokio::test]
+async fn a_real_ruff_keeps_the_project_style() {
+    if !which_ruff_on_path() {
+        eprintln!("skipped: no ruff on PATH");
+        return;
+    }
+    let e = env_with(None, |cfg| cfg.python_lint_path_prepend = None);
+    e.write(
+        "pyproject.toml",
+        "[tool.ruff]\nline-length = 120\n\n[tool.ruff.format]\nquote-style = \"single\"\n",
+    );
+    let body = "data = {'alpha': 'first value here', 'beta': 'second value here', 'gamma': 'third value'}\n";
+    assert!(body.len() > 89 && body.len() < 120);
+    e.write("app.py", body);
+    let ran = e.call(json!({"path": "app.py"})).await.unwrap();
+    assert_eq!(ran["success"], true, "{ran}");
+    assert_eq!(std::fs::read_to_string(e.workspace.join("app.py")).unwrap(), body);
+    assert_eq!(ran["changed_files"], json!([]), "{ran}");
 }
