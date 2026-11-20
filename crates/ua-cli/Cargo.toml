@@ -13,11 +13,16 @@ path = "src/main.rs"
 
 [features]
 # On by default, so `ua` with no feature flags is the same binary as before.
-# `--no-default-features` builds it without tree-sitter, dom_smoothie and rmcp.
-default = ["tree-sitter", "dom_smoothie", "rmcp"]
-tree-sitter = ["ua-tools/tree-sitter", "ua-server/tree-sitter", "ua-import/tree-sitter"]
-dom_smoothie = ["ua-tools/dom_smoothie", "ua-server/dom_smoothie", "ua-import/dom_smoothie"]
-rmcp = ["ua-tools/rmcp", "ua-server/rmcp", "ua-import/rmcp"]
+# `--no-default-features` builds it without tree-sitter, dom_smoothie and
+# rmcp. See "Build options" in the README.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+code-intel = ["ua-tools/code-intel", "ua-server/code-intel", "ua-import/code-intel"]
+readability = ["ua-tools/readability", "ua-server/readability", "ua-import/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway", "ua-server/mcp-gateway", "ua-import/mcp-gateway"]
+# `ua mcp` and the `/mcp` route of `ua serve`.
+mcp-server = ["ua-server/mcp-server"]
+# Off by default: semantic memory search with fastembed.
+embeddings = ["ua-tools/embeddings", "ua-server/embeddings", "ua-import/embeddings"]
 
 [dependencies]
 anyhow.workspace = true

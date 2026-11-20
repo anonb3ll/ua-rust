@@ -1,7 +1,7 @@
 //! The MCP surface claims (capability_catalog's `tool_annotations`) that
 //! every tool carries readOnlyHint and destructiveHint. Hold it to that.
 
-#![cfg(feature = "rmcp")]
+#![cfg(feature = "mcp-server")]
 
 use ua_server::mcp::to_mcp_tool;
 

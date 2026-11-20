@@ -13,9 +13,24 @@ use ua_core::{ActorKind, Caller, Config};
 use ua_server::AppState;
 use ua_tools::{Hub, builtin_registry};
 
+/// `ua --version`: the version and the optional Cargo features compiled in,
+/// the same list system_doctor and capability_catalog report as
+/// `build_features`.
+fn version_text() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let names = |on: bool| -> String {
+            let v: Vec<&str> =
+                ua_tools::BUILD_FEATURES.iter().filter(|f| f.enabled == on).map(|f| f.feature).collect();
+            if v.is_empty() { "none".into() } else { v.join(", ") }
+        };
+        format!("{} (features: {}; without: {})", env!("CARGO_PKG_VERSION"), names(true), names(false))
+    })
+}
+
 /// ua: agent-operations hub.
 #[derive(Parser)]
-#[command(version, about, propagate_version = true)]
+#[command(version = version_text(), about, propagate_version = true)]
 struct Cli {
     /// Config file (default: $UA_CONFIG, then $UA_HOME/config.toml).
     #[arg(long, global = true, env = "UA_CONFIG")]
@@ -28,8 +43,8 @@ struct Cli {
 enum Cmd {
     /// Run the HTTP hub (MCP at /mcp, JSON API at /api).
     Serve,
-    /// Serve MCP over stdin/stdout for one local client.
-    #[cfg(feature = "rmcp")]
+    /// Serve MCP over stdin/stdout for one local client (needs the
+    /// mcp-server feature, on by default).
     Mcp {
         /// Identity label to act as.
         #[arg(long, env = "UA_AGENT_LABEL")]
@@ -312,6 +327,11 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// What `ua mcp` answers in a build without the `mcp-server` feature.
+#[cfg(not(feature = "mcp-server"))]
+const NO_MCP_SERVER: &str = "ua mcp: this ua was built without the mcp-server feature, so it serves no MCP. \
+Rebuild with default features (or `--features mcp-server`), or call tools with `ua call` or the JSON API.";
+
 async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
@@ -425,8 +445,10 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
             });
             serve_until_shutdown(state, ct, background).await?;
         }
-        #[cfg(feature = "rmcp")]
+        #[cfg(feature = "mcp-server")]
         Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
+        #[cfg(not(feature = "mcp-server"))]
+        Cmd::Mcp { .. } => anyhow::bail!("{NO_MCP_SERVER}"),
         Cmd::Tools { names } => {
             for t in registry.all() {
                 if names {

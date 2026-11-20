@@ -116,7 +116,13 @@ async fn refresh(hub: &TestHub, client_id: &str, rt: &str) -> (StatusCode, Value
     token(hub, &[("grant_type", "refresh_token"), ("client_id", client_id), ("refresh_token", rt)]).await
 }
 
+/// Status of a call made with `access`: an MCP initialize on `/mcp`. A build
+/// without the `mcp-server` feature has no `/mcp` and issues hub-wide tokens
+/// by default, so there it is `GET /api/whoami`.
 async fn mcp_initialize_status(hub: &TestHub, access: &str) -> StatusCode {
+    if !ua_server::MCP_SERVER {
+        return hub.send(get("/api/whoami", None, Some(access))).await.status();
+    }
     let init = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "0" } }
@@ -146,9 +152,15 @@ async fn metadata_documents() {
     assert_eq!(m["authorization_response_iss_parameter_supported"], true);
     assert_eq!(m["client_id_metadata_document_supported"], false);
 
-    let pr = json_body(hub.send(get("/.well-known/oauth-protected-resource/mcp", None, None)).await).await;
-    assert_eq!(pr["resource"], "https://hub.example.com/mcp");
-    assert_eq!(pr["authorization_servers"], json!([BASE]));
+    let pr = hub.send(get("/.well-known/oauth-protected-resource/mcp", None, None)).await;
+    if ua_server::MCP_SERVER {
+        let pr = json_body(pr).await;
+        assert_eq!(pr["resource"], "https://hub.example.com/mcp");
+        assert_eq!(pr["authorization_servers"], json!([BASE]));
+    } else {
+        // No /mcp in this build, so no resource document for it.
+        assert_eq!(pr.status(), 404);
+    }
     let root = json_body(hub.send(get("/.well-known/oauth-protected-resource", None, None)).await).await;
     assert_eq!(root["resource"], BASE);
 
@@ -165,14 +177,23 @@ async fn metadata_documents() {
 #[tokio::test]
 async fn unauthenticated_requests_get_the_rfc9728_challenge() {
     let hub = TestHub::new(config());
-    for (path, bearer) in [("/api/whoami", None), ("/api/whoami", Some("uao_bogus")), ("/mcp", None)] {
+    let mut paths = vec![("/api/whoami", None), ("/api/whoami", Some("uao_bogus"))];
+    if ua_server::MCP_SERVER {
+        paths.push(("/mcp", None));
+    }
+    // Without the mcp-server feature the challenge points at the root
+    // document: there is no /mcp resource.
+    let metadata = if ua_server::MCP_SERVER {
+        "resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource/mcp\""
+    } else {
+        "resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource\""
+    };
+    for (path, bearer) in paths {
         let resp = hub.send(get(path, None, bearer)).await;
         assert_eq!(resp.status(), 401, "{path}");
         let h = resp.headers().get(header::WWW_AUTHENTICATE).unwrap().to_str().unwrap().to_string();
         assert!(h.starts_with("Bearer "));
-        assert!(h.contains(
-            "resource_metadata=\"https://hub.example.com/.well-known/oauth-protected-resource/mcp\""
-        ));
+        assert!(h.contains(metadata), "{h}");
         assert_eq!(h.contains("error=\"invalid_token\""), bearer.is_some(), "{h}");
     }
 }
@@ -200,8 +221,19 @@ async fn full_authorization_code_flow() {
 
     // The token is good on /mcp, as the bound agent identity...
     assert_eq!(mcp_initialize_status(&hub, access).await, StatusCode::OK);
-    // ...but its audience is /mcp, so /api refuses it.
-    assert_eq!(hub.send(get("/api/whoami", None, Some(access))).await.status(), 401);
+    if ua_server::MCP_SERVER {
+        // ...but its audience is /mcp, so /api refuses it.
+        assert_eq!(hub.send(get("/api/whoami", None, Some(access))).await.status(), 401);
+    } else {
+        // Without the mcp-server feature the default audience is the hub.
+        let row: String = hub
+            .state
+            .hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT resource FROM oauth_tokens LIMIT 1", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(row, BASE);
+    }
 
     // Only digests are stored.
     let stored: i64 = hub

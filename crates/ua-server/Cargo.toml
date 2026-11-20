@@ -11,12 +11,18 @@ categories.workspace = true
 readme.workspace = true
 
 [features]
-# On by default, so `cargo build -p ua-server` still links the MCP server and
-# the same ua-tools extras as before. `--no-default-features` drops all three.
-default = ["tree-sitter", "dom_smoothie", "rmcp"]
-tree-sitter = ["ua-tools/tree-sitter"]
-dom_smoothie = ["ua-tools/dom_smoothie"]
-rmcp = ["dep:rmcp", "ua-tools/rmcp"]
+# On by default, so `cargo build -p ua-server` still serves MCP and links the
+# same ua-tools extras as before. `--no-default-features` drops all four.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+code-intel = ["ua-tools/code-intel"]
+readability = ["ua-tools/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway"]
+# The hub's own MCP server: the `/mcp` route, `serve_stdio` (`ua mcp`) and the
+# OAuth protected resource metadata for `/mcp`. Without it the hub serves the
+# JSON API, the UI and OAuth for `/api` only.
+mcp-server = ["dep:rmcp", "ua-tools/mcp-server"]
+# Off by default, as in ua-tools.
+embeddings = ["ua-tools/embeddings"]
 
 [dependencies]
 ua-core.workspace = true

@@ -92,6 +92,10 @@ fn sigterm_drains_and_checkpoints_the_wal() {
     assert!(log.contains("signal=\"SIGTERM\"") || log.contains("signal=SIGTERM"), "{log}");
     assert!(log.contains("WAL checkpointed and truncated"), "{log}");
     assert!(log.contains("hub stopped"), "{log}");
+    // A build without the mcp-server feature says at startup that it serves
+    // no MCP.
+    let warned = log.contains("built without the mcp-server feature");
+    assert_eq!(warned, !cfg!(feature = "mcp-server"), "{log}");
     assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0, "the WAL was truncated\n{log}");
 }
 

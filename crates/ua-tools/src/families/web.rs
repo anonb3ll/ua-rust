@@ -467,11 +467,37 @@ fn page_title(html: &str) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// How [`html_extract`] turned a page into Markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extraction {
+    /// The readability pass found the article (the `readability` feature).
+    Readability,
+    /// The whole page was converted: no article was found, or this build has
+    /// no `readability` feature.
+    FullPage,
+}
+
+impl Extraction {
+    /// The `extraction` value in tool results.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Extraction::Readability => "readability",
+            Extraction::FullPage => "full-page",
+        }
+    }
+}
+
 /// Readable main content of an HTML page as Markdown, plus its title.
 /// Falls back to converting the whole page when no article is found.
 pub fn html_to_markdown(html: &str, url: Option<&str>) -> (Option<String>, String) {
+    let (title, md, _) = html_extract(html, url);
+    (title, md)
+}
+
+/// [`html_to_markdown`], also saying which path produced the Markdown.
+pub fn html_extract(html: &str, url: Option<&str>) -> (Option<String>, String, Extraction) {
     let conv = markdown_converter();
-    #[cfg(feature = "dom_smoothie")]
+    #[cfg(feature = "readability")]
     {
         let article = dom_smoothie::Readability::new(html, url, None).ok().and_then(|mut r| r.parse().ok());
         if let Some(a) = article {
@@ -479,14 +505,14 @@ pub fn html_to_markdown(html: &str, url: Option<&str>) -> (Option<String>, Strin
             if !md.trim().is_empty() {
                 let title =
                     Some(collapse_ws(&a.title)).filter(|t| !t.is_empty()).or_else(|| page_title(html));
-                return (title, md);
+                return (title, md, Extraction::Readability);
             }
         }
     }
-    #[cfg(not(feature = "dom_smoothie"))]
+    #[cfg(not(feature = "readability"))]
     let _ = url;
     let md = conv.convert(html).map(|m| tidy_markdown(&m)).unwrap_or_default();
-    (page_title(html), md)
+    (page_title(html), md, Extraction::FullPage)
 }
 
 fn truncate_chars(s: &str, cap: usize) -> (String, bool) {
@@ -540,16 +566,17 @@ fn shape_fetch(url: String, f: Fetched, cap: usize, raw: bool, pdf_base64: bool)
     }
 
     let text = decode_text(&f.body, f.charset.as_deref());
-    let (title, content) = if raw {
-        (None, text)
+    // `extraction` is set for HTML converted to Markdown only.
+    let (title, content, extraction) = if raw {
+        (None, text, None)
     } else if is_html(&f.content_type, &text) {
-        let (title, md) = html_to_markdown(&text, Some(&final_url));
-        if md.trim().is_empty() { (title, text) } else { (title, md) }
+        let (title, md, how) = html_extract(&text, Some(&final_url));
+        if md.trim().is_empty() { (title, text, None) } else { (title, md, Some(how)) }
     } else {
-        (None, text)
+        (None, text, None)
     };
     let (content, cut) = truncate_chars(&content, cap);
-    json!({
+    let mut out = json!({
         "url": url,
         "final_url": final_url,
         "title": title,
@@ -557,7 +584,11 @@ fn shape_fetch(url: String, f: Fetched, cap: usize, raw: bool, pdf_base64: bool)
         "truncated": cut || f.capped,
         "untrusted": true,
         "untrusted_note": UNTRUSTED_NOTE,
-    })
+    });
+    if let Some(how) = extraction {
+        out["extraction"] = json!(how.as_str());
+    }
+    out
 }
 
 async fn web_fetch(ctx: ToolCtx, a: FetchArgs) -> UaResult<Value> {
@@ -944,7 +975,8 @@ pub fn register(r: &mut Registry) {
              Private, loopback, link-local and metadata addresses are refused, also after DNS resolution \
              and on each of at most 5 redirects. 20 s per request, 2 MB download cap, output capped at \
              max_chars (100-200000, default 40000). Returns {url, final_url, title, content, truncated, \
-             untrusted, untrusted_note}; an image, PDF or other binary body returns {url, final_url, \
+             untrusted, untrusted_note}, plus extraction for converted HTML: readability (the main article) \
+             or full-page (no article found, or a build without the readability feature); an image, PDF or other binary body returns {url, final_url, \
              kind, mime, base64, note} instead (PDF text is not extracted).",
             web_fetch,
         )

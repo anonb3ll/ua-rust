@@ -120,6 +120,7 @@ async fn logout_ends_the_session() {
     assert_eq!(after.status(), 401);
 }
 
+#[cfg(feature = "mcp-server")]
 #[tokio::test]
 async fn cookie_is_never_accepted_on_mcp() {
     let hub = TestHub::new(config());

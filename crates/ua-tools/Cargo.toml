@@ -8,14 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# These three are on by default, so a build with no feature flags matches a
+# The four below are on by default, so a build with no feature flags matches a
 # build from before they were optional. `--no-default-features` drops them.
-default = ["tree-sitter", "dom_smoothie", "rmcp"]
+# `build_features()` reports which are compiled in (system_doctor,
+# capability_catalog), and `BUILD_FEATURES` lists the tools each one adds.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
 # Local semantic memory search with fastembed. Off by default: without it,
 # memory search is lexical (FTS5) only. The feature lives in ua-memory.
 embeddings = ["ua-memory/embeddings"]
-# `fs_index_symbols`, `fs_list_symbols`, `fs_search_symbols`, `fs_repo_map`.
-tree-sitter = [
+# Symbol indexing with tree-sitter: `fs_index_symbols`, `fs_list_symbols`,
+# `fs_search_symbols`, `fs_repo_map`.
+code-intel = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
     "dep:tree-sitter-python",
@@ -23,11 +26,17 @@ tree-sitter = [
     "dep:tree-sitter-typescript",
     "dep:tree-sitter-go",
 ]
-# Readability pass inside `web_fetch` and `dash_view`. Without it those tools
-# still run and convert the whole HTML page.
-dom_smoothie = ["dep:dom_smoothie"]
-# Downstream MCP client (`mcp_gateway`).
-rmcp = ["dep:rmcp"]
+# Readability article extraction (dom_smoothie) inside `web_fetch` and
+# `dash_view`. Without it those tools still run and convert the whole HTML
+# page, and say so with `extraction: "full-page"`.
+readability = ["dep:dom_smoothie"]
+# The downstream MCP client (rmcp): the `mcp_gateway` tool. Without it the
+# `mcp_server_*` registry tools stay, but `mcp_server_register` refuses.
+mcp-gateway = ["dep:rmcp"]
+# Pulls in nothing here. The hub's own MCP server (`/mcp`, `ua mcp`) lives in
+# ua-server, whose `mcp-server` feature turns this on, so capability_catalog
+# and system_doctor report the MCP surface the binary actually serves.
+mcp-server = []
 
 [dependencies]
 subtle.workspace = true
@@ -116,3 +125,4 @@ rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-s
 [[test]]
 name = "mcp_gateway"
 harness = false
+required-features = ["mcp-gateway"]

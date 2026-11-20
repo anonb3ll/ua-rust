@@ -11,12 +11,15 @@ categories.workspace = true
 readme.workspace = true
 
 [features]
-# On by default so this crate still links the same ua-tools as a default
-# build. `--no-default-features` does not pull the heavy deps back in.
-default = ["tree-sitter", "dom_smoothie", "rmcp"]
-tree-sitter = ["ua-tools/tree-sitter"]
-dom_smoothie = ["ua-tools/dom_smoothie"]
-rmcp = ["ua-tools/rmcp"]
+# Forwarding only: this crate uses none of these itself. They exist so that
+# `cargo build -p ua-import` links the same ua-tools as a default build, and
+# `--no-default-features` (or ua-cli without them) keeps the heavy optional
+# deps out. The hub's MCP server is not here: ua-import never serves.
+default = ["code-intel", "readability", "mcp-gateway"]
+code-intel = ["ua-tools/code-intel"]
+readability = ["ua-tools/readability"]
+mcp-gateway = ["ua-tools/mcp-gateway"]
+embeddings = ["ua-tools/embeddings"]
 
 [dependencies]
 ua-core = { workspace = true, features = ["rusqlite"] }
