@@ -625,7 +625,9 @@ pub fn register(r: &mut Registry) {
             search,
         )
         .family("memory")
-        .read_only(),
+        .read_only()
+        // Every search bumps its hits' access counters.
+        .side_effects(|_| true),
     );
     r.add(
         tool(
@@ -647,6 +649,8 @@ pub fn register(r: &mut Registry) {
             get,
         )
         .family("memory")
-        .read_only(),
+        .read_only()
+        // count_access (default true) bumps the note's access counter.
+        .side_effects(|a| a.get("count_access").and_then(Value::as_bool).unwrap_or(true)),
     );
 }

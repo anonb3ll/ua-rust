@@ -951,24 +951,35 @@ impl BoardFilters {
 }
 
 /// `GET /api/board` composes its answer from several reads (five or six
-/// `task_list` pages, `dependency_list`, `delegate_list`); they run inside
-/// [`ua_tools::registry::page_reads`], so a view writes no `tool_calls` rows.
+/// `task_list` pages, `dependency_list`, `delegate_list`). For a verified
+/// human's browser session they run inside
+/// [`ua_tools::registry::page_reads`] and the view writes no `tool_calls`
+/// rows. Any other caller (an agent bearer token, local anonymous use) gets
+/// [`ua_tools::registry::page_view`]: the inner reads leave no rows and the
+/// view writes one summary row, tool `api_board`, so agent activity, perf
+/// and evidence reports still see it.
 async fn board(
-    state: State<AppState>,
-    id: Extension<AuthIdentity>,
-    headers: HeaderMap,
-    q: Query<HashMap<String, String>>,
-) -> Response {
-    ua_tools::registry::page_reads(board_view(state, id, headers, q)).await
-}
-
-async fn board_view(
     State(state): State<AppState>,
     Extension(id): Extension<AuthIdentity>,
+    session: Option<Extension<crate::login::UiSession>>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let caller = caller(&state, &id, &headers);
+    let who = caller(&state, &id, &headers);
+    let human_session = session.is_some() && id.verified && id.kind == ActorKind::Human;
+    let view = board_view(state.clone(), who.clone(), q);
+    if human_session {
+        ua_tools::registry::page_reads(view).await
+    } else {
+        ua_tools::registry::page_view(&state.hub, &who, BOARD_VIEW_TOOL, view).await
+    }
+}
+
+/// The `tool_calls` name of a board view by a caller other than a human's
+/// browser session.
+pub const BOARD_VIEW_TOOL: &str = "api_board";
+
+async fn board_view(state: AppState, caller: Caller, q: HashMap<String, String>) -> Response {
     let now = now_s();
     let get = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
     let include_cancelled = q

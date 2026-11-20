@@ -59,6 +59,11 @@ pub struct ToolDef {
     /// such a tool needs a `gate_payload` projection; without one the gate
     /// refuses rather than park the secret (`secret_args_unprojected`).
     pub secret_args: bool,
+    /// For a `read_only` tool that still writes something on some calls
+    /// (access counters, a heartbeat): true for the calls that do. Such a
+    /// call always records its `tool_calls` row, even inside
+    /// [`page_reads`].
+    pub side_effects: Option<SideEffects>,
     /// Deserializes arguments into the tool's typed argument struct, so a
     /// request can be checked without running the handler.
     check: Checker,
@@ -83,6 +88,10 @@ pub enum HandlerGate {
 
 /// Maps a call's arguments to the payload its approval binds.
 pub type GatePayload = fn(&ua_core::Config, &Value) -> Value;
+
+/// Whether one call of a read-only tool has a side effect (see
+/// [`ToolDef::side_effects`]).
+pub type SideEffects = fn(&Value) -> bool;
 
 impl std::fmt::Debug for ToolDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -135,6 +144,17 @@ impl ToolDef {
     pub fn secret_args(mut self) -> Self {
         self.secret_args = true;
         self
+    }
+
+    /// The calls for which `f` is true write something although the tool is
+    /// read-only (see [`ToolDef::side_effects`]).
+    pub fn side_effects(mut self, f: SideEffects) -> Self {
+        self.side_effects = Some(f);
+        self
+    }
+
+    fn has_side_effects(&self, args: &Value) -> bool {
+        self.side_effects.is_some_and(|f| f(args))
     }
 
     /// Whether this call's approval is (or may be) decided inside the
@@ -204,31 +224,71 @@ where
         gate_payload: None,
         handler_may_gate: HandlerGate::Never,
         secret_args: false,
+        side_effects: None,
         check,
         handler,
     }
 }
 
+/// The page composition a call runs in (see [`page_reads`]).
+#[derive(Clone, Default)]
+struct PageScope {
+    /// The error code of the first inner read that failed.
+    first_failure: Arc<std::sync::Mutex<Option<String>>>,
+}
+
 tokio::task_local! {
-    static PAGE_READS: ();
+    static PAGE_READS: PageScope;
 }
 
-/// Run `f` as the composition of one page the hub renders itself (the
-/// Control Center's `GET` pages, `GET /api/board`). Every call made inside
-/// passes every check exactly as [`Registry::call`] always does, but a
-/// read-only tool that succeeds without a policy reservation leaves no
-/// `tool_calls` row: a page built from six or eight reads would otherwise
-/// serialise six or eight writes through the single writer per view.
-/// Refusals still reach the ledger, failed reads are still recorded, and a
-/// call that changes state (not `read_only`) is recorded as usual. MCP and
-/// HTTP tool calls never run inside this scope.
+/// Run `f` as the composition of one page the hub renders itself for a
+/// **verified human's browser session** (a Control Center `GET` page, or `GET
+/// /api/board` with the session cookie). Adapters must not use it for any
+/// other caller: an agent's reads would vanish from `agent_activity`,
+/// `perf_summary` and `evidence_report`; use [`page_view`] instead.
+///
+/// Every call inside passes every check exactly as [`Registry::call`] always
+/// does. A call that is *skip-eligible* (a `read_only` tool, no approval gate
+/// applies, no side effect for these arguments, no policy-file reservation)
+/// leaves no `tool_calls` row when it succeeds, so a page built from six or
+/// eight reads does not serialise six or eight writes per view. A
+/// skip-eligible call that fails is recorded with `page = 1`, which rate and
+/// error calculations leave out (its successful siblings left no row).
+/// Everything else records as usual: refusals reach the ledger, writes,
+/// gated calls, side-effecting reads and, with a policy file loaded, every
+/// call (its rate-limit reservation is a row). MCP and `/api/tools` calls
+/// never run inside this scope.
 pub async fn page_reads<F: Future>(f: F) -> F::Output {
-    PAGE_READS.scope((), f).await
+    PAGE_READS.scope(PageScope::default(), f).await
 }
 
-/// Whether a finished call skips its `tool_calls` row (see [`page_reads`]).
-fn unrecorded_page_read(def: &ToolDef, result: &UaResult<Value>, reservation: Option<i64>) -> bool {
-    def.read_only && result.is_ok() && reservation.is_none() && PAGE_READS.try_with(|_| ()).is_ok()
+/// [`page_reads`] for any caller that is not a verified human's browser
+/// session: the inner skip-eligible reads leave no rows, and the view writes
+/// one summary row of its own, tool `name`, with the composition's duration
+/// and outcome (the first inner failure's code, else `ok`). The view stays
+/// visible to `agent_activity`, `perf_summary` and `evidence_report` as one
+/// call.
+pub async fn page_view<F: Future>(hub: &Hub, caller: &Caller, name: &str, f: F) -> F::Output {
+    let scope = PageScope::default();
+    let first_failure = scope.first_failure.clone();
+    let started_at = ua_core::time::now();
+    let clock = std::time::Instant::now();
+    let out = PAGE_READS.scope(scope, f).await;
+    let outcome = first_failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row =
+        Row::new(caller, name, started_at, clock.elapsed(), outcome.unwrap_or_else(|| "ok".into()), false);
+    insert_row(hub, row).await;
+    out
+}
+
+/// Whether this call may leave no `tool_calls` row if it succeeds (see
+/// [`page_reads`]).
+fn skip_eligible(def: &ToolDef, args: &Value, gated: bool, reservation: Option<i64>) -> bool {
+    def.read_only
+        && !gated
+        && !def.has_side_effects(args)
+        && reservation.is_none()
+        && PAGE_READS.try_with(|_| ()).is_ok()
 }
 
 /// Run blocking work (SQLite, filesystem) off the async runtime.
@@ -331,12 +391,25 @@ impl Registry {
             }
         }
 
+        let page = skip_eligible(def, &args, gated, reservation);
         let ctx = ToolCtx { hub: hub.clone(), caller: caller.clone() };
         let started_at = ua_core::time::now();
         let clock = std::time::Instant::now();
         let result = (def.handler)(ctx, args).await;
-        if !unrecorded_page_read(def, &result, reservation) {
-            record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation).await;
+        match (&result, page) {
+            (Ok(_), true) => {}
+            (Err(e), true) => {
+                let _ = PAGE_READS.try_with(|s| {
+                    s.first_failure
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_or_insert(e.code().to_string());
+                });
+                record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation, true).await;
+            }
+            _ => {
+                record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation, false).await
+            }
         }
         result
     }
@@ -562,7 +635,70 @@ pub enum ApprovalRequest {
     GatesInHandler,
 }
 
-/// One row per completed call in `tool_calls` (no arguments, no results).
+/// One `tool_calls` row (no arguments, no results).
+struct Row {
+    tool: String,
+    caller: String,
+    profile: String,
+    transport: String,
+    started_at: String,
+    duration_ms: i64,
+    outcome: String,
+    page: bool,
+}
+
+impl Row {
+    fn new(
+        caller: &Caller,
+        tool: &str,
+        started_at: String,
+        elapsed: std::time::Duration,
+        outcome: String,
+        page: bool,
+    ) -> Self {
+        Self {
+            tool: tool.to_string(),
+            caller: caller.label.clone(),
+            profile: caller.profile.as_str().to_string(),
+            transport: transport_name(caller),
+            started_at,
+            duration_ms: elapsed.as_millis() as i64,
+            outcome,
+            page,
+        }
+    }
+}
+
+async fn insert_row(hub: &Hub, row: Row) {
+    let res = hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute(
+                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, page) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    row.tool,
+                    row.caller,
+                    row.profile,
+                    row.transport,
+                    row.started_at,
+                    row.duration_ms,
+                    row.outcome,
+                    row.page
+                ],
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "could not record tool call");
+    }
+}
+
+/// One row per completed call in `tool_calls` (no arguments, no results):
+/// the reservation's row finished, or a new row (`page` marks a page-scope
+/// read, see [`page_reads`]).
+#[allow(clippy::too_many_arguments)]
 async fn record_call(
     hub: &Hub,
     caller: &Caller,
@@ -571,37 +707,21 @@ async fn record_call(
     elapsed: std::time::Duration,
     result: &UaResult<Value>,
     reservation: Option<i64>,
+    page: bool,
 ) {
     let outcome = match result {
         Ok(_) => "ok".to_string(),
         Err(e) => e.code().to_string(),
     };
-    let row = (
-        tool.to_string(),
-        caller.label.clone(),
-        caller.profile.as_str().to_string(),
-        serde_json::to_value(caller.transport)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default(),
-        started_at,
-        elapsed.as_millis() as i64,
-        outcome,
-    );
+    let row = Row::new(caller, tool, started_at, elapsed, outcome, page);
+    let Some(id) = reservation else { return insert_row(hub, row).await };
     let res = hub
         .db()
         .write_async(move |tx| {
-            match reservation {
-                Some(id) => tx.execute(
-                    "UPDATE tool_calls SET duration_ms = ?2, outcome = ?3 WHERE id = ?1",
-                    rusqlite::params![id, row.5, row.6],
-                )?,
-                None => tx.execute(
-                    "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
-                )?,
-            };
+            tx.execute(
+                "UPDATE tool_calls SET duration_ms = ?2, outcome = ?3 WHERE id = ?1",
+                rusqlite::params![id, row.duration_ms, row.outcome],
+            )?;
             Ok(())
         })
         .await;

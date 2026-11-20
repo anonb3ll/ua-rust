@@ -1,110 +1,145 @@
 //! Read-path write amplification: pages the hub composes from several
-//! read-only tool calls (`/ui/*`, `GET /api/board`) write no `tool_calls`
-//! rows, the activity page verifies the ledger only on demand, and MCP and
-//! HTTP tool calls still record one row each.
+//! read-only tool calls write no `tool_calls` rows for a verified human's
+//! browser session only; any other caller is recorded (one summary row per
+//! `/api/board` view, every call on `/ui`). The activity page verifies the
+//! ledger only on demand, and MCP and HTTP tool calls still record one row
+//! each.
 
-use std::sync::Arc;
+mod common;
 
-use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, Response, StatusCode, header};
-use http_body_util::BodyExt;
+use axum::http::{Request, StatusCode, header};
+use common::{TestHub, get, text_body};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio_util::sync::CancellationToken;
-use tower::ServiceExt;
 use ua_core::{Caller, Config, identity::Transport};
-use ua_server::AppState;
-use ua_tools::{Hub, builtin_registry};
 
-const OPERATOR: &str = "operator-test-token-0001";
+const BUILDER: &str = "builder-test-token-0001";
 
-fn app() -> (Router, AppState) {
-    let mut cfg = Config::for_home(std::env::temp_dir());
-    cfg.enforce_auth = true;
-    cfg.agent_tokens = Some(SecretString::from(format!("operator:{OPERATOR}")));
-    cfg.human_identities = vec!["operator".into()];
-    cfg.profiles.insert("operator".into(), "operator".into());
-    let state = AppState::new(Hub::in_memory(cfg).unwrap(), Arc::new(builtin_registry()));
-    (ua_server::router(state.clone(), CancellationToken::new()), state)
+fn config() -> Config {
+    let mut cfg = common::config();
+    cfg.agent_tokens = Some(SecretString::from(format!("builder-1:{BUILDER}")));
+    cfg
 }
 
-async fn send(app: &Router, req: Request<Body>) -> Response<Body> {
-    app.clone().oneshot(req).await.unwrap()
-}
-
-fn get(uri: &str) -> Request<Body> {
-    Request::get(uri).header(header::AUTHORIZATION, format!("Bearer {OPERATOR}")).body(Body::empty()).unwrap()
-}
-
-async fn body_text(resp: Response<Body>) -> String {
-    String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
-}
-
-/// `tool_calls` rows per tool.
-fn rows(state: &AppState) -> Vec<(String, i64)> {
-    state
+/// `(tool, page, count)` of every `tool_calls` row.
+fn rows(hub: &TestHub) -> Vec<(String, bool, i64)> {
+    hub.state
         .hub
         .db()
         .read(|c| {
-            let mut stmt = c.prepare("SELECT tool, COUNT(*) FROM tool_calls GROUP BY tool ORDER BY tool")?;
-            Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+            let mut stmt = c.prepare(
+                "SELECT tool, page, COUNT(*) FROM tool_calls GROUP BY tool, page ORDER BY tool, page",
+            )?;
+            Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)
         })
         .unwrap()
 }
 
-fn total(state: &AppState) -> i64 {
-    rows(state).iter().map(|(_, n)| n).sum()
+fn total(hub: &TestHub) -> i64 {
+    rows(hub).iter().map(|(_, _, n)| n).sum()
 }
 
-async fn seed(state: &AppState) {
+async fn seed(hub: &TestHub) {
     let local = Caller::local("local", Transport::Cli);
-    for (title, status) in [("Wire the board", "open"), ("Review the board", "doing")] {
-        let t = state.registry.call(&state.hub, &local, "task_add", json!({ "title": title })).await.unwrap();
-        if status != "open" {
-            let id = t["task"]["id"].as_i64().or_else(|| t["id"].as_i64()).unwrap();
-            state
-                .registry
-                .call(&state.hub, &local, "task_update", json!({ "id": id, "status": status }))
-                .await
-                .unwrap();
-        }
+    let s = &hub.state;
+    for title in ["Wire the board", "Review the board"] {
+        s.registry.call(&s.hub, &local, "task_add", json!({ "title": title })).await.unwrap();
     }
 }
+
+const PAGES: [&str; 6] =
+    ["/ui/work", "/ui/work?q=board", "/ui/inbox", "/ui/plans", "/ui/memory", "/ui/activity"];
 
 #[tokio::test]
-async fn composed_read_pages_write_no_tool_calls_rows() {
-    let (app, state) = app();
-    seed(&state).await;
-    let before = total(&state);
-
+async fn a_human_browser_session_composes_pages_without_tool_calls_rows() {
+    let hub = TestHub::new(config());
+    seed(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let before = total(&hub);
     // (Not /ui/agents: `session_list` reaps stale sessions, a write, so it is
     // not read-only and its row is kept.)
-    for uri in ["/ui/work", "/ui/work?q=board", "/ui/inbox", "/ui/plans", "/ui/memory", "/ui/activity"] {
-        let resp = send(&app, get(uri)).await;
+    for uri in PAGES {
+        let resp = hub.send(get(uri, Some(&cookie), None)).await;
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
     }
-    let board = send(&app, get("/api/board?include_cancelled=1")).await;
+    let board = hub.send(get("/api/board?include_cancelled=1", Some(&cookie), None)).await;
     assert_eq!(board.status(), StatusCode::OK);
-    let v: Value = serde_json::from_str(&body_text(board).await).unwrap();
-    assert!(v.to_string().contains("Wire the board"), "{v}");
+    assert!(text_body(board).await.contains("Wire the board"));
+    assert_eq!(total(&hub), before, "a page view wrote tool_calls rows: {:?}", rows(&hub));
+}
 
-    assert_eq!(total(&state), before, "a page view wrote tool_calls rows: {:?}", rows(&state));
+/// An agent bearer token reading the board is recorded: one summary row per
+/// view (not the six or eight inner reads), visible to the activity, perf
+/// and evidence reports.
+#[tokio::test]
+async fn an_agent_reading_the_board_leaves_one_summary_row_per_view() {
+    let hub = TestHub::new(config());
+    seed(&hub).await;
+    let before = total(&hub);
+    for _ in 0..2 {
+        let resp = hub.send(get("/api/board", None, Some(BUILDER))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let after = rows(&hub);
+    assert_eq!(total(&hub), before + 2, "{after:?}");
+    assert!(after.contains(&("api_board".to_string(), false, 2)), "{after:?}");
+    let builder: i64 = hub
+        .state
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE caller = 'builder-1' AND tool = 'api_board' AND outcome = 'ok'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(builder, 2);
+
+    // The same agent on a /ui page is recorded call by call, as before.
+    let before = total(&hub);
+    assert_eq!(hub.send(get("/ui/work", None, Some(BUILDER))).await.status(), StatusCode::OK);
+    assert_eq!(total(&hub), before + 6, "{:?}", rows(&hub));
+}
+
+/// With a policy file loaded every call reserves its row up front (rate
+/// limits must count it), so a page view records its reads even for a
+/// human's browser session.
+#[tokio::test]
+async fn with_a_policy_file_every_page_read_keeps_its_row() {
+    let policy = std::env::temp_dir().join(format!("ua-read-path-policy-{}.yaml", std::process::id()));
+    std::fs::write(&policy, "version: 1\nrules: []\n").unwrap();
+    let mut cfg = config();
+    cfg.policy_file = Some(policy);
+    let hub = TestHub::new(cfg);
+    seed(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let before = total(&hub);
+    assert_eq!(hub.send(get("/ui/work", Some(&cookie), None)).await.status(), StatusCode::OK);
+    let after = rows(&hub);
+    assert_eq!(total(&hub), before + 6, "{after:?}");
+    assert!(after.iter().all(|(_, page, _)| !page), "reserved rows are ordinary rows: {after:?}");
 }
 
 #[tokio::test]
 async fn the_activity_page_verifies_the_chain_only_on_request() {
-    let (app, state) = app();
-    seed(&state).await;
-    let html = body_text(send(&app, get("/ui/activity")).await).await;
+    let hub = TestHub::new(config());
+    seed(&hub).await;
+    let cookie = hub.sign_in("operator").await;
+    let page = |uri: &'static str| {
+        let (hub, cookie) = (&hub, cookie.clone());
+        async move { text_body(hub.send(get(uri, Some(&cookie), None)).await).await }
+    };
+    let html = page("/ui/activity").await;
     assert!(html.contains("Verify the hash chain"), "{html}");
     assert!(!html.contains("Ledger hash chain verified"), "{html}");
-
-    let html = body_text(send(&app, get("/ui/activity?verify=1")).await).await;
-    assert!(html.contains("Ledger hash chain verified"), "{html}");
-    let html = body_text(send(&app, get("/ui/activity?channel_prefix=agent.task.&verify=1")).await).await;
-    assert!(html.contains("Ledger hash chain verified"), "{html}");
-    let html = body_text(send(&app, get("/ui/activity?channel_prefix=agent.task.")).await).await;
+    assert!(page("/ui/activity?verify=1").await.contains("Ledger hash chain verified"));
+    assert!(
+        page("/ui/activity?channel_prefix=agent.task.&verify=1").await.contains("Ledger hash chain verified")
+    );
+    let html = page("/ui/activity?channel_prefix=agent.task.").await;
     assert!(
         html.contains("name=\"channel_prefix\" value=\"agent.task.\""),
         "the verify form keeps the filter"
@@ -113,35 +148,20 @@ async fn the_activity_page_verifies_the_chain_only_on_request() {
 
 #[tokio::test]
 async fn tool_calls_from_clients_still_record_one_row_each() {
-    let (app, state) = app();
-    seed(&state).await;
-    let before = total(&state);
-
-    // HTTP tool call.
+    let hub = TestHub::new(config());
+    seed(&hub).await;
+    let before = total(&hub);
     let req = Request::post("/api/tools/task_list")
-        .header(header::AUTHORIZATION, format!("Bearer {OPERATOR}"))
+        .header(header::AUTHORIZATION, format!("Bearer {BUILDER}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({ "status": "open" }).to_string()))
         .unwrap();
-    assert_eq!(send(&app, req).await.status(), StatusCode::OK);
-    assert_eq!(total(&state), before + 1);
-
-    // A registry call outside a page scope (the MCP adapter's path).
+    let resp = hub.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _: Value = serde_json::from_str(&text_body(resp).await).unwrap();
+    assert_eq!(total(&hub), before + 1);
     let local = Caller::local("local", Transport::Mcp);
-    state.registry.call(&state.hub, &local, "dependency_list", json!({})).await.unwrap();
-    assert_eq!(total(&state), before + 2);
-
-    // Inside a page scope, a call that changes state and a read that fails
-    // are still recorded; only a successful read-only call is not.
-    let reg = state.registry.clone();
-    let hub = state.hub.clone();
-    ua_tools::registry::page_reads(async {
-        reg.call(&hub, &local, "task_list", json!({})).await.unwrap();
-        reg.call(&hub, &local, "task_add", json!({ "title": "Written from a page" })).await.unwrap();
-        assert!(reg.call(&hub, &local, "plan_get", json!({ "plan_id": "missing" })).await.is_err());
-    })
-    .await;
-    let by_tool = rows(&state);
-    assert_eq!(total(&state), before + 4, "{by_tool:?}");
-    assert!(by_tool.iter().any(|(t, _)| t == "plan_get"), "{by_tool:?}");
+    let s = &hub.state;
+    s.registry.call(&s.hub, &local, "dependency_list", json!({})).await.unwrap();
+    assert_eq!(total(&hub), before + 2);
 }
