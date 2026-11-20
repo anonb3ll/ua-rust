@@ -817,7 +817,9 @@ Writer rules the schema cannot express, each with an acceptance test:
   set only with **both** parties: the named user's own act **and** an
   `org_admin`'s. Either the user requests a claim and an `org_admin` approves
   it, or an `org_admin` offers the link and the user accepts. Neither can set
-  it alone, and only an agent with no current owner can be claimed. An
+  it alone: the approving or offering admin must be a different person from
+  the user being linked, so an admin linking an agent to themselves needs
+  another admin. Only an agent with no current owner can be claimed. An
   `org_admin` may clear it (that narrows), never set it to someone else.
   Clearing the link immediately ends the agent's eligibility for that
   person's private notes, so an admin who clears it and then issues the agent
@@ -1373,7 +1375,8 @@ People and authority
 17b. **Agent owners.** An `org_admin` cannot set `agents.owner_user_id` alone
     and can clear it; a `member` cannot claim an agent alone; a claim needs the
     user's request plus an `org_admin`'s approval (or the reverse offer and
-    acceptance); an agent that already has an owner cannot be claimed; only the
+    acceptance), where the admin is not the user being linked; an agent that
+    already has an owner cannot be claimed; only the
     member can turn
     `consolidate_private` on or off; claiming an agent revokes credentials for
     it that another person issued, including one minted before the claim; with
