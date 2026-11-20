@@ -38,7 +38,7 @@
 //!
 //! Every change is ledgered on `agent.node` in the same transaction.
 
-mod acceptance;
+pub(crate) mod acceptance;
 mod claim;
 mod command;
 pub mod credentials;

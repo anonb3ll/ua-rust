@@ -253,7 +253,7 @@ code, reason}`; `reason` is one of:
 | Reason | Status | When |
 |---|---|---|
 | `disabled` | 403 | `session_credentials_enabled` is off |
-| `node_binding` | 403 / 409 | the node is not registered, retired, or another agent's |
+| `node_binding` | 403 / 409 | the node is not registered, retired, or another agent's, or the item's agent is not the node's |
 | `node_feature_missing` | 409 | the node did not advertise `acp_session_mcp` |
 | `item_not_found` | 409 | no such item on this node |
 | `not_acp` | 409 | the item's backend is not `acp:*` |
@@ -291,11 +291,26 @@ credential's grant. The grant is the `acp-session` tool list
 (`ACP_SESSION_ALLOWED_TOOLS`: `evidence_report`, `memory_get`, `memory_list`,
 `memory_save`, `memory_search`, `profile_status`, `session_packet`,
 `task_comment`, `task_list`), narrowed to what the subject's own default
-profile exposes. `task_comment` may only `append` to or `list` the item's own
-task (`session_task_scope`); an item without a task comments nowhere. A tool
-outside the grant is refused (`profile_denied`) before any policy or
-approval is looked at, and is not listed. A session credential cannot mint
-another one.
+profile exposes. The task tools reach the item's own task only, and a
+refusal names `session_task_scope`:
+
+- `task_comment` may only `append` to or `list` that task's comments.
+- `session_packet` and `evidence_report` read that task: an omitted
+  `task_id` is filled in with it and any other `task_id` is refused, as are
+  `session_id` (`session_packet`) and `project_id` (`evidence_report`),
+  which would reach other rows.
+- `task_list` lists that task at most, whatever its filters say.
+
+An item without a task reads and comments on no task. A tool outside the
+grant is refused (`profile_denied`) before any policy or approval is looked
+at, and is not listed. A session credential cannot mint another one.
+
+`acp-session` exists only for this: `profile_activate` refuses it
+(`profile_reserved`), config loading refuses it in `profiles` and
+`oauth_profile`, and a policy `profile_defaults` entry or profile overlay
+naming it is invalid. A caller under that profile with no verified grant
+(reachable only through a stale stored binding or a bug) is refused every
+tool (`session_grant_required`) and sees none.
 
 **Revocation.** The receipt for the item (`session_end`), cancelling the item
 or its run (`cancelled`), a lapsed lease (`lease_expired`, by the sweep),
@@ -307,7 +322,9 @@ metadata, never a value), and on use a lapsed window (`expired`,
 
 Events: `hub.session_credential.minted`, `hub.session_credential.revoked`
 (one per credential, with its reason) and `hub.session_credential.refused`
-(the failed check, at most once a minute per check).
+(the failed check, at most once a minute per check and credential: the
+credential id when the value matched one, else a prefix of the presented
+value's SHA-256; at most 32 a minute per check in all).
 
 A managed token may not start with `uas_` (nor `uao_`, `uar_`), and a static
 token that does is never matched.

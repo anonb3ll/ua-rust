@@ -406,7 +406,28 @@ impl Config {
     }
 
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
-        Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized).map_err(Into::into)
+        let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
+        cfg.check_profiles()?;
+        Ok(cfg)
+    }
+
+    /// Refuse a profile no identity may be given (`acp-session`, which only a
+    /// verified session credential runs under) in `profiles` or
+    /// `oauth_profile`.
+    pub fn check_profiles(&self) -> anyhow::Result<()> {
+        let reserved = |name: &str| name.trim().parse::<crate::Profile>().is_ok_and(|p| !p.assignable());
+        if reserved(&self.oauth_profile) {
+            anyhow::bail!(
+                "oauth_profile = {:?}: that profile is reserved for session credentials and cannot be configured",
+                self.oauth_profile
+            );
+        }
+        if let Some((label, p)) = self.profiles.iter().find(|(_, p)| reserved(p)) {
+            anyhow::bail!(
+                "profiles.{label} = {p:?}: that profile is reserved for session credentials and cannot be configured"
+            );
+        }
+        Ok(())
     }
 
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {
@@ -650,6 +671,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_credential_profile_cannot_be_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        std::fs::write(&file, "[profiles]\nbuilder-1 = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("profiles.builder-1"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"acp-session\"\n").unwrap();
+        let err = Config::load_inner(Some(&file), false).unwrap_err().to_string();
+        assert!(err.contains("oauth_profile"), "{err}");
+        std::fs::write(&file, "oauth_profile = \"research\"\n[profiles]\nbuilder-1 = \"reviewer\"\n")
+            .unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_ok());
+    }
 
     #[test]
     fn toml_layer_and_lists() {

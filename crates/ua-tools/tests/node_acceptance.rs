@@ -294,3 +294,114 @@ async fn required_acceptance_holds_real_work_until_attested() {
     let parked = h.call(&lead(), "node_dispatch", ask).await.unwrap_err();
     assert!(matches!(parked, UaError::ApprovalRequired { .. }), "{parked:?}");
 }
+
+impl H {
+    /// Pass diagnostics and have an operator attest the run.
+    async fn accept(&self) {
+        let run_id = self.pass_diagnostics().await;
+        self.manage(
+            &human(),
+            "node_acceptance_attest",
+            json!({ "node": NODE, "run_id": run_id, "evidence_ref": "operator verified the output file" }),
+        )
+        .await
+        .unwrap();
+        assert!(self.admits_work().await, "an attested node takes work");
+    }
+
+    /// Whether real work for the node passes the acceptance gate (it parks
+    /// for approval rather than being refused node_not_accepted).
+    async fn admits_work(&self) -> bool {
+        let ask = json!({ "node": NODE, "backend": "codex", "prompt": "fix it", "cwd": "/srv/work/repo" });
+        match self.call(&lead(), "node_dispatch", ask).await {
+            Err(UaError::ApprovalRequired { .. }) => true,
+            Err(e) if reason(&e) == "node_not_accepted" => false,
+            other => panic!("unexpected dispatch outcome {other:?}"),
+        }
+    }
+
+    fn stored_state(&self) -> Value {
+        self.scalar(&format!(
+            "SELECT state || ':' || COALESCE(reason, '') FROM node_acceptance WHERE node = '{NODE}'"
+        ))
+    }
+
+    async fn lifecycle(&self, action: &str, extra: Value) {
+        let mut params = json!({ "node": NODE, "reason": "maintenance" });
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        self.manage(&human(), action, params).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn acceptance_does_not_survive_node_lifecycle_changes() {
+    let h = H::new(true);
+    h.register().await;
+    h.accept().await;
+
+    // Retire and un-retire: the node runs acceptance again.
+    h.lifecycle("node_retire", json!({})).await;
+    h.lifecycle("node_unretire", json!({})).await;
+    h.register().await;
+    assert!(!h.admits_work().await, "retirement voids acceptance");
+    assert!(
+        h.stored_state().as_str().unwrap().starts_with("failed:voided: node_retired"),
+        "{}",
+        h.stored_state()
+    );
+    let status = h.manage(&human(), "node_acceptance_status", json!({ "node": NODE })).await.unwrap();
+    assert_eq!(status["state"], "failed", "{status}");
+
+    // Forget and register afresh: no acceptance carried over.
+    h.accept().await;
+    h.lifecycle("node_retire", json!({})).await;
+    h.lifecycle("node_forget", json!({})).await;
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_acceptance"), json!(0));
+    h.register().await;
+    assert!(!h.admits_work().await, "a forgotten node starts unaccepted");
+
+    // Reassigned away and back: voided.
+    h.accept().await;
+    h.lifecycle("node_reassign", json!({ "to_agent": "builder-2" })).await;
+    h.lifecycle("node_reassign", json!({ "to_agent": "builder-1" })).await;
+    h.register().await;
+    assert!(!h.admits_work().await, "reassignment voids acceptance");
+    assert!(h.stored_state().as_str().unwrap().contains("node_reassigned"));
+
+    // An identical re-registration (a restart) keeps it.
+    h.accept().await;
+    h.register().await;
+    assert!(h.admits_work().await, "a restart with the same facts keeps acceptance");
+
+    // A first code_sha by heartbeat keeps it; a different one voids it.
+    let sha = |c: char| c.to_string().repeat(40);
+    h.ok(&device(), "node_heartbeat", json!({ "node": NODE, "facts": { "code_sha": sha('a') } })).await;
+    assert!(h.admits_work().await);
+    h.ok(&device(), "node_heartbeat", json!({ "node": NODE, "facts": { "code_sha": sha('b') } })).await;
+    assert!(!h.admits_work().await, "new code voids acceptance");
+    assert!(h.stored_state().as_str().unwrap().contains("code_sha"), "{}", h.stored_state());
+
+    // A registration with other backends or harnesses voids it too.
+    h.accept().await;
+    let facts = json!({
+        "backends": ["codex", "acceptance", "acp:claude"],
+        "worktree_roots": [{ "path": "/srv/work", "realpath": "/srv/work", "exists": true }],
+    });
+    h.ok(&device(), "node_register", json!({ "node": NODE, "facts": facts })).await;
+    assert!(!h.admits_work().await, "new backends void acceptance");
+    assert!(h.stored_state().as_str().unwrap().contains("backends"), "{}", h.stored_state());
+    h.accept().await;
+    let mut facts = facts;
+    facts["harnesses"] = json!({ "codex": { "bin": "codex", "version": "2.0" } });
+    h.ok(&device(), "node_register", json!({ "node": NODE, "facts": facts })).await;
+    assert!(!h.admits_work().await, "new harnesses void acceptance");
+
+    let voided = h.scalar(
+        "SELECT COUNT(*) FROM event_log WHERE channel = 'agent.node' \
+         AND json_extract(payload, '$.kind') = 'acceptance_failed' \
+         AND json_extract(payload, '$.reason') LIKE 'voided:%'",
+    );
+    assert_eq!(voided, json!(6), "one ledgered void per change");
+}

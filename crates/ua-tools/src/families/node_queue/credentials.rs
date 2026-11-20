@@ -99,7 +99,7 @@ pub const CHANNEL_MINTED: &str = "hub.session_credential.minted";
 pub const CHANNEL_REVOKED: &str = "hub.session_credential.revoked";
 pub const CHANNEL_REFUSED: &str = "hub.session_credential.refused";
 
-/// A refused-check event is written at most this often per check.
+/// A refused-check event is written at most this often per (subject, check).
 const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// `last_used_at` is written at most this often per credential.
 const LAST_USED_RESOLUTION_S: i64 = 30;
@@ -232,16 +232,50 @@ pub(crate) fn slide_idle(tx: &mut WriteTx<'_>, item_id: &str, node: &str) -> UaR
 
 // --- refusal events -------------------------------------------------------------
 
-static REFUSED_LAST: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// At most this many `.refused` events per check per interval, across
+/// subjects: a spray of random values cannot flood the ledger.
+const REFUSED_PER_CHECK_CAP: usize = 32;
+/// The rate-limit map is pruned of expired entries past this size.
+const REFUSED_MAP_PRUNE: usize = 1024;
+
+static REFUSED_LAST: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether a `.refused` event for (`check`, `subject`) is due: at most one
+/// per pair per interval, and at most [`REFUSED_PER_CHECK_CAP`] per check.
+fn refusal_due(check: &str, subject: &str) -> bool {
+    let mut last = REFUSED_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.len() > REFUSED_MAP_PRUNE {
+        last.retain(|_, t| t.elapsed() < REFUSED_LOG_INTERVAL);
+    }
+    let key = (check.to_string(), subject.to_string());
+    if last.get(&key).is_some_and(|t| t.elapsed() < REFUSED_LOG_INTERVAL) {
+        return false;
+    }
+    let recent = last.iter().filter(|((c, _), t)| c == check && t.elapsed() < REFUSED_LOG_INTERVAL).count();
+    if recent >= REFUSED_PER_CHECK_CAP {
+        return false;
+    }
+    last.insert(key, Instant::now());
+    true
+}
+
+/// What a refusal is rate-limited by: the credential when one was found,
+/// else a short prefix of the presented value's SHA-256 (never the value).
+fn refusal_subject(credential_id: Option<&str>, token: Option<&str>) -> String {
+    match (credential_id, token) {
+        (Some(id), _) => format!("cred:{id}"),
+        (None, Some(t)) => format!("sha:{}", &digest(t)[..16]),
+        (None, None) => "-".into(),
+    }
+}
 
 /// A rate-limited `.refused` event naming the failed check, never a value.
-fn record_refused(hub: &Hub, check: &str, credential_id: Option<&str>) {
-    {
-        let mut last = REFUSED_LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if last.get(check).is_some_and(|t| t.elapsed() < REFUSED_LOG_INTERVAL) {
-            return;
-        }
-        last.insert(check.to_string(), Instant::now());
+/// Limited per (credential or presented value, check), so repeated replays
+/// of different credentials are each ledgered.
+fn record_refused(hub: &Hub, check: &str, credential_id: Option<&str>, subject: &str) {
+    if !refusal_due(check, subject) {
+        return;
     }
     let mut payload = json!({ "check": check });
     if let Some(id) = credential_id {
@@ -325,6 +359,16 @@ fn mint_tx(
         return Err(conflict("lease_expired", "the item's lease has expired"));
     }
     let subject = item.agent.clone();
+    // The session runs as the item's agent, which must be the node's owner:
+    // verify() would refuse any other subject on every request (node_stale).
+    if subject != row.agent {
+        return Err(refuse(
+            "node_binding",
+            format!(
+                "item {item_id} runs as {subject:?}, not as node {node:?}'s agent; no credential is minted"
+            ),
+        ));
+    }
     if governance::is_retired(tx, &subject)? {
         return Err(refuse(
             "agent_retired",
@@ -430,12 +474,13 @@ async fn node_session_credential(ctx: ToolCtx, a: MintArgs) -> UaResult<Value> {
         _ => return Err(UaError::invalid("attempt must be a positive integer")),
     };
     let hub = ctx.hub.clone();
+    let subject = format!("item:{item_id}");
     let out = ctx.hub.db().write_async(move |tx| mint_tx(tx, &hub, &agent, &node, &item_id, attempt)).await;
     if let Err(e) = &out
         && let Some(code) = e.reason_code()
     {
         let (hub, check) = (ctx.hub.clone(), format!("mint:{code}"));
-        let _ = tokio::task::spawn_blocking(move || record_refused(&hub, &check, None)).await;
+        let _ = tokio::task::spawn_blocking(move || record_refused(&hub, &check, None, &subject)).await;
     }
     out
 }
@@ -560,7 +605,7 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
 /// a lapsed window or a closed task is written as a revocation.
 pub fn verify(hub: &Hub, token: &str) -> Result<Verified, Refused> {
     let refused = |check: &'static str, id: Option<&str>| {
-        record_refused(hub, check, id);
+        record_refused(hub, check, id, &refusal_subject(id, Some(token)));
         Err(Refused { check })
     };
     if !hub.cfg().session_credentials_enabled {

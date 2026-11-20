@@ -232,7 +232,7 @@ async fn a_credential_is_minted_once_and_runs_under_its_grant() {
     })
     .await;
     assert_eq!(in_scope, v.grant.tools.len());
-    assert!(in_scope <= listed);
+    assert_eq!(listed, 0, "the profile without a grant sees nothing");
 
     // A second mint for the same attempt supersedes the first.
     let second = h.mint(&item, 1).await.unwrap();
@@ -451,4 +451,113 @@ async fn the_hub_advertises_session_credentials_at_registration() {
         )
         .await;
     assert!(matches!(e, UaError::InvalidArgument(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn the_acp_session_profile_cannot_be_activated_or_used_without_a_grant() {
+    let h = H::new();
+    // Not by an agent (it ranks below developer), not by a human.
+    let agent = Caller { enforce_profile: false, ..device() };
+    for who in [agent, Caller { session_key: Some("s2".into()), ..human() }] {
+        let e = h.err(&who, "profile_activate", json!({ "profile": "acp-session" })).await;
+        assert_eq!(reason(&e), "profile_reserved", "{}", who.label);
+    }
+    // A caller that somehow holds the profile, with no grant bound, gets
+    // nothing: not even the profile's own tools.
+    let orphan = Caller { profile: Profile::AcpSession, ..device() };
+    let task = h.task("t").await;
+    for (tool, args) in [
+        ("task_comment", json!({ "action": "append", "params": { "task_id": task, "body": "x" } })),
+        ("evidence_report", json!({})),
+        ("task_list", json!({})),
+        ("profile_status", json!({})),
+    ] {
+        let e = h.err(&orphan, tool, args).await;
+        assert_eq!(reason(&e), "session_grant_required", "{tool}");
+    }
+    let unenforced = Caller { enforce_profile: false, ..orphan.clone() };
+    let e = h.err(&unenforced, "task_list", json!({})).await;
+    assert_eq!(reason(&e), "session_grant_required");
+    assert_eq!(h.reg.visible_to(&orphan).count(), 0);
+    // A policy overlay or profile default naming it is refused as well.
+    assert!(!ua_tools::policy::overlay_allowed(Profile::AcpSession, Profile::Developer, ["task_list"]));
+}
+
+#[tokio::test]
+async fn a_credential_reads_only_its_own_task() {
+    let h = H::new();
+    h.register(json!(["acp_session_mcp", "session_settings"])).await;
+    let task = h.task("port the parser").await;
+    let other = h.task("something else").await;
+    let item = h.running("acp:claude", Some(task)).await;
+    let value = h.mint(&item, 1).await.unwrap()["credential"].as_str().unwrap().to_string();
+    let v = h.verify(&value).unwrap();
+
+    // session_packet: defaults to the grant's task; another task is refused.
+    let p = h.as_session(&v, "session_packet", json!({})).await.unwrap();
+    assert_eq!(p["task"]["id"], json!(task), "{p}");
+    h.as_session(&v, "session_packet", json!({ "task_id": task })).await.unwrap();
+    for args in [json!({ "task_id": other }), json!({ "session_id": "s-other" })] {
+        let e = h.as_session(&v, "session_packet", args).await.unwrap_err();
+        assert_eq!(reason(&e), "session_task_scope");
+    }
+
+    // evidence_report: the grant's task only.
+    let r = h.as_session(&v, "evidence_report", json!({})).await.unwrap();
+    let ids: Vec<i64> =
+        r["records"].as_array().unwrap().iter().filter_map(|x| x["task_id"].as_i64()).collect();
+    assert_eq!(ids, vec![task], "{r}");
+    for args in [json!({ "task_id": other }), json!({ "project_id": other })] {
+        let e = h.as_session(&v, "evidence_report", args).await.unwrap_err();
+        assert_eq!(reason(&e), "session_task_scope");
+    }
+
+    // task_list: whatever the filters, at most the grant's task.
+    let l = h.as_session(&v, "task_list", json!({ "status": "all" })).await.unwrap();
+    let ids: Vec<i64> = l["tasks"].as_array().unwrap().iter().filter_map(|x| x["id"].as_i64()).collect();
+    assert_eq!(ids, vec![task], "{l}");
+    let l = h.as_session(&v, "task_list", json!({ "status": "all", "query": "something" })).await.unwrap();
+    assert!(l["tasks"].as_array().unwrap().iter().all(|x| x["id"] == json!(task)), "{l}");
+    // Outside a grant the same caller label lists both.
+    let all = h.ok(&device(), "task_list", json!({ "status": "all" })).await;
+    assert!(all["tasks"].as_array().unwrap().len() >= 2);
+
+    // An item without a task reads no task at all.
+    h.ok(
+        &device(),
+        "node_receipt",
+        json!({ "node": NODE, "item_id": item, "receipt": { "status": "finished", "attempt": 1 } }),
+    )
+    .await;
+    let bare = h.running("acp:claude", None).await;
+    let value = h.mint(&bare, 1).await.unwrap()["credential"].as_str().unwrap().to_string();
+    let v = h.verify(&value).unwrap();
+    let l = h.as_session(&v, "task_list", json!({ "status": "all" })).await.unwrap();
+    assert_eq!(l["tasks"], json!([]));
+    let e = h.as_session(&v, "session_packet", json!({})).await.unwrap_err();
+    assert_eq!(reason(&e), "session_task_scope");
+}
+
+#[tokio::test]
+async fn the_mint_refuses_an_item_not_bound_to_the_nodes_owner() {
+    let h = H::new();
+    h.register(json!(["acp_session_mcp", "session_settings"])).await;
+    let item = h.running("acp:claude", None).await;
+    h.sql(&format!("UPDATE node_dispatch SET agent = 'builder-2' WHERE id = '{item}'"));
+    assert_eq!(reason(&h.mint(&item, 1).await.unwrap_err()), "node_binding");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM session_credentials"), json!(0));
+}
+
+#[tokio::test]
+async fn replayed_credentials_are_each_ledgered() {
+    let h = H::new();
+    let before = h.events("hub.session_credential.refused");
+    // Distinct unknown values: one refusal event each.
+    for c in ['B', 'C', 'D'] {
+        assert_eq!(h.verify(&format!("uas_{}", c.to_string().repeat(43))).unwrap_err(), "unknown_or_revoked");
+    }
+    assert_eq!(h.events("hub.session_credential.refused") - before, 3);
+    // The same value again within the interval is not ledgered twice.
+    assert!(h.verify(&format!("uas_{}", "B".repeat(43))).is_err());
+    assert_eq!(h.events("hub.session_credential.refused") - before, 3);
 }
