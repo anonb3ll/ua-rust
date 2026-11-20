@@ -5,9 +5,11 @@ memory family does not yet have. It is not a plan to rebuild what exists. It
 depends on the organization model (`docs/organization.md`, PR #39) for
 `org_id`, users, teams, roles, organization settings and agent owners.
 
-The memory family is moving out of `ua-tools` into its own crate,
-`crates/ua-memory`. File paths below name the module (`rank.rs`, `embed.rs`)
-and hold in either location.
+The memory domain now lives in its own crate, `crates/ua-memory` (PR #49,
+merged as `fdb4bad`); `ua-tools/src/families/memory` keeps only the tool
+registration. File paths below name modules of `crates/ua-memory/src`
+(`rank.rs`, `embed.rs`, `search.rs`, `note.rs`, `save.rs`, `lifecycle.rs`,
+`schema.rs`).
 
 ## Correction to the brief
 
@@ -38,7 +40,8 @@ Facts the first draft did not record:
 
 - **Vector recall is effectively off.** `embed.rs::embedder_for` returns a
   `NoopEmbedder` unless the crate is built with the `embeddings` cargo feature.
-  That feature is off by default (`ua-tools/Cargo.toml`), `ua-cli` does not pass
+  That feature is off by default (`ua-memory/Cargo.toml`, reached through
+  `ua-tools/embeddings`), `ua-cli` does not pass
   it through, and no CI job builds it, so the `fastembed` module has never been
   compiled in CI. A default build is lexical-only.
 - **Vector staleness is not checked.** `store_vector` writes a `content_sha`,
@@ -82,7 +85,7 @@ result is "as good as or better than a leading memory system" is currently
 |---|---|---|
 | 1. Evidence | — | none |
 | 2. Chunks and embedder | `organization.v1` (the chunk fence reads `memory.org_id`) | `memory.chunks.v1` |
-| 3. Scoped recall | `organization.v4` (team visibility needs `teams`; owner backfill needs `users`) | `memory.scope.v1` |
+| 3. Scoped recall | `organization.v3` (team visibility needs `teams`; owner backfill needs `users` from `organization.v2`) | `memory.scope.v1` |
 | 4. Link store, consolidation, workbench | step 3 | `memory.links.v1`, `memory.consolidation.v1` |
 | 5. Graph leg | step 4 | none |
 | 6. Context pack, distillation | step 3 | `memory.episodes.v1` |
@@ -299,9 +302,6 @@ ALTER TABLE memory ADD COLUMN owner_type TEXT
     CHECK (owner_type IS NULL OR owner_type IN ('human','agent','org','team'));
 ALTER TABLE memory ADD COLUMN owner TEXT;          -- users.id, agent label, org id or team id
 ALTER TABLE memory ADD COLUMN credential_id TEXT;  -- set for session-grant writes
-ALTER TABLE memory ADD COLUMN lex_title_len INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE memory ADD COLUMN lex_content_len INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE memory ADD COLUMN lex_tags_len INTEGER NOT NULL DEFAULT 0;
 
 -- parity backfill, in the same migration
 UPDATE memory SET visibility = 'org';
@@ -327,10 +327,6 @@ WHEN (NEW.visibility = 'team') != (NEW.team_id IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'team_id must be set exactly for team visibility, in the same org'); END;
 ```
 
-The `lex_*_len` columns are filled by the writer (and once by a first-start
-backfill) with the token count of each field under the FTS tokenizer; they feed
-the scoped BM25 below.
-
 The column default is the **narrowest** tier, so an insert that forgets
 `visibility` fails closed. The writer always binds `visibility` explicitly from
 the organization's setting; the organization doc's insert-walking test is
@@ -340,11 +336,15 @@ extended so an `INSERT INTO memory` that omits `visibility`, `owner` or
 **Owners.** `owner` is who the note belongs to; `author` stays the writer
 stamped by `write_author`. They differ for consolidation summaries and
 session-grant writes. The owner backfill above maps a note to a human when its
-author is a `users` label, else to its agent, else to the organization. Because
-a hub's `users` rows appear at bootstrap, after the migration, the organization
-doc's bootstrap and the importer run the same human re-own step idempotently
+author is a `users` label, else to its agent, else to the organization. A
+`users` row can also appear after this part has applied (bootstrap of a newly
+listed hub owner, an import). So **this** PR also owns the human re-own step
 (`owner_type = 'human', owner = users.id` where `owner_type = 'agent'` and
-`owner` equals that user's label). A consolidation summary of an `org` or
+`owner` equals that user's label, case-insensitively): it is a `MemoryRepo`
+method, `reown_for_user`, which the organization doc's bootstrap and the
+importer call through a hook `ua-memory` registers. Before `memory.scope.v1`
+exists there is no hook and nothing to re-own; the step is idempotent, and it
+runs through `MemoryRepo`, so the authorizer admits it. A consolidation summary of an `org` or
 `team` group is owned by that organization or team (`owner_type = 'org'` or
 `'team'`).
 
@@ -409,7 +409,7 @@ Inventory of the paths that read the table today, and the rule for each:
 | `memory_get`, `note_links`, versions | by id, unscoped | Scoped; linked ids, `supersedes`, `superseded_by` and `contradicts` show only visible notes |
 | `memory_save` update / append / overwrite, `linked_note` for `supersedes`/`contradicts` | by id | Scoped; a hidden target is `not_found` |
 | `memory_save` `similar_notes` / `check_only` | unscoped similarity | Only visible notes are compared or returned |
-| `memory_save` idempotency replay | key looked up globally | Keys are scoped by organization (organization doc rebuild) **and** principal; a replay by another principal is a fresh call, and the "already used" and "is deleted" errors appear only to the key's own principal |
+| `memory_save` idempotency replay | key looked up globally | The key is rebuilt as `(org_id, principal, key)` (organization doc), so it is scoped by organization **and** principal; a replay by another principal is a fresh call, and the "already used" and "is deleted" errors appear only to the key's own principal |
 | `memory_delete`, `memory_restore`, `memory_feedback` | by id | Scoped |
 | `memory_prune_candidates`, `recall_maintenance` (`live_notes`) | unfiltered | Scoped to the caller |
 | `memory_promote` | copies any note to the shared vault | Only in `'default'` (the vault is hub-scoped) and only `org`-visible notes |
@@ -418,7 +418,7 @@ Inventory of the paths that read the table today, and the rule for each:
 | `propose_session_learnings` dedupe | unscoped existence check | Scoped |
 | `platform_object_get` (`memory_note`) | by id | Scoped |
 | vault ingest memory lookups | unscoped | Scoped to the ingesting caller |
-| `agent.memory.saved` and other memory ledger events | carry `title` and `tags` | Only for `org` notes; for `private` and `team` notes, the id and a content hash only |
+| `agent.memory.saved` and other memory ledger events | carry `title` and `tags` | Only for `org` notes; for `private` and `team` notes, ids only — no title, tags or content hash, since a plain hash lets an auditor confirm guessed content |
 | export manifest | every note | Operator-only, on the authorizer allowlist, and records the scope columns |
 | observability and evidence counts | global counts | Scoped counts, or hub-operator only |
 
@@ -431,17 +431,31 @@ over the **whole** `memory_fts` table; a `WHERE` clause does not change them.
 Hidden notes would therefore shift visible notes' lexical scores and order,
 revealing whether a term occurs in notes the caller cannot see. So FTS5 is used
 only as a **match index** — which eligible notes contain the terms — and BM25
-is computed in Rust from scoped statistics:
+is computed in Rust from scoped statistics. Every statistic comes from FTS5's
+own tables, so nothing re-implements the `porter unicode61 remove_diacritics 2`
+tokenizer and nothing can drift from the index:
 
-- `N` and the average field lengths are aggregated over **eligible** notes
-  (`lex_*_len`);
-- each query term's document frequency per field is a count of eligible
-  matches (one `MATCH` per term and field, inside the scoped `WHERE`);
-- term frequencies come from tokenizing the candidates' fields with the same
-  tokenizer rules as the FTS index.
+- **Query terms** are tokenized by FTS5 itself: the query text is written to a
+  temporary in-memory `fts5` table declared with the identical `tokenize`
+  option and read back through `fts5vocab`, giving exactly the indexed term
+  forms.
+- **Term frequencies** per note and field come from an `fts5vocab` **instance**
+  table over `memory_fts` (`term`, `doc`, `col`, `offset`), joined to `memory`
+  on `seq` inside the scoped `WHERE`.
+- **Document frequency** per term and field is the count of distinct eligible
+  `doc`s in that table.
+- **Field lengths** come from `memory_fts_docsize` (per-row column sizes, read
+  and decoded in the SQLite implementation of `MemoryRepo`); `N` and the
+  average field lengths are aggregated over eligible notes only.
+- **The cap moves after scoring.** Today the lexical leg runs
+  `ORDER BY bm25(...) LIMIT FTS_LIMIT` (200) in SQL (`search.rs`), so global
+  statistics would still decide which visible notes reach the candidate set.
+  The leg now fetches **every** eligible match, scores it in Rust, and only then
+  keeps the top `FTS_LIMIT`.
 
-The cost is a few extra indexed counts per query; the bench records latency so
-a regression is visible. The per-field weights and `RRF_K` are unchanged.
+The cost is a scan of eligible matches per query; the bench records p95 latency
+so a regression is visible. No columns are added for this. The per-field
+weights and `RRF_K` are unchanged.
 
 **Counts and confidence are scoped.** Totals and per-leg explanations are
 computed after eligibility. `note::open_contradictions` counts only disputing
@@ -525,7 +539,40 @@ BEGIN
       FROM memory m
      WHERE m.id = NEW.superseded_by AND m.org_id = NEW.org_id AND m.id != NEW.id;
 END;
+CREATE TRIGGER IF NOT EXISTS memory_links_mirror_supersedes_insert
+AFTER INSERT ON memory
+WHEN NEW.superseded_by IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO memory_links (org_id, src_id, dst_id, rel, asserted_by, actor, created_at)
+    SELECT m.org_id, m.id, NEW.id, 'supersedes', m.id, NEW.updated_by, NEW.updated_at
+      FROM memory m
+     WHERE m.id = NEW.superseded_by AND m.org_id = NEW.org_id AND m.id != NEW.id;
+END;
+
+-- backfill in memory.links.v1, and the same statement as the importer's
+-- post-import mirror pass: idempotent, never raises
+INSERT OR IGNORE INTO memory_links (org_id, src_id, dst_id, rel, asserted_by, actor, created_at)
+SELECT s.org_id, s.id, t.id, 'supersedes', s.id, t.updated_by, t.updated_at
+  FROM memory t JOIN memory s ON s.id = t.superseded_by AND s.org_id = t.org_id
+ WHERE s.id != t.id;
 ```
+
+The `contradicts` and `evidence` mirrors have the same three shapes —
+`AFTER INSERT`, `AFTER UPDATE OF contradicts` / `OF evidence`, and a backfill —
+reading the JSON arrays with `json_each` (`memory:<id>` refs only, for
+evidence) and joining the named note in the same organization. Mirrors fire on
+insert as well as update, so a note written with `superseded_by`, `contradicts`
+or evidence already set gets its edges. The backfill gives notes that predate
+`memory.links.v1` their edges. The importer inserts rows in source order, so a
+mirror can miss a target imported later in the same run; it therefore runs the
+three backfill statements once after every import run.
+
+Every new memory table in this document (`memory_chunks`, `memory_entities`,
+`memory_links`, `memory_consolidations`, `memory_consolidation_sources`,
+`memory_invalidations`, `memory_feedback_events`) is a tenant table: it carries
+`org_id NOT NULL` and gets the generated `<table>_org_exists` and
+`<table>_org_immutable` triggers from the organization doc's `ua-store` helper,
+in addition to the fences shown here.
 
 Entity kinds keep Python's `project` (not `repo`), so imported entities match.
 
@@ -571,7 +618,13 @@ note it could not already read:
 | `org` | the organization's `memory_consolidator_label` agent |
 | `team` | an agent that is a member of that team |
 | `private`, agent owner | only that agent |
-| `private`, human owner | only an agent whose `agents.owner_user_id` is that user |
+| `private`, human owner | only an agent whose `agents.owner_user_id` is that user, and only while that user's `org_memberships.consolidate_private` is on |
+
+A human's private notes are never consolidated by default. Both conditions are
+the user's own acts: `agents.owner_user_id` is set only by the named user (or
+by their acceptance of an admin's request), and `consolidate_private` is
+changed only by that member (organization doc). An `org_admin` who holds an
+agent's tokens therefore cannot point it at someone's private notes.
 
 **Grouping.** The scheduled pass runs as `system_for(org)` with a **grouping
 scope**: it reads note ids, scope columns, tags and entity rows — never titles
@@ -665,7 +718,13 @@ catches every write path, so no tool can forget the hook:
 CREATE TRIGGER IF NOT EXISTS memory_consolidation_invalidate
 AFTER UPDATE OF title, content, tags, visibility, team_id, owner_type, owner,
                 superseded_by, valid_from, valid_to, expires_at ON memory
-WHEN EXISTS (SELECT 1 FROM memory_consolidation_sources
+WHEN (OLD.title IS NOT NEW.title OR OLD.content IS NOT NEW.content
+      OR OLD.tags IS NOT NEW.tags OR OLD.visibility IS NOT NEW.visibility
+      OR OLD.team_id IS NOT NEW.team_id OR OLD.owner_type IS NOT NEW.owner_type
+      OR OLD.owner IS NOT NEW.owner OR OLD.superseded_by IS NOT NEW.superseded_by
+      OR OLD.valid_from IS NOT NEW.valid_from OR OLD.valid_to IS NOT NEW.valid_to
+      OR OLD.expires_at IS NOT NEW.expires_at)
+ AND EXISTS (SELECT 1 FROM memory_consolidation_sources
               WHERE note_id = NEW.id AND live = 1)
 BEGIN
     INSERT INTO memory_invalidations (org_id, consolidation_id, summary_note_id, at)
@@ -699,7 +758,11 @@ BEGIN
 END;
 ```
 
-An `AFTER DELETE` twin does the same for `OLD.id`. The columns listed are the
+An `AFTER DELETE` twin does the same for `OLD.id`. `UPDATE OF` fires whenever
+a column is in the `SET` list, and `save.rs` always sets `title`, `content`,
+`tags`, `expires_at` and `valid_from`, so the `WHEN` clause compares each
+listed column's old and new value: a save that changes only salience, evidence,
+`contradicts` or counters does not invalidate. The columns listed are the
 content, scope and validity columns; feedback counters and link columns
 (`contradicts`, `evidence`) are not, so accepting a contradiction does not
 invalidate the summary that proposed it. The trigger:
@@ -862,8 +925,12 @@ holds.
   trusting freshness nobody can verify.
 - From Python's `memory_links`, only `extends` and `derives` rows are imported
   (`asserted_by = src_id`); `supersedes`, `contradicts` and `evidence` are
-  re-created by the mirror triggers from the imported columns, so each relation
-  keeps one authority. Entity kind `project` is kept.
+  re-created by the mirrors from the imported columns, so each relation keeps
+  one authority. Because rows arrive in source order, the importer runs the
+  three mirror backfill statements (§4) after every run. Entity kind `project`
+  is kept.
+- The importer calls the `reown_for_user` hook (§3) for every `users` row it
+  creates.
 - A NULL source `org_id` becomes `'default'` (per the organization doc's
   mapping). Imported notes are written with `visibility = 'org'` and an
   explicit owner by the same rule as the backfill (human by `users` label, else
@@ -875,8 +942,11 @@ holds.
 
 ## Where the code lives
 
-- `crates/ua-memory`: everything in this document. `ua-tools` keeps only the
-  registration.
+- `crates/ua-memory` (extracted in #49): everything in this document.
+  `ua-tools` keeps only the registration. The organization doc's authority
+  guard covers this crate too: today `note.rs` defines its own `is_human` and
+  `lifecycle.rs` uses it for delete, restore and the privileged-field checks;
+  those move to `ua-org::authz`.
 - `ua-store` gains a `MemoryRepo` trait next to `OrgRepo`; `ua-memory` reaches
   the database only through it, and the authorizer hook enforces that. Today
   `Filter` binds `rusqlite` `SqlValue`s and `VectorIndex` takes a
@@ -953,14 +1023,18 @@ Scope
    owner's `private` notes and another team's `team` notes — including ones
    sharing the query's terms and entities — leaves every corpus query's ids,
    order, raw lexical and semantic scores, counts, explanations and confidence
-   fields identical, on every leg including chunks and graph.
+   fields identical, on every leg including chunks and graph — including when
+   more than `FTS_LIMIT` hidden notes match the query (the cap applies after
+   scoped scoring) — and the lexical leg's term forms equal FTS5's own
+   tokenization for a query with stemming and diacritics.
 9. **Every path is scoped.** A connection outside `MemoryRepo` and the
    allowlist is denied a memory read by the authorizer; each tool in the
    inventory returns nothing invisible; an invisible id produces the same
    `not_found` as a missing one.
 10. **Idempotency and ledger.** Another principal reusing a `memory_save`
     idempotency key gets a fresh call and no hint of the first; ledger events
-    for `private` and `team` notes carry no title or tags; `export_memory`
+    for `private` and `team` notes carry ids only — no title, tags or content
+    hash; `export_memory`
     exports only visible notes and writes to the vault only in `'default'`.
 11. **Scoped confidence.** A hidden contradicting note changes neither a visible
     note's rank nor its `confidence_posterior`, and its id appears in no link
@@ -972,8 +1046,11 @@ Scope
     two teams saves `private`; `team` without `team_id`, or with another
     organization's team, is refused.
 13. **Owners.** After migration and bootstrap, a note written by a configured
-    human is owned by that `users` row; re-running bootstrap or import changes
-    nothing further; a summary of an `org` group is owned by the organization.
+    human is owned by that `users` row; a hub owner bootstrapped after
+    `memory.scope.v1` gets their notes re-owned through `reown_for_user`, and so
+    does a user the importer creates; re-running bootstrap or import changes
+    nothing further; the re-own runs through `MemoryRepo` and is not denied by
+    the authorizer; a summary of an `org` group is owned by the organization.
 14. **Visibility changes.** Only the owner widens, and widening into a team
     needs membership; an `org_admin` cannot read, narrow or delete a `private`
     note they cannot see, and can narrow an `org` note; narrowing invalidates
@@ -995,10 +1072,16 @@ Links and consolidation
 18. **Mirrors.** A save with a dangling or cross-organization `memory:` evidence
     ref succeeds and creates no edge; un-superseding a note removes its mirrored
     `supersedes` edge; accepting a proposed contradiction writes
-    `memory.contradicts` and leaves no `proposed` row.
+    `memory.contradicts` and leaves no `proposed` row; a note inserted with
+    `superseded_by`, `contradicts` or a `memory:` ref already set gets its edges
+    on insert; notes that predate `memory.links.v1` get theirs from the
+    backfill; running the backfill twice adds nothing.
 19. **Consolidator eligibility.** No agent is handed a `private` group unless it
-    is the owner or its `owner_user_id` is the owning human, nor a `team` group
-    of a team it is not in; the grouping pass reads no title or content.
+    is the owner, or its `owner_user_id` is the owning human **and** that human
+    has `consolidate_private` on; an `org_admin` cannot set `owner_user_id` to
+    another user or turn on someone else's `consolidate_private`; no agent is
+    handed a `team` group of a team it is not in; the grouping pass reads no
+    title or content.
 20. **Grouping.** With embeddings off, the same notes produce the same groups;
     a group never exceeds 20 sources or mixes scopes; a note is never a live
     source of two consolidations; the pass creates at most
@@ -1017,7 +1100,9 @@ Links and consolidation
     source leaves the summary's title and content as the tombstone through
     `memory_get` and `include_expired`, with no stored versions; the remaining
     sources are groupable again; an invalidation event with ids only reaches
-    the ledger; `derives` edges remain.
+    the ledger; `derives` edges remain. A save that rewrites a source with the
+    same title, content, tags, scope and validity — changing only salience, an
+    evidence ref, `contradicts` or counters — does not invalidate.
 24. **Workbench.** A pair with one hidden side is not listed; a `member` who
     does not own both notes cannot resolve; "both valid" sets the two ranges,
     closes the link and leaves both notes in default search; rendered note text
@@ -1043,4 +1128,6 @@ Graph, pack, distillation, import
     `extends`/`derives` links import with `asserted_by = src_id`, NULL org
     mapped to `'default'`, explicit visibility and owners, and stale vectors;
     imported `supersedes`, `contradicts` and `evidence` edges come only from the
-    mirrors; a manifest compare distinguishes a retired edge from a live one.
+    mirrors and are all present after the run even when the superseding note
+    was imported after the note it supersedes; a manifest compare distinguishes
+    a retired edge from a live one.
