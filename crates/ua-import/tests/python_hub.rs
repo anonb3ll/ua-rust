@@ -782,6 +782,39 @@ fn a_tampered_ledger_row_stops_the_import_before_any_write() {
 }
 
 #[test]
+fn an_imported_legacy_prefix_is_recorded_and_verified() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    // Two rows the Python hub wrote before it hashed its ledger.
+    for (rowid, ulid) in [(1, "01HZZZZZZZZZZZZZZZZZZZZZZ1"), (2, "01HZZZZZZZZZZZZZZZZZZZZZZ2")] {
+        c.execute(
+            "INSERT INTO event_log (rowid, ulid, channel, payload, created_at) \
+             VALUES (?1, ?2, 'agent.legacy', '{}', '2025-12-31T00:00:00+00:00')",
+            params![rowid, ulid],
+        )
+        .unwrap();
+    }
+    drop(c);
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3 && tl.unhashed_legacy_prefix == 2, "{tl:?}");
+    assert_eq!(n(&db, "SELECT value FROM ledger_meta WHERE key = 'unhashed_legacy_prefix'"), 2);
+    // A further unhashed row ahead of the chain is not explained by the record.
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at) \
+             VALUES (0, '01HZZZZZZZZZZZZZZZZZZZZZZ0', 'forged', '{}', '2025-12-31T00:00:00+00:00')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let v = db.read(ledger::verify).unwrap();
+    assert!(!v.ok && v.first_bad_seq == Some(0), "{v:?}");
+}
+
+#[test]
 fn a_hashed_value_that_is_not_text_is_refused() {
     let f = fixture();
     let c = Connection::open(&f.path).unwrap();

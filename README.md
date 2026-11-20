@@ -75,7 +75,8 @@ over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
   typed arguments, then a `tool_calls` row and ledger events. Ledger
   verification (`event_log_verify`, `evidence_report`) fails on any row
   without a hash after the chain starts; only an imported legacy prefix may
-  lack one, and it is reported as `unhashed_legacy_prefix`.
+  lack one, it must be exactly as long as the import recorded, and it is
+  reported as `unhashed_legacy_prefix`.
 - Approvals need a verified human. The approval payload binds the exact
   arguments, and for dispatch the resolved workdir, argv and prompt.
 - `fs_*`, `run_cmd` and `git_*` are confined to a workspace root. Hook

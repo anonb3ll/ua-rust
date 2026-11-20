@@ -40,6 +40,7 @@ use ua_store::SchemaPart;
 pub fn schema_parts() -> Vec<SchemaPart> {
     let mut parts =
         vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
+    parts.push(ua_store::ledger::META_SCHEMA);
     parts.extend(families::schema_parts());
     parts.push(config_revisions::SCHEMA);
     parts

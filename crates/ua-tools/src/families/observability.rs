@@ -1145,7 +1145,12 @@ fn ledger_check(facts: &DbFacts) -> Value {
         );
     }
     if c.checked == 0 {
-        return finding("ledger_chain", DORMANT, "the ledger is empty", gate);
+        let text = if c.unhashed_legacy_prefix > 0 {
+            format!("only {} imported legacy (unhashed) rows; nothing hashed yet", c.unhashed_legacy_prefix)
+        } else {
+            "the ledger is empty".to_string()
+        };
+        return finding("ledger_chain", DORMANT, text, gate);
     }
     finding(
         "ledger_chain",
