@@ -620,10 +620,11 @@ note it could not already read:
 | `private`, agent owner | only that agent |
 | `private`, human owner | only an agent whose `agents.owner_user_id` is that user, and only while that user's `org_memberships.consolidate_private` is on |
 
-A human's private notes are never consolidated by default. Both conditions are
-the user's own acts: `agents.owner_user_id` is set only by the named user (or
-by their acceptance of an admin's request), and `consolidate_private` is
-changed only by that member (organization doc). An `org_admin` who holds an
+A human's private notes are never consolidated by default. Both conditions
+need the user's own act: `agents.owner_user_id` is set only with the named
+user's act together with a different `org_admin`'s (request and approval, or
+offer and acceptance), and `consolidate_private` is changed only by that member
+(organization doc). An `org_admin` who holds an
 agent's tokens therefore cannot point it at someone's private notes. Nor can
 the admin take over an agent the user pointed: claiming an agent revokes the
 credentials others issued for it, and while it has an owner a new root
