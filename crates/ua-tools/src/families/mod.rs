@@ -19,6 +19,8 @@ pub mod export;
 pub mod governance;
 pub mod graph;
 pub mod injection;
+pub mod managed_secrets;
+pub mod mcp;
 pub mod memory;
 pub mod messaging;
 pub mod node_queue;
@@ -56,6 +58,8 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(delegation::SCHEMA);
     parts.push(governance::SCHEMA);
     parts.push(graph::SCHEMA);
+    parts.push(managed_secrets::SCHEMA);
+    parts.push(mcp::SCHEMA);
     parts.push(messaging::SCHEMA);
     parts.extend(node_queue::schema_parts());
     parts.push(nodes::SCHEMA);
@@ -82,6 +86,8 @@ pub fn register(r: &mut Registry) {
     governance::register(r);
     graph::register(r);
     injection::register(r);
+    managed_secrets::register(r);
+    mcp::register(r);
     memory::register(r);
     messaging::register(r);
     node_queue::register(r);
