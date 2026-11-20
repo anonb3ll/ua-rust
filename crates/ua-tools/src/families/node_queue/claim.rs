@@ -20,6 +20,7 @@ use super::{
     evidence_ref, items_where, load_item, now, owned_node, record, renew_run, run_gate, run_running,
     sweep_tx,
 };
+use crate::families::nodes;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -486,9 +487,13 @@ async fn node_claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         let done = out.item.is_some() || !out.pending && op.is_some() || last;
         if done {
             if out.item.is_none() {
-                // Nothing to run: retry any command notice still owed.
-                let hub = ctx.hub.clone();
-                let _ = tokio::task::spawn_blocking(move || command::deliver_pending(&hub, None)).await;
+                // Nothing to run: retry any command notice still owed for
+                // this node's items (the serve sweep covers every node).
+                let (hub, node) = (ctx.hub.clone(), nodes::validate_node_name(&a.node)?);
+                let _ = tokio::task::spawn_blocking(move || {
+                    command::deliver_pending(&hub, command::NoticeScope::Node(&node))
+                })
+                .await;
             }
             let mut v = json!({ "item": out.item });
             if let Some(d) = out.disposition {

@@ -25,6 +25,9 @@ pub const FOLLOWUP_OPEN_MAX: i64 = 20;
 const FOLLOWUP_BATCH: i64 = 20;
 const MAX_ACKS: usize = 50;
 const MAX_FOLLOWUP_CHARS: usize = 20_000;
+/// The approval an agent's follow-up waits on: its own tool name, so a
+/// reviewer never mistakes it for queuing new work (`node_dispatch`).
+const FOLLOWUP_GATE: &str = "node_followup";
 const MAX_OPTIONS: usize = 32;
 const MAX_PERMISSION_BYTES: usize = 32_768;
 
@@ -426,10 +429,10 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
         return Err(UaError::invalid("idempotency_key must be 8-128 of [A-Za-z0-9_.:-]"));
     }
     // Only a human writes without a gate; an agent's follow-up is new
-    // instructions to a running session and needs an approval.
+    // instructions to a running session and needs its own approval.
     let operator = ctx.caller.is_human() || ctx.hub.cfg().is_human(&who);
     if !operator
-        && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "node_dispatch")
+        && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, FOLLOWUP_GATE)
     {
         return Err(refusal.error);
     }
@@ -487,6 +490,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                 "not_required_operator"
             } else {
                 let payload = json!({
+                    "summary": format!("follow-up ({mode}) into {id} on {}", item.node),
                     "node": item.node,
                     "backend": item.backend,
                     "cwd": item.cwd,
@@ -497,7 +501,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                     "action": "dispatch",
                     "agent": who,
                 });
-                match approvals::gate(tx, hub.cfg(), &caller, "node_dispatch", &payload)? {
+                match approvals::gate(tx, hub.cfg(), &caller, FOLLOWUP_GATE, &payload)? {
                     GateOutcome::Pass { .. } => "gate_passed",
                     GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
                     GateOutcome::Denied { approval_id, reason } => {
@@ -537,7 +541,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
             })))
         })
         .await?;
-    out.map_err(|approval_id| UaError::ApprovalRequired { tool: "node_dispatch".into(), approval_id })
+    out.map_err(|approval_id| UaError::ApprovalRequired { tool: FOLLOWUP_GATE.into(), approval_id })
 }
 
 // --- permission prompts ---------------------------------------------------------
@@ -608,6 +612,10 @@ async fn node_permission(ctx: ToolCtx, a: PermissionArgs) -> UaResult<Value> {
                 return Ok(json!({ "status": "denied", "reason": why }));
             }
             let (tool_call, options) = &canonical_base;
+            // Nothing an approval could select: do not ask a human for it.
+            if !options.iter().any(|o| o["kind"].as_str().is_some_and(|k| k.starts_with("allow"))) {
+                return Ok(json!({ "status": "denied", "reason": "no_allow_option" }));
+            }
             let canonical = json!({
                 "node": row.node, "item_id": id, "session_id": session, "tool_call": tool_call, "options": options,
             });
@@ -676,8 +684,8 @@ pub fn register(r: &mut Registry) {
             "node_followup",
             "Send a follow-up into a running ACP item's session: mode queue (after the current turn) or steer \
              (into it). A human's follow-up needs no approval; an agent (the item's requester) needs a one-time \
-             human approval of the exact text. Idempotent by idempotency_key. Returns {followup_id, seq, status, \
-             approval, duplicate}.",
+             human approval (tool node_followup) of the exact text. Idempotent by idempotency_key. Returns \
+             {followup_id, seq, status, approval, duplicate}.",
             node_followup,
         )
         .gates_in_handler()
@@ -687,7 +695,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "node_permission",
             "Device plane: relay an ACP session's permission prompt for a human decision. Ask again with the \
-             identical request until it is decided. Returns {status: pending|approved|denied, approval_id, \
+             identical request until it is decided. A prompt with no allow* option is denied \
+             (no_allow_option) without asking anyone. Returns {status: pending|approved|denied, approval_id, \
              option_id?, reason?}; an approval is used once.",
             node_permission,
         )

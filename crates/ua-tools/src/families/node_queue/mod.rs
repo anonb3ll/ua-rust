@@ -10,16 +10,17 @@
 //!   `node_permission`; `node_heartbeat` (in [`super::nodes`]) renews the
 //!   running item's lease and relays cancels;
 //! - `node_items` lists items, and `node_followup` sends a follow-up into a
-//!   live ACP session;
+//!   live ACP session (an agent's needs a one-time `node_followup` approval);
 //! - `coordination_manage` actions `node_item_cancel`, `node_item_restart`,
 //!   `node_command_start`, `node_command_status` and `node_command_adopt`.
 //!
 //! An item is `queued`, then `claimed` (each claim adds one to `attempts`,
 //! the attempt fence, and sets a lease of `timeout_s` + [`LEASE_GRACE_S`]),
 //! then ends `finished`, `failed`, `killed` or `cancelled`. The first receipt
-//! wins (`receipt_json` is the idempotency gate). A receipt names the attempt
-//! it reports; one for an earlier attempt is refused. A supervised command
-//! must also echo the per-claim fence token.
+//! wins (`receipt_json` is the idempotency gate). A receipt must name the
+//! attempt it reports (an integer `attempt`; one without it is refused), and
+//! one for an earlier attempt is refused. A supervised command must also echo
+//! the per-claim fence token. Its free text is redacted before it is stored.
 //!
 //! Work for a node that is not live waits up to `node_queue_wait_s`, then
 //! fails `waiting_expired_node_offline`. A claimed item whose lease lapses
@@ -1309,13 +1310,14 @@ pub(crate) async fn node_item_restart(ctx: ToolCtx, a: ItemArgs) -> UaResult<Val
 
 // --- the sweep ------------------------------------------------------------------
 
-/// Expire waits, fail lapsed leases (for `node`, or every node) and retry
-/// undelivered command notices. Run by every claim for its node, and by
+/// Expire waits, fail lapsed leases and retry undelivered command notices,
+/// for `node`'s items or every node's. Run by every claim for its node, and by
 /// `ua serve` every `node_wait_sweep_s` seconds for all nodes.
 pub fn sweep(hub: &Hub, node: Option<&str>) -> UaResult<Value> {
-    let node = node.map(str::to_string);
-    let out = hub.db().write(move |tx| sweep_tx(tx, node.as_deref(), "node-queue-sweep"))?;
-    let notices = command::deliver_pending(hub, None)?;
+    let owned = node.map(str::to_string);
+    let out = hub.db().write(move |tx| sweep_tx(tx, owned.as_deref(), "node-queue-sweep"))?;
+    let scope = node.map_or(command::NoticeScope::All, command::NoticeScope::Node);
+    let notices = command::deliver_pending(hub, scope)?;
     let mut out = out;
     out["notices_delivered"] = json!(notices);
     Ok(out)

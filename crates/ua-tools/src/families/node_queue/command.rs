@@ -181,18 +181,37 @@ pub(crate) fn record_completion(tx: &WriteTx<'_>, item: &Item, status: &str, sto
     Ok(())
 }
 
-/// Send owed notices (one item's, or up to 50 of any), each in its own
-/// transaction under a stable message id, so a retry never sends twice.
-/// Returns how many were delivered now.
-pub(crate) fn deliver_pending(hub: &Hub, item: Option<&str>) -> UaResult<usize> {
-    let item = item.map(str::to_string);
+/// Which owed notices [`deliver_pending`] retries.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NoticeScope<'a> {
+    /// One item's notices (after its receipt).
+    Item(&'a str),
+    /// Notices for one node's items (an idle claim, a node's sweep).
+    Node(&'a str),
+    /// Any node's (the `ua serve` sweep).
+    All,
+}
+
+/// Send owed notices in `scope` (up to 50), each in its own transaction
+/// under a stable message id, so a retry never sends twice. Returns how
+/// many were delivered now.
+pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usize> {
+    let (item, node) = match scope {
+        NoticeScope::Item(i) => (Some(i.to_string()), None),
+        NoticeScope::Node(n) => (None, Some(n.to_string())),
+        NoticeScope::All => (None, None),
+    };
     let owed: Vec<(String, i64, String, String, String, Option<i64>)> = hub.db().read(|c| {
         let mut stmt = c.prepare(
             "SELECT item_id, attempt, terminal, owner_agent, body, task_id FROM node_command_notice \
-             WHERE sent_at IS NULL AND (?1 IS NULL OR item_id = ?1) ORDER BY created_at LIMIT 50",
+             WHERE sent_at IS NULL AND (?1 IS NULL OR item_id = ?1) \
+             AND (?2 IS NULL OR item_id IN (SELECT id FROM node_dispatch WHERE node = ?2)) \
+             ORDER BY created_at LIMIT 50",
         )?;
         let rows = stmt
-            .query_map([&item], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+            .query_map(params![item, node], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })?;

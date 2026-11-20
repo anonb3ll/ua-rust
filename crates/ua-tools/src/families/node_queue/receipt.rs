@@ -12,6 +12,7 @@ use super::{
     check_item_id, clip, close_linked_run, command, device_agent, evidence_ref, load_item, now, owned_node,
     record, relay,
 };
+use crate::families::audit::rules::redact_secrets;
 use crate::registry::{Registry, ToolCtx, tool};
 
 /// Statuses a node may report.
@@ -21,7 +22,13 @@ fn text(m: &Map<String, Value>, key: &str, max: usize) -> Value {
     m.get(key).and_then(Value::as_str).map_or(Value::Null, |s| json!(clip(s, max)))
 }
 
-/// The stored form of a receipt: known fields only, each bounded.
+/// Free text the node wrote: credential-shaped spans redacted, then bounded.
+fn free_text(m: &Map<String, Value>, key: &str, max: usize) -> Option<String> {
+    m.get(key).and_then(Value::as_str).map(|s| clip(&redact_secrets(s).0, max))
+}
+
+/// The stored form of a receipt: known fields only, each bounded, and its
+/// free text (`text`, `reason`, `log_capture.error`) redacted.
 pub(crate) fn bounded(m: &Map<String, Value>, node: &str) -> Value {
     let files: Vec<Value> = m
         .get("files_modified")
@@ -45,14 +52,14 @@ pub(crate) fn bounded(m: &Map<String, Value>, node: &str) -> Value {
         json!({
             "state": state,
             "truncated": lc.get("truncated").and_then(Value::as_bool),
-            "error": text(lc, "error", 300),
+            "error": free_text(lc, "error", 300),
             "state_path": text(lc, "state_path", 500),
         })
     });
     json!({
         "status": m.get("status").and_then(Value::as_str).unwrap_or(""),
-        "reason": text(m, "reason", 300),
-        "text": m.get("text").and_then(Value::as_str).map(|s| clip(s, 8000)).unwrap_or_default(),
+        "reason": free_text(m, "reason", 300),
+        "text": free_text(m, "text", 8000).unwrap_or_default(),
         "exit_code": exit_code,
         "backend_status": text(m, "backend_status", 40),
         "files_modified": files,
@@ -210,7 +217,8 @@ pub struct ReceiptArgs {
     pub item_id: String,
     /// `{status: finished|failed|killed, attempt, reason?, text?, exit_code?, backend_status?,
     /// files_modified?, session_id?, started_at?, finished_at?, log_path?, truncated?, log_capture?,
-    /// fence_token? (supervised commands)}`.
+    /// fence_token? (supervised commands)}`. `attempt` is required: the integer `attempt` of the
+    /// claim being reported. `text`, `reason` and `log_capture.error` are redacted before storage.
     pub receipt: Value,
 }
 
@@ -227,10 +235,15 @@ async fn node_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
             RECEIPT_STATUSES.join(", ")
         )));
     }
+    if !receipt.get("attempt").is_some_and(Value::is_i64) {
+        return Err(UaError::invalid("receipt.attempt is required"));
+    }
     let id2 = id.clone();
     let out = ctx.hub.db().write_async(move |tx| post(tx, &agent, &a.node, &id2, &receipt)).await??;
     let hub = ctx.hub.clone();
-    let _ = tokio::task::spawn_blocking(move || command::deliver_pending(&hub, Some(&id))).await;
+    let _ =
+        tokio::task::spawn_blocking(move || command::deliver_pending(&hub, command::NoticeScope::Item(&id)))
+            .await;
     Ok(out)
 }
 
@@ -239,8 +252,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "node_receipt",
             "Device plane: report what became of a claimed item (finished, failed or killed). The first receipt \
-             wins; a retry returns it with duplicate=true. A receipt for an earlier attempt is refused \
-             (stale_attempt), and a supervised command must echo its fence_token (stale_fence). Settles the \
+             wins; a retry returns it with duplicate=true. A receipt must name the claim's attempt; one for an \
+             earlier attempt is refused (stale_attempt), and a supervised command must echo its fence_token (stale_fence). Settles the \
              item's dispatch run. Returns {item_id, duplicate, status, evidence_ref, event_id, run_outcome, receipt}.",
             node_receipt,
         )
@@ -269,6 +282,21 @@ mod tests {
         assert!(b.get("secret").is_none());
         assert_eq!(b["attempt"], 2);
         assert_eq!(b["node"], "n1");
+    }
+
+    #[test]
+    fn receipt_free_text_is_redacted() {
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz0123";
+        let raw = json!({
+            "status": "failed",
+            "attempt": 1,
+            "text": format!("pushed with {token}"),
+            "reason": format!("auth {token}"),
+            "log_capture": { "state": "error", "error": format!("token {token}") },
+        });
+        let b = bounded(raw.as_object().unwrap(), "n1");
+        assert!(!b.to_string().contains("ghp_0123456789"), "{b}");
+        assert!(b["text"].as_str().unwrap().starts_with("pushed with "));
     }
 
     #[test]

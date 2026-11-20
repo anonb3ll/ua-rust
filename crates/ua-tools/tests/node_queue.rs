@@ -224,19 +224,35 @@ async fn work_is_approved_claimed_and_settled_by_its_receipt() {
         )
         .await;
     assert_eq!(reason(&e), "stale_attempt");
-    let receipt =
-        json!({ "status": "finished", "attempt": 1, "text": "done", "exit_code": 0, "secret": "x" });
+    // A receipt must name its attempt.
+    for attempt in [Value::Null, json!("1"), json!(1.5)] {
+        let mut r = json!({ "status": "finished" });
+        if !attempt.is_null() {
+            r["attempt"] = attempt;
+        }
+        let e = h.err(&device(), "node_receipt", json!({ "node": NODE, "item_id": id, "receipt": r })).await;
+        assert!(matches!(e, UaError::InvalidArgument(_)), "{e:?}");
+        assert!(e.to_string().contains("receipt.attempt is required"), "{e}");
+    }
+    let receipt = json!({
+        "status": "finished", "attempt": 1, "exit_code": 0, "secret": "x",
+        "text": "done; pushed with ghp_0123456789abcdefghijklmnopqrstuvwxyz0123",
+    });
     let out =
         h.ok(&device(), "node_receipt", json!({ "node": NODE, "item_id": id, "receipt": receipt })).await;
     assert_eq!(out["duplicate"], false);
     assert_eq!(out["status"], "finished");
     assert_eq!(out["evidence_ref"], format!("node:{NODE}:{id}"));
     assert!(out["receipt"].get("secret").is_none());
+    // Free text is redacted before it is stored.
+    assert!(out["receipt"]["text"].as_str().unwrap().starts_with("done; pushed with "));
+    let stored = h.scalar(&format!("SELECT receipt_json FROM node_dispatch WHERE id = '{id}'"));
+    assert!(!stored.as_str().unwrap().contains("ghp_0123456789"), "{stored}");
     let dup = h
         .ok(
             &device(),
             "node_receipt",
-            json!({ "node": NODE, "item_id": id, "receipt": { "status": "failed" } }),
+            json!({ "node": NODE, "item_id": id, "receipt": { "status": "failed", "attempt": 1 } }),
         )
         .await;
     assert_eq!(dup["duplicate"], true);
@@ -493,6 +509,31 @@ async fn a_supervised_command_needs_its_fence_and_notifies_its_owner() {
 }
 
 #[tokio::test]
+async fn an_idle_claim_retries_only_its_own_nodes_notices() {
+    let h = H::new();
+    h.register_default().await;
+    // Two finished commands, one on another node, each with a notice owed.
+    let ts = "2026-01-01T00:00:00+00:00";
+    for (item, node) in [("nd-00000000000000aa", NODE), ("nd-00000000000000bb", "node-b")] {
+        h.sql(&format!(
+            "INSERT INTO node_dispatch (id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+             created_by, created_at, updated_at) VALUES ('{item}', '{node}', 'builder-1', 'command', 'p', '/srv', \
+             60, 'finished', 1, 'lead-1', '{ts}', '{ts}'); \
+             INSERT INTO node_command_notice (item_id, attempt, terminal, owner_agent, body, created_at) \
+             VALUES ('{item}', 1, 'finished', 'lead-1', 'done', '{ts}');"
+        ));
+    }
+    let sent = |item: &str| {
+        h.scalar(&format!("SELECT sent_at IS NOT NULL FROM node_command_notice WHERE item_id = '{item}'"))
+    };
+    assert_eq!(h.claim().await["item"], Value::Null);
+    assert_eq!(sent("nd-00000000000000aa"), json!(1), "this node's notice is retried");
+    assert_eq!(sent("nd-00000000000000bb"), json!(0), "another node's is left to the sweep");
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(sent("nd-00000000000000bb"), json!(1));
+}
+
+#[tokio::test]
 async fn follow_ups_reach_a_running_acp_session() {
     let h = H::new();
     h.register_default().await;
@@ -526,9 +567,32 @@ async fn follow_ups_reach_a_running_acp_session() {
         )
         .await;
     assert_eq!(reason(&e), "not_item_owner");
-    let g = h
-        .gated(&lead(), "node_followup", json!({ "item_id": id, "mode": "queue", "body": "then open a PR", "idempotency_key": "queue-0002" }))
-        .await;
+    // The approval is its own tool, bound to the session and the exact text.
+    let ask =
+        json!({ "item_id": id, "mode": "queue", "body": "then open a PR", "idempotency_key": "queue-0002" });
+    let parked = h.err(&lead(), "node_followup", ask.clone()).await;
+    let UaError::ApprovalRequired { approval_id, tool } = parked else {
+        panic!("expected an approval: {parked:?}")
+    };
+    assert_eq!(tool, "node_followup");
+    let payload: Value = serde_json::from_str(
+        h.scalar(&format!("SELECT payload FROM approvals WHERE id = {approval_id}")).as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["summary"], format!("follow-up (queue) into {id} on {NODE}"));
+    assert_eq!(payload["prompt"], "then open a PR");
+    assert_eq!(payload["backend"], "acp:claude");
+    assert_eq!(payload["cwd"], "/srv/work/repo");
+    assert_eq!(
+        payload["followup"],
+        json!({ "item_id": id, "mode": "queue", "idempotency_key": "queue-0002" })
+    );
+    assert_eq!(
+        h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_dispatch' AND status = 'pending'"),
+        json!(0)
+    );
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    let g = h.ok(&lead(), "node_followup", ask).await;
     assert_eq!(g["approval"], "gate_passed");
 
     // The node polls, acknowledges, and reports delivery.
@@ -596,6 +660,17 @@ async fn a_permission_prompt_waits_for_a_human_and_is_used_once() {
     assert_eq!(decided["option_id"], "yes");
     let next = h.ok(&device(), "node_permission", ask.clone()).await;
     assert_eq!(next["status"], "pending", "an approval answers one prompt");
+
+    // A prompt the node could not apply an approval to is denied without asking.
+    let mut reject_only = ask.clone();
+    reject_only["options"] = json!([{ "optionId": "no", "name": "Reject", "kind": "reject_once" }]);
+    let before = h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'acp_permission'");
+    let refused = h.ok(&device(), "node_permission", reject_only).await;
+    assert_eq!(refused, json!({ "status": "denied", "reason": "no_allow_option" }));
+    let mut no_options = ask.clone();
+    no_options["options"] = json!([]);
+    assert_eq!(h.ok(&device(), "node_permission", no_options).await["reason"], "no_allow_option");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'acp_permission'"), before);
 
     // A cancelled item's prompts are denied without asking anyone.
     h.manage(&lead(), "node_item_cancel", json!({ "item_id": id })).await.unwrap();
@@ -821,6 +896,7 @@ async fn an_unscoped_agent_gets_no_permission_or_follow_up() {
         .await;
     assert!(!matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'acp_permission'"), json!(0));
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
 }
 
 #[tokio::test]
