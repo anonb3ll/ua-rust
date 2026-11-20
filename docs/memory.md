@@ -624,7 +624,10 @@ A human's private notes are never consolidated by default. Both conditions are
 the user's own acts: `agents.owner_user_id` is set only by the named user (or
 by their acceptance of an admin's request), and `consolidate_private` is
 changed only by that member (organization doc). An `org_admin` who holds an
-agent's tokens therefore cannot point it at someone's private notes.
+agent's tokens therefore cannot point it at someone's private notes. Nor can
+the admin take over an agent the user pointed: claiming an agent revokes the
+credentials others issued for it, and while it has an owner any new credential
+for it needs that owner's approval (organization doc, writer rules).
 
 **Grouping.** The scheduled pass runs as `system_for(org)` with a **grouping
 scope**: it reads note ids, scope columns, tags and entity rows — never titles
@@ -1079,9 +1082,11 @@ Links and consolidation
 19. **Consolidator eligibility.** No agent is handed a `private` group unless it
     is the owner, or its `owner_user_id` is the owning human **and** that human
     has `consolidate_private` on; an `org_admin` cannot set `owner_user_id` to
-    another user or turn on someone else's `consolidate_private`; no agent is
-    handed a `team` group of a team it is not in; the grouping pass reads no
-    title or content.
+    another user or turn on someone else's `consolidate_private`, nor mint a
+    credential for an owned agent without the owner's approval; a credential
+    minted for an agent before its owner claimed it no longer works after the
+    claim; no agent is handed a `team` group of a team it is not in; the
+    grouping pass reads no title or content.
 20. **Grouping.** With embeddings off, the same notes produce the same groups;
     a group never exceeds 20 sources or mixes scopes; a note is never a live
     source of two consolidations; the pass creates at most
