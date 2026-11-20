@@ -1,0 +1,23 @@
+{
+  "name": "unified-agent-sdk",
+  "private": true,
+  "description": "TypeScript SDK workspace for Unified Agent: @unified-agent/protocol, @unified-agent/client and @unified-agent/approval-client",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/client",
+    "packages/approval-client"
+  ],
+  "scripts": {
+    "build": "npm run build -w @unified-agent/protocol && npm run build -w @unified-agent/client && npm run build -w @unified-agent/approval-client",
+    "test": "npm run build -w @unified-agent/protocol && npm run test -w @unified-agent/protocol && npm run test -w @unified-agent/client && npm run build -w @unified-agent/client && npm run test -w @unified-agent/approval-client",
+    "test:conformance": "npm run build -w @unified-agent/protocol && npm run test:conformance -w @unified-agent/client",
+    "test:conformance:live": "npm run build -w @unified-agent/protocol && npm run test:conformance:live -w @unified-agent/client",
+    "typecheck": "npm run build -w @unified-agent/protocol && npm run typecheck -w @unified-agent/client && npm run build -w @unified-agent/client && npm run typecheck -w @unified-agent/approval-client",
+    "codegen": "npm run codegen -w @unified-agent/protocol",
+    "codegen:check": "npm run codegen:check -w @unified-agent/protocol"
+  }
+}

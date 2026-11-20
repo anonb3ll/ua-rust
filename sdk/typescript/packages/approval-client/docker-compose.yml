@@ -1,0 +1,17 @@
+# Single-user pilot deployment. From the repo root:
+#   cp packages/approval-client/.env.example packages/approval-client/.env
+#   # edit .env with the hub URL/token, bot token, and your Telegram user id
+#   docker compose -f packages/approval-client/docker-compose.yml up -d
+#
+# No volumes, no database: this bot is stateless. The hub is the only
+# durable store, and it's expected to run elsewhere (see UA_HUB_URL) — this
+# compose file does not stand one up.
+services:
+  approval-bot:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: unified-agent-approval-bot:pilot
+    restart: unless-stopped
+    env_file:
+      - .env
