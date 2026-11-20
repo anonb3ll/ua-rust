@@ -213,8 +213,6 @@ async fn work_round_trips_through_the_device_plane() {
     // Routes not built yet still say so.
     let (status, v) = post(&hub, "/api/node/wake", Some(BUILDER), json!({ "node": "node-a" })).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{v}");
-    let resp = hub.send(get("/api/nodes/acceptance", None, Some(BUILDER))).await;
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]

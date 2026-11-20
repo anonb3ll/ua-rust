@@ -85,6 +85,13 @@ pub struct Config {
     /// lapsed leases, undelivered command notices). 0 turns the sweep off;
     /// claims still sweep their own node.
     pub node_wait_sweep_s: u64,
+    /// Mint session credentials (`uas_…`) for claimed ACP node items
+    /// (`POST /api/node/session_credential`). Read on every request, so
+    /// turning it off refuses every outstanding credential at once.
+    pub session_credentials_enabled: bool,
+    /// Hold real work from a node until its latest device acceptance run is
+    /// accepted (attested by an operator). Off by default.
+    pub node_require_acceptance: bool,
     /// Planning canvas boards one agent may create (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
@@ -315,6 +322,8 @@ impl Default for Config {
             node_max_per_agent: 8,
             node_queue_wait_s: 3600,
             node_wait_sweep_s: 60,
+            session_credentials_enabled: false,
+            node_require_acceptance: false,
             graph_canvas_max_boards_per_agent: 50,
             graph_canvas_max_boards: 1000,
             graph_canvas_history_max: 20,

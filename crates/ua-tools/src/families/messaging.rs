@@ -119,6 +119,10 @@ pub const COORDINATION_ACTIONS: &[&str] = &[
     "agent_unretire",
     "message_ack",
     "message_inbox",
+    "node_acceptance_attest",
+    "node_acceptance_evaluate",
+    "node_acceptance_start",
+    "node_acceptance_status",
     "node_command_adopt",
     "node_command_start",
     "node_command_status",
@@ -133,6 +137,7 @@ pub const COORDINATION_ACTIONS: &[&str] = &[
     "project_repo_get",
     "project_repo_list",
     "project_repo_unbind",
+    "session_credential_revoke",
     "task_claim_release",
     "task_hold",
     "task_hold_get",
@@ -1508,6 +1513,21 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "node_command_start" => node_queue::node_command_start(ctx, action_params(action, params)?).await,
         "node_command_status" => node_queue::node_command_status(ctx, action_params(action, params)?).await,
         "node_command_adopt" => node_queue::node_command_adopt(ctx, action_params(action, params)?).await,
+        "node_acceptance_start" => {
+            node_queue::node_acceptance_start(ctx, action_params(action, params)?).await
+        }
+        "node_acceptance_evaluate" => {
+            node_queue::node_acceptance_evaluate(ctx, action_params(action, params)?).await
+        }
+        "node_acceptance_status" => {
+            node_queue::node_acceptance_status(ctx, action_params(action, params)?).await
+        }
+        "node_acceptance_attest" => {
+            node_queue::node_acceptance_attest(ctx, action_params(action, params)?).await
+        }
+        "session_credential_revoke" => {
+            node_queue::session_credential_revoke(ctx, action_params(action, params)?).await
+        }
         "agent_state" => governance::agent_state(ctx, action_params(action, params)?).await,
         "agent_states" => governance::agent_states(ctx, action_params(action, params)?).await,
         "agent_pause" => governance::agent_pause(ctx, action_params(action, params)?).await,

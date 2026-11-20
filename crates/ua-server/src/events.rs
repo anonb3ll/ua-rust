@@ -192,13 +192,15 @@ impl StreamAuth {
     ) -> Result<(), &'static str> {
         let id = match &self.credential {
             Credential::Unverified => {
-                AuthIdentity { label: self.label.clone(), kind: self.kind, verified: false }
+                AuthIdentity { label: self.label.clone(), kind: self.kind, verified: false, grant: None }
             }
             Credential::Bearer(t) => {
                 resolve_bearer(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
             }
             Credential::Cookie(h) => match crate::login::session_from_headers(state, h) {
-                Some(s) => AuthIdentity { label: s.label, kind: ActorKind::Human, verified: true },
+                Some(s) => {
+                    AuthIdentity { label: s.label, kind: ActorKind::Human, verified: true, grant: None }
+                }
                 None => return Err("credential_invalid"),
             },
         };

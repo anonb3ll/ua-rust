@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use ua_core::UaError;
 use ua_core::identity::Transport;
 use ua_tools::families::events::EventScope;
+use ua_tools::grant;
 
 use crate::AppState;
 use crate::auth::{AuthIdentity, caller_for, session_key};
@@ -44,12 +45,21 @@ async fn whoami(
     headers: HeaderMap,
 ) -> Json<Value> {
     let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
-    Json(json!({
+    let mut body = json!({
         "identity": caller.label,
         "kind": caller.kind,
         "verified": id.verified,
         "profile": caller.profile.as_str(),
-    }))
+    });
+    if let Some(g) = &id.grant {
+        body["session_credential"] = json!({
+            "credential_id": g.credential_id,
+            "item_id": g.item_id,
+            "task_id": g.task_id,
+            "tools": g.tools,
+        });
+    }
+    Json(body)
 }
 
 async fn list_tools(
@@ -58,19 +68,22 @@ async fn list_tools(
     headers: HeaderMap,
 ) -> Json<Value> {
     let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
-    let tools: Vec<Value> = state
-        .registry
-        .visible_to(&caller)
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "family": t.family,
-                "read_only": t.read_only,
-                "input_schema": t.input_schema,
+    let registry = &state.registry;
+    let tools: Vec<Value> = grant::scope(id.grant.clone(), async {
+        registry
+            .visible_to(&caller)
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "family": t.family,
+                    "read_only": t.read_only,
+                    "input_schema": t.input_schema,
+                })
             })
-        })
-        .collect();
+            .collect()
+    })
+    .await;
     Json(json!({ "count": tools.len(), "tools": tools }))
 }
 
@@ -96,7 +109,7 @@ async fn call_tool(
 ) -> Response {
     let caller = caller_for(&state, &id, session_key(&headers), Transport::Http);
     let args = body.map(|Json(v)| v).unwrap_or(Value::Null);
-    match state.registry.call(&state.hub, &caller, &name, args).await {
+    match grant::scope(id.grant.clone(), state.registry.call(&state.hub, &caller, &name, args)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (status_for(&e), Json(e.to_json())).into_response(),
     }

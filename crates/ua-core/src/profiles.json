@@ -179,6 +179,17 @@
   "vault_search",
   "vault_write"
  ],
+ "ACP_SESSION_ALLOWED_TOOLS": [
+  "evidence_report",
+  "memory_get",
+  "memory_list",
+  "memory_save",
+  "memory_search",
+  "profile_status",
+  "session_packet",
+  "task_comment",
+  "task_list"
+ ],
  "RESEARCH_ALLOWED_ACTIONS": [
   "plan_checkpoint",
   "plan_create",

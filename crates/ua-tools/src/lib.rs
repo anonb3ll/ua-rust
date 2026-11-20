@@ -3,7 +3,8 @@
 //! [`Registry::call`] is the single chokepoint every adapter (MCP, HTTP, CLI,
 //! UI) goes through. In order it:
 //!
-//! 1. finds the tool,
+//! 1. finds the tool, and holds a session-credential request to its grant
+//!    ([`grant`]),
 //! 2. checks the caller's profile exposes it (and the `action`, for
 //!    consolidated `*_manage` tools); a policy-file profile overlay may lower
 //!    an agent's profile first,
@@ -21,6 +22,7 @@
 pub mod approvals;
 pub mod config_revisions;
 pub mod families;
+pub mod grant;
 pub mod hub;
 pub mod policy;
 pub mod registry;

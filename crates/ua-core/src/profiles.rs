@@ -126,8 +126,9 @@ impl Profile {
             Profile::Public => s.public_allowed.contains(tool),
             Profile::RemoteAssistant => s.remote_assistant_allowed.contains(tool),
             Profile::RemoteVaultCurator => s.remote_vault_curator_allowed.contains(tool),
-            // An ACP session runs one delegated task: the research surface.
-            Profile::AcpSession => s.research_allowed.contains(tool),
+            // A session credential for one claimed ACP node item: a fixed
+            // read/report set, narrowed further by the credential's grant.
+            Profile::AcpSession => s.acp_session_allowed.contains(tool),
         }
     }
 
@@ -139,7 +140,10 @@ impl Profile {
         }
         let s = &*SETS;
         match self {
-            Profile::Research | Profile::AcpSession => s.research_actions.contains(action),
+            Profile::Research => s.research_actions.contains(action),
+            // No consolidated manager is in the set; `task_comment`'s
+            // actions are scoped to the bound task by the session grant.
+            Profile::AcpSession => true,
             Profile::RemoteAssistant | Profile::RemoteVaultCurator => {
                 s.remote_assistant_actions.contains(action)
             }
@@ -167,6 +171,7 @@ impl Profile {
             ("PUBLIC_ALLOWED_TOOLS", &s.public_allowed),
             ("REMOTE_ASSISTANT_ALLOWED_TOOLS", &s.remote_assistant_allowed),
             ("REMOTE_VAULT_CURATOR_ALLOWED_TOOLS", &s.remote_vault_curator_allowed),
+            ("ACP_SESSION_ALLOWED_TOOLS", &s.acp_session_allowed),
         ]
     }
 
@@ -213,6 +218,7 @@ struct RawSets {
     public_allowed_tools: BTreeSet<String>,
     remote_assistant_allowed_tools: BTreeSet<String>,
     remote_vault_curator_allowed_tools: BTreeSet<String>,
+    acp_session_allowed_tools: BTreeSet<String>,
     research_allowed_actions: BTreeSet<String>,
     remote_assistant_allowed_actions: BTreeSet<String>,
     consolidated_legacy_tools: BTreeSet<String>,
@@ -227,6 +233,7 @@ struct Sets {
     public_allowed: BTreeSet<String>,
     remote_assistant_allowed: BTreeSet<String>,
     remote_vault_curator_allowed: BTreeSet<String>,
+    acp_session_allowed: BTreeSet<String>,
     research_actions: BTreeSet<String>,
     remote_assistant_actions: BTreeSet<String>,
     consolidated_legacy: BTreeSet<String>,
@@ -243,6 +250,7 @@ static SETS: LazyLock<Sets> = LazyLock::new(|| {
         public_allowed: raw.public_allowed_tools,
         remote_assistant_allowed: raw.remote_assistant_allowed_tools,
         remote_vault_curator_allowed: raw.remote_vault_curator_allowed_tools,
+        acp_session_allowed: raw.acp_session_allowed_tools,
         research_actions: raw.research_allowed_actions,
         remote_assistant_actions: raw.remote_assistant_allowed_actions,
         consolidated_legacy: raw.consolidated_legacy_tools,
@@ -270,6 +278,9 @@ mod tests {
         assert!(!Profile::Public.allows_tool("memory_search"));
         assert!(!Profile::Research.allows_tool("run_cmd"));
         assert!(Profile::Coordinator.allows_tool("anything"));
+        assert!(Profile::AcpSession.allows_tool("task_comment"));
+        assert!(!Profile::AcpSession.allows_tool("task_add"));
+        assert!(!Profile::AcpSession.allows_tool("profile_activate"));
     }
 
     #[test]

@@ -64,10 +64,7 @@ pub fn routes() -> Router<AppState> {
             "/api/runs/{*rest}",
             any(|| async { not_built("runs", "run projection (dispatch runs, executor runs)") }),
         )
-        .route(
-            "/api/nodes/{*rest}",
-            any(|| async { not_built("nodes", "node acceptance and discovered native sessions") }),
-        )
+        .route("/api/nodes/{*rest}", any(|| async { not_built("nodes", "discovered native sessions") }))
         .route(
             "/api/work-products",
             any(|| async { not_built("work_products", "work product review and release") }),
