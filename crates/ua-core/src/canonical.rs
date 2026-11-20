@@ -1,10 +1,14 @@
 //! Canonical JSON: the one text form every hash and stored comparison of a
 //! JSON value uses.
 //!
-//! Compact (no whitespace), object keys sorted by their UTF-8 bytes (the same
-//! order as Unicode code points, so Python's `json.dumps(sort_keys=True,
-//! separators=(",", ":"), ensure_ascii=False)` agrees), at every depth.
-//! Arrays keep their order.
+//! Compact (no whitespace), object keys sorted by their UTF-8 bytes (that
+//! is, by Unicode code point) at every depth; arrays keep their order;
+//! strings, numbers and literals are printed exactly as serde_json prints
+//! them. This is the form the hub has always stored, not a cross-language
+//! standard: it is not RFC 8785 (JCS), and it is not byte-compatible with
+//! Python's `json.dumps(sort_keys=True)`, which escapes non-ASCII by default
+//! and prints some floats differently (Python `1e-05` and `1e-07`, here
+//! `0.00001` and `1e-7`). Compare and hash only texts this module produced.
 //!
 //! The sort is done here, explicitly. `serde_json::to_string` happens to sort
 //! keys only while serde_json's `preserve_order` feature is off; Cargo unifies
@@ -124,5 +128,13 @@ mod tests {
             "nested": { "z": {}, "a": [] },
         });
         assert_eq!(to_string(&v), serde_json::to_string(&sorted(&v)).unwrap());
+    }
+
+    /// Floats print as serde_json prints them, which is not Python's form
+    /// (the module docs say so).
+    #[test]
+    fn floats_print_in_serde_json_form() {
+        // Python's json.dumps prints these two as 1e-05 and 1e-07.
+        assert_eq!(to_string(&json!([1e-5, 1e-7, 1e20, 0.1])), "[0.00001,1e-7,1e+20,0.1]");
     }
 }
