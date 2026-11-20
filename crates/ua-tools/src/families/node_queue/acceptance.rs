@@ -29,6 +29,11 @@
 //! The outcome is kept in `node_acceptance` (one row per node, the latest
 //! run). Events go on `agent.node`: `acceptance_started`,
 //! `acceptance_failed`, `acceptance_attested`.
+//!
+//! An acceptance vouches for one node as it was: retiring, forgetting or
+//! reassigning the node, or registering it again with a different
+//! `code_sha`, backends or harnesses, voids it ([`void_tx`]), so the node
+//! runs acceptance again before real work.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -521,6 +526,40 @@ pub(crate) fn evaluate_tx(tx: &mut WriteTx<'_>, cfg: &Config, node: &str) -> UaR
         )?;
     }
     Ok(public(&out, cfg))
+}
+
+/// End `node`'s acceptance in the caller's transaction because the node it
+/// vouched for changed: retired, forgotten, reassigned, or registered with
+/// different code or harness/backend facts. A pending or accepted run is
+/// marked `failed` with `voided: <why>` (its open items cancelled); with
+/// `forget` the row is deleted as well. Returns whether a run was ended.
+pub(crate) fn void_tx(tx: &mut WriteTx<'_>, node: &str, why: &str, forget: bool) -> UaResult<bool> {
+    let Some(row) = load_row(tx, node)? else { return Ok(false) };
+    let live = row.state != "failed";
+    if live {
+        let reason = format!("voided: {why}; start a fresh run");
+        let ts = now();
+        tx.execute(
+            "UPDATE node_acceptance SET state = 'failed', reason = ?2, accepted_at = NULL, updated_at = ?3 \
+             WHERE node = ?1",
+            params![node, reason, ts],
+        )?;
+        for id in [&row.complete_item_id, &row.cancel_item_id].into_iter().flatten() {
+            if load_item(tx, id)?.is_some_and(|i| matches!(i.status.as_str(), "queued" | "claimed")) {
+                cancel_item(tx, id, ACTOR, "device acceptance voided")?;
+            }
+        }
+        record(
+            tx,
+            "acceptance_failed",
+            json!({ "node": node, "run_id": row.run_id, "reason": reason, "previous_state": row.state }),
+            ACTOR,
+        )?;
+    }
+    if forget {
+        tx.execute("DELETE FROM node_acceptance WHERE node = ?1", [node])?;
+    }
+    Ok(live)
 }
 
 // --- hooks from the queue -------------------------------------------------------

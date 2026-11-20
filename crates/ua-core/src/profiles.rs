@@ -85,6 +85,26 @@ impl Profile {
         }
     }
 
+    /// Whether the profile may be assigned to an identity: activated with
+    /// `profile_activate`, named in `profiles`, `oauth_profile` or a policy
+    /// `profile_defaults` / overlay entry. `acp-session` is not: only a
+    /// verified session credential runs under it, and only with its grant.
+    pub fn assignable(self) -> bool {
+        self != Profile::AcpSession
+    }
+
+    /// Parse `name` as a profile an identity may be given (see
+    /// [`Profile::assignable`]).
+    pub fn parse_assignable(name: &str) -> Result<Profile, String> {
+        let p: Profile = name.parse()?;
+        if !p.assignable() {
+            return Err(format!(
+                "profile {p} is reserved for session credentials and cannot be activated or configured"
+            ));
+        }
+        Ok(p)
+    }
+
     /// The legacy alias of this profile, if it had another name.
     pub fn legacy_alias(self) -> Option<&'static str> {
         Self::LEGACY_ALIASES.iter().find(|(_, p)| *p == self).map(|(n, _)| *n)
@@ -281,6 +301,16 @@ mod tests {
         assert!(Profile::AcpSession.allows_tool("task_comment"));
         assert!(!Profile::AcpSession.allows_tool("task_add"));
         assert!(!Profile::AcpSession.allows_tool("profile_activate"));
+    }
+
+    #[test]
+    fn acp_session_is_not_assignable() {
+        assert!(!Profile::AcpSession.assignable());
+        assert!(Profile::parse_assignable("acp-session").is_err());
+        for p in Profile::ALL.into_iter().filter(|p| *p != Profile::AcpSession) {
+            assert_eq!(Profile::parse_assignable(p.as_str()), Ok(p));
+        }
+        assert_eq!(Profile::parse_assignable("cto"), Ok(Profile::Lead));
     }
 
     #[test]

@@ -205,6 +205,14 @@ accepted (and attested) takes no other work: `node_dispatch`,
 real items already queued for it. Acceptance items are claimable only while
 their run is the node's live pending run.
 
+An acceptance vouches for the node as it was. Retiring, forgetting or
+reassigning the node voids it, as does a registration that changes its
+`backends` or `harnesses` or a registration or heartbeat that changes a
+reported `code_sha`: a pending or accepted run is marked `failed` with
+reason `voided: <why>` (an `acceptance_failed` event; a forgotten node's row
+is deleted), and the node runs acceptance again before real work. An
+identical re-registration (a restart) keeps it.
+
 ## Not yet ported
 
 These routes answer `501`:

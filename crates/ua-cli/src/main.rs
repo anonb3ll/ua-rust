@@ -155,12 +155,9 @@ fn confirm_on_tty(label: &str) -> bool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
+    tracing::subscriber::set_global_default(log_subscriber(filter, std::io::stderr))
+        .map_err(|e| anyhow::anyhow!("could not install the logger: {e}"))?;
     let cfg = load_config(&cli)?;
 
     if let Cmd::Config = cli.cmd {
@@ -362,9 +359,87 @@ async fn warn_if_locked_out(state: &ua_server::AppState) {
     }
 }
 
+/// Whether `meta` is an `rmcp` span or event more verbose than info.
+fn rmcp_verbose(meta: &tracing::Metadata<'_>) -> bool {
+    let t = meta.target();
+    (t == "rmcp" || t.starts_with("rmcp::")) && *meta.level() > tracing::Level::INFO
+}
+
+/// The process logger: `filter` (from `UA_LOG`) with `rmcp` capped at info.
+/// rmcp logs whole requests and responses at debug level: tool arguments (a
+/// managed_secret_set value, a `uas_` session credential in a header echo)
+/// and downstream MCP results (a reflected credential). The directive caps
+/// the plain case; the final layer filter drops rmcp spans and events below
+/// info even when a more specific `UA_LOG` directive (`rmcp::service=trace`)
+/// would enable them.
+fn log_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    let filter = match "rmcp=info".parse() {
+        Ok(cap) => filter.add_directive(cap),
+        Err(_) => filter,
+    };
+    let cap = tracing_subscriber::filter::filter_fn(|meta| !rmcp_verbose(meta));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(writer).with_filter(cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'w self) -> Buf {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn rmcp_never_logs_below_info() {
+        for directive in [
+            "debug",
+            "info,rmcp=trace",
+            "info,rmcp::service=trace",
+            "info,rmcp::service::server=debug",
+            "trace",
+        ] {
+            let buf = Buf::default();
+            let filter = tracing_subscriber::EnvFilter::new(directive);
+            tracing::subscriber::with_default(log_subscriber(filter, buf.clone()), || {
+                tracing::debug!(target: "rmcp::service::server", "body uas_secret_debug");
+                tracing::trace!(target: "rmcp::service", "body uas_secret_trace");
+                let span = tracing::debug_span!(target: "rmcp::service", "serve", req = "uas_secret_span");
+                span.in_scope(|| tracing::info!(target: "ua_server", "inside the rmcp span"));
+                tracing::info!(target: "rmcp::service", "rmcp info kept");
+                tracing::debug!(target: "ua_server", "own debug");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("uas_secret"), "{directive}: {out}");
+            assert!(out.contains("rmcp info kept"), "{directive}: {out}");
+            assert!(out.contains("inside the rmcp span"), "{directive}: {out}");
+        }
+    }
 
     fn cfg() -> Config {
         let mut c = Config::for_home(std::env::temp_dir());
