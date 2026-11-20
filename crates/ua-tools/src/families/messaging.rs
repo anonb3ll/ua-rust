@@ -1,7 +1,8 @@
 //! Typed inter-agent messages: `message_send`, `message_list` and the
 //! `coordination_manage` dispatcher (`message_inbox`, `message_ack`,
-//! `agent_list`, `agent_context`, and the nodes family's `node_retire`,
-//! `node_unretire`, `node_reassign` and `node_forget`).
+//! `agent_list`, `agent_context`, the nodes family's `node_retire`,
+//! `node_unretire`, `node_reassign` and `node_forget`, and the actions of the
+//! governance, node queue and continuity families).
 //!
 //! Every message is one `agent.message.<act>` ledger event (the source of
 //! truth, carrying the body) plus one `message_index` row written in the same
@@ -34,7 +35,7 @@ use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
-use super::{governance, node_queue, nodes};
+use super::{continuity, governance, node_queue, nodes};
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -117,6 +118,8 @@ pub const COORDINATION_ACTIONS: &[&str] = &[
     "agent_states",
     "agent_terminate",
     "agent_unretire",
+    "conversation_handoff",
+    "conversation_handoffs",
     "message_ack",
     "message_inbox",
     "node_command_adopt",
@@ -133,10 +136,26 @@ pub const COORDINATION_ACTIONS: &[&str] = &[
     "project_repo_get",
     "project_repo_list",
     "project_repo_unbind",
+    "queue_fold",
+    "queue_health",
+    "queue_park",
+    "queue_stale",
+    "queue_sweep",
+    "queue_unpark",
+    "session_handoff_ack",
+    "session_handoff_discard",
+    "session_handoff_propose",
+    "session_handoff_recover",
+    "session_handoff_seal",
+    "session_handoff_update",
+    "task_check_record",
+    "task_check_verify",
     "task_claim_release",
     "task_hold",
     "task_hold_get",
     "task_holds",
+    "task_workflow_get",
+    "task_workflow_set",
     "work_proposal_decide",
     "work_proposal_file",
     "work_proposal_get",
@@ -1533,6 +1552,34 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "work_proposal_recover" => {
             governance::work_proposal_recover(ctx, action_params(action, params)?).await
         }
+        "task_workflow_get" => continuity::task_workflow_get(ctx, action_params(action, params)?).await,
+        "task_workflow_set" => continuity::task_workflow_set(ctx, action_params(action, params)?).await,
+        "task_check_record" => continuity::task_check_record(ctx, action_params(action, params)?).await,
+        "task_check_verify" => continuity::task_check_verify(ctx, action_params(action, params)?).await,
+        "session_handoff_propose" => {
+            continuity::session_handoff_propose(ctx, action_params(action, params)?).await
+        }
+        "session_handoff_update" => {
+            continuity::session_handoff_update(ctx, action_params(action, params)?).await
+        }
+        "session_handoff_seal" => continuity::session_handoff_seal(ctx, action_params(action, params)?).await,
+        "session_handoff_discard" => {
+            continuity::session_handoff_discard(ctx, action_params(action, params)?).await
+        }
+        "session_handoff_recover" => {
+            continuity::session_handoff_recover(ctx, action_params(action, params)?).await
+        }
+        "session_handoff_ack" => continuity::session_handoff_ack(ctx, action_params(action, params)?).await,
+        "conversation_handoff" => continuity::conversation_handoff(ctx, action_params(action, params)?).await,
+        "conversation_handoffs" => {
+            continuity::conversation_handoffs(ctx, action_params(action, params)?).await
+        }
+        "queue_health" => continuity::queue_health(ctx, action_params(action, params)?).await,
+        "queue_stale" => continuity::queue_stale(ctx, action_params(action, params)?).await,
+        "queue_sweep" => continuity::queue_sweep(ctx, action_params(action, params)?).await,
+        "queue_park" => continuity::queue_park(ctx, action_params(action, params)?).await,
+        "queue_fold" => continuity::queue_fold(ctx, action_params(action, params)?).await,
+        "queue_unpark" => continuity::queue_unpark(ctx, action_params(action, params)?).await,
         other => Err(UaError::invalid(format!(
             "unknown coordination_manage action {other:?}; supported actions: {}",
             COORDINATION_ACTIONS.join(", ")
@@ -1561,7 +1608,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "coordination_manage",
-            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch), project_repo_unbind (params project), project_repo_get (params project), project_repo_list. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Action arguments go in params.",
+            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch), project_repo_unbind (params project), project_repo_get (params project), project_repo_list. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Task workflow: task_workflow_get (params task_id, head_sha) returns the stage, resume capsule (goal, done, focus) and every check graded at a head: verified (the hub looked its CI run up), attested (an agent's word, or a reference that contradicted it) or unknown (nothing recorded at that head); task_workflow_set (params task_id, stage plan|implement|verify|review|merge|deploy|prove|done, goal, done, focus, head_sha, expected_checks: names or {name, job} binding a check to one CI job, expected_revision) and task_check_record (params task_id, name, outcome pass|fail, head_sha, ref {kind: ci_run, ref, repo, job}, detail, verify) are for the claimant, next owner, a lifecycle operator or a human; a ref needs the full 40-hex head_sha, its repo must be the task project's bound repo (repo_mismatch; without a binding it cannot be verified) and its job the check's bound job (job_mismatch); task_check_verify (params task_id, name, head_sha) looks a stored check up again. Report mode: nothing gates on it. Session handoff: session_handoff_propose (params session_id, done, next_steps, open_questions, task_id, supersede) writes a draft note for a session you own (done and next_steps need one item each; one pending note per session, a 5-minute cooldown and 5 proposals per hour); session_handoff_update (params note_id, done, next_steps, open_questions) edits the draft; session_handoff_seal (params note_id) is the commit point; session_handoff_discard (params note_id) drops a draft; session_handoff_recover (params session_id) returns the latest sealed note, never a draft, to the session's owner, the note's receiver, a lifecycle operator or a human (anyone else reads not_found); session_handoff_ack (params note_id) is the receiver acknowledging a note handed to it. conversation_handoff (params conversation_id, task_id or title, project, priority) links an existing task or creates one that references a conversation you can see, without copying its messages; conversation_handoffs (params conversation_id, same caller rule) lists the handoffs a ledger event records, and notes-only links as unaudited. Queue closure: queue_health (params stale_days) counts open, parked, stale and review-ready milestones; queue_stale (params stale_days, limit) lists stale tasks; queue_sweep (params stale_days) proposes parks and folds and writes nothing; queue_park (params task_id, reason, approved_by, fold_children, dry_run; a protected row needs a verified human or lifecycle operator, and approved_by is only that caller's note) parks a task (it keeps its status, leaves task_list unless parked=true, and refuses claims with task_parked) and folds its open descendants into it; queue_fold (params task_id, into, reason) folds a later child into its parked root; queue_unpark (params task_id, reason) restores a parked root and everything folded into it. Park, fold and unpark need a verified caller; a task someone holds (claimant or next owner) needs that holder, a lifecycle operator or a human. Action arguments go in params.",
             coordination_manage,
         )
         .family("messaging"),
