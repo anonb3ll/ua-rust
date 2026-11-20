@@ -68,9 +68,32 @@ tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
 
+# Managed secrets: AES-256-GCM at rest and an HMAC-SHA256 fingerprint. Both
+# RustCrypto crates were already in the dependency tree (cookie, webauthn-rs).
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+hmac = "0.13"
+rand.workspace = true
+# MCP gateway: the client side of the official SDK (the server side is in
+# ua-server), over a child's stdio or Streamable HTTP through our reqwest.
+rmcp = { version = "=3.11.0", default-features = false, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
 axum = "0.8.9"
+# The fake downstream MCP server in tests/mcp_gateway.rs.
+rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+tokio-util = "0.7"
+
+# Runs its own small harness so the test binary can double as the fake stdio
+# MCP server it spawns (libtest would write to the child's stdout first). It
+# speaks enough of libtest's CLI for cargo test and cargo nextest.
+[[test]]
+name = "mcp_gateway"
+harness = false

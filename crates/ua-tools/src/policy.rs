@@ -964,7 +964,8 @@ pub fn prod_action(tool: &str) -> &str {
         "task_delete" => "delete",
         "deploy" => "deploy",
         "fleet_host_action" => "restart",
-        "oauth_device_manage" => "revoke",
+        "oauth_device_manage" | "mcp_server_revoke" => "revoke",
+        "managed_secret_delete" => "delete",
         "node_dispatch" | "node_followup" | "acp_permission" | "dispatch_task" | "dispatch_resume" => {
             "dispatch"
         }
