@@ -98,7 +98,7 @@ fn bad(msg: impl Into<String>) -> UaError {
 
 /// SHA-256 of the canonical JSON form (sorted keys, no whitespace).
 pub fn doc_sha(doc: &Value) -> String {
-    hex::encode(Sha256::digest(serde_json::to_string(doc).unwrap_or_default().as_bytes()))
+    hex::encode(Sha256::digest(ua_core::canonical::to_string(doc).as_bytes()))
 }
 
 fn raw_sha(text: &str) -> String {

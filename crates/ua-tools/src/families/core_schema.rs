@@ -120,3 +120,14 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool, started_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_caller ON tool_calls(caller, started_at);
 ",
 };
+
+/// `tool_calls.page`: 1 on a row written inside a page composition
+/// ([`crate::registry::page_reads`]) for a read whose successful siblings
+/// leave no row. Rate and error calculations leave these rows out, so the
+/// recorded failures of unrecorded successes cannot skew them.
+pub const SCHEMA_V3: SchemaPart = SchemaPart {
+    name: "core.v3",
+    sql: "
+ALTER TABLE tool_calls ADD COLUMN page INTEGER NOT NULL DEFAULT 0;
+",
+};

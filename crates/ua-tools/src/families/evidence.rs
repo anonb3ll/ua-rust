@@ -224,7 +224,7 @@ fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, unt
     let marks = vec!["?"; callers.len()].join(",");
     let sql = format!(
         "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
-         WHERE caller IN ({marks}) AND started_at >= ? AND started_at <= ? GROUP BY tool ORDER BY tool"
+         WHERE caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 GROUP BY tool ORDER BY tool"
     );
     let mut args: Vec<String> = callers.iter().cloned().collect();
     args.push(since.to_string());

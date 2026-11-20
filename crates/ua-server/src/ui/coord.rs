@@ -143,7 +143,7 @@ pub struct PlanPage {
 }
 
 pub async fn plan(ui: Ui, Path(id): Path<String>) -> Response {
-    let v = match ui.call("plan_get", json!({ "plan_id": id })).await {
+    let v = match ui.call_read("plan_get", json!({ "plan_id": id })).await {
         Ok(v) => v,
         Err(e) => {
             let status = crate::api::status_for(&e);
@@ -200,7 +200,8 @@ pub struct DelegationPage {
 }
 
 pub async fn delegation(ui: Ui, Path(id): Path<i64>) -> Response {
-    let v = match ui.call("delegation_manage", json!({ "action": "get", "params": { "id": id } })).await {
+    let v = match ui.call_read("delegation_manage", json!({ "action": "get", "params": { "id": id } })).await
+    {
         Ok(v) => v,
         Err(e) => {
             let status = crate::api::status_for(&e);

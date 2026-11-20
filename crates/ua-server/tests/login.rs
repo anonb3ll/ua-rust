@@ -197,3 +197,135 @@ async fn passkey_start_does_not_reveal_identities() {
     assert!(v["options"]["publicKey"]["challenge"].is_string());
     assert_eq!(v["options"]["publicKey"]["rp"]["id"], "hub.example.com");
 }
+
+/// The cookie key is cached in the app state: once a session exists, an
+/// authenticated request does not read `ui_keys` (deleting the row changes
+/// nothing), and invalidating the cache makes the hub read the table again
+/// (here: mint a new key, so the old cookie no longer decrypts).
+#[tokio::test]
+async fn the_cookie_key_is_cached_and_invalidation_rereads_it() {
+    let hub = TestHub::new(config());
+    let cookie = hub.sign_in("operator").await;
+    let key_rows = |hub: &TestHub| -> i64 {
+        hub.state
+            .hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM ui_keys", [], |r| r.get(0))?))
+            .unwrap()
+    };
+    assert_eq!(key_rows(&hub), 1);
+    hub.state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute("DELETE FROM ui_keys", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+    let resp = hub.send(get("/api/session", Some(&cookie), None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(json_body(resp).await["auth"], "cookie");
+    assert_eq!(key_rows(&hub), 0, "an authenticated request served from the cache reads no key row");
+
+    hub.state.cookie_key.invalidate();
+    let resp = hub.send(get("/ui/work", Some(&cookie), None)).await;
+    assert!(resp.status().is_redirection(), "a replaced key signs the browser out: {}", resp.status());
+    assert!(location(&resp).starts_with("/login?next="));
+    assert_eq!(key_rows(&hub), 1, "the miss re-read ui_keys and created a fresh key");
+}
+
+/// Every `<script` tag in `html` loads a file (has `src=`); none is inline.
+fn no_inline_script(html: &str) -> bool {
+    html.match_indices("<script").all(|(i, _)| html[i..].split('>').next().unwrap().contains(" src=\""))
+}
+
+fn assert_strict_csp(resp: &axum::http::Response<axum::body::Body>) {
+    let csp = resp.headers().get(header::CONTENT_SECURITY_POLICY).expect("CSP").to_str().unwrap().to_string();
+    assert!(csp.contains("script-src 'self'"), "{csp}");
+    assert!(csp.contains("style-src 'self'"), "{csp}");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    assert!(!csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"), "{csp}");
+}
+
+/// The sign-in and passkey pages run no inline script or style: the script
+/// and stylesheet are files served by the hub (without a session), and the
+/// page passes its values in data- attributes, HTML-escaped.
+#[tokio::test]
+async fn sign_in_pages_run_under_a_csp_without_inline_script() {
+    let hub = TestHub::new(config());
+    let resp = hub.send(get("/login?next=/ui/tasks%3Fx%3D1%22%3E%3Cb%3E", None, None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_strict_csp(&resp);
+    let html = text_body(resp).await;
+    assert!(no_inline_script(&html), "{html}");
+    assert!(!html.contains("<style"), "{html}");
+    assert!(html.contains("<script src=\"/login/assets/login.js\" defer></script>"), "{html}");
+    assert!(html.contains("data-next=\"/ui/tasks?x=1&quot;&gt;&lt;b&gt;\""), "{html}");
+
+    let cookie = hub.sign_in("operator").await;
+    let resp = hub.send(get("/login/passkeys", Some(&cookie), None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_strict_csp(&resp);
+    let html = text_body(resp).await;
+    assert!(no_inline_script(&html), "{html}");
+    let csrf = hub.csrf(&cookie).await;
+    assert!(html.contains(&format!("data-csrf=\"{csrf}\"")), "{html}");
+
+    for (path, mime, needle) in [
+        ("/login/assets/login.js", "text/javascript", "navigator.credentials.get"),
+        ("/login/assets/page.css", "text/css", ".card"),
+    ] {
+        let resp = hub.send(get(path, None, None)).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert!(resp.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with(mime), "{path}");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(text_body(resp).await.contains(needle), "{path}");
+    }
+}
+
+/// The cached copy lapses after its TTL: a key deleted outside the hub
+/// stops decrypting cookies then. A sign-in never encrypts with a cached
+/// copy the table no longer holds.
+#[tokio::test]
+async fn the_cached_cookie_key_lapses_and_sign_in_uses_the_stored_key() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let hub = TestHub::new(config());
+    let mut state = hub.state.clone();
+    state.cookie_key = Arc::new(ua_server::login::CookieKeyCache::with_ttl(Duration::from_millis(200)));
+    let app = ua_server::router(state, tokio_util::sync::CancellationToken::new());
+    let send = |req| {
+        let app = app.clone();
+        async move { tower::ServiceExt::oneshot(app, req).await.unwrap() }
+    };
+    let cookie = hub.sign_in("operator").await;
+    assert_eq!(send(get("/api/session", Some(&cookie), None)).await.status(), 200);
+    let delete_key = || {
+        hub.state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute("DELETE FROM ui_keys", [])?;
+                Ok(())
+            })
+            .unwrap()
+    };
+    delete_key();
+    // Within the TTL the cached copy still reads the cookie.
+    assert_eq!(json_body(send(get("/api/session", Some(&cookie), None)).await).await["auth"], "cookie");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // After it, the table is read again: a new key, the old cookie is gone.
+    assert_ne!(json_body(send(get("/api/session", Some(&cookie), None)).await).await["auth"], "cookie");
+
+    // A sign-in right after the row is deleted again (the cache still holds
+    // the previous key) encrypts with the key the table holds now, so the
+    // new cookie keeps working once the cache lapses.
+    let url = ua_server::login::create_login_link(&hub.state.hub, "operator", "test").unwrap();
+    let token = query_param(&url, "token").unwrap();
+    delete_key();
+    let resp = send(form("/login/link", &[("token", &token)], None)).await;
+    let fresh = session_cookie(&resp).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(json_body(send(get("/api/session", Some(&fresh), None)).await).await["auth"], "cookie");
+}

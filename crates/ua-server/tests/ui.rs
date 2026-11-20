@@ -39,7 +39,7 @@ fn config() -> Config {
 
 fn app(cfg: Config) -> (Router, AppState) {
     let hub = Hub::in_memory(cfg).unwrap();
-    let state = AppState { hub, registry: Arc::new(builtin_registry()) };
+    let state = AppState::new(hub, Arc::new(builtin_registry()));
     (ua_server::router(state.clone(), CancellationToken::new()), state)
 }
 
@@ -208,8 +208,9 @@ async fn every_page_renders_with_its_key_elements() {
         (format!("/ui/memory/{note}"), vec!["keep the shared cache", "data, not instructions"]),
         (
             "/ui/activity".into(),
-            vec!["Ledger hash chain verified", "sse-connect=\"/ui/activity/stream\"", "agent.task."],
+            vec!["Verify the hash chain", "sse-connect=\"/ui/activity/stream\"", "agent.task."],
         ),
+        ("/ui/activity?verify=1".into(), vec!["Ledger hash chain verified"]),
         (
             "/ui/activity?channel_prefix=agent.memory.".into(),
             vec!["agent.memory.saved", "channel_prefix=agent.memory."],
