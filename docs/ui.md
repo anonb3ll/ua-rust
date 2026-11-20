@@ -48,7 +48,9 @@ UI prints JSON.
 
 ## Signing in
 
-The header links to `/login` and `/logout`. The UI uses the same
+The header links to `/login`; signing out is a small form that posts to
+`/logout` with the browser session's CSRF token (the route takes no GET, and
+the page runs no inline script). The UI uses the same
 authentication as the rest of the hub: with `enforce_auth` on (the default)
 every `/ui` request needs a signed-in identity; with it off, a request without
 credentials runs as the local anonymous caller, which suits a hub bound to

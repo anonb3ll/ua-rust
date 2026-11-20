@@ -15,6 +15,8 @@ use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
 use ua_server::AppState;
 use ua_tools::{Hub, builtin_registry};
 
+mod common;
+
 const OPERATOR_TOKEN: &str = "operator-test-token-0001";
 const BUILDER_TOKEN: &str = "builder-test-token-0002";
 
@@ -801,4 +803,46 @@ async fn an_approval_request_honours_policy_rules() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(resp).await["reason_code"], "policy_deny");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Sign out
+
+/// The value of the `name` attribute's sibling `value` in the first
+/// `<input ... name="{name}" ... value="...">` of `html`.
+fn hidden_input(html: &str, name: &str) -> Option<String> {
+    let at = html.find(&format!("name=\"{name}\""))?;
+    let tag_start = html[..at].rfind('<')?;
+    let tag_end = at + html[at..].find('>')?;
+    let tag = &html[tag_start..tag_end];
+    let v = tag.find("value=\"")? + "value=\"".len();
+    Some(tag[v..v + tag[v..].find('"')?].to_string())
+}
+
+#[tokio::test]
+async fn sign_out_is_a_post_form_with_the_session_csrf_token() {
+    let hub = common::TestHub::new(common::config());
+    let cookie = hub.sign_in("operator").await;
+    let page = hub.send(common::get("/ui/inbox", Some(&cookie), None)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = common::text_body(page).await;
+
+    // No GET link to /logout (the route is POST-only), and no inline script.
+    assert!(!html.contains("href=\"/logout\""), "sign out is still a GET link");
+    assert!(!html.contains("onclick") && !html.contains("<script>"), "inline script in the layout");
+    let form_at = html.find("action=\"/logout\"").expect("a sign-out form");
+    let form = &html[html[..form_at].rfind("<form").unwrap()..];
+    let form = &form[..form.find("</form>").unwrap()];
+    assert!(form.contains("method=\"post\""), "{form}");
+    assert!(form.contains("type=\"submit\""), "{form}");
+
+    // The form carries the session's CSRF token, and submitting it ends the
+    // session.
+    let token = hidden_input(form, "csrf").expect("a csrf field");
+    assert_eq!(token, hub.csrf(&cookie).await);
+    let out = hub.send(common::form("/logout", &[("csrf", &token)], Some(&cookie))).await;
+    assert!(out.status().is_redirection(), "{}", out.status());
+    assert_eq!(common::location(&out), "/login");
+    let after = hub.send(common::get("/api/whoami", Some(&cookie), None)).await;
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
 }
