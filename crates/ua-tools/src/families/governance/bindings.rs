@@ -5,6 +5,11 @@
 //! optional default branch. Bind is an upsert; unbind removes the row. Each
 //! write appends a `project.repo.bound` or `project.repo.unbound` event in
 //! the same transaction.
+//!
+//! A binding decides which repository a task's CI checks are verified
+//! against (`task_check_record`), so bind and unbind are for a verified
+//! lifecycle operator or human, attributed to that caller; get and list are
+//! open to every caller.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -13,7 +18,7 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::now;
+use super::{is_operator, now, verified_actor};
 use crate::families::tasks::{acting_identity, check_slug, row_object};
 use crate::registry::ToolCtx;
 
@@ -124,7 +129,7 @@ pub struct BindArgs {
     pub repo: String,
     /// Default branch, at most 200 characters.
     pub default_branch: Option<String>,
-    /// Attribution for an unverified caller; ignored when the caller is verified.
+    /// Must name the verified caller when given (kept for compatibility).
     pub bound_by: Option<String>,
 }
 
@@ -133,7 +138,7 @@ pub struct BindArgs {
 pub struct UnbindArgs {
     /// Project stream slug.
     pub project: String,
-    /// Attribution for an unverified caller; ignored when the caller is verified.
+    /// Must name the verified caller when given (kept for compatibility).
     pub unbound_by: Option<String>,
 }
 
@@ -148,11 +153,27 @@ pub struct GetArgs {
 #[serde(deny_unknown_fields)]
 pub struct ListArgs {}
 
+/// The verified operator changing a binding. A binding names the repository
+/// a task's CI checks are verified against, so only a lifecycle operator or
+/// a human may change it, under its own name: `named` (the legacy `bound_by`
+/// / `unbound_by`) must be that caller when given.
+fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult<String> {
+    let who = verified_actor(&ctx.caller, doing)?;
+    acting_identity(&ctx.caller, named)?;
+    if !is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+        return Err(UaError::denied(
+            "not_lifecycle_operator",
+            format!("{doing} is for a lifecycle operator or a human; {who:?} is neither"),
+        ));
+    }
+    Ok(who)
+}
+
 /// `coordination_manage(action="project_repo_bind")`.
 pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
     let repo = normalize_repo(&a.repo)?;
-    let who = acting_identity(&ctx.caller, a.bound_by.as_deref())?;
+    let who = binding_operator(&ctx, a.bound_by.as_deref(), "binding a project repository")?;
     let branch = a.default_branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
     if branch
         .as_ref()
@@ -187,7 +208,7 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
 /// `coordination_manage(action="project_repo_unbind")`.
 pub(crate) async fn project_repo_unbind(ctx: ToolCtx, a: UnbindArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
-    let who = acting_identity(&ctx.caller, a.unbound_by.as_deref())?;
+    let who = binding_operator(&ctx, a.unbound_by.as_deref(), "unbinding a project repository")?;
     ctx.hub
         .db()
         .write_async(move |tx| {

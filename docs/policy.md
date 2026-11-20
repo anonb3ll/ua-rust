@@ -227,7 +227,8 @@ requester, node agent, task claimant or an operator); `resume` releases;
 `restore` releases once every run the cancel stopped has closed.
 `release_policy: after_active_runs_finish` releases the hold by itself once
 nothing in the subtree is running. Holding needs `task_update` in the
-caller's profile; releasing needs the hold's creator or an operator.
+caller's profile; releasing needs the hold's creator or an operator, verified
+either way (an unverified caller's `actor` names nobody).
 `task_holds` and `task_hold_get` read.
 
 `task_claim_release` (`task_id`, `expected_claimant`, `reason`,
@@ -257,7 +258,11 @@ decision), `work_proposal_get`, `work_proposal_list` and
 
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
-repository on an allowed forge host.
+repository on an allowed forge host. The binding is the repository a task's
+CI checks are verified against, so bind and unbind are for a verified
+lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
+attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+it. Get and list are open.
 
 ### Maintenance tools
 
