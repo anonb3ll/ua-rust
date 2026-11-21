@@ -900,6 +900,43 @@ async fn an_unscoped_agent_gets_no_permission_or_follow_up() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
 }
 
+/// A routine that runs unattended under a human's label is an agent. Its
+/// follow-up gets no human shortcut: into a session it did not request it is
+/// refused, and into one requested under that label it waits for the same
+/// one-time approval as any agent's.
+#[tokio::test]
+async fn an_unattended_routine_gets_no_human_shortcut_on_follow_ups() {
+    let h = H::new();
+    h.register_default().await;
+    let routine = caller("operator", ActorKind::Agent);
+    let id = h.queue(json!({ "backend": "acp:claude" })).await;
+    h.claim().await;
+    let ask =
+        json!({ "item_id": id, "mode": "queue", "body": "also push", "idempotency_key": "routine-0001" });
+    let e = h.err(&routine, "node_followup", ask.clone()).await;
+    assert_eq!(reason(&e), "not_item_owner");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_followups"), json!(0));
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
+
+    // Requested under the human's label: allowed, behind the approval.
+    h.sql(&format!("UPDATE node_dispatch SET created_by = 'operator' WHERE id = '{id}'"));
+    let parked = h.err(&routine, "node_followup", ask.clone()).await;
+    let UaError::ApprovalRequired { tool, .. } = parked else { panic!("expected an approval: {parked:?}") };
+    assert_eq!(tool, "node_followup");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_followups"), json!(0));
+
+    // The human, as themselves, still needs none.
+    let f = h
+        .ok(
+            &human(),
+            "node_followup",
+            json!({ "item_id": id, "mode": "queue", "body": "also push", "idempotency_key": "human-0001" }),
+        )
+        .await;
+    assert_eq!(f["approval"], "not_required_operator");
+    assert_eq!(f["operator_authored"], true);
+}
+
 #[tokio::test]
 async fn a_launch_key_belongs_to_its_caller_and_request() {
     let h = H::new();

@@ -46,6 +46,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
+use ua_org::authz::{Authority, Authz};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::now;
@@ -382,7 +383,8 @@ pub(crate) async fn work_proposal_file(ctx: ToolCtx, a: FileArgs) -> UaResult<Va
     let named = a.proposer.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let who = match verified(&ctx.caller) {
         Some(v) => {
-            let human = ctx.caller.is_human() || ctx.hub.cfg().is_human(v);
+            let human =
+                Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
             match named {
                 Some(p) if !p.eq_ignore_ascii_case(v) && !human => {
                     return Err(UaError::denied(
