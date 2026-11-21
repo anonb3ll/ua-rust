@@ -260,6 +260,7 @@ fn cancel_withdrawn(
         json!({
             "draft_id": row.id, "approval_id": approval_id, "approval_status": approval_status,
             "target": row.target, "previous_status": row.status,
+            "transport": approvals::transport_name(caller),
         }),
     )
 }
@@ -984,7 +985,10 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
             }
             let now = ua_core::time::now();
             let reason = p.reason.as_deref().map(clip).unwrap_or_else(|| "relay draft cancelled".into());
-            // Withdraw the human decision too, so it can never be spent.
+            // Withdraw the human decision too, so it can never be spent. The
+            // row records the latest decision (this withdrawal: who, when,
+            // through what), as approval_resolve's revoke does; the earlier
+            // approval stays in the ledger (`agent.approval.resolved`).
             let mut approval_status = None;
             if let Some(a) = row.approval_id {
                 let new = match approvals::get(tx, a)?.status.as_str() {
@@ -995,9 +999,9 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                 let approval = approvals::get(tx, a)?;
                 if let Some(new) = new {
                     tx.execute(
-                        "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = COALESCE(resolved_by, ?4), \
-                         resolved_at = COALESCE(resolved_at, ?5), updated_at = ?5 WHERE id = ?1",
-                        params![a, new, reason, caller.label, now],
+                        "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, \
+                         updated_at = ?5, resolved_transport = ?6 WHERE id = ?1",
+                        params![a, new, reason, caller.label, now, approvals::transport_name(&caller)],
                     )?;
                     approval_status = Some(new);
                 }
@@ -1016,6 +1020,7 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                 json!({
                     "draft_id": row.id, "approval_id": row.approval_id, "approval_status": approval_status,
                     "target": row.target, "previous_status": row.status,
+                    "transport": approvals::transport_name(&caller),
                 }),
             )?;
             Ok(json!({

@@ -28,7 +28,15 @@ from its commit history.
 - OAuth 2.1 authorization server, passkeys and browser sessions.
 - `ua import python-hub`, which copies a database from the original hub. A dry
   run reports counts without writing. A re-run resumes. The source ledger is
-  checked, and a refusal happens before any target write.
+  checked, and a refusal happens before any target write. Now also imports
+  `work_proposals`, `work_proposal_items`, `task_holds`, `task_hold_members`
+  and `project_repo_bindings`, clears `tasks.current_run_id` and
+  `current_run_agent` (since `dispatch_runs` are not imported) with separate
+  count and capped task-id reporting, never copies `org_id` on any mapped
+  table including `harness_config_bundles`, refuses duplicate active holds and
+  duplicate trimmed project slugs in `--dry-run` as well as real imports, and
+  clears invalid `project_repo_bindings.default_branch` values to `NULL`
+  instead of dropping the binding.
 - Dispatch runs and an executor. An approval binds the resolved workdir, argv
   and prompt. An operator can cancel a run. A previous process's orphans are
   reaped, including on macOS.
@@ -211,6 +219,15 @@ from its commit history.
   operator as its `actor` no longer gets operator authority over other
   agents' task workflow records and checks; it is refused, as every other
   operator check already refused it.
+- An approval decision records the adapter it came through: the approval
+  row's new `resolved_transport` (schema part `approvals.v2`; `stdio`,
+  `http`, `mcp`, `cli`, `ui`, `internal` or `slack`; NULL, shown as unknown,
+  for older rows; the row holds the latest decision), the
+  `agent.approval.resolved` and `relay.cancelled` ledger events'
+  `transport`, the approval list
+  and detail outputs, and a "Via" column in the Control Center inbox. A
+  `/approve` from Slack is no longer indistinguishable from a click in the
+  Control Center. Who may approve is unchanged.
 - `/api` and `/ui` refuse an unknown host and a cross-site write.
 - Auth fails closed: with `enforce_auth` and no token, every route except
   `GET /healthz` is rejected.

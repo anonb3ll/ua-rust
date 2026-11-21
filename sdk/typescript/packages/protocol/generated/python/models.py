@@ -33,6 +33,7 @@ class Approval(BaseModel):
     status: Status
     reason: str | None = None
     resolved_by: str | None = None
+    resolved_transport: str | None = None
     created_at: constr(min_length=1)
     updated_at: constr(min_length=1)
     resolved_at: constr(min_length=1) | None = None
