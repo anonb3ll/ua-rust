@@ -69,8 +69,11 @@ here for memory columns, owners and defaults.
   predicates delegate to `authz`, and ua-memory's human check goes through
   it. A guard test (`crates/ua-core/tests/authz_guard.rs`) holds per-crate
   counts of the remaining ad-hoc checks (`is_human` definitions and calls,
-  `is_lifecycle_operator` calls, `fn is_operator…`, profile comparisons, and
-  profile-as-authority uses), which may only go down. One behaviour change:
+  `is_lifecycle_operator` calls, `fn is_operator…`, profile comparisons and
+  matches, profile-as-authority uses, `ActorKind` comparisons and matches,
+  and direct reads of `human_identities` / `lifecycle_operators`), which may
+  only go down. It scans `ua-core` too, skipping only the files that define
+  the primitives. One behaviour change:
   an unverified caller naming a configured human as its actor is no longer a
   workflow-record operator.
 
