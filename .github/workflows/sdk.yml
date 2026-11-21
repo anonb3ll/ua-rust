@@ -1,0 +1,49 @@
+name: sdk
+
+# The TypeScript SDK under sdk/typescript: typecheck, tests (with the mock
+# conformance suite) and the codegen check. Runs only when the SDK or this
+# workflow changes. The live suite against `ua serve` is in sdk-live.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdk/**"
+      - ".github/workflows/sdk.yml"
+  pull_request:
+    paths:
+      - "sdk/**"
+      - ".github/workflows/sdk.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdk/typescript
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # Regenerates the JSON Schema and Pydantic models (uvx, pinned emitters)
+      # and fails if a committed generated file changes. No hub needed.
+      - run: npm run codegen:check
+      - run: uv run --no-project --python 3.12 --with 'pydantic==2.14.4' python -m unittest discover -s tests -p 'test_*.py'
+        working-directory: sdk/typescript/packages/protocol
