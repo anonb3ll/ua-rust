@@ -115,6 +115,13 @@ pub const BUILD_FEATURES: &[BuildFeature] = &[
         without: "the hub serves no MCP: no /mcp route and no `ua mcp`; the JSON API at /api remains",
     },
     BuildFeature {
+        feature: "slack-socket",
+        key: "slack_socket",
+        enabled: cfg!(feature = "slack-socket"),
+        tools: &[],
+        without: "no Slack Socket Mode: Slack reaches the hub only through the signed HTTP routes, which need a public URL",
+    },
+    BuildFeature {
         feature: "embeddings",
         key: "embeddings",
         enabled: ua_memory::EMBEDDINGS_ENABLED,
@@ -125,7 +132,7 @@ pub const BUILD_FEATURES: &[BuildFeature] = &[
 
 /// Which optional Cargo features this build has, keyed by
 /// [`BuildFeature::key`]: `{code_intel, readability, mcp_gateway, mcp_server,
-/// embeddings}`.
+/// slack_socket, embeddings}`.
 pub fn build_features() -> serde_json::Value {
     serde_json::Value::Object(BUILD_FEATURES.iter().map(|f| (f.key.to_string(), f.enabled.into())).collect())
 }

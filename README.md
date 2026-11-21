@@ -34,12 +34,15 @@ a rule is written once and holds for every client.
 | Crate | Holds |
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
-| `ua-store` | SQLite storage, migrations, repositories, the event ledger |
+| `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
 | `ua-cli` | The `ua` binary |
+
+The TypeScript SDK (protocol and client packages) is in `sdk/typescript`, and
+the Slack routes and Socket Mode are described in [docs/slack.md](docs/slack.md).
 
 Library choices and the reasons for them are in [docs/stack.md](docs/stack.md).
 
@@ -87,6 +90,7 @@ cargo build --release --features embeddings                          # add seman
 | `readability` | on | dom_smoothie article extraction in `web_fetch` and `dash_view` | The whole page is converted (`extraction: "full-page"`). |
 | `mcp-gateway` | on | `mcp_gateway`, the client for downstream MCP servers | `mcp_server_register` refuses. |
 | `mcp-server` | on | The hub's own MCP server: `/mcp` and `ua mcp` | `ua serve` serves the JSON API and UI only, and warns at startup. |
+| `slack-socket` | on | Slack Socket Mode: Slack over an outbound WebSocket, no public URL | `slack_socket_mode = true` is reported as not compiled in. |
 | `embeddings` | off | Semantic memory search with fastembed | Memory search is lexical (FTS5). |
 
 `system_doctor` and `capability_catalog` report which features a build has
@@ -170,7 +174,7 @@ vulnerability.
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
 | Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
 | Public relay | `relay_manage`: an agent drafts a comment for an issue or pull request in an allowlisted GitHub repository; gates refuse secrets, hidden or bidirectional Unicode, private addresses and internal host names, home paths, personal data, over-long text and a private denylist, never rewriting the text; a human approves the exact text and target, the send repeats it byte for byte, and the token is a managed secret | [relay](docs/relay.md) |
-| Slack | Off by default. Signed slash commands (`POST /api/slack/commands`) and Events API callbacks (`POST /api/slack/events`) behind `slack_enabled` and `UA_SLACK_SIGNING_SECRET`: the nine coordination commands run as the human identity a (`team_id`, `user_id`) pair is mapped to, through the governed call path (transport `slack`); `/approve` only for mappings with `can_approve`, as a verified human other than the requester; commands with no recorded outcome ledgered at startup; messages run only when marked (`!task`); replay and retry dedupe; slash-command results posted to `hooks.slack.com` only | [slack](docs/slack.md) |
+| Slack | Off by default. Signed slash commands (`POST /api/slack/commands`) and Events API callbacks (`POST /api/slack/events`) behind `slack_enabled` and `UA_SLACK_SIGNING_SECRET`: the nine coordination commands run as the human identity a (`team_id`, `user_id`) pair is mapped to, through the governed call path (transport `slack`); `/approve` only for mappings with `can_approve`, as a verified human other than the requester; commands with no recorded outcome ledgered at startup; messages run only when marked (`!task`); replay and retry dedupe; slash-command results posted to `hooks.slack.com` only. Or, for a hub with no public URL, Socket Mode (`slack_socket_mode`, `UA_SLACK_APP_TOKEN`): the same admission and execution over an outbound WebSocket to Slack | [slack](docs/slack.md) |
 | Zulip | `zulip_send_message`: the relay's gates plus Zulip wildcard, group and unlisted mentions and unlisted link hosts, then a human approval of the exact stream, topic and text; an uncertain send blocks a duplicate until a human runs `zulip_resolve_send`. `zulip_fetch_messages`: forward-only cursor, messages labelled untrusted. Off until configured; sending retired by default | [zulip](docs/zulip.md) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
@@ -181,15 +185,18 @@ vulnerability.
 
 ## Not yet ported
 
-Native-session resume and adopt, cloud executors, ACP, Slack interactions,
+Native-session resume and adopt, cloud executors, Slack interactions,
 bot-token posting and live chat (slash commands and events are in),
-role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
-installation flow), session-handoff failover, the SDK's
-queue-health and node-session routes (`/api/queue-health`,
-`/api/action/node-session`), the provenance graph and evidence export, billing
-and usage ledgers, and tenancy (`org_id`). Work products
+role workflows, GitHub writes other than the relay's approved comments
+(labels, held PRs, the GitHub App installation flow), session-handoff
+failover, the SDK's queue-health and node-session routes
+(`/api/queue-health`, `/api/action/node-session`, which no route serves), the
+provenance graph and evidence export (`/api/platform/*` paths other than the
+manifest and objects, and `/api/evidence/export`, answer 501), discovered
+native sessions (`/api/nodes/*` other than `/api/nodes/acceptance`, 501),
+billing and usage ledgers, and tenancy (`org_id`). Work products
 (`/api/work-products*`) are not ported pending an explicit product decision
-(hub task #2658) and answer 501.
+and answer 501.
 
 ## License
 

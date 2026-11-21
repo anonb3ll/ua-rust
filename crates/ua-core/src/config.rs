@@ -295,6 +295,21 @@ pub struct Config {
     /// not listed is refused. Read from TOML only, never the environment.
     /// Checked at load ([`Config::check_slack_identities`]).
     pub slack_identities: Vec<SlackIdentity>,
+    /// Serve Slack over Socket Mode: the hub opens an outbound WebSocket to
+    /// Slack, so it needs no public URL. Off by default; runs only when this
+    /// is on, `UA_SLACK_APP_TOKEN` is set and the binary has the
+    /// `slack-socket` feature (docs/slack.md#socket-mode). Independent of
+    /// `slack_enabled` and the signing secret.
+    pub slack_socket_mode: bool,
+    /// Test hook: an app-level token handed in directly instead of through
+    /// `UA_SLACK_APP_TOKEN`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub slack_app_token_value: Option<SecretString>,
+    /// Test hook: the Slack Web API base Socket Mode opens connections at,
+    /// instead of `https://slack.com/api`, and permission for a loopback
+    /// `ws://` socket URL. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub slack_socket_test_api: Option<String>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
     /// Empty means dispatch only records runs and spawns nothing.
     pub harnesses: BTreeMap<String, HarnessConfig>,
@@ -744,6 +759,9 @@ impl Default for Config {
             slack_signing_secret: None,
             slack_enabled: false,
             slack_identities: Vec::new(),
+            slack_socket_mode: false,
+            slack_app_token_value: None,
+            slack_socket_test_api: None,
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,
@@ -909,6 +927,13 @@ impl Config {
     /// The Slack signing secret, trimmed; `None` when unset or blank.
     pub fn slack_signing_secret(&self) -> Option<SecretString> {
         secret_from(&self.slack_signing_secret, None)
+    }
+
+    /// The Slack app-level token for Socket Mode, from the environment
+    /// variable `UA_SLACK_APP_TOKEN` only (never the config file), trimmed;
+    /// `None` when unset or blank. Never logged.
+    pub fn slack_app_token(&self) -> Option<SecretString> {
+        secret_from(&self.slack_app_token_value, Some("UA_SLACK_APP_TOKEN"))
     }
 
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {

@@ -35,6 +35,11 @@ reproduce. You will get an acknowledgement within a week.
   `can_approve`. The signing secret can act as any mapped human, and approve
   as the opted-in ones, so guard it like a bearer token
   ([docs/slack.md](docs/slack.md#threat-model)).
+  Slack Socket Mode (`slack_socket_mode`, off by default) needs no inbound
+  route: `ua serve` connects out to `slack.com` only, with the app-level
+  token from `UA_SLACK_APP_TOKEN`, which is equivalent to the signing secret
+  and belongs in the same secret store
+  ([docs/slack.md](docs/slack.md#socket-mode)).
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
   so a profile or policy that refuses the tool refuses the stream. An open

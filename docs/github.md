@@ -47,7 +47,8 @@ request (one connection pool), not rebuilt per call.
   database or the config file, never returned by a tool and never logged
   (it is held as a secret and sent as a sensitive header). A fine-grained
   token with read access to Actions, Checks, Pull requests and Metadata of
-  the bound repositories is enough; nothing here writes to GitHub. Without a
+  the bound repositories is enough; nothing here writes to GitHub (the relay
+  posts comments with its own token, see [relay.md](relay.md)). Without a
   token there are no GitHub requests at all: checks stay `attested` with
   verdict `unverifiable`, the poller skips, and `queue_close_merged` refuses.
 - **Later sources.** A GitHub App installation token can replace the
@@ -303,7 +304,10 @@ failure to notify never fails the write.
 
 - One REST client with a bound-repository type replaces the GitHub App
   worker, fast path and `gh` lookups. Nothing here writes to GitHub
-  (comments, labels, merges); only reads.
+  (comments, labels, merges); only reads. The one GitHub write in the hub is
+  the relay's approval-gated comment on a repository listed in
+  `relay_github_repos`, made with a separate managed secret
+  ([relay.md](relay.md)).
 - Webhook replay protection is by delivery id and body hash in the
   database, plus a payload-timestamp window; the Python hub relied on
   GitHub's signature alone.

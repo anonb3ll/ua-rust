@@ -21,9 +21,10 @@ route) and `crates/ua-tools/src/families/slack.rs` (verifier, admission,
 dedupe, command mapping).
 
 **These routes need a public HTTPS Request URL.** Slack calls the hub; it
-cannot reach a hub that is only on a private network. A Socket Mode
-transport (the hub opens an outbound WebSocket to Slack, no public URL) is
-planned as a separate change and is not part of this one.
+cannot reach a hub that is only on a private network. For such a hub, use
+[Socket Mode](#socket-mode) instead: the hub opens an outbound WebSocket to
+Slack and needs no public URL. Everything below about identities, commands,
+approvals, dedupe and the ledger applies to both transports.
 
 ## Enabling it
 
@@ -305,6 +306,165 @@ the `response_url`.
   the `team_id` is part of the key, so the same user id in another workspace
   is not the mapped user.
 
+## Socket Mode
+
+Socket Mode serves the same commands and events over a WebSocket the hub
+opens to Slack, so the hub needs **no public URL** (and no signing secret).
+Use it for a hub that is reachable only on a private network. It runs inside
+`ua serve` and needs a binary with the `slack-socket` cargo feature (on by
+default). Code: `crates/ua-server/src/slack_socket.rs`.
+
+### Setting it up
+
+1. In the Slack app's settings, turn on **Socket Mode** and create an
+   **app-level token** (`xapp-…`) with the `connections:write` scope.
+2. Keep Slash Commands and Event Subscriptions as above (`app_mention`,
+   `message.im` as bot events). With Socket Mode on, Slack delivers them
+   over the socket and asks for no Request URL.
+3. Set the token in the hub's environment only. It is never read from
+   `config.toml`, never logged and never ledgered:
+
+   ```sh
+   export UA_SLACK_APP_TOKEN=xapp-...
+   ```
+
+4. In `config.toml`:
+
+   ```toml
+   slack_socket_mode = true     # UA_SLACK_SOCKET_MODE also sets it
+   # slack_identities as above; slack_enabled may stay false
+   ```
+
+`ua serve` logs one line at startup saying whether Socket Mode started and,
+if not, why (off, no token, a token that is not `xapp-…`, an invalid
+`slack_identities`, or a binary without the feature). `system_doctor`'s
+`slack` row reports the transport's state: off, not compiled, connecting,
+connected, restarting (a connection failed and is being reopened) or auth
+failed. It never shows the token.
+
+Both transports may be on at once. A delivery is deduplicated by its event
+id or trigger id across both, so one that arrives on each runs once.
+
+### How it works
+
+1. The hub POSTs `https://slack.com/api/apps.connections.open` with the token
+   in the `Authorization` header, through the guarded web client (no
+   redirects, no proxy, public addresses only; the response is read up to
+   16 KiB). It answers a one-time `wss://` URL.
+2. The URL must be `wss`, on `slack.com` or a subdomain, on the default port,
+   with no user info; otherwise it is refused and the hub retries later. The
+   first refusal of each reason is ledgered as `agent.slack.socket.url_refused`
+   (reason class only; the URL carries a connection ticket and is not
+   recorded); repeats are only logged, until a connection works again. Every
+   address the host resolves to must be public, and TLS is rustls with the
+   platform's certificate verifier.
+3. Slack sends `hello`, then envelopes (`envelope_id`, `type`, `payload`,
+   `accepts_response_payload`). Each is acknowledged by sending
+   `{"envelope_id": …}` back, well inside Slack's few seconds:
+   - `slash_commands`: the payload carries the same fields as the HTTP form
+     and goes through the same admission. When the envelope accepts a
+     response payload, the ephemeral sentence rides in the acknowledgement;
+     `response_url` delivery stays as on the HTTP route.
+   - `events_api`: the payload is the Events API `event_callback` body and
+     goes through the same filters (marker, bot authorization for DMs, no
+     app-written or edited messages, approve refused).
+   - `interactive` and anything else: acknowledged, not acted on.
+4. `disconnect` (Slack's `warning`, `refresh_requested`, `link_disabled`):
+   the hub closes the socket and opens a new one after about a second
+   (jittered; never zero, so a `hello`/`disconnect` loop cannot make it
+   hammer Slack). Other failures reconnect with exponential backoff and
+   jitter (1 s doubling to a 60 s cap; the count starts over after a
+   `hello`).
+5. Liveness: the hub pings every 30 seconds (a late tick is not made up
+   with a burst). One deadline, reset only by an incoming frame (a message,
+   ping or pong), drops a connection that has been silent for two minutes;
+   two pings in a row with no pong drop it sooner; and Slack must say
+   `hello` within 30 seconds of the handshake, which pings and pongs do not
+   satisfy. So a peer that vanishes
+   without a TCP reset (a NAT timeout, a suspended machine) is noticed.
+   A panic inside a connection is caught: the state reads `restarting` and
+   the hub reconnects with backoff.
+6. If `apps.connections.open` refuses the token or the app (`invalid_auth`,
+   `not_authed`, `token_revoked`, `token_expired`, `account_inactive`,
+   `not_allowed_token_type` and the like), the transport stops, logs one
+   line and does not retry until `ua serve` restarts.
+
+Bounds: WebSocket messages over 1 MiB end the connection; an envelope whose
+payload is over 64 KiB is acknowledged and not acted on. Each envelope is
+admitted on its own task while the connection keeps being read (so a slow
+admission never stalls pings, pongs or other envelopes), and its single
+acknowledgement goes back to the connection when ready; acknowledgements
+may leave in a different order than the envelopes came (each is
+independent, and the event and trigger id dedupe does not depend on
+order). At most 32 envelopes per connection are being admitted at once,
+counted until each admission finishes, not just until it is acknowledged
+(so a stalled database cannot let a new batch start every ack period). One
+past that is turned away without admission, ledger or replay row, logged
+at warn (envelope hash, type, in-flight count) and counted in the
+`system_doctor` `slack` row: a slash command is acknowledged with "The hub
+is busy. Try again in a moment." (Slack may not redeliver it, so the person
+is told and can retry); an event is left unacknowledged, so Slack
+redelivers it. A failure or
+panic in one envelope never ends the connection, and a shutdown waits for
+envelopes in flight. If its admission transaction fails, it is not acknowledged, so
+Slack redelivers it. If admission is slower than the 2.5-second ack
+deadline, the envelope is acknowledged first and admission finishes on its
+own task; should it then fail, Slack will not redeliver it, so the hub logs
+a warning with the envelope hash and ledgers
+`agent.slack.envelope.outcome_unknown` (envelope hash, reason class) when the
+database accepts the write.
+
+The Socket Mode URL carries a one-time ticket. tungstenite logs the
+handshake request at trace level, so `ua` caps `tungstenite` and
+`tokio_tungstenite` logs at info whatever `UA_LOG` says, as it does for
+`rmcp`.
+
+### Replay protection without a signature
+
+There is no request signature in Socket Mode: the connection itself is
+authenticated by the app token over TLS. In place of the signed bytes, the
+envelope id goes into the same replay table (`slack_seen_signatures`, keyed
+by the SHA-256 of `socket-envelope:{envelope_id}`, so it never collides with
+an HTTP key, and pruned after the same 10 minutes). A redelivered envelope
+(Slack retries ones it saw no acknowledgement for) is acknowledged again and
+runs nothing. Past that, the event id and trigger id dedupe
+(`slack_seen_deliveries`, a day) still applies, across both transports. For
+a mapped identity the admission ledgers `agent.slack.envelope_accepted`
+(the envelope hash) where the HTTP route ledgers
+`agent.slack.signature_accepted`; unmapped users add no ledger row, as on
+HTTP.
+
+### Threat model
+
+- The app-level token is equivalent to the signing secret: whoever holds it
+  can receive every delivery and answer for every mapped human (and approve
+  as the opted-in ones). Keep it in the same secret store as the signing
+  secret, and rotate it in the Slack app settings if it leaks.
+- The hub connects only to `slack.com` hosts it resolved to public
+  addresses, with certificate verification; it accepts no inbound
+  connection for Slack at all.
+- Everything after the socket (identity, `can_approve`, approve only from
+  slash commands, marker, filters, dedupe, governed calls, ledger) is the
+  same code as the HTTP routes.
+
+### Not verified against a live workspace
+
+Built from Slack's Socket Mode documentation and tested against an
+in-process stand-in, not yet against a live workspace:
+
+- that an `events_api` payload is the full `event_callback` body with
+  `event_id` and `authorizations` (Slack's page shows only an inner event
+  and says the payloads are "identical to the typical Events API payloads,
+  with some additional metadata"); if it is not, events are acknowledged and
+  ignored (fail closed) and slash commands still work;
+- the acknowledgement deadline and redelivery behaviour (the docs say Slack
+  retries unacknowledged envelopes but give neither a deadline nor a
+  `retry_attempt` field); the hub acknowledges within 2.5 seconds;
+- whether a socket URL may be reused (the hub never reuses one);
+- the exact set of permanent `apps.connections.open` errors (the hub treats
+  the auth-, token- and permission-class codes on the method page as
+  permanent and everything else, `ratelimited` included, as retryable).
+
 ## Not included
 
 - Interactions (buttons, modals; `/api/slack/interactions`): the command
@@ -318,8 +478,6 @@ the `response_url`.
   It has not yet been confirmed against a live workspace that a bot-event
   `message.im` carries `is_bot: true`; if it does not, direct-message
   commands are ignored (fail closed) and mentions still work.
-- Socket Mode (no public URL): planned as a separate change; until then a
-  hub reachable only on a private network cannot use Slack.
 
 ## Primitives
 
