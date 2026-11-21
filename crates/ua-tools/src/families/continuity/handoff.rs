@@ -49,10 +49,10 @@ use ua_store::{EventInput, WriteTx, ledger};
 
 use crate::families::agents::verified;
 use crate::families::audit::rules::redact_secrets;
-use crate::families::governance;
 use crate::families::injection::mark_untrusted;
 use crate::families::tasks::{acting_identity, row_object};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.lifecycle.handoff";
 const COOLDOWN_SECS: i64 = 5 * 60;
@@ -452,7 +452,12 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
         return Err(UaError::invalid("session_id is required"));
     }
     let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.as_deref().is_some_and(|w| governance::is_operator(ctx.hub.cfg(), &ctx.caller, w));
+    let maintainer = who.is_some()
+        && Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        );
     ctx.hub
         .db()
         .read_async(move |c| {
@@ -460,7 +465,7 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
                 .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [&sid], |r| r.get(0))
                 .optional()?;
             let note = latest_committed_note(c, &sid)?;
-            let allowed = operator
+            let allowed = maintainer
                 || who.as_deref().is_some_and(|w| {
                     owner.as_deref() == Some(w)
                         || note.as_ref().is_some_and(|n| {

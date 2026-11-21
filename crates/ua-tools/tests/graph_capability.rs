@@ -515,10 +515,17 @@ async fn the_hub_map_is_shown_to_operators_only() {
     assert!(!agents.is_empty());
     assert!(agents.iter().all(|a| a.get("host").is_none()), "{agents:?}");
 
+    // A lifecycle operator and a coordinator-profile agent are not operators:
+    // the hub map is for a verified human only.
+    for who in [
+        caller("ops-bot", ActorKind::Agent, Profile::Developer),
+        caller("boss", ActorKind::Agent, Profile::Coordinator),
+    ] {
+        let view = ok(&reg, &hub, &who, "capability_catalog", json!({})).await;
+        assert_eq!(view["boundaries"], Value::Null, "{}", who.label);
+    }
     let human = caller("operator", ActorKind::Human, Profile::Coordinator);
-    let ops_bot = caller("ops-bot", ActorKind::Agent, Profile::Developer);
-    let boss = caller("boss", ActorKind::Agent, Profile::Coordinator);
-    for who in [human, ops_bot, boss] {
+    for who in [human] {
         let full = ok(&reg, &hub, &who, "capability_catalog", json!({})).await;
         assert_eq!(full["redacted"], json!([]), "{}", who.label);
         assert!(

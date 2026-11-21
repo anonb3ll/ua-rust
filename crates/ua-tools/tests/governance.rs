@@ -55,6 +55,7 @@ impl H {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(dir.path().join("home"));
         cfg.human_identities = vec!["operator".into()];
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]);
         cfg.workspace = Some(dir.path().join("ws"));
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), dir }
@@ -818,7 +819,15 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
     // An ordinary agent may not bind or unbind: the binding decides which
     // repository a task's CI checks are verified against.
     let e = h.act_err(&lead(), "project_repo_bind", bind.clone()).await;
-    assert_eq!(reason(&e), "not_lifecycle_operator");
+    assert_eq!(reason(&e), "operator_required");
+    // Nor may a lifecycle operator: bindings are human-only.
+    let fleet = caller("fleet-bot", ActorKind::Agent);
+    let e = h.act_err(&fleet, "project_repo_bind", bind.clone()).await;
+    assert_eq!(reason(&e), "operator_required");
+    // Nor an unattended routine running under the human's label.
+    let routine = caller("operator", ActorKind::Agent);
+    let e = h.act_err(&routine, "project_repo_bind", bind.clone()).await;
+    assert_eq!(reason(&e), "operator_required");
     // An unverified caller cannot borrow an operator's name.
     let spoof = json!({ "project": "web", "repo": "owner/web", "bound_by": "operator" });
     let e = h.act_err(&anon, "project_repo_bind", spoof).await;
@@ -831,7 +840,9 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
 
     h.act_ok(&human(), "project_repo_bind", bind).await;
     let e = h.act_err(&lead(), "project_repo_unbind", json!({ "project": "web" })).await;
-    assert_eq!(reason(&e), "not_lifecycle_operator");
+    assert_eq!(reason(&e), "operator_required");
+    let e = h.act_err(&fleet, "project_repo_unbind", json!({ "project": "web" })).await;
+    assert_eq!(reason(&e), "operator_required");
     let e =
         h.act_err(&anon, "project_repo_unbind", json!({ "project": "web", "unbound_by": "operator" })).await;
     assert_eq!(reason(&e), "identity_required");

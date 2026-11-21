@@ -177,12 +177,32 @@ rather than store the secret. The full status table is in
 A profile is a capability tier bound to the verified identity and the client
 session. `profiles` in the hub config sets each identity's default
 (unlisted identities get `developer`, OAuth identities get `oauth_profile`);
+**A profile is a permission set, never authority.** It decides which tools a
+session sees. Who may act on another agent's work, read every mailbox or
+conversation, see the hub's boundaries, or move vault notes comes from
+identity (`ua_org::authz`): an operator is a verified caller of kind human
+(a `human_identities` label that authenticated as itself), and an agent
+explicitly listed in `lifecycle_operators` holds a separate fleet-maintenance
+grant (closing, parking and folding tasks, releasing claims and holds,
+worktree cleanup, handoff recovery, workflow records, wake handling, skill
+registry changes, harness config status, node-queue administration including
+node acceptance, and agent and node lifecycle), never operator authority.
+Secret and provider-account administration, project repo bindings, harness
+config publish, session credential revocation and node command adoption are
+for an operator. An unattended routine runs as an agent under its owner's
+label and so holds no operator authority; list its label in
+`lifecycle_operators` to give it fleet-maintenance rights. An unset
+`lifecycle_operators` defaults to `human_identities` for humans only. The
+Python hub let the coordinator and operator profiles carry authority; ua-rust
+does not. A coordinator agent that read every mailbox to route work cannot do
+so any more; organization roles (`docs/organization.md`) are what replace it.
+
 `profile_activate` moves a session to a profile no more privileged than that
 default, and a `profile_defaults` overlay (below) can only lower it.
 
 | Profile | Rank | Surface |
 |---|---|---|
-| `coordinator` | 8 | Every tool. Holds config authority: a profile overlay may not demote the last identity configured with it. Moves vault notes, reads every mailbox. |
+| `coordinator` | 8 | Every tool. A profile overlay may not demote the last identity configured with it (a lockout guard for config revisions). It grants no authority: moving vault notes and reading every mailbox need an operator (a verified human). |
 | `lead` | 7 | The developer surface plus `LEAD_EXTRA_TOOLS` (today all of those are already visible to developer), ranked above it. |
 | `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, migration manifests (`export_migration_manifest`, `compare_migration_manifests`, also through `export_data`), and profile switching (deny list: new tools are visible). |
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
@@ -407,9 +427,10 @@ decision), `work_proposal_get`, `work_proposal_list` and
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
 repository on an allowed forge host. The binding is the repository a task's
-CI checks are verified against, so bind and unbind are for a verified
-lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
-attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+CI checks are verified against and the repository merges and policy
+authorizations name, and it is not approval-gated, so bind and unbind are for
+an operator, a verified human (`operator_required` otherwise; a lifecycle
+operator does not qualify), and are attributed to that caller; `bound_by` / `unbound_by`, when given, must name
 it. Get and list are open.
 
 ### Maintenance tools

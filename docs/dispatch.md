@@ -50,10 +50,10 @@ store is merged; until then the hub's environment is the only source.
 
 | Tool | Caller |
 |---|---|
-| `dispatch_task` | A verified caller that is the target `agent`, or an operator (a human, or the operator profile). |
+| `dispatch_task` | A verified caller that is the target `agent`, or an operator (a verified human). A profile grants nothing. |
 | `dispatch_report_self`, `dispatch_resume` | The run's agent only. |
 | `dispatch_cancel` | The run's agent, or an operator. The run records `cancelled_by`, and the cancel event says whether it acted for another agent. |
-| `dispatch_retry_cancellation`, `dispatch_confirm_cancellation` | The operator profile only. |
+| `dispatch_retry_cancellation`, `dispatch_confirm_cancellation` | An operator (a verified human), under a profile that lists the tools. |
 
 The shipped operator profile allowlist does not include `dispatch_task` or
 `dispatch_cancel`. A session that enforces profiles must therefore be a
@@ -114,7 +114,7 @@ like a credential are refused.
 
 | Tool | Caller | What |
 |---|---|---|
-| `provider_account_register` (`provider, label, billing, enabled?, notes?, cooldown_s?`) | Operators (a human or a lifecycle operator) | Add an account. `billing` is `api`, `subscription` or `local`. `label` is what a harness names. |
+| `provider_account_register` (`provider, label, billing, enabled?, notes?, cooldown_s?`) | An operator (a verified human) | Add an account. `billing` is `api`, `subscription` or `local`. `label` is what a harness names. |
 | `provider_account_update` (`label`, any field, `rate_limited_until?`, `clear_error?`) | Operators | Change it, mark it rate-limited until a time (an empty string clears the limit), or forget its last error. |
 | `provider_account_disable` (`label, reason?`) | Operators | Disable it; `provider_account_update(enabled=true)` re-enables. |
 | `provider_account_list` (`include_disabled?`) | Any caller | The registry with its observed state. |

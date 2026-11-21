@@ -55,6 +55,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::time::parse_ts;
 use ua_core::{ActorKind, Caller, UaError, UaResult};
+use ua_org::authz::{Authority, Authz};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{STATUS_THRESHOLDS, validate_label, verified};
@@ -1055,7 +1056,8 @@ async fn node_list(ctx: ToolCtx, _a: NodeListArgs) -> UaResult<Value> {
     // Full facts for the node's own agent and for lifecycle operators; a
     // summary for everyone else, including unverified callers.
     let viewer = verified(&ctx.caller).map(str::to_string);
-    let operator = viewer.as_deref().is_some_and(|v| ctx.hub.cfg().is_lifecycle_operator(v));
+    let operator =
+        Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::LifecycleOperator], ua_core::DEFAULT_ORG);
     ctx.hub
         .db()
         .read_async(move |c| {
@@ -1107,7 +1109,7 @@ fn lifecycle_operator(ctx: &ToolCtx, verb: &str) -> UaResult<String> {
             format!("{verb} a node requires an authenticated identity"),
         ));
     };
-    if !ctx.hub.cfg().is_lifecycle_operator(who) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::LifecycleOperator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
             "not_lifecycle_operator",
             format!(

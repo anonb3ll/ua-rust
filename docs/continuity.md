@@ -154,8 +154,8 @@ draft --seal--> sealed --> assigned --> delivered
 `project`, `priority` to create) ties a mailbox conversation to a task. The
 task gets one notes line, `[conversation: <id>] handed off from the agent
 conversation`; no message is copied. The caller must have sent or received a
-message in the conversation (a human, or the coordinator profile, sees every
-conversation). The task write goes through the registry as `task_add` or
+message in the conversation (an operator, a verified human, sees every
+conversation; a profile grants nothing). The task write goes through the registry as `task_add` or
 `task_update`, so the caller's profile, the policy file and the approval gate
 apply as they do to a direct call. Creating is idempotent per conversation,
 title, project and priority.

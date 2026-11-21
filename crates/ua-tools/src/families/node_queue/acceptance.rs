@@ -45,12 +45,13 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::{SchemaPart, WriteTx};
 
 use super::{
-    Item, NodeRow, TERMINAL, cancel_item, insert_item, is_operator, load_item, load_node, now, record,
-    validate_new, verified_caller,
+    Item, NodeRow, TERMINAL, cancel_item, insert_item, load_item, load_node, now, record, validate_new,
+    verified_caller,
 };
 use crate::families::nodes;
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "node_acceptance.v1",
@@ -671,7 +672,13 @@ fn authorize(c: &Connection, hub: &Hub, ctx: &ToolCtx, who: &str, node: &str) ->
     let Some(row) = load_node(c, node)? else {
         return Err(UaError::not_found(format!("node {node:?} is not registered")));
     };
-    if row.agent != who && !is_operator(hub, &ctx.caller, who) {
+    if row.agent != who
+        && !Authz::new(hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        )
+    {
         return Err(UaError::denied(
             "not_node_agent",
             format!(
@@ -851,7 +858,11 @@ pub(crate) async fn node_acceptance_status(ctx: ToolCtx, a: StatusArgs) -> UaRes
 /// decision; the node's self-report alone never accepts a node.
 pub(crate) async fn node_acceptance_attest(ctx: ToolCtx, a: AttestArgs) -> UaResult<Value> {
     let who = verified_caller(&ctx.caller, "attesting device acceptance")?;
-    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "not_operator",
             "only an independent operator may attest device acceptance",

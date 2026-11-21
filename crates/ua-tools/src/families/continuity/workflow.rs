@@ -61,6 +61,7 @@ use crate::ci::{CiRun, Verdict};
 use crate::families::governance;
 use crate::families::tasks::{acting_identity, emit, require_task, str_field};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub(crate) const STAGES: [&str; 8] =
     ["plan", "implement", "verify", "review", "merge", "deploy", "prove", "done"];
@@ -287,8 +288,11 @@ fn parse_ref(r: Option<CheckRef>) -> UaResult<Option<ParsedRef>> {
 /// not an operator (it still writes a task whose claimant or next owner it
 /// names, as every unverified write does).
 fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
-    let allowed = governance::is_operator(ctx.hub.cfg(), &ctx.caller, who)
-        || same_label(str_field(task, "claimed_by"), who)
+    let allowed = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) || same_label(str_field(task, "claimed_by"), who)
         || same_label(str_field(task, "next_owner"), who);
     if allowed {
         Ok(())

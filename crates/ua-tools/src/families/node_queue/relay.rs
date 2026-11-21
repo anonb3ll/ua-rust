@@ -10,12 +10,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::{
-    CHANNEL, Item, check_item_id, clip, device_agent, evidence_ref, is_operator, load_item, now, owned_node,
-    record, run_gate, verified_caller,
+    CHANNEL, Item, check_item_id, clip, device_agent, evidence_ref, load_item, now, owned_node, record,
+    run_gate, verified_caller,
 };
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 const MAX_EVENTS: usize = 200;
 const MAX_EVENT_BYTES: usize = 32_768;
@@ -448,7 +449,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !operator {
-                if !(item.created_by == who || item.agent == who || is_operator(&hub, &caller, &who)) {
+                if !(item.created_by == who || item.agent == who || Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator, Authority::LifecycleOperator], ua_core::DEFAULT_ORG)) {
                     return Err(UaError::denied(
                         "not_item_owner",
                         format!("{who:?} did not request {id}; only its requester or an operator sends follow-ups"),

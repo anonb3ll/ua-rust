@@ -83,13 +83,8 @@ fn is_id_safe(s: &str) -> bool {
 
 /// Whether the verified caller may read every mailbox (and so every
 /// conversation). An unverified caller never is.
-/// (A profile used as authority; see [`Authority::TransitionalMailboxReader`].)
 fn unrestricted(ctx: &ToolCtx) -> bool {
-    Authz::new(ctx.hub.cfg()).holds(
-        &ctx.caller,
-        &[Authority::TransitionalMailboxReader],
-        ua_core::DEFAULT_ORG,
-    )
+    Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {

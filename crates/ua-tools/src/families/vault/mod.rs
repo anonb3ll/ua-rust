@@ -93,6 +93,8 @@ pub(crate) struct Vault {
     /// Vault-relative inbox directory.
     pub inbox: String,
     pub caller: Caller,
+    /// Whether the caller is an operator (a verified human).
+    pub operator: bool,
 }
 
 /// The caller's vault, or `vault_not_configured`.
@@ -117,6 +119,11 @@ pub(crate) fn vault(ctx: &ToolCtx) -> UaResult<Vault> {
         write_dirs: cfg.vault_write_dirs.clone(),
         inbox: cfg.vault_inbox_dir.trim().trim_matches('/').to_string(),
         caller: ctx.caller.clone(),
+        operator: ua_org::authz::Authz::new(cfg).holds(
+            &ctx.caller,
+            &[ua_org::authz::Authority::Operator],
+            ua_core::DEFAULT_ORG,
+        ),
     })
 }
 

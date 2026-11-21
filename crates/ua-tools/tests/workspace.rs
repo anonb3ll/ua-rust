@@ -60,6 +60,17 @@ impl Env {
         self.reg.call(&self.hub, &agent("builder-1", Profile::Coordinator), tool, args).await
     }
 
+    /// As an operator (a verified human): only an operator is told why an
+    /// allowlisted-program check refused, and a profile grants nothing.
+    async fn op(&self, tool: &str, args: Value) -> Result<Value, UaError> {
+        let operator = Caller {
+            kind: ActorKind::Human,
+            profile: Profile::Coordinator,
+            ..agent("operator", Profile::Coordinator)
+        };
+        self.reg.call(&self.hub, &operator, tool, args).await
+    }
+
     async fn ok(&self, tool: &str, args: Value) -> Value {
         self.call(tool, args.clone()).await.unwrap_or_else(|e| panic!("{tool} {args}: {e}"))
     }
@@ -237,7 +248,7 @@ async fn commands_are_vetted_and_bounded() {
         ("echo hi | cat", "shell_syntax"),
         ("echo $(id)", "shell_syntax"),
     ] {
-        let e = env.call("run_cmd", json!({ "command": cmd })).await.unwrap_err();
+        let e = env.op("run_cmd", json!({ "command": cmd })).await.unwrap_err();
         assert_eq!(reason(&e), code, "{cmd}");
     }
     let e = env.call("run_cmd", json!({ "command": "echo hi", "cwd": ".." })).await.unwrap_err();
@@ -303,7 +314,7 @@ async fn run_cmd_check_reports_without_running() {
     assert_eq!(r["ok"], false);
     assert_eq!(r["findings"][0]["code"], "rejected");
 
-    let r = env.ok("run_cmd_check", json!({ "command": "git reset --hard" })).await;
+    let r = env.op("run_cmd_check", json!({ "command": "git reset --hard" })).await.unwrap();
     assert_eq!(r["findings"][0]["code"], "destructive");
 
     let r = env.ok("run_cmd_check", json!({ "command": "git frobnicate" })).await;
@@ -457,7 +468,7 @@ async fn git_refuses_repositories_outside_the_workspace() {
     let env = setup();
     assert_eq!(env.call("git_worktree_list", json!({})).await.unwrap_err().code(), "invalid_argument");
     // run_cmd cannot pass git config overrides either.
-    let e = env.call("run_cmd", json!({ "command": "git -c core.pager=sh log" })).await.unwrap_err();
+    let e = env.op("run_cmd", json!({ "command": "git -c core.pager=sh log" })).await.unwrap_err();
     assert_eq!(reason(&e), "git_config_override");
 }
 
@@ -731,9 +742,11 @@ async fn allowlist_refusals_do_not_reveal_membership_to_non_operators() {
         );
     }
     assert!(texts.windows(2).all(|w| w[0] == w[1]), "{texts:?}");
-    // An operator still sees why.
-    let e = env.call("run_cmd", json!({ "command": "rm notes.txt" })).await.unwrap_err();
+    // An operator still sees why; the coordinator profile alone does not.
+    let e = env.op("run_cmd", json!({ "command": "rm notes.txt" })).await.unwrap_err();
     assert_eq!(reason(&e), "program_not_allowed");
-    let e = env.call("run_cmd", json!({ "command": "git reset --hard" })).await.unwrap_err();
+    let e = env.op("run_cmd", json!({ "command": "git reset --hard" })).await.unwrap_err();
     assert_eq!(reason(&e), "destructive");
+    let e = env.call("run_cmd", json!({ "command": "rm notes.txt" })).await.unwrap_err();
+    assert_eq!(reason(&e), "command_refused");
 }

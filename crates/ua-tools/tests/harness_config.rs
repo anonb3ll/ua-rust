@@ -99,9 +99,16 @@ fn other_agent() -> Caller {
     caller("builder-2", ActorKind::Agent)
 }
 
-/// A lifecycle operator that is an agent: it publishes, a human approves.
+/// A lifecycle operator that is an agent: it changes the skill registry, a
+/// human approves. It may not publish harness config.
 fn ops() -> Caller {
     caller("ops-bot", ActorKind::Agent)
+}
+
+/// A second human: harness config publish is human-only, and a human other
+/// than the publisher approves it.
+fn publisher() -> Caller {
+    Caller { profile: Profile::Operator, enforce_profile: false, ..caller("operator-2", ActorKind::Human) }
 }
 
 fn human() -> Caller {
@@ -122,7 +129,7 @@ impl H {
     fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(std::env::temp_dir());
-        cfg.human_identities = vec!["operator".into()];
+        cfg.human_identities = vec!["operator".into(), "operator-2".into()];
         cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-bot".into()]);
         cfg.workspace = Some(ws.path().to_path_buf());
         tweak(&mut cfg);
@@ -146,12 +153,12 @@ impl H {
 
     async fn publish(&self, bundle: Value) -> Value {
         let args = json!({ "bundle": bundle });
-        let parked = self.call(&ops(), "harness_config_publish", args.clone()).await.unwrap_err();
+        let parked = self.call(&publisher(), "harness_config_publish", args.clone()).await.unwrap_err();
         let UaError::ApprovalRequired { approval_id, .. } = parked else {
             panic!("expected an approval: {parked:?}")
         };
         self.approve(approval_id).await;
-        self.ok(&ops(), "harness_config_publish", args).await
+        self.ok(&publisher(), "harness_config_publish", args).await
     }
 
     async fn register(&self) {
@@ -249,33 +256,37 @@ async fn publish_needs_an_operator_and_a_human_approval_bound_to_the_content() {
     let h = H::new();
     let bundle = json!({ "version": "1.0.0", "rules": { "claude": "be careful\n" } });
 
-    // A plain agent is not an operator.
+    // A plain agent is not an operator, nor is a lifecycle operator:
+    // publishing harness config is human-only.
     let e = h.call(&device(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required", "{e:?}");
+    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     assert_eq!(reason(&e), "operator_required", "{e:?}");
     // A bearer MCP server is refused before any approval is asked.
     let bad = json!({ "version": "2", "mcp_servers": [{ "name": "x", "url": "https://x.example.com", "auth": "bearer" }] });
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bad })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": bad })).await.unwrap_err();
     assert!(matches!(e, UaError::InvalidArgument(_)), "{e:?}");
 
     // The pass binds the content: a different bundle under the same version
     // is a new request, not the approved one.
-    let parked = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    let parked =
+        h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked:?}") };
     h.approve(approval_id).await;
     let changed = json!({ "version": "1.0.0", "rules": { "claude": "be reckless\n" } });
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": changed })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": changed })).await.unwrap_err();
     assert!(
         matches!(e, UaError::ApprovalRequired { approval_id: other, .. } if other != approval_id),
         "{e:?}"
     );
 
-    let out = h.ok(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await;
+    let out = h.ok(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await;
     assert_eq!(out["version"], "1.0.0");
     assert_eq!(out["surfaces"], json!(["agents", "claude", "codex", "cursor", "opencode"]));
     assert_eq!(h.events("harness_config_publish"), 1);
 
     // A version is published once; the refusal comes before any approval.
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     assert_eq!(reason(&e), "version_published", "{e:?}");
 
     let status = h.ok(&device(), "harness_config_status", json!({})).await;
@@ -744,7 +755,8 @@ async fn unsafe_paths_and_mcp_urls_are_refused() {
         json!({ "version": "v1", "rules": { "codex": "x\n\"\"\"\n[mcp_servers.x]\ncommand = \"sh\"\n" } }),
         json!({ "version": "v1", "rules": { "agents": "x\"\"\"" } }),
     ] {
-        let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+        let e =
+            h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
         assert!(matches!(e, UaError::InvalidArgument(_)), "{bundle}: {e:?}");
     }
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals"), json!(0), "nothing was asked for");

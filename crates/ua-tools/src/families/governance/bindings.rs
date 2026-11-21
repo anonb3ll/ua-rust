@@ -18,9 +18,10 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::{is_operator, now, verified_actor};
+use super::{now, verified_actor};
 use crate::families::tasks::{acting_identity, check_slug, row_object};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 /// Forge hosts a binding may name.
 const ALLOWED_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
@@ -154,16 +155,18 @@ pub struct GetArgs {
 pub struct ListArgs {}
 
 /// The verified operator changing a binding. A binding names the repository
-/// a task's CI checks are verified against, so only a lifecycle operator or
-/// a human may change it, under its own name: `named` (the legacy `bound_by`
-/// / `unbound_by`) must be that caller when given.
+/// a task's CI checks are verified against, and the repository merges and
+/// policy authorizations name, and it is not approval-gated, so only an
+/// operator (a verified human) may change it, under its own name: `named`
+/// (the legacy `bound_by` / `unbound_by`) must be that caller when given. A
+/// lifecycle operator may not.
 fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult<String> {
     let who = verified_actor(&ctx.caller, doing)?;
     acting_identity(&ctx.caller, named)?;
-    if !is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
-            "not_lifecycle_operator",
-            format!("{doing} is for a lifecycle operator or a human; {who:?} is neither"),
+            "operator_required",
+            format!("{doing} is for an operator (a verified human); {who:?} is not one"),
         ));
     }
     Ok(who)

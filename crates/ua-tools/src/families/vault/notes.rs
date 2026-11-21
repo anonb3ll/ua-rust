@@ -374,10 +374,10 @@ fn vault_write(v: &Vault, a: WriteArgs, require_revision: bool) -> UaResult<Writ
 // ── move ───────────────────────────────────────────────────────────────────
 
 fn vault_move(v: &Vault, a: MoveArgs) -> UaResult<Value> {
-    if v.caller.profile != ua_core::Profile::Coordinator && !v.caller.is_human() {
+    if !v.operator {
         return Err(UaError::denied(
-            "profile_denied",
-            "vault_move requires the coordinator profile or a verified human",
+            "operator_required",
+            "vault_move requires an operator (a verified human)",
         ));
     }
     require_human_force(v, a.force)?;

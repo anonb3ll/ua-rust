@@ -56,6 +56,7 @@ use ua_store::{EventInput, SchemaPart, ledger};
 
 use crate::approvals::{self, GateOutcome};
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "managed_secrets.v1",
@@ -306,15 +307,10 @@ pub(crate) fn orphan_consumer(
 
 // --- who may write ------------------------------------------------------------------
 
-/// A verified human, or an authenticated agent whose identity is a configured
-/// human or lifecycle operator. Keyed on identity, never on profile: an agent
-/// can activate the `operator` profile itself, so the profile proves nothing.
+/// An operator: a verified human ([`Authority::Operator`]). Keyed on
+/// identity, never on profile; a profile grants no authority.
 pub(crate) fn is_secret_admin(cfg: &Config, caller: &Caller) -> bool {
-    match caller.kind {
-        ActorKind::Human => true,
-        ActorKind::Agent => cfg.is_human(&caller.label) || cfg.is_lifecycle_operator(&caller.label),
-        ActorKind::System | ActorKind::Anonymous => false,
-    }
+    Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 fn require_admin(cfg: &Config, caller: &Caller, doing: &str) -> UaResult<()> {

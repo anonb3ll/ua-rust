@@ -44,6 +44,7 @@ use super::node_queue::{self, ITEM_COLS, item_from_row};
 use super::platform::object_ref;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 /// Every run kind this hub records.
 pub const KINDS: [&str; 4] = ["dispatch", "session", "workflow", "node"];
@@ -107,14 +108,19 @@ pub struct GetArgs {
 /// Who is reading, for node-item visibility.
 struct Viewer {
     who: Option<String>,
-    operator: bool,
+    maintainer: bool,
 }
 
 impl Viewer {
     fn of(hub: &Hub, caller: &Caller) -> Self {
         let who = verified(caller).map(str::to_string);
-        let operator = who.as_deref().is_some_and(|w| node_queue::is_operator(hub, caller, w));
-        Self { who, operator }
+        let maintainer = who.is_some()
+            && Authz::new(hub.cfg()).holds(
+                caller,
+                &[Authority::Operator, Authority::LifecycleOperator],
+                ua_core::DEFAULT_ORG,
+            );
+        Self { who, maintainer }
     }
 }
 
@@ -323,7 +329,7 @@ fn workflow_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Valu
 
 fn node_rows(c: &Connection, f: &Filter<'_>, viewer: &Viewer, now: &str) -> UaResult<Vec<Value>> {
     let (mut w, mut binds) = clauses(f, "agent", "created_at", "id");
-    if !viewer.operator {
+    if !viewer.maintainer {
         let Some(who) = viewer.who.as_deref() else { return Ok(Vec::new()) };
         w.push(
             "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ?))"

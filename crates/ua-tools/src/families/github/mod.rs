@@ -104,7 +104,9 @@ pub fn register(r: &mut Registry) {
 }
 
 /// The hub identity GitHub effects run as. Its reach is the grant
-/// [`grant_refusal`] enforces, not its profile.
+/// [`grant_refusal`] enforces. The `operator` profile here only selects the
+/// tool surface; a profile grants no authority, and as a system caller it
+/// holds neither `Operator` nor `LifecycleOperator`.
 pub fn github_caller() -> Caller {
     Caller { label: GITHUB_ACTOR.into(), profile: ua_core::Profile::Operator, ..Caller::system() }
 }
@@ -196,4 +198,26 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
     let payload = json!({ "repo": repo, "head_sha": head, "source": source, "checks": out });
     hub.db().write_async(move |tx| emit(tx, "agent.github.checks_reverified", payload, GITHUB_ACTOR)).await?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    /// The GitHub caller carries the operator profile for its tool surface,
+    /// but that profile grants nothing: it is not an operator for dispatch
+    /// (which an operator-profile caller used to be), nor for the hub view.
+    #[test]
+    fn the_github_caller_holds_no_operator_authority() {
+        let cfg = ua_core::Config { human_identities: vec!["operator".into()], ..ua_core::Config::default() };
+        let gh = github_caller();
+        assert_eq!(gh.profile, ua_core::Profile::Operator);
+        assert!(!crate::families::dispatch::is_operator(&cfg, &gh));
+        assert!(!crate::families::capability::is_operator(&gh, &cfg));
+        assert!(!ua_org::authz::Authz::new(&cfg).holds(
+            &gh,
+            &[ua_org::authz::Authority::Operator, ua_org::authz::Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        ));
+    }
 }

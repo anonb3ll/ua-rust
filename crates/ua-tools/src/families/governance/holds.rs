@@ -37,12 +37,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::lifecycle::stop_runs;
-use super::{clean_reason, is_operator, now};
+use super::{clean_reason, now};
 use crate::families::agents::verified;
 use crate::families::dispatch::{load_run, states};
 use crate::families::node_queue;
 use crate::families::tasks::{acting_identity, subtree_ids};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const CHANNEL: &str = "agent.task.hold";
 const MODES: [&str; 4] = ["pause", "cancel", "resume", "restore"];
@@ -356,8 +357,8 @@ pub(crate) async fn task_hold_get(ctx: ToolCtx, a: HoldGetArgs) -> UaResult<Valu
 /// Who may release `h`: its creator or an operator, both verified. An
 /// unverified caller's `actor` is attribution only, so naming the creator
 /// grants nothing. Returns whether the releaser is an operator.
-fn release_authority(h: &Hold, who: &str, verified: bool, operator: bool) -> UaResult<bool> {
-    if verified && operator {
+fn release_authority(h: &Hold, who: &str, verified: bool, maintainer: bool) -> UaResult<bool> {
+    if verified && maintainer {
         return Ok(true);
     }
     if verified && who == h.created_by {
@@ -404,7 +405,7 @@ fn restore_in_tx(
     h: &Hold,
     who: &str,
     verified: bool,
-    operator: bool,
+    maintainer: bool,
 ) -> UaResult<(Vec<Value>, bool)> {
     let mut out = Vec::new();
     let mut settled = true;
@@ -425,7 +426,7 @@ fn restore_in_tx(
             continue;
         }
         let run_agent = m.cancelled_run_agent.clone().unwrap_or_default();
-        if !operator && !(verified && who == run_agent) {
+        if !maintainer && !(verified && who == run_agent) {
             settled = false;
             out.push(with(
                 "refused",
@@ -484,7 +485,11 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
     }
     let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
     let is_verified = verified(&ctx.caller).is_some();
-    let operator = is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let maintainer = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     let reason = clean_reason(
         a.reason.as_deref(),
         matches!(verb.as_str(), "pause" | "cancel").then_some("hold a subtree"),
@@ -561,7 +566,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
                     return Err(UaError::invalid(format!("task {root} has no active hold")));
                 };
                 out.hold_id = h.id;
-                let op = release_authority(&h, &who, is_verified, operator)?;
+                let op = release_authority(&h, &who, is_verified, maintainer)?;
                 if cancelling(&h) {
                     return Err(UaError::conflict(format!(
                         "hold #{} is still recording its cancel requests; {verb} once that finishes",
@@ -598,7 +603,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
     let mut result = json!({ "action": verb, "changed": out.changed });
     if out.cancel {
         result["cancel_requests"] =
-            json!(request_cancels(&ctx, out.hold_id, root, &who, operator, &reason).await?);
+            json!(request_cancels(&ctx, out.hold_id, root, &who, maintainer, &reason).await?);
     }
     if verb == "resume" || verb == "restore" {
         result["released"] = json!(out.released);
@@ -626,7 +631,7 @@ async fn request_cancels(
     hold_id: i64,
     root: i64,
     who: &str,
-    operator: bool,
+    maintainer: bool,
     reason: &str,
 ) -> UaResult<Vec<Value>> {
     let is_verified = verified(&ctx.caller).is_some();
@@ -668,7 +673,7 @@ async fn request_cancels(
     let mut flagged: Vec<(String, String, i64)> = Vec::new();
     let why = format!("task hold #{hold_id}: {reason}");
     for (run_id, task_id, agent) in runs {
-        if !(operator || (is_verified && who == agent)) {
+        if !(maintainer || (is_verified && who == agent)) {
             outcomes.push(json!({
                 "task_id": task_id, "path": "dispatch", "ref": run_id, "control": "refused",
                 "detail": "cancelling another agent's run is an operator action",
@@ -690,7 +695,7 @@ async fn request_cancels(
             let mut out = Vec::new();
             for (item, claimant) in items {
                 let base = json!({ "task_id": item.task_id, "path": "node", "ref": item.id });
-                let allowed = operator
+                let allowed = maintainer
                     || (is_verified
                         && (who2 == item.created_by
                             || who2 == item.agent
