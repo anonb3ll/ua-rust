@@ -5191,6 +5191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-org"
+version = "0.1.0"
+dependencies = [
+ "ua-core",
+]
+
+[[package]]
 name = "ua-server"
 version = "0.1.0"
 dependencies = [
