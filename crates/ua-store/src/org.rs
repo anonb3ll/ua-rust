@@ -103,9 +103,10 @@ fn store(conn: &Connection, _: &'static [&'static str]) -> anyhow::Result<String
 /// creates the generated `<table>_org_exists` and `<table>_org_immutable`
 /// triggers. It needs `organization.v1.store` applied first.
 ///
-/// The part is a [`Procedure`] checked by name and version only, so the
-/// table list is part of what its name stands for: covering another table
-/// takes a new part, never an edit of a released one.
+/// The part is a [`Procedure`] whose checksum covers the table list, so
+/// adding a table to a released part is refused on databases that already
+/// ran it: covering another table takes a new part, never an edit of a
+/// released one.
 pub const fn tenant_part(name: &'static str, tables: &'static [&'static str]) -> Procedure {
     Procedure { name, version: 1, standalone: false, run: tenant_columns, args: tables }
 }
@@ -334,6 +335,32 @@ mod tests {
             generated.contains("UPDATE legacy SET org_id = 'default' WHERE org_id IS NULL"),
             "{generated}"
         );
+    }
+
+    /// A table added to a released tenant part, without a new name or
+    /// version, must be refused on a database that already ran the part,
+    /// not silently skipped (fresh databases would get the table, existing
+    /// ones would not).
+    #[test]
+    fn a_tenant_part_whose_table_list_changed_is_refused() {
+        let mut conn = tenant_db();
+        conn.execute_batch("CREATE TABLE gadgets (id INTEGER PRIMARY KEY);").unwrap();
+        const GROWN: Procedure = tenant_part("organization.v1.demo", &["widgets", "legacy", "gadgets"]);
+        let err = apply(&mut conn, &[GROWN]).unwrap_err().to_string();
+        assert!(
+            err.contains("organization.v1.demo") && err.contains("changed after it was applied"),
+            "{err}"
+        );
+        assert!(err.contains(r#"args ["widgets","legacy"]"#), "{err}");
+        assert!(err.contains(r#"args ["widgets","legacy","gadgets"]"#), "{err}");
+        let gadgets_org: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('gadgets') WHERE name = 'org_id'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(gadgets_org, 0, "nothing ran");
+        // The same list again is a no-op.
+        assert!(apply(&mut conn, &[DEMO_TENANT]).unwrap().is_empty());
     }
 
     #[test]

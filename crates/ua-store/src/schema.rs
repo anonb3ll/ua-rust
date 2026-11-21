@@ -8,15 +8,16 @@
 //! | Kind | Body | Checksum covers |
 //! |---|---|---|
 //! | [`SchemaPart`] (static) | a `&'static str` of SQL | that SQL |
-//! | [`Procedure`] | a Rust function and an explicit `version` | the part name and the `version` |
+//! | [`Procedure`] | a Rust function, an explicit `version` and static `args` | the part name, `version` and `args` |
 //!
 //! A procedure exists for schema whose SQL depends on the database it runs on
 //! (a column that may already be there, a timestamp bound at run time). It is
-//! checked by name and `version` only. The SQL it generated is stored in
-//! `schema_procedures` for audit and is never regenerated or compared on later
-//! starts. Re-running a recorded procedure with a different `version` under
-//! the same name is refused like a changed static part, so a procedure that
-//! changes ships under a new name.
+//! checked by name, `version` and `args` only, never by the SQL it produces.
+//! That SQL is stored in `schema_procedures` for audit and is never
+//! regenerated or compared on later starts. Re-running a recorded procedure
+//! with a different `version` or different `args` under the same name is
+//! refused like a changed static part, so a procedure that changes ships under
+//! a new name.
 //!
 //! A procedure flagged `standalone` runs alone, outside the shared
 //! transaction: the pending parts before it are committed first, it runs with
@@ -89,6 +90,14 @@ impl From<Procedure> for Part {
     }
 }
 
+impl Procedure {
+    /// `args` as a JSON array: the unambiguous form the checksum covers and
+    /// `schema_procedures` records.
+    fn args_json(&self) -> String {
+        serde_json::to_string(self.args).unwrap_or_default()
+    }
+}
+
 impl SchemaPart {
     /// The checksum recorded in `schema_parts`.
     pub fn checksum(&self) -> String {
@@ -98,13 +107,15 @@ impl SchemaPart {
 
 impl Part {
     /// The checksum recorded in `schema_parts`: the SHA-256 of the SQL for a
-    /// static part, of the name and `version` for a procedure.
+    /// static part; for a procedure, of its name, `version` and `args`, so a
+    /// procedure whose argument list changed (a table added to a tenant part)
+    /// is refused like a changed static part instead of being skipped.
     pub fn checksum(&self) -> String {
         match self.kind {
             PartKind::Static { sql } => hex::encode(Sha256::digest(sql.as_bytes())),
-            PartKind::Procedure(p) => {
-                hex::encode(Sha256::digest(format!("procedure\0{}\0{}", p.name, p.version).as_bytes()))
-            }
+            PartKind::Procedure(p) => hex::encode(Sha256::digest(
+                format!("procedure\0{}\0{}\0{}", p.name, p.version, p.args_json()).as_bytes(),
+            )),
         }
     }
 
@@ -130,6 +141,7 @@ const TRACKING: &str = "CREATE TABLE IF NOT EXISTS schema_parts (
 const PROCEDURE_TRACKING: &str = "CREATE TABLE IF NOT EXISTS schema_procedures (
     name TEXT PRIMARY KEY,
     version INTEGER NOT NULL,
+    args TEXT NOT NULL,
     generated_sql TEXT NOT NULL,
     applied_at TEXT NOT NULL
 )";
@@ -166,20 +178,24 @@ fn pending(conn: &Connection, part: &Part) -> anyhow::Result<bool> {
                 part.name
             ),
             PartKind::Procedure(p) => {
-                let recorded = recorded_procedure_version(conn, p.name)?;
+                let recorded = recorded_procedure(conn, p.name)?
+                    .map(|(v, a)| format!("version {v}, args {a}"))
+                    .unwrap_or_else(|| "unknown".into());
                 anyhow::bail!(
-                    "schema part {} changed after it was applied (recorded procedure version {}, this build has \
-                     version {}); released parts are immutable, ship the changed procedure under a new name",
+                    "schema part {} changed after it was applied (recorded procedure {recorded}; this build has \
+                     version {}, args {}); released parts are immutable, ship the changed procedure under a new \
+                     name",
                     part.name,
-                    recorded.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()),
-                    p.version
+                    p.version,
+                    p.args_json()
                 )
             }
         },
     }
 }
 
-fn recorded_procedure_version(conn: &Connection, name: &str) -> anyhow::Result<Option<i64>> {
+/// The recorded `(version, args)` of a procedure part.
+fn recorded_procedure(conn: &Connection, name: &str) -> anyhow::Result<Option<(i64, String)>> {
     let has: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_procedures'",
@@ -192,7 +208,9 @@ fn recorded_procedure_version(conn: &Connection, name: &str) -> anyhow::Result<O
         return Ok(None);
     }
     Ok(conn
-        .query_row("SELECT version FROM schema_procedures WHERE name = ?1", [name], |r| r.get(0))
+        .query_row("SELECT version, args FROM schema_procedures WHERE name = ?1", [name], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()?)
 }
 
@@ -208,8 +226,9 @@ fn record(conn: &Connection, part: &Part, generated_sql: Option<&str>) -> anyhow
     if let (PartKind::Procedure(p), Some(sql)) = (part.kind, generated_sql) {
         conn.execute_batch(PROCEDURE_TRACKING)?;
         conn.execute(
-            "INSERT INTO schema_procedures (name, version, generated_sql, applied_at) VALUES (?1, ?2, ?3, ?4)",
-            (p.name, p.version, sql, &now),
+            "INSERT INTO schema_procedures (name, version, args, generated_sql, applied_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (p.name, p.version, p.args_json(), sql, &now),
         )?;
     }
     Ok(())
@@ -314,7 +333,7 @@ mod tests {
         assert!(sql.contains("VALUES (0)"), "{sql}");
 
         // The procedure would now generate different SQL; it is not re-run,
-        // compared or refused, because it is checked by name and version.
+        // compared or refused, because it is checked by name, version and args.
         conn.execute_batch("INSERT INTO base VALUES (1), (2);").unwrap();
         assert!(apply(&mut conn, &parts).unwrap().is_empty());
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM counted", [], |r| r.get(0)).unwrap();
@@ -327,7 +346,10 @@ mod tests {
         apply(&mut conn, &[Part::from(BASE), counting_part(1)]).unwrap();
         let err = apply(&mut conn, &[Part::from(BASE), counting_part(2)]).unwrap_err().to_string();
         assert!(err.contains("counted.v1"), "{err}");
-        assert!(err.contains("recorded procedure version 1") && err.contains("version 2"), "{err}");
+        assert!(
+            err.contains("recorded procedure version 1, args []") && err.contains("has version 2"),
+            "{err}"
+        );
         // Nothing ran: the table still has one row and the record is unchanged.
         let v: i64 = conn
             .query_row("SELECT version FROM schema_procedures WHERE name = 'counted.v1'", [], |r| r.get(0))
