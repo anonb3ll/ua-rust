@@ -34,6 +34,14 @@ pub(crate) enum Kind {
     /// host facts do not. ua-rust stores only facts it bounded on write, so
     /// `facts_json` starts empty and the node's next registration fills it.
     Nodes,
+    /// Tasks: `current_run_id` and `current_run_agent` are cleared to NULL
+    /// because `dispatch_runs` are not imported.
+    Tasks,
+    /// Task subtree holds: require valid `status` and refuse duplicate active holds.
+    TaskHolds,
+    /// Project repository bindings: validate `project` slug and `repo`, and
+    /// normalize `default_branch` (clearing invalid values to NULL).
+    ProjectRepoBindings,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +74,11 @@ pub(crate) const MAPS: &[TableMap] = &[
         kind: Kind::Tokens,
         ..plain("agent_tokens")
     },
-    TableMap { self_ref: Some(Ref { col: "parent_id", table: "tasks", key: "id" }), ..plain("tasks") },
+    TableMap {
+        self_ref: Some(Ref { col: "parent_id", table: "tasks", key: "id" }),
+        kind: Kind::Tasks,
+        ..plain("tasks")
+    },
     TableMap {
         refs: &[TASK_REF, Ref { col: "depends_on_task_id", table: "tasks", key: "id" }],
         ..plain("task_dependencies")
@@ -90,6 +102,19 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_steps") },
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_checkpoints") },
     TableMap { refs: &[TASK_REF], ..plain("delegations") },
+    plain("work_proposals"),
+    TableMap {
+        refs: &[Ref { col: "proposal_id", table: "work_proposals", key: "id" }],
+        ..plain("work_proposal_items")
+    },
+    // Neither schema has an FK from task_holds.root_task_id to tasks: hold
+    // records intentionally outlive deleted tasks, while members keep their task FK.
+    TableMap { kind: Kind::TaskHolds, ..plain("task_holds") },
+    TableMap {
+        refs: &[Ref { col: "hold_id", table: "task_holds", key: "id" }, TASK_REF],
+        ..plain("task_hold_members")
+    },
+    TableMap { kind: Kind::ProjectRepoBindings, ..plain("project_repo_bindings") },
     TableMap { rowid_to: Some("seq"), ..plain("memory") },
     TableMap { refs: &[Ref { col: "note_id", table: "memory", key: "id" }], ..plain("memory_versions") },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },

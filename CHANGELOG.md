@@ -28,7 +28,15 @@ from its commit history.
 - OAuth 2.1 authorization server, passkeys and browser sessions.
 - `ua import python-hub`, which copies a database from the original hub. A dry
   run reports counts without writing. A re-run resumes. The source ledger is
-  checked, and a refusal happens before any target write.
+  checked, and a refusal happens before any target write. Now also imports
+  `work_proposals`, `work_proposal_items`, `task_holds`, `task_hold_members`
+  and `project_repo_bindings`, clears `tasks.current_run_id` and
+  `current_run_agent` (since `dispatch_runs` are not imported) with separate
+  count and capped task-id reporting, never copies `org_id` on any mapped
+  table including `harness_config_bundles`, refuses duplicate active holds and
+  duplicate trimmed project slugs in `--dry-run` as well as real imports, and
+  clears invalid `project_repo_bindings.default_branch` values to `NULL`
+  instead of dropping the binding.
 - Dispatch runs and an executor. An approval binds the resolved workdir, argv
   and prompt. An operator can cancel a run. A previous process's orphans are
   reaped, including on macOS.
