@@ -76,6 +76,8 @@ pub struct Policy {
     /// Redirects followed by hand, each hop checked against this policy
     /// again. With 0 a redirect response is returned as it is.
     pub max_redirects: u8,
+    /// Follow a redirect from https to http. No shipped policy does.
+    pub allow_scheme_downgrade: bool,
     /// Largest response body any read path returns.
     pub max_body_bytes: usize,
     pub connect_timeout: Duration,
@@ -95,6 +97,7 @@ pub const SLACK_RESPONSE_URL: Policy = Policy {
     default_port_only: true,
     addresses: Addresses::Public,
     max_redirects: 0,
+    allow_scheme_downgrade: false,
     max_body_bytes: 64 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),

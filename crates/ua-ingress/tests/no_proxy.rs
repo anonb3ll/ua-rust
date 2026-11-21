@@ -58,6 +58,7 @@ async fn proxy_environment_variables_are_ignored() {
         default_port_only: false,
         addresses: Addresses::PublicOrLoopback,
         max_redirects: 0,
+        allow_scheme_downgrade: false,
         max_body_bytes: 1024,
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
