@@ -1074,7 +1074,7 @@ async fn an_apply_pass_does_not_depend_on_how_long_the_diff_took() {
     assert_eq!(applied["approval_id"], id, "{applied}");
 }
 
-// --- permission front matter in rules text (hub #2687) ------------------------------
+// --- permission front matter in rules text -------------------------------------------
 
 fn refusal(raw: Value) -> String {
     match policy::validate(&raw) {

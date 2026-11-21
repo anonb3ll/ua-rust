@@ -353,3 +353,28 @@ async fn schema_fingerprint_and_call_counts() {
         assert_eq!(narrow["registry_schema_fingerprint"], first["registry_schema_fingerprint"]);
     }
 }
+
+#[tokio::test]
+async fn doctor_reports_slack_without_secrets() {
+    let reg = builtin_registry();
+    let who = agent("builder-1", Profile::Developer);
+    let row = |report: &Value| {
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "slack").unwrap().clone()
+    };
+    let hub = mem_hub();
+    let off = row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
+    assert_eq!(off["status"], "DORMANT", "{off}");
+
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.slack_socket_mode = true;
+    cfg.slack_app_token_value = Some(SecretString::from("xapp-1-doctor-secret".to_string()));
+    let hub = Hub::in_memory(cfg).unwrap();
+    let on = row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
+    assert!(!on.to_string().contains("doctor-secret"), "{on}");
+    if cfg!(feature = "slack-socket") {
+        assert!(on["detail"].as_str().unwrap().contains("Socket Mode"), "{on}");
+    } else {
+        assert_eq!(on["status"], "MISCONFIGURED", "{on}");
+        assert!(on["detail"].as_str().unwrap().contains("without the slack-socket feature"), "{on}");
+    }
+}
