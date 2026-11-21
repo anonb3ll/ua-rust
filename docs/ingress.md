@@ -186,7 +186,7 @@ it on again (for idempotent effects), `Duplicate` refuses it.
 A caller, inside one write transaction that also holds its own records (its
 ledger event, for one):
 
-1. `sweep(source, now, rules)`: abandon `accepted` rows whose claim is gone
+1. `sweep(org, source, now, rules)`: within one organization, abandon `accepted` rows whose claim is gone
    or past `abandon_after_s`, delete expired rows (never an `accepted` one),
    and keep at most `max_per_kind` rows per organization and kind (never
    dropping an `accepted` one). Stuck rows are marked `abandoned` rather
@@ -273,7 +273,10 @@ and `Stale::Redeliver`:
 | A slow original that fails after a redelivery took over | the original deleted the newer record | the original's `release` is `NotMine`; the newer record stands |
 
 When the sweep abandons GitHub deliveries it appends one
-`agent.github.webhook.abandoned` event per sweep (actor `hub-github`) with
+`agent.github.webhook.abandoned` event per sweep (actor `hub-github`), under
+the organization it swept (each sweep covers one, so every abandoned row is
+in the event's organization; the webhook serves the default organization
+today), with
 `count`, `kinds` (`delivery_id` and `body_sha256` counts), `delivery_ids` (at
 most 50) and `delivery_ids_truncated`; never a body or a body hash. Each is
 a delivery that may never have been handled.

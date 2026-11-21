@@ -236,7 +236,10 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             let now = ua_core::time::now_ms() / 1000;
             let sweep =
                 inbound::SweepRules { max_per_kind: Some(KEEP_MAX - 1), abandon_after_s: Some(IN_FLIGHT_S) };
-            let swept = inbound::sweep(tx, SOURCE, now, sweep)?;
+            // One organization per sweep, so every row it abandons belongs to
+            // the organization the event below is written under.
+            let swept = inbound::sweep(tx, ua_core::DEFAULT_ORG, SOURCE, now, sweep)?;
+            debug_assert!(swept.abandoned.iter().all(|a| a.org_id == ua_core::DEFAULT_ORG));
             if !swept.abandoned.is_empty() {
                 ledger::append(tx, abandoned_event(&swept.abandoned).by(GITHUB_ACTOR.to_string()))?;
             }

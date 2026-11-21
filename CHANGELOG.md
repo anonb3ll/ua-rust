@@ -261,7 +261,8 @@ from its commit history.
   whose record the sweep abandoned still finishes it, so a later copy stays
   a replay. When the sweep abandons deliveries it appends one
   `agent.github.webhook.abandoned` event (counts and up to 50 delivery ids,
-  no body). Downgrading past this change reopens a replay window for
+  no body) under the organization it swept; a sweep covers one
+  organization. Downgrading past this change reopens a replay window for
   deliveries handled since: nothing refuses an older binary, which reads
   only the old GitHub tables (`docs/ingress.md`, Limits).
 

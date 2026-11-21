@@ -367,7 +367,9 @@ pub struct Swept {
     pub abandoned: Vec<Abandoned>,
 }
 
-/// Housekeeping for `source` at `now`:
+/// Housekeeping for `source` in one organization at `now` (rows of other
+/// organizations are untouched, so a caller ledgers what it abandoned under
+/// the organization it swept):
 ///
 /// 1. `accepted` rows whose claim is gone or past `abandon_after_s` become
 ///    `abandoned` and are returned, so the caller can record them. They are
@@ -379,17 +381,17 @@ pub struct Swept {
 ///    step 1, however old).
 /// 3. Rows past `max_per_kind` are deleted, oldest first, `accepted` ones
 ///    excepted.
-pub fn sweep(tx: &WriteTx<'_>, source: &str, now: i64, rules: SweepRules) -> UaResult<Swept> {
+pub fn sweep(tx: &WriteTx<'_>, org_id: &str, source: &str, now: i64, rules: SweepRules) -> UaResult<Swept> {
     let mut out = Swept::default();
     if let Some(after) = rules.abandon_after_s {
         let rows: Vec<Abandoned> = {
             let mut stmt = tx.prepare(
                 "SELECT org_id, kind, delivery_key, received_at, identity FROM inbound_deliveries \
-                 WHERE source = ?1 AND state = 'accepted' \
+                 WHERE org_id = ?4 AND source = ?1 AND state = 'accepted' \
                  AND (claim IS NULL OR substr(claim, 1, length(?2)) != ?2 OR updated_at < ?3) \
                  ORDER BY received_at, kind, delivery_key",
             )?;
-            stmt.query_map(params![source, process_prefix(), now.saturating_sub(after)], |r| {
+            stmt.query_map(params![source, process_prefix(), now.saturating_sub(after), org_id], |r| {
                 Ok(Abandoned {
                     org_id: r.get(0)?,
                     kind: r.get(1)?,
@@ -410,18 +412,19 @@ pub fn sweep(tx: &WriteTx<'_>, source: &str, now: i64, rules: SweepRules) -> UaR
         out.abandoned = rows;
     }
     out.expired = tx.execute(
-        "DELETE FROM inbound_deliveries WHERE source = ?1 AND expires_at <= ?2 AND state != 'accepted'",
-        params![source, now],
+        "DELETE FROM inbound_deliveries WHERE org_id = ?3 AND source = ?1 AND expires_at <= ?2 \
+         AND state != 'accepted'",
+        params![source, now, org_id],
     )?;
     if let Some(max) = rules.max_per_kind {
         out.capped = tx.execute(
             "DELETE FROM inbound_deliveries WHERE rowid IN ( \
                SELECT rowid FROM ( \
                  SELECT rowid, state, ROW_NUMBER() OVER ( \
-                   PARTITION BY org_id, kind ORDER BY received_at DESC, rowid DESC) AS n \
-                 FROM inbound_deliveries WHERE source = ?1) \
+                   PARTITION BY kind ORDER BY received_at DESC, rowid DESC) AS n \
+                 FROM inbound_deliveries WHERE org_id = ?3 AND source = ?1) \
                WHERE n > ?2 AND state != 'accepted')",
-            params![source, max.max(0)],
+            params![source, max.max(0), org_id],
         )?;
     }
     Ok(out)

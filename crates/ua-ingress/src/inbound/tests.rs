@@ -149,7 +149,7 @@ fn finish_after_the_sweep_abandoned_the_same_claim_marks_it_finished() {
     let db = db();
     let slow = take(&db, "a", T0);
     let rules = SweepRules { max_per_kind: None, abandon_after_s: Some(600) };
-    let swept = db.write(|tx| sweep(tx, "demo", T0 + 700, rules)).unwrap();
+    let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 700, rules)).unwrap();
     assert_eq!(swept.abandoned.len(), 1);
     // The slow handler finishes: the row is still its own (same claim), so
     // a later copy is a duplicate instead of running again.
@@ -162,8 +162,16 @@ fn finish_after_the_sweep_abandoned_the_same_claim_marks_it_finished() {
 fn release_after_the_sweep_abandoned_the_row_leaves_the_report_standing() {
     let db = db();
     let slow = take(&db, "a", T0);
-    db.write(|tx| sweep(tx, "demo", T0 + 700, SweepRules { max_per_kind: None, abandon_after_s: Some(600) }))
-        .unwrap();
+    db.write(|tx| {
+        sweep(
+            tx,
+            ua_core::DEFAULT_ORG,
+            "demo",
+            T0 + 700,
+            SweepRules { max_per_kind: None, abandon_after_s: Some(600) },
+        )
+    })
+    .unwrap();
     let r = db.write(|tx| release(tx, d("a"), &slow)).unwrap();
     assert_eq!(r, Settle::NotMine { state: Some(State::Abandoned) });
     assert_eq!(state(&db, d("a")).as_deref(), Some("abandoned"));
@@ -232,7 +240,7 @@ fn sweep_expires_rows_but_never_an_accepted_one() {
     take(&db, "old-running", T0);
     db.write(|tx| record(tx, d("young"), T0 + 3000, RULES, None)).unwrap();
     let rules = SweepRules { max_per_kind: None, abandon_after_s: None };
-    let swept = db.write(|tx| sweep(tx, "demo", T0 + 3600, rules)).unwrap();
+    let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 3600, rules)).unwrap();
     assert_eq!(swept.expired, 2);
     assert_eq!(state(&db, d("old-seen")), None);
     assert_eq!(state(&db, d("old-done")), None);
@@ -240,7 +248,7 @@ fn sweep_expires_rows_but_never_an_accepted_one() {
     assert_eq!(state(&db, d("young")).as_deref(), Some("seen"));
     let other = Delivery { source: "other", ..d("x") };
     db.write(|tx| record(tx, other, T0, RULES, None)).unwrap();
-    db.write(|tx| sweep(tx, "demo", T0 + 99_999, rules)).unwrap();
+    db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 99_999, rules)).unwrap();
     assert_eq!(state(&db, other).as_deref(), Some("seen"), "another source is untouched");
 }
 
@@ -257,7 +265,7 @@ fn sweep_abandons_stuck_rows_and_reports_them() {
     .unwrap();
     orphan(&db, "stopped");
     let rules = SweepRules { max_per_kind: None, abandon_after_s: Some(600) };
-    let swept = db.write(|tx| sweep(tx, "demo", T0 + 700, rules)).unwrap();
+    let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 700, rules)).unwrap();
     let keys: Vec<&str> = swept.abandoned.iter().map(|a| a.key.as_str()).collect();
     assert_eq!(keys, ["hung", "stopped"]);
     assert_eq!(swept.abandoned[0].identity.as_deref(), Some("operator"));
@@ -268,8 +276,16 @@ fn sweep_abandons_stuck_rows_and_reports_them() {
     assert_eq!(dup.unwrap(), Sight::Duplicate { state: State::Abandoned });
     let again = db.write(|tx| record(tx, d("hung"), T0 + 702, RULES, None)).unwrap();
     assert!(matches!(again, Sight::Redelivered { was: State::Abandoned, .. }), "{again:?}");
-    db.write(|tx| sweep(tx, "demo", T0 + 99_999, SweepRules { max_per_kind: None, abandon_after_s: None }))
-        .unwrap();
+    db.write(|tx| {
+        sweep(
+            tx,
+            ua_core::DEFAULT_ORG,
+            "demo",
+            T0 + 99_999,
+            SweepRules { max_per_kind: None, abandon_after_s: None },
+        )
+    })
+    .unwrap();
     assert_eq!(state(&db, d("stopped")), None, "abandoned rows expire like any other");
 }
 
@@ -285,8 +301,15 @@ fn sweep_caps_each_kind_keeping_the_newest_and_any_accepted() {
         Ok(())
     })
     .unwrap();
-    let swept = db
-        .write(|tx| sweep(tx, "demo", T0 + 10, SweepRules { max_per_kind: Some(2), abandon_after_s: None }));
+    let swept = db.write(|tx| {
+        sweep(
+            tx,
+            ua_core::DEFAULT_ORG,
+            "demo",
+            T0 + 10,
+            SweepRules { max_per_kind: Some(2), abandon_after_s: None },
+        )
+    });
     assert_eq!(swept.unwrap().capped, 2, "k1 and k2 go; k0 is accepted");
     for (k, kept) in [("k0", true), ("k1", false), ("k2", false), ("k3", true), ("k4", true)] {
         assert_eq!(state(&db, d(k)).is_some(), kept, "{k}");
@@ -343,4 +366,22 @@ fn the_table_is_tenant_scoped() {
         })
         .unwrap();
     assert_eq!(notnull, 1);
+}
+
+#[test]
+fn a_sweep_touches_only_its_organization() {
+    let db = db();
+    let acme = Delivery { org_id: "acme", ..d("a") };
+    db.write(|tx| record(tx, acme, T0, RULES, None)).unwrap();
+    let sight = db.write(|tx| record(tx, Delivery { org_id: "acme", ..d("b") }, T0, RULES, None)).unwrap();
+    let claim = sight.claim().cloned().unwrap();
+    db.write(|tx| accept(tx, Delivery { org_id: "acme", ..d("b") }, &claim, T0, None)).unwrap();
+    let rules = SweepRules { max_per_kind: Some(0), abandon_after_s: Some(0) };
+    let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 99_999, rules)).unwrap();
+    assert_eq!(swept, Swept::default(), "nothing in the default organization");
+    assert_eq!(state(&db, acme).as_deref(), Some("seen"));
+    assert_eq!(state(&db, Delivery { org_id: "acme", ..d("b") }).as_deref(), Some("accepted"));
+    let swept = db.write(|tx| sweep(tx, "acme", "demo", T0 + 99_999, rules)).unwrap();
+    assert_eq!(swept.abandoned.len(), 1);
+    assert!(swept.abandoned.iter().all(|a| a.org_id == "acme"));
 }
