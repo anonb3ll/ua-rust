@@ -436,12 +436,69 @@ async fn unverified_local_caller() {
     )
     .await;
     assert_eq!(named["from_agent"], "builder-9");
-    // Unrestricted: reads any mailbox it names; every row is marked untrusted.
+    // A message board: it reads any mailbox it names; every row is marked
+    // untrusted, and its sender as not verified.
     let listed = call(&reg, &hub, &local, "message_list", json!({"to_agent": "builder-2"})).await;
     assert_eq!(listed["total"], 2);
-    assert!(listed["messages"].as_array().unwrap().iter().all(|m| m["trust"]["level"] == "untrusted"));
-    let inbox = coord(&reg, &hub, &local, "message_inbox", json!({"to_agent": "builder-2"})).await.unwrap();
-    assert_eq!(inbox["marked_read"], 2);
+    let rows = listed["messages"].as_array().unwrap();
+    assert!(rows.iter().all(|m| m["trust"]["level"] == "untrusted"));
+    assert!(rows.iter().all(|m| m["sender_verified"] == false), "{listed}");
+    assert_eq!(sent["sender_verified"], false);
+}
+
+/// With no verified identity, another label's mailbox is a board to read:
+/// reading it never changes what its owner has read or acknowledged.
+#[tokio::test]
+async fn an_unverified_reader_leaves_another_mailbox_unread() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let local = Caller::local("local-agent", Transport::Stdio);
+    let (a, b) = (agent("builder-1"), agent("builder-2"));
+    let first = send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "builder-2", "body": "one"})).await;
+    assert_eq!(first["sender_verified"], true);
+    send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "builder-2", "body": "two"})).await;
+    send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "local-agent", "body": "yours"})).await;
+
+    // The board: listed in full, nothing marked, and it says so.
+    let board = coord(&reg, &hub, &local, "message_inbox", json!({"to_agent": "builder-2"})).await.unwrap();
+    assert_eq!(board["total"], 2);
+    assert_eq!(board["marked_read"], 0);
+    assert_eq!(board["mailbox"], "builder-2");
+    assert!(board["read_state"].as_str().unwrap().starts_with("unchanged"), "{board}");
+    assert!(board["messages"].as_array().unwrap().iter().all(|m| m["sender_verified"] == true));
+    assert_eq!(events(&hub, "agent.mailbox.read"), 0);
+    // Nor acknowledged, by one id or by a cursor, nor read as one of its sessions.
+    let mid = first["message_id"].clone();
+    for params in [
+        json!({"to_agent": "builder-2", "message_id": mid}),
+        json!({"to_agent": "builder-2", "through": 999}),
+    ] {
+        let e = coord(&reg, &hub, &local, "message_ack", params).await.unwrap_err();
+        assert!(e.to_string().contains("only your own mailbox"), "{e}");
+    }
+    let e = coord(&reg, &hub, &local, "message_inbox", json!({"to_agent": "builder-2", "session_id": "s-1"}))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("not yours"), "{e}");
+    // The owner still has both unread.
+    let own = coord(&reg, &hub, &b, "message_inbox", json!({})).await.unwrap();
+    assert_eq!(own["marked_read"], 2);
+
+    // Its own mailbox works as before, named or not.
+    let mine = coord(&reg, &hub, &local, "message_inbox", json!({"to_agent": "local-agent"})).await.unwrap();
+    assert_eq!(mine["marked_read"], 1);
+    assert!(mine.get("read_state").is_none());
+    let acked = coord(&reg, &hub, &local, "message_ack", json!({"through": 999})).await.unwrap();
+    assert_eq!(acked["mailbox"], "local-agent");
+
+    // A caller with only the shared local label has no mailbox of its own: it
+    // acts as the mailbox it names.
+    send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "builder-2", "body": "three"})).await;
+    let shared = Caller::local(ua_core::identity::LOCAL_LABEL, Transport::Http);
+    let named = coord(&reg, &hub, &shared, "message_inbox", json!({"to_agent": "builder-2"})).await.unwrap();
+    assert_eq!(named["marked_read"], 1);
+    coord(&reg, &hub, &shared, "message_ack", json!({"to_agent": "builder-2", "through": 999}))
+        .await
+        .unwrap();
 }
 
 /// Reading every mailbox: an operator (a verified human) may; an agent under
