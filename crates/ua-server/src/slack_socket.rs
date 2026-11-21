@@ -49,10 +49,27 @@ use crate::slack_api::{Admitted, EventRequest, Replay, admit_and_run, command_re
 const MAX_MESSAGE: usize = 1024 * 1024;
 /// Connect, TLS and WebSocket handshake, each.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// A connection with no frame at all for this long is dropped and reopened.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// How often the hub pings Slack.
-const PING_EVERY: Duration = Duration::from_secs(30);
+
+/// The connection's liveness timings.
+#[derive(Debug, Clone, Copy)]
+struct Timings {
+    /// A connection with no incoming frame at all (text, ping or pong) for
+    /// this long is dropped and reopened, `hello` or not.
+    idle: Duration,
+    /// How often the hub pings Slack. Two pings in a row with no pong drop
+    /// the connection too.
+    ping_every: Duration,
+}
+
+impl Timings {
+    fn new(test: bool) -> Self {
+        if test {
+            Self { idle: Duration::from_millis(600), ping_every: Duration::from_millis(150) }
+        } else {
+            Self { idle: Duration::from_secs(120), ping_every: Duration::from_secs(30) }
+        }
+    }
+}
 /// How long one envelope may take to be admitted before it is acknowledged
 /// anyway (Slack wants an acknowledgement within about 3 seconds).
 const ACK_DEADLINE: Duration = Duration::from_millis(2500);
@@ -85,6 +102,28 @@ impl Backoff {
     fn reset(&mut self) {
         self.attempt = 0;
     }
+
+    /// The delay before reconnecting after a connection that worked: the
+    /// attempt count starts over, but never with zero delay (about `base`,
+    /// jittered), so a peer that says `hello` and `disconnect` in a loop
+    /// cannot make the hub hammer `apps.connections.open`.
+    fn floor(&mut self) -> Duration {
+        self.reset();
+        self.base.mul_f64(rand::random_range(1.0..1.5))
+    }
+}
+
+/// Run one connection on its own task, so a panic in it becomes an error
+/// the supervisor reconnects from instead of ending the transport.
+async fn guarded<F>(session: F) -> Result<End, String>
+where
+    F: std::future::Future<Output = Result<End, String>> + Send + 'static,
+{
+    match tokio::spawn(session).await {
+        Ok(r) => r,
+        Err(e) if e.is_panic() => Err("the connection task panicked".into()),
+        Err(_) => Err("the connection task was cancelled".into()),
+    }
 }
 
 /// How a connection ended.
@@ -103,6 +142,11 @@ pub async fn run(state: AppState, token: SecretString, ct: CancellationToken) {
     let cfg = state.hub.cfg().clone();
     let test = cfg.slack_socket_test_api.is_some();
     let mut backoff = Backoff::new(test);
+    let timings = Timings::new(test);
+    // Refused socket URLs are ledgered once per reason until a connection
+    // works; repeats are only logged, so a misbehaving endpoint cannot fill
+    // the permanent ledger.
+    let mut refused_ledgered: std::collections::BTreeSet<&'static str> = Default::default();
     let _ = rustls::crypto::ring::default_provider().install_default();
     loop {
         if ct.is_cancelled() {
@@ -120,10 +164,15 @@ pub async fn run(state: AppState, token: SecretString, ct: CancellationToken) {
             }
             Err(OpenError::BadUrl(reason)) => {
                 tracing::warn!(reason, "Slack Socket Mode: refused the socket URL Slack returned");
-                let recorded =
-                    state.hub.db().write_async(move |tx| slack::record_socket_url_refused(tx, reason)).await;
-                if let Err(e) = recorded {
-                    tracing::warn!(code = e.code(), "could not ledger a refused Slack socket URL");
+                if refused_ledgered.insert(reason) {
+                    let recorded = state
+                        .hub
+                        .db()
+                        .write_async(move |tx| slack::record_socket_url_refused(tx, reason))
+                        .await;
+                    if let Err(e) = recorded {
+                        tracing::warn!(code = e.code(), "could not ledger a refused Slack socket URL");
+                    }
                 }
                 backoff.next()
             }
@@ -131,19 +180,20 @@ pub async fn run(state: AppState, token: SecretString, ct: CancellationToken) {
                 tracing::info!(error = %code, "Slack Socket Mode: could not open a connection; retrying");
                 backoff.next()
             }
-            Ok(url) => match session(&state, &url, &ct, test).await {
+            Ok(url) => match guarded(session(state.clone(), url, ct.clone(), timings)).await {
                 Ok(End::Shutdown) => break,
                 Ok(End::Reconnect { hello, reason }) => {
                     tracing::info!(reason = %reason, "Slack Socket Mode: reconnecting");
                     if hello {
-                        backoff.reset();
-                        Duration::ZERO
+                        refused_ledgered.clear();
+                        backoff.floor()
                     } else {
                         backoff.next()
                     }
                 }
                 Err(why) => {
                     tracing::info!(error = %why, "Slack Socket Mode: connection failed; retrying");
+                    slack::set_socket_state(SocketState::Restarting);
                     backoff.next()
                 }
             },
@@ -200,14 +250,11 @@ async fn connect(url: &url::Url) -> Result<Box<dyn Io>, String> {
     Ok(Box::new(stream))
 }
 
-/// One connection, from connect to `disconnect`, close or shutdown.
-async fn session(
-    state: &AppState,
-    url: &url::Url,
-    ct: &CancellationToken,
-    _test: bool,
-) -> Result<End, String> {
-    let io = connect(url).await?;
+/// One connection, from connect to `disconnect`, close, a dead peer or
+/// shutdown.
+async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timings) -> Result<End, String> {
+    let state = &state;
+    let io = connect(&url).await?;
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     let handshake = tokio_tungstenite::client_async_with_config(url.as_str(), io, Some(config));
@@ -217,8 +264,14 @@ async fn session(
         .map_err(|_| "WebSocket handshake failed".to_string())?;
     let (mut sink, mut stream) = ws.split();
     let mut hello = false;
-    let mut ping = tokio::time::interval(PING_EVERY);
+    let mut ping = tokio::time::interval(t.ping_every);
     ping.tick().await;
+    // One deadline, reset only by an incoming frame: a peer that goes silent
+    // without a reset (NAT timeout, a suspended machine) is noticed even
+    // while the hub keeps pinging, and so is one that never says `hello`.
+    let idle = tokio::time::sleep(t.idle);
+    tokio::pin!(idle);
+    let mut unanswered = 0u32;
     loop {
         let frame = tokio::select! {
             _ = ct.cancelled() => {
@@ -226,20 +279,29 @@ async fn session(
                 let _ = sink.close().await;
                 return Ok(End::Shutdown);
             }
+            _ = &mut idle => return Err("idle timeout".into()),
             _ = ping.tick() => {
+                if unanswered >= 2 {
+                    return Err("two pings in a row went unanswered".into());
+                }
                 sink.send(Message::Ping(Vec::new().into())).await.map_err(|_| "ping failed".to_string())?;
+                unanswered += 1;
                 continue;
             }
-            f = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => f,
+            f = stream.next() => f,
         };
+        idle.as_mut().reset(tokio::time::Instant::now() + t.idle);
         let msg = match frame {
-            Err(_) => return Err("idle timeout".into()),
-            Ok(None) => return Ok(End::Reconnect { hello, reason: "closed".into() }),
-            Ok(Some(Err(_))) => return Err("read failed (or a message over the size limit)".into()),
-            Ok(Some(Ok(m))) => m,
+            None => return Ok(End::Reconnect { hello, reason: "closed".into() }),
+            Some(Err(_)) => return Err("read failed (or a message over the size limit)".into()),
+            Some(Ok(m)) => m,
         };
         let text = match msg {
             Message::Text(t) => t,
+            Message::Pong(_) => {
+                unanswered = 0;
+                continue;
+            }
             Message::Ping(p) => {
                 let _ = sink.send(Message::Pong(p)).await;
                 continue;
@@ -289,8 +351,8 @@ async fn acknowledge(state: &AppState, envelope: Map<String, Value>) -> Option<V
         return None;
     }
     let bare = json!({ "envelope_id": id });
-    let task = tokio::spawn(handle_envelope(state.clone(), id.clone(), envelope));
-    match tokio::time::timeout(ACK_DEADLINE, task).await {
+    let mut task = tokio::spawn(handle_envelope(state.clone(), id.clone(), envelope));
+    match tokio::time::timeout(ACK_DEADLINE, &mut task).await {
         Ok(Ok(Some(ack))) => Some(ack),
         Ok(Ok(None)) => None,
         Ok(Err(_)) => {
@@ -299,8 +361,37 @@ async fn acknowledge(state: &AppState, envelope: Map<String, Value>) -> Option<V
             );
             Some(bare)
         }
-        // Slow: acknowledge now; the admission finishes on its own task.
-        Err(_) => Some(bare),
+        // Slow: acknowledge now; the admission finishes on its own task. If
+        // it then fails, Slack will not redeliver (it was acknowledged), so
+        // say so: a warning with the envelope hash, and a ledger row if the
+        // database takes one.
+        Err(_) => {
+            let hub = state.hub.clone();
+            tokio::spawn(async move {
+                let failed = match task.await {
+                    Ok(None) => Some("admission_failed_after_ack"),
+                    Err(_) => Some("handler_failed_after_ack"),
+                    Ok(Some(_)) => None,
+                };
+                if let Some(reason) = failed {
+                    let sha = slack::envelope_sha(&id);
+                    tracing::warn!(
+                        envelope_sha = %sha,
+                        reason,
+                        "Slack Socket Mode: an envelope acknowledged after the deadline was not admitted; \
+                         its outcome is unknown"
+                    );
+                    let recorded = hub
+                        .db()
+                        .write_async(move |tx| slack::record_envelope_outcome_unknown(tx, &sha, reason))
+                        .await;
+                    if let Err(e) = recorded {
+                        tracing::warn!(code = e.code(), "could not ledger a lost Slack envelope");
+                    }
+                }
+            });
+            Some(bare)
+        }
     }
 }
 
@@ -340,6 +431,25 @@ async fn handle_envelope(state: AppState, id: String, envelope: Map<String, Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reconnect_after_a_working_connection_still_waits() {
+        let mut b = Backoff::new(false);
+        for _ in 0..5 {
+            b.next();
+        }
+        let d = b.floor();
+        assert!(d >= Duration::from_secs(1) && d < Duration::from_millis(1500), "{d:?}");
+        assert!(b.next() < Duration::from_secs(1), "the attempt count started over");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_connection_is_an_error_not_the_end() {
+        let r = guarded(async { panic!("injected") }).await;
+        assert!(matches!(r, Err(ref e) if e.contains("panicked")), "{:?}", r.err());
+        let ok = guarded(async { Ok(End::Shutdown) }).await;
+        assert!(matches!(ok, Ok(End::Shutdown)));
+    }
 
     #[test]
     fn backoff_doubles_to_its_cap_with_jitter() {

@@ -334,7 +334,8 @@ default). Code: `crates/ua-server/src/slack_socket.rs`.
 if not, why (off, no token, a token that is not `xapp-…`, an invalid
 `slack_identities`, or a binary without the feature). `system_doctor`'s
 `slack` row reports the transport's state: off, not compiled, connecting,
-connected or auth failed. It never shows the token.
+connected, restarting (a connection failed and is being reopened) or auth
+failed. It never shows the token.
 
 Both transports may be on at once. A delivery is deduplicated by its event
 id or trigger id across both, so one that arrives on each runs once.
@@ -346,9 +347,10 @@ id or trigger id across both, so one that arrives on each runs once.
    redirects, no proxy, public addresses only; the response is read up to
    16 KiB). It answers a one-time `wss://` URL.
 2. The URL must be `wss`, on `slack.com` or a subdomain, on the default port,
-   with no user info; otherwise it is refused, ledgered as
-   `agent.slack.socket.url_refused` (reason class only; the URL carries a
-   connection ticket and is not recorded), and the hub retries later. Every
+   with no user info; otherwise it is refused and the hub retries later. The
+   first refusal of each reason is ledgered as `agent.slack.socket.url_refused`
+   (reason class only; the URL carries a connection ticket and is not
+   recorded); repeats are only logged, until a connection works again. Every
    address the host resolves to must be public, and TLS is rustls with the
    platform's certificate verifier.
 3. Slack sends `hello`, then envelopes (`envelope_id`, `type`, `payload`,
@@ -363,11 +365,19 @@ id or trigger id across both, so one that arrives on each runs once.
      app-written or edited messages, approve refused).
    - `interactive` and anything else: acknowledged, not acted on.
 4. `disconnect` (Slack's `warning`, `refresh_requested`, `link_disabled`):
-   the hub closes the socket and opens a new one at once. Other failures
-   reconnect with exponential backoff and jitter (1 s doubling to a 60 s
-   cap; reset after a `hello`). A connection with no frame for two minutes
-   is reopened; the hub pings every 30 seconds.
-5. If `apps.connections.open` refuses the token or the app (`invalid_auth`,
+   the hub closes the socket and opens a new one after about a second
+   (jittered; never zero, so a `hello`/`disconnect` loop cannot make it
+   hammer Slack). Other failures reconnect with exponential backoff and
+   jitter (1 s doubling to a 60 s cap; the count starts over after a
+   `hello`).
+5. Liveness: the hub pings every 30 seconds. One deadline, reset only by an
+   incoming frame (a message, ping or pong), drops a connection that has
+   been silent for two minutes, whether or not it ever said `hello`; two
+   pings in a row with no pong drop it sooner. So a peer that vanishes
+   without a TCP reset (a NAT timeout, a suspended machine) is noticed.
+   A panic inside a connection is caught: the state reads `restarting` and
+   the hub reconnects with backoff.
+6. If `apps.connections.open` refuses the token or the app (`invalid_auth`,
    `not_authed`, `token_revoked`, `token_expired`, `account_inactive`,
    `not_allowed_token_type` and the like), the transport stops, logs one
    line and does not retry until `ua serve` restarts.
@@ -376,7 +386,17 @@ Bounds: WebSocket messages over 1 MiB end the connection; an envelope whose
 payload is over 64 KiB is acknowledged and not acted on. One envelope is
 admitted on its own task: a failure or panic in it never ends the
 connection. If its admission transaction fails, it is not acknowledged, so
-Slack redelivers it.
+Slack redelivers it. If admission is slower than the 2.5-second ack
+deadline, the envelope is acknowledged first and admission finishes on its
+own task; should it then fail, Slack will not redeliver it, so the hub logs
+a warning with the envelope hash and ledgers
+`agent.slack.envelope.outcome_unknown` (envelope hash, reason class) when the
+database accepts the write.
+
+The Socket Mode URL carries a one-time ticket. tungstenite logs the
+handshake request at trace level, so `ua` caps `tungstenite` and
+`tokio_tungstenite` logs at info whatever `UA_LOG` says, as it does for
+`rmcp`.
 
 ### Replay protection without a signature
 

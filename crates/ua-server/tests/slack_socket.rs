@@ -88,6 +88,17 @@ mod socket {
         }
     }
 
+    /// How the stand-in behaves on one connection.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Peer {
+        /// `hello`, then reads (and so answers pings) and relays.
+        Normal,
+        /// `hello`, then nothing at all: no frames, no pongs.
+        SilentAfterHello,
+        /// The handshake, then nothing: no `hello`, no pongs.
+        NoHello,
+    }
+
     /// The stand-in for Slack.
     struct MockSlack {
         api: String,
@@ -95,6 +106,10 @@ mod socket {
         /// Scripted `apps.connections.open` answers; empty means a good URL.
         answers: Arc<Mutex<VecDeque<Value>>>,
         conns: mpsc::UnboundedReceiver<Conn>,
+        /// Behaviour of the next connections; empty means `Normal`.
+        peers: Arc<Mutex<VecDeque<Peer>>>,
+        /// Connections accepted (handshake done), whatever their behaviour.
+        accepted: Arc<AtomicUsize>,
     }
 
     impl MockSlack {
@@ -102,11 +117,23 @@ mod socket {
             let ws = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let ws_url = format!("ws://{}/link/?ticket=t-1&app_id=A0TEST", ws.local_addr().unwrap());
             let (conn_tx, conns) = mpsc::unbounded_channel();
+            let peers: Arc<Mutex<VecDeque<Peer>>> = Arc::default();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let (ps, acc) = (peers.clone(), accepted.clone());
             tokio::spawn(async move {
                 while let Ok((tcp, _)) = ws.accept().await {
                     let conn_tx = conn_tx.clone();
+                    let peer = ps.lock().unwrap().pop_front().unwrap_or(Peer::Normal);
+                    let acc = acc.clone();
                     tokio::spawn(async move {
                         let Ok(socket) = tokio_tungstenite::accept_async(tcp).await else { return };
+                        acc.fetch_add(1, Ordering::SeqCst);
+                        if peer == Peer::NoHello {
+                            // Hold the socket open, read nothing, say nothing.
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            drop(socket);
+                            return;
+                        }
                         let (mut sink, mut stream) = socket.split();
                         let hello = json!({
                             "type": "hello",
@@ -115,6 +142,11 @@ mod socket {
                             "debug_info": { "host": "applink-test", "approximate_connection_time": 18060 },
                         });
                         let _ = sink.send(Message::text(hello.to_string())).await;
+                        if peer == Peer::SilentAfterHello {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            drop((sink, stream));
+                            return;
+                        }
                         let (out, mut out_rx) = mpsc::unbounded_channel::<Message>();
                         let (in_tx, inbox) = mpsc::unbounded_channel();
                         let _ = conn_tx.send(Conn { out, inbox });
@@ -160,7 +192,7 @@ mod socket {
             let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let api = format!("http://{}", http.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(http, app).await.unwrap() });
-            Self { api, opens, answers, conns }
+            Self { api, opens, answers, conns, peers, accepted }
         }
 
         async fn next_conn(&mut self) -> Conn {
@@ -172,6 +204,21 @@ mod socket {
 
         fn opens(&self) -> usize {
             self.opens.load(Ordering::SeqCst)
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        /// Wait (up to 5 s) until `n` connections were accepted.
+        async fn wait_accepted(&self, n: usize) {
+            for _ in 0..250 {
+                if self.accepted() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("only {} connection(s) accepted, expected {n}", self.accepted());
         }
     }
 
@@ -188,8 +235,13 @@ mod socket {
 
     /// A rig whose first `apps.connections.open` answers are `answers`.
     async fn rig_answering(tweak: impl FnOnce(&mut Config), answers: Vec<Value>) -> Rig {
+        rig_full(tweak, answers, Vec::new()).await
+    }
+
+    async fn rig_full(tweak: impl FnOnce(&mut Config), answers: Vec<Value>, peers: Vec<Peer>) -> Rig {
         let slack = MockSlack::start().await;
         slack.answers.lock().unwrap().extend(answers);
+        slack.peers.lock().unwrap().extend(peers);
         let mut cfg = socket_config(&slack.api);
         tweak(&mut cfg);
         let hub = TestHub::new(cfg);
@@ -492,7 +544,7 @@ mod socket {
     #[tokio::test]
     async fn a_socket_url_off_slack_is_refused_and_ledgered() {
         let evil = json!({ "ok": true, "url": "wss://evil.example.com/link/?ticket=1" });
-        let mut r = rig_answering(|_| {}, vec![evil.clone(), evil]).await;
+        let mut r = rig_answering(|_| {}, vec![evil.clone(), evil.clone(), evil]).await;
         let mut refused = Vec::new();
         for _ in 0..250 {
             refused = events(&r.hub, "agent.slack.socket.url_refused").await;
@@ -506,7 +558,9 @@ mod socket {
         assert!(!refused[0].1.to_string().contains("evil"), "the URL itself is not recorded");
         // After the refusals it backs off and retries; the next good URL works.
         let _c = r.slack.next_conn().await;
-        assert!(r.slack.opens() >= 3);
+        assert!(r.slack.opens() >= 4);
+        // Three refusals of the same reason, one ledger row.
+        assert_eq!(events(&r.hub, "agent.slack.socket.url_refused").await.len(), 1);
         r.ct.cancel();
     }
 
@@ -576,5 +630,34 @@ mod socket {
         executed(&r.hub, 1).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(tasks(&r.hub).await, 1);
+    }
+
+    // --- liveness (test timings: idle 600 ms, a ping every 150 ms) ---------
+
+    #[tokio::test]
+    async fn a_peer_that_goes_silent_after_hello_is_dropped_and_reconnected() {
+        let r = rig_full(|_| {}, Vec::new(), vec![Peer::SilentAfterHello]).await;
+        r.slack.wait_accepted(2).await;
+        assert!(r.slack.opens() >= 2, "a fresh apps.connections.open for the new connection");
+        r.ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_says_hello_is_dropped_too() {
+        let r = rig_full(|_| {}, Vec::new(), vec![Peer::NoHello]).await;
+        r.slack.wait_accepted(2).await;
+        r.ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_answers_pings_stays_connected() {
+        let (r, mut c) = rig().await;
+        // Well past the idle deadline, with nothing but pings and pongs.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(r.slack.accepted(), 1, "no reconnect");
+        assert_eq!(r.slack.opens(), 1);
+        c.send(slash("env-live", HUMAN, "/contact", "", "7.8.a"));
+        assert!(c.recv().await["payload"]["text"].as_str().unwrap().contains("operator"));
+        r.ct.cancel();
     }
 }

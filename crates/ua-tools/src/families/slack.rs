@@ -874,6 +874,8 @@ pub enum SocketState {
     AuthFailed = 4,
     /// The transport stopped (shutdown).
     Stopped = 5,
+    /// A connection failed or its task panicked; reconnecting with backoff.
+    Restarting = 6,
 }
 
 impl SocketState {
@@ -885,6 +887,7 @@ impl SocketState {
             SocketState::Connected => "connected",
             SocketState::AuthFailed => "auth_failed",
             SocketState::Stopped => "stopped",
+            SocketState::Restarting => "restarting",
         }
     }
 }
@@ -910,6 +913,7 @@ pub fn socket_state() -> Option<SocketState> {
         3 => SocketState::Connected,
         4 => SocketState::AuthFailed,
         5 => SocketState::Stopped,
+        6 => SocketState::Restarting,
         _ => SocketState::Off,
     })
 }
@@ -1020,6 +1024,25 @@ pub fn record_socket_url_refused(tx: &mut WriteTx<'_>, reason: &'static str) -> 
     ledger::append(
         tx,
         EventInput::new("agent.slack.socket.url_refused", json!({ "reason": reason })).by("system"),
+    )?;
+    Ok(())
+}
+
+/// Ledger a Socket Mode envelope that was acknowledged after the deadline
+/// and then failed admission: outcome unknown, by envelope hash and reason
+/// class only (Slack will not redeliver an acknowledged envelope).
+pub fn record_envelope_outcome_unknown(
+    tx: &mut WriteTx<'_>,
+    envelope_sha: &str,
+    reason: &'static str,
+) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new(
+            "agent.slack.envelope.outcome_unknown",
+            json!({ "envelope_sha": envelope_sha, "reason": reason, "outcome": "unknown" }),
+        )
+        .by("system"),
     )?;
     Ok(())
 }
