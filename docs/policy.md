@@ -180,11 +180,19 @@ session. `profiles` in the hub config sets each identity's default
 **A profile is a permission set, never authority.** It decides which tools a
 session sees. Who may act on another agent's work, read every mailbox or
 conversation, see the hub's boundaries, or move vault notes comes from
-identity (`ua_org::authz`): an operator is a verified human (`human_identities`),
-and an agent in `lifecycle_operators` holds a separate fleet-maintenance grant
-(closing, parking and folding tasks, releasing claims and holds, worktree
-cleanup, handoff recovery, workflow records, wake handling, node-queue
-administration, and agent and node lifecycle), never operator authority. The
+identity (`ua_org::authz`): an operator is a verified caller of kind human
+(a `human_identities` label that authenticated as itself), and an agent
+explicitly listed in `lifecycle_operators` holds a separate fleet-maintenance
+grant (closing, parking and folding tasks, releasing claims and holds,
+worktree cleanup, handoff recovery, workflow records, wake handling, skill
+registry changes, harness config status, node-queue administration including
+node acceptance, and agent and node lifecycle), never operator authority.
+Secret and provider-account administration, project repo bindings, harness
+config publish, session credential revocation and node command adoption are
+for an operator. An unattended routine runs as an agent under its owner's
+label and so holds no operator authority; list its label in
+`lifecycle_operators` to give it fleet-maintenance rights. An unset
+`lifecycle_operators` defaults to `human_identities` for humans only. The
 Python hub let the coordinator and operator profiles carry authority; ua-rust
 does not. A coordinator agent that read every mailbox to route work cannot do
 so any more; organization roles (`docs/organization.md`) are what replace it.

@@ -215,18 +215,25 @@ from its commit history.
 
 ### Behaviour changes
 
-- Operator authority is a verified human (`human_identities`). Dispatch and
-  governance agree on it: acting for another agent in dispatch, and
-  confirming or retrying a cancellation, need an operator, not the
+- Operator authority is a verified caller of kind human, nothing else.
+  Dispatch and governance agree on it: acting for another agent in dispatch,
+  and confirming or retrying a cancellation, need an operator, not the
   `operator` profile. Agents listed in `lifecycle_operators` keep their
   fleet-maintenance operations under a separate grant (closing, parking and
   folding tasks, releasing claims and holds, worktree cleanup, handoff
-  recovery, workflow records, wake handling, skill registry and harness
-  config administration, node-queue administration, agent and node
-  lifecycle), but are no longer operators: secret administration (and the
-  default MCP read rule), provider-account administration, node command
-  adoption, the hub view, reading every mailbox or conversation, and
+  recovery, workflow records, wake handling, skill registry changes, harness
+  config status, node-queue administration including node acceptance, agent
+  and node lifecycle), but are not operators: secret administration (and
+  the default MCP read rule), provider-account administration, project repo
+  bindings, harness config publish, session credential revocation, node
+  command adoption, the hub view, reading every mailbox or conversation, and
   `vault_move` need a verified human.
+- An unattended routine no longer holds operator authority anywhere: it runs
+  as an agent under its owner's label, and an agent is never an operator.
+  To give a routine fleet-maintenance rights, list its label in
+  `lifecycle_operators`. When `lifecycle_operators` is unset it defaults to
+  `human_identities` for humans only; that fallback grants nothing to an
+  agent.
 - The `coordinator` and `operator` profiles grant no authority. The hub
   view, reading every mailbox or conversation, and `vault_move` need an
   operator. A coordinator agent that read every mailbox to route work cannot

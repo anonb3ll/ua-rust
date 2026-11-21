@@ -78,7 +78,9 @@ here for memory columns, owners and defaults.
   workflow-record operator.
 
 - Authority comes from identity, never from a profile (two owner
-  decisions). `Operator` is a verified human; `LifecycleOperator` is a
+  decisions). `Operator` is a verified caller of kind human, so an
+  unattended routine (an agent under a human's label) is never one;
+  `LifecycleOperator` is a
   separate fleet-maintenance grant for agents in `lifecycle_operators`,
   never operator authority, named at each call site that admits it next to
   `Operator`. The coordinator and operator profiles grant nothing; the
