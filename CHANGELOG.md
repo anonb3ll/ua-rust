@@ -70,6 +70,10 @@ from its commit history.
   marked (`!task …`, or `/task` after a mention), and direct messages only
   when delivered to the app's bot. Interactions, bot-token posting and Socket Mode
   are not included.
+- The TypeScript SDK under `sdk/typescript` (`@unified-agent/protocol` and
+  `@unified-agent/client`; not published), with workflows that typecheck,
+  test and check codegen, and run the live conformance suite against a
+  `ua serve` built from the commit.
 
 ### Changed
 
@@ -90,6 +94,16 @@ from its commit history.
   `exports/` and compares event logs, row content included. Both tools are
   denied to developer and lead sessions, and `export_data` runs them as
   governed calls under their own names.
+- The manifest summary's `chain_ok` covers `seq`-order `prev_hash` linkage
+  from genesis and zero `entry_hash` mismatches, plus a legacy unhashed prefix
+  whose length must match the length the import recorded in `ledger_meta`;
+  stores imported before that record existed (0a2466b) report false, as
+  `event_log_verify` already does. Ulid order feeds the rolling hash but is
+  not checked for linkage, so imported rows whose ULIDs were minted out of
+  write order no longer fail it. The summary has no anchor: it records the
+  count, the ulid range and the rolling hash, not the head `entry_hash`, so a
+  truncated or rewritten tail still reports true — compare against an earlier
+  manifest to catch it.
 - `python_lint_and_format` keeps the project's ruff style: it forwards
   line-length, indent-width, target-version, quote style, excludes
   (relative globs, anchored at the project) and the lint select, ignore,
