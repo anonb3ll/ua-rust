@@ -1101,7 +1101,7 @@ fn search_check(reg: &Registry) -> Value {
 /// absence costs. `embeddings` is off by default and has its own row
 /// (semantic_search).
 fn build_features_check() -> Value {
-    let gate = "cargo features code-intel, readability, mcp-gateway, mcp-server (all default)";
+    let gate = "cargo features code-intel, readability, mcp-gateway, mcp-server, slack-socket (all default)";
     let off: Vec<String> = crate::BUILD_FEATURES
         .iter()
         .filter(|f| !f.enabled && f.feature != "embeddings")
@@ -1312,6 +1312,52 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
     }
 }
 
+/// Slack: the HTTP routes (mounted or why not) and the Socket Mode
+/// transport (off, not compiled, connecting, connected, auth failed). The
+/// signing secret and the app token are only checked for presence.
+fn slack_check(cfg: &Config) -> Value {
+    use crate::families::slack;
+    let gate = "slack_enabled, UA_SLACK_SIGNING_SECRET, slack_socket_mode, UA_SLACK_APP_TOKEN, slack_identities, \
+                cargo feature slack-socket";
+    if !cfg.slack_enabled && !cfg.slack_socket_mode {
+        return finding(
+            "slack",
+            DORMANT,
+            "Slack is off (slack_enabled and slack_socket_mode are false)",
+            gate,
+        );
+    }
+    if cfg.check_slack_identities().is_err() {
+        return finding("slack", MISCONFIGURED, "slack_identities is invalid; Slack is not served", gate);
+    }
+    let http = match (cfg.slack_enabled, cfg.slack_signing_secret().is_some()) {
+        (false, _) => "HTTP routes off",
+        (true, true) => "HTTP routes mounted",
+        (true, false) => "HTTP routes not mounted (UA_SLACK_SIGNING_SECRET unset)",
+    };
+    let socket = match (cfg.slack_socket_mode, slack::socket_status(cfg)) {
+        (false, _) => "Socket Mode off".to_string(),
+        (true, Err(why)) => why.to_string(),
+        (true, Ok(_)) => match slack::socket_state() {
+            Some(s) => format!("Socket Mode {}", s.as_str()),
+            None => "Socket Mode configured (its state is known only inside ua serve)".to_string(),
+        },
+    };
+    let mappings = cfg.slack_identities.len();
+    let detail = format!("{http}; {socket}; {mappings} mapped Slack user(s)");
+    let broken = (cfg.slack_enabled && cfg.slack_signing_secret().is_none())
+        || (cfg.slack_socket_mode && slack::socket_status(cfg).is_err());
+    let failed = matches!(slack::socket_state(), Some(slack::SocketState::AuthFailed));
+    let status = if failed {
+        DEGRADED
+    } else if broken {
+        MISCONFIGURED
+    } else {
+        LIVE
+    };
+    finding("slack", status, detail, gate)
+}
+
 /// Zulip: DORMANT until site, email and key are all set; the API key's value
 /// is never read here beyond whether it is present.
 fn zulip_check(cfg: &Config) -> Value {
@@ -1477,6 +1523,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         schema_check(&facts),
         notify_check(cfg, &facts),
         zulip_check(cfg),
+        slack_check(cfg),
         policy_check(cfg),
         fleet_nodes_check(&facts),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
@@ -1703,9 +1750,10 @@ pub fn register(r: &mut Registry) {
             "Read-only LIVE/DORMANT/DEGRADED/MISCONFIGURED/UNKNOWN report over every config-gated capability of \
              this build: hub auth and token sources, HTTP bind, approval gating, vault, workspace root, search \
              provider, optional Cargo features left out of this build (build_features; build.features lists \
-             code_intel, readability, mcp_gateway, mcp_server and embeddings, build.compiled_out_tools the tools \
-             a disabled feature removes), semantic search (embeddings feature), ledger chain, database size and WAL, schema parts, \
-             notification webhook and policy file. Each finding names the setting that gates it. Never returns \
+             code_intel, readability, mcp_gateway, mcp_server, slack_socket and embeddings, build.compiled_out_tools \
+             the tools a disabled feature removes), semantic search (embeddings feature), ledger chain, database \
+             size and WAL, schema parts, notification webhook, Slack ingress (HTTP routes and Socket Mode state) \
+             and policy file. Each finding names the setting that gates it. Never returns \
              secret values. refresh=true adds SQLite quick_check.",
             system_doctor,
         )

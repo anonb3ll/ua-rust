@@ -68,8 +68,19 @@ from its commit history.
   before a stop with no recorded outcome is ledgered at startup as
   `agent.slack.request.abandoned` (outcome unknown). Messages run only when
   marked (`!task …`, or `/task` after a mention), and direct messages only
-  when delivered to the app's bot. Interactions, bot-token posting and Socket Mode
-  are not included.
+  when delivered to the app's bot. Interactions and bot-token posting are
+  not included.
+- Slack Socket Mode, off by default (`slack_socket_mode = true` plus the
+  app-level token in `UA_SLACK_APP_TOKEN`, never the config file): `ua serve`
+  opens an outbound WebSocket to Slack, so a hub with no public URL can serve
+  Slack. Envelopes go through the same admission and execution as the HTTP
+  routes; a redelivered envelope is acknowledged and runs nothing (its
+  envelope id goes into the replay table). Slash-command answers ride in the
+  acknowledgement. The socket URL must be `wss` on `slack.com`; reconnects
+  back off with jitter, and a refused token stops the transport with one log
+  line. `system_doctor` reports the transport's state. Behind the new
+  default-on cargo feature `slack-socket` (tokio-tungstenite, on the existing
+  rustls stack).
 
 ### Changed
 

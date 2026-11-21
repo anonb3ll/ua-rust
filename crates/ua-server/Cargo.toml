@@ -13,7 +13,7 @@ readme.workspace = true
 [features]
 # On by default, so `cargo build -p ua-server` still serves MCP and links the
 # same ua-tools extras as before. `--no-default-features` drops all four.
-default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server", "slack-socket"]
 code-intel = ["ua-tools/code-intel"]
 readability = ["ua-tools/readability"]
 mcp-gateway = ["ua-tools/mcp-gateway"]
@@ -21,6 +21,17 @@ mcp-gateway = ["ua-tools/mcp-gateway"]
 # OAuth protected resource metadata for `/mcp`. Without it the hub serves the
 # JSON API, the UI and OAuth for `/api` only.
 mcp-server = ["dep:rmcp", "ua-tools/mcp-server"]
+# Slack Socket Mode: an outbound WebSocket to Slack, so a hub with no public
+# URL can serve Slack. On by default (it adds only tungstenite's protocol code;
+# TLS is the rustls + ring + platform verifier stack reqwest already uses), and
+# it does nothing until `slack_socket_mode` and `UA_SLACK_APP_TOKEN` are set.
+# Without it, `slack_socket_mode = true` is reported as not compiled in.
+slack-socket = [
+    "dep:tokio-tungstenite",
+    "dep:tokio-rustls",
+    "dep:rustls-platform-verifier",
+    "ua-tools/slack-socket",
+]
 # Off by default, as in ua-tools.
 embeddings = ["ua-tools/embeddings"]
 
@@ -54,6 +65,12 @@ webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"]
 # Same TLS setup as ua-tools: rustls with the ring provider (no C toolchain).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Slack Socket Mode (feature `slack-socket`): the WebSocket protocol only. No
+# TLS feature of its own: the connection is wrapped in tokio-rustls with the
+# platform verifier, the same rustls/ring stack reqwest uses.
+tokio-tungstenite = { version = "0.28", optional = true, default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+rustls-platform-verifier = { version = "0.7", optional = true }
 askama = "0.16.1"
 askama_web = { version = "0.16.0", features = ["axum-0.8"] }
 memory-serve = "2.4.0"
@@ -64,4 +81,5 @@ memory-serve = "2.4.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 http-body-util = "0.1"

@@ -49,7 +49,7 @@ Re-check a row before relying on it after a few months.
 | Process execution | `tokio::process` + process-wrap 10, argv allowlist, timeout, output cap | — | No shell, kill the whole process group on timeout. |
 | Sandboxing | landlock 0.4 (Linux) | nono (macOS) | Defense in depth beside the path resolvers. |
 | Cron | croner 4.0 | cron 0.17 | |
-| GitHub / Slack | octocrab 0.54 / slack-morphism 2.34 | reqwest | Zulip has no maintained crate; plain reqwest. |
+| GitHub / Slack | Own REST client on reqwest / own Slack code (signature check, parser, Socket Mode on tokio-tungstenite) | octocrab, slack-morphism | No Slack SDK: the hub needs only request signing, `apps.connections.open` and the Socket Mode envelope protocol. Zulip has no maintained crate; plain reqwest. |
 | IDs | uuid 1.29 (v7) | ulid 3 | Time-ordered; maps to Postgres `uuid`. Existing integer task ids stay integers. |
 | Time | jiff 1.0 | time 0.3 | |
 | Tests and CI | cargo-nextest, insta, cargo-deny, Swatinem/rust-cache | cargo-audit | |
@@ -70,6 +70,7 @@ build has.
 | `readability` | on | dom_smoothie | The article pass in `web_fetch` and `dash_view` | The whole page is converted; results carry `extraction: "full-page"`. |
 | `mcp-gateway` | on | rmcp (client) | `mcp_gateway`, the downstream MCP client | No `mcp_gateway`; `mcp_server_register` refuses, and the `mcp_server_*` descriptions and results say no gateway is compiled in. |
 | `mcp-server` | on | rmcp (server) | The `/mcp` route, `ua mcp`, the `/mcp` OAuth protected resource | `ua serve` warns at startup and serves the JSON API and UI only; OAuth issues hub-wide tokens; `ua mcp` exits with an error naming the feature. |
+| `slack-socket` | on | tokio-tungstenite 0.28 (WebSocket protocol only, no TLS feature; TLS is tokio-rustls with the rustls/ring stack and platform verifier reqwest already uses, so no second TLS implementation) | Slack Socket Mode in `ua serve` (an outbound WebSocket; no public URL) | `slack_socket_mode = true` is reported as not compiled in (startup log, `system_doctor`); the signed HTTP routes still work. |
 | `embeddings` | off | fastembed | Semantic memory search (see the Embeddings row) | Memory search is lexical (FTS5). |
 
 ## Protocol notes

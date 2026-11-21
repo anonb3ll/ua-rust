@@ -15,12 +15,14 @@ path = "src/main.rs"
 # On by default, so `ua` with no feature flags is the same binary as before.
 # `--no-default-features` builds it without tree-sitter, dom_smoothie and
 # rmcp. See "Build options" in the README.
-default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server", "slack-socket"]
 code-intel = ["ua-tools/code-intel", "ua-server/code-intel", "ua-import/code-intel"]
 readability = ["ua-tools/readability", "ua-server/readability", "ua-import/readability"]
 mcp-gateway = ["ua-tools/mcp-gateway", "ua-server/mcp-gateway", "ua-import/mcp-gateway"]
 # `ua mcp` and the `/mcp` route of `ua serve`.
 mcp-server = ["ua-server/mcp-server"]
+# Slack Socket Mode in `ua serve` (an outbound WebSocket; no public URL).
+slack-socket = ["ua-server/slack-socket"]
 # Off by default: semantic memory search with fastembed.
 embeddings = ["ua-tools/embeddings", "ua-server/embeddings", "ua-import/embeddings"]
 
