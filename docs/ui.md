@@ -132,12 +132,14 @@ routes with the same request and response shapes:
 | `GET /api/evidence`, `POST /api/evidence` | `evidence_report`, `evidence_append` |
 
 The runs, platform and evidence routes and what the SDK can rely on are in
-[sdk.md](sdk.md). `/api/nodes/*` (acceptance), the node wake, config and
-session-credential routes under `/api/node/`, the provenance graph and the
-evidence export answer `501` with `{"error": "not_implemented", "capability":
-"..."}` until they are built. `/api/work-products*` answers `501` too: work
-products are not ported pending an explicit product decision (hub task
-#2658).
+[sdk.md](sdk.md). The node routes are served, including the node wake, config
+and session-credential routes under `/api/node/` and `GET
+/api/nodes/acceptance` (see [nodes.md](nodes.md)). Any other `/api/nodes/*`
+path (discovered native sessions), the provenance graph and other
+`/api/platform/*` paths outside the manifest and objects, and the evidence
+export answer `501` with `{"error": "not_implemented", "capability": "..."}`
+until they are built. `/api/work-products*` answers `501` too: work
+products are not ported pending an explicit product decision.
 
 ## Third-party files
 

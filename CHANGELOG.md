@@ -85,6 +85,21 @@ from its commit history.
   `@unified-agent/client`; not published), with workflows that typecheck,
   test and check codegen, and run the live conformance suite against a
   `ua serve` built from the commit.
+- Operations commands: `ua init` (private `$UA_HOME`, a validated
+  `config.toml`, an optional starter policy and token), `ua doctor` (read-only
+  checks of config, permissions, policy, SQLite and the ledger, with `--json`
+  and `--strict`), `ua backup` (an online snapshot, safe while `ua serve` runs)
+  and `ua restore` (verifies the backup, keeps a pre-restore copy, and needs
+  the hub stopped). `ua-store` gained `check_database`, `backup_database` and
+  `restore_database`. Docker, systemd, launchd and Litestream templates are in
+  `deploy/`, with `docs/operations.md`.
+- Zulip, off until `zulip_site`, `zulip_email` and `zulip_api_key` are set:
+  `zulip_send_message` (retired unless `zulip_retired` is turned off) and
+  `zulip_fetch_messages` (a cursor per agent, channel and topic; messages are
+  labelled untrusted). The API key is never logged, ledgered or stored.
+- Slack request signature check (v0 HMAC, five-minute window, replayed bodies
+  refused) and `slack_parse_command` for the nine coordination commands. The
+  Slack routes above build on both.
 
 ### Changed
 
@@ -137,6 +152,25 @@ from its commit history.
   refuses without a gateway, and without an MCP server `ua serve` warns, OAuth
   issues hub-wide tokens and does not advertise `/mcp`, and `ua mcp` exits with
   an error naming the feature.
+- Bearer and session lookups and every sign-in handler no longer block
+  runtime threads, and the cookie key is cached for up to a minute. A database
+  read that finds every pooled reader busy opens a short-lived extra reader
+  (at most four) instead of queueing behind the writer, and a panic in a read
+  no longer leaks a reader.
+- A successful read-only call made for a UI page, or for `GET /api/board` from
+  a signed-in browser session, leaves no `tool_calls` row; other callers of
+  `GET /api/board` get one summary row. `memory_search` and `memory_get` are
+  marked read-only but still record a row, because they update access
+  counters, and a failed counter update no longer fails the read.
+- `ua serve` stops on SIGTERM as well as Ctrl-C: one cancellation token stops
+  the server and the background loops, and the WAL is checkpointed on exit.
+- Canonical JSON for approval payloads, digests and fingerprints sorts keys
+  itself (`ua_core::canonical`) instead of relying on serde_json's map order.
+  The output is byte-identical to before.
+- The `/login` pages and the OAuth consent page carry no inline script or
+  style, and are covered by a content security policy.
+- The stale-worktree scan works on macOS, where it reads processes with
+  `proc_pidinfo`.
 
 ### Security
 
@@ -173,5 +207,20 @@ from its commit history.
   `argument-hint`, `model`; skills also `license`, `version` and a
   `metadata` map of plain values) with plain values; front matter that does
   not parse is refused.
+- `POST /api/approvals/request` runs the same profile, policy and prod-action
+  checks as a tool call before it parks a request, and refuses a tool that
+  binds its own approval or marks its arguments secret (409). A payload that
+  does not match the tool's typed arguments gets 400, and one over 16 KiB gets
+  413. `agent_token_issue` and `agent_token_rotate` bind the label and a keyed
+  fingerprint of the token, never the token.
+- Releasing a task hold as its creator, and binding or unbinding a project
+  repository, need a verified identity; an unverified `actor` is no longer
+  trusted.
+- A node session credential can no longer reach memory tools, and a granted
+  tool with no narrowing rule is refused (`session_tool_unscoped`).
+- The host check covers the HTTP/2 `:authority` and absolute-form request
+  targets, so a request without a `Host` header is no longer let through.
+- Deleted elements in a planning canvas are not parsed as live shapes, and
+  canvas history is bounded by `graph_canvas_history_max_bytes` per board.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

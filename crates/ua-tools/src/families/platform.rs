@@ -408,7 +408,7 @@ pub static OBJECT_TYPES: &[ObjectType] = &[
         envelope: "work_product",
         required: &["id", "title", "status"],
         writers: &[],
-        notes: "Not ported to ua-rust pending an explicit product decision (hub task #2658), so this kind is \
+        notes: "Not ported to ua-rust pending an explicit product decision, so this kind is \
                 never served and /api/work-products answers 501.",
     },
 ];
