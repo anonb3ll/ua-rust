@@ -918,6 +918,20 @@ pub fn socket_state() -> Option<SocketState> {
     })
 }
 
+/// Envelopes the transport turned away because a connection was at its
+/// in-flight cap (this process, since start).
+static SOCKET_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one envelope turned away at the in-flight cap.
+pub fn record_socket_busy() {
+    SOCKET_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Envelopes turned away at the in-flight cap since the process started.
+pub fn socket_busy_count() -> u64 {
+    SOCKET_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether this binary was built with the `slack-socket` feature.
 pub const SOCKET_COMPILED: bool = cfg!(feature = "slack-socket");
 

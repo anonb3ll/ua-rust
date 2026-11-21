@@ -777,4 +777,87 @@ mod socket {
         assert!(c.recv().await["payload"]["text"].as_str().unwrap().contains("operator"));
         r.ct.cancel();
     }
+
+    // --- the in-flight cap (32 envelopes being admitted per connection) ----
+
+    const CAP: usize = 32;
+
+    /// Hold the database writer for `secs` (in memory, reads wait too).
+    fn hold_writer(r: &Rig, secs: u64) -> tokio::task::JoinHandle<ua_core::UaResult<()>> {
+        let db = r.hub.state.hub.db().clone();
+        tokio::task::spawn_blocking(move || {
+            db.write(|_| {
+                std::thread::sleep(Duration::from_secs(secs));
+                Ok(())
+            })
+        })
+    }
+
+    /// Receive acks until `n` arrived or none comes for `quiet`.
+    async fn acks(c: &mut Conn, n: usize, quiet: Duration) -> Vec<Value> {
+        let mut out = Vec::new();
+        while out.len() < n {
+            match tokio::time::timeout(quiet, c.inbox.recv()).await {
+                Ok(Some(v)) => out.push(v),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_cap_counts_admissions_until_they_finish_and_a_busy_slash_command_is_told() {
+        let (r, mut c) = rig().await;
+        let held = hold_writer(&r, 3);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // First burst: the cap's worth, acknowledged at the (500 ms) deadline
+        // while their admissions wait on the writer.
+        for i in 0..CAP {
+            c.send(slash(&format!("env-c{i}"), HUMAN, "/task", "capped", &format!("8.1.{i}")));
+        }
+        let first = acks(&mut c, CAP, Duration::from_secs(2)).await;
+        assert_eq!(first.len(), CAP);
+        assert!(first.iter().all(|a| a.get("payload").is_none()), "bare acks at the deadline");
+        let busy_before = slack::socket_busy_count();
+        // Second burst after the deadline: the slots are still taken by the
+        // admissions, so nothing more is admitted; each person is told.
+        for i in 0..5 {
+            c.send(slash(&format!("env-b{i}"), HUMAN, "/task", "busy", &format!("8.2.{i}")));
+        }
+        let second = acks(&mut c, 5, Duration::from_secs(1)).await;
+        assert_eq!(second.len(), 5);
+        for a in &second {
+            assert_eq!(a["payload"]["text"], "The hub is busy. Try again in a moment.", "{a}");
+        }
+        assert!(slack::socket_busy_count() >= busy_before + 5);
+        held.await.unwrap().unwrap();
+        executed(&r.hub, CAP).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(tasks(&r.hub).await, CAP as i64, "only the first burst was admitted");
+        // A turned-away command left no trace, so the person's retry runs.
+        c.send(slash("env-b0-retry", HUMAN, "/task", "busy", "8.2.0"));
+        assert!(c.recv().await["payload"]["text"].as_str().unwrap().starts_with("Accepted /task"));
+        executed(&r.hub, CAP + 1).await;
+        r.ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_event_over_the_cap_is_left_for_redelivery() {
+        let (r, mut c) = rig().await;
+        let held = hold_writer(&r, 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 0..CAP {
+            c.send(slash(&format!("env-f{i}"), HUMAN, "/task", "fill", &format!("8.3.{i}")));
+        }
+        assert_eq!(acks(&mut c, CAP, Duration::from_secs(2)).await.len(), CAP);
+        c.send(event("env-over", HUMAN, "Ev0OVER", "app_mention", "<@U0BOT> !task over the cap"));
+        assert!(acks(&mut c, 1, Duration::from_millis(500)).await.is_empty(), "not acknowledged");
+        held.await.unwrap().unwrap();
+        executed(&r.hub, CAP).await;
+        // Slack's redelivery, once there is room, runs it.
+        c.send(event("env-over", HUMAN, "Ev0OVER", "app_mention", "<@U0BOT> !task over the cap"));
+        assert_eq!(c.recv().await, json!({ "envelope_id": "env-over" }));
+        executed(&r.hub, CAP + 1).await;
+        r.ct.cancel();
+    }
 }

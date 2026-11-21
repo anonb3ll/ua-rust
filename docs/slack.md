@@ -391,8 +391,15 @@ admission never stalls pings, pongs or other envelopes), and its single
 acknowledgement goes back to the connection when ready; acknowledgements
 may leave in a different order than the envelopes came (each is
 independent, and the event and trigger id dedupe does not depend on
-order). At most 32 envelopes per connection are in flight; one past that
-is neither admitted nor acknowledged, so Slack redelivers it. A failure or
+order). At most 32 envelopes per connection are being admitted at once,
+counted until each admission finishes, not just until it is acknowledged
+(so a stalled database cannot let a new batch start every ack period). One
+past that is turned away without admission, ledger or replay row, logged
+at warn (envelope hash, type, in-flight count) and counted in the
+`system_doctor` `slack` row: a slash command is acknowledged with "The hub
+is busy. Try again in a moment." (Slack may not redeliver it, so the person
+is told and can retry); an event is left unacknowledged, so Slack
+redelivers it. A failure or
 panic in one envelope never ends the connection, and a shutdown waits for
 envelopes in flight. If its admission transaction fails, it is not acknowledged, so
 Slack redelivers it. If admission is slower than the 2.5-second ack

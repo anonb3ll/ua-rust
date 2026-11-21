@@ -87,9 +87,14 @@ impl Timings {
         }
     }
 }
-/// Envelopes of one connection admitted at the same time. One past that is
-/// not acknowledged (and not admitted), so Slack redelivers it later.
+/// Envelopes of one connection being admitted at the same time, counted
+/// until each admission finishes (not just until it is acknowledged). One
+/// past that is turned away without admission: a slash command gets a
+/// "busy" answer in its acknowledgement, an event is left unacknowledged so
+/// Slack redelivers it.
 const MAX_IN_FLIGHT: usize = 32;
+/// The answer a slash command gets when the connection is at its cap.
+const BUSY_TEXT: &str = "The hub is busy. Try again in a moment.";
 /// Longest envelope id accepted.
 const MAX_ENVELOPE_ID: usize = 128;
 
@@ -370,15 +375,35 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
             _ => {}
         }
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
-            tracing::debug!(
-                "Slack Socket Mode: too many envelopes in flight; left unacknowledged for redelivery"
+            // At the cap: nothing is admitted, ledgered or recorded for
+            // replay, so a retry runs normally once there is room.
+            let id = m.get("envelope_id").and_then(Value::as_str).unwrap_or_default();
+            let kind = m.get("type").and_then(Value::as_str).unwrap_or("unknown");
+            let kind: String =
+                kind.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+            slack::record_socket_busy();
+            tracing::warn!(
+                envelope_sha = %slack::envelope_sha(id),
+                envelope_type = %kind,
+                in_flight = MAX_IN_FLIGHT - in_flight.available_permits(),
+                "Slack Socket Mode: too many envelopes being admitted; turned one away"
             );
+            let usable =
+                !id.is_empty() && id.len() <= MAX_ENVELOPE_ID && id.bytes().all(|b| b.is_ascii_graphic());
+            if kind == "slash_commands" && usable {
+                // Slack may not redeliver a slash command: tell the person.
+                let mut ack = json!({ "envelope_id": id });
+                if m.get("accepts_response_payload").and_then(Value::as_bool) == Some(true) {
+                    ack["payload"] = json!({ "response_type": "ephemeral", "text": BUSY_TEXT });
+                }
+                sink.send(Message::text(ack.to_string())).await.map_err(|_| "ack failed".to_string())?;
+            }
+            // Events stay unacknowledged, so Slack redelivers them.
             continue;
         };
         let (state2, ack_tx, ack) = (state.clone(), ack_tx.clone(), t.ack);
         state.calls.spawn(async move {
-            let _permit = permit;
-            if let Some(v) = acknowledge(&state2, m, ack).await {
+            if let Some(v) = acknowledge(&state2, m, ack, permit).await {
                 // The connection may be gone; Slack then redelivers it.
                 let _ = ack_tx.send(v).await;
             }
@@ -390,7 +415,14 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
 /// connection, and build the acknowledgement. `None` when it cannot be
 /// acknowledged (no usable envelope id) or must not be yet (the admission
 /// transaction failed, so Slack should redeliver it).
-async fn acknowledge(state: &AppState, envelope: Map<String, Value>, deadline: Duration) -> Option<Value> {
+/// `permit` is this envelope's in-flight slot: it is released when the
+/// admission finishes, which may be after the acknowledgement.
+async fn acknowledge(
+    state: &AppState,
+    envelope: Map<String, Value>,
+    deadline: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Option<Value> {
     let id = envelope.get("envelope_id").and_then(Value::as_str).unwrap_or_default().to_string();
     if id.is_empty() || id.len() > MAX_ENVELOPE_ID || !id.bytes().all(|b| b.is_ascii_graphic()) {
         tracing::debug!("Slack Socket Mode: ignored an envelope without a usable envelope_id");
@@ -415,6 +447,8 @@ async fn acknowledge(state: &AppState, envelope: Map<String, Value>, deadline: D
             let hub = state.hub.clone();
             // On the task tracker, so a shutdown waits for it too.
             state.calls.spawn(async move {
+                // The slot frees only when the admission really ends.
+                let _permit = permit;
                 let failed = match task.await {
                     Ok(None) => Some("admission_failed_after_ack"),
                     Err(_) => Some("handler_failed_after_ack"),

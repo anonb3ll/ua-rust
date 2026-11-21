@@ -1339,7 +1339,10 @@ fn slack_check(cfg: &Config) -> Value {
         (false, _) => "Socket Mode off".to_string(),
         (true, Err(why)) => why.to_string(),
         (true, Ok(_)) => match slack::socket_state() {
-            Some(s) => format!("Socket Mode {}", s.as_str()),
+            Some(s) => match slack::socket_busy_count() {
+                0 => format!("Socket Mode {}", s.as_str()),
+                n => format!("Socket Mode {} ({n} envelope(s) turned away busy since start)", s.as_str()),
+            },
             None => "Socket Mode configured (its state is known only inside ua serve)".to_string(),
         },
     };
