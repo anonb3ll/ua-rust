@@ -993,3 +993,27 @@ async fn an_adopted_command_notifies_the_chosen_session() {
         .await;
     assert_eq!(h.scalar("SELECT target_session FROM message_index WHERE sender = 'hub-node'"), session);
 }
+
+/// Node command adoption is human-only: neither a lifecycle-operator agent
+/// nor an unattended routine under a human's label may adopt another agent's
+/// command; a human may.
+#[tokio::test]
+async fn command_adoption_is_for_a_verified_human_only() {
+    let h = H::with(|c| c.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]));
+    h.register_default().await;
+    let params = json!({ "node": NODE, "argv": ["make"], "cwd": "/srv/work" });
+    let parked = h.manage(&lead(), "node_command_start", params.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!() };
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    let id = h.manage(&lead(), "node_command_start", params).await.unwrap()["item_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fleet = Caller { label: "fleet-bot".into(), ..lead() };
+    let routine = Caller { kind: ActorKind::Agent, ..human() };
+    for who in [fleet, routine] {
+        let e = h.manage(&who, "node_command_adopt", json!({ "item_id": id })).await.unwrap_err();
+        assert!(e.to_string().contains("may adopt"), "{}: {e}", who.label);
+    }
+    h.manage(&human(), "node_command_adopt", json!({ "item_id": id })).await.unwrap();
+}

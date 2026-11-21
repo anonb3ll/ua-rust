@@ -528,6 +528,11 @@ async fn move_list_search_custodian_and_memory_ingest() {
     let boss = Caller { profile: Profile::Coordinator, ..agent("coord-1") };
     let e = t.err(&boss, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Cap.md"})).await;
     assert_eq!(reason(&e), "operator_required");
+    // Nor an unattended routine running under the human's label.
+    let routine = Caller { kind: ActorKind::Agent, ..human() };
+    let e =
+        t.err(&routine, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Cap.md"})).await;
+    assert_eq!(reason(&e), "operator_required");
     let coord = human();
     let m = t
         .ok(&coord, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Moved/Cap.md"}))

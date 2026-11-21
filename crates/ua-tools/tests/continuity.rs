@@ -1344,3 +1344,22 @@ async fn a_lifecycle_operator_keeps_fleet_maintenance_but_not_human_only_operati
     let e = h.call(&lifecycle_op(), "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
     assert!(e.to_string().contains("outside your mailbox"), "{e}");
 }
+
+/// An unattended routine owned by a human runs as an agent under the owner's
+/// label, so that it carries no human authority: it is refused at the
+/// human-only sites (provider accounts, the hub view, reading other
+/// mailboxes), where the human is allowed.
+#[tokio::test]
+async fn an_unattended_routine_under_a_humans_label_holds_no_operator_authority() {
+    let h = H::new();
+    let routine = caller("operator", ActorKind::Agent, Profile::Coordinator);
+    let args = json!({ "provider": "anthropic", "label": "acct-r", "billing": "subscription" });
+    let e = h.call(&routine, "provider_account_register", args).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required");
+    let catalog = h.ok(&routine, "capability_catalog", json!({})).await;
+    assert!(catalog["boundaries"].is_null(), "{catalog}");
+    assert!(!h.ok(&human(), "capability_catalog", json!({})).await["boundaries"].is_null());
+    let e = h.call(&routine, "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
+    assert!(e.to_string().contains("outside your mailbox"), "{e}");
+    h.ok(&human(), "message_list", json!({ "to_agent": "builder-2" })).await;
+}

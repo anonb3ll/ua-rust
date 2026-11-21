@@ -665,6 +665,9 @@ async fn dispatch_task_checks_the_caller_against_the_agent() {
         reason(&h.err(&operator_agent("ops-1"), "dispatch_task", args.clone()).await),
         "identity_mismatch"
     );
+    // Nor an unattended routine running under the human's label.
+    let routine = Caller { kind: ActorKind::Agent, ..human() };
+    assert_eq!(reason(&h.err(&routine, "dispatch_task", args.clone()).await), "identity_mismatch");
 
     // A harness that passes the agent's token says so on the approval.
     let tid2 = h.task().await;
