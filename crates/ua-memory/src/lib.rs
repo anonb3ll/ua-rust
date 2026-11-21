@@ -3,8 +3,9 @@
 //! This crate is the memory domain: the storage schema ([`schema`]), the note
 //! model and eligibility filter (`note`, crate-private), saving ([`save`]), search, listing
 //! and reads ([`search`]) with their rank fusion ([`rank`]) and embeddings
-//! ([`embed`]), delete, restore and feedback ([`lifecycle`]), and the
-//! report-only maintenance passes ([`maintenance`]). It depends on `ua-core`
+//! ([`embed`]), delete, restore and feedback ([`lifecycle`]), the
+//! report-only maintenance passes ([`maintenance`]), and the retrieval
+//! benchmark ([`bench`]). It depends on `ua-core`
 //! and `ua-store` only, never on the tool registry.
 //!
 //! The tools (`memory_save`, `memory_search`, `memory_list`, `memory_get`,
@@ -28,6 +29,7 @@
 //! and upvotes. Without the `embeddings` cargo feature the semantic leg is
 //! off and search is lexical only.
 
+pub mod bench;
 pub mod embed;
 pub mod lifecycle;
 pub mod maintenance;
