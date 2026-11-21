@@ -157,6 +157,7 @@ fn agent(label: &str) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

@@ -444,6 +444,7 @@ async fn approval_detail_agrees_with_the_resolve_check() {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let id =
         match hub.state.registry.call(&hub.state.hub, &builder, "task_add", json!({ "title": "x" })).await {
@@ -686,6 +687,7 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
         enforce_profile: false,
         session_key: None,
         transport: Transport::Internal,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     reg.call(
         &hub.state.hub,

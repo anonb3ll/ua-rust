@@ -51,6 +51,7 @@ fn builder() -> Caller {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

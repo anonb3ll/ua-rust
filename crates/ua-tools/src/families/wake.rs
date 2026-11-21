@@ -1485,6 +1485,7 @@ mod tests {
             enforce_profile: true,
             session_key: None,
             transport: Transport::Http,
+            org_id: ua_core::DEFAULT_ORG.into(),
         };
         let me = who("builder-1", ActorKind::Agent);
         reg.call(&hub, &me, "node_register", json!({ "node": "box", "facts": { "backends": ["codex"] } }))

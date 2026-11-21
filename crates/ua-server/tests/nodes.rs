@@ -122,6 +122,7 @@ async fn a_retired_node_is_refused_with_node_retired() {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     hub.state
         .registry
@@ -165,6 +166,7 @@ async fn work_round_trips_through_the_device_plane() {
         enforce_profile: false,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     hub.state
         .registry
@@ -254,6 +256,7 @@ async fn a_retired_agents_static_token_is_refused_until_it_is_unretired() {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let manage = |action: &'static str| json!({ "action": action, "params": { "agent": "builder-1", "reason": "decommissioned" } });
     hub.state
@@ -293,6 +296,7 @@ async fn a_node_long_polls_checks_and_reports_a_wake_over_http() {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let (reg, h) = (&hub.state.registry, &hub.state.hub);
     // The node wakes only its own agent's sessions.

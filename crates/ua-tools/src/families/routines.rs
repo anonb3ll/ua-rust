@@ -382,6 +382,7 @@ fn owner_caller(hub: &Hub, owner: &str, attended: bool) -> Caller {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Internal,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

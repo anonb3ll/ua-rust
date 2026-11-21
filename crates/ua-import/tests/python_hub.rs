@@ -502,6 +502,7 @@ fn operator() -> Caller {
         enforce_profile: false,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -1015,6 +1016,7 @@ async fn imported_legacy_prefix_and_hashed_chain_export_manifest_chain_ok() {
         enforce_profile: true,
         session_key: Some("builder-1-key".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let reg = builtin_registry();
     let exported = reg.call(&hub, &caller, "export_migration_manifest", json!({})).await.unwrap();
@@ -1095,6 +1097,7 @@ async fn an_out_of_order_ulid_keeps_manifest_chain_ok() {
         enforce_profile: true,
         session_key: Some("builder-1-key".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let reg = builtin_registry();
     let verified = reg.call(&hub, &operator(), "event_log_verify", json!({})).await.unwrap();
