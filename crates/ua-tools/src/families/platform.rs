@@ -484,6 +484,20 @@ async fn read_gate(
             format!("{kind} objects need {tool} permission, which profile {} does not have", caller.profile),
         ));
     }
+    // A kind read through a consolidated tool is read as that tool's `get`
+    // action: the standalone tool it runs (`plan_get` for `plan_manage`) is
+    // checked too, as a call of the action would be (see `crate::routes`).
+    let routed =
+        crate::routes::route(tool, &json!({ "action": "get" })).ok().flatten().and_then(|r| r.standalone());
+    if let Some(s) = routed
+        && caller.enforce_profile
+        && !caller.profile.allows_routed(s)
+    {
+        return Err(refuse(
+            "profile_denied",
+            format!("{kind} objects need {s} permission, which profile {} does not have", caller.profile),
+        ));
+    }
     let gated = |why: String| {
         refuse(
             "approval_required",
@@ -496,7 +510,23 @@ async fn read_gate(
         let c = caller.clone();
         let verdict = hub
             .db()
-            .read_async(move |conn| Ok(policy::evaluate(conn, &p, &c, tool, &json!({}))))
+            .read_async(move |conn| {
+                Ok(policy::evaluate(conn, &p, &c, tool, &json!({})).and_then(|door| match routed {
+                    Some(s) => {
+                        policy::evaluate_routed(conn, &p, &c, s, &json!({})).map(|own| match (door, own) {
+                            (Verdict::RequireApproval(mut a), Verdict::RequireApproval(b)) => {
+                                a.extend(b);
+                                Verdict::RequireApproval(a)
+                            }
+                            (Verdict::RequireApproval(a), _) | (_, Verdict::RequireApproval(a)) => {
+                                Verdict::RequireApproval(a)
+                            }
+                            _ => Verdict::Allow,
+                        })
+                    }
+                    None => Ok(door),
+                }))
+            })
             .await
             .map_err(|e| refuse("policy_unavailable", format!("policy gate failed closed: {e}")))?;
         match verdict {
@@ -516,8 +546,13 @@ async fn read_gate(
             }
         }
     }
-    if hub.cfg().approval_tools.iter().any(|t| t == tool) {
+    if crate::routes::listed(hub.cfg(), tool) {
         return Err(gated("is in approval_tools".into()));
+    }
+    if let Some(s) = routed
+        && crate::routes::listed(hub.cfg(), s)
+    {
+        return Err(gated(format!("runs {s}, which is in approval_tools")));
     }
     Ok(())
 }

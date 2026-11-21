@@ -671,8 +671,10 @@ async fn approval_request(
     // profile, policy rules, prod-action identity), then the payload its gate
     // would bind: a `gate_payload` projection, never the raw arguments, so a
     // secret value is not parked in the approvals table.
-    let payload = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
-        Ok(ApprovalRequest::Payload(p)) => p,
+    // A consolidated tool's action is requested under the name its gate binds
+    // (the standalone tool, or `tool:action`), as the call itself would park it.
+    let (tool, payload) = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
+        Ok(ApprovalRequest::Payload { tool, payload }) => (tool, payload),
         Err(e) if e.reason_code() == Some("secret_args_unprojected") => {
             return (
                 StatusCode::CONFLICT,

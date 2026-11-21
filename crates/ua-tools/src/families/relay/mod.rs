@@ -1092,21 +1092,19 @@ async fn resolve(ctx: ToolCtx, p: ResolveParams) -> UaResult<Value> {
 
 // --- registration ------------------------------------------------------------------------------
 
-const ACTIONS: [&str; 8] = ["check", "draft", "request_send", "send", "status", "list", "cancel", "resolve"];
-
 async fn relay_manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
+    let action = crate::routes::action_of(TOOL, Some(&a.action))?;
     let f = "relay";
-    match action.as_str() {
-        "check" => check(ctx, parse_params(f, &action, a.params)?).await,
-        "draft" => draft(ctx, parse_params(f, &action, a.params)?).await,
-        "request_send" => request_send(ctx, parse_params(f, &action, a.params)?).await,
-        "send" => send(ctx, parse_params(f, &action, a.params)?).await,
-        "status" => status(ctx, parse_params(f, &action, a.params)?).await,
-        "list" => list(ctx, parse_params(f, &action, a.params)?).await,
-        "cancel" => cancel(ctx, parse_params(f, &action, a.params)?).await,
-        "resolve" => resolve(ctx, parse_params(f, &action, a.params)?).await,
-        _ => Err(UaError::invalid(format!("action must be one of {ACTIONS:?}"))),
+    match action {
+        "check" => check(ctx, parse_params(f, action, a.params)?).await,
+        "draft" => draft(ctx, parse_params(f, action, a.params)?).await,
+        "request_send" => request_send(ctx, parse_params(f, action, a.params)?).await,
+        "send" => send(ctx, parse_params(f, action, a.params)?).await,
+        "status" => status(ctx, parse_params(f, action, a.params)?).await,
+        "list" => list(ctx, parse_params(f, action, a.params)?).await,
+        "cancel" => cancel(ctx, parse_params(f, action, a.params)?).await,
+        "resolve" => resolve(ctx, parse_params(f, action, a.params)?).await,
+        other => Err(crate::routes::unhandled(TOOL, other)),
     }
 }
 

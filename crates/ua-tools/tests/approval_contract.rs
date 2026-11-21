@@ -142,7 +142,9 @@ async fn no_tool_parks_a_plaintext_secret_through_the_request_route() {
         if !args.to_string().contains("PLAINTEXT-SECRET") {
             continue;
         }
-        if let Ok(ApprovalRequest::Payload(p)) = reg.approval_request(&hub, &human, def.name, args).await {
+        if let Ok(ApprovalRequest::Payload { payload: p, .. }) =
+            reg.approval_request(&hub, &human, def.name, args).await
+        {
             assert!(!p.to_string().contains("PLAINTEXT-SECRET"), "{} parks a secret: {p}", def.name);
         }
     }
@@ -177,10 +179,6 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                     ("autonomous_cycle_transition", json!({})),
                 ],
             ),
-        ),
-        (
-            "families/delegation.rs",
-            (1, vec![("delegation_manage", action("create")), ("handoff", json!({}))]),
         ),
         (
             "families/dispatch/tools.rs",
@@ -294,7 +292,7 @@ fn every_tool_that_gates_in_its_handler_is_marked() {
         }
     }
     // A tool nothing in its handler gates stays requestable.
-    for tool in ["task_add", "task_update", "crew_intervene", "delegate"] {
+    for tool in ["task_add", "task_update", "crew_intervene", "delegate", "handoff"] {
         assert!(!reg.get(tool).unwrap().handler_decides(&json!({})), "{tool}");
     }
 }

@@ -131,3 +131,15 @@ pub const SCHEMA_V3: SchemaPart = SchemaPart {
 ALTER TABLE tool_calls ADD COLUMN page INTEGER NOT NULL DEFAULT 0;
 ",
 };
+
+/// `tool_calls.action_tool`: for a call of a tool that dispatches on an
+/// `action` ([`crate::routes`]), the standalone tool its action ran, or the
+/// `tool:action` key of an action with no standalone tool. Rate limits and
+/// cooldowns on that name count these rows too.
+pub const SCHEMA_V4: SchemaPart = SchemaPart {
+    name: "core.v4",
+    sql: "
+ALTER TABLE tool_calls ADD COLUMN action_tool TEXT;
+CREATE INDEX IF NOT EXISTS idx_tool_calls_action_tool ON tool_calls(action_tool, started_at);
+",
+};

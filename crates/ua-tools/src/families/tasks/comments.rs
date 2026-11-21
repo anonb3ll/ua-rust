@@ -68,7 +68,7 @@ pub fn register(r: &mut Registry) {
 }
 
 async fn comment(ctx: ToolCtx, a: CommentArgs) -> UaResult<Value> {
-    match a.action.trim().to_ascii_lowercase().as_str() {
+    match crate::routes::action_of("task_comment", Some(&a.action))? {
         "update" | "delete" | "edit" | "remove" => Err(UaError::invalid("comments are append-only")),
         "append" => {
             let p: AppendParams = parse_params("append", a.params)?;
@@ -89,7 +89,7 @@ async fn comment(ctx: ToolCtx, a: CommentArgs) -> UaResult<Value> {
                 })
                 .await
         }
-        other => Err(UaError::invalid(format!("action must be one of append, list, get, not {other:?}"))),
+        other => Err(crate::routes::unhandled("task_comment", other)),
     }
 }
 

@@ -18,14 +18,14 @@ pub use spec::{SpecCheck, TextOrList};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{SchemaPart, WriteTx};
 
 use super::plans::{emit, parse_params, row_map, write_identity};
-use crate::approvals::{self, GateOutcome};
+use crate::approvals;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -326,7 +326,7 @@ pub struct LookupArgs {
     pub from_agent: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffArgs {
     /// The work, written to the Delegation Spec Standard.
@@ -385,9 +385,11 @@ pub struct ManageArgs {
 // ---------------------------------------------------------------------------
 // Create.
 
-/// `entry_tool` is the registered tool the call came through; the registry
-/// has already gated it if it is listed in `approval_tools`.
-fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
+/// Every door to this (`delegate`, `delegation_manage` create, `handoff`)
+/// passes `delegate`'s profile entry, policy rules and approval gate in the
+/// registry first, on the arguments of a `delegate` call (see
+/// `crate::routes`), so nothing here gates again.
+fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let task_spec = a.task_spec.trim().to_string();
     if task_spec.is_empty() {
         return Err(UaError::invalid("task_spec must not be empty"));
@@ -438,30 +440,6 @@ fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
         let existing = ctx.hub.db().read(|c| read_receipt(c, &k))?;
         if let Some(done) = replay(existing, &digest)? {
             return Ok(done);
-        }
-    }
-
-    // `delegate` listed in approval_tools gates every path that creates a
-    // delegation, not only the `delegate` tool itself.
-    let cfg = ctx.hub.cfg();
-    let listed = |t: &str| cfg.approval_tools.iter().any(|x| x == t);
-    if listed("delegate") && !listed(entry_tool) {
-        let mut payload = request.clone();
-        if let Some(o) = payload.as_object_mut() {
-            o.remove("project");
-        }
-        let outcome = ctx.hub.db().write(|tx| approvals::gate(tx, cfg, &ctx.caller, "delegate", &payload))?;
-        match outcome {
-            GateOutcome::Pass { .. } => {}
-            GateOutcome::Pending { approval_id } => {
-                return Err(UaError::ApprovalRequired { tool: "delegate".into(), approval_id });
-            }
-            GateOutcome::Denied { approval_id, reason } => {
-                return Err(UaError::denied(
-                    "approval_denied",
-                    format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-                ));
-            }
         }
     }
 
@@ -879,19 +857,34 @@ fn retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // Handoff (lifecycle metadata only) and spec tools.
 
-fn handoff(ctx: &ToolCtx, a: HandoffArgs, entry_tool: &str) -> UaResult<Value> {
-    let d = DelegateArgs {
-        task_spec: a.task_spec,
-        from_agent: a.agent,
-        to_agent: a.to_agent,
-        deadline: a.deadline,
-        callback: Some("none".into()),
-        priority: a.priority,
-        parent_task_id: a.parent_task_id,
-        project: None,
-        idempotency_key: None,
-    };
-    let r = create(ctx, d, entry_tool)?;
+/// A `handoff` call's arguments as the `delegate` call it makes: the same
+/// fields, `agent` as `from_agent`, `callback: "none"`; absent fields are
+/// left out, so a direct `delegate` call with these arguments binds the same
+/// approval. The registry gates `handoff` under `delegate` on this mapping
+/// (`crate::routes::DOORS`), and [`handoff`] builds its delegation from it.
+pub(crate) fn handoff_as_delegate(args: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for (from, to) in [
+        ("task_spec", "task_spec"),
+        ("agent", "from_agent"),
+        ("to_agent", "to_agent"),
+        ("deadline", "deadline"),
+        ("priority", "priority"),
+        ("parent_task_id", "parent_task_id"),
+    ] {
+        if let Some(v) = args.get(from).filter(|v| !v.is_null()) {
+            out.insert(to.to_string(), v.clone());
+        }
+    }
+    out.insert("callback".into(), json!("none"));
+    Value::Object(out)
+}
+
+fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
+    let raw = serde_json::to_value(&a).map_err(|e| UaError::internal(e.to_string()))?;
+    let d: DelegateArgs =
+        serde_json::from_value(handoff_as_delegate(&raw)).map_err(|e| UaError::invalid(e.to_string()))?;
+    let r = create(ctx, d)?;
     Ok(json!({ "handoff_id": r["delegation_id"], "task_id": r["task_id"], "status": "pending" }))
 }
 
@@ -952,7 +945,7 @@ fn spec_build(a: SpecBuildArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // The consolidated entry point and registration.
 
-const ACTIONS: [&str; 13] = [
+pub(crate) const ACTIONS: [&str; 13] = [
     "create",
     "list",
     "claim",
@@ -990,7 +983,8 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
     let p = params;
     let f = "delegation";
     match act {
-        "create" => create(ctx, parse_params(f, act, p)?, "delegation_manage"),
+        // The registry gated this action as `delegate` (see `crate::routes`).
+        "create" => create(ctx, parse_params(f, act, p)?),
         "list" => list(ctx, parse_params(f, act, p)?),
         "claim" => claim(ctx, parse_params(f, act, p)?),
         "release" => release(ctx, parse_params(f, act, p)?),
@@ -1006,7 +1000,7 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
             Ok(spec_template())
         }
         "spec_build" => spec_build(parse_params(f, act, p)?),
-        other => Err(UaError::invalid(format!("unknown delegation action {other:?}"))),
+        other => Err(crate::routes::unhandled("delegation_manage", other)),
     }
 }
 
@@ -1018,7 +1012,6 @@ pub fn register(r: &mut Registry) {
              lookup, spec_check, spec_template, spec_build. `params` holds the action's arguments.",
             |ctx: ToolCtx, a: ManageArgs| blocking(move || dispatch(&ctx, &a.action, a.params)),
         )
-        .handler_may_gate(crate::HandlerGate::Actions(&["create"]))
         .family("delegation"),
     );
     r.add(
@@ -1027,7 +1020,7 @@ pub fn register(r: &mut Registry) {
             "Delegate work to another agent: creates a child task addressed to to_agent and a pending \
              delegations row. The spec must meet the Delegation Spec Standard. Grants the receiver no extra \
              tools. Returns {delegation_id, task_id, memory_id}.",
-            |ctx: ToolCtx, a: DelegateArgs| blocking(move || create(&ctx, a, "delegate")),
+            |ctx: ToolCtx, a: DelegateArgs| blocking(move || create(&ctx, a)),
         )
         .family("delegation"),
     );
@@ -1073,9 +1066,8 @@ pub fn register(r: &mut Registry) {
             "handoff",
             "Hand work to another agent as the verified sender: a delegation with callback none. Returns only \
              lifecycle ids: {handoff_id, task_id, status}.",
-            |ctx: ToolCtx, a: HandoffArgs| blocking(move || handoff(&ctx, a, "handoff")),
+            |ctx: ToolCtx, a: HandoffArgs| blocking(move || handoff(&ctx, a)),
         )
-        .handler_may_gate(crate::HandlerGate::Always)
         .family("delegation"),
     );
     r.add(
