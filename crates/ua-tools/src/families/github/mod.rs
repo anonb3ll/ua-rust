@@ -209,8 +209,7 @@ mod authority_tests {
     /// (which an operator-profile caller used to be), nor for the hub view.
     #[test]
     fn the_github_caller_holds_no_operator_authority() {
-        let mut cfg = ua_core::Config::default();
-        cfg.human_identities = vec!["operator".into()];
+        let cfg = ua_core::Config { human_identities: vec!["operator".into()], ..ua_core::Config::default() };
         let gh = github_caller();
         assert_eq!(gh.profile, ua_core::Profile::Operator);
         assert!(!crate::families::dispatch::is_operator(&cfg, &gh));
