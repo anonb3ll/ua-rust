@@ -18,16 +18,25 @@ use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, UaError, UaResult};
 /// One authority a caller may hold (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority {
-    /// Operator authority: a **verified human**, that is a caller of kind
-    /// human, or a verified caller whose label is a configured human identity
-    /// (`human_identities`). A label listed only in `lifecycle_operators` is
-    /// never an operator.
+    /// Operator authority: a **verified caller of kind human** (a configured
+    /// human identity that authenticated as itself: bearer token, browser
+    /// session, Slack, or a local CLI `--label` after confirmation), and
+    /// nothing else. An agent-kind caller is never an operator, even under a
+    /// human's label: that is how an unattended routine owned by a human runs,
+    /// precisely so that it carries no human authority. A label listed in
+    /// `lifecycle_operators` is never an operator either.
     ///
     /// Replaced by `OrgRole { min: OrgAdmin }` (and `HubOwner` for hub-scoped
     /// rows) once users and memberships exist (`organization.v2`).
     Operator,
-    /// A configured lifecycle operator (`lifecycle_operators`, which defaults
-    /// to `human_identities`), verified. A separate, explicitly named grant,
+    /// A configured lifecycle operator, verified. A separate, explicitly
+    /// named grant. It holds for a human whose label is in
+    /// `lifecycle_operators` (or, when that list is unset, for any human: the
+    /// list then defaults to `human_identities`), and for an agent whose label
+    /// is **explicitly** listed in `lifecycle_operators` and is not a human
+    /// identity. The unset-list fallback grants nothing to a non-human
+    /// caller, and an agent-kind caller under a human's label (an unattended
+    /// routine) never holds it.
     /// **not** operator authority: it never satisfies a requirement for
     /// [`Authority::Operator`]. It holds at the design's agent and node
     /// lifecycle sites, and at the fleet-maintenance sites that list it next
@@ -63,8 +72,21 @@ impl Authority {
 }
 
 /// The operator rule as a pure predicate: a verified human.
-pub fn operator_rule(cfg: &Config, caller: &Caller) -> bool {
-    verified_label(caller).is_some_and(|label| human(caller) || cfg.is_human(label))
+pub fn operator_rule(caller: &Caller) -> bool {
+    human(caller)
+}
+
+/// The lifecycle-operator rule as a pure predicate (see
+/// [`Authority::LifecycleOperator`]).
+pub fn lifecycle_rule(cfg: &Config, caller: &Caller) -> bool {
+    match caller.kind {
+        ActorKind::Human => cfg.is_lifecycle_operator(&caller.label),
+        ActorKind::Agent => {
+            cfg.lifecycle_operators.as_ref().is_some_and(|list| list.iter().any(|l| l == &caller.label))
+                && !cfg.is_human(&caller.label)
+        }
+        ActorKind::Anonymous | ActorKind::System => false,
+    }
 }
 
 /// The caller's verified label: an authenticated agent or human. Anonymous,
@@ -133,9 +155,9 @@ impl<'a> Authz<'a> {
     fn holds_one(&self, caller: &Caller, a: &Authority) -> bool {
         let verified = verified_label(caller);
         match *a {
-            Authority::Operator => operator_rule(self.cfg, caller),
+            Authority::Operator => operator_rule(caller),
             Authority::LocalTrustReader => verified.is_none(),
-            Authority::LifecycleOperator => verified.is_some_and(|l| self.cfg.is_lifecycle_operator(l)),
+            Authority::LifecycleOperator => lifecycle_rule(self.cfg, caller),
             Authority::TransitionalHuman => human(caller),
         }
     }
@@ -168,9 +190,9 @@ mod tests {
     fn operator_is_a_verified_human_and_not_a_lifecycle_agent() {
         let human = caller("operator", ActorKind::Human, Profile::Developer);
         assert!(holds(&human, Authority::Operator));
-        // A verified agent whose label is a configured human identity.
-        assert!(holds(&caller("operator", ActorKind::Agent, Profile::Developer), Authority::Operator));
         for c in [
+            // An unattended routine owned by the human: agent kind, human label.
+            caller("operator", ActorKind::Agent, Profile::Coordinator),
             caller("fleet-bot", ActorKind::Agent, Profile::Developer),
             caller("builder-1", ActorKind::Agent, Profile::Operator),
             caller("lead-1", ActorKind::Agent, Profile::Coordinator),
@@ -188,7 +210,7 @@ mod tests {
         let cfg = cfg();
         let authz = Authz::new(&cfg);
         let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Developer);
-        assert!(!operator_rule(&cfg, &fleet));
+        assert!(!operator_rule(&fleet));
         assert!(!authz.holds(&fleet, &[Authority::Operator], DEFAULT_ORG));
         assert!(authz.holds(&fleet, &[Authority::Operator, Authority::LifecycleOperator], DEFAULT_ORG));
         let human = caller("operator", ActorKind::Human, Profile::Developer);
@@ -234,6 +256,29 @@ mod tests {
             &caller("operator", ActorKind::Human, Profile::Developer),
             Authority::LifecycleOperator
         ));
+    }
+
+    /// The unset-list fallback (`lifecycle_operators` defaults to
+    /// `human_identities`) grants humans only; an unattended routine under a
+    /// human's label never holds the grant, listed or not.
+    #[test]
+    fn the_lifecycle_fallback_grants_nothing_to_a_non_human_caller() {
+        let unset = Config { human_identities: vec!["operator".into()], ..Config::default() };
+        let routine = caller("operator", ActorKind::Agent, Profile::Developer);
+        let human = caller("operator", ActorKind::Human, Profile::Developer);
+        assert!(lifecycle_rule(&unset, &human), "a human, by the fallback");
+        assert!(!lifecycle_rule(&unset, &routine), "the fallback grants a routine nothing");
+        // Even when the human's label is listed explicitly.
+        let listed = Config {
+            human_identities: vec!["operator".into()],
+            lifecycle_operators: Some(vec!["operator".into(), "fleet-bot".into()]),
+            ..Config::default()
+        };
+        assert!(lifecycle_rule(&listed, &human));
+        assert!(!lifecycle_rule(&listed, &routine));
+        assert!(lifecycle_rule(&listed, &caller("fleet-bot", ActorKind::Agent, Profile::Developer)));
+        assert!(!lifecycle_rule(&unset, &caller("fleet-bot", ActorKind::Agent, Profile::Developer)));
+        assert!(!lifecycle_rule(&listed, &Caller::system()));
     }
 
     #[test]
