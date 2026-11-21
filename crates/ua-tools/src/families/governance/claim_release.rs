@@ -165,10 +165,10 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                 "at": now(),
             });
             let event =
-                ledger::append(tx, EventInput::new("agent.task.claim_released", released.clone()).by(who.clone()))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.task.claim_released", released.clone()).by(who.clone()))?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.task.updated",
                     json!({
                         "task_id": id,

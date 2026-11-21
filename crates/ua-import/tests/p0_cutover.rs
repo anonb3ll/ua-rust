@@ -215,6 +215,7 @@ fn human_coordinator() -> Caller {
         enforce_profile: true,
         session_key: Some("s-op".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -226,6 +227,7 @@ fn agent(label: &str) -> Caller {
         enforce_profile: true,
         session_key: Some("s-agent".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

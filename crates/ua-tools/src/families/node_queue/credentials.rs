@@ -170,6 +170,7 @@ fn revoke_where(
             params![id, ts, reason],
         )?;
         let mut ev = EventInput::new(
+            ua_core::DEFAULT_ORG,
             CHANNEL_REVOKED,
             json!({ "credential_id": id, "reason": reason, "actor": actor }),
         );
@@ -282,7 +283,7 @@ fn record_refused(hub: &Hub, check: &str, credential_id: Option<&str>, subject: 
         payload["credential_id"] = json!(id);
     }
     let res = hub.db().write(move |tx| {
-        ledger::append(tx, EventInput::new(CHANNEL_REFUSED, payload))?;
+        ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL_REFUSED, payload))?;
         Ok(())
     });
     if let Err(e) = res {
@@ -428,6 +429,7 @@ fn mint_tx(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             CHANNEL_MINTED,
             json!({
                 "credential_id": credential_id,

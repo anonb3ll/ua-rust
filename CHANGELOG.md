@@ -93,9 +93,53 @@ from its commit history.
   `@unified-agent/client`; not published), with workflows that typecheck,
   test and check codegen, and run the live conformance suite against a
   `ua serve` built from the commit.
+- Operations commands: `ua init` (private `$UA_HOME`, a validated
+  `config.toml`, an optional starter policy and token), `ua doctor` (read-only
+  checks of config, permissions, policy, SQLite and the ledger, with `--json`
+  and `--strict`), `ua backup` (an online snapshot, safe while `ua serve` runs)
+  and `ua restore` (verifies the backup, keeps a pre-restore copy, and needs
+  the hub stopped). `ua-store` gained `check_database`, `backup_database` and
+  `restore_database`. Docker, systemd, launchd and Litestream templates are in
+  `deploy/`, with `docs/operations.md`.
+- Zulip, off until `zulip_site`, `zulip_email` and `zulip_api_key` are set:
+  `zulip_send_message` (retired unless `zulip_retired` is turned off) and
+  `zulip_fetch_messages` (a cursor per agent, channel and topic; messages are
+  labelled untrusted). The API key is never logged, ledgered or stored.
+- Slack request signature check (v0 HMAC, five-minute window, replayed bodies
+  refused) and `slack_parse_command` for the nine coordination commands. The
+  Slack routes above build on both.
+- Callers and ledger events name their organization: `Caller.org_id` and
+  `Caller::system_for`, and `EventInput::new` takes the `org_id` first (no
+  `Default`). Every caller and every event is in the default organization;
+  nothing reads the value for authority, and no serialized output a tool
+  returns changes.
+- Organization groundwork (`docs/organization.md`, `organization.v1`): the
+  `orgs` table with one seeded `default` organization, and `org_id` and
+  `hash_v` columns on `event_log`, in the schema part `organization.v1.store`.
+  Every event belongs to `default` and keeps the existing hash form
+  (`hash_v = 1`); `org_id` is not covered by that hash yet, so it is not
+  tamper-evident. Ledger verification refuses any other `hash_v`, and the
+  store refuses to open, or append to, a ledger whose newest row has a newer
+  `hash_v` than this build writes (a rollback fence). No tool and no
+  permission changes.
+- Procedure schema parts: a part that runs a Rust function once, records its
+  version, arguments and the SQL it generated (`schema_procedures`), and
+  refuses a version or argument change under the same name. A `standalone` procedure runs outside
+  the shared migration transaction. `ua_store::org::tenant_part` builds the
+  part that gives a crate's tables `org_id` and its guard triggers.
+- A test that classifies every table for organization scoping and fails on
+  an unclassified one.
 
 ### Changed
 
+- `ua import python-hub` never copies a source `org_id` by column name, even
+  where the target has the column (`event_log`, the harness config tables).
+  Such rows are refused unless `--drop-org-scope` is given. Before this,
+  `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: a backup taken after `organization.v1.store` applied cannot be
+  restored by an earlier build, even with `--allow-newer`, because that build
+  sees `event_log` as an altered table and refuses. Older backups restore into
+  this build as before (see `docs/operations.md`).
 - Session profile names are neutral capability tiers. Older names are accepted
   only as aliases.
 - Acting as a human from the CLI requires an interactive confirmation. Each
@@ -145,6 +189,25 @@ from its commit history.
   refuses without a gateway, and without an MCP server `ua serve` warns, OAuth
   issues hub-wide tokens and does not advertise `/mcp`, and `ua mcp` exits with
   an error naming the feature.
+- Bearer and session lookups and every sign-in handler no longer block
+  runtime threads, and the cookie key is cached for up to a minute. A database
+  read that finds every pooled reader busy opens a short-lived extra reader
+  (at most four) instead of queueing behind the writer, and a panic in a read
+  no longer leaks a reader.
+- A successful read-only call made for a UI page, or for `GET /api/board` from
+  a signed-in browser session, leaves no `tool_calls` row; other callers of
+  `GET /api/board` get one summary row. `memory_search` and `memory_get` are
+  marked read-only but still record a row, because they update access
+  counters, and a failed counter update no longer fails the read.
+- `ua serve` stops on SIGTERM as well as Ctrl-C: one cancellation token stops
+  the server and the background loops, and the WAL is checkpointed on exit.
+- Canonical JSON for approval payloads, digests and fingerprints sorts keys
+  itself (`ua_core::canonical`) instead of relying on serde_json's map order.
+  The output is byte-identical to before.
+- The `/login` pages and the OAuth consent page carry no inline script or
+  style, and are covered by a content security policy.
+- The stale-worktree scan works on macOS, where it reads processes with
+  `proc_pidinfo`.
 
 ### Security
 
@@ -181,5 +244,47 @@ from its commit history.
   `argument-hint`, `model`; skills also `license`, `version` and a
   `metadata` map of plain values) with plain values; front matter that does
   not parse is refused.
+- A gate on a tool holds when a consolidated tool runs it as an action.
+  `plan_manage`, `delegation_manage`, `coordination_manage`,
+  `observability_manage`, `autonomous_cycle_manage` and `export_data` ran
+  their actions' handlers directly, so `approval_tools = ["plan_delete"]` or
+  a policy rule on `plan_delete` did not stop `plan_manage` action `delete`.
+  Such a call now passes the profile check, policy rules, approval gate and
+  prod-action check of the standalone tool too, and its approval binds what
+  a direct call binds, so one approval runs one action once through either
+  tool. An action with no standalone tool is
+  gated as `tool:action` (`plan_manage:close`) in `approval_tools` and policy
+  rules; `system_doctor` flags a key that matches nothing. Rate limits and
+  cooldowns on the standalone name count calls through the consolidated
+  tool. An unknown action is refused before the tool runs. `tool_calls`
+  gains `action_tool` (schema part `core.v4`), gateway decisions name it,
+  and approval events carry `via`. `delegation_manage` `create` is gated
+  once, as `delegate`, and can be requested ahead. `handoff` is held to
+  `delegate`'s profile entry, policy rules and approval gate (a reviewer
+  session could hand off what it may not delegate). A call with no `action`
+  is gated as the tool's default action. A `tool:action` spelling of an
+  action that has a standalone tool (`plan_manage:delete`) restricts that
+  tool in `approval_tools` and restrictive policy rules; an `allow` so
+  spelled stays literal, so no existing policy is loosened.
+  A plan object read through `platform_object_get` is also checked as
+  `plan_get`. Upgrading: an approval for `delegation_manage` `create` or for
+  `handoff` requested before the upgrade and not yet used bound the old
+  payload (the normalized request); it no longer matches and must be
+  requested and approved again, as `delegate`.
+- `POST /api/approvals/request` runs the same profile, policy and prod-action
+  checks as a tool call before it parks a request, and refuses a tool that
+  binds its own approval or marks its arguments secret (409). A payload that
+  does not match the tool's typed arguments gets 400, and one over 16 KiB gets
+  413. `agent_token_issue` and `agent_token_rotate` bind the label and a keyed
+  fingerprint of the token, never the token.
+- Releasing a task hold as its creator, and binding or unbinding a project
+  repository, need a verified identity; an unverified `actor` is no longer
+  trusted.
+- A node session credential can no longer reach memory tools, and a granted
+  tool with no narrowing rule is refused (`session_tool_unscoped`).
+- The host check covers the HTTP/2 `:authority` and absolute-form request
+  targets, so a request without a `Host` header is no longer let through.
+- Deleted elements in a planning canvas are not parsed as live shapes, and
+  canvas history is bounded by `graph_canvas_history_max_bytes` per board.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

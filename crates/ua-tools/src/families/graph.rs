@@ -423,6 +423,7 @@ async fn graph_canvas_write(ctx: ToolCtx, a: WriteArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.graph.canvas_write",
                     json!({
                         "board_id": board,
@@ -567,6 +568,7 @@ async fn graph_canvas_restore(ctx: ToolCtx, a: RestoreArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.graph.canvas_restore",
                     json!({
                         "board_id": board,

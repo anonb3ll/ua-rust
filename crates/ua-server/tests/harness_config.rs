@@ -31,6 +31,7 @@ fn as_caller(label: &str, kind: ActorKind) -> Caller {
         enforce_profile: kind != ActorKind::Human,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

@@ -565,6 +565,7 @@ async fn security_audit(ctx: ToolCtx, a: AuditArgs) -> UaResult<Value> {
                 ledger::append(
                     tx,
                     EventInput::new(
+                        ua_core::DEFAULT_ORG,
                         "agent.audit.remediated",
                         json!({ "approval_id": approval_id, "root": root, "files": files }),
                     )

@@ -1014,7 +1014,7 @@ async fn python_lint_and_format(ctx: ToolCtx, a: LintArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new("agent.python_lint.ran", event).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.python_lint.ran", event).by(by))?;
             Ok(())
         })
         .await?;

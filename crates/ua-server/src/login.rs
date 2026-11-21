@@ -288,7 +288,7 @@ async fn create_session(
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.ui.login", json!({ "identity": label, "method": method }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.ui.login", json!({ "identity": label, "method": method }))
                     .by(label.clone()),
             )?;
             Ok(())
@@ -335,7 +335,7 @@ pub fn create_login_link(hub: &Hub, label: &str, created_by: &str) -> UaResult<S
             "INSERT INTO login_links (token_hash, label, created_by, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![hash, label, by, ua_core::time::now(), ts_in(ttl)],
         )?;
-        ledger::append(tx, EventInput::new("agent.ui.login_link_created", json!({ "identity": label })).by(by.clone()))?;
+        ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.ui.login_link_created", json!({ "identity": label })).by(by.clone()))?;
         Ok(())
     })?;
     Ok(format!("{}/login/link?token={raw}", hub.cfg().public_base_url()))
@@ -689,7 +689,7 @@ async fn passkey_register_finish(
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.ui.passkey_registered", json!({ "identity": label }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.ui.passkey_registered", json!({ "identity": label }))
                     .by(label.clone()),
             )?;
             Ok(())
@@ -795,7 +795,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap, Form(f): Form
                 )?;
                 ledger::append(
                     tx,
-                    EventInput::new("agent.ui.logout", json!({ "identity": label })).by(label.clone()),
+                    EventInput::new(ua_core::DEFAULT_ORG, "agent.ui.logout", json!({ "identity": label }))
+                        .by(label.clone()),
                 )?;
                 Ok(())
             })

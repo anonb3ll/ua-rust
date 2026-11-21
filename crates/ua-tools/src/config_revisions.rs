@@ -477,6 +477,7 @@ fn record(tx: &mut WriteTx<'_>, n: NewRevision<'_>) -> UaResult<Value> {
     let event = ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             CHANNEL,
             json!({
                 "schema": 1,
@@ -1045,7 +1046,7 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
     let to = p.to_revision.or(a.to_revision);
     let document = p.document.or(a.document);
     let limit = p.limit.or(a.limit).unwrap_or(50);
-    match a.action.as_str() {
+    match crate::routes::action_of("config_revision_manage", Some(&a.action))? {
         "list" => blocking(move || list(&ctx, kind, limit, from, to)).await,
         "diff" => {
             let from = from.ok_or_else(|| bad("diff requires from_revision"))?;
@@ -1064,9 +1065,7 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
             let revision = revision.ok_or_else(|| bad("rollback requires revision"))?;
             rollback(&ctx, kind, revision).await
         }
-        other => {
-            Err(bad(format!("action must be list, diff, show, capture, commit or rollback, not {other:?}")))
-        }
+        other => Err(crate::routes::unhandled("config_revision_manage", other)),
     }
 }
 

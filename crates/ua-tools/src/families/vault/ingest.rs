@@ -138,7 +138,7 @@ async fn ingest_status(ctx: ToolCtx, a: IngestStatusArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.vault.ingest_marked",
                     json!({"path": c["path"], "content_hash": c["content_hash"], "agent": agent, "pages": pages}),
                 )

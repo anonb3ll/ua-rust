@@ -56,7 +56,10 @@ node_max_per_agent = 8
 # evidence_append_max_per_hour = 120
 # evidence_append_max_bytes_per_hour = 2097152
 
-# Tools that always need a one-time human approval.
+# Tools that always need a one-time human approval. A tool named here is
+# also gated when a consolidated tool runs it as an action (plan_delete gates
+# plan_manage action delete); an action with no standalone tool is named as
+# tool:action, for example "plan_manage:close". See docs/policy.md.
 approval_tools = ["git_merge_task"]
 
 # Programs run_cmd may start. Setting this replaces the built-in list.

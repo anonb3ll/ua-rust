@@ -9,7 +9,10 @@
 //!    request to its grant ([`grant`]),
 //! 2. checks the caller's profile exposes it (and the `action`, for
 //!    consolidated `*_manage` tools); a policy-file profile overlay may lower
-//!    an agent's profile first,
+//!    an agent's profile first. A call of a tool that dispatches on an
+//!    `action` is resolved through [`routes`]: when the action runs a
+//!    standalone tool's handler, steps 2 to 5 also apply under that tool's
+//!    name (or under `tool:action` when it has none),
 //! 3. evaluates the policy file ([`policy`]): deny, rate limit, or
 //!    require_approval, failing closed when the file cannot be loaded,
 //! 4. for always-gated (prod) tools, refuses anonymous network callers and
@@ -29,27 +32,31 @@ pub mod grant;
 pub mod hub;
 pub mod policy;
 pub mod registry;
+pub mod routes;
 pub mod sessions;
 
 pub use hub::Hub;
 pub use registry::{ApprovalRequest, HandlerGate, Registry, ToolCtx, ToolDef, tool};
 
-use ua_store::SchemaPart;
+use ua_store::{Part, SchemaPart};
 
 /// Every schema part, in application order.
-pub fn schema_parts() -> Vec<SchemaPart> {
-    let mut parts =
+pub fn schema_parts() -> Vec<Part> {
+    let mut parts: Vec<SchemaPart> =
         vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
     parts.push(ua_store::ledger::META_SCHEMA);
-    parts.extend(families::schema_parts());
-    parts.push(config_revisions::SCHEMA);
+    let mut parts = ua_store::schema::parts(&parts);
+    // `orgs`, the default organization and the ledger's organization columns.
+    parts.push(ua_store::org::STORE_PART.into());
+    parts.extend(families::schema_parts().into_iter().map(Part::from));
+    parts.push(config_revisions::SCHEMA.into());
     parts
 }
 
 /// Optional schema parts recognized by this build (applied only by optional
 /// commands such as `ua import`, not on every `Hub::open`).
-pub fn optional_schema_parts() -> Vec<SchemaPart> {
-    vec![ua_store::schema::IMPORT_SCHEMA]
+pub fn optional_schema_parts() -> Vec<Part> {
+    vec![ua_store::schema::IMPORT_SCHEMA.into()]
 }
 
 /// The full registry of built-in tools.

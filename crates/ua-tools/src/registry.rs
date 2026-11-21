@@ -14,6 +14,7 @@ use ua_store::{EventInput, ledger};
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
 use crate::policy::{self, Verdict};
+use crate::routes::Route;
 
 /// What a tool receives besides its arguments.
 #[derive(Clone)]
@@ -275,8 +276,14 @@ pub async fn page_view<F: Future>(hub: &Hub, caller: &Caller, name: &str, f: F) 
     let clock = std::time::Instant::now();
     let out = PAGE_READS.scope(scope, f).await;
     let outcome = first_failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let row =
-        Row::new(caller, name, started_at, clock.elapsed(), outcome.unwrap_or_else(|| "ok".into()), false);
+    let row = Row::new(
+        caller,
+        Recorded { tool: name, action_tool: None },
+        started_at,
+        clock.elapsed(),
+        outcome.unwrap_or_else(|| "ok".into()),
+        false,
+    );
     insert_row(hub, row).await;
     out
 }
@@ -349,22 +356,28 @@ impl Registry {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
-        let Admitted { caller, args, policy_gated, reservation } =
+        let Admitted { caller, args, policy_gated, reservation, route, route_policy_gated } =
             self.admit(hub, caller, name, args, true).await?;
         let caller = &caller;
+        let routed = route.as_ref().and_then(Route::recorded);
 
-        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if gated && !def.handler_gates(&args) {
-            let gate_args = match def.gate_payload {
-                Some(f) => f(hub.cfg(), &args),
-                None if def.secret_args => {
+        let plan =
+            self.gate_plan(hub.cfg(), def, name, &args, policy_gated, route.as_ref(), route_policy_gated);
+        if let Some(bind) = &plan.bind {
+            let gate_args = match bind.payload(hub.cfg()) {
+                Ok(p) => p,
+                Err(e) => {
                     release_reservation(hub, reservation).await;
-                    return Err(unprojected_secret(name));
+                    return Err(e);
                 }
-                None => args.clone(),
             };
-            let (h, c, n, a) = (hub.clone(), caller.clone(), name.to_string(), gate_args);
-            let outcome = match hub.db().write_async(move |tx| approvals::gate(tx, h.cfg(), &c, &n, &a)).await
+            let gate_tool = bind.name.clone();
+            let via = (gate_tool != name).then(|| name.to_string());
+            let (h, c, n, a) = (hub.clone(), caller.clone(), gate_tool.clone(), gate_args);
+            let outcome = match hub
+                .db()
+                .write_async(move |tx| approvals::gate_via(tx, h.cfg(), &c, &n, &a, via.as_deref()))
+                .await
             {
                 Ok(o) => o,
                 Err(e) => {
@@ -377,25 +390,26 @@ impl Registry {
                 GateOutcome::Pending { approval_id } => {
                     // A parked call has not run; it does not count against limits.
                     release_reservation(hub, reservation).await;
-                    return Err(UaError::ApprovalRequired { tool: name.to_string(), approval_id });
+                    return Err(UaError::ApprovalRequired { tool: gate_tool, approval_id });
                 }
                 GateOutcome::Denied { approval_id, reason } => {
                     let err = UaError::denied(
                         "approval_denied",
                         format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
                     );
-                    record_decision(hub, caller, name, &err).await;
+                    record_decision_routed(hub, caller, name, routed.as_deref(), &err, "").await;
                     release_reservation(hub, reservation).await;
                     return Err(err);
                 }
             }
         }
 
-        let page = skip_eligible(def, &args, gated, reservation);
+        let page = skip_eligible(def, &args, plan.gated, reservation);
         let ctx = ToolCtx { hub: hub.clone(), caller: caller.clone() };
         let started_at = ua_core::time::now();
         let clock = std::time::Instant::now();
         let result = (def.handler)(ctx, args).await;
+        let rec = Recorded { tool: name, action_tool: routed.as_deref() };
         match (&result, page) {
             (Ok(_), true) => {}
             (Err(e), true) => {
@@ -405,20 +419,69 @@ impl Registry {
                         .unwrap_or_else(|p| p.into_inner())
                         .get_or_insert(e.code().to_string());
                 });
-                record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation, true).await;
+                record_call(hub, caller, rec, started_at, clock.elapsed(), &result, reservation, true).await;
             }
             _ => {
-                record_call(hub, caller, name, started_at, clock.elapsed(), &result, reservation, false).await
+                record_call(hub, caller, rec, started_at, clock.elapsed(), &result, reservation, false).await
             }
         }
         result
     }
 
+    /// Which approval, if any, a call that passed [`Registry::admit`] must
+    /// hold. The consolidated tool's own gates (its `always_gated` flag, a
+    /// policy `require_approval` on its name, `approval_tools`) apply as
+    /// always. For a routed call the gates of the action's own name apply
+    /// too: the standalone tool's `always_gated` flag, a policy rule and an
+    /// `approval_tools` entry for it (or for `tool:action`). When both
+    /// apply, one approval covers the call, bound as a direct call of the
+    /// standalone tool would bind it, so a human approves the action itself
+    /// whichever door reached it and is asked once.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_plan<'a>(
+        &'a self,
+        cfg: &ua_core::Config,
+        def: &'a ToolDef,
+        name: &str,
+        args: &'a Value,
+        policy_gated: bool,
+        route: Option<&'a Route>,
+        route_policy_gated: bool,
+    ) -> GatePlan<'a> {
+        let listed = |t: &str| crate::routes::listed(cfg, t);
+        let door_gated = def.always_gated || policy_gated || listed(name);
+        let mut key_gated = false;
+        let mut bind = None;
+        if let Some(r) = route
+            && let Some(key) = r.gate_name()
+        {
+            let standalone = r.standalone().and_then(|s| self.tools.get(s));
+            key_gated = route_policy_gated || listed(&key) || standalone.is_some_and(|d| d.always_gated);
+            // The standalone tool's handler may gate itself, as on a direct
+            // call; an own key follows the consolidated tool's flags.
+            let (bdef, bargs) = match standalone {
+                Some(d) => (d, &r.args),
+                None => (def, args),
+            };
+            // An own action whose handler always asks a human itself takes
+            // that one approval only.
+            if key_gated && !bdef.handler_gates(bargs) && !r.handler_gated() {
+                bind = Some(Bind { name: key, def: bdef, args: bargs });
+            }
+        }
+        if bind.is_none() && door_gated && !def.handler_gates(args) {
+            bind = Some(Bind { name: name.to_string(), def, args });
+        }
+        GatePlan { gated: door_gated || key_gated, bind }
+    }
+
     /// What an approval requested ahead of a call (`POST
     /// /api/approvals/request`) may bind: the same grant, profile, policy
-    /// and prod-action checks as [`Registry::call`], then the payload the
-    /// call's own gate would bind (the tool's `gate_payload` projection, so a
-    /// secret value is never parked). Nothing runs and no call is reserved.
+    /// and prod-action checks as [`Registry::call`], then the tool and
+    /// payload the call's own gate would bind (the `gate_payload`
+    /// projection, so a secret value is never parked; for a routed call,
+    /// the standalone tool's name and payload, see [`crate::routes`]).
+    /// Nothing runs and no call is reserved.
     ///
     /// A tool that evaluates its gate in its handler binds values only the
     /// handler resolves, so it cannot be requested ahead and answers
@@ -434,22 +497,34 @@ impl Registry {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
-        let Admitted { args, policy_gated, .. } = self.admit(hub, caller, name, args, false).await?;
-        let gated = def.always_gated || policy_gated || hub.cfg().approval_tools.iter().any(|t| t == name);
-        if !gated {
+        let Admitted { args, policy_gated, route, route_policy_gated, .. } =
+            self.admit(hub, caller, name, args, false).await?;
+        let plan =
+            self.gate_plan(hub.cfg(), def, name, &args, policy_gated, route.as_ref(), route_policy_gated);
+        if !plan.gated {
             return Ok(ApprovalRequest::NotGated);
         }
-        if def.handler_decides(&args) {
+        let standalone =
+            route.as_ref().and_then(|r| r.standalone().and_then(|s| self.tools.get(s)).zip(Some(r)));
+        // An own `tool:action` key the registry binds is requestable: it is
+        // exactly what the call parks first. Otherwise a handler that may
+        // gate decides on values only it resolves.
+        let own_bind = route.as_ref().zip(plan.bind.as_ref()).is_some_and(|(r, b)| {
+            r.target == crate::routes::Target::Own && r.gate_name().as_deref() == Some(b.name.as_str())
+        });
+        if !own_bind
+            && (def.handler_decides(&args) || standalone.is_some_and(|(d, r)| d.handler_decides(&r.args)))
+        {
             return Ok(ApprovalRequest::GatesInHandler);
         }
         // The arguments must be a call the tool would accept: what a human
         // approves is exactly what can run.
         def.check_args(&args)?;
-        Ok(ApprovalRequest::Payload(match def.gate_payload {
-            Some(f) => f(hub.cfg(), &args),
-            None if def.secret_args => return Err(unprojected_secret(name)),
-            None => args,
-        }))
+        if let Some((d, r)) = standalone {
+            d.check_args(&r.args)?;
+        }
+        let Some(bind) = plan.bind else { return Ok(ApprovalRequest::GatesInHandler) };
+        Ok(ApprovalRequest::Payload { tool: bind.name.clone(), payload: bind.payload(hub.cfg())? })
     }
 
     /// Every check before the approval gate: the session grant, the profile
@@ -457,6 +532,11 @@ impl Registry {
     /// tool, the prod-action identity check. With `reserve`, the policy
     /// verdict and a `tool_calls` reservation are taken in one write
     /// transaction; without, the policy is evaluated on a read.
+    ///
+    /// A call of a tool that dispatches on an `action` is resolved with
+    /// [`crate::routes::route`] after the grant: the profile, the policy
+    /// rules and the prod-action check then also apply under the action's
+    /// own name (see [`Route::gate_name`]), on the action's arguments.
     async fn admit(
         &self,
         hub: &Hub,
@@ -498,6 +578,13 @@ impl Registry {
             None => args,
         };
 
+        // Which action of a consolidated tool this is. An action the routing
+        // table does not know never runs (refused after the profile check of
+        // the tool itself, so a hidden tool reads as hidden).
+        let route_res = crate::routes::route(name, &args);
+        let routed = route_res.as_ref().ok().and_then(Option::as_ref).and_then(Route::recorded);
+        let routed = routed.as_deref();
+
         // The policy file is read once per call (cached by mtime). A file that
         // cannot be loaded refuses the call below, after the profile check.
         let loaded = hub.cfg().policy_file.as_deref().map(policy::load);
@@ -522,50 +609,81 @@ impl Registry {
                     "profile_denied",
                     format!("tool {name} is not available to profile {}", caller.profile),
                 );
-                record_decision(hub, &caller, name, &err).await;
+                record_decision_routed(hub, &caller, name, routed, &err, "").await;
                 return Err(err);
             }
-            if let Some(action) = args.get("action").and_then(Value::as_str)
+            if let Some(action) = profile_action(name, &args)
                 && !caller.profile.allows_action(name, action)
             {
                 let err = UaError::denied(
                     "action_denied",
                     format!("action {action} of {name} is not available to profile {}", caller.profile),
                 );
-                record_decision(hub, &caller, name, &err).await;
+                record_decision_routed(hub, &caller, name, routed, &err, "").await;
+                return Err(err);
+            }
+        }
+        let route = route_res?;
+        if caller.enforce_profile {
+            // The action runs a standalone tool's handler: the profile must
+            // allow that tool too (or grant it as an action).
+            if let Some(r) = &route
+                && let Some(standalone) = r.standalone()
+                && !caller.profile.allows_routed(standalone)
+            {
+                let err = UaError::denied(
+                    "profile_denied",
+                    format!(
+                        "action {} of {name} runs tool {standalone}, which is not available to profile {}",
+                        r.action, caller.profile
+                    ),
+                );
+                record_decision_routed(hub, &caller, name, routed, &err, "").await;
                 return Err(err);
             }
         }
 
         let mut policy_gated = false;
+        let mut route_policy_gated = false;
         let mut reservation: Option<i64> = None;
         match loaded {
             None => {}
             Some(Err(reason)) => {
                 let err =
                     UaError::denied("policy_unavailable", format!("policy gate failed closed: {reason}"));
-                record_decision_rule(hub, &caller, name, &err, "").await;
+                record_decision_routed(hub, &caller, name, routed, &err, "").await;
                 return Err(err);
             }
             Some(Ok(p)) => {
                 // Evaluate and reserve the `tool_calls` row in one write
                 // transaction. The single writer serializes concurrent calls,
                 // so rate limits and cooldowns count calls still in flight.
+                // A routed call is evaluated under its own name too, on the
+                // action's arguments; either refusal refuses it.
                 let (c, n, a) = (caller.clone(), name.to_string(), args.clone());
+                let key = route.as_ref().and_then(|r| r.gate_name().map(|k| (k, r.args.clone())));
+                let rec = routed.map(str::to_string);
+                let eval = move |conn: &rusqlite::Connection| -> Result<(Verdict, Verdict), policy::Refusal> {
+                    let door = policy::evaluate(conn, &p, &c, &n, &a)?;
+                    let own = match &key {
+                        Some((k, ka)) => policy::evaluate_routed(conn, &p, &c, k, ka)?,
+                        None => Verdict::Allow,
+                    };
+                    Ok((door, own))
+                };
                 let verdict = if reserve {
+                    let (c, n) = (caller.clone(), name.to_string());
                     hub.db()
-                        .write_async(move |tx| match policy::evaluate(tx, &p, &c, &n, &a) {
+                        .write_async(move |tx| match eval(tx) {
                             Ok(v) => {
-                                let id = reserve_call(tx, &c, &n)?;
+                                let id = reserve_call(tx, &c, &n, rec.as_deref())?;
                                 Ok(Ok((v, Some(id))))
                             }
                             Err(r) => Ok(Err(r)),
                         })
                         .await
                 } else {
-                    hub.db()
-                        .read_async(move |c2| Ok(policy::evaluate(c2, &p, &c, &n, &a).map(|v| (v, None))))
-                        .await
+                    hub.db().read_async(move |c2| Ok(eval(c2).map(|v| (v, None)))).await
                 }
                 .unwrap_or_else(|e| {
                     Err(policy::Refusal {
@@ -577,28 +695,77 @@ impl Registry {
                     })
                 });
                 match verdict {
-                    Ok((Verdict::Allow, id)) => reservation = id,
-                    Ok((Verdict::RequireApproval(_), id)) => {
+                    Ok(((door, own), id)) => {
                         reservation = id;
-                        policy_gated = true;
+                        policy_gated = matches!(door, Verdict::RequireApproval(_));
+                        route_policy_gated = matches!(own, Verdict::RequireApproval(_));
                     }
                     Err(refusal) => {
-                        record_decision_rule(hub, &caller, name, &refusal.error, &refusal.rule).await;
+                        record_decision_routed(hub, &caller, name, routed, &refusal.error, &refusal.rule)
+                            .await;
                         return Err(refusal.error);
                     }
                 }
             }
         }
 
-        if def.always_gated
-            && let Err(refusal) = policy::check_prod_action(hub.cfg(), &caller, name)
-        {
-            record_decision_rule(hub, &caller, name, &refusal.error, &refusal.rule).await;
-            release_reservation(hub, reservation).await;
-            return Err(refusal.error);
+        // The prod-action identity check, for the tool called and for an
+        // always-gated standalone tool a routed action runs.
+        let standalone_always = route
+            .as_ref()
+            .and_then(Route::standalone)
+            .and_then(|s| self.tools.get(s))
+            .filter(|d| d.always_gated)
+            .map(|d| d.name);
+        for prod in def.always_gated.then_some(name).into_iter().chain(standalone_always) {
+            if let Err(refusal) = policy::check_prod_action(hub.cfg(), &caller, prod) {
+                record_decision_routed(hub, &caller, name, routed, &refusal.error, &refusal.rule).await;
+                release_reservation(hub, reservation).await;
+                return Err(refusal.error);
+            }
         }
 
-        Ok(Admitted { caller, args, policy_gated, reservation })
+        Ok(Admitted { caller, args, policy_gated, reservation, route, route_policy_gated })
+    }
+}
+
+/// The approval one call must hold (see [`Registry::gate_plan`]).
+struct GatePlan<'a> {
+    /// Some approval gate applies (the call is not skip-eligible).
+    gated: bool,
+    /// What the registry gate binds; `None` when nothing is gated or a
+    /// handler gates the call itself.
+    bind: Option<Bind<'a>>,
+}
+
+/// The tool name an approval binds, and the definition and arguments whose
+/// projection is its payload.
+struct Bind<'a> {
+    name: String,
+    def: &'a ToolDef,
+    args: &'a Value,
+}
+
+impl Bind<'_> {
+    fn payload(&self, cfg: &ua_core::Config) -> UaResult<Value> {
+        match self.def.gate_payload {
+            Some(f) => Ok(f(cfg, self.args)),
+            None if self.def.secret_args => Err(unprojected_secret(&self.name)),
+            None => Ok(self.args.clone()),
+        }
+    }
+}
+
+/// The action a profile's action allow-list is checked against: the
+/// `action` as the caller wrote it (the lists name actions that way, e.g.
+/// `plan_create` for `plan_manage`), or, when the call names none (absent or
+/// `null`), the tool's default action, which is what the call runs (see
+/// [`crate::routes::action_of`]). `None` for a tool with no action.
+fn profile_action<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    match args.get("action") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        None | Some(Value::Null) => crate::routes::manager(name).and_then(|m| m.default_action),
+        Some(_) => None,
     }
 }
 
@@ -621,13 +788,19 @@ struct Admitted {
     policy_gated: bool,
     /// The reserved `tool_calls` row, when a policy was evaluated.
     reservation: Option<i64>,
+    /// The action of a consolidated tool, resolved.
+    route: Option<Route>,
+    /// A policy `require_approval` rule matched the action's own name.
+    route_policy_gated: bool,
 }
 
 /// What [`Registry::approval_request`] found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApprovalRequest {
-    /// The approval would bind this payload.
-    Payload(Value),
+    /// The approval would bind this payload under this tool name (the tool
+    /// called, or the standalone tool or `tool:action` key a consolidated
+    /// tool's action is gated as).
+    Payload { tool: String, payload: Value },
     /// No rule gates the call, so there is nothing to approve.
     NotGated,
     /// The tool evaluates its gate in its handler on values it resolves;
@@ -638,6 +811,9 @@ pub enum ApprovalRequest {
 /// One `tool_calls` row (no arguments, no results).
 struct Row {
     tool: String,
+    /// For a call of a consolidated tool, the standalone tool (or
+    /// `tool:action` key) its action ran.
+    action_tool: Option<String>,
     caller: String,
     profile: String,
     transport: String,
@@ -650,14 +826,15 @@ struct Row {
 impl Row {
     fn new(
         caller: &Caller,
-        tool: &str,
+        tool: Recorded<'_>,
         started_at: String,
         elapsed: std::time::Duration,
         outcome: String,
         page: bool,
     ) -> Self {
         Self {
-            tool: tool.to_string(),
+            tool: tool.tool.to_string(),
+            action_tool: tool.action_tool.map(str::to_string),
             caller: caller.label.clone(),
             profile: caller.profile.as_str().to_string(),
             transport: transport_name(caller),
@@ -674,8 +851,8 @@ async fn insert_row(hub: &Hub, row: Row) {
         .db()
         .write_async(move |tx| {
             tx.execute(
-                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, page) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, page, \
+                 action_tool) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     row.tool,
                     row.caller,
@@ -684,7 +861,8 @@ async fn insert_row(hub: &Hub, row: Row) {
                     row.started_at,
                     row.duration_ms,
                     row.outcome,
-                    row.page
+                    row.page,
+                    row.action_tool
                 ],
             )?;
             Ok(())
@@ -702,7 +880,7 @@ async fn insert_row(hub: &Hub, row: Row) {
 async fn record_call(
     hub: &Hub,
     caller: &Caller,
-    tool: &str,
+    tool: Recorded<'_>,
     started_at: String,
     elapsed: std::time::Duration,
     result: &UaResult<Value>,
@@ -730,6 +908,14 @@ async fn record_call(
     }
 }
 
+/// The names one `tool_calls` row records: the tool called, and the action
+/// a consolidated tool ran.
+#[derive(Clone, Copy)]
+struct Recorded<'a> {
+    tool: &'a str,
+    action_tool: Option<&'a str>,
+}
+
 async fn record_decision(hub: &Hub, caller: &Caller, tool: &str, err: &UaError) {
     record_decision_rule(hub, caller, tool, err, "").await
 }
@@ -737,6 +923,20 @@ async fn record_decision(hub: &Hub, caller: &Caller, tool: &str, err: &UaError) 
 /// Append an `agent.gateway.decision` deny event. `rule` names the policy
 /// rule that fired; it is empty for profile and approval refusals.
 pub(crate) async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str, err: &UaError, rule: &str) {
+    record_decision_routed(hub, caller, tool, None, err, rule).await
+}
+
+/// [`record_decision_rule`] for a call of a consolidated tool: the event
+/// names the tool called (`tool`) and the action it would have run
+/// (`action_tool`: the standalone tool or `tool:action` key).
+async fn record_decision_routed(
+    hub: &Hub,
+    caller: &Caller,
+    tool: &str,
+    action_tool: Option<&str>,
+    err: &UaError,
+    rule: &str,
+) {
     let reason_code = match err {
         UaError::Denied { reason_code, .. } => reason_code.clone(),
         other => other.code().to_string(),
@@ -751,11 +951,17 @@ pub(crate) async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str,
     if !rule.is_empty() {
         payload["rule"] = json!(rule);
     }
+    if let Some(a) = action_tool {
+        payload["action_tool"] = json!(a);
+    }
     let originator = caller.label.clone();
     let res = hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new("agent.gateway.decision", payload).by(originator))?;
+            ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.gateway.decision", payload).by(originator),
+            )?;
             Ok(())
         })
         .await;
@@ -773,16 +979,22 @@ fn transport_name(caller: &Caller) -> String {
 
 /// Insert an in-flight `tool_calls` row (outcome `running`) so policy limits
 /// see calls that have not finished yet. Returns its id.
-fn reserve_call(tx: &rusqlite::Transaction<'_>, caller: &Caller, tool: &str) -> rusqlite::Result<i64> {
+fn reserve_call(
+    tx: &rusqlite::Transaction<'_>,
+    caller: &Caller,
+    tool: &str,
+    action_tool: Option<&str>,
+) -> rusqlite::Result<i64> {
     tx.execute(
-        "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'running')",
+        "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, action_tool) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'running', ?6)",
         rusqlite::params![
             tool,
             caller.label,
             caller.profile.as_str(),
             transport_name(caller),
-            ua_core::time::now()
+            ua_core::time::now(),
+            action_tool
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -800,5 +1012,41 @@ async fn release_reservation(hub: &Hub, reservation: Option<i64>) {
         .await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "could not release a tool_calls reservation");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use ua_core::Profile;
+
+    use super::profile_action;
+
+    #[test]
+    fn a_call_with_no_action_is_filtered_as_the_default_action() {
+        // Absent and null are the default action; a written action is as
+        // written; a tool without actions has none.
+        assert_eq!(profile_action("oauth_device_manage", &json!({})), Some("list"));
+        assert_eq!(profile_action("oauth_device_manage", &json!({ "action": null })), Some("list"));
+        assert_eq!(profile_action("config_revision_manage", &json!({})), Some("list"));
+        assert_eq!(profile_action("mcp_gateway", &json!({})), Some("call"));
+        assert_eq!(profile_action("node_config", &json!({})), Some("get"));
+        assert_eq!(profile_action("oauth_device_manage", &json!({ "action": "revoke" })), Some("revoke"));
+        assert_eq!(profile_action("plan_manage", &json!({ "action": "plan_create" })), Some("plan_create"));
+        assert_eq!(profile_action("plan_manage", &json!({})), None, "no default: route() refuses it");
+        assert_eq!(profile_action("task_add", &json!({})), None);
+        // So an allow-list that excludes the default refuses a call naming
+        // none, as it refuses one naming the default. No shipped allow-list
+        // profile sees a default-action tool, so this is the filter itself:
+        // research sees plan_manage and lists `plan_create` but not `list`.
+        let filter = |p: Profile, tool: &str, args: serde_json::Value| {
+            profile_action(tool, &args).is_none_or(|a| p.allows_action(tool, a))
+        };
+        assert!(!filter(Profile::Research, "plan_manage", json!({ "action": "list" })));
+        assert!(filter(Profile::Research, "plan_manage", json!({ "action": "plan_create" })));
+        for tool in ["oauth_device_manage", "config_revision_manage", "mcp_gateway", "node_config"] {
+            assert!(!filter(Profile::Research, tool, json!({})), "{tool}");
+            assert!(filter(Profile::Coordinator, tool, json!({})), "{tool}");
+        }
     }
 }

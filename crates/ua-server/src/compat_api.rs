@@ -15,9 +15,10 @@
 //! | `GET  /api/capability-catalog` | the registry, grouped by family |
 //! | `GET  /api/board` | `task_list`, `dependency_list`, `delegate_list` |
 //!
-//! `/api/nodes/*` (node acceptance and discovered sessions) is not built yet
-//! and answers `501` with `{"error": "not_implemented", "capability": ...}`.
-//! `GET /api/nodes` itself is served by [`crate::node_api`]; runs, platform
+//! `/api/nodes/*` paths other than the ones [`crate::node_api`] serves
+//! (discovered native sessions) are not built yet and answer `501` with
+//! `{"error": "not_implemented", "capability": ...}`. `GET /api/nodes` and
+//! `GET /api/nodes/acceptance` are served by [`crate::node_api`]; runs, platform
 //! objects, evidence and work products by [`crate::platform_api`].
 //!
 //! Writes go through [`ua_tools::Registry::call`] with the request's caller,
@@ -669,8 +670,10 @@ async fn approval_request(
     // profile, policy rules, prod-action identity), then the payload its gate
     // would bind: a `gate_payload` projection, never the raw arguments, so a
     // secret value is not parked in the approvals table.
-    let payload = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
-        Ok(ApprovalRequest::Payload(p)) => p,
+    // A consolidated tool's action is requested under the name its gate binds
+    // (the standalone tool, or `tool:action`), as the call itself would park it.
+    let (tool, payload) = match state.registry.approval_request(&state.hub, &caller, &tool, payload).await {
+        Ok(ApprovalRequest::Payload { tool, payload }) => (tool, payload),
         Err(e) if e.reason_code() == Some("secret_args_unprojected") => {
             return (
                 StatusCode::CONFLICT,

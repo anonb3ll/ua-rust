@@ -1,9 +1,64 @@
 # Organization model
 
-Status: **design, not implemented.** This document is the review gate for the
-`organization.*` schema parts and the `ua-org` crate. Nothing here is in the
-tree yet. Its companion is `docs/memory.md` (PR #40), which relies on the
-decisions recorded here for memory columns, owners and defaults.
+Status: **design, first infrastructure in the tree.** This document is the
+review gate for the `organization.*` schema parts and the `ua-org` crate. Its
+companion is `docs/memory.md` (PR #40), which relies on the decisions recorded
+here for memory columns, owners and defaults.
+
+`organization.v1` lands in several PRs rather than one. What is in the tree:
+
+- The `Procedure` part kind with `version` refusal and the `standalone` flag
+  ([Schema](#schema)). It departs from the wording below in one way:
+  `SchemaPart` stays the static kind, unchanged, and both kinds convert into
+  a `Part` that `schema::apply` takes, so existing static parts did not
+  change. A procedure's generated SQL is stored in a `schema_procedures`
+  table, created with the first procedure that runs, rather than in a column
+  of `schema_parts`, so an older database and an older backup keep exactly
+  the objects they had.
+- `organization.v1.store`: `orgs` (created without `IF NOT EXISTS`, so a
+  database holding another `orgs` table refuses the part), the seed, and
+  `event_log.org_id` and `event_log.hash_v`. Every row is written with
+  `hash_v = 1`, the nine-field form, which does **not** cover `org_id`: until
+  rows are written with `hash_v = 2`, a row's `org_id` can be changed without
+  `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
+- `ua_store::org::tenant_part`. It takes the full part name
+  (`organization.v1.<crate>`) rather than the owner alone, so the part stays a
+  constant. No table uses it yet.
+- `ua_core::DEFAULT_ORG`.
+- The importer exclusion: `org_id` is never mapped by column name.
+- The classification test (`crates/ua-tools/tests/org_classification.rs`,
+  until `ua-org` exists). It uses the classes in
+  [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
+  as a hub table. **The test is the authority on classification**; the table
+  in that section is a copy kept in step with it. Two temporary relaxations
+  may only shrink: the tenant tables still missing `org_id` (all 68 today,
+  frozen as a baseline that a new table cannot join), and the grant tables
+  `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
+- The procedure checksum covers the part's name, `version` and arguments,
+  so a table added to a released tenant part is refused, not skipped.
+- A rollback fence: opening the store, and every append, refuses a ledger
+  whose newest row has a `hash_v` above the build's.
+
+- `Caller.org_id` (always `DEFAULT_ORG`; a serialized caller without it
+  reads as the default) and `Caller::system_for(org_id)`, with
+  `Caller::system()` in the default organization. A source test
+  (`crates/ua-core/tests/org_guard.rs`, over every crate's non-test source)
+  fails if a `Caller` literal, an `EventInput`, or an `.org_id =`
+  assignment names any organization but `DEFAULT_ORG` (a caller's
+  organization included), or if anything calls `system_for`, before
+  memberships exist.
+- `EventInput::new(org_id, …)` with `Default` removed, so every event names
+  its organization; every site passes `ua_core::DEFAULT_ORG`, the
+  organization of the affected row, never the caller's. `append` writes
+  `org_id` and `hash_v` explicitly, and refuses an organization `orgs` does
+  not hold. On a ledger from before
+  `organization.v1.store` (an older backup just restored) it writes the old
+  row shape, and refuses any organization other than the default rather than
+  drop it. `org_id` is still not covered by the hash.
+
+Not yet: the tenant parts, the label and launch-key indexes, the
+`memory_versions_capture` trigger, `hash_v = 2`, and everything after
+`organization.v1`.
 
 ## Decision
 
@@ -411,9 +466,9 @@ backfills for exactly the listed tables, so the rules are written once.
 | Kind | Body | Checksum covers |
 |---|---|---|
 | `Static` | a `&'static str` of SQL | that SQL, as today |
-| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name and the `version` |
+| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name, the `version` and the procedure's static arguments (for a tenant part, its table list) |
 
-An applied procedure is checked by name and `version` only, because the SQL it
+An applied procedure is checked by name, `version` and arguments only, because the SQL it
 generates may depend on the database it ran on; that generated SQL is stored
 beside the checksum for audit and is never regenerated or compared on later
 starts. A procedure that changes must bump its `version`, which makes it a new
@@ -1076,7 +1131,9 @@ escaped text.
 ## Scoping per subsystem
 
 Every table is classified, and a test over `sqlite_master` fails on any table
-missing from `ua-org`'s classification list. For every **tenant** table it also
+missing from `ua-org`'s classification list. That list (today in
+`crates/ua-tools/tests/org_classification.rs`) is the authority; the table
+below is kept in step with it. For every **tenant** table it also
 checks, through `PRAGMA table_info`, that `org_id` exists and is `NOT NULL`,
 and that its `org_exists` and `org_immutable` triggers exist.
 

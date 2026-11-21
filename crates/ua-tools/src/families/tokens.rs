@@ -329,8 +329,12 @@ async fn issue(ctx: ToolCtx, a: IssueArgs) -> UaResult<Value> {
                 insert_token(tx, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), None)?;
             ledger::append(
                 tx,
-                EventInput::new("agent.token.issued", json!({ "agent": label, "token_id": id }))
-                    .by(by.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.token.issued",
+                    json!({ "agent": label, "token_id": id }),
+                )
+                .by(by.clone()),
             )?;
             Ok(json!({
                 "ok": true,
@@ -376,6 +380,7 @@ async fn rotate(ctx: ToolCtx, a: RotateArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.token.rotated",
                     json!({ "agent": label, "previous_token_id": previous, "new_token_id": id }),
                 )
@@ -460,7 +465,7 @@ pub fn revoke_family(tx: &rusqlite::Transaction<'_>, family_id: &str, reason: &s
 }
 
 async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
-    match a.action.trim() {
+    match crate::routes::action_of("oauth_device_manage", Some(&a.action))? {
         "list" => {
             let sessions = ctx.hub.db().read_async(list_oauth_sessions).await?;
             Ok(json!({
@@ -516,7 +521,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                     }
                     ledger::append(
                         tx,
-                        EventInput::new(
+                        EventInput::new(ua_core::DEFAULT_ORG,
                             "agent.oauth.sessions_revoked",
                             json!({ "session_id": session_id, "identity": identity, "sessions": families.len() }),
                         )
@@ -531,7 +536,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                 })
                 .await
         }
-        other => Err(UaError::invalid(format!("action must be list or revoke, not {other:?}"))),
+        other => Err(crate::routes::unhandled("oauth_device_manage", other)),
     }
 }
 

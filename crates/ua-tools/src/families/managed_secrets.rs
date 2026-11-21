@@ -294,6 +294,7 @@ pub(crate) fn orphan_consumer(
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "managed_secret.deleted",
                 json!({ "name": name, "consumer": consumer, "approval_id": approval_id, "reason": why }),
             )
@@ -422,7 +423,7 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
             let replaced = prior.is_some();
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "managed_secret.set",
                     json!({ "name": name, "consumer": consumer, "replaced": replaced, "approval_id": approval_id }),
                 )
@@ -525,6 +526,7 @@ async fn managed_secret_delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "managed_secret.deleted",
                     json!({ "name": name, "consumer": consumer, "approval_id": approval_id }),
                 )

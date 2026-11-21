@@ -131,7 +131,7 @@ fn record(tx: &mut WriteTx<'_>, who: &str, mut payload: Value) -> UaResult<()> {
     payload["kind"] = json!("task.hold");
     payload["actor"] = json!(who);
     payload["at"] = json!(now());
-    ledger::append(tx, EventInput::new(CHANNEL, payload).by(who.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(who.to_string()))?;
     Ok(())
 }
 

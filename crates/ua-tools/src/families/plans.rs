@@ -148,7 +148,7 @@ pub(crate) fn parse_params<T: DeserializeOwned>(
 }
 
 pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(channel, payload).by(caller.label.clone()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
 
@@ -1298,7 +1298,7 @@ fn edit(ctx: &ToolCtx, a: EditArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // The consolidated entry point and registration.
 
-const ACTIONS: [&str; 16] = [
+pub(crate) const ACTIONS: [&str; 16] = [
     "create",
     "update",
     "get",
@@ -1354,7 +1354,7 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
         "step_remove" => step_remove(ctx, parse_params("plan", act, p)?),
         "step_reorder" => step_reorder(ctx, parse_params("plan", act, p)?),
         "edit" => edit(ctx, parse_params("plan", act, p)?),
-        other => Err(UaError::invalid(format!("unknown plan action {other:?}"))),
+        other => Err(crate::routes::unhandled("plan_manage", other)),
     }
 }
 

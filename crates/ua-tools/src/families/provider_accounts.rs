@@ -221,7 +221,7 @@ fn future(ts: Option<&str>) -> bool {
 
 fn record(tx: &mut WriteTx<'_>, kind: &str, mut payload: Value, by: &str) -> UaResult<()> {
     payload["kind"] = json!(kind);
-    ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string()))?;
     Ok(())
 }
 

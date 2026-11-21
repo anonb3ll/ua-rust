@@ -1153,19 +1153,17 @@ pub struct ManageArgs {
 }
 
 async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
     let fam = "autonomous_cycle_manage";
-    match action.as_str() {
-        "start" => start(ctx, parse_params(fam, &action, a.params)?).await,
-        "get" => get(ctx, parse_params(fam, &action, a.params)?).await,
-        "get_for_task" => get_for_task(ctx, parse_params(fam, &action, a.params)?).await,
-        "transition" => transition(ctx, parse_params(fam, &action, a.params)?).await,
-        "kill" => kill(ctx, parse_params(fam, &action, a.params)?).await,
-        "record_usage" => record_usage(ctx, parse_params(fam, &action, a.params)?).await,
-        "list" => list(ctx, parse_params(fam, &action, a.params)?).await,
-        other => Err(UaError::invalid(format!(
-            "action must be one of start, get, get_for_task, transition, kill, record_usage, list; not {other:?}"
-        ))),
+    let action = crate::routes::action_of(fam, Some(&a.action))?;
+    match action {
+        "start" => start(ctx, parse_params(fam, action, a.params)?).await,
+        "get" => get(ctx, parse_params(fam, action, a.params)?).await,
+        "get_for_task" => get_for_task(ctx, parse_params(fam, action, a.params)?).await,
+        "transition" => transition(ctx, parse_params(fam, action, a.params)?).await,
+        "kill" => kill(ctx, parse_params(fam, action, a.params)?).await,
+        "record_usage" => record_usage(ctx, parse_params(fam, action, a.params)?).await,
+        "list" => list(ctx, parse_params(fam, action, a.params)?).await,
+        other => Err(crate::routes::unhandled(fam, other)),
     }
 }
 

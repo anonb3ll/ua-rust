@@ -169,7 +169,7 @@ const MAX_DESCRIPTION: usize = 1024;
 
 fn record(tx: &mut WriteTx<'_>, kind: &str, mut payload: Value, by: &str) -> UaResult<()> {
     payload["kind"] = json!(kind);
-    ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string()))?;
     Ok(())
 }
 
@@ -989,11 +989,11 @@ fn commit_applied(
 
 async fn node_config(ctx: ToolCtx, a: NodeConfigArgs) -> UaResult<Value> {
     device_agent(&ctx.caller)?;
-    let action = a.action.clone().unwrap_or_else(|| "get".into());
+    let action = crate::routes::action_of("node_config", a.action.as_deref())?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let agent = caller.label.clone();
     let db = ctx.hub.db();
-    match action.as_str() {
+    match action {
         "get" => db.read_async(move |c| get_payload(c, &hub, &agent, &a.node)).await,
         "report" => {
             let (h, ag) = (hub.clone(), agent.clone());
@@ -1018,7 +1018,7 @@ async fn node_config(ctx: ToolCtx, a: NodeConfigArgs) -> UaResult<Value> {
                 )),
             }
         }
-        _ => Err(UaError::invalid("action must be 'get', 'report', or 'applied'")),
+        other => Err(crate::routes::unhandled("node_config", other)),
     }
 }
 

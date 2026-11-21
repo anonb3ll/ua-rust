@@ -22,6 +22,7 @@ fn caller(label: &str, kind: ActorKind) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -134,6 +135,7 @@ impl H {
             enforce_profile: true,
             session_key: None,
             transport: Transport::Mcp,
+            org_id: ua_core::DEFAULT_ORG.into(),
         };
         grant::scope(Some(Arc::new(v.grant.clone())), self.reg.call(&self.hub, &c, tool, args)).await
     }

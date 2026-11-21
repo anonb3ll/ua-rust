@@ -200,7 +200,7 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "project.repo.bound",
                     json!({ "project": project, "repo": repo, "default_branch": branch, "bound_by": who }),
                 )
@@ -222,8 +222,12 @@ pub(crate) async fn project_repo_unbind(ctx: ToolCtx, a: UnbindArgs) -> UaResult
             tx.execute("DELETE FROM project_repo_bindings WHERE project = ?1", [&project])?;
             ledger::append(
                 tx,
-                EventInput::new("project.repo.unbound", json!({ "project": project, "previous": previous }))
-                    .by(who.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "project.repo.unbound",
+                    json!({ "project": project, "previous": previous }),
+                )
+                .by(who.clone()),
             )?;
             Ok(json!({ "unbound": previous.is_some(), "previous": previous }))
         })

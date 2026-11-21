@@ -36,7 +36,9 @@ fn append(hub: &TestHub, channel: &str, i: usize) -> i64 {
     hub.state
         .hub
         .db()
-        .write(|tx| ledger::append(tx, EventInput::new(channel, json!({ "i": i })).by("tester")))
+        .write(|tx| {
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, json!({ "i": i })).by("tester"))
+        })
         .unwrap()
         .unwrap()
         .seq
@@ -225,7 +227,11 @@ fn revoke_tokens(hub: &TestHub, label: &str) {
                 "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 WHERE agent_label = ?1",
                 rusqlite::params![label, ua_core::time::now()],
             )?;
-            ledger::append(tx, EventInput::new("agent.token.revoked", json!({ "agent": label })).by("cli"))?;
+            ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.token.revoked", json!({ "agent": label }))
+                    .by("cli"),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -438,6 +444,7 @@ async fn approval_detail_agrees_with_the_resolve_check() {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let id =
         match hub.state.registry.call(&hub.state.hub, &builder, "task_add", json!({ "title": "x" })).await {
@@ -680,6 +687,7 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
         enforce_profile: false,
         session_key: None,
         transport: Transport::Internal,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     reg.call(
         &hub.state.hub,

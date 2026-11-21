@@ -130,6 +130,7 @@ async fn deliver(
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": name, "path": rel, "rows": rows, "bytes": bytes }),
                 )
@@ -1018,6 +1019,7 @@ async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Va
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": "migration-manifest", "path": path, "rows": rows, "bytes": bytes }),
                 )
@@ -1552,11 +1554,11 @@ fn inner_params(params: Option<Value>) -> Value {
 }
 
 async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
-    match action.as_str() {
-        "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", &action, a.params)?).await,
-        "memory" | "export_memory" => export_memory(ctx, parse_params("export", &action, a.params)?).await,
-        "journal" | "export_journal" => export_journal(ctx, parse_params("export", &action, a.params)?).await,
+    let action = crate::routes::action_of("export_data", Some(&a.action))?;
+    match action {
+        "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", action, a.params)?).await,
+        "memory" | "export_memory" => export_memory(ctx, parse_params("export", action, a.params)?).await,
+        "journal" | "export_journal" => export_journal(ctx, parse_params("export", action, a.params)?).await,
         // A full governed call under the inner tool's name: its profile entry,
         // policy rules, approval_tools and grants apply, not export_data's.
         "manifest" | "export_migration_manifest" => {
@@ -1572,7 +1574,7 @@ async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
         "import" | "rollback" => Err(UaError::invalid(format!(
             "export action {action:?} is not available: migration import and rollback are not implemented"
         ))),
-        _ => Err(UaError::invalid("action must be one of tasks, memory, journal, manifest, compare")),
+        other => Err(crate::routes::unhandled("export_data", other)),
     }
 }
 

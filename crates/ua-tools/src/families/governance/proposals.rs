@@ -354,7 +354,11 @@ fn public(c: &Connection, p: &Proposal, with_items: bool) -> UaResult<Value> {
 }
 
 fn emit(tx: &mut WriteTx<'_>, kind: &str, by: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(format!("agent.work_proposal.{kind}"), payload).by(by.to_string()))?;
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, format!("agent.work_proposal.{kind}"), payload)
+            .by(by.to_string()),
+    )?;
     Ok(())
 }
 

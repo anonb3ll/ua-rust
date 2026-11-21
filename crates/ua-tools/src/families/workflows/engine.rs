@@ -569,7 +569,7 @@ pub(crate) async fn create_run(
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.workflow.started",
                     json!({
                         "run_id": run_id,
@@ -954,7 +954,7 @@ async fn checkpoint(
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.workflow.step",
                     json!({
                         "run_id": rid,
@@ -1052,7 +1052,7 @@ async fn run_steps(
             }
             ledger::append(
                 tx,
-                EventInput::new("agent.workflow.finished", json!({ "run_id": rid, "status": st })).by(label),
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.workflow.finished", json!({ "run_id": rid, "status": st })).by(label),
             )?;
             Ok(true)
         })

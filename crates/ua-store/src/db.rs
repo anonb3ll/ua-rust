@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use ua_core::{UaError, UaResult};
 
 use crate::ledger::Event;
-use crate::schema::{self, SchemaPart};
+use crate::schema::{self, Part};
 
 /// Pooled read-only connections of a file database.
 pub const READERS: usize = 4;
@@ -135,13 +135,14 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 
 impl Db {
     /// Open (creating if needed) the database at `path` and apply `parts`.
-    pub fn open(path: &Path, parts: &[SchemaPart]) -> anyhow::Result<Self> {
+    pub fn open<P: Into<Part> + Copy>(path: &Path, parts: &[P]) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
         schema::apply(&mut writer, parts)?;
+        crate::ledger::check_hash_form(&writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
             readers.push(open_reader(path)?);
@@ -150,10 +151,11 @@ impl Db {
     }
 
     /// An in-memory database (tests). Reads share the writer connection.
-    pub fn open_in_memory(parts: &[SchemaPart]) -> anyhow::Result<Self> {
+    pub fn open_in_memory<P: Into<Part> + Copy>(parts: &[P]) -> anyhow::Result<Self> {
         let mut writer = Connection::open_in_memory()?;
         writer.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::apply(&mut writer, parts)?;
+        crate::ledger::check_hash_form(&writer)?;
         Ok(Self::from_parts(None, writer, Vec::new()))
     }
 
@@ -339,6 +341,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::schema::SchemaPart;
 
     const PART: SchemaPart = SchemaPart {
         name: "pool_test.v1",

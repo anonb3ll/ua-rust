@@ -193,6 +193,7 @@ fn enqueue(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.notify.queued",
             json!({ "outbox_id": id, "kind": kind, "category": category, "chars": chars, "status": status }),
         )
@@ -214,6 +215,7 @@ fn settle(tx: &mut WriteTx<'_>, id: i64, agent: &str, d: &Delivery) -> UaResult<
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             format!("agent.notify.{status}"),
             json!({ "outbox_id": id, "attempts": d.attempts, "http_status": d.http_status }),
         )
@@ -390,7 +392,7 @@ async fn batch_notify(ctx: ToolCtx, a: BatchArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new("agent.notify.batched", json!({ "category": cat, "queued": valid.len() }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.notify.batched", json!({ "category": cat, "queued": valid.len() }))
                     .by(who.clone()),
             )?;
             Ok(tx.query_row("SELECT COUNT(*) FROM pending_notifications WHERE category = ?1", [&cat], |r| {

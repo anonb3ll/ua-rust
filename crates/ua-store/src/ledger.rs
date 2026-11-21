@@ -8,6 +8,13 @@
 //!
 //! Event ids are ULIDs minted inside the write transaction against the log's
 //! current maximum, so id order equals commit order.
+//!
+//! Once `organization.v1.store` has applied, every row also carries `org_id`
+//! and `hash_v`. This build writes and verifies only `hash_v = 1`, the
+//! nine-field form above, which does **not** cover `org_id`: a row's
+//! `org_id` is recorded but not tamper-evident until rows are written with
+//! `hash_v = 2` (see `docs/organization.md`, The ledger). [`verify`] refuses
+//! any other `hash_v`.
 
 use std::fmt::Write as _;
 
@@ -21,6 +28,54 @@ use crate::db::WriteTx;
 use crate::schema::SchemaPart;
 
 pub const GENESIS_HASH: &str = "GENESIS";
+
+/// The only hash form this build writes and verifies.
+pub const HASH_V: i64 = 1;
+
+/// Refuse a ledger whose newest row uses a hash form newer than [`HASH_V`].
+///
+/// This is the rollback fence: a hub rolled back from a build that writes
+/// `hash_v = 2` must not append `hash_v = 1` rows after those, which no
+/// later `verify` accepts. [`crate::Db`] runs it at open and [`append`] before
+/// every write.
+///
+/// It reads only the newest row (by `seq`, the primary key, so a single
+/// index lookup however long the ledger is), not `MAX(hash_v)` (a full scan,
+/// as `hash_v` has no index). That is sufficient because a valid chain never
+/// decreases its `hash_v` (`docs/organization.md`, The ledger: a `hash_v = 1`
+/// row after the first `hash_v = 2` row fails verification), so the newest
+/// row carries the highest form. A ledger whose newest row has a lower form
+/// than an earlier one already fails [`verify`]. Ledgers without the column
+/// (`organization.v1.store` not applied) pass.
+pub fn check_hash_form(conn: &Connection) -> UaResult<()> {
+    if has_org_columns(conn)? { refuse_newer_hash_form(conn) } else { Ok(()) }
+}
+
+/// Whether `event_log` has the `org_id` and `hash_v` columns
+/// (`organization.v1.store` applied). A ledger without them is one from
+/// before organizations, such as an older backup just restored; the part
+/// adds them on the next open.
+fn has_org_columns(conn: &Connection) -> UaResult<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn refuse_newer_hash_form(conn: &Connection) -> UaResult<()> {
+    let newest: Option<rusqlite::types::Value> = conn
+        .query_row("SELECT hash_v FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    match newest {
+        None | Some(rusqlite::types::Value::Integer(HASH_V)) => Ok(()),
+        Some(rusqlite::types::Value::Integer(v)) if v > HASH_V => Err(UaError::conflict(format!(
+            "event_log holds rows with hash_v {v}, written by a newer build; this build writes and verifies \
+             only hash_v {HASH_V}, so it refuses to append to this ledger. Run a build that supports hash_v {v}"
+        ))),
+        // Anything else is not a form any build writes; `verify` reports it.
+        Some(_) => Ok(()),
+    }
+}
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "ledger.v1",
@@ -99,8 +154,16 @@ fn recorded_legacy_prefix(conn: &Connection) -> UaResult<u64> {
 }
 
 /// A new event.
-#[derive(Debug, Clone, Default)]
+///
+/// There is no `Default`: every event names its organization, the
+/// organization of the row it is about (not the caller's;
+/// `docs/organization.md`, The ledger). Today that is always
+/// [`ua_core::DEFAULT_ORG`].
+#[derive(Debug, Clone)]
 pub struct EventInput {
+    /// The organization of the affected row. Recorded in `event_log.org_id`,
+    /// which `hash_v = 1` does not cover.
+    pub org_id: String,
     pub channel: String,
     pub payload: Value,
     pub originator: Option<String>,
@@ -111,8 +174,16 @@ pub struct EventInput {
 }
 
 impl EventInput {
-    pub fn new(channel: impl Into<String>, payload: Value) -> Self {
-        Self { channel: channel.into(), payload, ..Self::default() }
+    pub fn new(org_id: impl Into<String>, channel: impl Into<String>, payload: Value) -> Self {
+        Self {
+            org_id: org_id.into(),
+            channel: channel.into(),
+            payload,
+            originator: None,
+            episode_id: None,
+            causal_parent_id: None,
+            dedupe_key: None,
+        }
     }
 
     pub fn by(mut self, originator: impl Into<String>) -> Self {
@@ -248,6 +319,33 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
     if input.channel.trim().is_empty() {
         return Err(UaError::invalid("event channel must not be empty"));
     }
+    if input.org_id.trim().is_empty() {
+        return Err(UaError::invalid("event org_id must not be empty"));
+    }
+    let org_columns = has_org_columns(tx)?;
+    if org_columns {
+        refuse_newer_hash_form(tx)?;
+        // The organization must exist: one primary-key lookup in `orgs` (a
+        // handful of rows), in the same write transaction as the insert.
+        // `event_log` has no existence trigger, so this is the check.
+        let known: bool = tx
+            .query_row("SELECT 1 FROM orgs WHERE id = ?1", [&input.org_id], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !known {
+            return Err(UaError::invalid(format!(
+                "unknown organization {:?}; the event was not recorded",
+                input.org_id
+            )));
+        }
+    } else if input.org_id != ua_core::DEFAULT_ORG {
+        // Nowhere to record another organization: refuse rather than drop it.
+        return Err(UaError::conflict(format!(
+            "event_log has no org_id column (organization.v1.store not applied), so an event for \
+             organization {:?} cannot be recorded",
+            input.org_id
+        )));
+    }
     if let Some(k) = &input.dedupe_key {
         let seen: Option<i64> =
             tx.query_row("SELECT seq FROM event_log WHERE dedupe_key = ?1", [k], |r| r.get(0)).optional()?;
@@ -277,22 +375,44 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
         &created_at,
         input.dedupe_key.as_deref(),
     );
-    tx.execute(
-        "INSERT INTO event_log (ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
-         dedupe_key, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            ulid,
-            input.channel,
-            payload_str,
-            input.originator,
-            input.episode_id,
-            input.causal_parent_id,
-            created_at,
-            input.dedupe_key,
-            prev_hash,
-            entry_hash
-        ],
-    )?;
+    if org_columns {
+        tx.execute(
+            "INSERT INTO event_log (ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
+             dedupe_key, prev_hash, entry_hash, org_id, hash_v) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                ulid,
+                input.channel,
+                payload_str,
+                input.originator,
+                input.episode_id,
+                input.causal_parent_id,
+                created_at,
+                input.dedupe_key,
+                prev_hash,
+                entry_hash,
+                input.org_id,
+                HASH_V
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO event_log (ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
+             dedupe_key, prev_hash, entry_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                ulid,
+                input.channel,
+                payload_str,
+                input.originator,
+                input.episode_id,
+                input.causal_parent_id,
+                created_at,
+                input.dedupe_key,
+                prev_hash,
+                entry_hash
+            ],
+        )?;
+    }
     let event = Event {
         seq: tx.last_insert_rowid(),
         ulid,
@@ -386,12 +506,21 @@ pub struct VerifyReport {
 /// chain (a low or negative `seq`) fails too. An unhashed row after the
 /// chain has started fails verification: nothing the hub appends lacks a
 /// hash, so such a row was written around the ledger.
+///
+/// Every row's `hash_v` (when the column exists, after
+/// `organization.v1.store`) must be [`HASH_V`]; any other value fails, so a
+/// row cannot claim a hash form this build does not check.
 pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     let expected_prefix = recorded_legacy_prefix(conn)?;
-    let mut stmt = conn.prepare(
+    let has_hash_v: bool = conn
+        .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    let hash_v = if has_hash_v { "hash_v" } else { "1" };
+    let mut stmt = conn.prepare(&format!(
         "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, dedupe_key, \
-         prev_hash, entry_hash FROM event_log ORDER BY seq ASC",
-    )?;
+         prev_hash, entry_hash, {hash_v} FROM event_log ORDER BY seq ASC"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut report =
@@ -406,6 +535,18 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
             first_bad_seq: Some(seq),
             reason: Some(reason.to_string()),
         };
+        // Read untyped, so a tampered non-integer value is reported, not an error.
+        let form: rusqlite::types::Value = r.get(11)?;
+        if form != rusqlite::types::Value::Integer(HASH_V) {
+            let shown = match form {
+                rusqlite::types::Value::Null => "NULL".to_string(),
+                rusqlite::types::Value::Integer(v) => v.to_string(),
+                rusqlite::types::Value::Real(v) => v.to_string(),
+                rusqlite::types::Value::Text(v) => format!("{v:?}"),
+                rusqlite::types::Value::Blob(_) => "a blob".to_string(),
+            };
+            return Ok(fail(&format!("unknown hash_v {shown}; this build verifies only hash_v = {HASH_V}")));
+        }
         let entry: Option<String> = r.get(10)?;
         let Some(entry) = entry else {
             if report.checked > 0 {
@@ -477,7 +618,8 @@ mod tests {
     fn a_cursor_pages_forward_without_skipping() {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         for i in 0..10 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         let page = |after: i64| {
             db.read(|c| {
@@ -499,13 +641,19 @@ mod tests {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         let mut rx = db.subscribe();
         for i in 0..5 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })).by("tester"))).unwrap();
+            db.write(|tx| {
+                append(
+                    tx,
+                    EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i })).by("tester"),
+                )
+            })
+            .unwrap();
         }
         assert_eq!(rx.try_recv().unwrap().payload, json!({ "i": 0 }));
         let deduped = db
             .write(|tx| {
-                append(tx, EventInput::new("test.once", json!({})).dedupe("k1"))?;
-                append(tx, EventInput::new("test.once", json!({})).dedupe("k1"))
+                append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.once", json!({})).dedupe("k1"))?;
+                append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.once", json!({})).dedupe("k1"))
             })
             .unwrap();
         assert!(deduped.is_none());
@@ -535,6 +683,155 @@ mod tests {
         assert_eq!(report.first_bad_seq, Some(2));
     }
 
+    #[test]
+    fn verify_refuses_a_hash_form_it_does_not_check() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        for i in 0..3 {
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
+        }
+        assert!(db.read(verify).unwrap().ok);
+        db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
+        // A text value keeps TEXT storage in an INTEGER column only when it does
+        // not look like a number.
+        for (value, shown) in [("2", "2"), ("'v1'", "\"v1\"")] {
+            db.write(|tx| {
+                Ok(tx.execute(&format!("UPDATE event_log SET hash_v = {value} WHERE seq = 2"), [])?)
+            })
+            .unwrap();
+            let report = db.read(verify).unwrap();
+            assert!(!report.ok, "{value}: {report:?}");
+            assert_eq!(report.first_bad_seq, Some(2), "{value}");
+            assert_eq!(
+                report.reason.as_deref(),
+                Some(format!("unknown hash_v {shown}; this build verifies only hash_v = 1").as_str()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The rollback fence: a ledger whose newest row has a newer hash form
+    /// (as a later build will write) refuses both `append` and `Db::open`,
+    /// naming both forms, so a rolled-back build never writes `hash_v = 1`
+    /// rows after `hash_v = 2` ones.
+    #[test]
+    fn a_ledger_with_a_newer_hash_form_refuses_append_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        let parts = [
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ];
+        let db = Db::open(&path, &parts).unwrap();
+        for i in 0..2 {
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
+        }
+        // Stand in for a newer build's row: the newest row claims hash_v 2.
+        db.write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+            tx.execute("UPDATE event_log SET hash_v = 2 WHERE seq = (SELECT MAX(seq) FROM event_log)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let before: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        let err = db
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+        let after: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(before, after, "nothing was appended");
+        drop(db);
+
+        let err = Db::open(&path, &parts).err().expect("open must refuse").to_string();
+        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+
+        // A ledger whose rows are all hash_v 1 opens and appends as before.
+        let fresh = dir.path().join("fresh.db");
+        let db = Db::open(&fresh, &parts).unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
+        drop(db);
+        assert!(Db::open(&fresh, &parts).is_ok());
+    }
+
+    /// `append` writes the event's organization and hash form explicitly
+    /// when the ledger has the columns, and on a ledger from before them
+    /// refuses an organization it cannot record instead of dropping it.
+    #[test]
+    fn append_records_the_organization_or_refuses_what_it_cannot_record() {
+        let parts = [
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ];
+        let db = Db::open_in_memory(&parts).unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
+        let row: (String, i64) = db
+            .read(|c| {
+                Ok(c.query_row("SELECT org_id, hash_v FROM event_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+            })
+            .unwrap();
+        assert_eq!(row, (ua_core::DEFAULT_ORG.to_string(), HASH_V));
+        let err = db
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: " ".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("org_id must not be empty"), "{err}");
+        // An organization `orgs` does not hold is refused, and nothing is written.
+        let err = db
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: "nope".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown organization \"nope\""), "{err}");
+        let n: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 1);
+
+        let legacy = Db::open_in_memory(&[SCHEMA]).unwrap();
+        legacy
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))))
+            .unwrap();
+        let err = legacy
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: "org-b".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no org_id column") && err.contains("org-b"), "{err}");
+        assert!(legacy.read(verify).unwrap().ok);
+    }
+
     /// Insert a row with no hashes, as a legacy import or a direct write would.
     fn insert_unhashed(db: &Db, ulid: &str) {
         db.write(|tx| {
@@ -552,10 +849,12 @@ mod tests {
     fn an_unhashed_row_after_the_chain_started_fails_verification() {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         for i in 0..2 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         insert_unhashed(&db, "01J0000000000000000000ZZZZ");
-        db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": 2 })))).unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 2 }))))
+            .unwrap();
         let report = db.read(verify).unwrap();
         assert!(!report.ok, "{report:?}");
         assert_eq!(report.first_bad_seq, Some(3));
@@ -572,7 +871,8 @@ mod tests {
         assert!(!report.ok && report.first_bad_seq == Some(1), "{report:?}");
         db.write(|tx| record_legacy_prefix(tx, 2)).unwrap();
         for i in 0..3 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         let report = db.read(verify).unwrap();
         assert!(report.ok, "{report:?}");
@@ -591,7 +891,8 @@ mod tests {
     fn an_unhashed_row_slipped_ahead_of_the_chain_fails_verification() {
         let db = Db::open_in_memory(&[SCHEMA, META_SCHEMA]).unwrap();
         for i in 0..3 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         assert!(db.read(verify).unwrap().ok);
         for seq in [0i64, -5] {

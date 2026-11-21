@@ -245,7 +245,7 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             let bound = !rp.is_empty() && BoundRepo::check(tx, &rp).is_ok();
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.github.webhook.received",
                     json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound }),
                 )

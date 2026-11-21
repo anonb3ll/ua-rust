@@ -983,7 +983,7 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
                         _ => v.clone(),
                     };
                 }
-                ledger::append(tx, EventInput::new("agent.node.register", payload).by(agent.clone()))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.node.register", payload).by(agent.clone()))?;
             }
             Ok(json!({
                 "node": name,
@@ -1197,6 +1197,7 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
     let event = ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             format!("agent.node.{kind}"),
             json!({
                 "kind": kind,
@@ -1265,6 +1266,7 @@ fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str)
     let event = ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.node.reassign",
             json!({
                 "kind": "reassign",
@@ -1314,6 +1316,7 @@ fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult
     let event = ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.node.forget",
             json!({
                 "kind": "forget",

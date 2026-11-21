@@ -281,7 +281,8 @@ pub(crate) fn record(
     by: &str,
 ) -> UaResult<Option<String>> {
     payload["kind"] = json!(kind);
-    Ok(ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?.map(|e| e.ulid))
+    Ok(ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string()))?
+        .map(|e| e.ulid))
 }
 
 /// The verified agent a device-plane call acts for (the node's owner).

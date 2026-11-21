@@ -68,6 +68,21 @@ pub fn gate(
     tool: &str,
     args: &Value,
 ) -> UaResult<GateOutcome> {
+    gate_via(tx, cfg, caller, tool, args, None)
+}
+
+/// [`gate`] for a call that reached `tool` through another tool `via` (a
+/// consolidated tool's action, see [`crate::routes`]). The approval binds
+/// `tool` and `args` exactly as a direct call would; the ledger events of
+/// the request and of the pass it consumes also name `via`.
+pub fn gate_via(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+    via: Option<&str>,
+) -> UaResult<GateOutcome> {
     let canon = canonical_payload(args);
     let now = ua_core::time::now();
 
@@ -105,10 +120,13 @@ pub fn gate(
             "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![id, now],
         )?;
+        let mut event = json!({ "approval_id": id, "tool": tool });
+        if let Some(v) = via {
+            event["via"] = json!(v);
+        }
         ledger::append(
             tx,
-            EventInput::new("agent.approval.consumed", json!({ "approval_id": id, "tool": tool }))
-                .by(caller.label.clone()),
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.consumed", event).by(caller.label.clone()),
         )?;
         return Ok(GateOutcome::Pass { approval_id: id });
     }
@@ -125,24 +143,31 @@ pub fn gate(
     if let Some(approval_id) = pending {
         return Ok(GateOutcome::Pending { approval_id });
     }
-    park(tx, caller, tool, &canon, &now).map(|approval_id| GateOutcome::Pending { approval_id })
+    park(tx, caller, tool, &canon, &now, via).map(|approval_id| GateOutcome::Pending { approval_id })
 }
 
 /// Insert a pending request for `canon` and ledger it.
-fn park(tx: &mut WriteTx<'_>, caller: &Caller, tool: &str, canon: &str, now: &str) -> UaResult<i64> {
+fn park(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    tool: &str,
+    canon: &str,
+    now: &str,
+    via: Option<&str>,
+) -> UaResult<i64> {
     tx.execute(
         "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
          VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
         params![tool, canon, caller.label, now],
     )?;
     let approval_id = tx.last_insert_rowid();
+    let mut event = json!({ "approval_id": approval_id, "tool": tool, "requested_by": caller.label });
+    if let Some(v) = via {
+        event["via"] = json!(v);
+    }
     ledger::append(
         tx,
-        EventInput::new(
-            "agent.approval.requested",
-            json!({ "approval_id": approval_id, "tool": tool, "requested_by": caller.label }),
-        )
-        .by(caller.label.clone()),
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.requested", event).by(caller.label.clone()),
     )?;
     Ok(approval_id)
 }
@@ -239,7 +264,7 @@ pub fn request(
         return Ok(state);
     }
     let now = ua_core::time::now();
-    let approval_id = park(tx, caller, tool, &canonical_payload(args), &now)?;
+    let approval_id = park(tx, caller, tool, &canonical_payload(args), &now, None)?;
     Ok(RequestState::Pending { approval_id })
 }
 
@@ -469,7 +494,7 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
         }
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.approval.resolved",
                 json!({ "approval_id": row.id, "tool": row.tool, "decision": args.decision, "resolved_by": resolver }),
             )

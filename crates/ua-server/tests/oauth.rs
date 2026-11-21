@@ -517,7 +517,7 @@ async fn dynamic_registration_rules() {
     assert!(m.get("registration_endpoint").is_none());
 }
 
-// --- client_credentials refusals (hub #2660) ----------------------------------------
+// --- client_credentials refusals -----------------------------------------------------
 
 const CC_SECRET: &str = "test-client-secret-value";
 
@@ -646,6 +646,7 @@ async fn client_credentials_refuses_a_retired_identity() {
         enforce_profile: true,
         session_key: None,
         transport: ua_core::identity::Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     let manage = |action: &'static str| json!({ "action": action, "params": { "agent": "svc-agent", "reason": "decommissioned" } });
     hub.state
@@ -707,6 +708,7 @@ async fn a_code_for_an_identity_retired_after_consent_is_refused() {
         enforce_profile: true,
         session_key: None,
         transport: ua_core::identity::Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     };
     hub.state
         .registry

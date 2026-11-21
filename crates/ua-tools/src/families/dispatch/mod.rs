@@ -391,7 +391,10 @@ pub(crate) fn record_transition(
     if let (Some(o), Value::Object(e)) = (payload.as_object_mut(), extra) {
         o.extend(e);
     }
-    let ev = ledger::append(tx, EventInput::new(CHANNEL_TRANSITION, payload).by(actor.to_string()))?;
+    let ev = ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, CHANNEL_TRANSITION, payload).by(actor.to_string()),
+    )?;
     Ok(ev.map(|e| e.ulid))
 }
 
