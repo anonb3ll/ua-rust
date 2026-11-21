@@ -473,7 +473,7 @@ async fn task_holds_coerce_defaults_block_claim_and_resume_unblocks() {
          INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at, released_by, released_at) VALUES
            (1, 20, 'pause', NULL, NULL, NULL, 'operator', '{T0}', NULL, NULL),
            (2, 20, 'pause', 'released', 'past', 'manual', 'operator', '{T_OLD}', 'operator', '{T_OLD}'),
-           (3, 999, 'pause', 'active', 'orphan hold', 'manual', 'operator', '{T0}', NULL, NULL);
+           (3, 999, 'pause', 'released', 'deleted root', 'manual', 'operator', '{T_OLD}', 'operator', '{T0}');
          INSERT INTO task_hold_members (hold_id, task_id, status_at_hold, cancel_requested_by_hold) VALUES
            (1, 20, 'open', NULL),
            (1, 999, 'open', 0);"
@@ -483,8 +483,8 @@ async fn task_holds_coerce_defaults_block_claim_and_resume_unblocks() {
 
     let db = target();
     let r = ua_import::import(&db, &f.path, &opts()).unwrap();
-    assert_eq!(table(&r, "task_holds").copied, 2);
-    assert_eq!(table(&r, "task_holds").skipped.get("missing_root_task_id"), Some(&1));
+    assert_eq!(table(&r, "task_holds").copied, 3);
+    assert!(table(&r, "task_holds").skipped.is_empty());
     assert_eq!(table(&r, "task_hold_members").copied, 1);
     assert_eq!(table(&r, "task_hold_members").skipped.get("missing_task_id"), Some(&1));
 
@@ -522,6 +522,45 @@ async fn task_holds_coerce_defaults_block_claim_and_resume_unblocks() {
 
     let claimed = reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 20 })).await.unwrap();
     assert_eq!(claimed["claimed"], json!(true), "{claimed}");
+}
+
+#[tokio::test]
+async fn active_hold_on_a_reparented_member_survives_deletion_of_its_root() {
+    let (f, c) = new_source();
+    c.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, created_at, updated_at, parent_id) VALUES
+           (20, 'Original root', '{T0}', '{T0}', NULL),
+           (21, 'Held member', '{T0}', '{T0}', 20);
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, created_by, created_at)
+           VALUES (1, 20, 'pause', 'active', 'paused by operator', 'operator', '{T0}');
+         INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) VALUES
+           (1, 20, 'open'), (1, 21, 'open');
+         UPDATE tasks SET parent_id = NULL WHERE id = 21;
+         DELETE FROM tasks WHERE id = 20;"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    let report = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(table(&report, "task_holds").copied, 1);
+    assert_eq!(table(&report, "task_hold_members").copied, 1);
+    assert_eq!(table(&report, "task_hold_members").skipped.get("missing_task_id"), Some(&1));
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
+    let reg = builtin_registry();
+    let member = agent("agent-1");
+    let claim = || reg.call(&hub, &member, "task_claim", json!({ "id": 21 }));
+    assert_eq!(claim().await.unwrap_err().reason_code(), Some("task_held"));
+
+    let resume =
+        json!({ "action": "task_hold", "params": { "root_task_id": 20, "hold_id": 1, "mode": "resume" } });
+    assert!(reg.call(&hub, &member, "coordination_manage", resume.clone()).await.is_err());
+    assert_eq!(claim().await.unwrap_err().reason_code(), Some("task_held"));
+
+    let released = reg.call(&hub, &human_coordinator(), "coordination_manage", resume).await.unwrap();
+    assert_eq!(released["released"], true);
+    assert_eq!(claim().await.unwrap()["claimed"], true);
+    assert!(db.read(ledger::verify).unwrap().ok);
 }
 
 #[test]

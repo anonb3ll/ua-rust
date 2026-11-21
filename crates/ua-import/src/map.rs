@@ -114,11 +114,9 @@ pub(crate) const MAPS: &[TableMap] = &[
         kind: Kind::WorkProposalItems,
         ..plain("work_proposal_items")
     },
-    TableMap {
-        refs: &[Ref { col: "root_task_id", table: "tasks", key: "id" }],
-        kind: Kind::TaskHolds,
-        ..plain("task_holds")
-    },
+    // The root is historical. A surviving member is still held even if the
+    // original root was deleted.
+    TableMap { kind: Kind::TaskHolds, ..plain("task_holds") },
     TableMap {
         refs: &[Ref { col: "hold_id", table: "task_holds", key: "id" }, TASK_REF],
         kind: Kind::TaskHoldMembers,
