@@ -1982,6 +1982,60 @@ mod tests {
         assert_eq!(has_wal_row, 1);
     }
 
+    /// A backup taken before `organization.v1.store` existed restores into a
+    /// build that has it: the part is reported missing, not refused, and
+    /// applies on the next open, after which the ledger still verifies.
+    #[test]
+    fn an_older_backup_without_the_org_part_restores_and_upgrades() {
+        let (dir, live_path, db) = test_db();
+        for i in 0..3 {
+            db.write(|tx| ledger::append(tx, EventInput::new("before.upgrade", json!({ "i": i })))).unwrap();
+        }
+        drop(db);
+        let bak = dir.path().join("old.db");
+        let rep = backup_database(&live_path, &bak, false).unwrap();
+
+        let full = vec![
+            Part::from(LEDGER_SCHEMA),
+            Part::from(META_SCHEMA),
+            Part::from(crate::org::STORE_PART),
+            Part::from(EXTRA),
+        ];
+        let dest = dir.path().join("restored.db");
+        let restored = restore_database(
+            &bak,
+            &dest,
+            RestoreOptions {
+                expected_sha256: Some(rep.sha256),
+                expected_schema: Some((full.clone(), Vec::new())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let compat = restored.schema.unwrap();
+        assert_eq!(compat.missing, ["organization.v1.store"], "{compat:?}");
+        assert!(!compat.has_tampering_or_unowned_objects(), "{compat:?}");
+
+        let db = Db::open(&dest, &full).unwrap();
+        let (orgs, hash_forms): (i64, i64) = db
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM orgs WHERE id = 'default'", [], |r| r.get(0))?,
+                    c.query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE org_id = 'default' AND hash_v = 1",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(orgs, 1);
+        assert!(hash_forms >= 3, "every restored row is backfilled ({hash_forms})");
+        db.write(|tx| ledger::append(tx, EventInput::new("after.upgrade", json!({})))).unwrap();
+        let report = db.read(ledger::verify).unwrap();
+        assert!(report.ok, "{report:?}");
+    }
+
     #[test]
     fn restore_enforces_pinning_schema_triggers_and_records_ops_restored_event() {
         let (_dir, live_path, db) = test_db();
