@@ -15,9 +15,10 @@
 //! | `GET  /api/capability-catalog` | the registry, grouped by family |
 //! | `GET  /api/board` | `task_list`, `dependency_list`, `delegate_list` |
 //!
-//! `/api/nodes/*` (node acceptance and discovered sessions) is not built yet
-//! and answers `501` with `{"error": "not_implemented", "capability": ...}`.
-//! `GET /api/nodes` itself is served by [`crate::node_api`]; runs, platform
+//! `/api/nodes/*` paths other than the ones [`crate::node_api`] serves
+//! (discovered native sessions) are not built yet and answer `501` with
+//! `{"error": "not_implemented", "capability": ...}`. `GET /api/nodes` and
+//! `GET /api/nodes/acceptance` are served by [`crate::node_api`]; runs, platform
 //! objects, evidence and work products by [`crate::platform_api`].
 //!
 //! Writes go through [`ua_tools::Registry::call`] with the request's caller,
