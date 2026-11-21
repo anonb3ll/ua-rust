@@ -38,9 +38,10 @@ pub enum Authority<'a> {
     /// worktree cleanup, handoff recovery, wake handling, workflow records and
     /// node-queue administration).
     LifecycleOperator,
-    /// An **unverified** caller: the local full-surface model when auth
-    /// enforcement is off (stdio, or HTTP without `enforce_auth`). It is what
-    /// lets such a caller read every mailbox in the messaging tools today.
+    /// A caller with no verified label: an unverified local caller (the local
+    /// full-surface model when auth enforcement is off: stdio, or HTTP
+    /// without `enforce_auth`), or the hub's own system jobs. It is what lets
+    /// such a caller read every mailbox in the messaging tools, as before.
     /// Auth enforcement off; behaviour under review.
     LocalTrustReader,
     /// A caller of kind human: a label in `human_identities` that
@@ -272,12 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn local_trust_reader_is_an_unverified_caller_only() {
+    fn local_trust_reader_is_a_caller_without_a_verified_label() {
         assert!(holds(
             &caller("local", ActorKind::Anonymous, Profile::Developer),
             Authority::LocalTrustReader
         ));
-        for kind in [ActorKind::Agent, ActorKind::Human, ActorKind::System] {
+        assert!(holds(&Caller::system(), Authority::LocalTrustReader));
+        for kind in [ActorKind::Agent, ActorKind::Human] {
             assert!(
                 !holds(&caller("x", kind, Profile::Coordinator), Authority::LocalTrustReader),
                 "{kind:?}"
