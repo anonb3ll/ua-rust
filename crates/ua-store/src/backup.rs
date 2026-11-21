@@ -1246,6 +1246,12 @@ fn create_safety_backup(existing_dest: &Path) -> anyhow::Result<(PathBuf, Vec<St
         let mut raw_main_ro = open_file_no_follow_ro(&raw_main, "staged pre-restore database")?;
         stream_fd_to_new_file_hashed(&mut raw_main_ro, &probe_main)?;
         for (suffix, raw_side) in &captured_sidecars {
+            // Never probe with a copied `-shm`: a wal-index whose valid header lags
+            // the WAL would make SQLite trust a stale mxFrame and silently miss
+            // committed frames. Without it SQLite rebuilds the index from the WAL.
+            if *suffix == "-shm" {
+                continue;
+            }
             let mut raw_side_ro = open_file_no_follow_ro(raw_side, "staged pre-restore sidecar")?;
             let probe_side = probe_dir.join(format!("main{suffix}"));
             stream_fd_to_new_file_hashed(&mut raw_side_ro, &probe_side)?;
@@ -3697,5 +3703,62 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&b_bak_wal).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn safety_backup_clean_wal_snapshots_uncheckpointed_rows_without_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sdir, src_path, src_db) = test_db();
+        src_db
+            .write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
+                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+        drop(src_db);
+        let bak = dir.path().join("clean.bak");
+        backup_database(&src_path, &bak, false).unwrap();
+
+        // Valid WAL-mode hub DB captured hot: the committed row lives only in the
+        // WAL, and the copied `-shm` is snapshotted BEFORE the write, so its
+        // wal-index lags the WAL the probe would otherwise trust.
+        let (_bdir, b_seed, b_db) = test_db();
+        let b_dest = dir.path().join("hot-clean-wal.db");
+        b_db.read(|_| {
+            fs::copy(&b_seed, &b_dest).unwrap();
+            if shm_sidecar_path(&b_seed).exists() {
+                fs::copy(shm_sidecar_path(&b_seed), shm_sidecar_path(&b_dest)).unwrap();
+            }
+            b_db.write(|tx| {
+                tx.execute("INSERT INTO items (val) VALUES ('hot-frame-row')", [])?;
+                ledger::append(tx, EventInput::new("b.hot", json!({})))?;
+                Ok(())
+            })
+            .unwrap();
+            fs::copy(&b_seed, &b_dest).unwrap();
+            fs::copy(wal_sidecar_path(&b_seed), wal_sidecar_path(&b_dest)).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        drop(b_db);
+
+        let rep = restore_database(
+            &bak,
+            &b_dest,
+            RestoreOptions {
+                force: true,
+                allow_unpinned: true,
+                keep_safety_backup: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(rep.safety_backup_sidecars.is_empty(), "{:?}", rep.safety_backup_sidecars);
+        let safety = PathBuf::from(rep.safety_backup.as_deref().unwrap());
+        let sc = open_read_only(&safety).unwrap();
+        let has_wal_row: i64 =
+            sc.query_row("SELECT COUNT(*) FROM items WHERE val = 'hot-frame-row'", [], |r| r.get(0)).unwrap();
+        assert_eq!(has_wal_row, 1, "uncheckpointed row missing from safety backup");
     }
 }
