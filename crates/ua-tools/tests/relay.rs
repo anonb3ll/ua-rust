@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
@@ -43,13 +43,24 @@ impl Mock {
     }
 }
 
+/// The mock records only the request the relay makes: a `POST` to an issue's
+/// comments path with a bearer token (any token: the swapped-token test must
+/// see a post under the wrong one). Anything else (a stray
+/// local connection, another process that was handed a recycled port) gets an
+/// unrecorded 400, so it can neither inflate the counts the tests assert nor
+/// consume the scripted status.
 async fn start_mock() -> (String, Mock) {
     let mock = Mock { seen: Arc::default(), status: Arc::new(Mutex::new(201)) };
     let m = mock.clone();
-    let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+    let app = axum::Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
         let m = m.clone();
         async move {
             let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let path = uri.path();
+            let comments = path.starts_with("/repos/") && path.ends_with("/comments");
+            if method != Method::POST || !comments || !auth.starts_with("Bearer ") {
+                return (StatusCode::BAD_REQUEST, axum::Json(json!({ "message": "unexpected request" })));
+            }
             let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
             m.seen.lock().unwrap().push(Seen { path: uri.path().to_string(), auth, body });
             let status = *m.status.lock().unwrap();

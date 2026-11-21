@@ -55,6 +55,11 @@ async fn server(statuses: Vec<u16>) -> (String, Arc<Mutex<Vec<Seen>>>) {
                     break (head, body);
                 }
             };
+            // Only the hook's own POST is recorded and uses up a scripted
+            // status; a stray connection or request is dropped unanswered.
+            if !head.starts_with("post /hooks/path-secret ") {
+                continue;
+            }
             let status = statuses[n.min(statuses.len() - 1)];
             n += 1;
             log.lock()
@@ -193,10 +198,10 @@ async fn client_errors_are_not_retried() {
     assert_eq!(outbox_message(&hub, res["outbox_id"].as_i64().unwrap()).as_deref(), Some("bad payload"));
 
     // A dead endpoint fails after every attempt, without leaking the URL.
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = dead.local_addr().unwrap();
-    drop(dead);
-    let hub = hub_with(Some(format!("http://{addr}/hooks/path-secret")));
+    // Port 1 is privileged: it cannot be bound without root and is never
+    // handed out as an ephemeral port, so nothing can come to listen there
+    // (a dropped ephemeral listener's port could be reused before the connect).
+    let hub = hub_with(Some("http://127.0.0.1:1/hooks/path-secret".to_string()));
     let res = call(&reg, &hub, &staff(), "notify", json!({ "message": "nobody home", "timeout_s": 2 })).await;
     assert_eq!(res["status"], "failed");
     assert_eq!(res["attempts"], 3);

@@ -44,6 +44,12 @@ type Shared = Arc<Mutex<Mock>>;
 
 async fn serve_mock(State(m): State<Shared>, req: Request) -> Response {
     let path = req.uri().path().to_string();
+    // Only requests for the mocked repository are recorded and answered; a
+    // stray local connection (another process handed a recycled loopback
+    // port) gets an unrecorded 400 and cannot inflate the logged requests.
+    if path != "/repos/example/repo" && !path.starts_with("/repos/example/repo/") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
     let h: &HeaderMap = req.headers();
     let inm = h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string);
