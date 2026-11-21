@@ -27,9 +27,9 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::SchemaPart;
 use crate::ledger::{self, EventInput, VerifyReport};
 use crate::schema;
+use crate::schema::Part;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -133,7 +133,7 @@ pub struct RestoreOptions {
     /// and node session credentials in the restore transaction.
     pub revoke_sessions: bool,
     /// Optional `(required, optional)` schema parts from the running build.
-    pub expected_schema: Option<(Vec<SchemaPart>, Vec<SchemaPart>)>,
+    pub expected_schema: Option<(Vec<Part>, Vec<Part>)>,
 }
 
 /// Result of verifying (with `dry_run`) or installing a backup over a hub database.
@@ -384,11 +384,12 @@ fn read_master_objects(conn: &Connection) -> anyhow::Result<MasterObjectMap> {
 
 /// Verify `schema_parts` checksums and `sqlite_master` tables, views, indexes,
 /// and triggers in `conn` against the schemas registered in the current build.
-pub fn check_schema_compatibility(
+pub fn check_schema_compatibility<E: Into<Part> + Copy>(
     conn: &Connection,
-    expected: &[SchemaPart],
-    optional: &[SchemaPart],
+    expected: &[E],
+    optional: &[Part],
 ) -> anyhow::Result<SchemaCompatibility> {
+    let expected = schema::parts(expected);
     if !table_exists(conn, "schema_parts")? {
         bail!("database is missing the schema_parts table");
     }
@@ -408,10 +409,10 @@ pub fn check_schema_compatibility(
     let mut applied_parts = Vec::new();
     let mut full_parts = Vec::with_capacity(expected.len() + optional.len());
 
-    for part in expected {
+    for part in &expected {
         known.insert(part.name);
         full_parts.push(*part);
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
+        let sum = part.checksum();
         match applied.get(part.name) {
             None => missing.push(part.name.to_string()),
             Some(s) => {
@@ -425,7 +426,7 @@ pub fn check_schema_compatibility(
     for part in optional {
         known.insert(part.name);
         full_parts.push(*part);
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
+        let sum = part.checksum();
         if let Some(s) = applied.get(part.name) {
             applied_parts.push(*part);
             if *s != sum {
@@ -1773,6 +1774,7 @@ fn restore_database_with_hooks(
 mod tests {
     use super::*;
     use crate::Db;
+    use crate::SchemaPart;
     use crate::ledger::{EventInput, META_SCHEMA, SCHEMA as LEDGER_SCHEMA};
     use serde_json::json;
 
@@ -1788,8 +1790,8 @@ mod tests {
         (dir, path, db)
     }
 
-    fn schema_pair() -> Option<(Vec<SchemaPart>, Vec<SchemaPart>)> {
-        Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], Vec::new()))
+    fn schema_pair() -> Option<(Vec<Part>, Vec<Part>)> {
+        Some((schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]), Vec::new()))
     }
 
     #[test]
@@ -1978,6 +1980,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items WHERE val = 'uncheckpointed-wal-row'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(has_wal_row, 1);
+    }
+
+    /// A backup taken before `organization.v1.store` existed restores into a
+    /// build that has it: the part is reported missing, not refused, and
+    /// applies on the next open, after which the ledger still verifies.
+    #[test]
+    fn an_older_backup_without_the_org_part_restores_and_upgrades() {
+        let (dir, live_path, db) = test_db();
+        for i in 0..3 {
+            db.write(|tx| ledger::append(tx, EventInput::new("before.upgrade", json!({ "i": i })))).unwrap();
+        }
+        drop(db);
+        let bak = dir.path().join("old.db");
+        let rep = backup_database(&live_path, &bak, false).unwrap();
+
+        let full = vec![
+            Part::from(LEDGER_SCHEMA),
+            Part::from(META_SCHEMA),
+            Part::from(crate::org::STORE_PART),
+            Part::from(EXTRA),
+        ];
+        let dest = dir.path().join("restored.db");
+        let restored = restore_database(
+            &bak,
+            &dest,
+            RestoreOptions {
+                expected_sha256: Some(rep.sha256),
+                expected_schema: Some((full.clone(), Vec::new())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let compat = restored.schema.unwrap();
+        assert_eq!(compat.missing, ["organization.v1.store"], "{compat:?}");
+        assert!(!compat.has_tampering_or_unowned_objects(), "{compat:?}");
+
+        let db = Db::open(&dest, &full).unwrap();
+        let (orgs, hash_forms): (i64, i64) = db
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM orgs WHERE id = 'default'", [], |r| r.get(0))?,
+                    c.query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE org_id = 'default' AND hash_v = 1",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(orgs, 1);
+        assert!(hash_forms >= 3, "every restored row is backfilled ({hash_forms})");
+        db.write(|tx| ledger::append(tx, EventInput::new("after.upgrade", json!({})))).unwrap();
+        let report = db.read(ledger::verify).unwrap();
+        assert!(report.ok, "{report:?}");
     }
 
     #[test]
@@ -2513,7 +2569,7 @@ mod tests {
         const DEP_ALTER: SchemaPart =
             SchemaPart { name: "dep_base.v2", sql: "ALTER TABLE dep_tbl ADD COLUMN note TEXT;" };
         let parts = vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA, DEP_BASE, DEP_ALTER];
-        let optional = vec![schema::IMPORT_SCHEMA];
+        let optional = schema::parts(&[schema::IMPORT_SCHEMA]);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("dest.db");
 
@@ -2556,7 +2612,7 @@ mod tests {
                 RestoreOptions {
                     allow_unpinned: true,
                     allow_newer,
-                    expected_schema: Some((parts.clone(), optional.clone())),
+                    expected_schema: Some((schema::parts(&parts), schema::parts(&optional))),
                     ..Default::default()
                 },
             )
@@ -2587,7 +2643,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2624,7 +2683,10 @@ mod tests {
             &dest,
             RestoreOptions {
                 allow_unpinned: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2653,7 +2715,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2682,7 +2747,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2711,7 +2779,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2746,7 +2817,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional)),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2922,7 +2996,7 @@ mod tests {
         RestoreOptions {
             allow_unpinned: true,
             allow_newer,
-            expected_schema: Some((parts, Vec::new())),
+            expected_schema: Some((schema::parts(&parts), Vec::new())),
             ..Default::default()
         }
     }

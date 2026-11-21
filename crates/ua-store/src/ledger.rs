@@ -8,6 +8,13 @@
 //!
 //! Event ids are ULIDs minted inside the write transaction against the log's
 //! current maximum, so id order equals commit order.
+//!
+//! Once `organization.v1.store` has applied, every row also carries `org_id`
+//! and `hash_v`. This build writes and verifies only `hash_v = 1`, the
+//! nine-field form above, which does **not** cover `org_id`: a row's
+//! `org_id` is recorded but not tamper-evident until rows are written with
+//! `hash_v = 2` (see `docs/organization.md`, The ledger). [`verify`] refuses
+//! any other `hash_v`.
 
 use std::fmt::Write as _;
 
@@ -21,6 +28,46 @@ use crate::db::WriteTx;
 use crate::schema::SchemaPart;
 
 pub const GENESIS_HASH: &str = "GENESIS";
+
+/// The only hash form this build writes and verifies.
+pub const HASH_V: i64 = 1;
+
+/// Refuse a ledger whose newest row uses a hash form newer than [`HASH_V`].
+///
+/// This is the rollback fence: a hub rolled back from a build that writes
+/// `hash_v = 2` must not append `hash_v = 1` rows after those, which no
+/// later `verify` accepts. [`crate::Db`] runs it at open and [`append`] before
+/// every write.
+///
+/// It reads only the newest row (by `seq`, the primary key, so a single
+/// index lookup however long the ledger is), not `MAX(hash_v)` (a full scan,
+/// as `hash_v` has no index). That is sufficient because a valid chain never
+/// decreases its `hash_v` (`docs/organization.md`, The ledger: a `hash_v = 1`
+/// row after the first `hash_v = 2` row fails verification), so the newest
+/// row carries the highest form. A ledger whose newest row has a lower form
+/// than an earlier one already fails [`verify`]. Ledgers without the column
+/// (`organization.v1.store` not applied) pass.
+pub fn check_hash_form(conn: &Connection) -> UaResult<()> {
+    let has_hash_v: bool = conn
+        .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    if !has_hash_v {
+        return Ok(());
+    }
+    let newest: Option<rusqlite::types::Value> = conn
+        .query_row("SELECT hash_v FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    match newest {
+        None | Some(rusqlite::types::Value::Integer(HASH_V)) => Ok(()),
+        Some(rusqlite::types::Value::Integer(v)) if v > HASH_V => Err(UaError::conflict(format!(
+            "event_log holds rows with hash_v {v}, written by a newer build; this build writes and verifies \
+             only hash_v {HASH_V}, so it refuses to append to this ledger. Run a build that supports hash_v {v}"
+        ))),
+        // Anything else is not a form any build writes; `verify` reports it.
+        Some(_) => Ok(()),
+    }
+}
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "ledger.v1",
@@ -248,6 +295,7 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
     if input.channel.trim().is_empty() {
         return Err(UaError::invalid("event channel must not be empty"));
     }
+    check_hash_form(tx)?;
     if let Some(k) = &input.dedupe_key {
         let seen: Option<i64> =
             tx.query_row("SELECT seq FROM event_log WHERE dedupe_key = ?1", [k], |r| r.get(0)).optional()?;
@@ -386,12 +434,21 @@ pub struct VerifyReport {
 /// chain (a low or negative `seq`) fails too. An unhashed row after the
 /// chain has started fails verification: nothing the hub appends lacks a
 /// hash, so such a row was written around the ledger.
+///
+/// Every row's `hash_v` (when the column exists, after
+/// `organization.v1.store`) must be [`HASH_V`]; any other value fails, so a
+/// row cannot claim a hash form this build does not check.
 pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     let expected_prefix = recorded_legacy_prefix(conn)?;
-    let mut stmt = conn.prepare(
+    let has_hash_v: bool = conn
+        .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    let hash_v = if has_hash_v { "hash_v" } else { "1" };
+    let mut stmt = conn.prepare(&format!(
         "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, dedupe_key, \
-         prev_hash, entry_hash FROM event_log ORDER BY seq ASC",
-    )?;
+         prev_hash, entry_hash, {hash_v} FROM event_log ORDER BY seq ASC"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut report =
@@ -406,6 +463,18 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
             first_bad_seq: Some(seq),
             reason: Some(reason.to_string()),
         };
+        // Read untyped, so a tampered non-integer value is reported, not an error.
+        let form: rusqlite::types::Value = r.get(11)?;
+        if form != rusqlite::types::Value::Integer(HASH_V) {
+            let shown = match form {
+                rusqlite::types::Value::Null => "NULL".to_string(),
+                rusqlite::types::Value::Integer(v) => v.to_string(),
+                rusqlite::types::Value::Real(v) => v.to_string(),
+                rusqlite::types::Value::Text(v) => format!("{v:?}"),
+                rusqlite::types::Value::Blob(_) => "a blob".to_string(),
+            };
+            return Ok(fail(&format!("unknown hash_v {shown}; this build verifies only hash_v = {HASH_V}")));
+        }
         let entry: Option<String> = r.get(10)?;
         let Some(entry) = entry else {
             if report.checked > 0 {
@@ -533,6 +602,82 @@ mod tests {
         let report = db.read(verify).unwrap();
         assert!(!report.ok);
         assert_eq!(report.first_bad_seq, Some(2));
+    }
+
+    #[test]
+    fn verify_refuses_a_hash_form_it_does_not_check() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        for i in 0..3 {
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+        }
+        assert!(db.read(verify).unwrap().ok);
+        db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
+        // A text value keeps TEXT storage in an INTEGER column only when it does
+        // not look like a number.
+        for (value, shown) in [("2", "2"), ("'v1'", "\"v1\"")] {
+            db.write(|tx| {
+                Ok(tx.execute(&format!("UPDATE event_log SET hash_v = {value} WHERE seq = 2"), [])?)
+            })
+            .unwrap();
+            let report = db.read(verify).unwrap();
+            assert!(!report.ok, "{value}: {report:?}");
+            assert_eq!(report.first_bad_seq, Some(2), "{value}");
+            assert_eq!(
+                report.reason.as_deref(),
+                Some(format!("unknown hash_v {shown}; this build verifies only hash_v = 1").as_str()),
+                "{value}"
+            );
+        }
+    }
+
+    /// The rollback fence: a ledger whose newest row has a newer hash form
+    /// (as a later build will write) refuses both `append` and `Db::open`,
+    /// naming both forms, so a rolled-back build never writes `hash_v = 1`
+    /// rows after `hash_v = 2` ones.
+    #[test]
+    fn a_ledger_with_a_newer_hash_form_refuses_append_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        let parts = [
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ];
+        let db = Db::open(&path, &parts).unwrap();
+        for i in 0..2 {
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+        }
+        // Stand in for a newer build's row: the newest row claims hash_v 2.
+        db.write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+            tx.execute("UPDATE event_log SET hash_v = 2 WHERE seq = (SELECT MAX(seq) FROM event_log)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let before: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        let err =
+            db.write(|tx| append(tx, EventInput::new("test.event", json!({})))).unwrap_err().to_string();
+        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+        let after: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(before, after, "nothing was appended");
+        drop(db);
+
+        let err = Db::open(&path, &parts).err().expect("open must refuse").to_string();
+        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+
+        // A ledger whose rows are all hash_v 1 opens and appends as before.
+        let fresh = dir.path().join("fresh.db");
+        let db = Db::open(&fresh, &parts).unwrap();
+        db.write(|tx| append(tx, EventInput::new("test.event", json!({})))).unwrap();
+        drop(db);
+        assert!(Db::open(&fresh, &parts).is_ok());
     }
 
     /// Insert a row with no hashes, as a legacy import or a direct write would.
