@@ -3,9 +3,11 @@
 # The `vocab` and `check` steps run the jobs of the same name in
 # .github/workflows/ci.yml, in parallel. Both may fail without stopping the
 # build, so each reports its own result (the `CI / vocab` and `CI / check`
-# statuses); the final `full-verification` step then fails the build unless
-# both passed. There is no cargo cache: every build compiles from scratch, which
-# keeps the build free of state from earlier runs.
+# statuses). The `sdk` step runs the TypeScript SDK's checks (the `verify` job
+# of .github/workflows/sdk.yml) beside them, when the commit has sdk/typescript;
+# it has no status of its own. The final `full-verification` step fails the
+# build unless all three passed. There is no cargo cache: every build compiles
+# from scratch, which keeps the build free of state from earlier runs.
 substitutions:
   # Pinned by digest to the stable toolchain the GitHub workflow's
   # dtolnay/rust-toolchain resolves to; bump both together. The workspace needs
@@ -14,6 +16,9 @@ substitutions:
   _RUST_IMAGE: rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
   # The step that can read the private denylist; pinned for the same reason.
   _GCLOUD_IMAGE: gcr.io/cloud-builders/gcloud@sha256:dc291205504ce8fdb830e55cae4905c7880c7978b03e54b5bcdabe7cab5f8e2e
+  # The SDK step's Node (full bookworm image: git, curl, python3), matching
+  # node-version in .github/workflows/sdk.yml; pinned for the same reason.
+  _NODE_IMAGE: node:22.23.5-bookworm@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb
   # The build's identity, `projects/<project>/serviceAccounts/<email>`, from
   # UA_CI_SERVICE_ACCOUNT. Empty (cloud-ci.sh --default-sa) runs as the
   # project's default build account.
@@ -50,15 +55,29 @@ steps:
     result=$$?
     mkdir -p .ci && printf '%s\n' "$$result" > .ci/check.exit
     exit "$$result"
+- id: sdk
+  waitFor: ['-']
+  allowFailure: true
+  name: ${_NODE_IMAGE}
+  entrypoint: bash
+  env:
+  - UA_CI_SOURCE_SHA=${_SOURCE_SHA}
+  args:
+  - -c
+  - |
+    bash ci-step.sh sdk
+    result=$$?
+    mkdir -p .ci && printf '%s\n' "$$result" > .ci/sdk.exit
+    exit "$$result"
 - id: full-verification
-  waitFor: [vocab, check]
+  waitFor: [vocab, check, sdk]
   name: ${_RUST_IMAGE}
   entrypoint: bash
   args:
   - -c
   - |
     set -eu
-    for job in vocab check; do
+    for job in vocab check sdk; do
       test -f ".ci/$$job.exit"
       test "$$(cat ".ci/$$job.exit")" = 0
     done
