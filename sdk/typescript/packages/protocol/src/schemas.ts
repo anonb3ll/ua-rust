@@ -190,6 +190,12 @@ export const Approval = z.object({
   status: ApprovalStatus,
   reason: z.string().nullable().optional(),
   resolved_by: z.string().nullable().optional(),
+  /**
+   * Adapter the latest decision on the row came through: `stdio`, `http`,
+   * `mcp`, `cli`, `ui`, `internal` or `slack`. Null for a row not yet
+   * resolved or resolved before the hub recorded it; absent from older hubs.
+   */
+  resolved_transport: z.string().nullable().optional(),
   created_at: IsoDateTime,
   updated_at: IsoDateTime,
   resolved_at: IsoDateTime.nullable().optional(),

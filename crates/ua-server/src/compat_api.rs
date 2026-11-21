@@ -576,6 +576,7 @@ async fn approval_detail(
         "requested_by": row.requested_by,
         "run_id": row.run_id,
         "resolved_by": row.resolved_by,
+        "resolved_transport": row.resolved_transport,
         "reason": row.reason,
         "created_at": row.created_at,
         "updated_at": row.updated_at,

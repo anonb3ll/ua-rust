@@ -211,6 +211,15 @@ from its commit history.
 
 ### Security
 
+- An approval decision records the adapter it came through: the approval
+  row's new `resolved_transport` (schema part `approvals.v2`; `stdio`,
+  `http`, `mcp`, `cli`, `ui`, `internal` or `slack`; NULL, shown as unknown,
+  for older rows; the row holds the latest decision), the
+  `agent.approval.resolved` and `relay.cancelled` ledger events'
+  `transport`, the approval list
+  and detail outputs, and a "Via" column in the Control Center inbox. A
+  `/approve` from Slack is no longer indistinguishable from a click in the
+  Control Center. Who may approve is unchanged.
 - `/api` and `/ui` refuse an unknown host and a cross-site write.
 - Auth fails closed: with `enforce_auth` and no token, every route except
   `GET /healthz` is rejected.
