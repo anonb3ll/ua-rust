@@ -28,6 +28,14 @@ from its commit history.
   unchanged. A ratchet test counts `reqwest` client builders, address
   classifiers and inbound delivery tables outside the crate; the counts may
   only go down.
+- `ua-ingress` hardening before any policy follows redirects: a hop to
+  another origin carries only `Accept` and `Accept-Language` (every other
+  header stays with its origin, whatever its name), a 307 or 308 that would
+  resend the body to another origin is refused, and a redirect from https to
+  http is refused unless a policy allows it (none does). The ratchet also
+  counts connections dialled by hand, inline address range checks, and
+  delivery tables recognised by name marks or columns instead of a fixed
+  list. No change for Slack replies, which follow no redirect.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.

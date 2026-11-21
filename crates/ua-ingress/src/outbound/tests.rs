@@ -98,6 +98,7 @@ const LOCAL: Policy = Policy {
     default_port_only: false,
     addresses: Addresses::PublicOrLoopback,
     max_redirects: 0,
+    allow_scheme_downgrade: false,
     max_body_bytes: 1024,
     connect_timeout: Duration::from_secs(5),
     request_timeout: Duration::from_secs(5),
@@ -421,4 +422,180 @@ fn errors_become_hub_errors_with_stable_codes() {
     assert_eq!(e.reason_code(), Some("ssrf_blocked"));
     let e: ua_core::UaError = OutboundError::UrlRefused { policy: "p", why: "w" }.into();
     assert_eq!(e.reason_code(), Some("outbound_refused"));
+}
+
+// --- cross-origin hops -------------------------------------------------------------------------
+
+/// Two loopback servers on different ports: different origins.
+async fn two_origins(
+    first_answer: impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+) -> (Server, Server) {
+    let other = Server::start(|_| ok("other")).await;
+    let other_base = format!("http://{}", other.addr);
+    let first = Server::start(move |req| first_answer(req, &other_base)).await;
+    (first, other)
+}
+
+#[tokio::test]
+async fn a_plain_header_stays_with_the_origin_it_was_built_for() {
+    let (first, other) = two_origins(|req, other| {
+        if req.starts_with("GET /away ") {
+            redirect(302, &format!("{other}/landing"))
+        } else if req.starts_with("GET /same ") {
+            redirect(302, "/after")
+        } else {
+            ok("same")
+        }
+    })
+    .await;
+    let out = Outbound::new(Policy { max_redirects: 3, ..LOCAL }).unwrap();
+    // A credential under a name the word list does not know.
+    let build = |path: &str| {
+        Request::get(first.url(path))
+            .header("X-Custom-Auth", "hunter2")
+            .unwrap()
+            .header("Accept", "text/plain")
+            .unwrap()
+            .header("Accept-Language", "en")
+            .unwrap()
+            .header("X-Trace", "abc")
+            .unwrap()
+    };
+    out.send(build("/away")).await.unwrap();
+    let at_first = first.seen().join("\n").to_ascii_lowercase();
+    assert!(at_first.contains("x-custom-auth: hunter2") && at_first.contains("x-trace: abc"), "{at_first}");
+    let at_other = other.seen().join("\n").to_ascii_lowercase();
+    assert!(at_other.contains("accept: text/plain"), "{at_other}");
+    assert!(at_other.contains("accept-language: en"), "{at_other}");
+    assert!(!at_other.contains("hunter2") && !at_other.contains("x-custom-auth"), "{at_other}");
+    assert!(!at_other.contains("x-trace"), "{at_other}");
+
+    // Within the origin, every header follows.
+    out.send(build("/same")).await.unwrap();
+    let after: Vec<String> = first.seen().into_iter().filter(|r| r.starts_with("GET /after ")).collect();
+    assert!(after[0].to_ascii_lowercase().contains("x-custom-auth: hunter2"));
+}
+
+#[tokio::test]
+async fn a_body_is_never_resent_to_another_origin() {
+    let (first, other) = two_origins(|req, other| {
+        let path = req.split_whitespace().nth(1).unwrap_or("/");
+        match path {
+            "/307" => redirect(307, &format!("{other}/landing")),
+            "/308" => redirect(308, &format!("{other}/landing")),
+            "/303" => redirect(303, &format!("{other}/landing")),
+            "/same307" => redirect(307, "/landed"),
+            _ => ok("done"),
+        }
+    })
+    .await;
+    let out = Outbound::new(Policy { max_redirects: 3, ..LOCAL }).unwrap();
+    let post =
+        |path: &str| Request::post(first.url(path)).json(&serde_json::json!({"k": "payload"})).unwrap();
+    for path in ["/307", "/308"] {
+        let err = out.send(post(path)).await.err().unwrap();
+        assert!(
+            matches!(err, OutboundError::Redirect(ref why) if why.contains("resend the request body")),
+            "{err:?}"
+        );
+    }
+    assert!(other.seen().is_empty(), "nothing reached the other origin");
+
+    // 303 becomes a GET without the body or its content type.
+    out.send(post("/303")).await.unwrap();
+    let at_other = other.seen().join("\n");
+    assert!(at_other.starts_with("GET /landing "), "{at_other}");
+    assert!(!at_other.contains("payload") && !at_other.to_ascii_lowercase().contains("content-type"));
+
+    // A 307 within the origin resends the body, as it must.
+    out.send(post("/same307")).await.unwrap();
+    let landed: Vec<String> = first.seen().into_iter().filter(|r| r.starts_with("POST /landed ")).collect();
+    assert_eq!(landed.len(), 1);
+    assert!(landed[0].ends_with("{\"k\":\"payload\"}"));
+}
+
+#[test]
+fn a_redirect_from_https_to_http_is_refused_unless_the_policy_allows_it() {
+    let strict = Outbound::new(Policy { max_redirects: 3, ..LOCAL }).unwrap();
+    let home = Url::parse("https://a.example.com/").unwrap().origin();
+    let mut req = Request::get(Url::parse("https://a.example.com/start").unwrap());
+    let err =
+        strict.follow(&mut req, &home, StatusCode::FOUND, Some("http://a.example.com/next")).err().unwrap();
+    assert!(matches!(err, OutboundError::Redirect(ref why) if why.contains("https to http")), "{err:?}");
+    assert_eq!(req.url.as_str(), "https://a.example.com/start", "the request is unchanged");
+    // https to https elsewhere and http to https are fine.
+    strict.follow(&mut req, &home, StatusCode::FOUND, Some("https://b.example.com/x")).unwrap();
+    let mut plain = Request::get(Url::parse("http://a.example.com/").unwrap());
+    strict.follow(&mut plain, &home, StatusCode::FOUND, Some("https://a.example.com/")).unwrap();
+
+    let lax = Outbound::new(Policy { max_redirects: 3, allow_scheme_downgrade: true, ..LOCAL }).unwrap();
+    let mut req = Request::get(Url::parse("https://a.example.com/start").unwrap());
+    lax.follow(&mut req, &home, StatusCode::FOUND, Some("http://a.example.com/next")).unwrap();
+    assert_eq!(req.url.scheme(), "http");
+    for p in crate::policy::POLICIES {
+        assert!(!p.allow_scheme_downgrade, "{} allows a downgrade", p.name);
+    }
+}
+
+// --- the peer-address re-check ----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_peer_outside_the_class_is_refused_after_the_resolver_passed_it() {
+    let server = Server::start(|_| ok("hi")).await;
+    let policy = Policy { hosts: Hosts::Exactly(&["svc.test"]), addresses: Addresses::Public, ..LOCAL };
+    // The resolver is given a looser rule than the policy, so its answer
+    // (loopback) passes and the connection is made: only the peer check is
+    // left to refuse it.
+    let out = Outbound::with_seams(
+        policy,
+        fake_lookup("svc.test", vec![server.addr]),
+        Addresses::PublicOrLoopback,
+        reqwest::Response::remote_addr,
+    )
+    .unwrap();
+    let url = Url::parse(&format!("http://svc.test:{}/", server.addr.port())).unwrap();
+    let err = out.send(Request::get(url)).await.err().unwrap();
+    assert!(
+        matches!(err, OutboundError::AddressRefused { reason: "loopback", ref host, .. } if host == "svc.test"),
+        "{err:?}"
+    );
+    // The check runs after the response head: the request did go out.
+    assert_eq!(server.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn a_missing_peer_address_is_refused() {
+    let server = Server::start(|_| ok("hi")).await;
+    let out = Outbound::with_seams(LOCAL, system_lookup(), LOCAL.addresses, |_| None).unwrap();
+    let err = out.send(Request::get(server.url("/"))).await.err().unwrap();
+    assert_eq!(err, OutboundError::Unverified);
+}
+
+// --- the Slack reply policy ---------------------------------------------------------------------
+
+// The Slack reply policy follows no redirect and allows no downgrade.
+const _: () = assert!(SLACK_RESPONSE_URL.max_redirects == 0 && !SLACK_RESPONSE_URL.allow_scheme_downgrade);
+
+#[tokio::test]
+async fn the_slack_reply_policy_never_follows_a_redirect() {
+    let other = Server::start(|_| ok("other")).await;
+    let target = other.url("/elsewhere").to_string();
+    let hooks = Server::start(move |_| redirect(307, &target)).await;
+    // The Slack policy, loosened only so a plain loopback server can stand in
+    // for the hooks host.
+    let policy = Policy {
+        schemes: Schemes::HttpOrHttps,
+        default_port_only: false,
+        addresses: Addresses::PublicOrLoopback,
+        ..SLACK_RESPONSE_URL
+    };
+    let out = Outbound::with_lookup(policy, fake_lookup("hooks.slack.com", vec![hooks.addr])).unwrap();
+    let url = Url::parse(&format!("http://hooks.slack.com:{}/commands/T0/1/abc", hooks.addr.port())).unwrap();
+    let req = Request::post(url).json(&serde_json::json!({"text": "hi"})).unwrap();
+    let resp = out.send(req).await.unwrap();
+    // Returned as it is; `post_reply` reports a non-success status as `status`.
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(!resp.status().is_success());
+    assert_eq!(hooks.seen().len(), 1);
+    assert!(other.seen().is_empty(), "the Location was not followed");
 }

@@ -11,17 +11,28 @@
 //!   policy instead;
 //! - `address_classifier`: definitions of a function that takes an IP
 //!   address (`IpAddr`, `Ipv4Addr`, `Ipv6Addr`, by value or reference),
-//!   returns `bool`, `Option<..>` or `Result<..>`, and whose body tests an
-//!   address range or takes the address apart ([`RANGE_PROBES`]): the shape
-//!   of an address classifier. Use `ua_ingress::addr` instead;
+//!   returns `bool`, `Option<..>` or `Result<..>`, and whose body holds
+//!   hand-written range logic ([`RANGE_PROBES`]: a standard-library range
+//!   test or taking the address apart): the shape of an address classifier.
+//!   A function that only calls `ua_ingress::addr` is not counted. Use
+//!   `ua_ingress::addr` instead;
+//! - `inline_address_check`: each [`RANGE_PROBES`] call outside such a
+//!   function: range logic written inline, on an address or a socket
+//!   address (`addr.ip().is_loopback()`). Calls of the `ua_ingress::addr`
+//!   functions are not counted;
+//! - `direct_dial`: a connection dialled by hand instead of through
+//!   `Outbound` ([`DIAL_PATTERNS`]: `TcpStream::connect…`, `TcpSocket`,
+//!   rustls or native TLS connectors, `tokio-tungstenite` client
+//!   handshakes, hyper's `HttpConnector`). Unix-domain sockets are local and
+//!   not counted;
 //! - `delivery_table`: `CREATE TABLE` (with or without `IF NOT EXISTS`) of
-//!   an inbound duplicate-delivery table: `github_deliveries`,
-//!   `github_delivery_bodies`, `slack_seen_signatures`,
-//!   `slack_seen_deliveries`. Searched in the text as written, since SQL
-//!   lives in strings.
+//!   an inbound delivery, replay or dedupe record: a table whose name holds
+//!   one of [`DELIVERY_NAME_MARKS`] or which has a column named in
+//!   [`DELIVERY_COLUMNS`]. Searched in the text as written, since SQL lives
+//!   in strings.
 //!
 //! Test code (`#[cfg(test)]` items) is not counted; comments and strings are
-//! not counted for the first two categories.
+//! not counted for the code categories.
 //!
 //! Each count must equal [`BASELINE`]: above it, a new duplicate was added
 //! (use the crate instead); below it, one was removed (lower the baseline
@@ -41,10 +52,24 @@ use support::{close_brace, find_all, sources, without_tests, without_tests_raw};
 const BASELINE: &[(&str, &str, usize)] = &[
     // `oauth/cimd.rs` (the client ID metadata document fetch).
     ("ua-server", "client_builder", 1),
-    // `web::vet_ip`, `mcp::scope::{classify, classify_v4}` and
-    // `relay::gates::{v4_kind, v6_kind}` (which judge publication, not
-    // reachability, but have the same shape).
-    ("ua-tools", "address_classifier", 5),
+    // `oauth/register.rs`: a loopback redirect host (2) and the
+    // registration rate limit's loopback peer (1); `login.rs`: a loopback
+    // link host (2).
+    ("ua-server", "inline_address_check", 5),
+    // `slack_socket.rs::connect`: `TcpStream::connect`, the rustls
+    // `TlsConnector`, the `tokio-tungstenite` client handshake.
+    ("ua-server", "direct_dial", 3),
+    // `ops/doctor.rs`: is the bind address loopback.
+    ("ua-cli", "inline_address_check", 1),
+    // `mcp::scope::{classify, classify_v4}` and `relay::gates::{v4_kind,
+    // v6_kind}` (which judge publication, not reachability, but have the
+    // same shape).
+    ("ua-tools", "address_classifier", 4),
+    // Loopback URL hosts in `slack.rs` (2), `zulip.rs` (2),
+    // `github/client.rs` (2) and `harness_config/policy.rs` (2); loopback
+    // bind or host checks in `observability.rs` (2) and `vault/obsidian.rs`
+    // (1).
+    ("ua-tools", "inline_address_check", 11),
     // `web::http_client`, `github::client`, `mcp::gateway`, `notify`,
     // `vault::obsidian`.
     ("ua-tools", "client_builder", 5),
@@ -53,15 +78,37 @@ const BASELINE: &[(&str, &str, usize)] = &[
     ("ua-tools", "delivery_table", 4),
 ];
 
-const CATEGORIES: &[&str] = &["client_builder", "address_classifier", "delivery_table"];
+const CATEGORIES: &[&str] =
+    &["client_builder", "address_classifier", "inline_address_check", "direct_dial", "delivery_table"];
 
-const DELIVERY_TABLES: &[&str] =
-    &["github_deliveries", "github_delivery_bodies", "slack_seen_signatures", "slack_seen_deliveries"];
+/// Words in a table name that mark an inbound delivery, replay or dedupe
+/// record. Checked against every table in the tree: they match the four
+/// delivery tables and nothing else (`idempotency_keys` and
+/// `dispatch_receipts` are not inbound deliveries and match no mark).
+const DELIVERY_NAME_MARKS: &[&str] = &["deliver", "seen", "replay", "dedup", "webhook", "envelope"];
+
+/// Column names that mark an inbound delivery record, whatever the table is
+/// called.
+const DELIVERY_COLUMNS: &[&str] = &["delivery_id", "envelope_id", "event_id", "trigger_id", "request_sha"];
+
+/// Connections dialled by hand.
+const DIAL_PATTERNS: &[&str] = &[
+    "TcpStream::connect",
+    "TcpSocket::new_v4(",
+    "TcpSocket::new_v6(",
+    "TlsConnector::from(",
+    "TlsConnector::new(",
+    "TlsConnector::builder(",
+    "connect_async",
+    "client_async",
+    "HttpConnector::new(",
+];
 
 const IP_TYPES: &[&str] = &["IpAddr", "Ipv4Addr", "Ipv6Addr"];
 
-/// What a classifier's body does to an address: test a range or take it
-/// apart. A function that only uses an address as a key is not counted.
+/// Hand-written range logic: a standard-library range test, or taking the
+/// address apart. A function that only uses an address as a key, or only
+/// calls `ua_ingress::addr`, holds none.
 const RANGE_PROBES: &[&str] = &[
     ".is_loopback(",
     ".is_private(",
@@ -73,11 +120,10 @@ const RANGE_PROBES: &[&str] = &[
     ".is_global(",
     ".octets(",
     ".segments(",
+    ".is_unique_local(",
+    ".is_unicast_link_local(",
     ".to_ipv4_mapped(",
     ".to_ipv4(",
-    "non_public_reason(",
-    "embedded_v4(",
-    "is_loopback(",
 ];
 
 fn crate_of(path: &Path) -> String {
@@ -142,6 +188,7 @@ fn count_code(m: &str) -> BTreeMap<&'static str, Vec<usize>> {
             }
         }
     }
+    let mut classifier_bodies: Vec<(usize, usize)> = Vec::new();
     for at in find_all(m, "fn ") {
         let Some(open) = m[at..].find('(').map(|n| at + n) else { continue };
         if !is_fn_name(m[at + 3..open].trim()) {
@@ -171,9 +218,22 @@ fn count_code(m: &str) -> BTreeMap<&'static str, Vec<usize>> {
         if !(returns_verdict && takes_ip(&m[open + 1..close])) || !m[tail_end..].starts_with('{') {
             continue;
         }
-        let body = &m[tail_end..close_brace(m, tail_end)];
-        if RANGE_PROBES.iter().any(|p| body.contains(p)) {
+        let end = close_brace(m, tail_end);
+        if RANGE_PROBES.iter().any(|p| m[tail_end..end].contains(p)) {
             out.entry("address_classifier").or_default().push(at);
+            classifier_bodies.push((tail_end, end));
+        }
+    }
+    for p in RANGE_PROBES {
+        for (at, _) in m.match_indices(p) {
+            if !classifier_bodies.iter().any(|(s, e)| *s <= at && at < *e) {
+                out.entry("inline_address_check").or_default().push(at);
+            }
+        }
+    }
+    for pat in DIAL_PATTERNS {
+        for at in find_all(m, pat) {
+            out.entry("direct_dial").or_default().push(at);
         }
     }
     out
@@ -190,11 +250,46 @@ fn count_tables(raw: &str) -> Vec<usize> {
         }
         let rest = rest.trim_start_matches(['"', '`', '[']);
         let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-        if DELIVERY_TABLES.contains(&name.as_str()) {
+        if DELIVERY_NAME_MARKS.iter().any(|w| name.contains(w))
+            || columns(rest).iter().any(|c| DELIVERY_COLUMNS.contains(&c.as_str()))
+        {
             out.push(at);
         }
     }
     out
+}
+
+/// The column names of a `CREATE TABLE` body (`rest` starts at the table
+/// name): the first word of each top-level item, constraints skipped.
+fn columns(rest: &str) -> Vec<String> {
+    let Some(open) = rest.find('(') else { return Vec::new() };
+    let mut depth = 0i32;
+    let mut items = Vec::new();
+    let mut start = open + 1;
+    for (i, c) in rest[open..].char_indices() {
+        let i = open + i;
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    items.push(&rest[start..i]);
+                    break;
+                }
+            }
+            ',' if depth == 1 => {
+                items.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items
+        .iter()
+        .filter_map(|item| item.split_whitespace().next())
+        .map(|w| w.trim_matches(['"', '`', '[', ']']).to_string())
+        .filter(|w| !["primary", "unique", "foreign", "check", "constraint"].contains(&w.as_str()))
+        .collect()
 }
 
 fn count(src: &str) -> BTreeMap<&'static str, usize> {
@@ -272,7 +367,7 @@ fn each_category_is_caught() {
             "address_classifier",
         ),
         (
-            "pub(crate) fn vet(a: &Ipv6Addr, loopback: bool) -> Result<(), String> { non_public_reason(a)?; Ok(()) }",
+            "pub(crate) fn vet(a: &Ipv6Addr, loopback: bool) -> Result<(), String> { (a.segments()[0] == 0).then_some(()).ok_or_default() }",
             "address_classifier",
         ),
         (
@@ -280,13 +375,33 @@ fn each_category_is_caught() {
             "address_classifier",
         ),
         (
-            "fn g<T: Into<u8>>(t: T, ip: &net::IpAddr) -> Option<T> { embedded_v4(ip).map(|_| t) }",
+            "fn g<T: Into<u8>>(t: T, ip: &net::IpAddr) -> Option<T> { ip.to_ipv4_mapped().map(|_| t) }",
             "address_classifier",
         ),
+        ("fn f() { let local = cfg.bind.ip().is_loopback(); }", "inline_address_check"),
+        (
+            "fn f(h: url::Host) -> bool { matches!(h, Host::Ipv4(ip) if ip.is_private()) }",
+            "inline_address_check",
+        ),
+        ("fn f(o: [u8; 4]) { let x = ip.octets()[0] == 10; }", "inline_address_check"),
+        ("async fn f() { tokio::net::TcpStream::connect(&addrs[..]).await; }", "direct_dial"),
+        ("fn f() { std::net::TcpStream::connect_timeout(&a, t); }", "direct_dial"),
+        ("fn f() { let c = tokio_rustls::TlsConnector::from(Arc::new(config)); }", "direct_dial"),
+        ("async fn f() { tokio_tungstenite::client_async_with_config(u, io, None).await; }", "direct_dial"),
+        ("async fn f() { tokio_tungstenite::connect_async(u).await; }", "direct_dial"),
+        ("fn f() { let s = tokio::net::TcpSocket::new_v4(); }", "direct_dial"),
         ("const S: &str = \"CREATE TABLE IF NOT EXISTS github_deliveries (id TEXT)\";", "delivery_table"),
         ("const S: &str = \"create table slack_seen_signatures (sig TEXT)\";", "delivery_table"),
         ("const S: &str = r#\"CREATE TABLE \"github_delivery_bodies\" (x)\"#;", "delivery_table"),
         ("const S: &str = \"CREATE TABLE IF NOT EXISTS\n    slack_seen_deliveries (x)\";", "delivery_table"),
+        // Under another name: by a name mark, or by a column.
+        ("const S: &str = \"CREATE TABLE zulip_webhook_log (id TEXT)\";", "delivery_table"),
+        ("const S: &str = \"CREATE TABLE inbound_replays (id TEXT)\";", "delivery_table"),
+        (
+            "const S: &str = \"CREATE TABLE IF NOT EXISTS chat_inbox (\n    team TEXT,\n    event_id TEXT NOT NULL,\n    PRIMARY KEY (team, event_id)\n)\";",
+            "delivery_table",
+        ),
+        ("const S: &str = \"CREATE TABLE things (kind TEXT, delivery_id TEXT)\";", "delivery_table"),
     ];
     for (src, cat) in cases {
         let got = count(src);
@@ -294,13 +409,49 @@ fn each_category_is_caught() {
     }
     // Not a classifier: no address parameter, no verdict returned, or the
     // address only used as a key.
-    assert!(count("fn f(port: u16) -> bool { ip.is_loopback() }").is_empty());
+    assert_eq!(
+        count("fn f(port: u16) -> bool { ip.is_loopback() }"),
+        BTreeMap::from([("inline_address_check", 1)]),
+        "not a classifier, but inline range logic"
+    );
     assert!(count("fn rate_ok(addr: IpAddr, n: u32) -> bool { seen(addr) < n }").is_empty());
-    assert!(count("fn show(ip: IpAddr) -> String { ip.octets().len().to_string() }").is_empty());
-    assert!(count("fn f(ip: MyIpAddrish) -> bool { ip.is_private() }").is_empty());
-    // Other tables, other clients, and a `Client::new` with no reqwest in sight.
-    assert!(count("const S: &str = \"CREATE TABLE github_deliveries_v2 (x)\";").is_empty());
+    assert!(
+        !count("fn show(ip: IpAddr) -> String { ip.octets().len().to_string() }")
+            .contains_key("address_classifier")
+    );
+    assert!(!count("fn f(ip: MyIpAddrish) -> bool { ip.is_private() }").contains_key("address_classifier"));
+    // A function that only calls the crate's classifier holds no range logic.
+    assert!(
+        count("fn vet(ip: IpAddr, lo: bool) -> Result<(), String> { match non_public_reason(ip) { None => Ok(()), Some(_) if lo && is_loopback(ip) => Ok(()), Some(r) => Err(r.into()) } }")
+            .is_empty()
+    );
+    assert!(count("fn f(a: SocketAddr) -> bool { ua_ingress::addr::is_public(a.ip()) }").is_empty());
+    // Probes inside a counted classifier are not counted again inline.
+    assert_eq!(
+        count("fn c(ip: Ipv4Addr) -> bool { ip.is_loopback() || ip.is_private() }"),
+        BTreeMap::from([("address_classifier", 1)])
+    );
+    // Local sockets are not dialled connections.
+    assert!(count("async fn f() { tokio::net::UnixStream::connect(p).await; }").is_empty());
+    assert!(count("fn reconnect_async_later() {}").is_empty());
+    // Other tables (the tree's lookalikes among them), other clients, and a
+    // `Client::new` with no reqwest in sight.
     assert!(count("const S: &str = \"CREATE TABLE tasks (x)\";").is_empty());
+    assert!(
+        count("const S: &str = \"CREATE TABLE idempotency_keys (key TEXT PRIMARY KEY, response TEXT)\";")
+            .is_empty()
+    );
+    assert!(
+        count("const S: &str = \"CREATE TABLE dispatch_receipts (run_id TEXT, received_at TEXT)\";")
+            .is_empty()
+    );
+    assert!(count("const S: &str = \"CREATE TABLE managed_secrets (name TEXT, nonce BLOB)\";").is_empty());
+    assert!(
+        count(
+            "const S: &str = \"CREATE TABLE event_log (id INTEGER, kind TEXT, CHECK (kind <> 'event_id'))\";"
+        )
+        .is_empty()
+    );
     assert!(count("fn f() { let c = rmcp::Client::new(); }").is_empty());
     assert!(count("fn f() { let c = HttpClient::builder(); }").is_empty());
     // Comments and test code are not counted; code text in strings is not.

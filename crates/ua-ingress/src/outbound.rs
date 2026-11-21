@@ -7,6 +7,10 @@
 //!   `ALL_PROXY` and the system settings are ignored).
 //! - **No redirects** unless the policy allows them. Allowed redirects are
 //!   followed by hand, and each hop is checked against the policy again.
+//!   Headers and the body belong to the origin of the request URL: a hop to
+//!   another origin carries only `accept` and `accept-language`, a 307 or
+//!   308 that would resend the body to another origin is refused, and so is
+//!   a hop from https to http unless the policy allows it (none does).
 //! - **A body cap** on every read path of a [`Response`].
 //! - **A connect-time address check.** The client's DNS resolver classifies
 //!   every address a name resolves to and fails the lookup when any one is
@@ -18,8 +22,10 @@
 //!   not guarantee.
 //! - **Secret headers stay with their origin.** A header added with
 //!   [`Request::secret_header`] is bound to the origin (scheme, host, port)
-//!   of the request URL and is attached only to a hop with that origin.
-//!   [`Request::header`] refuses names that look like credentials.
+//!   of the request URL and is attached only to a hop with that origin. So
+//!   is every plain header outside the short cross-origin list above.
+//!   [`Request::header`] also refuses names that look like credentials, an
+//!   extra check that cross-origin safety does not rely on.
 //! - **Timeouts**: connect, per request (body included) and for the whole
 //!   call (redirects and body included).
 
@@ -30,7 +36,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION,
+};
 use reqwest::{Method, StatusCode};
 use tokio::time::Instant;
 use url::Url;
@@ -320,16 +328,27 @@ impl Request {
 // The client
 // ---------------------------------------------------------------------------
 
+/// Headers that may follow a redirect to another origin. Every other header,
+/// however it was named or set, is sent only to the origin of the request
+/// URL it was built for. `content-type` would be listed only together with a
+/// body, and a body never crosses origins.
+const CROSS_ORIGIN_HEADERS: &[HeaderName] = &[ACCEPT, ACCEPT_LANGUAGE];
+
+/// How the client reads the peer address of a response's connection.
+type PeerOf = fn(&reqwest::Response) -> Option<SocketAddr>;
+
 /// A guarded HTTP client for one [`Policy`].
 pub struct Outbound {
     policy: Policy,
     client: reqwest::Client,
+    /// `reqwest::Response::remote_addr`, except in tests.
+    peer_of: PeerOf,
 }
 
 impl Outbound {
     /// A client for `policy`. An invalid policy is refused.
     pub fn new(policy: Policy) -> Result<Self, OutboundError> {
-        Self::build(policy, system_lookup())
+        Self::build(policy, system_lookup(), policy.addresses, reqwest::Response::remote_addr)
     }
 
     /// A client for the named policy ([`policy::POLICIES`]). An unknown
@@ -340,14 +359,31 @@ impl Outbound {
 
     #[cfg(test)]
     pub(crate) fn with_lookup(policy: Policy, lookup: Lookup) -> Result<Self, OutboundError> {
-        Self::build(policy, lookup)
+        Self::build(policy, lookup, policy.addresses, reqwest::Response::remote_addr)
     }
 
-    fn build(policy: Policy, lookup: Lookup) -> Result<Self, OutboundError> {
+    /// Test seam for the peer-address re-check: the resolver applies
+    /// `resolver_rule` instead of the policy's rule, and `peer_of` reads the
+    /// peer address.
+    #[cfg(test)]
+    pub(crate) fn with_seams(
+        policy: Policy,
+        lookup: Lookup,
+        resolver_rule: Addresses,
+        peer_of: PeerOf,
+    ) -> Result<Self, OutboundError> {
+        Self::build(policy, lookup, resolver_rule, peer_of)
+    }
+
+    fn build(
+        policy: Policy,
+        lookup: Lookup,
+        resolver_rule: Addresses,
+        peer_of: PeerOf,
+    ) -> Result<Self, OutboundError> {
         policy.validate()?;
         install_crypto_provider();
-        let resolver =
-            GuardedResolver { addresses: policy.addresses, timeout: policy.connect_timeout, lookup };
+        let resolver = GuardedResolver { addresses: resolver_rule, timeout: policy.connect_timeout, lookup };
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
@@ -360,7 +396,7 @@ impl Outbound {
             .map_err(|e| {
                 OutboundError::Transport(format!("cannot build the HTTP client: {}", error_chain(&e)))
             })?;
-        Ok(Self { policy, client })
+        Ok(Self { policy, client, peer_of })
     }
 
     pub fn policy(&self) -> &Policy {
@@ -378,21 +414,41 @@ impl Outbound {
         }
     }
 
+    /// The hops of one call. Headers and the body belong to the origin of
+    /// the request URL (`home`): a hop there gets them all; a hop to any
+    /// other origin gets only [`CROSS_ORIGIN_HEADERS`] and secret headers
+    /// bound to it (none, as built), and a redirect that would resend the
+    /// body to another origin, or move from https to http, is refused.
     async fn send_hops(&self, mut req: Request, deadline: Instant) -> Result<Response, OutboundError> {
         let max = self.policy.max_redirects;
+        let home = req.url.origin();
         for hop in 0..=max {
             self.policy.check_url(&req.url)?;
-            let mut rb =
-                self.client.request(req.method.clone(), req.url.clone()).headers(req.headers.clone());
             let origin = req.url.origin();
+            let headers = if origin == home {
+                req.headers.clone()
+            } else {
+                let mut kept = HeaderMap::new();
+                for name in CROSS_ORIGIN_HEADERS {
+                    for v in req.headers.get_all(name) {
+                        kept.append(name.clone(), v.clone());
+                    }
+                }
+                kept
+            };
+            let mut rb = self.client.request(req.method.clone(), req.url.clone()).headers(headers);
             for s in req.secrets.iter().filter(|s| s.origin == origin) {
                 rb = rb.header(s.name.clone(), s.value.clone());
             }
             if let Some(b) = &req.body {
+                if origin != home {
+                    // Unreachable: the redirect step below refuses this hop.
+                    return Err(OutboundError::Redirect("the body may not go to another origin".into()));
+                }
                 rb = rb.body(b.clone());
             }
             let resp = rb.send().await.map_err(send_error)?;
-            let remote = resp.remote_addr().ok_or(OutboundError::Unverified)?;
+            let remote = (self.peer_of)(&resp).ok_or(OutboundError::Unverified)?;
             self.policy.addresses.check(remote.ip()).map_err(|reason| OutboundError::AddressRefused {
                 host: req.url.host_str().unwrap_or_default().to_string(),
                 ip: remote.ip(),
@@ -411,18 +467,41 @@ impl Outbound {
             if hop == max {
                 return Err(OutboundError::Redirect(format!("stopped after {max} redirects")));
             }
-            let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).ok_or_else(|| {
-                OutboundError::Redirect(format!("HTTP {} without a Location", status.as_u16()))
-            })?;
-            let next = req.url.join(loc).map_err(|_| OutboundError::Redirect("bad Location".into()))?;
-            if !matches!(status.as_u16(), 307 | 308) {
-                req.method = Method::GET;
-                req.body = None;
-                req.headers.remove(CONTENT_TYPE);
-            }
-            req.url = next;
+            let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
+            self.follow(&mut req, &home, status, loc)?;
         }
         Err(OutboundError::Redirect(format!("stopped after {max} redirects")))
+    }
+
+    /// Turn `req` into the next hop of a redirect, or refuse it. `home` is
+    /// the origin the request was built for.
+    fn follow(
+        &self,
+        req: &mut Request,
+        home: &url::Origin,
+        status: StatusCode,
+        location: Option<&str>,
+    ) -> Result<(), OutboundError> {
+        let loc = location
+            .ok_or_else(|| OutboundError::Redirect(format!("HTTP {} without a Location", status.as_u16())))?;
+        let next = req.url.join(loc).map_err(|_| OutboundError::Redirect("bad Location".into()))?;
+        if req.url.scheme() == "https" && next.scheme() == "http" && !self.policy.allow_scheme_downgrade {
+            return Err(OutboundError::Redirect("refusing a redirect from https to http".into()));
+        }
+        if !matches!(status.as_u16(), 307 | 308) {
+            // 301, 302 and 303 become a GET without a body.
+            req.method = Method::GET;
+            req.body = None;
+            req.headers.remove(CONTENT_TYPE);
+        }
+        if req.body.is_some() && &next.origin() != home {
+            return Err(OutboundError::Redirect(format!(
+                "refusing HTTP {} to another origin: it would resend the request body",
+                status.as_u16()
+            )));
+        }
+        req.url = next;
+        Ok(())
     }
 }
 
