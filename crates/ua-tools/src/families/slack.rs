@@ -45,7 +45,9 @@ CREATE INDEX IF NOT EXISTS slack_seen_signatures_seen_at ON slack_seen_signature
 
 /// Slack event ids and trigger ids already handled, so a retried delivery
 /// (Slack re-sends an Events API callback it thinks timed out, with a new
-/// timestamp and so a new signature) runs once.
+/// timestamp and so a new signature) runs once. `state` tracks a command
+/// from `accepted` to `finished`; one still `accepted` when the hub starts
+/// was lost and is ledgered as abandoned ([`sweep_abandoned`]).
 pub const SCHEMA_V2: SchemaPart = SchemaPart {
     name: "slack.v2",
     sql: "
@@ -53,6 +55,8 @@ CREATE TABLE IF NOT EXISTS slack_seen_deliveries (
     kind TEXT NOT NULL CHECK (kind IN ('event', 'trigger')),
     delivery_id TEXT NOT NULL,
     seen_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'seen' CHECK (state IN ('seen', 'accepted', 'finished', 'abandoned')),
+    identity TEXT,
     PRIMARY KEY (kind, delivery_id)
 );
 CREATE INDEX IF NOT EXISTS slack_seen_deliveries_seen_at ON slack_seen_deliveries (seen_at);
@@ -236,8 +240,9 @@ pub fn remember_delivery(tx: &mut WriteTx<'_>, kind: DeliveryKind, id: &str, now
     if !delivery_id_ok(id) {
         return Err(UaError::invalid("malformed Slack delivery id"));
     }
+    // An `accepted` row waits for the startup sweep however old it is.
     tx.execute(
-        "DELETE FROM slack_seen_deliveries WHERE seen_at < ?1",
+        "DELETE FROM slack_seen_deliveries WHERE seen_at < ?1 AND state != 'accepted'",
         params![now.saturating_sub(DELIVERY_RETENTION_S)],
     )?;
     let inserted = tx.execute(
@@ -267,11 +272,12 @@ pub struct Delivery {
 /// What [`admit`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// Run it as `identity`.
-    Accepted { identity: String, human: bool },
-    /// Refused, with a reason class (`unmapped_identity`, `identity_retired`,
+    /// Run it as `identity` (always a human: `slack_identities` maps only to
+    /// `human_identities`).
+    Accepted { identity: String },
+    /// Refused, with a reason class (`unmapped_identity`, `approve_not_enabled`
     /// or the route's own refusal). Nothing runs. `identity` is `None` for
-    /// the first two, which are not ledgered.
+    /// `unmapped_identity`, which is not ledgered.
     Refused { reason: &'static str, identity: Option<String> },
     /// The event id or trigger id was handled before (a Slack retry).
     Deduped { identity: String },
@@ -282,7 +288,7 @@ pub enum Admission {
 /// rolls everything back), map (`team_id`, `user_id`) to a hub identity,
 /// then dedupe on the delivery id.
 ///
-/// A request with no usable identity (unmapped pair, retired agent) adds
+/// A request with no usable identity (an unmapped pair) adds
 /// **no ledger row**: its signature is still remembered, so a replay is
 /// still refused, but any member of the workspace (or of a shared channel)
 /// can send such requests in a loop, and the ledger is permanent. The caller
@@ -301,15 +307,17 @@ pub fn admit(
 ) -> UaResult<Admission> {
     let sha = record_signature(tx, timestamp, body, now)?;
     let kind = d.kind.request();
-    let Some(identity) = cfg.slack_identity(&d.team_id, &d.user_id).map(str::to_string) else {
+    let Some(mapping) = cfg.slack_identity(&d.team_id, &d.user_id) else {
         return Ok(Admission::Refused { reason: "unmapped_identity", identity: None });
     };
-    let human = cfg.is_human(&identity);
-    if !human && crate::families::governance::is_retired(tx, &identity)? {
-        return Ok(Admission::Refused { reason: "identity_retired", identity: None });
-    }
+    let identity = mapping.identity.clone();
     ledger_signature(tx, &sha, timestamp)?;
-    if let Some(reason) = d.refusal {
+    // `/approve` needs a per-mapping opt-in; the route's own refusals (a
+    // malformed payload, `approve` sent as a message) come first.
+    let refusal = d.refusal.or_else(|| {
+        (d.command.as_deref() == Some("approve") && !mapping.can_approve).then_some(APPROVE_NOT_ENABLED)
+    });
+    if let Some(reason) = refusal {
         let mut payload = json!({ "kind": kind, "reason": reason });
         if delivery_id_ok(&d.delivery_id) {
             payload["delivery_id"] = json!(d.delivery_id);
@@ -336,12 +344,58 @@ pub fn admit(
         )
         .by(identity.clone()),
     )?;
-    Ok(Admission::Accepted { identity, human })
+    tx.execute(
+        "UPDATE slack_seen_deliveries SET state = 'accepted', identity = ?3 WHERE kind = ?1 AND delivery_id = ?2",
+        params![d.kind.as_str(), d.delivery_id, identity],
+    )?;
+    Ok(Admission::Accepted { identity })
+}
+
+/// Refusal reason for `/approve` from a mapping without `can_approve`.
+pub const APPROVE_NOT_ENABLED: &str = "approve_not_enabled";
+
+/// At startup, before the routes take traffic: ledger every delivery that
+/// was accepted but never recorded as executed (the hub stopped while it
+/// ran) as `agent.slack.request.abandoned` (identity, kind, delivery id, age
+/// in seconds; no body), exactly once, and mark it `abandoned`. Slack's
+/// retry of such a delivery was answered "Already received.", so this is
+/// the only trace that it never ran. Returns how many were ledgered.
+pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
+    let rows: Vec<(String, String, i64, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT kind, delivery_id, seen_at, identity FROM slack_seen_deliveries WHERE state = 'accepted' \
+             ORDER BY seen_at, delivery_id",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?
+    };
+    for (kind, delivery_id, seen_at, identity) in &rows {
+        let request = if kind == "event" { "event" } else { "command" };
+        let who = identity.clone().unwrap_or_else(|| "system".into());
+        ledger::append(
+            tx,
+            EventInput::new(
+                "agent.slack.request.abandoned",
+                json!({
+                    "identity": who,
+                    "kind": request,
+                    "delivery_id": delivery_id,
+                    "age_s": now.saturating_sub(*seen_at).max(0),
+                }),
+            )
+            .by(who.clone()),
+        )?;
+        tx.execute(
+            "UPDATE slack_seen_deliveries SET state = 'abandoned' WHERE kind = ?1 AND delivery_id = ?2",
+            params![kind, delivery_id],
+        )?;
+    }
+    Ok(rows.len())
 }
 
 /// Ledger the outcome of a command that ran after the acknowledgement, as
 /// the identity it ran as: `agent.slack.request.executed` with the tool, `ok`
 /// and, on failure, the error code (never the error text or the arguments).
+/// Marks the delivery `finished`, so the startup sweep leaves it alone.
 pub fn record_executed(
     tx: &mut WriteTx<'_>,
     identity: &str,
@@ -368,6 +422,10 @@ pub fn record_executed(
         }
     }
     ledger::append(tx, EventInput::new("agent.slack.request.executed", payload).by(identity.to_string()))?;
+    tx.execute(
+        "UPDATE slack_seen_deliveries SET state = 'finished' WHERE kind = ?1 AND delivery_id = ?2",
+        params![d_kind.as_str(), delivery_id],
+    )?;
     Ok(())
 }
 

@@ -18,28 +18,41 @@ use ua_tools::families::slack;
 
 const SECRET: &str = "test-signing-secret";
 const TEAM: &str = "T0TEAM1";
-/// Maps to the human `operator` (profile coordinator).
+/// Maps to the human `operator` (profile coordinator), `can_approve`.
 const HUMAN: &str = "U0HUMAN";
-/// Maps to the agent `builder-1` (profile developer).
+/// Maps to the human `dev-human` (profile developer), `can_approve`.
 const DEV: &str = "U0DEV";
-/// Maps to the agent `builder-2` (profile coordinator).
-const AGENT: &str = "U0AGENT";
+/// Maps to the human `plain-human` (profile coordinator), without
+/// `can_approve` (the default).
+const PLAIN: &str = "U0PLAIN";
 /// Not mapped.
 const STRANGER: &str = "U0STRANGER";
 
+/// A mapping with the default `can_approve = false`.
 fn map(user: &str, identity: &str) -> SlackIdentity {
-    SlackIdentity { team_id: TEAM.into(), user_id: user.into(), identity: identity.into() }
+    SlackIdentity {
+        team_id: TEAM.into(),
+        user_id: user.into(),
+        identity: identity.into(),
+        can_approve: false,
+    }
+}
+
+fn approver(user: &str, identity: &str) -> SlackIdentity {
+    SlackIdentity { can_approve: true, ..map(user, identity) }
 }
 
 fn slack_config() -> Config {
     let mut cfg = common::config();
     cfg.slack_enabled = true;
     cfg.slack_signing_secret = Some(SecretString::from(SECRET.to_string()));
+    cfg.human_identities = vec!["operator".into(), "dev-human".into(), "plain-human".into()];
     cfg.profiles.insert("operator".into(), "coordinator".into());
-    cfg.profiles.insert("builder-1".into(), "developer".into());
-    cfg.profiles.insert("builder-2".into(), "coordinator".into());
+    cfg.profiles.insert("dev-human".into(), "developer".into());
+    cfg.profiles.insert("plain-human".into(), "coordinator".into());
     cfg.approval_tools = vec!["task_delete".into()];
-    cfg.slack_identities = vec![map(HUMAN, "operator"), map(DEV, "builder-1"), map(AGENT, "builder-2")];
+    cfg.slack_identities =
+        vec![approver(HUMAN, "operator"), approver(DEV, "dev-human"), map(PLAIN, "plain-human")];
     cfg.check_slack_identities().unwrap();
     cfg
 }
@@ -391,14 +404,14 @@ async fn an_unmapped_user_is_refused_with_no_side_effects() {
 async fn user_name_is_never_identity() {
     let h = TestHub::new(slack_config());
     let id = pending_approval(&h, &agent("builder-9")).await;
-    // builder-1's Slack user, with user_name "operator" in the body.
+    // dev-human's Slack user, with user_name "operator" in the body.
     let r = h.send(command(DEV, "/approve", &id.to_string(), "1.2.a")).await;
     assert_eq!(r.status(), 200);
     settle(&h).await;
     assert_eq!(approval(&h, id).await.0, "pending", "a developer agent cannot approve");
     let ran = executed(&h).await;
     assert_eq!(ran.len(), 1);
-    assert_eq!(ran[0].0, "builder-1", "attributed to the mapped identity, not user_name");
+    assert_eq!(ran[0].0, "dev-human", "attributed to the mapped identity, not user_name");
     assert_eq!(ran[0].1["ok"], false);
 }
 
@@ -418,7 +431,7 @@ async fn a_repeated_trigger_id_runs_once() {
     assert_eq!(task_count(&h).await, 1);
     let deduped = events(&h, "agent.slack.request.deduped").await;
     assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].0, "builder-1");
+    assert_eq!(deduped[0].0, "dev-human");
     assert_eq!(deduped[0].1["kind"], "command");
 }
 
@@ -484,20 +497,20 @@ async fn a_command_runs_through_the_governed_path_as_the_mapped_identity() {
         })
         .await
         .unwrap();
-    assert_eq!(caller, "builder-1");
-    assert_eq!(transport, "http");
+    assert_eq!(caller, "dev-human");
+    assert_eq!(transport, "slack", "the call record shows it came from Slack");
     let accepted = events(&h, "agent.slack.request.accepted").await;
     assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].0, "builder-1");
+    assert_eq!(accepted[0].0, "dev-human");
     assert_eq!(accepted[0].1["command"], "task");
     let ran = executed(&h).await;
     assert_eq!(ran.len(), 1);
-    assert_eq!(ran[0].0, "builder-1");
+    assert_eq!(ran[0].0, "dev-human");
     assert_eq!(ran[0].1["tool"], "task_add");
     assert_eq!(ran[0].1["ok"], true);
     let created = events(&h, "agent.task.created").await;
     assert_eq!(created.len(), 1);
-    assert_eq!(created[0].0, "builder-1");
+    assert_eq!(created[0].0, "dev-human");
     // Neither the body nor the secret nor the signature reaches the ledger.
     let all: String = h
         .state
@@ -518,7 +531,7 @@ async fn a_command_runs_through_the_governed_path_as_the_mapped_identity() {
 #[tokio::test]
 async fn the_profile_still_applies_to_slack_commands() {
     let h = TestHub::new(slack_config());
-    // builder-1 is a developer: approval_resolve is not in its profile.
+    // dev-human is a developer: approval_resolve is not in its profile.
     let id = pending_approval(&h, &agent("builder-9")).await;
     h.send(command(DEV, "/approve", &id.to_string(), "1.2.a")).await;
     settle(&h).await;
@@ -535,13 +548,13 @@ async fn an_invalid_command_is_refused_and_ledgered() {
     settle(&h).await;
     let refused = events(&h, "agent.slack.request.refused").await;
     assert_eq!(refused.len(), 1);
-    assert_eq!(refused[0].0, "builder-1");
+    assert_eq!(refused[0].0, "dev-human");
     assert_eq!(refused[0].1["reason"], "invalid_command");
     assert!(executed(&h).await.is_empty());
     // A single app command carrying the command in its text works.
     let r = h.send(command(DEV, "/hub", "contact", "1.2.b")).await;
     let text = json_body(r).await["text"].as_str().unwrap().to_string();
-    assert!(text.contains("builder-1"), "{text}");
+    assert!(text.contains("dev-human"), "{text}");
 }
 
 // --- approvals --------------------------------------------------------------------
@@ -572,17 +585,39 @@ async fn a_human_cannot_approve_their_own_request_from_slack() {
 }
 
 #[tokio::test]
-async fn a_mapped_agent_cannot_approve_even_with_a_broad_profile() {
+async fn a_mapping_to_an_agent_label_is_refused_at_load() {
+    let mut cfg = slack_config();
+    cfg.profiles.insert("builder-2".into(), "coordinator".into());
+    cfg.slack_identities.push(approver("U0AGENT", "builder-2"));
+    let err = cfg.check_slack_identities().unwrap_err().to_string();
+    assert!(err.contains("never to an agent label"), "{err}");
+    // Such a table keeps the routes unmounted, and the pair maps to nobody.
+    assert!(ua_server::slack_api::mount_status(&cfg).is_err());
+    assert!(cfg.slack_identity(TEAM, "U0AGENT").is_none());
+    let h = TestHub::new(cfg);
+    assert_eq!(h.send(command("U0AGENT", "/contact", "", "1.2.a")).await.status(), 404);
+}
+
+#[tokio::test]
+async fn approve_needs_can_approve_on_the_mapping() {
     let h = TestHub::new(slack_config());
     let id = pending_approval(&h, &agent("builder-9")).await;
-    // builder-2 is a coordinator: approval_resolve is in its profile, but it
-    // is not a human.
-    h.send(command(AGENT, "/approve", &id.to_string(), "1.2.a")).await;
+    // plain-human is a human with a coordinator profile, but its mapping
+    // leaves can_approve at its default (off).
+    let r = h.send(command(PLAIN, "/approve", &id.to_string(), "1.2.a")).await;
+    let text = json_body(r).await["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Approvals are not enabled for this Slack user"), "{text}");
     settle(&h).await;
     assert_eq!(approval(&h, id).await.0, "pending");
-    let ran = executed(&h).await;
-    assert_eq!(ran[0].0, "builder-2");
-    assert_eq!(ran[0].1["reason_code"], "not_human");
+    assert!(executed(&h).await.is_empty(), "nothing ran");
+    let refused = events(&h, "agent.slack.request.refused").await;
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].0, "plain-human");
+    assert_eq!(refused[0].1["reason"], "approve_not_enabled");
+    // Other commands from the same mapping still run.
+    h.send(command(PLAIN, "/task", "write it", "1.2.b")).await;
+    settle(&h).await;
+    assert_eq!(task_count(&h).await, 2, "the approval's own task plus this one");
 }
 
 // --- delivery ---------------------------------------------------------------------
@@ -687,4 +722,83 @@ async fn events_an_app_wrote_are_ignored() {
     settle(&h).await;
     assert_eq!(total_changes(&h).await, before);
     assert_eq!(task_count(&h).await, 0);
+}
+
+// --- round 2: direct messages, provenance, lost commands ----------------------------
+
+fn dm(user: &str, event_id: &str, text: &str) -> Vec<u8> {
+    event_with(user, event_id, "message", text, json!({ "channel_type": "im" }))
+}
+
+#[tokio::test]
+async fn a_direct_message_may_start_with_a_bare_command_word() {
+    let h = TestHub::new(slack_config());
+    let body = dm(DEV, "Ev0DM1", "task write the report");
+    assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
+    settle(&h).await;
+    assert_eq!(task_count(&h).await, 1);
+    let ran = executed(&h).await;
+    assert_eq!((ran[0].0.as_str(), ran[0].1["tool"].as_str()), ("dev-human", Some("task_add")));
+}
+
+#[tokio::test]
+async fn free_text_and_bare_words_in_channels_change_nothing() {
+    let h = TestHub::new(slack_config());
+    let before = total_changes(&h).await;
+    for (i, body) in [
+        dm(DEV, "Ev0FT1", "tasks are piling up, can you help"),
+        dm(DEV, "Ev0FT2", "please task fix it"),
+        event_body(DEV, "Ev0FT3", "app_mention", "<@U0BOT> task fix it"),
+        event_with(DEV, "Ev0FT4", "message", "task fix it", json!({ "channel_type": "channel" })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = h.send(signed(slack_api_events(), "application/json", &body, now())).await;
+        assert_eq!(r.status(), 200, "case {i}");
+    }
+    settle(&h).await;
+    assert_eq!(total_changes(&h).await, before);
+}
+
+#[tokio::test]
+async fn approve_as_a_bare_word_in_a_direct_message_is_refused() {
+    let h = TestHub::new(slack_config());
+    let id = pending_approval(&h, &agent("builder-9")).await;
+    let body = dm(HUMAN, "Ev0DMA", &format!("approve {id}"));
+    h.send(signed(slack_api_events(), "application/json", &body, now())).await;
+    settle(&h).await;
+    assert_eq!(approval(&h, id).await.0, "pending");
+    assert_eq!(events(&h, "agent.slack.request.refused").await[0].1["reason"], "approve_needs_slash_command");
+}
+
+#[tokio::test]
+async fn an_approval_from_slack_is_recorded_with_the_slack_transport() {
+    let h = TestHub::new(slack_config());
+    let id = pending_approval(&h, &agent("builder-9")).await;
+    h.send(command(HUMAN, "/approve", &id.to_string(), "1.2.a")).await;
+    settle(&h).await;
+    let transport: String = h
+        .state
+        .hub
+        .db()
+        .read_async(|c| {
+            Ok(c.query_row("SELECT transport FROM tool_calls WHERE tool = 'approval_resolve'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(transport, "slack");
+}
+
+#[tokio::test]
+async fn a_finished_command_is_not_swept_as_abandoned() {
+    let h = TestHub::new(slack_config());
+    h.send(command(DEV, "/task", "write it", "1.2.a")).await;
+    settle(&h).await;
+    for _ in 0..2 {
+        assert_eq!(ua_server::slack_api::sweep_abandoned(&h.state.hub).await.unwrap(), 0);
+    }
+    assert!(events(&h, "agent.slack.request.abandoned").await.is_empty());
 }

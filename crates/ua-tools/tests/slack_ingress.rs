@@ -342,18 +342,19 @@ fn parser_validates_task_and_approval_ids() {
 fn slack_env() -> Env {
     let home = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(home.path());
-    cfg.human_identities = vec!["operator".into()];
-    cfg.profiles.insert("builder-1".into(), "developer".into());
+    cfg.human_identities = vec!["operator".into(), "reviewer-1".into()];
     cfg.slack_identities = vec![
         ua_core::SlackIdentity {
             team_id: "T0TEAM1".into(),
             user_id: "U0HUMAN".into(),
             identity: "operator".into(),
+            can_approve: true,
         },
         ua_core::SlackIdentity {
             team_id: "T0TEAM1".into(),
             user_id: "U0DEV".into(),
-            identity: "builder-1".into(),
+            identity: "reviewer-1".into(),
+            can_approve: false,
         },
     ];
     Env { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), _home: home }
@@ -389,12 +390,12 @@ async fn admission_maps_identity_dedupes_and_ledgers() {
     let e = slack_env();
     let now = 1_700_000_000;
     let a = e.admit("1700000000", "a", now, delivery("U0HUMAN", "1.2.a")).await.unwrap();
-    assert_eq!(a, slack::Admission::Accepted { identity: "operator".into(), human: true });
+    assert_eq!(a, slack::Admission::Accepted { identity: "operator".into() });
     let a = e.admit("1700000001", "b", now, delivery("U0DEV", "1.2.b")).await.unwrap();
-    assert_eq!(a, slack::Admission::Accepted { identity: "builder-1".into(), human: false });
+    assert_eq!(a, slack::Admission::Accepted { identity: "reviewer-1".into() });
     // Same trigger id, new signature: deduped.
     let a = e.admit("1700000002", "c", now, delivery("U0DEV", "1.2.b")).await.unwrap();
-    assert_eq!(a, slack::Admission::Deduped { identity: "builder-1".into() });
+    assert_eq!(a, slack::Admission::Deduped { identity: "reviewer-1".into() });
     // Same signed bytes: replayed, and the transaction rolls back.
     let err = e.admit("1700000002", "c", now, delivery("U0DEV", "1.2.z")).await.unwrap_err();
     assert_eq!(err.reason_code(), Some("replayed"));
@@ -429,7 +430,7 @@ async fn admission_maps_identity_dedupes_and_ledgers() {
         .await
         .unwrap();
     let by: Vec<_> = accepted.iter().map(|e| e.originator.clone().unwrap_or_default()).collect();
-    assert_eq!(by, ["operator", "builder-1"]);
+    assert_eq!(by, ["operator", "reviewer-1"]);
 }
 
 #[tokio::test]
@@ -440,7 +441,7 @@ async fn a_route_refusal_is_ledgered_under_the_identity() {
     let a = e.admit("1700000000", "a", 1_700_000_000, d).await.unwrap();
     assert_eq!(
         a,
-        slack::Admission::Refused { reason: "invalid_command", identity: Some("builder-1".into()) }
+        slack::Admission::Refused { reason: "invalid_command", identity: Some("reviewer-1".into()) }
     );
 }
 
@@ -530,4 +531,105 @@ async fn each_command_maps_to_a_call_its_tool_accepts() {
         .await
         .unwrap();
     assert_eq!(check["ok"], true, "{check}");
+}
+
+#[tokio::test]
+async fn approve_needs_the_mapping_opt_in() {
+    let e = slack_env();
+    let approve =
+        |user: &str, id: &str| slack::Delivery { command: Some("approve".into()), ..delivery(user, id) };
+    // U0DEV's mapping has can_approve = false.
+    let a = e.admit("1700000000", "a", 1_700_000_000, approve("U0DEV", "1.2.a")).await.unwrap();
+    assert_eq!(
+        a,
+        slack::Admission::Refused { reason: "approve_not_enabled", identity: Some("reviewer-1".into()) }
+    );
+    let a = e.admit("1700000001", "b", 1_700_000_000, approve("U0HUMAN", "1.2.b")).await.unwrap();
+    assert_eq!(a, slack::Admission::Accepted { identity: "operator".into() });
+}
+
+async fn abandoned_events(e: &Env) -> Vec<Value> {
+    e.hub
+        .db()
+        .read_async(|c| {
+            ledger::query(
+                c,
+                &EventQuery {
+                    channels: Some(vec!["agent.slack.request.abandoned".into()]),
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ev| ev.payload)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_accepted_but_unfinished_delivery_is_ledgered_abandoned_once() {
+    let e = slack_env();
+    let t0 = 1_700_000_000;
+    // Accepted, never finished: the hub stopped while it ran.
+    e.admit("1700000000", "a", t0, delivery("U0HUMAN", "1.2.lost")).await.unwrap();
+    // Accepted and finished.
+    e.admit("1700000001", "b", t0, delivery("U0DEV", "1.2.done")).await.unwrap();
+    let db = e.hub.db().clone();
+    db.write_async(|tx| {
+        slack::record_executed(
+            tx,
+            "reviewer-1",
+            slack::DeliveryKind::Trigger,
+            "1.2.done",
+            "task",
+            None,
+            &Ok(json!({})),
+        )
+    })
+    .await
+    .unwrap();
+    // Two startups.
+    for (startup, expected) in [(1, 1), (2, 0)] {
+        let db = e.hub.db().clone();
+        let n = db.write_async(move |tx| slack::sweep_abandoned(tx, t0 + 60 * startup)).await.unwrap();
+        assert_eq!(n, expected, "startup {startup}");
+    }
+    let events = abandoned_events(&e).await;
+    assert_eq!(events.len(), 1, "ledgered exactly once");
+    assert_eq!(
+        events[0],
+        json!({ "identity": "operator", "kind": "command", "delivery_id": "1.2.lost", "age_s": 60 })
+    );
+    // An abandoned row is pruned like any other; an accepted one never is.
+    let db = e.hub.db().clone();
+    let far = t0 + slack::DELIVERY_RETENTION_S + 100;
+    db.write_async(move |tx| slack::remember_delivery(tx, slack::DeliveryKind::Event, "Ev0X", far))
+        .await
+        .unwrap();
+    let left: i64 = e
+        .hub
+        .db()
+        .read_async(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM slack_seen_deliveries WHERE kind = 'trigger'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn an_accepted_row_is_not_pruned_before_the_sweep() {
+    let e = slack_env();
+    let t0 = 1_700_000_000;
+    e.admit("1700000000", "a", t0, delivery("U0HUMAN", "1.2.lost")).await.unwrap();
+    let db = e.hub.db().clone();
+    let far = t0 + slack::DELIVERY_RETENTION_S + 100;
+    db.write_async(move |tx| slack::remember_delivery(tx, slack::DeliveryKind::Event, "Ev0X", far))
+        .await
+        .unwrap();
+    let db = e.hub.db().clone();
+    assert_eq!(db.write_async(move |tx| slack::sweep_abandoned(tx, far)).await.unwrap(), 1);
 }

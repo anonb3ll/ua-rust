@@ -59,12 +59,16 @@ from its commit history.
 - Slack ingress, off by default: `POST /api/slack/commands` and
   `POST /api/slack/events`, mounted only with `slack_enabled = true` and
   `UA_SLACK_SIGNING_SECRET`. Each Slack (`team_id`, `user_id`) pair in
-  `[[slack_identities]]` runs the nine coordination commands as its hub
-  identity through the governed call path; `/approve` follows
-  `approval_resolve`'s rules. Slash-command results go to `response_url` on
-  `hooks.slack.com` only. Repeated event ids and trigger ids are dropped
-  (`slack_seen_deliveries`). Interactions and bot-token posting are not
-  included.
+  `[[slack_identities]]` runs the nine coordination commands as the human
+  identity it is mapped to, through the governed call path, recorded with
+  the new `slack` transport; `/approve` needs the mapping's `can_approve`
+  opt-in and then follows `approval_resolve`'s rules. Slash-command results
+  go to `response_url` on `hooks.slack.com` only. Repeated event ids and
+  trigger ids are dropped (`slack_seen_deliveries`), and a command accepted
+  before a stop but never finished is ledgered at startup as
+  `agent.slack.request.abandoned`. Direct messages to the app may start
+  with a bare command word. Interactions, bot-token posting and Socket Mode
+  are not included.
 
 ### Changed
 
@@ -119,7 +123,7 @@ from its commit history.
 - The Slack routes verify the signature over the raw body before any parsing
   or database transaction (401 otherwise), refuse a replayed signature and an
   unmapped Slack user, never use `user_name` for identity, and refuse a
-  `slack_identities` table with a duplicate pair or an unknown identity at
+  `slack_identities` table with a duplicate pair or a non-human identity at
   load.
   A signed request from an unmapped Slack user adds no ledger row (only its
   replay-table entry), and `/approve` is accepted only as a slash command,

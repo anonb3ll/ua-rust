@@ -14,9 +14,10 @@
 //!    at debug level only, never ledgered: anyone could send them.
 //! 3. The body is parsed (form for commands, JSON for events). An Events API
 //!    `url_verification` answers its challenge here, with no state. Events
-//!    that are not explicit commands, or that an app wrote (`bot_id`,
-//!    `subtype`, `app_id`, `bot_profile`), are acknowledged and ignored, with
-//!    no state.
+//!    that are not commands (a mention must say `/command`; a direct message
+//!    may also start with a bare command word), or that an app wrote or that
+//!    were edited (`bot_id`, `subtype`, `app_id`, `bot_profile`, `edited`),
+//!    are acknowledged and ignored, with no state.
 //! 4. One write transaction ([`slack::admit`]) records the signature (a
 //!    replay is a 401), maps (`team_id`, `user_id`) to a hub identity through
 //!    `slack_identities`, dedupes on the trigger id or event id, and ledgers
@@ -55,6 +56,13 @@ pub const EVENTS_PATH: &str = "/api/slack/events";
 
 /// Refusal reason for `approve` sent as a message (Events API).
 const APPROVE_NOT_ON_EVENTS: &str = "approve_needs_slash_command";
+
+/// Ledger, once, every Slack command accepted before the hub last stopped
+/// but never finished ([`slack::sweep_abandoned`]). `ua serve` runs this
+/// before it binds, so before the routes take traffic.
+pub async fn sweep_abandoned(hub: &ua_tools::Hub) -> ua_core::UaResult<usize> {
+    hub.db().write_async(|tx| slack::sweep_abandoned(tx, now_s())).await
+}
 
 /// Whether `path` is one of the Slack routes (public: they authenticate by
 /// signature, and the commands route takes a form body).
@@ -150,8 +158,8 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
     let db = hub.db().clone();
     let admitted = db.write_async(move |tx| slack::admit(tx, hub.cfg(), &ts, &raw, now_s(), &d)).await;
     let ack = |text: &str| if is_command { ephemeral(text) } else { axum::Json(json!({})).into_response() };
-    let (identity, human) = match admitted {
-        Ok(Admission::Accepted { identity, human }) => (identity, human),
+    let identity = match admitted {
+        Ok(Admission::Accepted { identity }) => identity,
         Ok(Admission::Deduped { .. }) => return ack("Already received."),
         Ok(Admission::Refused { reason, identity }) => {
             if identity.is_none() {
@@ -170,7 +178,10 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
                 );
             }
             return ack(match reason {
-                "unmapped_identity" | "identity_retired" => {
+                slack::APPROVE_NOT_ENABLED => {
+                    "Approvals are not enabled for this Slack user (can_approve is off in slack_identities)."
+                }
+                "unmapped_identity" => {
                     "This Slack user is not mapped to a hub identity. Ask an operator to add it to slack_identities."
                 }
                 "invalid_command" => {
@@ -198,7 +209,7 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
         (_, None) => (format!("Accepted /{command}. The result is recorded in the hub ledger."), None),
     };
     let task_state = state.clone();
-    state.calls.spawn(execute(task_state, identity, human, req.delivery, parsed, response_url));
+    state.calls.spawn(execute(task_state, identity, req.delivery, parsed, response_url));
     ack(&text)
 }
 
@@ -207,7 +218,6 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
 async fn execute(
     state: AppState,
     identity: String,
-    human: bool,
     d: Delivery,
     parsed: Value,
     response_url: Option<url::Url>,
@@ -215,11 +225,13 @@ async fn execute(
     let command = parsed["command"].as_str().unwrap_or_default().to_string();
     let id = AuthIdentity {
         label: identity.clone(),
-        kind: if human { ActorKind::Human } else { ActorKind::Agent },
+        // `slack_identities` maps only to `human_identities` (checked at load
+        // and again on every lookup).
+        kind: ActorKind::Human,
         verified: true,
         grant: None,
     };
-    let caller = caller_for(&state, &id, None, Transport::Http);
+    let caller = caller_for(&state, &id, None, Transport::Slack);
     let (tool, outcome) = match slack::command_call(&parsed, &d.delivery_id) {
         Ok(Some(call)) => {
             (Some(call.tool), state.registry.call(&state.hub, &caller, call.tool, call.args).await)
@@ -310,15 +322,31 @@ fn is_command_word(name: &str) -> bool {
     )
 }
 
+/// `text` after leading user mentions; `None` when a mention is unclosed.
+fn after_mentions(text: &str) -> Option<&str> {
+    let mut rest = text.trim_start();
+    while let Some(after) = rest.strip_prefix("<@") {
+        let close = after.find('>')?;
+        rest = after[close + 1..].trim_start();
+    }
+    Some(rest)
+}
+
 /// The first word of `text` after leading user mentions starts with `/`: an
 /// explicit command. Natural-language messages never run anything.
 fn explicit_command(text: &str) -> bool {
-    let mut rest = text.trim_start();
-    while let Some(after) = rest.strip_prefix("<@") {
-        let Some(close) = after.find('>') else { return false };
-        rest = after[close + 1..].trim_start();
-    }
-    rest.starts_with('/')
+    after_mentions(text).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The first word of `text` after leading user mentions is one of the nine
+/// command words, exactly (ignoring ASCII case, since phone keyboards
+/// capitalise the first letter): `task fix it`. Accepted only in a direct
+/// message with the app, where Slack's composer would swallow a leading `/`
+/// as a slash command.
+fn bare_command(text: &str) -> bool {
+    after_mentions(text)
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|w| is_command_word(&w.to_ascii_lowercase()))
 }
 
 async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -353,16 +381,19 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     let event_type = s(event, "type");
     let text = s(event, "text");
     // Only a message addressed to the app (a mention, or a direct message),
-    // written by a person, and written as an explicit `/command`.
-    let addressed =
-        event_type == "app_mention" || (event_type == "message" && s(event, "channel_type") == "im");
+    // written by a person, and written as a command.
+    let direct = event_type == "message" && s(event, "channel_type") == "im";
+    let addressed = event_type == "app_mention" || direct;
     // Anything an app wrote, including a message an app posted with a user's
     // token on their behalf, is not a person typing: Slack marks such
     // messages with some of these keys. An edited message (`edited`) is not
     // run again either: the command already ran when it was first sent.
     let by_person =
         !["bot_id", "subtype", "app_id", "bot_profile", "edited"].iter().any(|k| event.contains_key(*k));
-    if !addressed || !by_person || !explicit_command(&text) {
+    // In a channel a mention must say `/command`; in a direct message with
+    // the app a bare command word (`task fix it`) is enough.
+    let command_shaped = explicit_command(&text) || (direct && bare_command(&text));
+    if !addressed || !by_person || !command_shaped {
         return ignore();
     }
     // The user's own workspace: `user_team` or `team` on the event (shared
@@ -412,6 +443,17 @@ mod tests {
         assert!(!explicit_command("<@U0BOT> task fix it"));
         assert!(!explicit_command("task status is confusing"));
         assert!(!explicit_command("<@U0BOT"));
+    }
+
+    #[test]
+    fn a_bare_command_word_must_be_exactly_one_of_the_nine() {
+        assert!(bare_command("task fix it"));
+        assert!(bare_command("Status task-1"));
+        assert!(bare_command("<@U0BOT> plan the week"));
+        assert!(!bare_command("tasks are confusing"));
+        assert!(!bare_command("please task fix it"));
+        assert!(!bare_command("hello"));
+        assert!(!bare_command(""));
     }
 
     #[test]

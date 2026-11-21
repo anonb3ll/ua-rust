@@ -98,6 +98,16 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
 /// Serve HTTP until `ct` is cancelled.
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
     let bind = state.hub.cfg().bind;
+    // Before anything is served: Slack commands lost when the hub last
+    // stopped are ledgered as abandoned.
+    match slack_api::sweep_abandoned(&state.hub).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            n,
+            "Slack commands accepted before the last stop never finished; ledgered as abandoned"
+        ),
+        Err(e) => tracing::warn!(code = e.code(), "could not sweep abandoned Slack commands"),
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, tools = state.registry.len(), mcp = MCP_SERVER, "hub listening");
     if !MCP_SERVER {
