@@ -108,11 +108,26 @@ sdk)
         echo "sdk: no sdk/typescript in this commit; nothing to check"
         exit 0
     fi
-    # A private copy: codegen:check rewrites the generated files in place and
-    # reads `git status`, and the vocab step greps /workspace/repo meanwhile.
-    mkdir -p "$ci/sdk"
-    cp -a /workspace/repo "$ci/sdk/repo"
-    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$ci/sdk/repo"
+    if [ "$(id -u)" = "0" ]; then
+        # Root only makes a private copy of the checkout. npm ci and the tests
+        # run the head's own scripts, so they run as an unprivileged user (uid
+        # 1000, as the check step does): the other steps' files in /workspace,
+        # their verdicts included, stay out of reach. The copy also matters
+        # because codegen:check rewrites the generated files in place and reads
+        # `git status`, and the vocab step greps /workspace/repo meanwhile.
+        user="$(getent passwd "$CI_UID" | cut -d: -f1 || true)"
+        if [ -z "$user" ]; then
+            useradd --uid "$CI_UID" --create-home --shell /bin/bash ci
+            user=ci
+        fi
+        home="$(getent passwd "$user" | cut -d: -f6)"
+        mkdir -p "$ci/sdk"
+        cp -a /workspace/repo "$ci/sdk/repo"
+        cp -a "$0" "$ci/sdk/ci-step.sh"
+        chown -R "$CI_UID:$CI_UID" "$ci/sdk"
+        exec runuser -u "$user" -- env HOME="$home" PATH="$PATH" \
+            UA_CI_SOURCE_SHA="${UA_CI_SOURCE_SHA:-}" bash "$ci/sdk/ci-step.sh" sdk
+    fi
     cd "$ci/sdk/repo"
     verify_head
     bin="$ci/sdk/bin"

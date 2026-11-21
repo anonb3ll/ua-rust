@@ -30,7 +30,7 @@ Python models have their own tests:
 
 ```sh
 cd packages/protocol
-uv run --no-project --python 3.12 --with 'pydantic>=2,<3' python -m unittest discover -s tests -p 'test_*.py'
+uv run --no-project --python 3.12 --with 'pydantic==2.14.4' python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 `scripts/pack-candidates.mjs` packs the two packages into installable
