@@ -11,7 +11,15 @@
 //! - a table in [`TENANT_MISSING_ORG_ID`] is not a tenant table, or already
 //!   has what the tenant check requires (remove it from the list);
 //! - `event_log` (a global table with a tenant column) lacks a `NOT NULL`
-//!   `org_id`.
+//!   `org_id`;
+//! - [`TENANT_MISSING_ORG_ID`] names a table outside its frozen baseline or
+//!   grows past it;
+//! - a grant table ([`GRANT_TENANT_COLUMN`]: `oauth_grants`, `ui_sessions`)
+//!   lacks a `NOT NULL` `org_id`, unless it is in [`GRANT_MISSING_ORG_ID`],
+//!   or is still listed there once it has one.
+//!
+//! This file, not the table in the design, is the authority on which class a
+//! table is in; the design's table is kept in step with it.
 //!
 //! `TENANT_MISSING_ORG_ID` is a temporary relaxation of the design, which
 //! requires the tenant check for every tenant table: no tenant table carries
@@ -234,12 +242,100 @@ const HUB: &[&str] = &[
     "ledger_meta",
 ];
 
+/// The frozen baseline the missing list started from when the classification
+/// test landed: every tenant table that existed then. Never add to it. The
+/// missing list must stay a subset of it, so a tenant table created later
+/// cannot be parked on the missing list; it gets `org_id` and the triggers in
+/// the part that creates it.
+const TENANT_MISSING_BASELINE: &[&str] = &[
+    "agent_lifecycle",
+    "agent_sessions",
+    "agent_tokens",
+    "agents",
+    "approvals",
+    "autonomous_cycle_transitions",
+    "autonomous_cycle_usage",
+    "autonomous_cycles",
+    "code_symbols",
+    "delegations",
+    "dispatch_receipts",
+    "dispatch_runs",
+    "goals",
+    "graph_canvas_revisions",
+    "graph_canvas_scenes",
+    "harness_config_bundles",
+    "harness_config_drift",
+    "harness_config_proposals",
+    "harness_config_report_window",
+    "idempotency_keys",
+    "managed_secrets",
+    "memory",
+    "memory_embeddings",
+    "memory_versions",
+    "message_index",
+    "message_reads",
+    "node_acceptance",
+    "node_claim_ops",
+    "node_command",
+    "node_command_notice",
+    "node_dispatch",
+    "node_followups",
+    "nodes",
+    "notify_outbox",
+    "pending_notifications",
+    "plan_checkpoints",
+    "plan_steps",
+    "plans",
+    "policy_authorizations",
+    "project_repo_bindings",
+    "relay_messages",
+    "review_ready_notices",
+    "routine_runs",
+    "routines",
+    "session_credentials",
+    "session_handoff_notes",
+    "session_profiles",
+    "session_wake",
+    "session_wake_offers",
+    "skill_assignments",
+    "skill_publish_staging",
+    "skill_versions",
+    "task_checks",
+    "task_comment_threads",
+    "task_comments",
+    "task_dependencies",
+    "task_goal_links",
+    "task_hold_members",
+    "task_holds",
+    "task_workflow",
+    "tasks",
+    "tool_calls",
+    "web_search_cache",
+    "work_proposal_items",
+    "work_proposals",
+    "workflow_checkpoints",
+    "workflow_runs",
+    "zulip_sends",
+];
+const TENANT_MISSING_BASELINE_LEN: usize = 68;
+
+/// Global identity tables whose rows are grants and so carry the
+/// organization (`docs/organization.md`, Scoping per subsystem: "the grant
+/// carries the organization"). Each needs a `NOT NULL` `org_id`, unless it is
+/// listed in [`GRANT_MISSING_ORG_ID`]. (`agent_tokens` is a tenant table.)
+const GRANT_TENANT_COLUMN: &[&str] = &["oauth_grants", "ui_sessions"];
+
+/// Grant tables that do not have their `org_id` yet: the same temporary
+/// relaxation as [`TENANT_MISSING_ORG_ID`]. May only shrink.
+const GRANT_MISSING_ORG_ID: &[&str] = &["oauth_grants", "ui_sessions"];
+
 /// SQLite's own tables.
 const SQLITE_INTERNAL: &[&str] = &["sqlite_sequence", "sqlite_stat1", "sqlite_stat4"];
 
 struct Lists<'a> {
     classes: Vec<(Class, &'a [&'a str])>,
     missing: &'a [&'a str],
+    grants_missing: &'a [&'a str],
 }
 
 fn lists() -> Lists<'static> {
@@ -252,6 +348,7 @@ fn lists() -> Lists<'static> {
             (Class::Hub, HUB),
         ],
         missing: TENANT_MISSING_ORG_ID,
+        grants_missing: GRANT_MISSING_ORG_ID,
     }
 }
 
@@ -349,9 +446,20 @@ fn problems(conn: &Connection, l: &Lists<'_>) -> Vec<String> {
     }
 
     let missing: BTreeSet<&str> = l.missing.iter().copied().collect();
+    if l.missing.len() > TENANT_MISSING_BASELINE_LEN {
+        out.push(format!(
+            "TENANT_MISSING_ORG_ID has {} entries, more than its baseline of {TENANT_MISSING_BASELINE_LEN}; it may only shrink",
+            l.missing.len()
+        ));
+    }
     for name in &missing {
         if class_of.get(name) != Some(&Class::Tenant) {
             out.push(format!("{name}: listed as missing org_id but is not a tenant table"));
+        } else if !TENANT_MISSING_BASELINE.contains(name) {
+            out.push(format!(
+                "{name}: listed as missing org_id but not in the frozen baseline; a new tenant table gets \
+                 org_id and its triggers in the part that creates it"
+            ));
         } else if present_set.contains(name) && tenant_gaps(conn, name).is_empty() {
             out.push(format!("{name}: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"));
         }
@@ -369,6 +477,31 @@ fn problems(conn: &Connection, l: &Lists<'_>) -> Vec<String> {
             Class::TenantColumnOnGlobal if org_id(conn, name) != Some(true) => {
                 out.push(format!("{name}: needs a NOT NULL org_id"));
             }
+            _ => {}
+        }
+    }
+
+    for name in l.grants_missing {
+        if !GRANT_TENANT_COLUMN.contains(name) {
+            out.push(format!("{name}: listed as a grant missing org_id but is not a grant table"));
+        }
+    }
+    for name in GRANT_TENANT_COLUMN {
+        if class_of.get(name) != Some(&Class::GlobalIdentity) {
+            out.push(format!("{name}: a grant table must be classified as global identity"));
+            continue;
+        }
+        if !present_set.contains(name) {
+            continue;
+        }
+        let has = org_id(conn, name) == Some(true);
+        match (l.grants_missing.contains(name), has) {
+            (true, true) => {
+                out.push(format!("{name}: now has a NOT NULL org_id; remove it from GRANT_MISSING_ORG_ID"))
+            }
+            (false, false) => out.push(format!(
+                "{name}: a grant table needs a NOT NULL org_id (the grant carries the organization)"
+            )),
             _ => {}
         }
     }
@@ -447,8 +580,69 @@ fn a_tenant_table_must_leave_the_missing_list_once_it_passes_and_fail_otherwise(
 #[test]
 fn only_tenant_tables_may_be_listed_as_missing() {
     let conn = schema();
-    let missing: Vec<&str> = TENANT_MISSING_ORG_ID.iter().copied().chain(["orgs"]).collect();
+    // Swap one entry for a hub table, so the list keeps its length.
+    let missing: Vec<&str> =
+        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "goals").chain(["orgs"]).collect();
+    // Give `goals` its tenant shape, so leaving the list is not itself a finding.
+    conn.execute_batch(
+        "ALTER TABLE goals ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
+         CREATE TRIGGER goals_org_exists BEFORE INSERT ON goals
+         WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
+         BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
+         CREATE TRIGGER goals_org_immutable BEFORE UPDATE OF org_id ON goals
+         WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
+         BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
+    )
+    .unwrap();
     let l = Lists { missing: &missing, ..lists() };
     let found = problems(&conn, &l);
     assert_eq!(found, ["orgs: listed as missing org_id but is not a tenant table"]);
+}
+
+#[test]
+fn the_missing_baseline_is_frozen() {
+    assert_eq!(TENANT_MISSING_BASELINE.len(), TENANT_MISSING_BASELINE_LEN, "the baseline never grows");
+    assert!(TENANT_MISSING_ORG_ID.len() <= TENANT_MISSING_BASELINE_LEN);
+    for name in TENANT_MISSING_ORG_ID {
+        assert!(TENANT_MISSING_BASELINE.contains(name), "{name}");
+    }
+}
+
+#[test]
+fn a_new_tenant_table_cannot_be_parked_on_the_missing_list() {
+    let conn = schema();
+    conn.execute_batch("CREATE TABLE new_widgets (id INTEGER PRIMARY KEY);").unwrap();
+    let tenant: Vec<&str> = TENANT.iter().copied().chain(["new_widgets"]).collect();
+    let missing: Vec<&str> = TENANT_MISSING_ORG_ID.iter().copied().chain(["new_widgets"]).collect();
+    let mut l: Lists<'_> = lists();
+    l.classes.retain(|(c, _)| *c != Class::Tenant);
+    l.classes.push((Class::Tenant, tenant.as_slice()));
+    l.missing = &missing;
+    let found = problems(&conn, &l);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
+    assert!(
+        found[1].starts_with("new_widgets: listed as missing org_id but not in the frozen baseline"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn grant_tables_are_tracked_until_they_carry_org_id() {
+    let conn = schema();
+    // With the relaxation removed, both grant tables fail.
+    let l = Lists { grants_missing: &[], ..lists() };
+    assert_eq!(
+        problems(&conn, &l),
+        [
+            "oauth_grants: a grant table needs a NOT NULL org_id (the grant carries the organization)",
+            "ui_sessions: a grant table needs a NOT NULL org_id (the grant carries the organization)",
+        ]
+    );
+    // Once one has its column, it must leave the list.
+    conn.execute_batch("ALTER TABLE ui_sessions ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';").unwrap();
+    assert_eq!(
+        problems(&conn, &lists()),
+        ["ui_sessions: now has a NOT NULL org_id; remove it from GRANT_MISSING_ORG_ID"]
+    );
 }
