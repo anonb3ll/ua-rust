@@ -145,7 +145,7 @@ pub(crate) fn check_one_of(field: &str, value: &str, allowed: &[&str]) -> UaResu
 
 /// A project, domain or lane value: 1-64 characters of letters, digits,
 /// `.`, `_` or `-`, starting with a letter or digit.
-pub(crate) fn check_slug(field: &str, value: &str) -> UaResult<String> {
+pub fn check_slug(field: &str, value: &str) -> UaResult<String> {
     let v = value.trim();
     let ok = !v.is_empty()
         && v.len() <= 64

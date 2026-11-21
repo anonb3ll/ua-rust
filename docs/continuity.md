@@ -252,10 +252,18 @@ vault page is written.
 
 ## Import
 
-`ua import python-hub` copies `task_workflow`, `task_checks` and
-`session_handoff_notes` by column name. A Python task parked the old way
-(archived, with a `[parked @ ...]` or `[folded-into: #N @ ...]` notes line)
-moves to the parking columns and is un-archived; its notes are kept.
+`ua import python-hub` copies `task_workflow`, `task_checks`,
+`session_handoff_notes`, `work_proposals`, `work_proposal_items`, `task_holds`,
+`task_hold_members`, and `project_repo_bindings` by column name. Since
+`dispatch_runs` are not imported, any non-NULL `tasks.current_run_id` and
+`tasks.current_run_agent` pointers are cleared to NULL on import and reported in
+`task_runs_cleared`. A Python task parked the old way (archived, with a
+`[parked @ ...]` or `[folded-into: #N @ ...]` notes line) moves to the parking
+columns and is un-archived; its notes are kept.
+
+Take a target database snapshot before importing into an existing database:
+post-import ledger verification runs after the batch transactions commit, so if
+verification ever fails, the imported rows remain in place without rollback.
 
 ## Differences from the Python hub
 

@@ -65,7 +65,10 @@ UA_CI_GCP_PROJECT=<project-id> UA_CI_SERVICE_ACCOUNT=ua-rust-ci@<project-id>.iam
 
 - It uploads a one-commit checkout of the resolved head, submits
   `deploy/cloudbuild/ci.yaml` from your checkout, waits for the build, and
-  posts `CI / vocab`, `CI / check` and `CI / full-verification`. Each status
+  posts `CI / vocab`, `CI / check` and `CI / full-verification`. When the
+  commit has `sdk/typescript`, an `sdk` step (Node image, the `verify` job of
+  `.github/workflows/sdk.yml`) runs beside them; it has no status of its own,
+  and `CI / full-verification` fails if it fails. Each status
   names the build and links to its log. A PR number or branch resolves to the
   head GitHub has, so push first.
 - The commit's own code (build scripts, tests) runs inside the build with the

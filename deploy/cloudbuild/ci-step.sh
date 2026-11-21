@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # One step of the Cloud Build CI (deploy/cloudbuild/ci.yaml).
 #
-#   ci-step.sh check | vocab
+#   ci-step.sh check | vocab | sdk
 #
 # scripts/cloud-ci.sh uploads a one-commit checkout of the commit under test
 # at /workspace/repo and this script beside it. Scratch lives in /workspace/.ci,
-# outside the tree the checks read. Each step mirrors the job of the same name
-# in .github/workflows/ci.yml.
+# outside the tree the checks read. `check` and `vocab` mirror the jobs of the
+# same name in .github/workflows/ci.yml; `sdk` mirrors the `verify` job of
+# .github/workflows/sdk.yml.
 set -euo pipefail
 
 NEXTEST_VERSION=0.9.152
 NEXTEST_SHA256=d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
+UV_VERSION=0.13.7
+UV_SHA256=c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83
 DENYLIST_SECRET=ua-rust-vocab-denylist
 CI_UID=1000
 ci=/workspace/.ci
@@ -25,7 +28,7 @@ verify_head() {
     echo "testing $head"
 }
 
-step="${1:?usage: ci-step.sh check|vocab}"
+step="${1:?usage: ci-step.sh check|vocab|sdk}"
 case "$step" in
 vocab)
     # Runs as root in the gcloud image, which has git. The checkout's owner can
@@ -98,6 +101,52 @@ check)
     cargo nextest run --workspace --no-tests=pass
     cargo nextest run --workspace --no-tests=pass --no-default-features
     cargo test --workspace --doc
+    ;;
+sdk)
+    # Runs in the Node image. A commit without the SDK passes trivially.
+    if [ ! -d /workspace/repo/sdk/typescript ]; then
+        echo "sdk: no sdk/typescript in this commit; nothing to check"
+        exit 0
+    fi
+    if [ "$(id -u)" = "0" ]; then
+        # Root only makes a private copy of the checkout. npm ci and the tests
+        # run the head's own scripts, so they run as an unprivileged user (uid
+        # 1000, as the check step does): the other steps' files in /workspace,
+        # their verdicts included, stay out of reach. The copy also matters
+        # because codegen:check rewrites the generated files in place and reads
+        # `git status`, and the vocab step greps /workspace/repo meanwhile.
+        user="$(getent passwd "$CI_UID" | cut -d: -f1 || true)"
+        if [ -z "$user" ]; then
+            useradd --uid "$CI_UID" --create-home --shell /bin/bash ci
+            user=ci
+        fi
+        home="$(getent passwd "$user" | cut -d: -f6)"
+        mkdir -p "$ci/sdk"
+        cp -a /workspace/repo "$ci/sdk/repo"
+        cp -a "$0" "$ci/sdk/ci-step.sh"
+        chown -R "$CI_UID:$CI_UID" "$ci/sdk"
+        exec runuser -u "$user" -- env HOME="$home" PATH="$PATH" \
+            UA_CI_SOURCE_SHA="${UA_CI_SOURCE_SHA:-}" bash "$ci/sdk/ci-step.sh" sdk
+    fi
+    cd "$ci/sdk/repo"
+    verify_head
+    bin="$ci/sdk/bin"
+    mkdir -p "$bin"
+    export PATH="$bin:$PATH"
+    curl -fsSL -o "$ci/sdk/uv.tar.gz" \
+        "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz"
+    echo "$UV_SHA256  $ci/sdk/uv.tar.gz" | sha256sum -c -
+    tar -xzf "$ci/sdk/uv.tar.gz" -C "$bin" --strip-components=1
+    export npm_config_cache="$ci/sdk/npm-cache" UV_CACHE_DIR="$ci/sdk/uv-cache"
+    node --version
+    cd sdk/typescript
+    npm ci
+    npm run typecheck
+    npm test
+    npm run codegen:check
+    (cd packages/protocol &&
+        uv run --no-project --python 3.12 --with 'pydantic==2.14.4' \
+            python -m unittest discover -s tests -p 'test_*.py')
     ;;
 *)
     echo "unknown step: $step" >&2

@@ -11,6 +11,12 @@ stored only as a SHA-256 digest, and every comparison is constant time.
 | Browser session cookie (`ua_session`) | humans in the Control Center | `/ui`, `/api` only, **never `/mcp`** | `ui_sessions` (digest) |
 | Session credential (`uas_…`) | the ACP session a node runs for one claimed item | `/mcp`, `/api/tools`, `/api/whoami` only | `session_credentials` (digest) |
 
+Two routes take no credential and authenticate each request by an HMAC
+signature over its body instead: `POST /api/github/webhook`
+([github.md](github.md#security-model)) and, only when `slack_enabled` is on
+and `UA_SLACK_SIGNING_SECRET` is set, `POST /api/slack/commands` and
+`POST /api/slack/events` ([slack.md](slack.md)).
+
 The auth middleware (`crates/ua-server/src/auth.rs`) checks a `uas_` bearer
 only as a session credential (below). It tries any other bearer token
 first, then (for `/ui` and `/api` only) the session cookie. With

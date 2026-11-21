@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# The four below are on by default, so a build with no feature flags matches a
+# The five below are on by default, so a build with no feature flags matches a
 # build from before they were optional. `--no-default-features` drops them.
 # `build_features()` reports which are compiled in (system_doctor,
 # capability_catalog), and `BUILD_FEATURES` lists the tools each one adds.
-default = ["code-intel", "readability", "mcp-gateway", "mcp-server"]
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server", "slack-socket"]
 # Local semantic memory search with fastembed. Off by default: without it,
 # memory search is lexical (FTS5) only. The feature lives in ua-memory.
 embeddings = ["ua-memory/embeddings"]
@@ -37,6 +37,10 @@ mcp-gateway = ["dep:rmcp"]
 # ua-server, whose `mcp-server` feature turns this on, so capability_catalog
 # and system_doctor report the MCP surface the binary actually serves.
 mcp-server = []
+# Pulls in nothing here either. The Slack Socket Mode transport (an outbound
+# WebSocket) lives in ua-server, whose `slack-socket` feature turns this on so
+# system_doctor and capability_catalog report whether the binary has it.
+slack-socket = []
 
 [dependencies]
 subtle.workspace = true

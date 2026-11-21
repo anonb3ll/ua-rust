@@ -68,12 +68,13 @@ instead.
 in `ua-tools/tests/tasks.rs`), because its parameter structs deny unknown
 fields. That stays: the organization never comes from tool arguments.
 
-`ua-import` refuses source rows that carry an `org_id` only when `org_id` is an
-**unmapped** column (`ua-import/src/lib.rs`); `--drop-org-scope` overrides and
-records that boundaries were dropped. Where a target table already has an
-`org_id` column (today `harness_config_bundles`), the source value is copied
-silently. See [The importer](#the-importer) for why that must change in the
-same change that adds the columns.
+`ua-import` never copies `org_id` as a column on any table (including
+`harness_config_bundles`, `work_proposals`, `work_proposal_items`, `task_holds`,
+and `project_repo_bindings`): any non-NULL `org_id` rows are reported in
+`org_scoped_rows` and refused unless `--drop-org-scope` is passed (which drops
+the tenant boundary and leaves target `org_id` NULL on tables that carry the
+column). See [The importer](#the-importer) for the multi-tenant import design when org
+columns are introduced.
 
 ## The model
 
@@ -1094,7 +1095,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
 | Global identity | `users`, `passkeys`, `webauthn_states`, `login_links`, `oauth_clients`, `oauth_codes`, `oauth_grants`, `oauth_requests`, `oauth_tokens`, `ui_keys`, `ui_sessions`, `org_bootstrap` | Identity is global; the **grant** carries the organization (`oauth_grants.org_id`, `ui_sessions.org_id`, `agent_tokens.org_id`) |
-| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state`, `slack_seen_signatures`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `import_org_map`, `import_finalized`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
+| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state`, `slack_seen_signatures`, `slack_seen_deliveries`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `import_org_map`, `import_finalized`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
 
 The vault is hub-scoped, so anything that copies tenant data into it —
 `memory_promote` above all — is allowed only in `'default'` (see

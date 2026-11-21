@@ -28,7 +28,15 @@ from its commit history.
 - OAuth 2.1 authorization server, passkeys and browser sessions.
 - `ua import python-hub`, which copies a database from the original hub. A dry
   run reports counts without writing. A re-run resumes. The source ledger is
-  checked, and a refusal happens before any target write.
+  checked, and a refusal happens before any target write. Now also imports
+  `work_proposals`, `work_proposal_items`, `task_holds`, `task_hold_members`
+  and `project_repo_bindings`, clears `tasks.current_run_id` and
+  `current_run_agent` (since `dispatch_runs` are not imported) with separate
+  count and capped task-id reporting, never copies `org_id` on any mapped
+  table including `harness_config_bundles`, refuses duplicate active holds and
+  duplicate trimmed project slugs in `--dry-run` as well as real imports, and
+  clears invalid `project_repo_bindings.default_branch` values to `NULL`
+  instead of dropping the binding.
 - Dispatch runs and an executor. An approval binds the resolved workdir, argv
   and prompt. An operator can cancel a run. A previous process's orphans are
   reaped, including on macOS.
@@ -56,6 +64,35 @@ from its commit history.
 - Harness config bundles served at `/api/node/config`, and a skills registry.
 - A security contact in `SECURITY.md`, and `NOTICE`.
 - A Cloud Build runner that builds the pushed head.
+- Slack ingress, off by default: `POST /api/slack/commands` and
+  `POST /api/slack/events`, mounted only with `slack_enabled = true` and
+  `UA_SLACK_SIGNING_SECRET`. Each Slack (`team_id`, `user_id`) pair in
+  `[[slack_identities]]` runs the nine coordination commands as the human
+  identity it is mapped to, through the governed call path, recorded with
+  the new `slack` transport; `/approve` needs the mapping's `can_approve`
+  opt-in and then follows `approval_resolve`'s rules. Slash-command results
+  go to `response_url` on `hooks.slack.com` only. Repeated event ids and
+  trigger ids are dropped (`slack_seen_deliveries`), and a command accepted
+  before a stop with no recorded outcome is ledgered at startup as
+  `agent.slack.request.abandoned` (outcome unknown). Messages run only when
+  marked (`!task …`, or `/task` after a mention), and direct messages only
+  when delivered to the app's bot. Interactions and bot-token posting are
+  not included.
+- Slack Socket Mode, off by default (`slack_socket_mode = true` plus the
+  app-level token in `UA_SLACK_APP_TOKEN`, never the config file): `ua serve`
+  opens an outbound WebSocket to Slack, so a hub with no public URL can serve
+  Slack. Envelopes go through the same admission and execution as the HTTP
+  routes; a redelivered envelope is acknowledged and runs nothing (its
+  envelope id goes into the replay table). Slash-command answers ride in the
+  acknowledgement. The socket URL must be `wss` on `slack.com`; reconnects
+  back off with jitter, and a refused token stops the transport with one log
+  line. `system_doctor` reports the transport's state. Behind the new
+  default-on cargo feature `slack-socket` (tokio-tungstenite, on the existing
+  rustls stack).
+- The TypeScript SDK under `sdk/typescript` (`@unified-agent/protocol` and
+  `@unified-agent/client`; not published), with workflows that typecheck,
+  test and check codegen, and run the live conformance suite against a
+  `ua serve` built from the commit.
 
 ### Changed
 
@@ -117,6 +154,14 @@ from its commit history.
 - Agent tokens are stored as SHA-256 digests.
 - The GitHub webhook checks HMAC-SHA256 and refuses a delivery id it has
   already seen.
+- The Slack routes verify the signature over the raw body before any parsing
+  or database transaction (401 otherwise), refuse a replayed signature and an
+  unmapped Slack user, never use `user_name` for identity, and refuse a
+  `slack_identities` table with a duplicate pair or a non-human identity at
+  load.
+  A signed request from an unmapped Slack user adds no ledger row (only its
+  replay-table entry), and `/approve` is accepted only as a slash command,
+  never from an Events API message an app could post on a user's behalf.
 - OAuth `client_credentials` refuses a scope other than `mcp`, a retired
   identity, and an identity with no configured profile (it no longer falls
   back to `developer`). An authorization code exchanged after its identity

@@ -983,7 +983,9 @@ pub fn prod_action(tool: &str) -> &str {
 pub fn check_prod_action(cfg: &ua_core::Config, caller: &Caller, tool: &str) -> Result<(), Refusal> {
     use ua_core::identity::Transport;
     let action = prod_action(tool);
-    if caller.kind == ActorKind::Anonymous && matches!(caller.transport, Transport::Http | Transport::Mcp) {
+    if caller.kind == ActorKind::Anonymous
+        && matches!(caller.transport, Transport::Http | Transport::Mcp | Transport::Slack)
+    {
         return Err(Refusal::new(
             "anonymous_prod_action",
             "",
