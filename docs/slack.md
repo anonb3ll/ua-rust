@@ -271,7 +271,11 @@ Replay keys older than 600 seconds and delivery ids older than a day
 They live in `inbound_deliveries` since `slack.inbound.v1.copy` carried
 the rows of the earlier `slack_seen_signatures` and `slack_seen_deliveries`
 across, every state kept; those two tables stay in the schema, unread and
-unwritten, until a later release drops them.
+unwritten, until a later release drops them. Do not downgrade past this
+change while Slack takes traffic: an older binary reads only the old
+tables, so for about a day a Slack retry of a command the newer build
+already ran would run again ([ingress.md](ingress.md#inbound-deliveries),
+Limits).
 
 ## Threat model
 

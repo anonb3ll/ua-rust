@@ -10,8 +10,9 @@
 //!
 //! The signature is HMAC-SHA256 over `v0:{timestamp}:{body}`, compared in
 //! constant time. Timestamps more than five minutes from the hub clock are
-//! rejected. A signature that already passed is remembered in
-//! `slack_seen_signatures` so the same signed bytes cannot be accepted twice.
+//! rejected. A signature that already passed is remembered in the
+//! inbound-delivery table (`ua_ingress::inbound`, kind `request_sha`) so the
+//! same signed bytes cannot be accepted twice.
 //! The signing secret comes from `UA_SLACK_SIGNING_SECRET` and is never logged
 //! or stored.
 //!

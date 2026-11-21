@@ -47,7 +47,10 @@ from its commit history.
   and `slack_seen_deliveries` stay, unread and unwritten, until a later
   release drops them. `ua_ingress::inbound` gains `abandon_all_accepted`
   (the startup sweep) and `claim_of`, and an expired row is now kept
-  through its expiry second (as both families did before).
+  through its expiry second (as both families did before). Downgrading past
+  this change while Slack takes traffic lets a Slack retry of a command the
+  newer build already ran run again for about a day (`docs/ingress.md`,
+  Limits).
 - `ua-ingress::inbound`: one inbound-delivery table, `inbound_deliveries`
   (parts `ingress.inbound.v1`, `organization.v1.ingress`; a tenant table
   from birth), with `record`, `accept`, `finish`, `release` and `sweep` and

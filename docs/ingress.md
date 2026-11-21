@@ -247,8 +247,11 @@ redelivers stale rows processes the next copy anyway.
   GitHub tables, which stopped being written at the cut-over, so a downgrade
   reopens a replay window: a copy of any GitHub delivery handled since the
   upgrade (within its 30-day retention, and inside the payload-timestamp
-  window) is accepted again. Do not downgrade past this change while the
-  webhook takes traffic.
+  window) is accepted again. The same holds for Slack, where it matters
+  more: an older binary reads only the old Slack tables, so for about a day
+  (the delivery-id retention) a Slack retry of a command the newer build
+  already ran is run again, and Slack commands are not idempotent. Do not
+  downgrade past this change while either endpoint takes traffic.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from
@@ -312,7 +315,12 @@ the routes take traffic, `abandon_all_accepted` marks every `accepted` row
 `abandoned` (all of them belong to a process that has stopped), and the
 Slack family ledgers each as `agent.slack.request.abandoned` with
 `outcome: "unknown"`, as it did before. If the outcome does arrive later
-(a slow handler), it is still ledgered and the row is finished.
+(a slow handler), it is still ledgered, and the row is finished when it
+still carries the claim it was accepted under. Two cases differ, and in
+neither does anything run twice: a row the upgrade copy carried over has no
+claim, so a late outcome is ledgered and the row stays `abandoned`; and if
+a settled row has expired and the same id was recorded again (a day or more
+later), a very late outcome for the first settles the newer row.
 
 `record_executed` takes no claim: Slack never takes a delivery over, so an
 `accepted` row keeps the claim it was accepted under, and the handler
