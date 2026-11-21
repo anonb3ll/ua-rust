@@ -42,6 +42,8 @@ pub fn schema_parts() -> Vec<Part> {
         vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
     parts.push(ua_store::ledger::META_SCHEMA);
     let mut parts = ua_store::schema::parts(&parts);
+    // `orgs`, the default organization and the ledger's organization columns.
+    parts.push(ua_store::org::STORE_PART.into());
     parts.extend(families::schema_parts().into_iter().map(Part::from));
     parts.push(config_revisions::SCHEMA.into());
     parts
