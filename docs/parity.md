@@ -9,6 +9,9 @@ This page says what "parity" means for that work, what is deliberately left
 behind, and how each family of capabilities is checked before and after it is
 brought over.
 
+The shape all work builds toward is in
+[design-principles.md](design-principles.md).
+
 ## What parity means
 
 There are three things a port could preserve. They are treated differently.
