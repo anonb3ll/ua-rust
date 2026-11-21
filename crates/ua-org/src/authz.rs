@@ -21,6 +21,19 @@ use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, UaResult
 /// module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority<'a> {
+    /// Operator authority: a **verified human**, that is a caller of kind
+    /// human, or a verified caller whose label is a configured human identity
+    /// (`human_identities`). A label listed only in `lifecycle_operators` is
+    /// not an operator, unless [`OPERATOR_ADMITS_LIFECYCLE`] is set.
+    ///
+    /// Replaced by `OrgRole { min: OrgAdmin }` (and `HubOwner` for hub-scoped
+    /// rows) once users and memberships exist (`organization.v2`).
+    Operator,
+    /// A configured lifecycle operator (`lifecycle_operators`, which defaults
+    /// to `human_identities`), verified. It holds only where the design gives
+    /// it: pausing, terminating or retiring an agent, and retiring,
+    /// unretiring and viewing the full facts of a node.
+    LifecycleOperator,
     /// A caller of kind human: a label in `human_identities` that
     /// authenticated as itself (bearer token, browser session, or a local CLI
     /// `--label` after confirmation).
@@ -75,14 +88,30 @@ impl Authority<'_> {
     /// A stable name for messages and logs (not the Rust variant name).
     pub fn name(&self) -> &'static str {
         match self {
+            Authority::Operator => "operator",
+            Authority::LifecycleOperator => "lifecycle operator",
             Authority::TransitionalHuman => "human",
-            Authority::TransitionalOperator { .. } => "operator",
+            Authority::TransitionalOperator { .. } => "operator (transitional)",
             Authority::TransitionalProfileOperator => "dispatch operator",
             Authority::TransitionalHubView => "hub view",
             Authority::TransitionalMailboxReader => "mailbox reader",
             Authority::TransitionalLocalMailboxReader => "local mailbox reader",
         }
     }
+}
+
+/// Whether a configured lifecycle operator also holds [`Authority::Operator`].
+/// `false`: operator authority belongs to humans only. Flipping it is the
+/// whole change; the tests run the authority matrix under both values.
+pub const OPERATOR_ADMITS_LIFECYCLE: bool = false;
+
+/// The operator rule as a pure predicate, with whether lifecycle operators
+/// are admitted as a parameter ([`OPERATOR_ADMITS_LIFECYCLE`] chooses it in
+/// [`Authz`]).
+pub fn operator_rule(cfg: &Config, caller: &Caller, admits_lifecycle: bool) -> bool {
+    verified_label(caller).is_some_and(|label| {
+        human(caller) || cfg.is_human(label) || (admits_lifecycle && cfg.is_lifecycle_operator(label))
+    })
 }
 
 /// The caller's verified label: an authenticated agent or human. Anonymous,
@@ -155,6 +184,8 @@ impl<'a> Authz<'a> {
     fn holds_one(&self, caller: &Caller, a: &Authority<'_>) -> bool {
         let verified = verified_label(caller);
         match *a {
+            Authority::Operator => operator_rule(self.cfg, caller, OPERATOR_ADMITS_LIFECYCLE),
+            Authority::LifecycleOperator => verified.is_some_and(|l| self.cfg.is_lifecycle_operator(l)),
             Authority::TransitionalHuman => human(caller),
             Authority::TransitionalOperator { who } => {
                 verified.is_some() && (human(caller) || self.configured(who))
@@ -200,6 +231,64 @@ mod tests {
     fn holds(c: &Caller, a: Authority<'_>) -> bool {
         let cfg = cfg();
         Authz::new(&cfg).holds(c, &[a], DEFAULT_ORG)
+    }
+
+    #[test]
+    fn operator_is_a_verified_human_and_not_a_lifecycle_agent() {
+        let human = caller("operator", ActorKind::Human, Profile::Developer);
+        assert!(holds(&human, Authority::Operator));
+        // A verified agent whose label is a configured human identity.
+        assert!(holds(&caller("operator", ActorKind::Agent, Profile::Developer), Authority::Operator));
+        for c in [
+            caller("fleet-bot", ActorKind::Agent, Profile::Developer),
+            caller("builder-1", ActorKind::Agent, Profile::Operator),
+            caller("lead-1", ActorKind::Agent, Profile::Coordinator),
+            caller("operator", ActorKind::Anonymous, Profile::Coordinator),
+            Caller::system(),
+        ] {
+            assert!(!holds(&c, Authority::Operator), "{} {:?} {:?}", c.label, c.kind, c.profile);
+        }
+    }
+
+    /// The operator rule under both settings of the one constant.
+    #[test]
+    fn the_operator_rule_admits_lifecycle_operators_only_when_flipped() {
+        let cfg = cfg();
+        let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Developer);
+        let human = caller("operator", ActorKind::Human, Profile::Developer);
+        let anon = caller("fleet-bot", ActorKind::Anonymous, Profile::Developer);
+        let dev = caller("builder-1", ActorKind::Agent, Profile::Operator);
+        for admits in [false, true] {
+            assert_eq!(operator_rule(&cfg, &fleet, admits), admits, "lifecycle agent, admits={admits}");
+            assert!(operator_rule(&cfg, &human, admits));
+            assert!(!operator_rule(&cfg, &anon, admits), "never unverified");
+            assert!(!operator_rule(&cfg, &dev, admits), "never by profile");
+        }
+        assert_eq!(
+            operator_rule(&cfg, &fleet, OPERATOR_ADMITS_LIFECYCLE),
+            holds(&fleet, Authority::Operator)
+        );
+    }
+
+    #[test]
+    fn lifecycle_operator_is_a_verified_configured_label() {
+        assert!(holds(
+            &caller("fleet-bot", ActorKind::Agent, Profile::Developer),
+            Authority::LifecycleOperator
+        ));
+        assert!(!holds(
+            &caller("fleet-bot", ActorKind::Anonymous, Profile::Developer),
+            Authority::LifecycleOperator
+        ));
+        assert!(!holds(
+            &caller("builder-1", ActorKind::Agent, Profile::Coordinator),
+            Authority::LifecycleOperator
+        ));
+        // With lifecycle_operators set, a human not listed there is not one.
+        assert!(!holds(
+            &caller("operator", ActorKind::Human, Profile::Developer),
+            Authority::LifecycleOperator
+        ));
     }
 
     #[test]
@@ -325,11 +414,11 @@ mod tests {
         let err = authz
             .require(
                 &dev,
-                &[Authority::TransitionalHuman, Authority::TransitionalOperator { who: "x" }],
+                &[Authority::TransitionalHuman, Authority::Operator, Authority::LifecycleOperator],
                 DEFAULT_ORG,
             )
             .unwrap_err();
-        assert!(err.to_string().ends_with("authorities: human, operator"), "{err}");
+        assert!(err.to_string().ends_with("authorities: human, operator, lifecycle operator"), "{err}");
         let coord = caller("lead-1", ActorKind::Agent, Profile::Coordinator);
         let any = [Authority::TransitionalHuman, Authority::TransitionalMailboxReader];
         assert!(authz.require(&coord, &any, DEFAULT_ORG).is_ok());
