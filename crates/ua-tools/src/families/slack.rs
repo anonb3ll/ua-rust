@@ -287,9 +287,10 @@ pub enum Admission {
 /// still refused, but any member of the workspace (or of a shared channel)
 /// can send such requests in a loop, and the ledger is permanent. The caller
 /// logs it by reason class. Once the identity is known, the request appends
-/// `agent.slack.signature_accepted` and one of `agent.slack.request.refused`,
-/// `.deduped` or `.accepted`, attributed to that identity. Payloads carry
-/// ids and reason classes, never the body or text.
+/// `agent.slack.signature_accepted` (attributed to `system`) and one of
+/// `agent.slack.request.refused`, `.deduped` or `.accepted` (attributed to
+/// that identity). Payloads carry ids and reason classes, never the body or
+/// text.
 pub fn admit(
     tx: &mut WriteTx<'_>,
     cfg: &Config,

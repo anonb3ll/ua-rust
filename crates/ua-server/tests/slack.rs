@@ -675,6 +675,7 @@ async fn events_an_app_wrote_are_ignored() {
         json!({ "bot_profile": { "id": "B0BOT", "app_id": "A0OTHERAPP" } }),
         json!({ "bot_id": "B0BOT" }),
         json!({ "subtype": "bot_message" }),
+        json!({ "edited": { "user": HUMAN, "ts": "1700000000.000100" } }),
     ]
     .into_iter()
     .enumerate()

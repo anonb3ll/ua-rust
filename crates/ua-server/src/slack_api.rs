@@ -156,7 +156,18 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
         Ok(Admission::Refused { reason, identity }) => {
             if identity.is_none() {
                 // Not ledgered (anyone in the workspace can send these); debug only.
-                tracing::debug!(reason, "refused a signed Slack request without a mapped identity");
+                // The ids are what an operator adds to `slack_identities`; they
+                // come from the signed body and are logged only when id-shaped.
+                let id = |v: &str| {
+                    let ok = !v.is_empty() && v.len() <= 32 && v.bytes().all(|b| b.is_ascii_alphanumeric());
+                    if ok { v.to_string() } else { "-".to_string() }
+                };
+                tracing::debug!(
+                    reason,
+                    team_id = %id(&req.delivery.team_id),
+                    user_id = %id(&req.delivery.user_id),
+                    "refused a signed Slack request without a mapped identity"
+                );
             }
             return ack(match reason {
                 "unmapped_identity" | "identity_retired" => {
@@ -347,8 +358,10 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         event_type == "app_mention" || (event_type == "message" && s(event, "channel_type") == "im");
     // Anything an app wrote, including a message an app posted with a user's
     // token on their behalf, is not a person typing: Slack marks such
-    // messages with some of these keys.
-    let by_person = !["bot_id", "subtype", "app_id", "bot_profile"].iter().any(|k| event.contains_key(*k));
+    // messages with some of these keys. An edited message (`edited`) is not
+    // run again either: the command already ran when it was first sent.
+    let by_person =
+        !["bot_id", "subtype", "app_id", "bot_profile", "edited"].iter().any(|k| event.contains_key(*k));
     if !addressed || !by_person || !explicit_command(&text) {
         return ignore();
     }

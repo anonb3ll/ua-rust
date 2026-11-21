@@ -117,7 +117,7 @@ that user, while only the person can invoke a slash command.
 
 In the Events API, only an `app_mention` or a direct message (`message`
 with `channel_type = im`), written by a person (no `bot_id`, `subtype`,
-`app_id` or `bot_profile` on the event),
+`app_id` or `bot_profile` on the event) and not edited (no `edited`),
 whose first word after mentions starts with `/` runs anything
 (`@hub /task write the report`). Every other event is acknowledged and
 ignored without touching the database.
@@ -222,7 +222,7 @@ the `response_url`.
 - **Messages posted on someone's behalf:** an app installed with a user
   token can post messages that look like the user's own, and Slack does not
   always mark them. Events with `bot_id`, `subtype`, `app_id` or
-  `bot_profile` are ignored, and `/approve` is never accepted from the
+  `bot_profile` are ignored, an edited message is not run a second time, and `/approve` is never accepted from the
   Events API at all, only as a slash command, which only the person can
   invoke. Other commands sent as messages run as the mapped identity, so an
   app with a mapped user's token can create or update tasks as that user;
