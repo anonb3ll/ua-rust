@@ -138,7 +138,9 @@ verified human other than the requester, and the profile must allow
 `approval_resolve`. Approvals from Slack are therefore opt-in per
 identity, and each one is recorded as coming from Slack: the approval row's
 `resolved_transport` is `slack` (every decision records the adapter it came
-through: `ui`, `http`, `mcp`, `cli`, `slack`), the `agent.approval.resolved`
+through, one of `stdio`, `http`, `mcp`, `cli`, `ui`, `internal` and `slack`;
+the row holds the latest decision, so a later revoke overwrites it, while
+each decision stays in the ledger), the `agent.approval.resolved`
 ledger event carries `transport: "slack"`, the Control Center inbox shows
 it in the "Via" column, and the `approval_resolve` call's `tool_calls` row
 has transport `slack`. The row's `reason` is `approved from Slack`.

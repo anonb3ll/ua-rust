@@ -48,6 +48,12 @@
         "null"
       ]
     },
+    "resolved_transport": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "created_at": {
       "type": "string",
       "minLength": 1

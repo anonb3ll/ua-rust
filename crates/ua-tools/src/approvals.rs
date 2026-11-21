@@ -36,10 +36,19 @@ CREATE INDEX IF NOT EXISTS idx_approvals_lookup ON approvals(tool, status, reque
 ",
 };
 
-/// `approvals.resolved_transport`: which adapter the resolving call came
-/// through (`ui`, `http`, `mcp`, `cli`, `slack`, ...), so an approval made
-/// from chat is told apart from one made in the Control Center. Evidence
-/// only: no rule reads it. NULL for rows resolved before this part.
+/// `approvals.resolved_transport`: which adapter the latest decision on the
+/// row came through (`ui`, `http`, `mcp`, `cli`, `stdio`, `internal`,
+/// `slack`), so an approval made from chat is told apart from one made in
+/// the Control Center. Evidence only: no rule reads it. NULL for rows
+/// resolved before this part.
+///
+/// `resolved_by`, `resolved_at` and `resolved_transport` always describe the
+/// **latest** decision: approve or deny, then a revoke (through
+/// `approval_resolve` or the relay withdrawing its draft) overwrites them.
+/// The earlier decision is not lost: each `approval_resolve` decision is an
+/// `agent.approval.resolved` ledger event with its own `resolved_by` and
+/// `transport`, and a relay withdrawal is a `relay.cancelled` event with its
+/// `transport`.
 pub const SCHEMA_V2: SchemaPart = SchemaPart {
     name: "approvals.v2",
     sql: "
@@ -272,8 +281,9 @@ pub struct ApprovalRow {
     pub status: String,
     pub reason: Option<String>,
     pub resolved_by: Option<String>,
-    /// The adapter the decision came through (`ui`, `http`, `slack`, ...);
-    /// `None` for a row resolved before this was recorded.
+    /// The adapter the latest decision came through (`ui`, `http`, `mcp`,
+    /// `cli`, `stdio`, `internal`, `slack`); `None` for a row resolved before
+    /// this was recorded. See [`SCHEMA_V2`] for the latest-decision rule.
     pub resolved_transport: Option<String>,
     pub created_at: String,
     pub updated_at: String,
