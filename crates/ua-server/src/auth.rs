@@ -188,6 +188,8 @@ fn is_public_path(path: &str) -> bool {
         || path == "/logout"
         // GitHub signs its deliveries instead (see `github_api`).
         || path == crate::github_api::WEBHOOK_PATH
+        // Slack signs its requests too (see `slack_api`); 404 unless mounted.
+        || crate::slack_api::is_slack_path(path)
 }
 
 pub async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {

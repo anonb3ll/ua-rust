@@ -1,0 +1,2 @@
+# Formatting for the generated Pydantic models and their fixture test.
+line-length = 100

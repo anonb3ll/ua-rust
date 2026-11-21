@@ -279,11 +279,22 @@ pub struct Config {
     /// runs the gates; one approved message takes two). 0 refuses every call.
     pub zulip_send_calls_per_hour: u32,
     /// Slack signing secret, from the `UA_SLACK_SIGNING_SECRET` environment
-    /// variable; keep it out of the config file. Read by the future Slack
-    /// route (docs/slack.md); no tool reads it. Never logged, never written
-    /// to the database.
+    /// variable; keep it out of the config file. Only the Slack routes read
+    /// it (docs/slack.md); no tool does. Never logged, never written to the
+    /// database.
     #[serde(skip_serializing)]
     pub slack_signing_secret: Option<SecretString>,
+    /// Serve the Slack routes (`/api/slack/commands`, `/api/slack/events`).
+    /// Off by default; the routes are mounted only when this is on and
+    /// `UA_SLACK_SIGNING_SECRET` is set (docs/slack.md). Like other settings
+    /// it can come from the environment (`UA_SLACK_ENABLED`);
+    /// `slack_identities` cannot.
+    pub slack_enabled: bool,
+    /// Which Slack user acts as which hub identity: `[[slack_identities]]`
+    /// tables of `team_id`, `user_id` and `identity`. A request from a pair
+    /// not listed is refused. Read from TOML only, never the environment.
+    /// Checked at load ([`Config::check_slack_identities`]).
+    pub slack_identities: Vec<SlackIdentity>,
     /// Agent harnesses `dispatch_task` may start, by name (`[harnesses.<name>]`).
     /// Empty means dispatch only records runs and spawns nothing.
     pub harnesses: BTreeMap<String, HarnessConfig>,
@@ -427,6 +438,36 @@ pub struct Config {
     /// Gate runs (`check` and `draft`) one caller may make per hour, so the
     /// private denylist cannot be probed term by term. 0 refuses every run.
     pub relay_checks_per_hour: u32,
+}
+
+/// One Slack user the Slack routes accept, and the hub identity it acts as.
+/// Slack's `user_name` and display names are never used for identity: only
+/// this exact (`team_id`, `user_id`) pair.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SlackIdentity {
+    /// Slack workspace id, e.g. `T0000000000`.
+    pub team_id: String,
+    /// Slack user id in that workspace, e.g. `U0000000000`.
+    pub user_id: String,
+    /// Hub identity label. Must be a `human_identities` entry: a person
+    /// typing in Slack never acts under an agent label.
+    pub identity: String,
+    /// Whether this Slack user may resolve approvals with `/approve`. Off by
+    /// default, so turning Slack on does not widen who can approve. When on,
+    /// `approval_resolve`'s own rules still apply (a human other than the
+    /// requester, and a profile that allows it).
+    #[serde(default)]
+    pub can_approve: bool,
+}
+
+/// A Slack id: a prefix letter from `prefixes`, then 2 to 31 uppercase
+/// letters or digits.
+fn slack_id_ok(id: &str, prefixes: &[u8]) -> bool {
+    let b = id.as_bytes();
+    (3..=32).contains(&b.len())
+        && prefixes.contains(&b[0])
+        && b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// A cargo config file above a workspace root that the operator reviewed
@@ -701,6 +742,8 @@ impl Default for Config {
             zulip_mention_allowlist: Vec::new(),
             zulip_send_calls_per_hour: 30,
             slack_signing_secret: None,
+            slack_enabled: false,
+            slack_identities: Vec::new(),
             harnesses: BTreeMap::new(),
             dispatch_lease_seconds: 300,
             dispatch_reaper_interval_s: None,
@@ -790,6 +833,7 @@ impl Config {
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
         let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
         cfg.check_profiles()?;
+        cfg.check_slack_identities()?;
         for (name, h) in &cfg.harnesses {
             h.check(name)?;
         }
@@ -815,6 +859,58 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse a `slack_identities` table the Slack routes could not use
+    /// safely: a malformed team or user id, an empty identity, a (`team_id`,
+    /// `user_id`) pair listed twice, or an identity that is not in
+    /// `human_identities` (a person typing in Slack never acts as an agent).
+    pub fn check_slack_identities(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, m) in self.slack_identities.iter().enumerate() {
+            if !slack_id_ok(&m.team_id, b"T") {
+                anyhow::bail!("slack_identities[{i}].team_id {:?} is not a Slack team id (T...)", m.team_id);
+            }
+            if !slack_id_ok(&m.user_id, b"UW") {
+                anyhow::bail!(
+                    "slack_identities[{i}].user_id {:?} is not a Slack user id (U... or W...)",
+                    m.user_id
+                );
+            }
+            let label = m.identity.trim();
+            if label.is_empty() || label != m.identity {
+                anyhow::bail!("slack_identities[{i}].identity must be a label without surrounding spaces");
+            }
+            if !seen.insert((m.team_id.as_str(), m.user_id.as_str())) {
+                anyhow::bail!(
+                    "slack_identities: team_id {:?} user_id {:?} is listed twice",
+                    m.team_id,
+                    m.user_id
+                );
+            }
+            if !self.is_human(label) {
+                anyhow::bail!(
+                    "slack_identities[{i}].identity {label:?} is not in human_identities: a Slack user can be \
+                     mapped only to a human identity, never to an agent label"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The `slack_identities` entry for a Slack (`team_id`, `user_id`) pair.
+    /// Exact, case-sensitive match. A pair listed more than once, or mapped
+    /// to an identity that is not (or no longer) a human, maps to nobody
+    /// (fail closed).
+    pub fn slack_identity(&self, team_id: &str, user_id: &str) -> Option<&SlackIdentity> {
+        let mut hits = self.slack_identities.iter().filter(|m| m.team_id == team_id && m.user_id == user_id);
+        let first = hits.next()?;
+        (hits.next().is_none() && self.is_human(&first.identity)).then_some(first)
+    }
+
+    /// The Slack signing secret, trimmed; `None` when unset or blank.
+    pub fn slack_signing_secret(&self) -> Option<SecretString> {
+        secret_from(&self.slack_signing_secret, None)
+    }
+
     fn figment(explicit: Option<&Path>, with_env: bool) -> Figment {
         let mut fig = Figment::from(Serialized::defaults(Config::default()));
         let file = explicit
@@ -829,8 +925,9 @@ impl Config {
             fig = fig.merge(Toml::file(f));
         }
         if with_env {
-            // MCP servers come from TOML only: no JSON-in-an-environment-variable form.
-            fig = fig.merge(Env::prefixed("UA_").ignore(&["config", "mcp_servers"]));
+            // MCP servers and the Slack identity map come from TOML only: no
+            // JSON-in-an-environment-variable form.
+            fig = fig.merge(Env::prefixed("UA_").ignore(&["config", "mcp_servers", "slack_identities"]));
         }
         fig
     }
@@ -1155,6 +1252,69 @@ mod tests {
         std::fs::write(&file, "oauth_profile = \"research\"\n[profiles]\nbuilder-1 = \"reviewer\"\n")
             .unwrap();
         assert!(Config::load_inner(Some(&file), false).is_ok());
+    }
+
+    #[test]
+    fn slack_identities_are_checked_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("c.toml");
+        let base =
+            "human_identities = [\"operator\", \"reviewer-1\"]\n[profiles]\nbuilder-1 = \"developer\"\n";
+        let row = |team: &str, user: &str, who: &str| {
+            format!(
+                "[[slack_identities]]\nteam_id = \"{team}\"\nuser_id = \"{user}\"\nidentity = \"{who}\"\n"
+            )
+        };
+        let load = |rows: &str| {
+            std::fs::write(&file, format!("{base}{rows}")).unwrap();
+            Config::load_inner(Some(&file), false)
+        };
+        let ok = load(&format!(
+            "{}{}can_approve = true\n",
+            row("T0001", "U0001", "operator"),
+            row("T0001", "U0002", "reviewer-1")
+        ))
+        .unwrap();
+        let who = |t: &str, u: &str| ok.slack_identity(t, u).map(|m| (m.identity.clone(), m.can_approve));
+        assert_eq!(who("T0001", "U0001"), Some(("operator".into(), false)), "can_approve defaults to false");
+        assert_eq!(who("T0001", "U0002"), Some(("reviewer-1".into(), true)));
+        assert_eq!(who("T0002", "U0001"), None, "the team is part of the key");
+        assert_eq!(who("t0001", "u0001"), None, "exact match only");
+        assert!(!ok.slack_enabled, "off by default");
+
+        let dup =
+            load(&format!("{}{}", row("T0001", "U0001", "operator"), row("T0001", "U0001", "reviewer-1")));
+        assert!(dup.unwrap_err().to_string().contains("listed twice"));
+        let unknown = load(&row("T0001", "U0001", "someone-else")).unwrap_err().to_string();
+        assert!(unknown.contains("not in human_identities"), "{unknown}");
+        // An agent label, even one with an explicit profile, is refused.
+        let agent = load(&row("T0001", "U0001", "builder-1")).unwrap_err().to_string();
+        assert!(agent.contains("never to an agent label"), "{agent}");
+        for (team, user) in [("X0001", "U0001"), ("T0001", "B0001"), ("T0001", "U00 1"), ("T0001", "u0001")] {
+            let err = load(&row(team, user, "operator")).unwrap_err().to_string();
+            assert!(err.contains("slack_identities[0]"), "{team} {user}: {err}");
+        }
+        std::fs::write(&file, format!("{base}[[slack_identities]]\nteam_id = \"T0001\"\nuser_id = \"U0001\"\nidentity = \"operator\"\nuser_name = \"operator\"\n")).unwrap();
+        assert!(Config::load_inner(Some(&file), false).is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn a_slack_pair_listed_twice_maps_to_nobody() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.human_identities = vec!["operator".into(), "reviewer-1".into()];
+        let m = SlackIdentity {
+            team_id: "T0001".into(),
+            user_id: "U0001".into(),
+            identity: "operator".into(),
+            can_approve: false,
+        };
+        cfg.slack_identities = vec![m.clone(), SlackIdentity { identity: "reviewer-1".into(), ..m.clone() }];
+        assert!(cfg.slack_identity("T0001", "U0001").is_none());
+        // A mapping whose identity is no longer a human maps to nobody.
+        cfg.slack_identities = vec![m];
+        assert!(cfg.slack_identity("T0001", "U0001").is_some());
+        cfg.human_identities.clear();
+        assert_eq!(cfg.slack_identity("T0001", "U0001"), None);
     }
 
     #[test]

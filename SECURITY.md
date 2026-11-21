@@ -23,7 +23,18 @@ reproduce. You will get an acknowledgement within a week.
   hosts outside `allowed_hosts` and the host of `public_url`, as protection
   against DNS rebinding; both the `Host` header and an HTTP/2 `:authority`
   are checked. They also refuse state-changing requests that are
-  cross-site or have non-JSON bodies.
+  cross-site or have non-JSON bodies, except the Slack slash-command route,
+  which takes Slack's form body and no credential.
+- **Slack ingress is off by default.** `/api/slack/commands` and
+  `/api/slack/events` exist only with `slack_enabled` and
+  `UA_SLACK_SIGNING_SECRET`. The signature is checked over the raw body
+  before anything is parsed or written; only Slack users listed in
+  `slack_identities` act, as the human identity they are mapped to (never
+  an agent label), through the normal profile, policy and approval checks,
+  recorded with transport `slack`. `/approve` works only for mappings with
+  `can_approve`. The signing secret can act as any mapped human, and approve
+  as the opted-in ones, so guard it like a bearer token
+  ([docs/slack.md](docs/slack.md#threat-model)).
 - **Event streams are governed.** `/api/events/stream` and
   `/ui/activity/stream` open with an `event_log_query` call as the caller,
   so a profile or policy that refuses the tool refuses the stream. An open
