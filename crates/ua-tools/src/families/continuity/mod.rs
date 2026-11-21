@@ -29,7 +29,6 @@ pub(crate) mod merged;
 mod queue;
 mod workflow;
 
-use ua_core::{Caller, Config};
 use ua_store::SchemaPart;
 
 pub(crate) use conversation::{conversation_handoff, conversation_handoffs};
@@ -196,12 +195,6 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 /// stored value, so two records inside one second must not share it.
 pub(crate) fn now_micros() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
-}
-
-/// Whether `who` holds operator authority: a human caller, a configured
-/// human identity or a lifecycle operator.
-pub(crate) fn is_operator_identity(cfg: &Config, caller: &Caller, who: &str) -> bool {
-    caller.is_human() || cfg.is_human(who) || cfg.is_lifecycle_operator(who)
 }
 
 /// Same label, ignoring ASCII case.

@@ -56,7 +56,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
 
-use super::{bounded, is_operator_identity, now_micros, same_label};
+use super::{bounded, now_micros, same_label};
 use crate::ci::{CiRun, Verdict};
 use crate::families::governance;
 use crate::families::tasks::{acting_identity, emit, require_task, str_field};
@@ -281,8 +281,13 @@ fn parse_ref(r: Option<CheckRef>) -> UaResult<Option<ParsedRef>> {
 
 // --- authority ----------------------------------------------------------------------
 
+/// The claimant, the next owner, or an operator may write a task's workflow
+/// record. Operator authority is governance's rule, which needs a verified
+/// caller: an unverified caller that names a human's label as its `actor` is
+/// not an operator (it still writes a task whose claimant or next owner it
+/// names, as every unverified write does).
 fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
-    let allowed = is_operator_identity(ctx.hub.cfg(), &ctx.caller, who)
+    let allowed = governance::is_operator(ctx.hub.cfg(), &ctx.caller, who)
         || same_label(str_field(task, "claimed_by"), who)
         || same_label(str_field(task, "next_owner"), who);
     if allowed {
