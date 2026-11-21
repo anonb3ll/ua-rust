@@ -141,24 +141,49 @@ fn ephemeral(text: &str) -> Response {
     axum::Json(json!({ "response_type": "ephemeral", "text": text })).into_response()
 }
 
-/// What one verified request asks for.
-struct Request {
-    delivery: Delivery,
-    parsed: Option<Value>,
-    response_url: Option<url::Url>,
+/// What one authenticated Slack delivery asks for, from either transport.
+pub(crate) struct Request {
+    pub(crate) delivery: Delivery,
+    pub(crate) parsed: Option<Value>,
+    pub(crate) response_url: Option<url::Url>,
 }
 
-/// Step 4, then the answer: a slash command gets an ephemeral sentence
-/// (never the body or anything from the hub but the mapped identity), an
-/// event an empty 200 whatever happened, so Slack does not retry a refusal.
-async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: Request) -> Response {
-    let is_command = req.delivery.kind == DeliveryKind::Trigger;
-    let ts = header(headers, "x-slack-request-timestamp").to_string();
+/// What makes a delivery unique before its event or trigger id is read.
+pub(crate) enum Replay {
+    /// An HTTP request: its signed timestamp and raw body.
+    Signed { timestamp: String, body: Vec<u8> },
+    /// A Socket Mode envelope: its `envelope_id`.
+    #[cfg_attr(not(feature = "slack-socket"), allow(dead_code))]
+    Envelope(String),
+}
+
+/// How a delivery was answered by [`admit_and_run`].
+pub(crate) enum Admitted {
+    /// The sentence a slash command shows the user (events ignore it).
+    Answer(String),
+    /// The same signed bytes or envelope were accepted before.
+    Replayed,
+    /// The admission transaction failed.
+    Internal,
+}
+
+/// Step 4, then the answer, for both transports: one admission transaction
+/// ([`slack::admit_keyed`]), then the command on a tracked task as the mapped
+/// human. The answer is a fixed sentence (never the body or anything from the
+/// hub but the mapped identity).
+pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request) -> Admitted {
     let (hub, d) = (state.hub.clone(), req.delivery.clone());
-    let raw = body.to_vec();
     let db = hub.db().clone();
-    let admitted = db.write_async(move |tx| slack::admit(tx, hub.cfg(), &ts, &raw, now_s(), &d)).await;
-    let ack = |text: &str| if is_command { ephemeral(text) } else { axum::Json(json!({})).into_response() };
+    let admitted = db
+        .write_async(move |tx| {
+            let key = match &replay {
+                Replay::Signed { timestamp, body } => slack::ReplayKey::Signed { timestamp, body },
+                Replay::Envelope(id) => slack::ReplayKey::Envelope { envelope_id: id },
+            };
+            slack::admit_keyed(tx, hub.cfg(), key, now_s(), &d)
+        })
+        .await;
+    let ack = |text: &str| Admitted::Answer(text.to_string());
     let identity = match admitted {
         Ok(Admission::Accepted { identity }) => identity,
         Ok(Admission::Deduped { .. }) => return ack("Already received."),
@@ -175,7 +200,7 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
                     reason,
                     team_id = %id(&req.delivery.team_id),
                     user_id = %id(&req.delivery.user_id),
-                    "refused a signed Slack request without a mapped identity"
+                    "refused an authenticated Slack request without a mapped identity"
                 );
             }
             return ack(match reason {
@@ -194,11 +219,10 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
                 _ => "Malformed Slack request.",
             });
         }
-        Err(e) if e.reason_code() == Some("replayed") => return unauthorized("replayed"),
+        Err(e) if e.reason_code() == Some("replayed") => return Admitted::Replayed,
         Err(e) => {
             tracing::warn!(code = e.code(), "could not record a Slack request");
-            let body = json!({ "ok": false, "error": "internal", "message": "internal error" });
-            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+            return Admitted::Internal;
         }
     };
     let Some(parsed) = req.parsed else { return ack("Malformed Slack request.") };
@@ -212,6 +236,26 @@ async fn admit_and_run(state: AppState, headers: &HeaderMap, body: Bytes, req: R
     let task_state = state.clone();
     state.calls.spawn(execute(task_state, identity, req.delivery, parsed, response_url));
     ack(&text)
+}
+
+/// The HTTP answer for [`admit_and_run`]'s result: a slash command gets an
+/// ephemeral sentence, an event an empty 200 whatever happened, so Slack
+/// does not retry a refusal.
+async fn http_admit(state: AppState, headers: &HeaderMap, body: Bytes, req: Request) -> Response {
+    let is_command = req.delivery.kind == DeliveryKind::Trigger;
+    let replay = Replay::Signed {
+        timestamp: header(headers, "x-slack-request-timestamp").to_string(),
+        body: body.to_vec(),
+    };
+    match admit_and_run(state, replay, req).await {
+        Admitted::Answer(text) if is_command => ephemeral(&text),
+        Admitted::Answer(_) => axum::Json(json!({})).into_response(),
+        Admitted::Replayed => unauthorized("replayed"),
+        Admitted::Internal => {
+            let body = json!({ "ok": false, "error": "internal", "message": "internal error" });
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
+        }
+    }
 }
 
 /// Step 5, after the acknowledgement. Never panics: every failure is
@@ -283,8 +327,15 @@ async fn commands(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         return *r;
     }
     let fields = form_fields(&body);
+    let req = command_request(fields.as_ref());
+    http_admit(state, &headers, body, req).await
+}
+
+/// A slash command's fields (the HTTP form, or a Socket Mode
+/// `slash_commands` payload), as a [`Request`]. `None` is a malformed body.
+pub(crate) fn command_request(fields: Option<&Map<String, Value>>) -> Request {
     let empty = Map::new();
-    let f = fields.as_ref().unwrap_or(&empty);
+    let f = fields.unwrap_or(&empty);
     // Identity is (team_id, user_id) only; user_name is never read.
     let (team_id, user_id, trigger_id) = (field(f, "team_id"), field(f, "user_id"), field(f, "trigger_id"));
     // `/task fix it` arrives as command=/task, text=fix it; a single app
@@ -311,7 +362,7 @@ async fn commands(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         refusal,
     };
     let response_url = slack::response_url(field(f, "response_url"));
-    admit_and_run(state, &headers, body, Request { delivery, parsed, response_url }).await
+    Request { delivery, parsed, response_url }
 }
 
 /// One of the nine command words (the parser refuses a bare word that needs
@@ -368,18 +419,41 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         tracing::debug!("ignored a signed Slack event that is not a JSON object");
         return ignore();
     };
+    match event_request(&envelope) {
+        EventRequest::Challenge(challenge) => axum::Json(json!({ "challenge": challenge })).into_response(),
+        EventRequest::BadChallenge => {
+            (StatusCode::BAD_REQUEST, axum::Json(json!({ "ok": false, "error": "bad_challenge" })))
+                .into_response()
+        }
+        EventRequest::Ignore => ignore(),
+        EventRequest::Run(req) => http_admit(state, &headers, body, *req).await,
+    }
+}
+
+/// What an Events API envelope asks for.
+pub(crate) enum EventRequest {
+    /// `url_verification`: echo this challenge (HTTP only).
+    Challenge(String),
+    /// `url_verification` with a missing or oversized challenge.
+    BadChallenge,
+    /// Not a command, or not one this hub acts on: acknowledge, no state.
+    Ignore,
+    /// A marked command to admit.
+    Run(Box<Request>),
+}
+
+/// Read an Events API envelope (the HTTP body, or a Socket Mode `events_api`
+/// payload): the filters on who wrote it and whether it is a marked command,
+/// then the [`Request`]. No database access.
+pub(crate) fn event_request(envelope: &Map<String, Value>) -> EventRequest {
+    let ignore = || EventRequest::Ignore;
     match envelope.get("type").and_then(Value::as_str) {
         Some("url_verification") => {
-            // Signed like everything else (checked above); echo the challenge.
             let challenge = envelope.get("challenge").and_then(Value::as_str).unwrap_or_default();
             if challenge.is_empty() || challenge.len() > 256 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({ "ok": false, "error": "bad_challenge" })),
-                )
-                    .into_response();
+                return EventRequest::BadChallenge;
             }
-            return axum::Json(json!({ "challenge": challenge })).into_response();
+            return EventRequest::Challenge(challenge.to_string());
         }
         Some("event_callback") => {}
         _ => return ignore(),
@@ -403,17 +477,17 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // A direct message counts only when it was delivered to the app's bot,
     // not to a user-scoped subscription.
     let Some(command_text) = marked_command(&text) else { return ignore() };
-    if !addressed || !by_person || (direct && !bot_authorized(&envelope)) {
+    if !addressed || !by_person || (direct && !bot_authorized(envelope)) {
         return ignore();
     }
     // The user's own workspace: `user_team` or `team` on the event (shared
     // channels), else the envelope's.
-    let team_id = [s(event, "user_team"), s(event, "team"), s(&envelope, "team_id")]
+    let team_id = [s(event, "user_team"), s(event, "team"), s(envelope, "team_id")]
         .into_iter()
         .find(|t| !t.is_empty())
         .unwrap_or_default();
     let user_id = s(event, "user");
-    let event_id = s(&envelope, "event_id");
+    let event_id = s(envelope, "event_id");
     let parsed = slack::parse_slack_command(command_text).ok();
     let malformed = team_id.is_empty() || user_id.is_empty() || !slack::delivery_id_ok(&event_id);
     let is_approve =
@@ -440,7 +514,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     };
     // Events carry no response_url; replies would need a bot token, which
     // this hub does not hold.
-    admit_and_run(state, &headers, body, Request { delivery, parsed, response_url: None }).await
+    EventRequest::Run(Box::new(Request { delivery, parsed, response_url: None }))
 }
 
 #[cfg(test)]
