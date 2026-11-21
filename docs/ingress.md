@@ -164,13 +164,19 @@ Not guaranteed:
 sent: `inbound_deliveries`, keyed by `(org_id, source, kind,
 delivery_key)`. `source` names the sender (`github`), `kind` what the key is
 (`delivery_id`, `body_sha256`). Each row has a state, `received_at`,
-`updated_at` and `expires_at` (Unix seconds), the claim of the process that
-took it on, an optional identity, and a free-text `detail`.
+`updated_at` and `expires_at` (Unix seconds), the claim it was taken on
+under, an optional identity, and a free-text `detail`.
+
+A claim is the process's prefix (its id and start time) and a number of its
+own: every `record` that takes a delivery on hands out a new one. A claim
+whose prefix is not this process's belongs to a process that stopped; a
+claim with this prefix but another number is another handler in this
+process (a redelivery that took the delivery over).
 
 | State | Meaning | A repeat is |
 |---|---|---|
 | `seen` | Recorded, not taken on | a duplicate |
-| `accepted` | Taken on under this process's claim | a duplicate while the claim is live; stale once the claim belongs to a stopped process or the in-flight bound passes |
+| `accepted` | Taken on under a claim | a duplicate while the claim is live (this process's prefix, inside the in-flight bound); stale once the claim belongs to a stopped process or the bound passes |
 | `finished` | Handled | a duplicate until the row expires |
 | `abandoned` | Was `accepted`, claim gone or past the bound; outcome unknown | stale |
 
@@ -187,14 +193,61 @@ ledger event, for one):
    than released: the sweep cannot know whether their effects happened, and
    releasing one would let a non-idempotent delivery run again unnoticed.
    They are returned, so a caller can record them.
-2. `record(delivery, now, rules, detail)`: `First`, `Duplicate { state }`
-   or `Redelivered { was }`.
-3. `accept(delivery, now, identity)` when it takes the delivery on.
+2. `record(delivery, now, rules, detail)`: `First { claim }`,
+   `Duplicate { state }` or `Redelivered { was, claim }`.
+3. `accept(delivery, claim, now, identity)` when it takes the delivery on.
 
-Then, after handling, in a second transaction: `finish` when it is done,
-or `release` when a retry should be processed as a first sight. One hub
-process writes the database, so a claim that is not the current process's
-belongs to one that stopped.
+Then, after handling, in a second transaction: `finish(delivery, claim,
+now)` when it is done, or `release(delivery, claim)` when a retry should
+be processed as a first sight. Both act only on a row that still carries
+the caller's claim and return `Settled` or `NotMine { state }`; on
+`NotMine` nothing changed, and the caller logs it:
+
+| The row is | `finish` with the caller's claim | `release` with the caller's claim | either with another claim |
+|---|---|---|---|
+| `accepted` under the caller's claim | `Settled`: `finished` | `Settled`: deleted | `NotMine` |
+| `abandoned`, still the caller's claim | `Settled`: `finished` | `NotMine`: stays `abandoned` | `NotMine` |
+| taken over by a redelivery (new claim) | `NotMine` | `NotMine` | (the new owner settles it) |
+| `finished` | `NotMine` | `NotMine` | `NotMine` |
+| `seen`, or gone | `NotMine` | `NotMine` | `NotMine` |
+
+A slow handler therefore never undoes a newer owner's record: once a
+redelivery has taken the delivery over, the original's `finish` or
+`release` changes nothing, and the newer owner's settlement stands. An
+`abandoned` row whose original handler does finish is still that handler's
+(nobody took it over, since a takeover changes the claim) and its effects
+are done, so `finish` marks it `finished` and a later copy is a duplicate
+instead of running again. `release` leaves an `abandoned` row alone: the
+sweep has already reported its outcome as unknown, and a source that
+redelivers stale rows processes the next copy anyway.
+
+### Limits
+
+- **One `ua serve` per database.** Only `ua serve` hosts the routes that
+  record inbound deliveries. Two of them on one database would each see
+  the other's claims as a stopped process's: each treats the other's
+  in-flight deliveries as stale, so with `Stale::Redeliver` a delivery can
+  be handled by both, and the sweep of either abandons the other's work in
+  progress. The serve command takes only a shared hub lock today (the one
+  an import or restore takes exclusively), so nothing refuses a second
+  `ua serve`.
+- **The clock.** Staleness is judged against the wall clock. A forward
+  step past the in-flight bound (15 minutes for GitHub) makes this
+  process's own in-flight deliveries stale, with the same effect as a
+  second process for the deliveries in flight at that moment. A backward
+  step only makes rows look younger, so they stay duplicates longer.
+- **Downgrading.** Nothing refuses an older binary on a database that has
+  these parts. Recorded parts a build does not know are ignored when the
+  store opens, and the rollback fence (`docs/organization.md`) refuses only
+  a ledger whose newest row has a `hash_v` above the build's, which these
+  parts do not write. `ua doctor` and `system_doctor` report the parts as
+  from another build, and `ua restore` refuses them without
+  `--allow-newer`, but `ua serve` starts. An older binary reads only the old
+  GitHub tables, which stopped being written at the cut-over, so a downgrade
+  reopens a replay window: a copy of any GitHub delivery handled since the
+  upgrade (within its 30-day retention, and inside the payload-timestamp
+  window) is accepted again. Do not downgrade past this change while the
+  webhook takes traffic.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from
@@ -216,6 +269,14 @@ and `Stale::Redeliver`:
 | A redelivery after handling failed with an internal error | handled (the records were deleted) | handled (the records are released) |
 | A redelivery after handling refused the payload (400) | 409 `replayed` | the same (the records are finished) |
 | A second copy while the first is still being handled here | 409 `replayed` | the same, until the 15-minute bound |
+| A copy after a slow original was abandoned and then finished | 409 `replayed` | the same (the original's `finish` still counts) |
+| A slow original that fails after a redelivery took over | the original deleted the newer record | the original's `release` is `NotMine`; the newer record stands |
+
+When the sweep abandons GitHub deliveries it appends one
+`agent.github.webhook.abandoned` event per sweep (actor `hub-github`) with
+`count`, `kinds` (`delivery_id` and `body_sha256` counts), `delivery_ids` (at
+most 50) and `delivery_ids_truncated`; never a body or a body hash. Each is
+a delivery that may never have been handled.
 
 `github.inbound.v1.copy` (a procedure part) copies the rows of the old
 `github_deliveries` and `github_delivery_bodies` into the table as

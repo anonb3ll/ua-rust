@@ -256,6 +256,14 @@ from its commit history.
   15 minutes) is processed when GitHub redelivers it, instead of being
   refused as a replay and lost. Its `agent.github.webhook.received` event
   carries `"redelivered": true`. Every other response is unchanged.
+  Settling a delivery record is by claim (one per taking-on): a slow
+  handler cannot finish or release a record a redelivery took over, and one
+  whose record the sweep abandoned still finishes it, so a later copy stays
+  a replay. When the sweep abandons deliveries it appends one
+  `agent.github.webhook.abandoned` event (counts and up to 50 delivery ids,
+  no body). Downgrading past this change reopens a replay window for
+  deliveries handled since: nothing refuses an older binary, which reads
+  only the old GitHub tables (`docs/ingress.md`, Limits).
 
 - Operator authority is a verified caller of kind human, nothing else.
   Dispatch and governance agree on it: acting for another agent in dispatch,

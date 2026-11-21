@@ -15,11 +15,16 @@
 //! ```
 //!
 //! - `seen`: recorded, not taken on. A repeat is a duplicate.
-//! - `accepted`: taken on by this process (the row carries the process's
-//!   claim). A repeat while the claim is live is a duplicate.
+//! - `accepted`: taken on under a [`Claim`] (this process's prefix and a
+//!   number of its own). A repeat while the claim is live is a duplicate.
 //! - `finished`: handled. A repeat is a duplicate until the row expires.
 //! - `abandoned`: was `accepted` under a claim that is gone (the process
 //!   stopped) or older than the in-flight bound; the outcome is unknown.
+//!
+//! Settling ([`finish`], [`release`]) acts only on a row that still carries
+//! the caller's claim, so a slow handler cannot undo the record of a newer
+//! owner that took the delivery over; it reports [`Settle::NotMine`]
+//! instead.
 //!
 //! What a repeat of a stale `accepted` or an `abandoned` row means is the
 //! caller's choice ([`Stale`]): a source whose effects are idempotent
@@ -32,6 +37,7 @@
 //! and this module opens no connection of its own.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{OptionalExtension, params};
 use ua_core::{UaError, UaResult};
@@ -135,29 +141,80 @@ pub struct Rules {
 }
 
 /// What [`record`] found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sight {
-    /// First time: recorded as `seen`.
-    First,
+    /// First time: recorded as `seen` under `claim`.
+    First { claim: Claim },
     /// A delivery taken on before and never finished, taken on again (only
-    /// under [`Stale::Redeliver`]); recorded as `seen` again.
-    Redelivered { was: State },
+    /// under [`Stale::Redeliver`]); recorded as `seen` again under a new
+    /// `claim`, so the earlier holder can no longer settle it.
+    Redelivered { was: State, claim: Claim },
     /// Already known: nothing changed.
     Duplicate { state: State },
 }
 
-/// This process's claim on the rows it accepts: a row accepted under another
-/// claim was accepted by a process that has since stopped (one hub process
-/// writes the database).
-pub fn claim() -> &'static str {
-    static CLAIM: OnceLock<String> = OnceLock::new();
-    CLAIM.get_or_init(|| {
+impl Sight {
+    /// The claim to accept and settle with, unless this is a duplicate.
+    pub fn claim(&self) -> Option<&Claim> {
+        match self {
+            Sight::First { claim } | Sight::Redelivered { claim, .. } => Some(claim),
+            Sight::Duplicate { .. } => None,
+        }
+    }
+}
+
+/// One taking-on of a delivery: this process's prefix and a number unique
+/// within the process. Every [`record`] that takes a delivery on hands out
+/// a new one, so a takeover inside the same process is still a different
+/// claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim(String);
+
+impl Claim {
+    fn next() -> Claim {
+        static N: AtomicU64 = AtomicU64::new(0);
+        Claim(format!("{}{}", process_prefix(), N.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A claim spelled out, for tests that stand in for another holder.
+    #[doc(hidden)]
+    pub fn from_raw(raw: impl Into<String>) -> Claim {
+        Claim(raw.into())
+    }
+}
+
+/// How [`finish`] or [`release`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    Settled,
+    /// The row no longer carries the caller's claim in a state it may
+    /// settle (`state` is what it is now; `None` when there is no row), so
+    /// nothing changed.
+    NotMine {
+        state: Option<State>,
+    },
+}
+
+/// The prefix of every claim this process hands out: its id and start time,
+/// then `:`. A claim without this prefix belongs to a process that has
+/// stopped (one hub process writes the database).
+pub fn process_prefix() -> &'static str {
+    static PREFIX: OnceLock<String> = OnceLock::new();
+    PREFIX.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        format!("{}-{nanos}", std::process::id())
+        format!("{}-{nanos}:", std::process::id())
     })
+}
+
+fn ours(claim: Option<&str>) -> bool {
+    claim.is_some_and(|c| c.starts_with(process_prefix()))
 }
 
 fn check(d: &Delivery<'_>) -> UaResult<()> {
@@ -193,20 +250,21 @@ pub fn record(
 ) -> UaResult<Sight> {
     check(&d)?;
     let expires = now.saturating_add(rules.ttl_s.max(0));
+    let claim = Claim::next();
     let inserted = tx.execute(
         "INSERT INTO inbound_deliveries \
          (org_id, source, kind, delivery_key, state, received_at, updated_at, expires_at, claim, detail) \
          VALUES (?1, ?2, ?3, ?4, 'seen', ?5, ?5, ?6, ?7, ?8) \
          ON CONFLICT (org_id, source, kind, delivery_key) DO NOTHING",
-        params![d.org_id, d.source, d.kind, d.key, now, expires, claim(), detail],
+        params![d.org_id, d.source, d.kind, d.key, now, expires, claim.as_str(), detail],
     )?;
     if inserted == 1 {
-        return Ok(Sight::First);
+        return Ok(Sight::First { claim });
     }
     let Some((state, row_claim, updated_at)) = current(tx, &d)? else {
         return Err(UaError::internal("inbound delivery vanished inside its transaction"));
     };
-    let live = row_claim.as_deref() == Some(claim()) && updated_at >= now.saturating_sub(rules.in_flight_s);
+    let live = ours(row_claim.as_deref()) && updated_at >= now.saturating_sub(rules.in_flight_s);
     let stale = match state {
         State::Seen | State::Finished => false,
         State::Accepted => !live,
@@ -219,43 +277,65 @@ pub fn record(
         "UPDATE inbound_deliveries SET state = 'seen', updated_at = ?5, expires_at = ?6, claim = ?7, \
          detail = COALESCE(?8, detail) \
          WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4",
-        params![d.org_id, d.source, d.kind, d.key, now, expires, claim(), detail],
+        params![d.org_id, d.source, d.kind, d.key, now, expires, claim.as_str(), detail],
     )?;
-    Ok(Sight::Redelivered { was: state })
+    Ok(Sight::Redelivered { was: state, claim })
 }
 
-/// Take a `seen` delivery on under this process's claim, with the identity
-/// it runs as. `false` when the row is not `seen`.
-pub fn accept(tx: &WriteTx<'_>, d: Delivery<'_>, now: i64, identity: Option<&str>) -> UaResult<bool> {
+/// Take a `seen` delivery on under `claim` (from [`record`]), with the
+/// identity it runs as. `false` when the row is not `seen` under that claim.
+pub fn accept(
+    tx: &WriteTx<'_>,
+    d: Delivery<'_>,
+    claim: &Claim,
+    now: i64,
+    identity: Option<&str>,
+) -> UaResult<bool> {
     check(&d)?;
     Ok(tx.execute(
-        "UPDATE inbound_deliveries SET state = 'accepted', updated_at = ?5, claim = ?6, \
-         identity = COALESCE(?7, identity) \
-         WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4 AND state = 'seen'",
-        params![d.org_id, d.source, d.kind, d.key, now, claim(), identity],
+        "UPDATE inbound_deliveries SET state = 'accepted', updated_at = ?5, identity = COALESCE(?7, identity) \
+         WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4 AND state = 'seen' \
+         AND claim = ?6",
+        params![d.org_id, d.source, d.kind, d.key, now, claim.as_str(), identity],
     )? == 1)
 }
 
-/// Mark a `seen` or `accepted` delivery handled. `false` when it is in
-/// neither state.
-pub fn finish(tx: &WriteTx<'_>, d: Delivery<'_>, now: i64) -> UaResult<bool> {
+fn settled_or_not_mine(tx: &WriteTx<'_>, d: &Delivery<'_>, changed: usize) -> UaResult<Settle> {
+    if changed == 1 {
+        return Ok(Settle::Settled);
+    }
+    Ok(Settle::NotMine { state: current(tx, d)?.map(|(s, _, _)| s) })
+}
+
+/// Mark a delivery handled: only a row `accepted` (or `abandoned` by the
+/// sweep) under `claim`. An abandoned row with the caller's claim is still
+/// the caller's: nobody has taken it over (a takeover changes the claim),
+/// and the caller's effects are done, so marking it `finished` keeps a later
+/// copy from running them again. Anything else is [`Settle::NotMine`].
+pub fn finish(tx: &WriteTx<'_>, d: Delivery<'_>, claim: &Claim, now: i64) -> UaResult<Settle> {
     check(&d)?;
-    Ok(tx.execute(
+    let changed = tx.execute(
         "UPDATE inbound_deliveries SET state = 'finished', updated_at = ?5 \
          WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4 \
-         AND state IN ('seen', 'accepted')",
-        params![d.org_id, d.source, d.kind, d.key, now],
-    )? == 1)
+         AND state IN ('accepted', 'abandoned') AND claim = ?6",
+        params![d.org_id, d.source, d.kind, d.key, now, claim.as_str()],
+    )?;
+    settled_or_not_mine(tx, &d, changed)
 }
 
 /// Forget a delivery whose handling failed in a way worth retrying, so the
-/// sender's next attempt is a first sight. `false` when there was no row.
-pub fn release(tx: &WriteTx<'_>, d: Delivery<'_>) -> UaResult<bool> {
+/// sender's next attempt is a first sight: only a row `accepted` under
+/// `claim`. A row taken over, finished, abandoned or gone is left as it is
+/// ([`Settle::NotMine`]): deleting it could undo a newer owner's record, or
+/// the sweep's report that the outcome is unknown.
+pub fn release(tx: &WriteTx<'_>, d: Delivery<'_>, claim: &Claim) -> UaResult<Settle> {
     check(&d)?;
-    Ok(tx.execute(
-        "DELETE FROM inbound_deliveries WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4",
-        params![d.org_id, d.source, d.kind, d.key],
-    )? == 1)
+    let changed = tx.execute(
+        "DELETE FROM inbound_deliveries WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4 \
+         AND state = 'accepted' AND claim = ?5",
+        params![d.org_id, d.source, d.kind, d.key, claim.as_str()],
+    )?;
+    settled_or_not_mine(tx, &d, changed)
 }
 
 /// What [`sweep`] applies to one source.
@@ -264,7 +344,7 @@ pub struct SweepRules {
     /// Keep at most this many rows per organization and kind (the newest by
     /// `received_at`); `accepted` rows are never removed this way.
     pub max_per_kind: Option<i64>,
-    /// Mark `accepted` rows abandoned when their claim is not this
+    /// Mark `accepted` rows abandoned when their claim is not one of this
     /// process's, or they are older than this many seconds.
     pub abandon_after_s: Option<i64>,
 }
@@ -305,10 +385,11 @@ pub fn sweep(tx: &WriteTx<'_>, source: &str, now: i64, rules: SweepRules) -> UaR
         let rows: Vec<Abandoned> = {
             let mut stmt = tx.prepare(
                 "SELECT org_id, kind, delivery_key, received_at, identity FROM inbound_deliveries \
-                 WHERE source = ?1 AND state = 'accepted' AND (claim IS NOT ?2 OR updated_at < ?3) \
+                 WHERE source = ?1 AND state = 'accepted' \
+                 AND (claim IS NULL OR substr(claim, 1, length(?2)) != ?2 OR updated_at < ?3) \
                  ORDER BY received_at, kind, delivery_key",
             )?;
-            stmt.query_map(params![source, claim(), now.saturating_sub(after)], |r| {
+            stmt.query_map(params![source, process_prefix(), now.saturating_sub(after)], |r| {
                 Ok(Abandoned {
                     org_id: r.get(0)?,
                     kind: r.get(1)?,

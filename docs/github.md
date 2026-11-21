@@ -116,7 +116,16 @@ refused, and its ledger event says `"redelivered": true`. Every effect is
 idempotent. Rows the old `github_deliveries` and `github_delivery_bodies`
 tables held when the hub was upgraded are copied in as `finished`; the two
 tables stay in the schema, unread and unwritten, until a later release drops
-them. The payload is trusted only after the signature check:
+them.
+
+Settling is by claim: a slow handler whose delivery a redelivery took over
+cannot finish or release the newer record. When the sweep abandons
+deliveries that were taken on and never finished, it ledgers one
+`agent.github.webhook.abandoned` event (counts and delivery ids, no body).
+Downgrading past this change reopens a replay window: an older binary reads
+only `github_deliveries` and `github_delivery_bodies`, which are no longer
+written, so it accepts a copy of anything handled since the upgrade (see
+[ingress.md](ingress.md#limits)). The payload is trusted only after the signature check:
 it carries the merge commit and head, so these effects need no API call.
 
 **Effects are governed calls under a narrow grant.** Closing a task is a

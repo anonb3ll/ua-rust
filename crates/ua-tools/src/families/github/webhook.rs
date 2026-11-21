@@ -27,7 +27,10 @@
 //! stopped while handling it, or it has been in flight for 15 minutes) is
 //! processed again when it is redelivered, not refused: every effect is
 //! idempotent. The ledger event of such a redelivery says
-//! `"redelivered": true`.
+//! `"redelivered": true`. Settling is by claim: records a redelivery took
+//! over meanwhile are left to it. When the sweep abandons deliveries taken
+//! on and never finished, one `agent.github.webhook.abandoned` event says
+//! how many and which delivery ids.
 //!
 //! Effects, for a bound repository:
 //!
@@ -233,7 +236,10 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             let now = ua_core::time::now_ms() / 1000;
             let sweep =
                 inbound::SweepRules { max_per_kind: Some(KEEP_MAX - 1), abandon_after_s: Some(IN_FLIGHT_S) };
-            inbound::sweep(tx, SOURCE, now, sweep)?;
+            let swept = inbound::sweep(tx, SOURCE, now, sweep)?;
+            if !swept.abandoned.is_empty() {
+                ledger::append(tx, abandoned_event(&swept.abandoned).by(GITHUB_ACTOR.to_string()))?;
+            }
             let by_id = inbound::record(tx, record_key(KIND_ID, &dl), now, RULES, Some(&ev))?;
             if let inbound::Sight::Duplicate { .. } = by_id {
                 return Ok(None);
@@ -244,8 +250,12 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             if let inbound::Sight::Duplicate { .. } = by_body {
                 return Err(UaError::conflict_code(REPLAYED_BODY, "this payload was already processed"));
             }
-            inbound::accept(tx, record_key(KIND_ID, &dl), now, None)?;
-            inbound::accept(tx, record_key(KIND_BODY, &bh), now, None)?;
+            let (Some(id_claim), Some(body_claim)) = (by_id.claim().cloned(), by_body.claim().cloned())
+            else {
+                return Err(UaError::internal("a recorded delivery came back without a claim"));
+            };
+            inbound::accept(tx, record_key(KIND_ID, &dl), &id_claim, now, None)?;
+            inbound::accept(tx, record_key(KIND_BODY, &bh), &body_claim, now, None)?;
             let bound = !rp.is_empty() && BoundRepo::check(tx, &rp).is_ok();
             let mut payload =
                 json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound });
@@ -259,7 +269,7 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
                 EventInput::new(ua_core::DEFAULT_ORG, "agent.github.webhook.received", payload)
                     .by(GITHUB_ACTOR.to_string()),
             )?;
-            Ok(Some(bound))
+            Ok(Some((bound, id_claim, body_claim)))
         })
         .await
         .map_err(|e| {
@@ -269,33 +279,72 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
                 WebhookError::from(e)
             }
         })?;
-    let Some(bound) = bound else { return Err(WebhookError::Replayed) };
+    let Some((bound, id_claim, body_claim)) = bound else { return Err(WebhookError::Replayed) };
     let result = handle(hub, &event, &action, &repo, bound, &payload, &delivery).await;
     // An internal failure releases both records so GitHub's redelivery of
     // this event is processed (every effect is idempotent); any other
-    // outcome finishes them, so a later copy is a replay.
+    // outcome finishes them, so a later copy is a replay. Only records still
+    // under this delivery's claims are settled: one a redelivery took over
+    // meanwhile belongs to that redelivery and is left alone.
     let retry = matches!(result, Err(WebhookError::Internal(_)));
     let (dl, bh) = (delivery.clone(), body_hash);
     let settled = hub
         .db()
         .write_async(move |tx| {
             let now = ua_core::time::now_ms() / 1000;
-            for (kind, key) in [(KIND_BODY, &bh), (KIND_ID, &dl)] {
-                if retry {
-                    inbound::release(tx, record_key(kind, key))?;
+            let mut not_mine = Vec::new();
+            for (kind, key, claim) in [(KIND_BODY, &bh, &body_claim), (KIND_ID, &dl, &id_claim)] {
+                let outcome = if retry {
+                    inbound::release(tx, record_key(kind, key), claim)?
                 } else {
-                    inbound::finish(tx, record_key(kind, key), now)?;
+                    inbound::finish(tx, record_key(kind, key), claim, now)?
+                };
+                if let inbound::Settle::NotMine { state } = outcome {
+                    not_mine.push((kind, state.map(inbound::State::as_str).unwrap_or("gone")));
                 }
             }
-            Ok(())
+            Ok(not_mine)
         })
         .await;
-    if let Err(e) = settled {
+    match settled {
+        Ok(not_mine) => {
+            for (kind, state) in not_mine {
+                tracing::info!(
+                    delivery_id = %delivery,
+                    kind,
+                    state,
+                    "a GitHub delivery record was taken over or settled by another handler; left as it is"
+                );
+            }
+        }
         // The response stands. The records stay accepted, and a redelivery
         // after the in-flight bound is processed again.
-        tracing::warn!(code = e.code(), "could not settle a GitHub delivery record");
+        Err(e) => tracing::warn!(code = e.code(), "could not settle a GitHub delivery record"),
     }
     result
+}
+
+/// Most delivery ids one `agent.github.webhook.abandoned` event lists.
+const ABANDONED_IDS_MAX: usize = 50;
+
+/// `agent.github.webhook.abandoned`: deliveries the sweep found taken on and
+/// never finished (the hub stopped, or they passed the in-flight bound).
+/// Each may never have been handled. The count, the count per kind and up
+/// to [`ABANDONED_IDS_MAX`] delivery ids; never a body or a body hash.
+fn abandoned_event(rows: &[inbound::Abandoned]) -> EventInput {
+    let per_kind = |k: &str| rows.iter().filter(|a| a.kind == k).count();
+    let ids: Vec<&str> =
+        rows.iter().filter(|a| a.kind == KIND_ID).map(|a| a.key.as_str()).take(ABANDONED_IDS_MAX).collect();
+    EventInput::new(
+        ua_core::DEFAULT_ORG,
+        "agent.github.webhook.abandoned",
+        json!({
+            "count": rows.len(),
+            "kinds": { KIND_ID: per_kind(KIND_ID), KIND_BODY: per_kind(KIND_BODY) },
+            "delivery_ids": ids,
+            "delivery_ids_truncated": per_kind(KIND_ID) > ids.len(),
+        }),
+    )
 }
 
 async fn handle(
