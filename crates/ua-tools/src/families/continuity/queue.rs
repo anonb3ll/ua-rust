@@ -151,18 +151,18 @@ pub struct UnparkArgs {
 /// operator authority (a human or a lifecycle operator).
 pub(super) struct Writer {
     pub(super) who: String,
-    pub(super) operator: bool,
+    pub(super) maintainer: bool,
 }
 
 pub(super) fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> UaResult<Writer> {
     acting_identity(&ctx.caller, actor)?;
     let who = governance::verified_actor(&ctx.caller, verb)?;
-    let operator = Authz::new(ctx.hub.cfg()).holds(
+    let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
         ua_core::DEFAULT_ORG,
     );
-    if !operator && !QUEUE_WRITER_PROFILES.contains(&ctx.caller.profile) {
+    if !maintainer && !QUEUE_WRITER_PROFILES.contains(&ctx.caller.profile) {
         return Err(UaError::denied(
             "profile_denied",
             format!(
@@ -170,7 +170,7 @@ pub(super) fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> Ua
             ),
         ));
     }
-    Ok(Writer { who, operator })
+    Ok(Writer { who, maintainer })
 }
 
 /// The agents holding a task: its claimant and next owner, when set.
@@ -186,7 +186,7 @@ fn holders(row: &Row) -> Vec<&str> {
 /// caller is an operator. A task nobody holds is open to any queue writer.
 fn require_holder(w: &Writer, row: &Row, verb: &str) -> UaResult<()> {
     let held = holders(row);
-    if w.operator || held.is_empty() || held.iter().any(|h| same_label(Some(h), &w.who)) {
+    if w.maintainer || held.is_empty() || held.iter().any(|h| same_label(Some(h), &w.who)) {
         return Ok(());
     }
     let id = int_field(row, "id").unwrap_or_default();
@@ -461,7 +461,7 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
     {
         return Err(UaError::invalid(format!("approved_by must be at most {REASON_MAX} characters")));
     }
-    if note.is_some() && !writer.operator {
+    if note.is_some() && !writer.maintainer {
         return Err(UaError::denied(
             "operator_required",
             "approved_by is recorded only for a verified human or lifecycle operator; it is a note, not authority",
@@ -495,7 +495,7 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 ));
             }
             let gated = gate_reasons(&row);
-            if !gated.is_empty() && !writer.operator {
+            if !gated.is_empty() && !writer.maintainer {
                 return Err(UaError::denied(
                     "protected_task",
                     format!(

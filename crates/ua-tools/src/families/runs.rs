@@ -108,19 +108,19 @@ pub struct GetArgs {
 /// Who is reading, for node-item visibility.
 struct Viewer {
     who: Option<String>,
-    operator: bool,
+    maintainer: bool,
 }
 
 impl Viewer {
     fn of(hub: &Hub, caller: &Caller) -> Self {
         let who = verified(caller).map(str::to_string);
-        let operator = who.is_some()
+        let maintainer = who.is_some()
             && Authz::new(hub.cfg()).holds(
                 caller,
                 &[Authority::Operator, Authority::LifecycleOperator],
                 ua_core::DEFAULT_ORG,
             );
-        Self { who, operator }
+        Self { who, maintainer }
     }
 }
 
@@ -329,7 +329,7 @@ fn workflow_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Valu
 
 fn node_rows(c: &Connection, f: &Filter<'_>, viewer: &Viewer, now: &str) -> UaResult<Vec<Value>> {
     let (mut w, mut binds) = clauses(f, "agent", "created_at", "id");
-    if !viewer.operator {
+    if !viewer.maintainer {
         let Some(who) = viewer.who.as_deref() else { return Ok(Vec::new()) };
         w.push(
             "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ?))"

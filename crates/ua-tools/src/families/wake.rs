@@ -1281,7 +1281,7 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
     // A decline only restricts, so any verified human may make one, as may a
     // lifecycle operator or the session's own agent.
     let human = ctx.caller.is_human();
-    let operator = human
+    let maintainer = human
         || Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
@@ -1291,7 +1291,7 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
         .db()
         .write_async(move |tx| {
             let (agent, _) = session_agent(tx, &sid)?;
-            if !operator && agent != actor {
+            if !maintainer && agent != actor {
                 return Err(UaError::denied(
                     "not_authorized",
                     "a wake request is declined by a verified human, a lifecycle operator or the session's own agent",
@@ -1373,7 +1373,7 @@ fn state_json(r: &Row<'_>) -> rusqlite::Result<Value> {
 
 pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
     let who = verified_identity(&ctx.caller, "session_wake_status")?;
-    let operator = Authz::new(ctx.hub.cfg()).holds(
+    let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
         ua_core::DEFAULT_ORG,
@@ -1384,7 +1384,7 @@ pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
         .read_async(move |c| {
             if let Some(sid) = sid {
                 let (agent, _) = session_agent(c, &sid)?;
-                if !operator && agent != who {
+                if !maintainer && agent != who {
                     return Err(UaError::not_found(format!("session {sid:?} does not exist")));
                 }
                 return state(c, &sid);
@@ -1397,7 +1397,7 @@ pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
                  FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
                  WHERE (?1 OR s.agent = ?2) ORDER BY w.requested_at, w.session_id LIMIT 500",
             )?;
-            let rows = stmt.query_map(params![operator, who], state_json)?.collect::<Result<Vec<_>, _>>()?;
+            let rows = stmt.query_map(params![maintainer, who], state_json)?.collect::<Result<Vec<_>, _>>()?;
             let open = |v: &Value| matches!(v["session_status"].as_str(), Some("starting" | "running" | "waiting"));
             let requested: Vec<&Value> = rows.iter().filter(|v| open(v) && v["requested"] == json!(true)).collect();
             let awaiting: Vec<&Value> = requested
@@ -1408,7 +1408,7 @@ pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
             let woken: i64 = c.query_row(
                 "SELECT COUNT(DISTINCT o.session_id) FROM session_wake_offers o \
                  JOIN agent_sessions s ON s.id = o.session_id WHERE o.outcome = 'delivered' AND (?1 OR s.agent = ?2)",
-                params![operator, who],
+                params![maintainer, who],
                 |r| r.get(0),
             )?;
             Ok(json!({

@@ -1523,7 +1523,7 @@ pub struct ItemsArgs {
 
 async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
     let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.is_some()
+    let maintainer = who.is_some()
         && Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
@@ -1543,7 +1543,7 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
             // An item is visible to an operator, its requester, the node's
             // agent and a command's owner.
             let visible = |item: &Item| -> UaResult<bool> {
-                if operator {
+                if maintainer {
                     return Ok(true);
                 }
                 let Some(w) = who.as_deref() else { return Ok(false) };
@@ -1572,7 +1572,7 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
             }
             let mut clauses = vec!["1 = 1".to_string()];
             let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-            if !operator {
+            if !maintainer {
                 let Some(w) = who.clone() else { return Ok(json!({ "items": [], "count": 0 })) };
                 binds.push(w.into());
                 let i = binds.len();

@@ -452,7 +452,7 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
         return Err(UaError::invalid("session_id is required"));
     }
     let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.is_some()
+    let maintainer = who.is_some()
         && Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
@@ -465,7 +465,7 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
                 .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [&sid], |r| r.get(0))
                 .optional()?;
             let note = latest_committed_note(c, &sid)?;
-            let allowed = operator
+            let allowed = maintainer
                 || who.as_deref().is_some_and(|w| {
                     owner.as_deref() == Some(w)
                         || note.as_ref().is_some_and(|n| {
