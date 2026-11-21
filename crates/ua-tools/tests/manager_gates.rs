@@ -862,3 +862,84 @@ async fn a_deny_written_either_way_holds_through_both_doors() {
     let err = e.call(&me, "plan_delete", json!({ "plan_id": "p" })).await.unwrap_err();
     assert_eq!(reason(&err), "default_deny", "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// A malformed action never reaches a handler
+
+#[tokio::test]
+async fn a_non_string_action_is_refused_before_any_handler_runs() {
+    let e = env(None, |_| {});
+    let me = agent("coord-1", Profile::Coordinator);
+    // With a default action and without one.
+    for tool in ["oauth_device_manage", "plan_manage"] {
+        for bad in [json!(123), json!(false), json!({ "a": 1 }), json!(["list"])] {
+            let err = e.call(&me, tool, json!({ "action": bad, "params": {} })).await.unwrap_err();
+            assert_eq!(err.code(), "invalid_argument", "{tool} {bad}: {err}");
+            assert!(err.to_string().contains("must be a string"), "{tool} {bad}: {err}");
+        }
+    }
+    // A handler that ran would have recorded its call; the refusal ran none.
+    assert!(e.tool_calls().is_empty(), "{:?}", e.tool_calls());
+    // `null` is absent: refused where there is no default.
+    let err = e.call(&me, "plan_manage", json!({ "action": null })).await.unwrap_err();
+    assert!(err.to_string().contains("action is required"), "{err}");
+    assert!(e.tool_calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_null_action_is_gated_as_the_default() {
+    let e = env(Some(&rules("deny", &["oauth_device_manage:list".to_string()])), |_| {});
+    let me = agent("coord-1", Profile::Coordinator);
+    let err = e.call(&me, "oauth_device_manage", json!({ "action": null })).await.unwrap_err();
+    assert_eq!(reason(&err), "policy_deny", "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Every door is held to its target's gates
+
+/// Arguments a call through each door accepts; a new door needs one.
+fn door_args(door: &str) -> Value {
+    match door {
+        "handoff" => json!({ "task_spec": SPEC, "to_agent": "builder-1" }),
+        other => panic!("no arguments for door {other}: add a case so its gates are checked"),
+    }
+}
+
+#[tokio::test]
+async fn every_door_is_held_to_its_targets_gates() {
+    let reg = builtin_registry();
+    assert!(!ua_tools::routes::DOORS.is_empty());
+    for d in ua_tools::routes::DOORS {
+        assert!(reg.get(d.tool).is_some(), "door {} is not a tool", d.tool);
+        assert!(reg.get(d.target).is_some(), "door {} targets {}, which is not a tool", d.tool, d.target);
+        let me = agent("lead-1", Profile::Developer);
+        let args = door_args(d.tool);
+
+        // Policy deny and require_approval on the target name.
+        let e = env(Some(&rules("deny", &[d.target.to_string()])), |_| {});
+        let err = e.call(&me, d.tool, args.clone()).await.unwrap_err();
+        assert_eq!(reason(&err), "policy_deny", "{} -> {}: {err}", d.tool, d.target);
+        let e = env(Some(&rules("require_approval", &[d.target.to_string()])), |_| {});
+        let (tool, _) = pending(e.call(&me, d.tool, args.clone()).await.unwrap_err());
+        assert_eq!(tool, d.target, "{}", d.tool);
+
+        // approval_tools on the target name, bound as the target's call.
+        let e = env(None, |c| c.approval_tools = vec![d.target.to_string()]);
+        let (tool, _) = pending(e.call(&me, d.tool, args.clone()).await.unwrap_err());
+        assert_eq!(tool, d.target, "{}", d.tool);
+        let rows = e.approvals();
+        let bound: Value = serde_json::from_str(&rows[0].1).unwrap();
+        assert_eq!(bound, (d.args)(&args), "{} binds the target's arguments", d.tool);
+
+        // Every profile that sees the door but not the target is refused.
+        let e = env(None, |_| {});
+        for p in Profile::ALL.into_iter().filter(|p| p.assignable()) {
+            if p.allows_tool(d.tool) && !p.allows_routed(d.target) {
+                let err = e.call(&agent("x-1", p), d.tool, args.clone()).await.unwrap_err();
+                assert_eq!(reason(&err), "profile_denied", "{} as {p}: {err}", d.tool);
+            }
+        }
+        // And a profile that may call the target may use the door.
+        e.call(&me, d.tool, args).await.unwrap();
+    }
+}

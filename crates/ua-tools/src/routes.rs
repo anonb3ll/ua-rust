@@ -485,10 +485,10 @@ impl Route {
     }
 }
 
-/// Resolve a call of `tool`. `Ok(None)` for a tool that does not dispatch
-/// on an action, and for a call whose `action` is missing or not a string
-/// with no default (the handler refuses its arguments). An action the table
-/// does not know is refused here, before anything runs.
+/// Resolve a call of `tool`. `Ok(None)` only for a tool that is neither in
+/// [`MANAGERS`] nor in [`DOORS`]. For a tool in the table, an `action` that
+/// is unknown, not a string, or missing with no default is refused here,
+/// before anything runs; a missing or `null` action is the default.
 pub fn route(tool: &str, args: &Value) -> Result<Option<Route>, UaError> {
     if let Some(d) = DOORS.iter().find(|d| d.tool == tool) {
         return Ok(Some(Route {
@@ -499,13 +499,20 @@ pub fn route(tool: &str, args: &Value) -> Result<Option<Route>, UaError> {
         }));
     }
     let Some(m) = manager(tool) else { return Ok(None) };
+    // A tool in the table always routes or is refused here: `null` means
+    // absent (as the handlers' `Option` actions read it), absent means the
+    // default action, and anything that is not a string never reaches a
+    // handler, so no future handler can fall back to a default the
+    // registry did not gate.
     let raw = match args.get("action") {
         None | Some(Value::Null) => match m.default_action {
             Some(d) => d,
-            None => return Ok(None),
+            None => return Err(UaError::invalid(format!("{tool}: action is required"))),
         },
         Some(Value::String(s)) => s.as_str(),
-        Some(_) => return Ok(None),
+        Some(other) => {
+            return Err(UaError::invalid(format!("{tool}: action must be a string, not {other}")));
+        }
     };
     let Some((action, target)) = m.resolve(raw) else {
         return Err(UaError::invalid(format!(
@@ -731,7 +738,8 @@ mod tests {
                 }
             }
             // A call with none routes exactly as one naming the default.
-            let none = route(m.tool, &json!({})).unwrap().map(|r| (r.action, r.target));
+            // (With no default, a call with none is refused.)
+            let none = route(m.tool, &json!({})).ok().flatten().map(|r| (r.action, r.target));
             let named = m.default_action.map(|d| route(m.tool, &json!({ "action": d })).unwrap().unwrap());
             assert_eq!(none, named.map(|r| (r.action, r.target)), "{}", m.tool);
             assert_eq!(
@@ -739,6 +747,34 @@ mod tests {
                 m.default_action.and_then(|d| m.resolve(d)).map(|(a, _)| a)
             );
         }
+    }
+
+    #[test]
+    fn a_tool_in_the_table_always_routes_or_is_refused() {
+        // With a default (oauth_device_manage) and without (plan_manage).
+        for tool in ["oauth_device_manage", "plan_manage"] {
+            for bad in [json!(123), json!(true), json!({}), json!([]), json!(["list"])] {
+                let e = route(tool, &json!({ "action": bad })).unwrap_err();
+                assert_eq!(e.code(), "invalid_argument", "{tool} {bad}");
+                assert!(e.to_string().contains("must be a string"), "{e}");
+            }
+        }
+        // `null` is absent: the default where there is one, else refused.
+        let r = route("oauth_device_manage", &json!({ "action": null })).unwrap().unwrap();
+        assert_eq!(r.gate_name().as_deref(), Some("oauth_device_manage:list"));
+        assert!(route("plan_manage", &json!({ "action": null })).is_err());
+        for m in MANAGERS {
+            for args in [json!({}), json!({ "action": null }), json!({ "action": 1 })] {
+                match route(m.tool, &args) {
+                    Ok(Some(_)) => {
+                        assert!(m.default_action.is_some() && !args["action"].is_number(), "{}", m.tool)
+                    }
+                    Ok(None) => panic!("{} {args} routed to nothing", m.tool),
+                    Err(_) => assert!(m.default_action.is_none() || args["action"].is_number(), "{}", m.tool),
+                }
+            }
+        }
+        assert!(route("task_add", &json!({ "action": 1 })).unwrap().is_none());
     }
 
     #[test]
@@ -813,7 +849,7 @@ mod tests {
         // Defaults, and what is not this table's to refuse.
         let d = route("config_revision_manage", &json!({})).unwrap().unwrap();
         assert_eq!(d.gate_name().as_deref(), Some("config_revision_manage:list"));
-        assert!(route("plan_manage", &json!({})).unwrap().is_none());
+        assert!(route("plan_manage", &json!({})).is_err(), "no default: an action is required");
         assert!(route("task_add", &json!({ "action": "x" })).unwrap().is_none());
         assert!(route("plan_manage", &json!({ "action": "explode" })).is_err());
         assert!(route("config_revision_manage", &json!({ "action": "List" })).is_err());
