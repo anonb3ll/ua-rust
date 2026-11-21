@@ -562,7 +562,7 @@ fn operator(ctx: &ToolCtx, verb: &str) -> UaResult<String> {
     if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
             "operator_required",
-            format!("{verb} is for operators (a human or a lifecycle operator); {who:?} is neither"),
+            format!("{verb} is for an operator (a verified human); {who:?} is not one"),
         ));
     }
     Ok(who)

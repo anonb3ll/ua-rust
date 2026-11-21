@@ -378,7 +378,7 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
             if cmd.owner_agent != who && !operator {
                 return Err(UaError::denied(
                     "not_command_owner",
-                    format!("only {:?} or a lifecycle operator may adopt {id}", cmd.owner_agent),
+                    format!("only {:?} or an operator (a verified human) may adopt {id}", cmd.owner_agent),
                 ));
             }
             if !matches!(item.status.as_str(), "queued" | "claimed") {
