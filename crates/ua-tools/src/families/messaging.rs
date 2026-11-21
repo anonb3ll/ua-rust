@@ -1610,10 +1610,7 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "queue_fold" => continuity::queue_fold(ctx, action_params(action, params)?).await,
         "queue_close_merged" => continuity::queue_close_merged(ctx, action_params(action, params)?).await,
         "queue_unpark" => continuity::queue_unpark(ctx, action_params(action, params)?).await,
-        other => Err(UaError::invalid(format!(
-            "unknown coordination_manage action {other:?}; supported actions: {}",
-            COORDINATION_ACTIONS.join(", ")
-        ))),
+        other => Err(crate::routes::unhandled("coordination_manage", other)),
     }
 }
 
