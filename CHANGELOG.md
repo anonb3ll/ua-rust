@@ -100,6 +100,10 @@ from its commit history.
 - Slack request signature check (v0 HMAC, five-minute window, replayed bodies
   refused) and `slack_parse_command` for the nine coordination commands. The
   Slack routes above build on both.
+- `ua-org`, a new crate holding `authz`: the operator, dispatch, hub-view
+  and mailbox authority checks go through it, with today's rules kept as
+  named transitional authorities, and a guard test holds the remaining
+  ad-hoc checks to counts that only go down.
 - Callers and ledger events name their organization: `Caller.org_id` and
   `Caller::system_for`, and `EventInput::new` takes the `org_id` first (no
   `Default`). Every caller and every event is in the default organization;
@@ -203,6 +207,10 @@ from its commit history.
 
 ### Security
 
+- An unverified caller (auth off) that names a configured human or lifecycle
+  operator as its `actor` no longer gets operator authority over other
+  agents' task workflow records and checks; it is refused, as every other
+  operator check already refused it.
 - `/api` and `/ui` refuse an unknown host and a cross-site write.
 - Auth fails closed: with `enforce_auth` and no token, every route except
   `GET /healthz` is rejected.
