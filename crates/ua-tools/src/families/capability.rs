@@ -272,9 +272,9 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
 /// Whether `caller` may see hub boundaries (the program allowlist among them).
-/// (A profile used as authority; see [`Authority::TransitionalHubView`].)
+/// An operator (a verified human); a profile grants nothing.
 pub(crate) fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
-    Authz::new(cfg).holds(caller, &[Authority::TransitionalHubView], ua_core::DEFAULT_ORG)
+    Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

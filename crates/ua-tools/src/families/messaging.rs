@@ -334,11 +334,12 @@ impl Viewer {
     fn of(ctx: &ToolCtx) -> Self {
         let identity = agents::verified(&ctx.caller).map(str::to_string);
         let cfg = ctx.hub.cfg();
-        // A profile used as authority; see
-        // [`Authority::TransitionalLocalMailboxReader`].
+        // Every mailbox: an operator (a verified human), or a caller without
+        // a verified label (auth enforcement off; that part is under review
+        // and unchanged). A profile grants nothing.
         let unrestricted = Authz::new(cfg).holds(
             &ctx.caller,
-            &[Authority::TransitionalLocalMailboxReader],
+            &[Authority::LocalTrustReader, Authority::Operator],
             ua_core::DEFAULT_ORG,
         );
         Self {

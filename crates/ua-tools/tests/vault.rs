@@ -520,10 +520,15 @@ async fn move_list_search_custodian_and_memory_ingest() {
     let t = T::new();
     let a = agent("builder-1");
     t.put("Inbox/cap.md", "a capture");
-    // Developers cannot move notes; the coordinator profile can.
+    // Moving notes is for an operator (a verified human). The developer
+    // profile does not list the tool; a coordinator-profile agent sees it but
+    // is refused, since a profile grants nothing.
     let e = t.err(&a, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Cap.md"})).await;
-    assert_eq!(reason(&e), "profile_denied");
-    let coord = Caller { profile: Profile::Coordinator, ..agent("coord-1") };
+    assert_eq!(reason(&e), "profile_denied", "the developer profile does not list the tool");
+    let boss = Caller { profile: Profile::Coordinator, ..agent("coord-1") };
+    let e = t.err(&boss, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Cap.md"})).await;
+    assert_eq!(reason(&e), "operator_required");
+    let coord = human();
     let m = t
         .ok(&coord, "vault_move", json!({"source": "Inbox/cap.md", "destination": "Wiki/Moved/Cap.md"}))
         .await;

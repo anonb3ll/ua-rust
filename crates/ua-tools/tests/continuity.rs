@@ -1161,9 +1161,11 @@ async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_li
     assert_eq!(ids("unaudited"), vec![forged]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-1");
     assert_eq!(listed["handoffs"][0]["note_reference"], true);
-    // The coordinator sees every conversation; an outsider sees none.
+    // A human sees every conversation; a coordinator-profile agent, like an
+    // outsider, sees none (a profile grants nothing).
+    h.act_ok(&human(), "conversation_handoffs", params.clone()).await;
     let coord = caller("coord-1", ActorKind::Agent, Profile::Coordinator);
-    h.act_ok(&coord, "conversation_handoffs", params.clone()).await;
+    assert_eq!(h.act_err(&coord, "conversation_handoffs", params.clone()).await.code(), "not_found");
     assert_eq!(h.act_err(&outsider(), "conversation_handoffs", params).await.code(), "not_found");
 }
 
@@ -1307,7 +1309,7 @@ async fn an_unverified_caller_naming_a_human_is_not_a_workflow_operator() {
 /// The lifecycle-operator grant: an agent listed in `lifecycle_operators`
 /// keeps the fleet-maintenance operations (here: writing another task's
 /// workflow record, releasing another agent's claim) but never human-only ones
-/// (provider accounts, reading other mailboxes). An unverified
+/// (provider accounts, the hub view, reading other mailboxes). An unverified
 /// caller claiming that label holds neither.
 #[tokio::test]
 async fn a_lifecycle_operator_keeps_fleet_maintenance_but_not_human_only_operations() {
@@ -1331,10 +1333,14 @@ async fn a_lifecycle_operator_keeps_fleet_maintenance_but_not_human_only_operati
     assert_eq!(reason(&h.act_err(&anon, "task_claim_release", release.clone()).await), "identity_required");
     h.act_ok(&lifecycle_op(), "task_claim_release", release).await;
 
-    // Human-only: provider accounts, other agents' mailboxes.
+    // Human-only: provider accounts, the hub view, other agents' mailboxes.
     let args = json!({ "provider": "anthropic", "label": "acct-1", "billing": "subscription" });
     let e = h.call(&lifecycle_op(), "provider_account_register", args.clone()).await.unwrap_err();
     assert_eq!(reason(&e), "operator_required");
+    let catalog = h.ok(&lifecycle_op(), "capability_catalog", json!({})).await;
+    assert!(catalog["boundaries"].is_null(), "{catalog}");
+    let catalog = h.ok(&human(), "capability_catalog", json!({})).await;
+    assert!(!catalog["boundaries"].is_null(), "{catalog}");
     let e = h.call(&lifecycle_op(), "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
     assert!(e.to_string().contains("outside your mailbox"), "{e}");
 }

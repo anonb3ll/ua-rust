@@ -5,20 +5,17 @@
 //! `HubOwner`, `LifecycleOperator`, `OrgRole`, `TeamLead` and `Requester`.
 //! Those need users, memberships and teams (`organization.v2` and later),
 //! which do not exist yet. Until then authority comes from the hub
-//! configuration (`human_identities`, `lifecycle_operators`, `[profiles]`), so
-//! [`Authz`] carries the [`Config`], and the authorities below are
-//! **transitional**: each reproduces one rule the tree uses today, exactly,
-//! and names the design authority that replaces it.
+//! configuration (`human_identities`, `lifecycle_operators`), so [`Authz`]
+//! carries the [`Config`], and each authority below names the design
+//! authority that replaces it.
 //!
-//! Some transitional authorities use a **profile as authority**. The design
-//! forbids that (a profile decides which tools a session sees, never what it
-//! may do); they are kept only to preserve today's behaviour, are marked
-//! below, and the guard test counts their uses so they can only go down.
+//! **A profile never grants authority.** A profile is a permission set: it
+//! decides which tools a session sees. Who may act on another agent's work,
+//! read every mailbox, or see the hub's boundaries comes from identity only.
 
-use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, UaResult};
+use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, UaError, UaResult};
 
-/// One authority a caller may hold. All of these are transitional (see the
-/// module docs).
+/// One authority a caller may hold (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority {
     /// Operator authority: a **verified human**, that is a caller of kind
@@ -51,32 +48,6 @@ pub enum Authority {
     /// Replaced by `HubOwner` and `OrgRole` once `users` and memberships
     /// exist (`organization.v2`).
     TransitionalHuman,
-    /// Seeing the hub's boundaries in the capability catalog (read-only): a
-    /// human, a caller under the `coordinator` or `operator` profile, or a
-    /// verified caller whose label is a configured human or lifecycle
-    /// operator.
-    ///
-    /// **Profile used as authority; the design forbids this; kept to preserve
-    /// behaviour.** Replaced by `HubOwner` for hub boundaries.
-    TransitionalHubView,
-    /// Reading every conversation: a **verified** caller that is a human,
-    /// whose label is a configured human, or that runs under the
-    /// `coordinator` profile. An unverified caller never holds it.
-    ///
-    /// **Profile used as authority; the design forbids this; kept to preserve
-    /// behaviour.** Replaced by `OrgRole` (an auditor or admin reads the
-    /// organization's mail).
-    TransitionalMailboxReader,
-    /// Reading every mailbox in the messaging tools: an **unverified** local
-    /// caller (the local full-surface model: stdio, or HTTP with auth off),
-    /// or a caller that is a human, whose verified label is a configured
-    /// human, or that runs under the `coordinator` profile.
-    ///
-    /// **Profile used as authority; the design forbids this; kept to preserve
-    /// behaviour.** Differs from [`Authority::TransitionalMailboxReader`] for
-    /// an unverified caller, which holds this one but not that one. Replaced
-    /// by `OrgRole`.
-    TransitionalLocalMailboxReader,
 }
 
 impl Authority {
@@ -87,9 +58,6 @@ impl Authority {
             Authority::LifecycleOperator => "lifecycle operator",
             Authority::LocalTrustReader => "local trust reader",
             Authority::TransitionalHuman => "human",
-            Authority::TransitionalHubView => "hub view",
-            Authority::TransitionalMailboxReader => "mailbox reader",
-            Authority::TransitionalLocalMailboxReader => "local mailbox reader",
         }
     }
 }
@@ -162,10 +130,6 @@ impl<'a> Authz<'a> {
         Ok(())
     }
 
-    fn configured(&self, label: &str) -> bool {
-        self.cfg.is_human(label) || self.cfg.is_lifecycle_operator(label)
-    }
-
     fn holds_one(&self, caller: &Caller, a: &Authority) -> bool {
         let verified = verified_label(caller);
         match *a {
@@ -173,20 +137,6 @@ impl<'a> Authz<'a> {
             Authority::LocalTrustReader => verified.is_none(),
             Authority::LifecycleOperator => verified.is_some_and(|l| self.cfg.is_lifecycle_operator(l)),
             Authority::TransitionalHuman => human(caller),
-            Authority::TransitionalHubView => {
-                human(caller)
-                    || matches!(caller.profile, Profile::Coordinator | Profile::Operator)
-                    || verified.is_some_and(|l| self.configured(l))
-            }
-            Authority::TransitionalMailboxReader => verified.is_some_and(|l| {
-                human(caller) || self.cfg.is_human(l) || caller.profile == Profile::Coordinator
-            }),
-            Authority::TransitionalLocalMailboxReader => {
-                verified.is_none()
-                    || human(caller)
-                    || verified.is_some_and(|l| self.cfg.is_human(l))
-                    || caller.profile == Profile::Coordinator
-            }
         }
     }
 }
@@ -194,6 +144,7 @@ impl<'a> Authz<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ua_core::Profile;
     use ua_core::identity::Transport;
 
     fn cfg() -> Config {
@@ -300,45 +251,6 @@ mod tests {
     }
 
     #[test]
-    fn hub_view_admits_coordinator_and_operator_profiles_and_configured_labels() {
-        for p in [Profile::Coordinator, Profile::Operator] {
-            assert!(
-                holds(&caller("local", ActorKind::Anonymous, p), Authority::TransitionalHubView),
-                "{p:?}"
-            );
-        }
-        assert!(holds(
-            &caller("fleet-bot", ActorKind::Agent, Profile::Developer),
-            Authority::TransitionalHubView
-        ));
-        assert!(!holds(
-            &caller("fleet-bot", ActorKind::Anonymous, Profile::Developer),
-            Authority::TransitionalHubView
-        ));
-        assert!(!holds(
-            &caller("builder-1", ActorKind::Agent, Profile::Developer),
-            Authority::TransitionalHubView
-        ));
-    }
-
-    #[test]
-    fn the_two_mailbox_readers_differ_only_for_an_unverified_caller() {
-        let anon = caller("local", ActorKind::Anonymous, Profile::Developer);
-        assert!(!holds(&anon, Authority::TransitionalMailboxReader));
-        assert!(holds(&anon, Authority::TransitionalLocalMailboxReader));
-        let coord = caller("lead-1", ActorKind::Agent, Profile::Coordinator);
-        let dev = caller("builder-1", ActorKind::Agent, Profile::Developer);
-        let human = caller("operator", ActorKind::Human, Profile::Operator);
-        for (c, expect) in [(&coord, true), (&dev, false), (&human, true)] {
-            assert_eq!(holds(c, Authority::TransitionalMailboxReader), expect, "{}", c.label);
-            assert_eq!(holds(c, Authority::TransitionalLocalMailboxReader), expect, "{}", c.label);
-        }
-        // Lifecycle operators are not mailbox readers.
-        let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Developer);
-        assert!(!holds(&fleet, Authority::TransitionalMailboxReader));
-    }
-
-    #[test]
     fn another_organization_is_refused_not_ignored() {
         let cfg = cfg();
         let authz = Authz::new(&cfg);
@@ -368,9 +280,9 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().ends_with("authorities: human, operator, lifecycle operator"), "{err}");
-        let coord = caller("lead-1", ActorKind::Agent, Profile::Coordinator);
-        let any = [Authority::TransitionalHuman, Authority::TransitionalMailboxReader];
-        assert!(authz.require(&coord, &any, DEFAULT_ORG).is_ok());
-        assert!(authz.require(&coord, &[], DEFAULT_ORG).is_err(), "nothing needed is nothing held");
+        let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Coordinator);
+        let any = [Authority::Operator, Authority::LifecycleOperator];
+        assert!(authz.require(&fleet, &any, DEFAULT_ORG).is_ok());
+        assert!(authz.require(&fleet, &[], DEFAULT_ORG).is_err(), "nothing needed is nothing held");
     }
 }

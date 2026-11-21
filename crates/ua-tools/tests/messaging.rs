@@ -443,3 +443,22 @@ async fn unverified_local_caller() {
     let inbox = coord(&reg, &hub, &local, "message_inbox", json!({"to_agent": "builder-2"})).await.unwrap();
     assert_eq!(inbox["marked_read"], 2);
 }
+
+/// Reading every mailbox: an operator (a verified human) may; an agent under
+/// the coordinator profile may not, since a profile grants nothing. (An
+/// unverified local caller is unchanged; see `unverified_local_caller`.)
+#[tokio::test]
+async fn reading_every_mailbox_needs_an_operator_not_the_coordinator_profile() {
+    let (hub, reg) = (hub(), builtin_registry());
+    send(&reg, &hub, &agent("builder-1"), json!({"act": "inform", "to_agent": "builder-2", "body": "hi"}))
+        .await;
+    let coordinator = Caller { profile: Profile::Coordinator, ..agent("lead-1") };
+    let e = reg.call(&hub, &coordinator, "message_list", json!({"to_agent": "builder-2"})).await.unwrap_err();
+    assert!(e.to_string().contains("outside your mailbox"), "{e}");
+    let human = Caller { kind: ActorKind::Human, enforce_profile: false, ..agent("operator") };
+    let listed = call(&reg, &hub, &human, "message_list", json!({"to_agent": "builder-2"})).await;
+    assert_eq!(listed["total"], 1);
+    // A verified agent reads its own mailbox.
+    let own = call(&reg, &hub, &agent("builder-2"), "message_list", json!({})).await;
+    assert_eq!(own["total"], 1);
+}

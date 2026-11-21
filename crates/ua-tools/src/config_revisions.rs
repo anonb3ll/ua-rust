@@ -321,9 +321,10 @@ fn validate_overlay(cfg: &Config, overlay: &Value) -> UaResult<Map<String, Value
         }
         clean.insert(key.clone(), json!(chosen.as_str()));
     }
-    // The coordinator profile holds config authority: it is the recovery
-    // path for config revisions, so an overlay may not demote every identity
-    // configured with it. Legacy profile names count as the profile they name.
+    // A lockout guard, not a grant of authority: the coordinator profile is
+    // the recovery path for config revisions, so an overlay may not demote
+    // every identity configured with it. Legacy profile names count as the
+    // profile they name.
     let authority = Profile::Coordinator;
     let holders: Vec<&String> = cfg
         .profiles
