@@ -108,7 +108,7 @@ pub(crate) async fn record(ctx: &ToolCtx, channel: &'static str, payload: Value)
     ctx.hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new(channel, payload).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by))?;
             Ok(())
         })
         .await

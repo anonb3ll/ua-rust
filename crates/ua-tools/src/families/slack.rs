@@ -217,6 +217,7 @@ fn ledger_signature(tx: &mut WriteTx<'_>, sha: &str, timestamp: &str) -> UaResul
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.slack.signature_accepted",
             json!({ "request_sha": sha, "timestamp": timestamp }),
         )
@@ -362,7 +363,12 @@ pub fn admit_keyed(
         ReplayKey::Envelope { .. } => {
             ledger::append(
                 tx,
-                EventInput::new("agent.slack.envelope_accepted", json!({ "envelope_sha": sha })).by("system"),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.slack.envelope_accepted",
+                    json!({ "envelope_sha": sha }),
+                )
+                .by("system"),
             )?;
         }
     }
@@ -376,13 +382,18 @@ pub fn admit_keyed(
         if delivery_id_ok(&d.delivery_id) {
             payload["delivery_id"] = json!(d.delivery_id);
         }
-        ledger::append(tx, EventInput::new("agent.slack.request.refused", payload).by(identity.clone()))?;
+        ledger::append(
+            tx,
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.refused", payload)
+                .by(identity.clone()),
+        )?;
         return Ok(Admission::Refused { reason, identity: Some(identity) });
     }
     if !remember_delivery(tx, d.kind, &d.delivery_id, now)? {
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.slack.request.deduped",
                 json!({ "kind": kind, "delivery_id": d.delivery_id }),
             )
@@ -393,6 +404,7 @@ pub fn admit_keyed(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.slack.request.accepted",
             json!({ "kind": kind, "delivery_id": d.delivery_id, "command": d.command }),
         )
@@ -437,6 +449,7 @@ pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.slack.request.abandoned",
                 json!({
                     "identity": who,
@@ -486,7 +499,11 @@ pub fn record_executed(
             payload["approval_id"] = json!(approval_id);
         }
     }
-    ledger::append(tx, EventInput::new("agent.slack.request.executed", payload).by(identity.to_string()))?;
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.executed", payload)
+            .by(identity.to_string()),
+    )?;
     tx.execute(
         "UPDATE slack_seen_deliveries SET state = 'finished' WHERE kind = ?1 AND delivery_id = ?2",
         params![d_kind.as_str(), delivery_id],
@@ -505,6 +522,7 @@ pub fn record_reply_failed(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.slack.reply.failed",
             json!({ "kind": "command", "delivery_id": delivery_id, "reason": reason }),
         )
@@ -1037,7 +1055,8 @@ pub fn socket_url(raw: &str, allow_loopback_ws: bool) -> Result<url::Url, &'stat
 pub fn record_socket_url_refused(tx: &mut WriteTx<'_>, reason: &'static str) -> UaResult<()> {
     ledger::append(
         tx,
-        EventInput::new("agent.slack.socket.url_refused", json!({ "reason": reason })).by("system"),
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.socket.url_refused", json!({ "reason": reason }))
+            .by("system"),
     )?;
     Ok(())
 }
@@ -1053,6 +1072,7 @@ pub fn record_envelope_outcome_unknown(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.slack.envelope.outcome_unknown",
             json!({ "envelope_sha": envelope_sha, "reason": reason, "outcome": "unknown" }),
         )

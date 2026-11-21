@@ -443,7 +443,7 @@ pub(crate) fn rollup(conn: &Connection, root: i64) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn emit(tx: &mut WriteTx<'_>, channel: &str, payload: Value, by: &str) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(channel, payload).by(by.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
     Ok(())
 }
 

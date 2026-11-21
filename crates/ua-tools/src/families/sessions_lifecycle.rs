@@ -944,6 +944,7 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.session.learning_proposed",
                     json!({ "session_id": ev_sid, "path": ev_rel, "fingerprint": ev_fp, "candidates": n }),
                 )

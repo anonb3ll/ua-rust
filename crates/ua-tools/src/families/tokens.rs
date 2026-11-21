@@ -329,8 +329,12 @@ async fn issue(ctx: ToolCtx, a: IssueArgs) -> UaResult<Value> {
                 insert_token(tx, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), None)?;
             ledger::append(
                 tx,
-                EventInput::new("agent.token.issued", json!({ "agent": label, "token_id": id }))
-                    .by(by.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.token.issued",
+                    json!({ "agent": label, "token_id": id }),
+                )
+                .by(by.clone()),
             )?;
             Ok(json!({
                 "ok": true,
@@ -376,6 +380,7 @@ async fn rotate(ctx: ToolCtx, a: RotateArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.token.rotated",
                     json!({ "agent": label, "previous_token_id": previous, "new_token_id": id }),
                 )
@@ -516,7 +521,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                     }
                     ledger::append(
                         tx,
-                        EventInput::new(
+                        EventInput::new(ua_core::DEFAULT_ORG,
                             "agent.oauth.sessions_revoked",
                             json!({ "session_id": session_id, "identity": identity, "sessions": families.len() }),
                         )

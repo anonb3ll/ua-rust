@@ -315,7 +315,7 @@ fn throttle(c: &Connection, cfg: &Config, caller: &Caller) -> UaResult<()> {
 }
 
 fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(channel, payload).by(caller.label.clone()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
 
@@ -769,8 +769,12 @@ fn begin_send(
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.approval.consumed", json!({ "approval_id": id, "tool": TOOL }))
-                    .by(caller.label.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.approval.consumed",
+                    json!({ "approval_id": id, "tool": TOOL }),
+                )
+                .by(caller.label.clone()),
             )?;
             id
         }

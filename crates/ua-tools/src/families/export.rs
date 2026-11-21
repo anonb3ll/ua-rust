@@ -130,6 +130,7 @@ async fn deliver(
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": name, "path": rel, "rows": rows, "bytes": bytes }),
                 )
@@ -1018,6 +1019,7 @@ async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Va
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": "migration-manifest", "path": path, "rows": rows, "bytes": bytes }),
                 )

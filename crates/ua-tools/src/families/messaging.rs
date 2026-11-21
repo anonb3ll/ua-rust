@@ -849,6 +849,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
             episode_id: Some(conversation.clone()),
             causal_parent_id: reply.clone().or_else(|| event_id.clone()),
             dedupe_key: None,
+            org_id: ua_core::DEFAULT_ORG.into(),
         },
     )?
     .ok_or_else(|| UaError::internal("message event was not appended"))?;
@@ -1377,7 +1378,7 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
     if acked > 0 {
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.mailbox.acked",
                 json!({ "mailbox": mailbox, "session_id": sid, "message_id": mid, "through_seq": through_seq, "count": acked }),
             )
@@ -1475,26 +1476,26 @@ async fn message_inbox(ctx: ToolCtx, a: InboxArgs) -> UaResult<Value> {
         after_seq: a.after_seq,
         ..ListArgs::default()
     };
-    let mut out = ctx
-        .hub
-        .db()
-        .write_async(move |tx| {
-            let out = list_messages(tx, &v, q, true)?;
-            let marked = out["marked_read"].as_u64().unwrap_or(0);
-            if marked > 0 {
-                let mailbox = out["mailbox"].as_str().unwrap_or(&v.local_label).to_string();
-                ledger::append(
+    let mut out =
+        ctx.hub
+            .db()
+            .write_async(move |tx| {
+                let out = list_messages(tx, &v, q, true)?;
+                let marked = out["marked_read"].as_u64().unwrap_or(0);
+                if marked > 0 {
+                    let mailbox = out["mailbox"].as_str().unwrap_or(&v.local_label).to_string();
+                    ledger::append(
                     tx,
-                    EventInput::new(
+                    EventInput::new(ua_core::DEFAULT_ORG,
                         "agent.mailbox.read",
                         json!({ "mailbox": mailbox, "session_id": out.get("session_id"), "count": marked }),
                     )
                     .by(mailbox.clone()),
                 )?;
-            }
-            Ok(out)
-        })
-        .await?;
+                }
+                Ok(out)
+            })
+            .await?;
     mark_untrusted(&mut out, caller.as_deref());
     Ok(out)
 }

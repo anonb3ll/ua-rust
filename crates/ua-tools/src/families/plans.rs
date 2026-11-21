@@ -148,7 +148,7 @@ pub(crate) fn parse_params<T: DeserializeOwned>(
 }
 
 pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(channel, payload).by(caller.label.clone()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
 

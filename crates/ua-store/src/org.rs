@@ -235,7 +235,10 @@ mod tests {
         ])
         .unwrap();
         // `append` names neither column; both take their defaults.
-        db.write(|tx| ledger::append(tx, EventInput::new("test.event", json!({ "i": 1 })))).unwrap();
+        db.write(|tx| {
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 1 })))
+        })
+        .unwrap();
         let (org, hash_v): (String, i64) = db
             .read(|c| {
                 Ok(c.query_row("SELECT org_id, hash_v FROM event_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?)

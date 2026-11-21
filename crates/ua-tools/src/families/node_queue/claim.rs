@@ -455,9 +455,13 @@ pub(crate) fn on_heartbeat(
         // Once per claim, however many heartbeats it takes the node to stop.
         ledger::append(
             tx,
-            EventInput::new(CHANNEL, json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }))
-                .by(agent.to_string())
-                .dedupe(format!("cancel_relayed:{}:{}", item.id, item.attempts)),
+            EventInput::new(
+                ua_core::DEFAULT_ORG,
+                CHANNEL,
+                json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }),
+            )
+            .by(agent.to_string())
+            .dedupe(format!("cancel_relayed:{}:{}", item.id, item.attempts)),
         )?;
     }
     Ok(cancel.into_iter().map(|i| i.id).collect())

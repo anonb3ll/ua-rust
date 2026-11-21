@@ -249,6 +249,7 @@ async fn project_build(ctx: ToolCtx, a: ProjectBuildArgs) -> UaResult<Value> {
             let event = ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.project.built",
                     json!({ "parent_task_id": id, "project_id": id, "identity": identity }),
                 )

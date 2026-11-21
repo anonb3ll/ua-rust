@@ -123,8 +123,12 @@ pub fn prune_unused_clients_tx(tx: &mut WriteTx<'_>, ttl_hours: f64) -> UaResult
 fn pruned_event(tx: &mut WriteTx<'_>, count: usize, reason: &str) -> UaResult<()> {
     ledger::append(
         tx,
-        EventInput::new("agent.oauth.clients_pruned", json!({ "count": count, "reason": reason }))
-            .by("oauth"),
+        EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "agent.oauth.clients_pruned",
+            json!({ "count": count, "reason": reason }),
+        )
+        .by("oauth"),
     )?;
     Ok(())
 }
@@ -294,7 +298,7 @@ pub async fn register(
             )?;
             ua_store::ledger::append(
                 tx,
-                ua_store::EventInput::new("agent.oauth.client_registered", json!({ "client_id": row.0 }))
+                ua_store::EventInput::new(ua_core::DEFAULT_ORG, "agent.oauth.client_registered", json!({ "client_id": row.0 }))
                     .by("oauth"),
             )?;
             Ok(true)

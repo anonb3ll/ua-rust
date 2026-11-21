@@ -192,7 +192,10 @@ fn emit(tx: &mut WriteTx<'_>, note: &Value, state: &str, by: &str, extra: Value)
     let session = note["session_id"].as_str().map(str::to_string);
     ledger::append(
         tx,
-        EventInput { episode_id: session, ..EventInput::new(CHANNEL, payload).by(by.to_string()) },
+        EventInput {
+            episode_id: session,
+            ..EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string())
+        },
     )?;
     Ok(())
 }

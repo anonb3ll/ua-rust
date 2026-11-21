@@ -107,12 +107,12 @@ async fn seed(hub: &TestHub) -> i64 {
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.dispatch.transition", json!({ "run_id": "run-1-aa", "state": "running" }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.dispatch.transition", json!({ "run_id": "run-1-aa", "state": "running" }))
                     .by("builder-1"),
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.node", json!({ "kind": "enqueue", "item_id": "nd-0123456789abcdef" }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.node", json!({ "kind": "enqueue", "item_id": "nd-0123456789abcdef" }))
                     .by("builder-2"),
             )?;
             Ok(())

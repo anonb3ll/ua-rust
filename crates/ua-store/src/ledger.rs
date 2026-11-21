@@ -605,7 +605,8 @@ mod tests {
     fn a_cursor_pages_forward_without_skipping() {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         for i in 0..10 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         let page = |after: i64| {
             db.read(|c| {
@@ -627,13 +628,19 @@ mod tests {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         let mut rx = db.subscribe();
         for i in 0..5 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })).by("tester"))).unwrap();
+            db.write(|tx| {
+                append(
+                    tx,
+                    EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i })).by("tester"),
+                )
+            })
+            .unwrap();
         }
         assert_eq!(rx.try_recv().unwrap().payload, json!({ "i": 0 }));
         let deduped = db
             .write(|tx| {
-                append(tx, EventInput::new("test.once", json!({})).dedupe("k1"))?;
-                append(tx, EventInput::new("test.once", json!({})).dedupe("k1"))
+                append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.once", json!({})).dedupe("k1"))?;
+                append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.once", json!({})).dedupe("k1"))
             })
             .unwrap();
         assert!(deduped.is_none());
@@ -672,7 +679,8 @@ mod tests {
         ])
         .unwrap();
         for i in 0..3 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         assert!(db.read(verify).unwrap().ok);
         db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
@@ -709,7 +717,8 @@ mod tests {
         ];
         let db = Db::open(&path, &parts).unwrap();
         for i in 0..2 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         // Stand in for a newer build's row: the newest row claims hash_v 2.
         db.write(|tx| {
@@ -720,8 +729,10 @@ mod tests {
         .unwrap();
         let before: i64 =
             db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
-        let err =
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({})))).unwrap_err().to_string();
+        let err = db
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
         let after: i64 =
             db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
@@ -734,7 +745,7 @@ mod tests {
         // A ledger whose rows are all hash_v 1 opens and appends as before.
         let fresh = dir.path().join("fresh.db");
         let db = Db::open(&fresh, &parts).unwrap();
-        db.write(|tx| append(tx, EventInput::new("test.event", json!({})))).unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
         drop(db);
         assert!(Db::open(&fresh, &parts).is_ok());
     }
@@ -744,20 +755,47 @@ mod tests {
     /// refuses an organization it cannot record instead of dropping it.
     #[test]
     fn append_records_the_organization_or_refuses_what_it_cannot_record() {
-        let parts = [crate::Part::from(SCHEMA), crate::Part::from(META_SCHEMA), crate::Part::from(crate::org::STORE_PART)];
+        let parts = [
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ];
         let db = Db::open_in_memory(&parts).unwrap();
         db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
         let row: (String, i64) = db
-            .read(|c| Ok(c.query_row("SELECT org_id, hash_v FROM event_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?))
+            .read(|c| {
+                Ok(c.query_row("SELECT org_id, hash_v FROM event_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+            })
             .unwrap();
         assert_eq!(row, (ua_core::DEFAULT_ORG.to_string(), HASH_V));
-        let err = db.write(|tx| append(tx, EventInput { org_id: " ".into(), ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})) })).unwrap_err().to_string();
+        let err = db
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: " ".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("org_id must not be empty"), "{err}");
 
         let legacy = Db::open_in_memory(&[SCHEMA]).unwrap();
-        legacy.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
+        legacy
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))))
+            .unwrap();
         let err = legacy
-            .write(|tx| append(tx, EventInput { org_id: "org-b".into(), ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})) }))
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: "org-b".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
             .unwrap_err()
             .to_string();
         assert!(err.contains("no org_id column") && err.contains("org-b"), "{err}");
@@ -781,10 +819,12 @@ mod tests {
     fn an_unhashed_row_after_the_chain_started_fails_verification() {
         let db = Db::open_in_memory(&[SCHEMA]).unwrap();
         for i in 0..2 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         insert_unhashed(&db, "01J0000000000000000000ZZZZ");
-        db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": 2 })))).unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 2 }))))
+            .unwrap();
         let report = db.read(verify).unwrap();
         assert!(!report.ok, "{report:?}");
         assert_eq!(report.first_bad_seq, Some(3));
@@ -801,7 +841,8 @@ mod tests {
         assert!(!report.ok && report.first_bad_seq == Some(1), "{report:?}");
         db.write(|tx| record_legacy_prefix(tx, 2)).unwrap();
         for i in 0..3 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         let report = db.read(verify).unwrap();
         assert!(report.ok, "{report:?}");
@@ -820,7 +861,8 @@ mod tests {
     fn an_unhashed_row_slipped_ahead_of_the_chain_fails_verification() {
         let db = Db::open_in_memory(&[SCHEMA, META_SCHEMA]).unwrap();
         for i in 0..3 {
-            db.write(|tx| append(tx, EventInput::new("test.event", json!({ "i": i })))).unwrap();
+            db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
+                .unwrap();
         }
         assert!(db.read(verify).unwrap().ok);
         for seq in [0i64, -5] {

@@ -36,7 +36,9 @@ fn append(hub: &TestHub, channel: &str, i: usize) -> i64 {
     hub.state
         .hub
         .db()
-        .write(|tx| ledger::append(tx, EventInput::new(channel, json!({ "i": i })).by("tester")))
+        .write(|tx| {
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, json!({ "i": i })).by("tester"))
+        })
         .unwrap()
         .unwrap()
         .seq
@@ -225,7 +227,11 @@ fn revoke_tokens(hub: &TestHub, label: &str) {
                 "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 WHERE agent_label = ?1",
                 rusqlite::params![label, ua_core::time::now()],
             )?;
-            ledger::append(tx, EventInput::new("agent.token.revoked", json!({ "agent": label })).by("cli"))?;
+            ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.token.revoked", json!({ "agent": label }))
+                    .by("cli"),
+            )?;
             Ok(())
         })
         .unwrap();

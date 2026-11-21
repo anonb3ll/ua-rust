@@ -603,8 +603,13 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(v["checked"], json!(3));
 
     // New native events chain onto the imported head.
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.test.after_import", json!({})).by("tester")))
-        .unwrap();
+    db.write(|tx| {
+        ledger::append(
+            tx,
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.test.after_import", json!({})).by("tester"),
+        )
+    })
+    .unwrap();
     let after = db.read(ledger::verify).unwrap();
     assert!(after.ok && after.checked == 4, "{after:?}");
 
@@ -716,7 +721,8 @@ fn counts(db: &Db) -> Vec<i64> {
 fn a_target_with_its_own_events_refuses_before_any_write() {
     let f = fixture();
     let db = target();
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.native.event", json!({}))))
+        .unwrap();
     let before = counts(&db);
     let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
     let msg = format!("{err:#}");
@@ -729,7 +735,8 @@ fn a_catch_up_after_the_target_wrote_its_own_events_is_refused_up_front() {
     let f = fixture();
     let db = target();
     ua_import::import(&db, &f.path, &opts()).unwrap();
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.native.event", json!({}))))
+        .unwrap();
     let c = Connection::open(&f.path).unwrap();
     c.execute("INSERT INTO tasks (id, title, created_at, updated_at) VALUES (5, 'Later', ?1, ?1)", [T0])
         .unwrap();

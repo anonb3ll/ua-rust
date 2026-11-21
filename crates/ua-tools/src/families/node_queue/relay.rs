@@ -112,7 +112,7 @@ fn turn_summary(
     }
     ledger::append(
         tx,
-        EventInput::new(CHANNEL, payload)
+        EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload)
             .by(agent.to_string())
             .dedupe(format!("turn_summary:{}:{}:{turn}", item.node, item.id)),
     )?;

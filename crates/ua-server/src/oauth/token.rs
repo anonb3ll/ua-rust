@@ -246,7 +246,7 @@ async fn authorization_code(state: &AppState, client: Client, form: &HashMap<Str
                 revoke_family(tx, &family, "code_reuse")?;
                 ledger::append(
                     tx,
-                    EventInput::new("agent.oauth.code_reuse", json!({ "client_id": code_client, "session_id": family }))
+                    EventInput::new(ua_core::DEFAULT_ORG, "agent.oauth.code_reuse", json!({ "client_id": code_client, "session_id": family }))
                         .by("oauth"),
                 )?;
                 return Ok(Outcome::Refused("invalid_grant", "authorization code was already used".into()));
@@ -337,7 +337,7 @@ async fn refresh(state: &AppState, client: Client, form: &HashMap<String, String
                 let n = revoke_family(tx, &family, "refresh_reuse")?;
                 ledger::append(
                     tx,
-                    EventInput::new(
+                    EventInput::new(ua_core::DEFAULT_ORG,
                         "agent.oauth.refresh_reuse",
                         json!({ "client_id": token_client, "identity": subject, "session_id": family, "revoked_tokens": n }),
                     )
@@ -459,6 +459,7 @@ pub async fn revoke(State(state): State<AppState>, headers: HeaderMap, body: Byt
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.oauth.token_revoked",
                     json!({ "client_id": owner, "kind": kind, "session_id": family }),
                 )

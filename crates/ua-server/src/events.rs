@@ -587,7 +587,9 @@ mod tests {
         state
             .hub
             .db()
-            .write(|tx| ledger::append(tx, EventInput::new(channel, json!({})).by("tester")))
+            .write(|tx| {
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, json!({})).by("tester"))
+            })
             .unwrap()
             .unwrap()
             .seq

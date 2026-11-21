@@ -110,7 +110,10 @@ mod tests {
         assert_eq!(Caller::system().org_id, DEFAULT_ORG);
         assert_eq!(Caller::local("builder-1", Transport::Stdio).org_id, DEFAULT_ORG);
         let job = Caller::system_for("org-b");
-        assert_eq!((job.org_id.as_str(), job.label.as_str(), job.kind), ("org-b", "system", ActorKind::System));
+        assert_eq!(
+            (job.org_id.as_str(), job.label.as_str(), job.kind),
+            ("org-b", "system", ActorKind::System)
+        );
     }
 
     #[test]

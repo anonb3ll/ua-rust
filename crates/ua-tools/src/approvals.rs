@@ -124,7 +124,10 @@ pub fn gate_via(
         if let Some(v) = via {
             event["via"] = json!(v);
         }
-        ledger::append(tx, EventInput::new("agent.approval.consumed", event).by(caller.label.clone()))?;
+        ledger::append(
+            tx,
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.consumed", event).by(caller.label.clone()),
+        )?;
         return Ok(GateOutcome::Pass { approval_id: id });
     }
 
@@ -162,7 +165,10 @@ fn park(
     if let Some(v) = via {
         event["via"] = json!(v);
     }
-    ledger::append(tx, EventInput::new("agent.approval.requested", event).by(caller.label.clone()))?;
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.requested", event).by(caller.label.clone()),
+    )?;
     Ok(approval_id)
 }
 
@@ -488,7 +494,7 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
         }
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.approval.resolved",
                 json!({ "approval_id": row.id, "tool": row.tool, "decision": args.decision, "resolved_by": resolver }),
             )
