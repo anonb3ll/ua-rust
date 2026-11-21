@@ -226,10 +226,11 @@ sweep has seen it.
 
 A slash command's `response_url` is posted to only when it is
 `https://hooks.slack.com/...` on the default port with no user info: that
-exact host, nothing else. The client is the web tools' guarded client: no
-redirects, no proxy, every resolved address must be public (loopback is
-refused here even under `fetch_allow_loopback`), a 10-second timeout, and the
-response body is never read. Any other `response_url` is ignored and the
+exact host, nothing else. The client is `ua_ingress::Outbound` under the
+`slack.response_url` policy ([ingress.md](ingress.md)): https to that host
+only, no redirects, no proxy, every address the connection reaches must be
+public (loopback is refused here even under `fetch_allow_loopback`), a
+10-second limit on the whole call, and the response body is never read. Any other `response_url` is ignored and the
 acknowledgement says the result is in the hub ledger.
 
 The reply is one fixed sentence per command (ids, and for `status` the

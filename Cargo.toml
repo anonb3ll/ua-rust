@@ -14,6 +14,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 ua-core = { path = "crates/ua-core" }
+ua-ingress = { path = "crates/ua-ingress" }
 ua-store = { path = "crates/ua-store" }
 ua-memory = { path = "crates/ua-memory" }
 ua-org = { path = "crates/ua-org" }

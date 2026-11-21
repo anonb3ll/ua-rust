@@ -37,6 +37,7 @@ embeddings = ["ua-tools/embeddings"]
 
 [dependencies]
 ua-core.workspace = true
+ua-ingress.workspace = true
 ua-store.workspace = true
 ua-tools = { workspace = true, default-features = false }
 anyhow.workspace = true

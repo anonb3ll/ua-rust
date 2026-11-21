@@ -24,6 +24,7 @@ touched; CI runs the whole workspace (`cargo nextest run --workspace`).
 | Crate | Holds | Rule |
 |---|---|---|
 | `ua-core` | Config, identity, session profiles (`profiles.rs`, `profiles.json`), errors, sandbox resolvers | No I/O beyond reading config. |
+| `ua-ingress` | The address classifier (`addr`) and the guarded outbound HTTP client (`Outbound`, one `Policy` per destination class); inbound delivery handling moves here later ([docs/ingress.md](docs/ingress.md)) | Depends only on `ua-core`; only `ua-tools` and `ua-server` depend on it. New `reqwest` clients, address classifiers and delivery tables elsewhere fail its ratchet (`tests/ingress_guard.rs`). |
 | `ua-store` | SQLite access, migrations, the hash-chained ledger | No tool logic. |
 | `ua-memory` | The memory domain: schema parts, note model, save, hybrid search, ranking, embeddings (`embeddings` feature), lifecycle | Depends only on `ua-core` and `ua-store`, never on the registry. The memory tools stay in `ua-tools` (`families/memory`); adapters reach memory only through them (`tests/boundary.rs` enforces that only `ua-tools` depends on it). |
 | `ua-tools` | The tool registry, the governed call wrapper (`Registry::call`), policy, approvals, tool families (`src/families/`) | Every tool is registered and runs only through `Registry::call`. |

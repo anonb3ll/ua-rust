@@ -14,6 +14,20 @@ from its commit history.
 
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
+- Crate `ua-ingress` (`docs/ingress.md`): one address classifier
+  (`ua_ingress::addr`, with a public class and a stricter global-unicast-only
+  class) and one guarded outbound HTTP client (`Outbound`)
+  built from a named policy per destination class. The client ignores proxy
+  settings, follows redirects only when the policy allows (checking every
+  hop), caps every body read, checks addresses at connect time through its
+  resolver and again on the connection's peer address, sends a secret header
+  only to the origin it was built for, and bounds connect, request and total
+  time. An unknown policy is refused. Slack slash-command replies are its
+  first consumer (policy `slack.response_url`); their refusals and failure
+  reasons (`response_url_refused`, `timeout`, `transport`, `status`) are
+  unchanged. A ratchet test counts `reqwest` client builders, address
+  classifiers and inbound delivery tables outside the crate; the counts may
+  only go down.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.
@@ -257,6 +271,23 @@ from its commit history.
 - Messages carry `sender_verified`: `false` when the sender was not
   authenticated, so `from_agent` is only what the caller said (`null` on
   messages sent before this).
+
+- The web tools' and the OAuth client-metadata fetch's address checks are
+  now one classifier (`ua_ingress::addr`) with two named classes. Nothing is
+  allowed that was refused before. Newly refused:
+  - by the web-class callers (`web_fetch`, `web_search`, Zulip, the relay's
+    GitHub client, GitHub REST, Slack replies and the Socket Mode `wss`
+    host): the IPv4-compatible form `::a.b.c.d` of a public IPv4 address.
+    It is deprecated (RFC 4291), lies in `::/8`, which is not routed, and no
+    current transition mechanism produces it, so no reachable destination
+    uses it. NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 addresses are
+    still judged by the IPv4 address they carry, as before, so IPv6-only
+    networks behind DNS64 keep working;
+  - by the client-metadata fetch: translated IPv6 (`::ffff:0:a.b.c.d`) of a
+    non-public IPv4 address, `3fff::/20` (documentation), `2001::/23` beyond
+    Teredo (IETF protocol assignments), and every IPv6 address outside
+    `2000::/3` not refused before. It still refuses every NAT64, 6to4 and
+    IPv4-compatible address, as before.
 
 ### Security
 

@@ -5,6 +5,7 @@
 | Crate | Rule |
 |---|---|
 | `ua-core` | No I/O beyond reading config. Types, profiles, sandbox resolvers. |
+| `ua-ingress` | The address classifier and the guarded outbound HTTP client (`Outbound` with a named `Policy`). Depends only on `ua-core`; only `ua-tools` and `ua-server` depend on it. Call other systems through it: `tests/ingress_guard.rs` fails on a new `reqwest` client builder, address classifier or inbound delivery table outside it (see [docs/ingress.md](docs/ingress.md)). |
 | `ua-store` | SQLite access and the ledger. No tool logic. |
 | `ua-memory` | The memory domain: schema parts, note model, save, search, ranking, embeddings, lifecycle. Depends only on `ua-core` and `ua-store`, never on the `Registry`. Its tools are registered in `ua-tools` (`families/memory`), and adapters reach memory only through them; `ua-memory/tests/boundary.rs` fails if any other crate depends on it. |
 | `ua-tools` | Tools. Every tool is registered in the `Registry` and runs only through `Registry::call`. |

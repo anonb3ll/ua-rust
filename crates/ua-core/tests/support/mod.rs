@@ -109,9 +109,10 @@ pub fn close_brace(m: &str, open: usize) -> usize {
     m.len()
 }
 
-/// Masked source with every `#[cfg(test)]` item blanked.
-pub fn without_tests(src: &str) -> String {
+/// The byte ranges of every `#[cfg(test)]` item, found in masked text.
+pub fn test_spans(src: &str) -> Vec<(usize, usize)> {
     let mut m = mask(src);
+    let mut spans = Vec::new();
     while let Some(at) = m.find("#[cfg(test)]") {
         let after = at + "#[cfg(test)]".len();
         // The item ends at its matching brace, or at `;` when it has none.
@@ -123,10 +124,39 @@ pub fn without_tests(src: &str) -> String {
             (None, Some(s)) => s + 1,
             (None, None) => m.len(),
         };
-        let blank: String = m[at..end].chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect();
-        m.replace_range(at..end, &blank);
+        blank_range(&mut m, at, end);
+        spans.push((at, end));
+    }
+    spans
+}
+
+/// Blank `from..to` byte for byte (newlines kept), so later offsets hold.
+fn blank_range(text: &mut String, from: usize, to: usize) {
+    let blank: String = text[from..to]
+        .chars()
+        .map(|c| if c == '\n' { "\n".to_string() } else { " ".repeat(c.len_utf8()) })
+        .collect();
+    text.replace_range(from..to, &blank);
+}
+
+/// Masked source with every `#[cfg(test)]` item blanked.
+pub fn without_tests(src: &str) -> String {
+    let mut m = mask(src);
+    for (from, to) in test_spans(src) {
+        blank_range(&mut m, from, to);
     }
     m
+}
+
+/// The source as written (comments and strings kept) with every
+/// `#[cfg(test)]` item blanked, for patterns that live inside strings
+/// (SQL, for one).
+pub fn without_tests_raw(src: &str) -> String {
+    let mut s = src.to_string();
+    for (from, to) in test_spans(src) {
+        blank_range(&mut s, from, to);
+    }
+    s
 }
 
 /// Non-test source of every workspace crate.
