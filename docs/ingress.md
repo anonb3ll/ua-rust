@@ -88,12 +88,15 @@ Each property is enforced in the crate and has a test there:
 
 ### The cross-origin rule
 
-No shipped policy allows redirects; these rules are in place for the first
-one that does. A request's headers and body belong to the origin of the
-URL it was built for. On each redirect hop:
+`web.page` and `web.search` follow up to five redirects; every other
+shipped policy follows none. A request's headers and body belong to the
+origin of the URL it was built for. On each redirect hop:
 
 - **A hop from https to http is refused**, unless the policy sets
-  `allow_scheme_downgrade`. No shipped policy does.
+  `allow_scheme_downgrade`. Only `web.page` does: `web_fetch` sends no
+  credentials and may fetch plain http pages directly, and the scheme is
+  part of the origin, so the downgraded hop carries none of the caller's
+  headers anyway.
 - **301, 302 and 303** turn the request into a `GET` without a body or a
   `Content-Type`, as browsers do. The hop may then go to another origin.
 - **307 and 308** must repeat the method and the body. A 307 or 308 that
@@ -105,8 +108,14 @@ URL it was built for. On each redirect hop:
   is followed.
 - **Headers on a hop to another origin** are `Accept` and
   `Accept-Language` only (and the client's own `User-Agent`). Every other
-  header, plain or secret, whatever its name, is not sent there. A later
-  hop back to the request's own origin carries them again.
+  header, plain or secret, whatever its name, is not sent there.
+- **Once a chain has left the request's origin, it stays stripped.** A
+  later hop back to that origin carries only the same short list: the
+  caller's headers and secret headers are dropped for the rest of the
+  chain. Otherwise the intermediate origin could choose which path on the
+  original origin receives them. The return hop is followed rather than
+  refused, so a round trip through another host still reaches its page;
+  it simply arrives without credentials.
 
 Errors never include the request URL's path or query or any header value.
 `OutboundError` converts into `UaError` (`ssrf_blocked` for an address
@@ -186,7 +195,7 @@ category is caught, and that the lookalikes above are not. Baselines:
 | `ua-server` | `direct_dial` | 3 | `slack_socket.rs::connect`: `TcpStream::connect`, the rustls `TlsConnector`, the WebSocket client handshake |
 | `ua-server` | `inline_address_check` | 5 | loopback checks in `oauth/register.rs` (3) and `login.rs` (2) |
 | `ua-cli` | `inline_address_check` | 1 | `ops/doctor.rs`, the bind address |
-| `ua-tools` | `client_builder` | 5 | `web`, `github/client`, `mcp/gateway`, `notify`, `vault/obsidian` |
+| `ua-tools` | `client_builder` | 4 | `github/client`, `mcp/gateway`, `notify`, `vault/obsidian` (`web::http_client` was removed when its consumers moved onto `Outbound`) |
 | `ua-tools` | `address_classifier` | 4 | `mcp/scope.rs` `classify`, `classify_v4`; `relay/gates.rs` `v4_kind`, `v6_kind` |
 | `ua-tools` | `inline_address_check` | 11 | loopback URL hosts in `slack.rs`, `zulip.rs`, `github/client.rs`, `harness_config/policy.rs` (2 each); `observability.rs` (2); `vault/obsidian.rs` (1) |
 | `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies`, `slack_seen_signatures`, `slack_seen_deliveries` |
@@ -199,10 +208,23 @@ calls `ua_ingress::addr`, so it no longer counts.
 | Consumer | Policy |
 |---|---|
 | Slack slash-command replies (`slack::post_reply`) | `slack.response_url`: https to `hooks.slack.com` on the default port, public addresses, no redirects, 64 KiB cap, 10 s for everything |
+| Slack Socket Mode `apps.connections.open` (`slack::open_socket_url`) | `slack.web_api`: https to `slack.com` on the default port, public addresses, no redirects, 16 KiB cap (refused past it), 15 s |
+| `web_fetch` | `web.page`: http or https, any host and port, public addresses, 5 redirects with https to http followed, 2 MB cap (cut), 20 s a request, 45 s in all |
+| `web_search` (DuckDuckGo, Brave, Tavily) | `web.search`: as `web.page`, but a redirect from https to http is refused |
+| Zulip (`zulip_send_message`, `zulip_fetch_messages`) | `zulip.api`: https to the configured site, public addresses, no redirects, 4 MiB cap (each call reads less), 20 s |
+| The relay's GitHub comments (`relay/github.rs`) | `relay.github`: https to `relay_github_api_url`, public addresses, no redirects, 256 KiB cap (cut), 20 s |
+
+The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
+neither settable from TOML or the environment) apply
+`Policy::loopback_test_hook`: loopback admitted besides public addresses,
+plain http, any host and port; everything else unchanged.
 
 ## Planned slices
 
-1. Move the remaining HTTP client consumers onto policies.
+1. Move the remaining HTTP client consumers onto policies (GitHub REST,
+   the MCP gateway, notify webhooks, the Obsidian client, the client ID
+   metadata fetch; the web, Zulip, relay and Slack Web API consumers have
+   moved).
 2. One inbound-delivery table, with a cut-over for GitHub deliveries.
 3. Slack's signed HTTP routes and Socket Mode onto it.
 4. GitHub REST and the MCP gateway.

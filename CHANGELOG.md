@@ -36,6 +36,11 @@ from its commit history.
   counts connections dialled by hand, inline address range checks, and
   delivery tables recognised by name marks or columns instead of a fixed
   list. No change for Slack replies, which follow no redirect.
+- `ua-ingress`: once a redirect chain leaves the request's origin, the
+  caller's headers and secret headers are dropped for the rest of the
+  chain, including a hop back to the original origin (only `Accept` and
+  `Accept-Language` travel from then on), so an intermediate origin cannot
+  choose which path on the original origin receives them.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.
@@ -296,6 +301,28 @@ from its commit history.
     Teredo (IETF protocol assignments), and every IPv6 address outside
     `2000::/3` not refused before. It still refuses every NAT64, 6to4 and
     IPv4-compatible address, as before.
+- `web_fetch`, `web_search`, the Zulip tools, the relay's GitHub comments
+  and Slack Socket Mode's `apps.connections.open` call now go through
+  `ua_ingress::Outbound` under named policies (`web.page`, `web.search`,
+  `zulip.api`, `relay.github`, `slack.web_api`; `docs/ingress.md`), and the
+  web family's shared client is gone. Schemes, hosts, redirect limits, body
+  caps, timeouts, proxy handling, outcomes and error messages are as
+  before, except where each is now stricter:
+  - every one: the address of the connection that carried a response is
+    checked again after it arrives (a peer outside the class fails the
+    call), and failure messages no longer quote the request URL;
+  - `web_fetch`: a URL with credentials (`user:password@host`) is refused
+    (they were sent as basic auth); a fetch that runs out of its 45-second
+    budget reads `fetch of <host> timed out` instead of `fetch timed out`;
+  - `web_search`: a redirect from https to http is refused (it was
+    followed); a 307 or 308 that would resend the DuckDuckGo form or the
+    Tavily request body to another origin is refused (it was resent);
+    the Brave and Tavily keys, and every header other than `Accept` and
+    `Accept-Language`, are not sent once a redirect chain changes origin,
+    where before they were dropped only when the host changed (a change of
+    scheme or port kept them); a credentialled endpoint URL is refused;
+  - Zulip, the relay and Slack: nothing beyond the first item. None of them
+    follows redirects, before or now.
 
 ### Security
 

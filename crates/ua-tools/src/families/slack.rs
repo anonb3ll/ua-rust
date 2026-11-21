@@ -864,7 +864,7 @@ pub async fn post_reply(_cfg: &Config, url: &url::Url, text: &str) -> Result<(),
     let body = json!({ "response_type": "ephemeral", "replace_original": false, "text": text });
     let req = Request::post(url.clone()).json(&body).map_err(|_| "transport")?;
     let resp = client.send(req).await.map_err(|e| match e {
-        OutboundError::Timeout => "timeout",
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => "timeout",
         OutboundError::UrlRefused { .. } => "response_url_refused",
         _ => "transport",
     })?;
@@ -1011,8 +1011,9 @@ const PERMANENT_OPEN_ERRORS: [&str; 17] = [
     "deprecated_endpoint",
 ];
 
-/// The longest `apps.connections.open` response read.
-const OPEN_RESPONSE_MAX: usize = 16 * 1024;
+// The longest `apps.connections.open` response read is the `slack.web_api`
+// policy's cap.
+const _: () = assert!(ua_ingress::policy::SLACK_WEB_API.max_body_bytes == 16 * 1024);
 
 /// A socket URL from `apps.connections.open` this hub will connect to:
 /// `wss`, host `slack.com` or ending in `.slack.com`, the default port, no
@@ -1082,36 +1083,35 @@ pub fn record_envelope_outcome_unknown(
 /// Call `apps.connections.open` with the app token (in the `Authorization`
 /// header, never a parameter) and return the WebSocket URL to connect to.
 /// The request goes only to `https://slack.com/api` (or the test hook's
-/// base) through the guarded web client: no redirects, no proxy, public
-/// addresses only. The response is read up to 16 KiB. The token is never
+/// base, where loopback is admitted) through `ua_ingress::Outbound` under
+/// the `slack.web_api` policy: no redirects, no proxy, public addresses
+/// only, 15 seconds. The response is read up to 16 KiB. The token is never
 /// logged and never part of an error.
 pub async fn open_socket_url(cfg: &Config, token: &secrecy::SecretString) -> Result<url::Url, OpenError> {
     use secrecy::ExposeSecret;
+    use ua_ingress::{Outbound, OutboundError, Request, policy};
+    let transport = || OpenError::Transient("transport".into());
     let test = cfg.slack_socket_test_api.as_deref();
     let base = test.unwrap_or(SLACK_API).trim_end_matches('/');
-    let mut guarded = cfg.clone();
-    guarded.fetch_allow_loopback = test.is_some();
-    let client =
-        crate::families::web::http_client(&guarded).map_err(|_| OpenError::Transient("client".into()))?;
-    let resp = client
-        .post(format!("{base}/apps.connections.open"))
-        .bearer_auth(token.expose_secret())
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| {
-            OpenError::Transient(if e.is_timeout() { "timeout".into() } else { "transport".into() })
-        })?;
-    let status = resp.status();
-    let mut body = Vec::new();
-    let mut resp = resp;
-    while let Some(chunk) = resp.chunk().await.map_err(|_| OpenError::Transient("transport".into()))? {
-        if body.len() + chunk.len() > OPEN_RESPONSE_MAX {
-            return Err(OpenError::Transient("response_too_large".into()));
+    let rules =
+        if test.is_some() { policy::SLACK_WEB_API.loopback_test_hook() } else { policy::SLACK_WEB_API };
+    let client = Outbound::new(rules).map_err(|_| OpenError::Transient("client".into()))?;
+    let url = url::Url::parse(&format!("{base}/apps.connections.open")).map_err(|_| transport())?;
+    let req = Request::post(url)
+        .secret_header("Authorization", &format!("Bearer {}", token.expose_secret()))
+        .and_then(|r| r.header("Content-Type", "application/x-www-form-urlencoded"))
+        .map_err(|_| transport())?;
+    let resp = client.send(req).await.map_err(|e| match e {
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => {
+            OpenError::Transient("timeout".into())
         }
-        body.extend_from_slice(&chunk);
-    }
+        _ => transport(),
+    })?;
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| match e {
+        OutboundError::TooLarge { .. } => OpenError::Transient("response_too_large".into()),
+        _ => transport(),
+    })?;
     if !status.is_success() {
         return Err(OpenError::Transient(format!("http_{}", status.as_u16())));
     }

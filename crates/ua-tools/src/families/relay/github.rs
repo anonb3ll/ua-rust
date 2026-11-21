@@ -4,22 +4,21 @@
 //! `relay_github_repos`. The token is a managed secret named by
 //! `relay_github_secret` and bound to consumer `relay:github`; it is loaded
 //! in-process at send time and sent only as the `Authorization` header to
-//! `relay_github_api_url`. Requests go through the web family's client: no
-//! redirects, no proxy, a 20-second timeout, and non-public addresses refused.
+//! `relay_github_api_url`. Requests go through `ua_ingress::Outbound` under
+//! the `relay.github` policy: https, no redirects, no proxy, non-public
+//! addresses refused at connect time, a 256 KiB reply, 20 seconds.
 
 use reqwest::Url;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
 
 use crate::families::audit::rules::redact_secrets;
-use crate::families::web::{error_chain, http_client, vet_url};
+use crate::families::web::{hooked, outbound_error};
+use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
 
 /// The managed-secret consumer the relay's GitHub token must be bound to.
 pub const CONSUMER: &str = "relay:github";
-/// Largest response body read.
-const MAX_REPLY_BYTES: usize = 256 * 1024;
 const ERROR_CHARS: usize = 300;
 
 /// An issue or pull request in one repository.
@@ -127,15 +126,10 @@ fn clean(s: &str) -> String {
     redact_secrets(s).0.chars().take(ERROR_CHARS).collect()
 }
 
-async fn read_capped(mut resp: reqwest::Response) -> Vec<u8> {
-    let mut body = Vec::new();
-    while let Ok(Some(chunk)) = resp.chunk().await {
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_REPLY_BYTES {
-            break;
-        }
-    }
-    body
+/// The reply, cut at the policy's cap (a cut reply does not parse as JSON
+/// and reads as no reply).
+async fn read_capped(resp: Response) -> Vec<u8> {
+    resp.body().await.map(|b| b.bytes).unwrap_or_default()
 }
 
 /// Post `body` as a comment on `t`.
@@ -155,34 +149,38 @@ pub async fn post_comment(cfg: &Config, token: &SecretString, t: &Target, body: 
         Ok(u) => u,
         Err(_) => return failed("could not build the GitHub API URL".into()),
     };
-    if let Err(e) = vet_url(&url, cfg.fetch_allow_loopback).await {
-        return failed(e.to_string());
-    }
-    let client = match http_client(cfg) {
+    let client = match Outbound::new(hooked(cfg, policy::RELAY_GITHUB)) {
         Ok(c) => c,
         Err(e) => return failed(e.to_string()),
     };
-    let mut auth = match HeaderValue::from_str(&format!("Bearer {}", token.expose_secret().trim())) {
-        Ok(v) => v,
+    let auth = format!("Bearer {}", token.expose_secret().trim());
+    let req = match Request::post(url.clone()).secret_header("Authorization", &auth) {
+        Ok(r) => r,
         Err(_) => return failed("the relay's GitHub token is not a valid header value".into()),
     };
-    auth.set_sensitive(true);
-    let sent = client
-        .post(url)
-        .header(AUTHORIZATION, auth)
-        .header(ACCEPT, HeaderValue::from_static("application/vnd.github+json"))
-        .header("X-GitHub-Api-Version", HeaderValue::from_static("2022-11-28"))
-        .json(&json!({ "body": body }))
-        .send()
-        .await;
-    let resp = match sent {
+    let req = req
+        .header("Accept", "application/vnd.github+json")
+        .and_then(|r| r.header("X-GitHub-Api-Version", "2022-11-28"))
+        .and_then(|r| r.json(&json!({ "body": body })));
+    let req = match req {
+        Ok(r) => r,
+        Err(e) => return failed(e.to_string()),
+    };
+    let resp = match client.send(req).await {
         Ok(r) => r,
         Err(e) => {
-            let error = clean(&error_chain(&e));
-            return if e.is_connect() || e.is_builder() {
-                Outcome::Failed { http_status: None, error }
-            } else {
-                Outcome::Uncertain { http_status: None, error }
+            let host = url.host_str().unwrap_or_default();
+            return match e {
+                // Refused before anything was sent: the old address check's
+                // message, as before.
+                OutboundError::AddressRefused { .. }
+                | OutboundError::Lookup { .. }
+                | OutboundError::UrlRefused { .. } => failed(outbound_error(host, e).to_string()),
+                // Nothing left the hub: no connection, or no request built.
+                OutboundError::NotSent { why, .. } => {
+                    Outcome::Failed { http_status: None, error: clean(&why) }
+                }
+                other => Outcome::Uncertain { http_status: None, error: clean(&other.to_string()) },
             };
         }
     };
