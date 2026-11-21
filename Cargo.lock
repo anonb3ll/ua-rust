@@ -5178,11 +5178,13 @@ name = "ua-ingress"
 version = "0.1.0"
 dependencies = [
  "reqwest 0.13.5",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "tokio",
  "ua-core",
+ "ua-store",
  "url",
 ]
 

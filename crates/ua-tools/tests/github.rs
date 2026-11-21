@@ -1298,3 +1298,156 @@ async fn a_failed_merge_keeps_the_policy_authorization() {
     assert_eq!(reason(&e), "policy_authorization_mismatch", "{e:?}");
     assert_eq!(h.events("agent.github.policy_authorization.revoked").await.len(), 1);
 }
+
+// --- inbound deliveries: the crash window and the copy of old rows -------------------------
+
+fn body_hash(payload: &Value) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(serde_json::to_vec(payload).unwrap()))
+}
+
+/// Leave the two records of `id` as a process that took the delivery on and
+/// stopped before handling it would: `accepted`, under `claim`, `age_s` ago.
+async fn leave_in_flight(h: &H, id: &str, payload: &Value, claim: &str, age_s: i64) {
+    let (id, hash, claim) = (id.to_string(), body_hash(payload), claim.to_string());
+    let at = ua_core::time::now_ms() / 1000 - age_s;
+    h.hub
+        .db()
+        .write(move |tx| {
+            for (kind, key) in [("delivery_id", &id), ("body_sha256", &hash)] {
+                tx.execute(
+                    "INSERT INTO inbound_deliveries (org_id, source, kind, delivery_key, state, received_at, \
+                     updated_at, expires_at, claim) VALUES ('default', 'github', ?1, ?2, 'accepted', ?3, ?3, ?4, ?5)",
+                    rusqlite::params![kind, key, at, at + 30 * 86_400, claim],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_delivery_taken_on_before_a_crash_is_processed_when_redelivered() {
+    let h = H::new().await;
+    h.bind().await;
+    let t = h.task("crashed", Some("example/repo#7")).await;
+    let payload = merged_payload(7);
+    // The hub stopped between recording the delivery and handling it.
+    leave_in_flight(&h, "crashed", &payload, "a-stopped-process", 30).await;
+    let done = h.deliver("pull_request", "crashed", &payload).await.unwrap();
+    assert_eq!(done["handled"], "closed_on_merge", "{done}");
+    assert_eq!(h.get_task(t).await["status"], "done");
+    let received = h.events("agent.github.webhook.received").await;
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["payload"]["redelivered"], true, "{received:?}");
+    // Now it is finished: a further copy is a replay, under either key.
+    assert_eq!(h.deliver("pull_request", "crashed", &payload).await.unwrap_err(), WebhookError::Replayed);
+    assert_eq!(h.deliver("pull_request", "other-id", &payload).await.unwrap_err(), WebhookError::Replayed);
+}
+
+#[tokio::test]
+async fn a_delivery_still_in_flight_here_is_a_replay_until_the_bound() {
+    let h = H::new().await;
+    h.bind().await;
+    let ping = json!({ "zen": "in flight", "repository": { "full_name": REPO } });
+    // Taken on by this very process a minute ago: a second copy is refused,
+    // as before (the first may still be handling it).
+    leave_in_flight(&h, "busy", &ping, ua_ingress::inbound::claim(), 60).await;
+    assert_eq!(h.deliver("ping", "busy", &ping).await.unwrap_err(), WebhookError::Replayed);
+    // Past the 15-minute bound it is taken on again.
+    let late = json!({ "zen": "stuck", "repository": { "full_name": REPO } });
+    leave_in_flight(&h, "stuck", &late, ua_ingress::inbound::claim(), 16 * 60).await;
+    assert_eq!(h.deliver("ping", "stuck", &late).await.unwrap()["handled"], "ping");
+}
+
+#[tokio::test]
+async fn a_delivery_refused_by_its_handler_stays_a_replay() {
+    // A merged pull request without a merge commit is a bad request; the
+    // delivery is finished, not released, so GitHub's redelivery is refused
+    // as before.
+    let h = H::new().await;
+    h.bind().await;
+    let mut payload = merged_payload(9);
+    payload["pull_request"]["merge_commit_sha"] = Value::Null;
+    assert!(matches!(h.deliver("pull_request", "bad", &payload).await, Err(WebhookError::BadRequest(_))));
+    assert_eq!(h.deliver("pull_request", "bad", &payload).await.unwrap_err(), WebhookError::Replayed);
+}
+
+#[tokio::test]
+async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
+    use ua_store::Part;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path().join("home"));
+    cfg.github_webhook_secret_value = Some(SECRET.to_string().into());
+    let new_parts = ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy"];
+    let old: Vec<Part> =
+        ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
+    assert_eq!(old.len() + 3, ua_tools::schema_parts().len());
+    let ping = json!({ "zen": "before the upgrade", "repository": { "full_name": REPO } });
+    let hash = body_hash(&ping);
+    let seen_at = ua_core::time::now();
+    {
+        // A hub from before this change, which saw one delivery.
+        let db = ua_store::Db::open(&cfg.db_path(), &old).unwrap();
+        let (h2, at) = (hash.clone(), seen_at.clone());
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO github_deliveries (delivery_id, event, received_at) VALUES ('old-1', 'ping', ?1)",
+                [&at],
+            )?;
+            tx.execute(
+                "INSERT INTO github_delivery_bodies (body_sha256, delivery_id, received_at) VALUES (?1, 'old-1', ?2)",
+                [&h2, &at],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let hub = Hub::open(cfg).unwrap();
+    let copied: Vec<(String, String, String, i64, i64)> = hub
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT kind, delivery_key, state, received_at, expires_at - received_at FROM inbound_deliveries \
+                 WHERE source = 'github' ORDER BY kind",
+            )?;
+            Ok(stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    let at = ua_core::time::parse_ts(&seen_at).unwrap().as_second();
+    assert_eq!(
+        copied,
+        [
+            ("body_sha256".to_string(), hash.clone(), "finished".to_string(), at, 30 * 86_400),
+            ("delivery_id".to_string(), "old-1".to_string(), "finished".to_string(), at, 30 * 86_400),
+        ]
+    );
+    // The copy is idempotent: running it again adds nothing.
+    let again = ua_tools::families::github::INBOUND_COPY;
+    hub.db()
+        .write(|tx| (again.run)(tx, again.args).map(|_| ()).map_err(|e| UaError::internal(e.to_string())))
+        .unwrap();
+    let rows: i64 = hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM inbound_deliveries", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(rows, 2);
+    // Replays of what the old hub saw are refused, by id and by body.
+    let body = serde_json::to_vec(&ping).unwrap();
+    let sig = signature_for(SECRET.as_bytes(), &body);
+    for id in ["old-1", "new-id"] {
+        let r = receive(
+            &hub,
+            WebhookDelivery { event: "ping", delivery_id: id, signature: Some(&sig), body: &body },
+        );
+        assert_eq!(r.await.unwrap_err(), WebhookError::Replayed, "{id}");
+    }
+    // The old tables are left as they were: unread, unwritten.
+    let old_rows: i64 = hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM github_deliveries", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(old_rows, 1);
+}

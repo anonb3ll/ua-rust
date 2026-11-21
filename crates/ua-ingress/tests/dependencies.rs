@@ -1,7 +1,7 @@
-//! Dependency direction: `ua-ingress` sits just above `ua-core`. It depends
-//! on no other workspace crate, and only `ua-tools` and `ua-server` depend
-//! on it, so the order core → store → organization → families → server/CLI
-//! stays one-way.
+//! Dependency direction: `ua-ingress` sits just above `ua-core` and
+//! `ua-store`. It depends on no other workspace crate, and only `ua-tools`
+//! and `ua-server` depend on it, so the order core → store → organization →
+//! families → server/CLI stays one-way.
 
 use std::process::Command;
 
@@ -19,7 +19,7 @@ fn metadata() -> Value {
 }
 
 #[test]
-fn ua_ingress_depends_only_on_ua_core_and_only_families_and_server_depend_on_it() {
+fn ua_ingress_depends_only_on_core_and_store_and_only_families_and_server_depend_on_it() {
     let meta = metadata();
     let packages = meta["packages"].as_array().expect("packages");
     let members: Vec<&str> = packages.iter().filter_map(|p| p["name"].as_str()).collect();
@@ -36,7 +36,11 @@ fn ua_ingress_depends_only_on_ua_core_and_only_families_and_server_depend_on_it(
         deps_of("ua-ingress").into_iter().filter(|d| members.contains(&d.as_str())).collect();
     ours.sort();
     ours.dedup();
-    assert_eq!(ours, ["ua-core"], "ua-ingress may depend on ua-core and third-party crates only");
+    assert_eq!(
+        ours,
+        ["ua-core", "ua-store"],
+        "ua-ingress may depend on ua-core, ua-store and third-party crates only"
+    );
 
     let mut dependents: Vec<&str> =
         members.iter().copied().filter(|m| deps_of(m).iter().any(|d| d == "ua-ingress")).collect();

@@ -158,6 +158,75 @@ Not guaranteed:
 - Code that builds its own `reqwest` client gets none of this. That is what
   the ratchet below tracks.
 
+## Inbound deliveries
+
+`ua_ingress::inbound` is the one table that remembers what other systems
+sent: `inbound_deliveries`, keyed by `(org_id, source, kind,
+delivery_key)`. `source` names the sender (`github`), `kind` what the key is
+(`delivery_id`, `body_sha256`). Each row has a state, `received_at`,
+`updated_at` and `expires_at` (Unix seconds), the claim of the process that
+took it on, an optional identity, and a free-text `detail`.
+
+| State | Meaning | A repeat is |
+|---|---|---|
+| `seen` | Recorded, not taken on | a duplicate |
+| `accepted` | Taken on under this process's claim | a duplicate while the claim is live; stale once the claim belongs to a stopped process or the in-flight bound passes |
+| `finished` | Handled | a duplicate until the row expires |
+| `abandoned` | Was `accepted`, claim gone or past the bound; outcome unknown | stale |
+
+What a stale repeat means is the caller's rule (`Stale`): `Redeliver` takes
+it on again (for idempotent effects), `Duplicate` refuses it.
+
+A caller, inside one write transaction that also holds its own records (its
+ledger event, for one):
+
+1. `sweep(source, now, rules)`: abandon `accepted` rows whose claim is gone
+   or past `abandon_after_s`, delete expired rows (never an `accepted` one),
+   and keep at most `max_per_kind` rows per organization and kind (never
+   dropping an `accepted` one). Stuck rows are marked `abandoned` rather
+   than released: the sweep cannot know whether their effects happened, and
+   releasing one would let a non-idempotent delivery run again unnoticed.
+   They are returned, so a caller can record them.
+2. `record(delivery, now, rules, detail)`: `First`, `Duplicate { state }`
+   or `Redelivered { was }`.
+3. `accept(delivery, now, identity)` when it takes the delivery on.
+
+Then, after handling, in a second transaction: `finish` when it is done,
+or `release` when a retry should be processed as a first sight. One hub
+process writes the database, so a claim that is not the current process's
+belongs to one that stopped.
+
+The table is a tenant table: `org_id NOT NULL` from its first part
+(`ingress.inbound.v1`) and the generated triggers from
+`organization.v1.ingress`. Both are registered by `ua_tools::schema_parts`
+after the family parts.
+
+### GitHub webhook
+
+The webhook records the delivery id and the body hash as two kinds, with
+30 days of retention, at most 20 000 of each, a 15-minute in-flight bound
+and `Stale::Redeliver`:
+
+| Case | Before | Now |
+|---|---|---|
+| First delivery | recorded, handled, 200 | the same |
+| The same delivery id again | 409 `replayed` | the same |
+| The same body under a new id | 409 `replayed`; the new id is not kept | the same |
+| A redelivery after the hub stopped between recording and handling | 409 `replayed`: the event was lost | handled, 200; ledgered with `"redelivered": true` |
+| A redelivery after handling failed with an internal error | handled (the records were deleted) | handled (the records are released) |
+| A redelivery after handling refused the payload (400) | 409 `replayed` | the same (the records are finished) |
+| A second copy while the first is still being handled here | 409 `replayed` | the same, until the 15-minute bound |
+
+`github.inbound.v1.copy` (a procedure part) copies the rows of the old
+`github_deliveries` and `github_delivery_bodies` into the table as
+`finished`, keeping their receipt times, so a hub upgraded between two
+copies of one delivery still refuses the second. A row that was in the
+crash window at the upgrade is copied as `finished` too: its redelivery is
+refused, as it was before. The old tables stay in the schema, unread and
+unwritten, and are dropped one release later. The importer does not map
+them from the Python hub (they are reported as unmapped), and it does not
+map `inbound_deliveries` either.
+
 ## The ratchet
 
 `crates/ua-ingress/tests/ingress_guard.rs` scans the non-test source of
@@ -198,7 +267,7 @@ category is caught, and that the lookalikes above are not. Baselines:
 | `ua-tools` | `client_builder` | 4 | `github/client`, `mcp/gateway`, `notify`, `vault/obsidian` (`web::http_client` was removed when its consumers moved onto `Outbound`) |
 | `ua-tools` | `address_classifier` | 4 | `mcp/scope.rs` `classify`, `classify_v4`; `relay/gates.rs` `v4_kind`, `v6_kind` |
 | `ua-tools` | `inline_address_check` | 11 | loopback URL hosts in `slack.rs`, `zulip.rs`, `github/client.rs`, `harness_config/policy.rs` (2 each); `observability.rs` (2); `vault/obsidian.rs` (1) |
-| `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies`, `slack_seen_signatures`, `slack_seen_deliveries` |
+| `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies` (still created, no longer read or written; dropped one release later), `slack_seen_signatures`, `slack_seen_deliveries`. `inbound_deliveries` is in `ua-ingress` and not counted |
 
 `web::vet_ip` was counted as a classifier when the crate landed; it only
 calls `ua_ingress::addr`, so it no longer counts.
@@ -225,7 +294,8 @@ plain http, any host and port; everything else unchanged.
    the MCP gateway, notify webhooks, the Obsidian client, the client ID
    metadata fetch; the web, Zulip, relay and Slack Web API consumers have
    moved).
-2. One inbound-delivery table, with a cut-over for GitHub deliveries.
+2. One inbound-delivery table, with a cut-over for GitHub deliveries
+   (done: [Inbound deliveries](#inbound-deliveries)).
 3. Slack's signed HTTP routes and Socket Mode onto it.
 4. GitHub REST and the MCP gateway.
 5. Retire the old delivery tables one release later.

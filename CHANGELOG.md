@@ -36,6 +36,15 @@ from its commit history.
   counts connections dialled by hand, inline address range checks, and
   delivery tables recognised by name marks or columns instead of a fixed
   list. No change for Slack replies, which follow no redirect.
+- `ua-ingress::inbound`: one inbound-delivery table, `inbound_deliveries`
+  (parts `ingress.inbound.v1`, `organization.v1.ingress`; a tenant table
+  from birth), with `record`, `accept`, `finish`, `release` and `sweep` and
+  the states `seen`, `accepted`, `finished`, `abandoned`. The GitHub
+  webhook's delivery-id and body-hash checks moved onto it;
+  `github.inbound.v1.copy` carries the rows of `github_deliveries` and
+  `github_delivery_bodies` across, and those two tables stay, unread and
+  unwritten, until a later release drops them. `ua-ingress` now depends on
+  `ua-store`.
 - `ua-ingress`: once a redirect chain leaves the request's origin, the
   caller's headers and secret headers are dropped for the rest of the
   chain, including a hop back to the original origin (only `Accept` and
@@ -241,6 +250,12 @@ from its commit history.
   `proc_pidinfo`.
 
 ### Behaviour changes
+
+- GitHub webhook: a delivery that the hub recorded but never finished
+  handling (it stopped in between, or the delivery has been in flight for
+  15 minutes) is processed when GitHub redelivers it, instead of being
+  refused as a replay and lost. Its `agent.github.webhook.received` event
+  carries `"redelivered": true`. Every other response is unchanged.
 
 - Operator authority is a verified caller of kind human, nothing else.
   Dispatch and governance agree on it: acting for another agent in dispatch,
