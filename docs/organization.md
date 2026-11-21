@@ -39,8 +39,24 @@ here for memory columns, owners and defaults.
 - A rollback fence: opening the store, and every append, refuses a ledger
   whose newest row has a `hash_v` above the build's.
 
-Not yet: `Caller.org_id` and `Caller::system_for`, `EventInput` taking an
-`org_id`, the tenant parts, the label and launch-key indexes, the
+- `Caller.org_id` (always `DEFAULT_ORG`; a serialized caller without it
+  reads as the default) and `Caller::system_for(org_id)`, with
+  `Caller::system()` in the default organization. A source test
+  (`crates/ua-core/tests/org_guard.rs`, over every crate's non-test source)
+  fails if a `Caller` literal, an `EventInput`, or an `.org_id =`
+  assignment names any organization but `DEFAULT_ORG` (a caller's
+  organization included), or if anything calls `system_for`, before
+  memberships exist.
+- `EventInput::new(org_id, …)` with `Default` removed, so every event names
+  its organization; every site passes `ua_core::DEFAULT_ORG`, the
+  organization of the affected row, never the caller's. `append` writes
+  `org_id` and `hash_v` explicitly, and refuses an organization `orgs` does
+  not hold. On a ledger from before
+  `organization.v1.store` (an older backup just restored) it writes the old
+  row shape, and refuses any organization other than the default rather than
+  drop it. `org_id` is still not covered by the hash.
+
+Not yet: the tenant parts, the label and launch-key indexes, the
 `memory_versions_capture` trigger, `hash_v = 2`, and everything after
 `organization.v1`.
 

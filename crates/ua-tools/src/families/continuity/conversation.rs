@@ -190,6 +190,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     CHANNEL,
                     json!({ "conversation_id": c2, "task_id": task_id, "created": created, "by": a2 }),
                 )

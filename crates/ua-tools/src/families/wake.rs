@@ -202,7 +202,7 @@ fn ts_f(s: Option<&str>) -> Option<f64> {
 
 fn record(tx: &mut WriteTx<'_>, channel: &str, kind: &str, mut payload: Value, by: &str) -> UaResult<()> {
     payload["kind"] = json!(kind);
-    ledger::append(tx, EventInput::new(channel, payload).by(by.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
     Ok(())
 }
 
@@ -932,8 +932,12 @@ fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[S
             revived += 1;
             ledger::append(
                 tx,
-                EventInput::new(CHANNEL_REVIVED, json!({ "session_id": id, "agent": agent, "node": name }))
-                    .by(identity.to_string()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    CHANNEL_REVIVED,
+                    json!({ "session_id": id, "agent": agent, "node": name }),
+                )
+                .by(identity.to_string()),
             )?;
         }
     }
@@ -1481,6 +1485,7 @@ mod tests {
             enforce_profile: true,
             session_key: None,
             transport: Transport::Http,
+            org_id: ua_core::DEFAULT_ORG.into(),
         };
         let me = who("builder-1", ActorKind::Agent);
         reg.call(&hub, &me, "node_register", json!({ "node": "box", "facts": { "backends": ["codex"] } }))

@@ -366,7 +366,7 @@ pub async fn decide(
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.oauth.consent",
                     json!({ "client_id": p2.0, "identity": identity, "approved_by": human, "session_id": family }),
                 )

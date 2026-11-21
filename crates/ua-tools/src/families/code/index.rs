@@ -264,7 +264,7 @@ pub(super) async fn index(ctx: &ToolCtx, path: String) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             store(tx, &ws2, &prefix, &files)?;
-            ledger::append(tx, EventInput::new("agent.code.indexed", event).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.code.indexed", event).by(by))?;
             Ok(())
         })
         .await?;

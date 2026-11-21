@@ -162,7 +162,7 @@ async fn mcp_gateway(ctx: ToolCtx, a: GatewayArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new(CALL_CHANNEL, payload).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CALL_CHANNEL, payload).by(by))?;
             Ok(())
         })
         .await;

@@ -722,6 +722,7 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "skill.published",
                     json!({
                         "name": staged.name,
@@ -835,7 +836,7 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         )?;
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "skill.assigned",
                 json!({ "name": name, "target_type": ttype, "target": target, "version": pin }),
             )
@@ -894,7 +895,7 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         if removed > 0 {
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "skill.unassigned",
                     json!({ "name": name, "target_type": ttype, "target": target }),
                 )

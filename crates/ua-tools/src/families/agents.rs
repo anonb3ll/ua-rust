@@ -189,9 +189,13 @@ pub(crate) fn touch_agent(
     if !existed {
         ledger::append(
             tx,
-            EventInput::new("agent.agent.registered", json!({ "label": label, "kind": kind, "via": via }))
-                .by(label.to_string())
-                .dedupe(format!("agent.registered:{label}")),
+            EventInput::new(
+                ua_core::DEFAULT_ORG,
+                "agent.agent.registered",
+                json!({ "label": label, "kind": kind, "via": via }),
+            )
+            .by(label.to_string())
+            .dedupe(format!("agent.registered:{label}")),
         )?;
     }
     Ok(!existed)
@@ -221,8 +225,12 @@ pub(crate) fn reap(tx: &mut WriteTx<'_>) -> UaResult<usize> {
     }
     ledger::append(
         tx,
-        EventInput::new("agent.session.reaped", json!({ "session_ids": ids, "count": ids.len() }))
-            .by("system"),
+        EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "agent.session.reaped",
+            json!({ "session_ids": ids, "count": ids.len() }),
+        )
+        .by("system"),
     )?;
     Ok(ids.len())
 }
@@ -821,7 +829,7 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
             if created {
                 ledger::append(
                     tx,
-                    EventInput::new(
+                    EventInput::new(ua_core::DEFAULT_ORG,
                         "agent.session.started",
                         json!({
                             "session_id": session_id, "agent": label, "kind": kind, "task_id": task_id,
@@ -833,7 +841,7 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
             } else if let Some(previous) = &reopened_from {
                 ledger::append(
                     tx,
-                    EventInput::new(
+                    EventInput::new(ua_core::DEFAULT_ORG,
                         "agent.session.reopened",
                         json!({ "session_id": session_id, "agent": label, "previous_status": previous }),
                     )
@@ -914,6 +922,7 @@ async fn session_end(ctx: ToolCtx, a: SessionEndArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.session.ended",
                     json!({
                         "session_id": session_id, "agent": owner, "status": status,
@@ -1021,7 +1030,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
                     }),
                     originator: Some(agent),
                     episode_id: session_id.clone(),
-                    ..EventInput::default()
+                    org_id: ua_core::DEFAULT_ORG.into(),
+                    dedupe_key: None,
+                    causal_parent_id: None,
                 },
             )?
             .ok_or_else(|| UaError::internal("lifecycle event was not appended"))?;

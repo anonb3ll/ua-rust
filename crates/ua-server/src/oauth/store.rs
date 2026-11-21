@@ -238,7 +238,7 @@ pub fn issue_tokens(
     tx.execute("UPDATE oauth_clients SET last_used_at = ?2 WHERE client_id = ?1", params![g.client_id, now])?;
     ledger::append(
         tx,
-        EventInput::new(
+        EventInput::new(ua_core::DEFAULT_ORG,
             "agent.oauth.token_issued",
             json!({ "client_id": g.client_id, "identity": g.subject, "session_id": g.family_id, "refresh": with_refresh }),
         )

@@ -888,7 +888,7 @@ async fn mcp_server_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "registered", "name": name, "spec_sha256": sha, "review_expires_at": expires,
                             "approval_id": approval_id }),
@@ -959,7 +959,7 @@ async fn mcp_server_review(ctx: ToolCtx, a: ReviewArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "reviewed", "name": name, "spec_sha256": server.spec_sha256,
                             "review_expires_at": expires, "approval_id": approval_id }),
@@ -1024,7 +1024,7 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "revoked", "name": name, "spec_sha256": server.spec_sha256, "approval_id": approval_id,
                             "orphaned_secrets": orphaned }),

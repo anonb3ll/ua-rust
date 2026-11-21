@@ -279,7 +279,7 @@ fn create_fire(
         let task_id = tx.last_insert_rowid();
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.task.created",
                 json!({ "task_id": task_id, "routine_id": id, "status": if status == "queued" { "blocked" } else { "open" } }),
             )
@@ -295,7 +295,7 @@ fn create_fire(
     let run_row = tx.last_insert_rowid();
     ledger::append(
         tx,
-        EventInput::new(
+        EventInput::new(ua_core::DEFAULT_ORG,
             "agent.routine.fired",
             json!({ "routine_id": id, "fire_key": fire_key, "status": status, "task_id": task_id, "reason": reason }),
         )
@@ -334,6 +334,7 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.routine.released",
                 json!({ "routine_id": routine_id, "task_id": task_id, "status": "open" }),
             )
@@ -381,6 +382,7 @@ fn owner_caller(hub: &Hub, owner: &str, attended: bool) -> Caller {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Internal,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -485,6 +487,7 @@ pub async fn reconcile_fires(hub: &Hub) -> UaResult<Value> {
                     ledger::append(
                         tx,
                         EventInput::new(
+                            ua_core::DEFAULT_ORG,
                             "agent.routine.fire_reconciled",
                             json!({ "routine_run_id": id, "workflow_status": status }),
                         )
@@ -794,7 +797,7 @@ async fn routine_add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
             let id = tx.last_insert_rowid();
             ledger::append(
                 tx,
-                EventInput::new("agent.routine.added", json!({ "routine_id": id, "trigger": a.trigger }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.routine.added", json!({ "routine_id": id, "trigger": a.trigger }))
                     .by(owner.clone()),
             )?;
             Ok(json!({ "id": id }))
@@ -870,7 +873,7 @@ async fn routine_pause(ctx: ToolCtx, a: PauseArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.routine.paused",
                     json!({ "routine_id": a.routine_id, "paused": a.paused, "previous_paused": previous }),
                 )

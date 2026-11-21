@@ -57,6 +57,7 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.memory.deleted",
                 json!({ "id": id, "owner": n.author, "actor": actor, "by_human": human }),
             )
@@ -149,7 +150,7 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.memory.restored",
                     json!({ "id": id, "was_deleted": true, "restored_version": version, "actor": actor }),
                 )
@@ -184,7 +185,7 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
         tx.execute("UPDATE memory SET superseded_by = NULL, valid_to = NULL WHERE id = ?1", [&id])?;
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.memory.restored",
                 json!({ "id": id, "was_superseded_by": was, "actor": actor }),
             )
@@ -219,7 +220,12 @@ pub async fn feedback(db: &Db, caller: &Caller, id: String, signal: String) -> U
         tx.execute(&format!("UPDATE memory SET {column} = {column} + 1{upvote} WHERE id = ?1"), [&id])?;
         ledger::append(
             tx,
-            EventInput::new("agent.memory.feedback", json!({ "id": id, "signal": signal })).by(label),
+            EventInput::new(
+                ua_core::DEFAULT_ORG,
+                "agent.memory.feedback",
+                json!({ "id": id, "signal": signal }),
+            )
+            .by(label),
         )?;
         let n = note::require(tx, &id)?;
         let open = note::open_contradictions(tx, None)?.get(&id).copied().unwrap_or(0);
