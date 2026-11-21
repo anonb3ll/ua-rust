@@ -378,7 +378,7 @@ fn check_reader(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
         ));
     }
     let allowed = if server.spec.read_profiles.is_empty() {
-        "humans and configured operator identities (read_profiles is empty)".to_string()
+        "operators, that is verified humans (read_profiles is empty)".to_string()
     } else {
         server.spec.read_profiles.join(", ")
     };
