@@ -517,7 +517,7 @@ async fn dynamic_registration_rules() {
     assert!(m.get("registration_endpoint").is_none());
 }
 
-// --- client_credentials refusals (hub #2660) ----------------------------------------
+// --- client_credentials refusals -----------------------------------------------------
 
 const CC_SECRET: &str = "test-client-secret-value";
 

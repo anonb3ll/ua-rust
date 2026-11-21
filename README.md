@@ -34,12 +34,15 @@ a rule is written once and holds for every client.
 | Crate | Holds |
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
-| `ua-store` | SQLite storage, migrations, repositories, the event ledger |
+| `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
 | `ua-cli` | The `ua` binary |
+
+The TypeScript SDK (protocol and client packages) is in `sdk/typescript`, and
+the Slack routes and Socket Mode are described in [docs/slack.md](docs/slack.md).
 
 Library choices and the reasons for them are in [docs/stack.md](docs/stack.md).
 
@@ -182,15 +185,18 @@ vulnerability.
 
 ## Not yet ported
 
-Native-session resume and adopt, cloud executors, ACP, Slack interactions,
+Native-session resume and adopt, cloud executors, Slack interactions,
 bot-token posting and live chat (slash commands and events are in),
-role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
-installation flow), session-handoff failover, the SDK's
-queue-health and node-session routes (`/api/queue-health`,
-`/api/action/node-session`), the provenance graph and evidence export, billing
-and usage ledgers, and tenancy (`org_id`). Work products
+role workflows, GitHub writes other than the relay's approved comments
+(labels, held PRs, the GitHub App installation flow), session-handoff
+failover, the SDK's queue-health and node-session routes
+(`/api/queue-health`, `/api/action/node-session`, which no route serves), the
+provenance graph and evidence export (`/api/platform/*` paths other than the
+manifest and objects, and `/api/evidence/export`, answer 501), discovered
+native sessions (`/api/nodes/*` other than `/api/nodes/acceptance`, 501),
+billing and usage ledgers, and tenancy (`org_id`). Work products
 (`/api/work-products*`) are not ported pending an explicit product decision
-(hub task #2658) and answer 501.
+and answer 501.
 
 ## License
 

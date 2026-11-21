@@ -170,7 +170,7 @@ events the same way.
 | `org_unit`, `org_proposal`, `agent_token` platform objects | not declared |
 
 Work products (submit, named-reviewer approval, release) are not ported
-pending an explicit product decision; hub task #2658 lists the options.
+pending an explicit product decision.
 Until that decision, `/api/work-products*` answers `501` and the manifest
 lists `work_product` with `served: false`.
 
