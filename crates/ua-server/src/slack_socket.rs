@@ -59,20 +59,37 @@ struct Timings {
     /// How often the hub pings Slack. Two pings in a row with no pong drop
     /// the connection too.
     ping_every: Duration,
+    /// Slack must say `hello` within this long of the handshake; pings and
+    /// pongs do not count.
+    hello: Duration,
+    /// How long one envelope may take to be admitted before it is
+    /// acknowledged anyway (Slack wants an acknowledgement within about 3
+    /// seconds). Kept below `idle`.
+    ack: Duration,
 }
 
 impl Timings {
     fn new(test: bool) -> Self {
         if test {
-            Self { idle: Duration::from_millis(600), ping_every: Duration::from_millis(150) }
+            Self {
+                idle: Duration::from_millis(1500),
+                ping_every: Duration::from_millis(150),
+                hello: Duration::from_millis(1500),
+                ack: Duration::from_millis(500),
+            }
         } else {
-            Self { idle: Duration::from_secs(120), ping_every: Duration::from_secs(30) }
+            Self {
+                idle: Duration::from_secs(120),
+                ping_every: Duration::from_secs(30),
+                hello: Duration::from_secs(30),
+                ack: Duration::from_millis(2500),
+            }
         }
     }
 }
-/// How long one envelope may take to be admitted before it is acknowledged
-/// anyway (Slack wants an acknowledgement within about 3 seconds).
-const ACK_DEADLINE: Duration = Duration::from_millis(2500);
+/// Envelopes of one connection admitted at the same time. One past that is
+/// not acknowledged (and not admitted), so Slack redelivers it later.
+const MAX_IN_FLIGHT: usize = 32;
 /// Longest envelope id accepted.
 const MAX_ENVELOPE_ID: usize = 128;
 
@@ -262,16 +279,29 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
         .await
         .map_err(|_| "WebSocket handshake timed out".to_string())?
         .map_err(|_| "WebSocket handshake failed".to_string())?;
+    tracing::debug!("Slack Socket Mode: WebSocket handshake done");
     let (mut sink, mut stream) = ws.split();
     let mut hello = false;
     let mut ping = tokio::time::interval(t.ping_every);
+    // A late tick (the runtime was busy) is not made up with a burst of
+    // pings that would trip the unanswered-ping check.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
     // One deadline, reset only by an incoming frame: a peer that goes silent
     // without a reset (NAT timeout, a suspended machine) is noticed even
-    // while the hub keeps pinging, and so is one that never says `hello`.
+    // while the hub keeps pinging.
     let idle = tokio::time::sleep(t.idle);
     tokio::pin!(idle);
+    // A second deadline only `hello` satisfies: a peer that answers pings
+    // but never says `hello` is not kept forever.
+    let hello_deadline = tokio::time::sleep(t.hello);
+    tokio::pin!(hello_deadline);
     let mut unanswered = 0u32;
+    // Envelopes are admitted on their own tasks, so the socket keeps being
+    // read (pongs included) while one is slow; their acknowledgements come
+    // back here and are written in the order they are ready.
+    let (ack_tx, mut acks) = tokio::sync::mpsc::channel::<Value>(MAX_IN_FLIGHT);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     loop {
         let frame = tokio::select! {
             _ = ct.cancelled() => {
@@ -280,12 +310,17 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
                 return Ok(End::Shutdown);
             }
             _ = &mut idle => return Err("idle timeout".into()),
+            _ = &mut hello_deadline, if !hello => return Err("no hello from Slack".into()),
             _ = ping.tick() => {
                 if unanswered >= 2 {
                     return Err("two pings in a row went unanswered".into());
                 }
                 sink.send(Message::Ping(Vec::new().into())).await.map_err(|_| "ping failed".to_string())?;
                 unanswered += 1;
+                continue;
+            }
+            Some(ack) = acks.recv() => {
+                sink.send(Message::text(ack.to_string())).await.map_err(|_| "ack failed".to_string())?;
                 continue;
             }
             f = stream.next() => f,
@@ -334,9 +369,20 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
             }
             _ => {}
         }
-        if let Some(ack) = acknowledge(state, m).await {
-            sink.send(Message::text(ack.to_string())).await.map_err(|_| "ack failed".to_string())?;
-        }
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            tracing::debug!(
+                "Slack Socket Mode: too many envelopes in flight; left unacknowledged for redelivery"
+            );
+            continue;
+        };
+        let (state2, ack_tx, ack) = (state.clone(), ack_tx.clone(), t.ack);
+        state.calls.spawn(async move {
+            let _permit = permit;
+            if let Some(v) = acknowledge(&state2, m, ack).await {
+                // The connection may be gone; Slack then redelivers it.
+                let _ = ack_tx.send(v).await;
+            }
+        });
     }
 }
 
@@ -344,7 +390,7 @@ async fn session(state: AppState, url: url::Url, ct: CancellationToken, t: Timin
 /// connection, and build the acknowledgement. `None` when it cannot be
 /// acknowledged (no usable envelope id) or must not be yet (the admission
 /// transaction failed, so Slack should redeliver it).
-async fn acknowledge(state: &AppState, envelope: Map<String, Value>) -> Option<Value> {
+async fn acknowledge(state: &AppState, envelope: Map<String, Value>, deadline: Duration) -> Option<Value> {
     let id = envelope.get("envelope_id").and_then(Value::as_str).unwrap_or_default().to_string();
     if id.is_empty() || id.len() > MAX_ENVELOPE_ID || !id.bytes().all(|b| b.is_ascii_graphic()) {
         tracing::debug!("Slack Socket Mode: ignored an envelope without a usable envelope_id");
@@ -352,7 +398,7 @@ async fn acknowledge(state: &AppState, envelope: Map<String, Value>) -> Option<V
     }
     let bare = json!({ "envelope_id": id });
     let mut task = tokio::spawn(handle_envelope(state.clone(), id.clone(), envelope));
-    match tokio::time::timeout(ACK_DEADLINE, &mut task).await {
+    match tokio::time::timeout(deadline, &mut task).await {
         Ok(Ok(Some(ack))) => Some(ack),
         Ok(Ok(None)) => None,
         Ok(Err(_)) => {
@@ -367,7 +413,8 @@ async fn acknowledge(state: &AppState, envelope: Map<String, Value>) -> Option<V
         // database takes one.
         Err(_) => {
             let hub = state.hub.clone();
-            tokio::spawn(async move {
+            // On the task tracker, so a shutdown waits for it too.
+            state.calls.spawn(async move {
                 let failed = match task.await {
                     Ok(None) => Some("admission_failed_after_ack"),
                     Err(_) => Some("handler_failed_after_ack"),

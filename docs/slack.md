@@ -370,10 +370,12 @@ id or trigger id across both, so one that arrives on each runs once.
    hammer Slack). Other failures reconnect with exponential backoff and
    jitter (1 s doubling to a 60 s cap; the count starts over after a
    `hello`).
-5. Liveness: the hub pings every 30 seconds. One deadline, reset only by an
-   incoming frame (a message, ping or pong), drops a connection that has
-   been silent for two minutes, whether or not it ever said `hello`; two
-   pings in a row with no pong drop it sooner. So a peer that vanishes
+5. Liveness: the hub pings every 30 seconds (a late tick is not made up
+   with a burst). One deadline, reset only by an incoming frame (a message,
+   ping or pong), drops a connection that has been silent for two minutes;
+   two pings in a row with no pong drop it sooner; and Slack must say
+   `hello` within 30 seconds of the handshake, which pings and pongs do not
+   satisfy. So a peer that vanishes
    without a TCP reset (a NAT timeout, a suspended machine) is noticed.
    A panic inside a connection is caught: the state reads `restarting` and
    the hub reconnects with backoff.
@@ -383,9 +385,16 @@ id or trigger id across both, so one that arrives on each runs once.
    line and does not retry until `ua serve` restarts.
 
 Bounds: WebSocket messages over 1 MiB end the connection; an envelope whose
-payload is over 64 KiB is acknowledged and not acted on. One envelope is
-admitted on its own task: a failure or panic in it never ends the
-connection. If its admission transaction fails, it is not acknowledged, so
+payload is over 64 KiB is acknowledged and not acted on. Each envelope is
+admitted on its own task while the connection keeps being read (so a slow
+admission never stalls pings, pongs or other envelopes), and its single
+acknowledgement goes back to the connection when ready; acknowledgements
+may leave in a different order than the envelopes came (each is
+independent, and the event and trigger id dedupe does not depend on
+order). At most 32 envelopes per connection are in flight; one past that
+is neither admitted nor acknowledged, so Slack redelivers it. A failure or
+panic in one envelope never ends the connection, and a shutdown waits for
+envelopes in flight. If its admission transaction fails, it is not acknowledged, so
 Slack redelivers it. If admission is slower than the 2.5-second ack
 deadline, the envelope is acknowledged first and admission finishes on its
 own task; should it then fail, Slack will not redeliver it, so the hub logs

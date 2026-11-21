@@ -5224,6 +5224,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "tracing-subscriber",
  "ua-core",
  "ua-store",
  "ua-tools",
