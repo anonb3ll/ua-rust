@@ -774,6 +774,29 @@ fn org_scoped_rows_refuse_unless_the_scope_is_dropped() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 4);
 }
 
+/// The target `event_log` has an `org_id` column (`organization.v1.store`),
+/// but a source ledger row's `org_id` is still refused, never copied by name.
+#[test]
+fn a_source_ledger_org_id_is_refused_and_never_copied() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute("UPDATE event_log SET org_id = 'org-a' WHERE rowid = (SELECT MIN(rowid) FROM event_log)", [])
+        .unwrap();
+    drop(c);
+    let r = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(r.org_scoped_rows.get("event_log"), Some(&1), "{:?}", r.org_scoped_rows);
+
+    let db = target();
+    let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("event_log: 1") && msg.contains("nothing was written"), "{msg}");
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log"), 0);
+
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log WHERE org_id <> 'default' OR hash_v <> 1"), 0);
+    assert!(n(&db, "SELECT COUNT(*) FROM event_log") > 0);
+}
+
 #[test]
 fn the_dry_run_reports_org_scope_either_way() {
     let f = fixture();

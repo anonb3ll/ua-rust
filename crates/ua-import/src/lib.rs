@@ -438,8 +438,9 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     if dst_cols.is_empty() {
         bail!("target table {} does not exist; open the target with ua_import::schema_parts()", map.target);
     }
-    let (cols, unmapped): (Vec<String>, Vec<String>) =
-        src_cols.into_iter().partition(|c| dst_cols.contains(c) && Some(c.as_str()) != map.rowid_to);
+    let (cols, unmapped): (Vec<String>, Vec<String>) = src_cols
+        .into_iter()
+        .partition(|c| c != "org_id" && dst_cols.contains(c) && Some(c.as_str()) != map.rowid_to);
     let mut insert_cols = cols.clone();
     if let Some(r) = map.rowid_to {
         insert_cols.push(r.to_string());
