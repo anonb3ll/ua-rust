@@ -170,6 +170,19 @@ The port itself has copied some duplication. These are tracked the same way.
 | Most of the code living in `ua-tools` | New families go in their own crates; existing ones move out by family |
 | Tables without an organization key | A frozen list that may only shrink |
 
+## Tools kept for now
+
+The "not every tool" non-goal does not yet apply to these. The maintainer has
+decided to keep them until each has had its own review:
+
+- `horizon2_*` (connector, package and server registration)
+- `bug_worker_manage`
+- `red_team_qa`
+- `synthetic_workflow`
+
+They are not candidates for Drop. Until one is reviewed as a family, its
+disposition is Keep or Defer, never Drop.
+
 ## Open question for the maintainer
 
 Should a dropped tool keep answering for one release with a clear refusal that
