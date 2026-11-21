@@ -15,7 +15,8 @@ from its commit history.
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
 - Crate `ua-ingress` (`docs/ingress.md`): one address classifier
-  (`ua_ingress::addr`) and one guarded outbound HTTP client (`Outbound`)
+  (`ua_ingress::addr`, with a public class and a stricter global-unicast-only
+  class) and one guarded outbound HTTP client (`Outbound`)
   built from a named policy per destination class. The client ignores proxy
   settings, follows redirects only when the policy allows (checking every
   hop), caps every body read, checks addresses at connect time through its
@@ -259,18 +260,21 @@ from its commit history.
   (auth enforcement off) can read in messaging is unchanged and under review.
 
 - The web tools' and the OAuth client-metadata fetch's address checks are
-  now one classifier that refuses the union of what each refused. Newly
-  refused by the web tools (`web_fetch`, `web_search`, Zulip, the relay's
-  GitHub client, GitHub REST, Slack replies and the Socket Mode `wss` host,
-  and the public scope of `mcp_gateway` servers, which already refused
-  these): IPv4-compatible IPv6 (`::a.b.c.d`), NAT64 (`64:ff9b::/32`) and 6to4
-  (`2002::/16`) addresses that embed a public IPv4 address. On an IPv6-only
-  network behind DNS64 and NAT64, IPv4-only sites are therefore refused.
-  Newly refused by the client-metadata fetch: translated IPv6
-  (`::ffff:0:a.b.c.d`) of a non-public IPv4 address, `3fff::/20`
-  (documentation), `2001::/23` beyond Teredo (IETF protocol assignments),
-  and every IPv6 address outside `2000::/3` not refused before. Nothing is
-  allowed that was refused before.
+  now one classifier (`ua_ingress::addr`) with two named classes. Nothing is
+  allowed that was refused before. Newly refused:
+  - by the web-class callers (`web_fetch`, `web_search`, Zulip, the relay's
+    GitHub client, GitHub REST, Slack replies and the Socket Mode `wss`
+    host): the IPv4-compatible form `::a.b.c.d` of a public IPv4 address.
+    It is deprecated (RFC 4291), lies in `::/8`, which is not routed, and no
+    current transition mechanism produces it, so no reachable destination
+    uses it. NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 addresses are
+    still judged by the IPv4 address they carry, as before, so IPv6-only
+    networks behind DNS64 keep working;
+  - by the client-metadata fetch: translated IPv6 (`::ffff:0:a.b.c.d`) of a
+    non-public IPv4 address, `3fff::/20` (documentation), `2001::/23` beyond
+    Teredo (IETF protocol assignments), and every IPv6 address outside
+    `2000::/3` not refused before. It still refuses every NAT64, 6to4 and
+    IPv4-compatible address, as before.
 
 ### Security
 

@@ -9,8 +9,9 @@
 //!   (`oauth_cimd_allow`) narrows it further;
 //! - every address the host resolves to must be globally routable
 //!   (`ua_ingress::addr`: no loopback, private, link-local, CGNAT,
-//!   documentation, multicast or reserved ranges, and no IPv6 form that
-//!   embeds a non-public IPv4 address), and the connection is pinned to the vetted
+//!   documentation, multicast or reserved ranges, no NAT64, 6to4 or
+//!   IPv4-compatible form, and no IPv6 form that embeds a non-public IPv4
+//!   address), and the connection is pinned to the vetted
 //!   address, so DNS rebinding cannot swap it afterwards;
 //! - no redirects, no proxy, a 5 s timeout and a 5 KiB body cap;
 //! - at most four fetches run at once;
@@ -132,9 +133,11 @@ pub fn validate_client_id_url(client_id: &str, allow: &[String]) -> Result<Strin
     Ok(host)
 }
 
-/// True only for globally routable unicast addresses. The one classifier
-/// lives in `ua_ingress::addr`; this is a re-export of it.
-pub use ua_ingress::addr::is_public as is_public_ip;
+/// True only for globally routable unicast addresses, NAT64 and 6to4 forms
+/// refused whatever they carry. The one classifier lives in
+/// `ua_ingress::addr`; this is a re-export of its strict class
+/// (`Class::GlobalUnicastOnly`).
+pub use ua_ingress::addr::is_global_unicast as is_public_ip;
 
 /// Vet resolved addresses: every one must be public. Returns the address to
 /// pin the connection to.

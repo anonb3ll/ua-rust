@@ -1,10 +1,21 @@
 //! The address classifier: is an IP address public, and if not, why.
 //!
-//! This is the one implementation. `ua_tools::families::web::non_public_reason`
-//! and `ua_server::oauth::cimd::is_public_ip` are re-exports of it.
+//! This is the one implementation, with two named classes over the same
+//! range tables:
 //!
-//! An address is public only when it is global unicast. Refused, with the
-//! reason returned:
+//! - [`Class::Public`] (`non_public_reason`, `is_public`): what may be
+//!   reached on the public internet. `ua_tools::families::web::non_public_reason`
+//!   is a re-export of it, and the web tools, Zulip, the relay's GitHub
+//!   client, GitHub REST, Slack and the `Public` outbound policies use it.
+//! - [`Class::GlobalUnicastOnly`] (`non_global_unicast_reason`,
+//!   `is_global_unicast`): the public class, minus every IPv6 form that
+//!   carries an IPv4 address other than mapped and translated (NAT64
+//!   `64:ff9b::/32` and 6to4 `2002::/16` whatever they carry).
+//!   `ua_server::oauth::cimd::is_public_ip` is a re-export of
+//!   `is_global_unicast`: a client metadata document has no business behind
+//!   a translator.
+//!
+//! Refused in both classes, with the reason returned:
 //!
 //! - IPv4: `0.0.0.0/8` (unspecified), loopback, RFC 1918 private, link-local
 //!   (cloud metadata lives there), the shared address space `100.64.0.0/10`,
@@ -13,27 +24,61 @@
 //!   broadcast included);
 //! - IPv6: unspecified, loopback, unique local `fc00::/7`, link-local
 //!   `fe80::/10` and the old site-local `fec0::/10`, multicast, everything
-//!   outside `2000::/3`, documentation (`2001:db8::/32`, `3fff::/20`) and
-//!   IETF protocol assignments `2001::/23` (Teredo included);
+//!   outside `2000::/3` (the rest of `64:ff9b::/32` included), documentation
+//!   (`2001:db8::/32`, `3fff::/20`) and IETF protocol assignments `2001::/23`
+//!   (Teredo included);
 //! - IPv6 forms that carry an IPv4 address (mapped, compatible, translated,
-//!   NAT64 well-known and local-use, 6to4) are judged by that IPv4 address
-//!   first. Mapped and translated forms of a public IPv4 address are public;
-//!   the compatible form `::/96`, NAT64 `64:ff9b::/32` and 6to4 `2002::/16`
-//!   are refused whatever they carry.
+//!   NAT64 well-known `64:ff9b::/96` and local-use `64:ff9b:1::/48`, 6to4)
+//!   whose IPv4 address is refused;
+//! - the IPv4-compatible form `::a.b.c.d` whatever it carries: RFC 4291
+//!   deprecated it, it sits in `::/8`, which is not routed on the internet,
+//!   and no current transition mechanism produces it, so no reachable
+//!   destination has such an address.
+//!
+//! In [`Class::Public`], NAT64 and 6to4 addresses that carry a public IPv4
+//! address are public: on an IPv6-only network behind DNS64, every
+//! IPv4-only site resolves to a NAT64 address.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// Why `ip` is not a public address, or `None` for a public one.
-pub fn non_public_reason(ip: IpAddr) -> Option<&'static str> {
+/// A named address class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Reachable on the public internet (NAT64 and 6to4 of a public IPv4
+    /// address included).
+    Public,
+    /// [`Class::Public`] without NAT64 and 6to4 forms.
+    GlobalUnicastOnly,
+}
+
+/// Why `ip` is outside `class`, or `None` when it is inside.
+pub fn reason_in(ip: IpAddr, class: Class) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => v4_reason(v4),
-        IpAddr::V6(v6) => v6_reason(v6),
+        IpAddr::V6(v6) => v6_reason(v6, class),
     }
 }
 
-/// True only for globally routable unicast addresses.
+/// Why `ip` is not a public address, or `None` for a public one
+/// ([`Class::Public`]).
+pub fn non_public_reason(ip: IpAddr) -> Option<&'static str> {
+    reason_in(ip, Class::Public)
+}
+
+/// True for an address in [`Class::Public`].
 pub fn is_public(ip: IpAddr) -> bool {
     non_public_reason(ip).is_none()
+}
+
+/// Why `ip` is not plain global unicast, or `None` when it is
+/// ([`Class::GlobalUnicastOnly`]).
+pub fn non_global_unicast_reason(ip: IpAddr) -> Option<&'static str> {
+    reason_in(ip, Class::GlobalUnicastOnly)
+}
+
+/// True for an address in [`Class::GlobalUnicastOnly`].
+pub fn is_global_unicast(ip: IpAddr) -> bool {
+    non_global_unicast_reason(ip).is_none()
 }
 
 /// Loopback, in IPv4, IPv6 or IPv4-mapped IPv6 form.
@@ -102,9 +147,9 @@ fn v4_reason(ip: Ipv4Addr) -> Option<&'static str> {
     None
 }
 
-/// Why an IPv6 wrapper of a public IPv4 address is still refused, or `None`
-/// for the forms judged as their IPv4 address (mapped and translated).
-fn wrapper_reason(ip: Ipv6Addr) -> Option<&'static str> {
+/// Why an IPv6 form that carries a public IPv4 address is still refused in
+/// `class`, or `None` when it is judged as that IPv4 address.
+fn wrapper_reason(ip: Ipv6Addr, class: Class) -> Option<&'static str> {
     let s = ip.segments();
     if ip.to_ipv4_mapped().is_some() || (s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0) {
         return None;
@@ -112,19 +157,23 @@ fn wrapper_reason(ip: Ipv6Addr) -> Option<&'static str> {
     if s[..6] == [0; 6] {
         return Some("IPv4-compatible");
     }
-    if s[0] == 0x64 && s[1] == 0xff9b {
-        return Some("NAT64");
+    let (form, reason) = if s[0] == 0x64 && s[1] == 0xff9b {
+        (true, "NAT64")
+    } else if s[0] == 0x2002 {
+        (true, "6to4")
+    } else {
+        // `embedded_v4` knows no other form; refuse rather than guess.
+        (false, "embeds an IPv4 address")
+    };
+    match class {
+        Class::Public if form => None,
+        _ => Some(reason),
     }
-    if s[0] == 0x2002 {
-        return Some("6to4");
-    }
-    // `embedded_v4` knows no other form; refuse rather than guess.
-    Some("embeds an IPv4 address")
 }
 
-fn v6_reason(ip: Ipv6Addr) -> Option<&'static str> {
+fn v6_reason(ip: Ipv6Addr, class: Class) -> Option<&'static str> {
     if let Some(v4) = embedded_v4(ip) {
-        return v4_reason(v4).or_else(|| wrapper_reason(ip));
+        return v4_reason(v4).or_else(|| wrapper_reason(ip, class));
     }
     let s = ip.segments();
     if ip.is_unspecified() {
@@ -237,17 +286,18 @@ mod tests {
             ("::ffff:0:127.0.0.1", Some("loopback")),
             ("::ffff:0:192.168.0.1", Some("private")),
             ("::ffff:0:8.8.8.8", None),
-            // NAT64, well-known and local-use, and the rest of 64:ff9b::/32.
+            // NAT64, well-known and local-use: judged as the IPv4 address.
+            // The rest of 64:ff9b::/32 is outside 2000::/3.
             ("64:ff9b::7f00:1", Some("loopback")),
             ("64:ff9b::a9fe:a9fe", Some("link-local (includes cloud metadata)")),
-            ("64:ff9b::808:808", Some("NAT64")),
-            ("64:ff9b:1::808:808", Some("NAT64")),
+            ("64:ff9b::808:808", None),
+            ("64:ff9b:1::808:808", None),
             ("64:ff9b:1::a00:1", Some("private")),
             ("64:ff9b:2::808:808", Some("reserved")),
-            // 6to4: the embedded IPv4 first, then refused anyway.
+            // 6to4: judged as the IPv4 address.
             ("2002:7f00:1::", Some("loopback")),
             ("2002:a00:1::", Some("private")),
-            ("2002:808:808::", Some("6to4")),
+            ("2002:808:808::", None),
             // Public.
             ("2606:4700:4700::1111", None),
             ("2a00:1450:4001::1", None),
@@ -256,6 +306,34 @@ mod tests {
         ];
         for (ip, want) in table {
             assert_eq!(reason(ip), *want, "{ip}");
+        }
+    }
+
+    /// The strict class differs from the public one only on NAT64 and 6to4
+    /// forms of a public IPv4 address.
+    #[test]
+    fn global_unicast_only_table() {
+        let table: &[(&str, Option<&str>, Option<&str>)] = &[
+            // (address, Class::Public, Class::GlobalUnicastOnly)
+            ("64:ff9b::808:808", None, Some("NAT64")),
+            ("64:ff9b:1::808:808", None, Some("NAT64")),
+            ("2002:808:808::", None, Some("6to4")),
+            ("64:ff9b::7f00:1", Some("loopback"), Some("loopback")),
+            ("2002:a00:1::", Some("private"), Some("private")),
+            ("64:ff9b:2::808:808", Some("reserved"), Some("reserved")),
+            ("::8.8.8.8", Some("IPv4-compatible"), Some("IPv4-compatible")),
+            ("::ffff:8.8.8.8", None, None),
+            ("::ffff:0:8.8.8.8", None, None),
+            ("8.8.8.8", None, None),
+            ("10.0.0.1", Some("private"), Some("private")),
+            ("2606:4700:4700::1111", None, None),
+            ("3fff::1", Some("documentation"), Some("documentation")),
+        ];
+        for (ip, public, strict) in table {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(reason_in(ip, Class::Public), *public, "{ip} public");
+            assert_eq!(non_global_unicast_reason(ip), *strict, "{ip} global unicast");
+            assert_eq!(is_global_unicast(ip), strict.is_none());
         }
     }
 
@@ -269,10 +347,10 @@ mod tests {
         }
     }
 
-    // --- the union of the two classifiers this one replaced -------------------
+    // --- the two classifiers this one replaced -----------------------------------
 
     /// `ua_tools::families::web::non_public_reason` before it became a
-    /// re-export, kept here verbatim (as a predicate) to prove the union.
+    /// re-export, kept here verbatim (as a predicate) for the class tests.
     fn legacy_web_refuses(ip: IpAddr) -> bool {
         fn v4(ip: Ipv4Addr) -> bool {
             let o = ip.octets();
@@ -309,7 +387,7 @@ mod tests {
     }
 
     /// `ua_server::oauth::cimd::is_public_ip` before it became a re-export,
-    /// negated, kept here verbatim to prove the union.
+    /// negated, kept here verbatim for the class tests.
     fn legacy_cimd_refuses(ip: IpAddr) -> bool {
         fn public_v4(ip: Ipv4Addr) -> bool {
             let o = ip.octets();
@@ -393,32 +471,46 @@ mod tests {
         out
     }
 
-    /// Whether `ip` is in a class where the union is knowingly stricter than
-    /// `ua_tools::families::web::non_public_reason` was.
-    fn web_stricter_class(ip: IpAddr) -> bool {
-        let IpAddr::V6(a) = ip else { return false };
-        let s = a.segments();
-        s[..6] == [0; 6] || s[0] == 0x2002 || (s[0] == 0x64 && s[1] == 0xff9b)
-    }
-
-    #[test]
-    fn at_least_as_strict_as_both_replaced_classifiers() {
+    fn corpus() -> Vec<IpAddr> {
         let all: Vec<IpAddr> =
             v4_sample().into_iter().map(IpAddr::V4).chain(v6_sample().into_iter().map(IpAddr::V6)).collect();
         assert!(all.len() > 30_000, "sample too small: {}", all.len());
-        let mut stricter_than_web = 0;
-        for ip in all {
+        all
+    }
+
+    /// The one class where [`Class::Public`] is deliberately stricter than
+    /// the old web classifier: IPv4-compatible `::a.b.c.d` of a public IPv4
+    /// address (deprecated, not routed, so no reachable destination).
+    fn public_stricter_than_web(ip: IpAddr) -> bool {
+        let IpAddr::V6(a) = ip else { return false };
+        a.segments()[..6] == [0; 6]
+    }
+
+    #[test]
+    fn the_public_class_is_the_old_web_classifier_plus_the_compatible_form() {
+        let mut stricter = 0;
+        for ip in corpus() {
             let refused = non_public_reason(ip).is_some();
-            let (web, cimd) = (legacy_web_refuses(ip), legacy_cimd_refuses(ip));
-            assert!(refused || !web, "{ip} was refused by the web classifier");
-            assert!(refused || !cimd, "{ip} was refused by the CIMD classifier");
-            // Nothing outside the union is refused.
-            assert_eq!(refused, web || cimd, "{ip} is outside the union");
+            let web = legacy_web_refuses(ip);
+            assert!(refused || !web, "{ip} was refused by the old web classifier");
             if refused && !web {
-                assert!(web_stricter_class(ip), "{ip}: stricter than web outside the listed classes");
-                stricter_than_web += 1;
+                assert!(public_stricter_than_web(ip), "{ip}: stricter than the old web classifier");
+                stricter += 1;
             }
         }
-        assert!(stricter_than_web > 0);
+        assert!(stricter > 0, "the corpus covers the compatible form");
+        assert!(is_public("64:ff9b::808:808".parse().unwrap()), "NAT64 of a public address");
+    }
+
+    #[test]
+    fn the_global_unicast_class_is_a_superset_of_both_old_classifiers() {
+        for ip in corpus() {
+            let refused = non_global_unicast_reason(ip).is_some();
+            let (web, cimd) = (legacy_web_refuses(ip), legacy_cimd_refuses(ip));
+            assert!(refused || !web, "{ip} was refused by the old web classifier");
+            assert!(refused || !cimd, "{ip} was refused by the old CIMD classifier");
+            // And no more than that: exactly the union.
+            assert_eq!(refused, web || cimd, "{ip} is outside the union");
+        }
     }
 }

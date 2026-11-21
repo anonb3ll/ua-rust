@@ -6,8 +6,7 @@
 //! - resolves the host and refuses it when any address is not public
 //!   (`ua_ingress::addr`: loopback, private, link-local and cloud metadata,
 //!   CGNAT, multicast, documentation and reserved ranges, IPv6 forms that
-//!   embed one, and the NAT64, 6to4 and IPv4-compatible forms whatever they
-//!   embed),
+//!   embed one, and the deprecated IPv4-compatible form whatever it embeds),
 //! - connects through a resolver that applies the same check, so a DNS answer
 //!   that changes between the check and the connection is refused too,
 //! - follows at most five redirects by hand, checking each hop again,
@@ -922,11 +921,13 @@ mod tests {
         for s in ["93.184.215.14", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
             assert!(non_public_reason(s.parse().unwrap()).is_none(), "{s} should be allowed");
         }
-        // Refused since the classifier became the union with the OAuth one:
-        // NAT64, 6to4 and IPv4-compatible forms of a public address.
-        for s in ["64:ff9b::808:808", "2002:808:808::", "::8.8.8.8"] {
-            assert!(non_public_reason(s.parse().unwrap()).is_some(), "{s} should be refused");
+        // NAT64 and 6to4 are judged by the IPv4 address they carry (an
+        // IPv6-only network reaches IPv4 sites through NAT64). The deprecated
+        // IPv4-compatible form is refused whatever it carries.
+        for s in ["64:ff9b::808:808", "64:ff9b:1::808:808", "2002:808:808::"] {
+            assert!(non_public_reason(s.parse().unwrap()).is_none(), "{s} should be allowed");
         }
+        assert!(non_public_reason("::8.8.8.8".parse().unwrap()).is_some());
         assert!(vet_ip("127.0.0.1".parse().unwrap(), true).is_ok());
         assert!(vet_ip("10.0.0.1".parse().unwrap(), true).is_err());
     }

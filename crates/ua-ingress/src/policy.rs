@@ -30,20 +30,31 @@ pub enum Hosts {
     Any,
 }
 
-/// Which addresses a connection may reach.
+/// Which addresses a connection may reach, by [`addr::Class`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Addresses {
-    /// Public addresses only ([`addr::non_public_reason`] is `None`).
+    /// [`addr::Class::Public`] only (NAT64 and 6to4 of a public IPv4
+    /// address included).
     Public,
-    /// Public addresses and loopback, nothing else. For a destination that
-    /// is deliberately local, and for tests.
+    /// [`addr::Class::GlobalUnicastOnly`] only: no NAT64 or 6to4 form.
+    GlobalUnicastOnly,
+    /// [`addr::Class::Public`] and loopback, nothing else. For a destination
+    /// that is deliberately local, and for tests.
     PublicOrLoopback,
 }
 
 impl Addresses {
+    /// The address class this rule is built on.
+    pub fn class(self) -> addr::Class {
+        match self {
+            Addresses::Public | Addresses::PublicOrLoopback => addr::Class::Public,
+            Addresses::GlobalUnicastOnly => addr::Class::GlobalUnicastOnly,
+        }
+    }
+
     /// `Err` with the reason when a connection to `ip` is not allowed.
     pub fn check(self, ip: IpAddr) -> Result<(), &'static str> {
-        match addr::non_public_reason(ip) {
+        match addr::reason_in(ip, self.class()) {
             None => Ok(()),
             Some(_) if self == Addresses::PublicOrLoopback && addr::is_loopback(ip) => Ok(()),
             Some(reason) => Err(reason),
@@ -240,6 +251,15 @@ mod tests {
         {
             assert!(matches!(any.check_url(&url(bad)), Err(OutboundError::AddressRefused { .. })), "{bad}");
         }
+        // The class decides NAT64 and 6to4 of a public address.
+        let nat64 = url("https://[64:ff9b::808:808]/");
+        assert!(any.check_url(&nat64).is_ok());
+        let strict = Policy { addresses: Addresses::GlobalUnicastOnly, ..any };
+        assert!(matches!(
+            strict.check_url(&nat64),
+            Err(OutboundError::AddressRefused { reason: "NAT64", .. })
+        ));
+        assert!(strict.check_url(&url("https://93.184.215.14/")).is_ok());
         let lo = Policy { addresses: Addresses::PublicOrLoopback, ..any };
         assert!(lo.check_url(&url("http://127.0.0.1/")).is_ok());
         assert!(lo.check_url(&url("http://[::1]/")).is_ok());

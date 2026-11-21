@@ -11,38 +11,48 @@ The crate depends on `ua-core` and third-party crates only. `ua-tools` and
 
 ## The address classifier
 
-`ua_ingress::addr::non_public_reason(ip)` says whether an IP address is
-public and, if not, why. `is_public`, `is_loopback` and `embedded_v4` sit
-next to it. It is the only implementation:
-`ua_tools::families::web::non_public_reason` and
-`ua_server::oauth::cimd::is_public_ip` are re-exports of it.
+`ua_ingress::addr` says whether an IP address is in an address class and,
+if not, why. It is the only implementation, with two named classes over the
+same range tables:
 
-It refuses the union of what the two classifiers it replaced refused, and
-nothing else (a unit test compares it with copies of both over about 70,000
-addresses):
+| Class | Functions | Used by |
+|---|---|---|
+| `Class::Public` | `non_public_reason`, `is_public` | `ua_tools::families::web::non_public_reason` (a re-export): the web tools, Zulip, the relay's GitHub client, GitHub REST, Slack replies and Socket Mode; outbound policies with `Addresses::Public` or `PublicOrLoopback` |
+| `Class::GlobalUnicastOnly` | `non_global_unicast_reason`, `is_global_unicast` | `ua_server::oauth::cimd::is_public_ip` (a re-export); outbound policies with `Addresses::GlobalUnicastOnly` |
+
+Refused in both classes:
 
 - IPv4: `0.0.0.0/8`, loopback, RFC 1918, link-local (cloud metadata),
   `100.64.0.0/10`, `192.0.0.0/24`, the documentation ranges,
   `198.18.0.0/15`, multicast and `240.0.0.0/4` (broadcast included).
 - IPv6: unspecified, loopback, `fc00::/7`, `fe80::/10`, `fec0::/10`,
-  multicast, everything outside `2000::/3`, `2001:db8::/32`, `3fff::/20`
-  and `2001::/23`.
-- IPv6 forms that carry an IPv4 address are judged by that address first.
-  Mapped (`::ffff:a.b.c.d`) and translated (`::ffff:0:a.b.c.d`) forms of a
-  public IPv4 address are public. The IPv4-compatible form (`::/96`), NAT64
-  (`64:ff9b::/32`) and 6to4 (`2002::/16`) are refused whatever they carry.
+  multicast, everything outside `2000::/3` (the rest of `64:ff9b::/32`
+  included), `2001:db8::/32`, `3fff::/20` and `2001::/23`.
+- IPv6 forms that carry an IPv4 address (mapped `::ffff:a.b.c.d`,
+  translated `::ffff:0:a.b.c.d`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`,
+  6to4 `2002::/16`) when that IPv4 address is refused.
+- The IPv4-compatible form `::a.b.c.d`, whatever it carries. RFC 4291
+  deprecated it, it lies in `::/8`, which is not routed on the internet,
+  and no current transition mechanism produces it, so no reachable
+  destination has such an address.
 
-The union made each former caller stricter in a few classes; see the
-changelog. One consequence: on an IPv6-only network that reaches IPv4 sites
-through DNS64 and NAT64, those sites resolve into `64:ff9b::/96` and the web
-tools refuse them.
+The classes differ only on NAT64 and 6to4 forms of a public IPv4 address:
+`Public` judges them by that address and admits them (on an IPv6-only
+network behind DNS64, every IPv4-only site resolves to a NAT64 address);
+`GlobalUnicastOnly` refuses them.
+
+Unit tests compare both classes with verbatim copies of the two classifiers
+they replaced, over about 70,000 addresses: `Public` refuses what the old
+web classifier refused plus only the IPv4-compatible form of a public
+address; `GlobalUnicastOnly` refuses exactly what either old classifier
+refused.
 
 ## Outbound: the guarded client
 
 `ua_ingress::Outbound` is built from a `Policy`, one per destination class.
 A policy fixes the schemes, the hosts (an exact list, or any), whether a
-URL may name a port, the address class a connection may reach (`Public`, or
-`PublicOrLoopback`), how many redirects are followed, the response body
+URL may name a port, the address class a connection may reach (`Public`,
+`GlobalUnicastOnly`, or `PublicOrLoopback`), how many redirects are followed, the response body
 cap, and three timeouts (connect, one request with its body, the whole
 call). Named policies are constants in `ua_ingress::policy`;
 `Outbound::named` and `policy::lookup` refuse any other name, and a policy
