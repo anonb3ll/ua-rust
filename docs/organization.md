@@ -42,13 +42,16 @@ here for memory columns, owners and defaults.
 - `Caller.org_id` (always `DEFAULT_ORG`; a serialized caller without it
   reads as the default) and `Caller::system_for(org_id)`, with
   `Caller::system()` in the default organization. A source test
-  (`crates/ua-core/tests/org_guard.rs`) fails if non-test code sets a
-  caller's organization from anything but `DEFAULT_ORG`, or calls
-  `system_for`, before memberships exist.
+  (`crates/ua-core/tests/org_guard.rs`, over every crate's non-test source)
+  fails if a `Caller` literal, an `EventInput`, or an `.org_id =`
+  assignment names any organization but `DEFAULT_ORG` (a caller's
+  organization included), or if anything calls `system_for`, before
+  memberships exist.
 - `EventInput::new(org_id, …)` with `Default` removed, so every event names
   its organization; every site passes `ua_core::DEFAULT_ORG`, the
   organization of the affected row, never the caller's. `append` writes
-  `org_id` and `hash_v` explicitly. On a ledger from before
+  `org_id` and `hash_v` explicitly, and refuses an organization `orgs` does
+  not hold. On a ledger from before
   `organization.v1.store` (an older backup just restored) it writes the old
   row shape, and refuses any organization other than the default rather than
   drop it. `org_id` is still not covered by the hash.
