@@ -1268,3 +1268,38 @@ async fn a_check_is_verified_only_against_the_bound_repo_a_full_head_and_its_job
         .await;
     assert_eq!(e.code(), "invalid_argument");
 }
+
+/// Behaviour change: with auth off, an unverified caller that names a
+/// configured human (or lifecycle operator) as its `actor` used to get
+/// operator authority over any task's workflow record. It no longer does; it
+/// keeps writing a task whose claimant it names, and a verified human or
+/// lifecycle operator still writes any task's record.
+#[tokio::test]
+async fn an_unverified_caller_naming_a_human_is_not_a_workflow_operator() {
+    let h = H::new();
+    let t = h.task("Ship the parser", None).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let anon = Caller::local("anyone", Transport::Mcp);
+    for actor in ["operator", "lead-op"] {
+        let e = h
+            .act_err(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": actor }))
+            .await;
+        assert_eq!(reason(&e), "not_task_owner", "{actor}");
+        let e = h
+            .act_err(
+                &anon,
+                "task_check_record",
+                json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": FULL, "actor": actor }),
+            )
+            .await;
+        assert_eq!(reason(&e), "not_task_owner", "{actor}");
+    }
+    // Naming the claimant still works without verification (unchanged).
+    let v = h
+        .act_ok(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": "builder-1" }))
+        .await;
+    assert_eq!(v["updated_by"], "builder-1");
+    // A verified human and a verified lifecycle operator still may.
+    h.act_ok(&human(), "task_workflow_set", json!({ "task_id": t, "focus": "the lexer" })).await;
+    h.act_ok(&lifecycle_op(), "task_workflow_set", json!({ "task_id": t, "focus": "the parser" })).await;
+}

@@ -656,7 +656,7 @@ fn route_to_node(
 
 async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
     let agent = check_slug("agent", &a.agent)?;
-    check_agent_or_operator(&ctx.caller, "dispatch_task", &agent)?;
+    check_agent_or_operator(ctx.hub.cfg(), &ctx.caller, "dispatch_task", &agent)?;
     if let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "dispatch_task") {
         return Err(refusal.error);
     }
@@ -978,7 +978,7 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     verified(&ctx.caller, "dispatch_cancel")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
-    check_agent_or_operator(&ctx.caller, "dispatch_cancel", &run.agent_label)?;
+    check_agent_or_operator(ctx.hub.cfg(), &ctx.caller, "dispatch_cancel", &run.agent_label)?;
     let reason =
         a.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or("client cancelled".into());
     cancel_run(&ctx.hub, ctx.caller.label.clone(), rid, reason).await

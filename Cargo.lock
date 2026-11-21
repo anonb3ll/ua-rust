@@ -5186,8 +5186,16 @@ dependencies = [
  "tokio",
  "tracing",
  "ua-core",
+ "ua-org",
  "ua-store",
  "uuid",
+]
+
+[[package]]
+name = "ua-org"
+version = "0.1.0"
+dependencies = [
+ "ua-core",
 ]
 
 [[package]]
@@ -5302,6 +5310,7 @@ dependencies = [
  "tree-sitter-typescript",
  "ua-core",
  "ua-memory",
+ "ua-org",
  "ua-store",
  "ulid",
  "url",

@@ -56,6 +56,27 @@ here for memory columns, owners and defaults.
   row shape, and refuses any organization other than the default rather than
   drop it. `org_id` is still not covered by the hash.
 
+- The `ua-org` crate, holding only `authz` for now. Departure from the
+  [Authority checks](#authority-checks) API: until users and memberships
+  exist (`organization.v2`), authority comes from the hub configuration, so
+  the checks run through an `Authz { cfg }` value with
+  `require(caller, need, target_org)` and `holds(...)`. `target_org` must be
+  `'default'` and the caller's organization; anything else is refused. The
+  authorities are **transitional**: each reproduces one rule the tree used,
+  and names the design authority that replaces it. Four of them use a
+  profile as authority, which this design forbids; they are marked, and kept
+  only to preserve behaviour. The operator, dispatch, hub-view and mailbox
+  predicates delegate to `authz`, and ua-memory's human check goes through
+  it. A guard test (`crates/ua-core/tests/authz_guard.rs`) holds per-crate
+  counts of the remaining ad-hoc checks (`is_human` definitions and calls,
+  `is_lifecycle_operator` calls, `fn is_operator…`, profile comparisons and
+  matches, profile-as-authority uses, `ActorKind` comparisons and matches,
+  and direct reads of `human_identities` / `lifecycle_operators`), which may
+  only go down. It scans `ua-core` too, skipping only the files that define
+  the primitives. One behaviour change:
+  an unverified caller naming a configured human as its actor is no longer a
+  workflow-record operator.
+
 Not yet: the tenant parts, the label and launch-key indexes, the
 `memory_versions_capture` trigger, `hash_v = 2`, and everything after
 `organization.v1`.

@@ -37,12 +37,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ua_core::{Profile, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use crate::families::agents::verified;
 use crate::families::governance;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.conversation.handoff";
 const MAX_TITLE: usize = 300;
@@ -83,11 +83,13 @@ fn is_id_safe(s: &str) -> bool {
 
 /// Whether the verified caller may read every mailbox (and so every
 /// conversation). An unverified caller never is.
+/// (A profile used as authority; see [`Authority::TransitionalMailboxReader`].)
 fn unrestricted(ctx: &ToolCtx) -> bool {
-    let cfg = ctx.hub.cfg();
-    verified(&ctx.caller).is_some_and(|label| {
-        ctx.caller.is_human() || cfg.is_human(label) || ctx.caller.profile == Profile::Coordinator
-    })
+    Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::TransitionalMailboxReader],
+        ua_core::DEFAULT_ORG,
+    )
 }
 
 fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
