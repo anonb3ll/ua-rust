@@ -35,6 +35,7 @@ use ua_core::{Config, Profile, UaError, UaResult};
 use super::agents;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
+use ua_org::authz::{Authority, Authz};
 
 const MAX_SKILLS: usize = 100;
 
@@ -271,11 +272,9 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
 /// Whether `caller` may see hub boundaries (the program allowlist among them).
+/// (A profile used as authority; see [`Authority::TransitionalHubView`].)
 pub(crate) fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
-    if caller.is_human() || matches!(caller.profile, Profile::Coordinator | Profile::Operator) {
-        return true;
-    }
-    agents::verified(caller).is_some_and(|l| cfg.is_human(l) || cfg.is_lifecycle_operator(l))
+    Authz::new(cfg).holds(caller, &[Authority::TransitionalHubView], ua_core::DEFAULT_ORG)
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

@@ -31,12 +31,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use ua_core::{Profile, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
 use super::{continuity, governance, node_queue, nodes, wake};
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "messaging.v1",
@@ -333,10 +334,13 @@ impl Viewer {
     fn of(ctx: &ToolCtx) -> Self {
         let identity = agents::verified(&ctx.caller).map(str::to_string);
         let cfg = ctx.hub.cfg();
-        let unrestricted = identity.is_none()
-            || ctx.caller.is_human()
-            || identity.as_deref().is_some_and(|l| cfg.is_human(l))
-            || ctx.caller.profile == Profile::Coordinator;
+        // A profile used as authority; see
+        // [`Authority::TransitionalLocalMailboxReader`].
+        let unrestricted = Authz::new(cfg).holds(
+            &ctx.caller,
+            &[Authority::TransitionalLocalMailboxReader],
+            ua_core::DEFAULT_ORG,
+        );
         Self {
             identity,
             unrestricted,

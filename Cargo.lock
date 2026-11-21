@@ -5309,6 +5309,7 @@ dependencies = [
  "tree-sitter-typescript",
  "ua-core",
  "ua-memory",
+ "ua-org",
  "ua-store",
  "ulid",
  "url",

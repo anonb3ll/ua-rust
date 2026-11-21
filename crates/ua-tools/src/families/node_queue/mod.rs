@@ -306,10 +306,13 @@ pub(crate) fn verified_caller(caller: &Caller, verb: &str) -> UaResult<String> {
     })
 }
 
-/// Whether `who` may act on any item: a human identity or a lifecycle
-/// operator.
+/// Whether `who` may act on any item: governance's operator rule. Every call
+/// site passes the caller's verified label as `who`, so requiring a verified
+/// caller (which the rule does and this function once did not) changes
+/// nothing today; it keeps a future unverified call site from claiming a
+/// human's label.
 pub(crate) fn is_operator(hub: &Hub, caller: &Caller, who: &str) -> bool {
-    caller.is_human() || hub.cfg().is_human(who) || hub.cfg().is_lifecycle_operator(who)
+    governance::is_operator(hub.cfg(), caller, who)
 }
 
 // --- node rows ------------------------------------------------------------------
