@@ -62,6 +62,10 @@ fn default_org() -> String {
     DEFAULT_ORG.to_string()
 }
 
+/// The label of an unauthenticated local caller that configured none. It
+/// names nobody: every such caller shares it.
+pub const LOCAL_LABEL: &str = "local";
+
 impl Caller {
     /// A local, unauthenticated caller with the full tool surface.
     pub fn local(label: impl Into<String>, transport: Transport) -> Self {

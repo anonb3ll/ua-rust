@@ -237,8 +237,21 @@ from its commit history.
 - The `coordinator` and `operator` profiles grant no authority. The hub
   view, reading every mailbox or conversation, and `vault_move` need an
   operator. A coordinator agent that read every mailbox to route work cannot
-  any more; organization roles will replace that. What an unverified caller
-  (auth enforcement off) can read in messaging is unchanged and under review.
+  any more; organization roles will replace that.
+- With auth enforcement off there is no verified identity to scope a read
+  by, so mailboxes and conversations are a message board
+  ([auth.md](docs/auth.md#with-auth-enforcement-off)). An unverified caller
+  reads every mailbox, as before, and now `conversation_handoffs` too
+  (handing a conversation off still needs a verified caller). Reading
+  another label's mailbox no longer changes its read state: for a caller
+  configured with its own label, `message_inbox` on another mailbox lists
+  without marking and says so (`read_state`), and `message_ack` and
+  `session_id` on it are refused. A caller with only the shared `local`
+  label has no mailbox of its own and still acts as the mailbox it names.
+  This read grant never counts as operator, lifecycle or human authority.
+- Messages carry `sender_verified`: `false` when the sender was not
+  authenticated, so `from_agent` is only what the caller said (`null` on
+  messages sent before this).
 
 ### Security
 

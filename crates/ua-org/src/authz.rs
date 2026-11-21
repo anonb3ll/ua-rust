@@ -46,9 +46,14 @@ pub enum Authority {
     LifecycleOperator,
     /// A caller with no verified label: an unverified local caller (the local
     /// full-surface model when auth enforcement is off: stdio, or HTTP
-    /// without `enforce_auth`), or the hub's own system jobs. It is what lets
-    /// such a caller read every mailbox in the messaging tools, as before.
-    /// Auth enforcement off; behaviour under review.
+    /// without `enforce_auth`), or the hub's own system jobs.
+    ///
+    /// With no verified identity there is nothing to scope a read by, so
+    /// mailboxes and conversations are a message board: such a caller may
+    /// **read** all of them. That is all this grants. It is a read grant
+    /// only: it never satisfies a requirement for [`Authority::Operator`],
+    /// [`Authority::LifecycleOperator`] or a human (so it approves nothing),
+    /// and a site that changes state must not list it.
     LocalTrustReader,
     /// A caller of kind human: a label in `human_identities` that
     /// authenticated as itself (bearer token, browser session, or a local CLI
@@ -234,6 +239,22 @@ mod tests {
                 !holds(&caller("x", kind, Profile::Coordinator), Authority::LocalTrustReader),
                 "{kind:?}"
             );
+        }
+    }
+
+    /// The local-trust grant is a read grant: whatever label an unverified
+    /// caller gives, it holds no operator, lifecycle or human authority.
+    #[test]
+    fn local_trust_reader_holds_no_other_authority() {
+        let others = [Authority::Operator, Authority::LifecycleOperator, Authority::TransitionalHuman];
+        for label in ["local", "operator", "fleet-bot", "builder-1"] {
+            for profile in [Profile::Developer, Profile::Coordinator, Profile::Operator] {
+                let anon = caller(label, ActorKind::Anonymous, profile);
+                assert!(holds(&anon, Authority::LocalTrustReader));
+                for a in others {
+                    assert!(!holds(&anon, a), "{label} {profile:?} {a:?}");
+                }
+            }
         }
     }
 

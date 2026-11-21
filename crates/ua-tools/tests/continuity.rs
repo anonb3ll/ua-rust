@@ -1127,7 +1127,7 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
 }
 
 #[tokio::test]
-async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_links() {
+async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_links() {
     let h = H::new();
     h.ok(
         &builder(),
@@ -1136,7 +1136,13 @@ async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_li
     )
     .await;
     let params = json!({ "conversation_id": "conv-9" });
-    let e = h.act_err(&unverified(), "conversation_handoffs", params.clone()).await;
+    // A caller with no verified identity (auth enforcement off) reads every
+    // conversation, like every mailbox. Handing off is a write: it cannot.
+    let board = h.act_ok(&unverified(), "conversation_handoffs", params.clone()).await;
+    assert_eq!(board["handoffs"], json!([]));
+    let e = h
+        .act_err(&unverified(), "conversation_handoff", json!({ "conversation_id": "conv-9", "title": "No" }))
+        .await;
     assert_eq!(reason(&e), "identity_required", "{e:?}");
 
     let real = h
