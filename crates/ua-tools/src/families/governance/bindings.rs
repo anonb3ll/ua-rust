@@ -38,7 +38,7 @@ fn segment_ok(s: &str) -> bool {
 /// host. Accepts `owner/name`, `github.com/owner/name`, `https://...`,
 /// `ssh://git@...` and `git@host:owner/name.git`. Refuses credentials or
 /// user info, other hosts, and anything that is not exactly two segments.
-pub(crate) fn normalize_repo(raw: &str) -> UaResult<String> {
+pub fn normalize_repo(raw: &str) -> UaResult<String> {
     let text = raw.trim();
     if text.is_empty() {
         return Err(UaError::invalid("repo must not be empty"));
@@ -174,12 +174,9 @@ fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult
     Ok(who)
 }
 
-/// `coordination_manage(action="project_repo_bind")`.
-pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Value> {
-    let project = check_slug("project", &a.project)?;
-    let repo = normalize_repo(&a.repo)?;
-    let who = binding_operator(&ctx, a.bound_by.as_deref(), "binding a project repository")?;
-    let branch = a.default_branch.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+/// Trim and validate an optional repository default branch name.
+pub fn check_default_branch(raw: Option<&str>) -> UaResult<Option<String>> {
+    let branch = raw.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
     if branch
         .as_ref()
         .is_some_and(|b| b.len() > MAX_BRANCH || b.starts_with('-') || b.contains(char::is_whitespace))
@@ -188,6 +185,15 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
             "default_branch must be at most {MAX_BRANCH} characters, without whitespace or a leading '-'"
         )));
     }
+    Ok(branch)
+}
+
+/// `coordination_manage(action="project_repo_bind")`.
+pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Value> {
+    let project = check_slug("project", &a.project)?;
+    let repo = normalize_repo(&a.repo)?;
+    let who = binding_operator(&ctx, a.bound_by.as_deref(), "binding a project repository")?;
+    let branch = check_default_branch(a.default_branch.as_deref())?;
     ctx.hub
         .db()
         .write_async(move |tx| {

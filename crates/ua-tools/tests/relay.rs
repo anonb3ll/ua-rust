@@ -879,3 +879,74 @@ async fn a_denied_approval_drops_the_text_everywhere() {
     assert_eq!(approval_payload(&h, approval_id)["text"], Value::Null);
     assert!(h.mock.requests().is_empty());
 }
+
+/// `resolved_by` and `resolved_transport` describe the latest decision on
+/// an approval row on every path: a revoke through `approval_resolve` and
+/// the relay withdrawing its draft both overwrite the approver. The earlier
+/// approval stays in the ledger with its own approver and transport.
+#[tokio::test]
+async fn the_approval_row_records_the_latest_decision_on_both_revoke_paths() {
+    let row = |h: &H, id: i64| h.hub.db().read(|c| ua_tools::approvals::get(c, id)).unwrap();
+    let via = |c: Caller, t: Transport| Caller { transport: t, ..c };
+
+    // Path 1: approved from Slack, then the relay withdraws the draft (CLI).
+    let h = H::new().await;
+    let (id, approval_id) = h.requested(CLEAN).await;
+    h.ok(
+        &via(human(), Transport::Slack),
+        "approval_resolve",
+        json!({ "id": approval_id, "decision": "approve" }),
+    )
+    .await;
+    h.reg
+        .call(
+            &h.hub,
+            &via(agent(), Transport::Cli),
+            "relay_manage",
+            json!({ "action": "cancel", "params": { "draft_id": id } }),
+        )
+        .await
+        .unwrap();
+    let r = row(&h, approval_id);
+    assert_eq!(
+        (r.status.as_str(), r.resolved_by.as_deref(), r.resolved_transport.as_deref()),
+        ("revoked", Some("relay-agent"), Some("cli"))
+    );
+    let approved = h.events("agent.approval.resolved");
+    assert_eq!(
+        (approved[0]["resolved_by"].as_str(), approved[0]["transport"].as_str()),
+        (Some("operator"), Some("slack"))
+    );
+    assert_eq!(h.events("relay.cancelled")[0]["transport"], "cli");
+
+    // Path 2: approved from Slack, then revoked through approval_resolve (UI).
+    let h = H::new().await;
+    let (_, approval_id) = h.requested(CLEAN).await;
+    h.ok(
+        &via(human(), Transport::Slack),
+        "approval_resolve",
+        json!({ "id": approval_id, "decision": "approve" }),
+    )
+    .await;
+    h.ok(
+        &via(human(), Transport::Ui),
+        "approval_resolve",
+        json!({ "id": approval_id, "decision": "revoke" }),
+    )
+    .await;
+    let r = row(&h, approval_id);
+    assert_eq!(
+        (r.status.as_str(), r.resolved_by.as_deref(), r.resolved_transport.as_deref()),
+        ("revoked", Some("operator"), Some("ui"))
+    );
+    let decisions: Vec<_> = h
+        .events("agent.approval.resolved")
+        .iter()
+        .map(|e| (e["decision"].as_str().unwrap().to_string(), e["transport"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(
+        decisions,
+        [("approve".to_string(), "slack".to_string()), ("revoke".to_string(), "ui".to_string())]
+    );
+    assert_eq!(h.events("relay.cancelled")[0]["transport"], "ui");
+}

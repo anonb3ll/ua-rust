@@ -501,8 +501,12 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             let (verb, who, reason) = (v2, w2, r2);
-            crate::families::tasks::require_task(tx, root)?;
             let existing = active_for_root(tx, root)?;
+            // Existing holds can outlive their roots. Releasing one still
+            // uses its stored creator and the same release authority check.
+            if existing.is_none() || matches!(verb.as_str(), "pause" | "cancel") {
+                crate::families::tasks::require_task(tx, root)?;
+            }
             if let Some(want) = a.hold_id
                 && existing.as_ref().map(|h| h.id) != Some(want)
             {
