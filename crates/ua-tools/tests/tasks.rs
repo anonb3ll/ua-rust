@@ -389,6 +389,10 @@ async fn untrusted_quarantine_needs_a_human_to_clear() {
     let row = h.ok(&b, "task_update", json!({ "id": child, "priority": "low" })).await;
     assert_eq!(row["untrusted"], 1, "quarantine is inherited");
     assert_eq!(h.err(&b, "task_update", json!({ "id": parent, "untrusted": false })).await.code(), "denied");
+    // A routine running unattended under the human's label is an agent.
+    let e = h.err(&agent("operator"), "task_update", json!({ "id": parent, "untrusted": false })).await;
+    assert_eq!(e.reason_code(), Some("untrusted_clear_needs_human"), "{e:?}");
+    assert_eq!(h.events("agent.task.untrusted_cleared").await.len(), 0);
     let row = h.ok(&human(), "task_update", json!({ "id": parent, "untrusted": false })).await;
     assert_eq!(row["untrusted"], 0);
     assert_eq!(h.events("agent.task.untrusted_cleared").await.len(), 1);

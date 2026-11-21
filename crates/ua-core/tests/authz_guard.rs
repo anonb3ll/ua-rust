@@ -59,7 +59,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     ("ua-server", "is_human_def", 1),
     ("ua-tools", "actor_kind_check", 43),
     ("ua-tools", "config_identity_read", 4),
-    ("ua-tools", "is_human_call", 32),
+    ("ua-tools", "is_human_call", 24),
     ("ua-tools", "operator_fn_def", 2),
     ("ua-tools", "profile_check", 13),
 ];

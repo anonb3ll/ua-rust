@@ -234,6 +234,11 @@ from its commit history.
   `lifecycle_operators`. When `lifecycle_operators` is unset it defaults to
   `human_identities` for humans only; that fallback grants nothing to an
   agent.
+- The same rule now holds at the last places that still read the caller's
+  label instead: a follow-up into a running node session from a routine
+  waits for the one-time approval like any agent's, and clearing a task's
+  untrusted quarantine or filing a work proposal in another identity's name
+  needs the human as themselves.
 - The `coordinator` and `operator` profiles grant no authority. The hub
   view, reading every mailbox or conversation, and `vault_move` need an
   operator. A coordinator agent that read every mailbox to route work cannot
