@@ -14,9 +14,10 @@
 //!    at debug level only, never ledgered: anyone could send them.
 //! 3. The body is parsed (form for commands, JSON for events). An Events API
 //!    `url_verification` answers its challenge here, with no state. Events
-//!    that are not commands (a mention must say `/command`; a direct message
-//!    may also start with a bare command word), or that an app wrote or that
-//!    were edited (`bot_id`, `subtype`, `app_id`, `bot_profile`, `edited`),
+//!    that are not marked commands (`!task …` or `/task …` after any leading
+//!    mentions; a bare word never is), direct messages not delivered to the
+//!    app's bot (`authorizations[].is_bot`), and events an app wrote or that
+//!    were edited (`bot_id`, `subtype`, `app_id`, `bot_profile`, `edited`)
 //!    are acknowledged and ignored, with no state.
 //! 4. One write transaction ([`slack::admit`]) records the signature (a
 //!    replay is a 401), maps (`team_id`, `user_id`) to a hub identity through
@@ -57,8 +58,8 @@ pub const EVENTS_PATH: &str = "/api/slack/events";
 /// Refusal reason for `approve` sent as a message (Events API).
 const APPROVE_NOT_ON_EVENTS: &str = "approve_needs_slash_command";
 
-/// Ledger, once, every Slack command accepted before the hub last stopped
-/// but never finished ([`slack::sweep_abandoned`]). `ua serve` runs this
+/// Ledger, once, every Slack command admitted before the hub last stopped
+/// with no recorded outcome ([`slack::sweep_abandoned`]; outcome unknown). `ua serve` runs this
 /// before it binds, so before the routes take traffic.
 pub async fn sweep_abandoned(hub: &ua_tools::Hub) -> ua_core::UaResult<usize> {
     hub.db().write_async(|tx| slack::sweep_abandoned(tx, now_s())).await
@@ -332,21 +333,30 @@ fn after_mentions(text: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// The first word of `text` after leading user mentions starts with `/`: an
-/// explicit command. Natural-language messages never run anything.
-fn explicit_command(text: &str) -> bool {
-    after_mentions(text).is_some_and(|rest| rest.starts_with('/'))
+/// The command in a message, when it is marked as one: after leading user
+/// mentions, `/` or `!` immediately followed by one of the nine command words
+/// (ignoring ASCII case, since phone keyboards capitalise), then whitespace
+/// or the end: `!task fix it`, `@hub !status task-12`, `@hub /task fix it`.
+/// Returns the text without mentions and marker, for the parser. A bare word
+/// (`task done, thanks`) is never a command: ordinary conversation must not
+/// write to the hub. `!` exists because Slack's composer takes a message
+/// starting with `/` as a slash command and does not post it.
+fn marked_command(text: &str) -> Option<&str> {
+    let rest = after_mentions(text)?;
+    let body = rest.strip_prefix('/').or_else(|| rest.strip_prefix('!'))?;
+    let word = body.split(char::is_whitespace).next().unwrap_or_default();
+    is_command_word(&word.to_ascii_lowercase()).then_some(body)
 }
 
-/// The first word of `text` after leading user mentions is one of the nine
-/// command words, exactly (ignoring ASCII case, since phone keyboards
-/// capitalise the first letter): `task fix it`. Accepted only in a direct
-/// message with the app, where Slack's composer would swallow a leading `/`
-/// as a slash command.
-fn bare_command(text: &str) -> bool {
-    after_mentions(text)
-        .and_then(|rest| rest.split_whitespace().next())
-        .is_some_and(|w| is_command_word(&w.to_ascii_lowercase()))
+/// Whether the envelope says the event was delivered to the app's bot
+/// (`authorizations: [{.., "is_bot": true}]`). A `message.im` subscribed as
+/// a user event ("on behalf of users") carries the user's own DMs with
+/// colleagues and only a user authorization; those never become commands.
+fn bot_authorized(envelope: &Map<String, Value>) -> bool {
+    envelope
+        .get("authorizations")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(|x| x.get("is_bot").and_then(Value::as_bool) == Some(true)))
 }
 
 async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -390,10 +400,10 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     // run again either: the command already ran when it was first sent.
     let by_person =
         !["bot_id", "subtype", "app_id", "bot_profile", "edited"].iter().any(|k| event.contains_key(*k));
-    // In a channel a mention must say `/command`; in a direct message with
-    // the app a bare command word (`task fix it`) is enough.
-    let command_shaped = explicit_command(&text) || (direct && bare_command(&text));
-    if !addressed || !by_person || !command_shaped {
+    // A direct message counts only when it was delivered to the app's bot,
+    // not to a user-scoped subscription.
+    let Some(command_text) = marked_command(&text) else { return ignore() };
+    if !addressed || !by_person || (direct && !bot_authorized(&envelope)) {
         return ignore();
     }
     // The user's own workspace: `user_team` or `team` on the event (shared
@@ -404,17 +414,19 @@ async fn events(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         .unwrap_or_default();
     let user_id = s(event, "user");
     let event_id = s(&envelope, "event_id");
-    let parsed = slack::parse_slack_command(&text).ok();
+    let parsed = slack::parse_slack_command(command_text).ok();
     let malformed = team_id.is_empty() || user_id.is_empty() || !slack::delivery_id_ok(&event_id);
+    let is_approve =
+        command_text.split(char::is_whitespace).next().is_some_and(|w| w.eq_ignore_ascii_case("approve"));
     let refusal = if malformed {
         Some("malformed_payload")
-    } else if parsed.is_none() {
-        Some("invalid_command")
-    } else if parsed.as_ref().is_some_and(|p| p["command"] == "approve") {
+    } else if is_approve {
         // A message can be posted on a person's behalf by any app holding
         // their user token; a slash command can only be invoked by the
         // person. Approvals therefore never come through the Events API.
         Some(APPROVE_NOT_ON_EVENTS)
+    } else if parsed.is_none() {
+        Some("invalid_command")
     } else {
         None
     };
@@ -436,24 +448,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_commands_need_a_leading_slash_after_mentions() {
-        assert!(explicit_command("/task fix it"));
-        assert!(explicit_command("<@U0BOT> /status task-1"));
-        assert!(explicit_command("<@U0BOT|hub>  <@U0OTHER> /plan x"));
-        assert!(!explicit_command("<@U0BOT> task fix it"));
-        assert!(!explicit_command("task status is confusing"));
-        assert!(!explicit_command("<@U0BOT"));
+    fn a_message_command_needs_a_marker_and_a_command_word() {
+        assert_eq!(marked_command("!task fix it"), Some("task fix it"));
+        assert_eq!(marked_command("/task fix it"), Some("task fix it"));
+        assert_eq!(marked_command("<@U0BOT> !status task-1"), Some("status task-1"));
+        assert_eq!(marked_command("<@U0BOT|hub>  <@U0OTHER> /Plan x"), Some("Plan x"));
+        assert_eq!(marked_command("!approve 5"), Some("approve 5"));
+        for text in [
+            "task fix it",
+            "Plan looks good to me",
+            "Task done, thanks!",
+            "Assign it to Bob tomorrow",
+            "<@U0BOT> task fix it",
+            "! task fix it",
+            "!tasks fix it",
+            "!taskfix it",
+            "!hello",
+            "<@U0BOT",
+            "",
+        ] {
+            assert_eq!(marked_command(text), None, "{text:?}");
+        }
     }
 
     #[test]
-    fn a_bare_command_word_must_be_exactly_one_of_the_nine() {
-        assert!(bare_command("task fix it"));
-        assert!(bare_command("Status task-1"));
-        assert!(bare_command("<@U0BOT> plan the week"));
-        assert!(!bare_command("tasks are confusing"));
-        assert!(!bare_command("please task fix it"));
-        assert!(!bare_command("hello"));
-        assert!(!bare_command(""));
+    fn only_a_bot_authorization_counts() {
+        let env = |v: Value| v.as_object().unwrap().clone();
+        assert!(bot_authorized(&env(json!({ "authorizations": [{ "user_id": "U0BOT", "is_bot": true }] }))));
+        assert!(bot_authorized(&env(json!({ "authorizations": [{ "is_bot": false }, { "is_bot": true }] }))));
+        assert!(!bot_authorized(&env(
+            json!({ "authorizations": [{ "user_id": "U0HUMAN", "is_bot": false }] })
+        )));
+        assert!(!bot_authorized(&env(json!({ "authorizations": [{ "is_bot": "true" }] }))));
+        assert!(!bot_authorized(&env(json!({}))));
     }
 
     #[test]

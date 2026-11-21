@@ -355,11 +355,20 @@ pub fn admit(
 pub const APPROVE_NOT_ENABLED: &str = "approve_not_enabled";
 
 /// At startup, before the routes take traffic: ledger every delivery that
-/// was accepted but never recorded as executed (the hub stopped while it
-/// ran) as `agent.slack.request.abandoned` (identity, kind, delivery id, age
-/// in seconds; no body), exactly once, and mark it `abandoned`. Slack's
-/// retry of such a delivery was answered "Already received.", so this is
-/// the only trace that it never ran. Returns how many were ledgered.
+/// was admitted but has no recorded outcome as
+/// `agent.slack.request.abandoned` with `outcome: "unknown"` (identity, kind,
+/// delivery id, age in seconds; no body), exactly once, and mark it
+/// `abandoned`.
+///
+/// "Unknown" is all the sweep can say. Usually the hub stopped before the
+/// command ran, and Slack's retry was answered "Already received.". But the
+/// tool call may have committed while its outcome record did not (shutdown
+/// deadline, a failed write), or the command may still be running under a
+/// second `ua serve` on the same database. Check `tool_calls` for the
+/// identity around that time before asking for it to be sent again. (No
+/// `tool_calls` id is linked: a call record does not carry the Slack
+/// delivery id, and matching by caller and time would not be exact.)
+/// Returns how many were ledgered.
 pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
     let rows: Vec<(String, String, i64, Option<String>)> = {
         let mut stmt = tx.prepare(
@@ -380,6 +389,8 @@ pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
                     "kind": request,
                     "delivery_id": delivery_id,
                     "age_s": now.saturating_sub(*seen_at).max(0),
+                    "outcome": "unknown",
+                    "detail": "admitted, no outcome recorded; check tool_calls",
                 }),
             )
             .by(who.clone()),

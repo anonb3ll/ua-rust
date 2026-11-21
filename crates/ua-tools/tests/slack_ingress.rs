@@ -599,7 +599,14 @@ async fn an_accepted_but_unfinished_delivery_is_ledgered_abandoned_once() {
     assert_eq!(events.len(), 1, "ledgered exactly once");
     assert_eq!(
         events[0],
-        json!({ "identity": "operator", "kind": "command", "delivery_id": "1.2.lost", "age_s": 60 })
+        json!({
+            "identity": "operator",
+            "kind": "command",
+            "delivery_id": "1.2.lost",
+            "age_s": 60,
+            "outcome": "unknown",
+            "detail": "admitted, no outcome recorded; check tool_calls",
+        })
     );
     // An abandoned row is pruned like any other; an accepted one never is.
     let db = e.hub.db().clone();

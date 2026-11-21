@@ -65,8 +65,13 @@ planned as a separate change and is not part of this one.
      command (`/hub task write the report`). Request URL:
      `https://hub.example.com/api/slack/commands`.
    - **Event Subscriptions** (optional): Request URL
-     `https://hub.example.com/api/slack/events`, bot events `app_mention`
-     and, for direct messages, `message.im`. Slack sends a signed
+     `https://hub.example.com/api/slack/events`, under **Subscribe to bot
+     events**: `app_mention` and, for direct messages with the app,
+     `message.im`. Subscribe `message.im` as a **bot** event, not under
+     "Subscribe to events on behalf of users": the hub runs a direct
+     message only when the envelope's `authorizations` include the app's
+     bot (`is_bot: true`), so a user-scoped subscription (a person's DMs
+     with colleagues) never becomes commands. Slack sends a signed
      `url_verification` challenge when you save the URL; the hub answers it.
 
 ### `slack_identities`
@@ -83,7 +88,12 @@ environment), and the hub refuses to start when:
   acts under an agent label; agents have their own credentials.
 
 A request from a pair that is not listed is refused, and so is a pair whose
-identity has since left `human_identities`. Slack's `user_name`, display
+identity has since left `human_identities`.
+
+Removing an identity from `human_identities` while a `[[slack_identities]]`
+row still names it makes the hub **refuse to start** (it fails closed, with
+`slack_identities[N].identity "..." is not in human_identities`). Remove or
+change that `[[slack_identities]]` row in the same edit, then start the hub. Slack's `user_name`, display
 names and any other display field are never read.
 
 Map a Slack account to a human identity only if that account is protected
@@ -127,24 +137,28 @@ verified human other than the requester, and the profile must allow
 `approval_resolve`. The approval row's `reason` is `approved from Slack`
 and the `approval_resolve` call is recorded with transport `slack`.
 `approve` is accepted **only as a slash command**: sent as a
-message through the Events API it is refused (`approve_needs_slash_command`
+message through the Events API, in any spelling (`!approve`, `/approve`,
+any case), it is refused (`approve_needs_slash_command`
 in the ledger), because an app holding a user's token can post messages as
 that user, while only the person can invoke a slash command.
 
-In the Events API, only an `app_mention` or a direct message (`message`
-with `channel_type = im`), written by a person (no `bot_id`, `subtype`,
-`app_id` or `bot_profile` on the event) and not edited (no `edited`), runs
-anything, and only when it is written as a command:
+In the Events API, only an `app_mention` or a direct message with the app
+(`message` with `channel_type = im`, delivered to the app's bot: the
+envelope's `authorizations` include `is_bot: true`), written by a person (no
+`bot_id`, `subtype`, `app_id` or `bot_profile` on the event) and not edited
+(no `edited`), runs anything, and only when it is **marked** as a command:
+after any leading mentions, `!` or `/` immediately followed by one of the
+nine command words (ignoring case):
 
-- a mention in a channel must say `/command` after the mention
-  (`@hub /task write the report`);
-- a direct message with the app may also start with a bare command word,
-  one of the nine exactly, ignoring case (`task write the report`), since
-  Slack's composer takes a message starting with `/` as a slash command and
-  does not post it.
+- `!task write the report` in a direct message;
+- `@hub !status task-12` or `@hub /task write the report` in a channel.
 
-Every other event (free text, a bare word in a channel) is acknowledged and
-ignored without touching the database.
+Use `!` in messages: Slack's composer takes a message that *starts* with
+`/` as a slash command and does not post it, so `/task` only works after a
+mention. A bare word is never a command, in a direct message or a channel:
+ordinary conversation ("Plan looks good to me", "Task done, thanks!") must
+not write to the hub. Every other event is acknowledged and ignored without
+touching the database.
 
 ## What happens to a request
 
@@ -182,14 +196,22 @@ ignored without touching the database.
    command's result is posted to its `response_url` as an ephemeral message
    (see below).
 
-### Lost commands
+### Commands with no recorded outcome
 
-If the hub stops after a delivery was admitted but before its command
-finished, Slack's retry is answered "Already received." and the command
-never runs. So at startup, before `ua serve` binds, every delivery still
-`accepted` is ledgered once as `agent.slack.request.abandoned` (identity,
-kind, delivery id, age in seconds; no body) and marked `abandoned`. Ask
-the user to send it again. An `accepted` row is never pruned before that
+If the hub stops after a delivery was admitted but before its outcome was
+recorded, Slack's retry is answered "Already received." So at startup,
+before `ua serve` binds, every delivery still `accepted` is ledgered once
+as `agent.slack.request.abandoned` with `outcome: "unknown"` (identity,
+kind, delivery id, age in seconds; no body) and marked `abandoned`.
+
+"Unknown" is exact: the delivery was admitted and no outcome was recorded.
+Usually the command never ran, but its tool call may have committed while
+the outcome record did not (a shutdown deadline, a failed write), or it may
+still be running under a second `ua serve` on the same database. Check
+`tool_calls` (transport `slack`, that identity, around that time) before
+asking for it to be sent again. The event carries no `tool_calls` id: a
+call record does not hold the Slack delivery id, and matching by caller and
+time would not be exact. An `accepted` row is never pruned before the
 sweep has seen it.
 
 ## Result delivery
@@ -220,7 +242,7 @@ not implemented.
 | `agent.slack.request.deduped` | A repeated trigger id or event id | the mapped identity |
 | `agent.slack.request.accepted` | Admitted: kind, delivery id, command | the mapped identity |
 | `agent.slack.request.executed` | After the command ran: tool, `ok`, and on failure the error code, reason code and any approval id | the mapped identity |
-| `agent.slack.request.abandoned` | At startup: accepted before the last stop, never finished (identity, kind, delivery id, `age_s`) | the mapped identity |
+| `agent.slack.request.abandoned` | At startup: admitted before the last stop with no recorded outcome (identity, kind, delivery id, `age_s`, `outcome: "unknown"`; check `tool_calls`) | the mapped identity |
 | `agent.slack.reply.failed` | The `response_url` post failed: `timeout`, `transport`, `status` | the mapped identity |
 
 Requests with no mapped identity (`unmapped_identity`) write no ledger row
@@ -234,7 +256,7 @@ the `response_url`.
 
 `slack_seen_signatures` rows older than 600 seconds and
 `slack_seen_deliveries` rows older than a day (except `accepted` ones, see
-[Lost commands](#lost-commands)) are pruned on each admission.
+[Commands with no recorded outcome](#commands-with-no-recorded-outcome)) are pruned on each admission.
 
 ## Threat model
 
@@ -268,9 +290,12 @@ the `response_url`.
   always mark them. Events with `bot_id`, `subtype`, `app_id` or
   `bot_profile` are ignored, an edited message is not run a second time,
   and `/approve` is never accepted from the Events API at all, only as a
-  slash command, which only the person can invoke. Other commands sent as messages run as the mapped identity, so an
-  app with a mapped user's token can create or update tasks as that user;
-  turn off Event Subscriptions if that matters to you.
+  slash command, which only the person can invoke. Other commands sent as
+  messages must be marked (`!task`) and run as the mapped identity, so an
+  app with a mapped user's token can still create or update tasks as that
+  user by posting `!task …` to the app; turn off Event Subscriptions if
+  that matters to you. A `message.im` subscription on behalf of users is
+  ignored (no bot authorization).
 - **Spoofed identity fields:** `user_name` and display names are never used;
   the `team_id` is part of the key, so the same user id in another workspace
   is not the mapped user.
@@ -282,6 +307,12 @@ the `response_url`.
 - Bot-token posting (`chat.postMessage`), threaded replies and live chat.
 - Channel allowlists: identity is per user, in any channel the app is in.
 - Enterprise Grid org-wide installs have not been exercised.
+- The direct-message bot check follows Slack's documented envelope
+  (`authorizations`: one installation the event is visible to, with
+  `enterprise_id`, `team_id`, `user_id`, `is_bot`, `is_enterprise_install`).
+  It has not yet been confirmed against a live workspace that a bot-event
+  `message.im` carries `is_bot: true`; if it does not, direct-message
+  commands are ignored (fail closed) and mentions still work.
 - Socket Mode (no public URL): planned as a separate change; until then a
   hub reachable only on a private network cannot use Slack.
 
@@ -294,7 +325,7 @@ the `response_url`.
 - `admit(tx, cfg, timestamp, body, now, delivery)`: signature record,
   identity, the `can_approve` check, dedupe and the admission ledger event,
   in the caller's transaction.
-- `sweep_abandoned(tx, now)`: the startup sweep for lost commands.
+- `sweep_abandoned(tx, now)`: the startup sweep for admitted commands with no recorded outcome.
 - `command_call(parsed, delivery_id)`: the registry call a parsed command
   becomes.
 - `parse_slack_command(text)`: the parser (`slack_parse_command`). It never

@@ -120,7 +120,9 @@ fn slack_api_events() -> &'static str {
     ua_server::slack_api::EVENTS_PATH
 }
 
-/// An Events API `event_callback` envelope in Slack's shape.
+/// An Events API `event_callback` envelope in Slack's shape, delivered to
+/// the app's bot: `authorizations` lists the bot installation, as Slack's
+/// Events API documents for bot events (`is_bot: true`).
 fn event_body(user: &str, event_id: &str, event_type: &str, text: &str) -> Vec<u8> {
     json!({
         "token": "deprecated-verification-token",
@@ -129,6 +131,15 @@ fn event_body(user: &str, event_id: &str, event_type: &str, text: &str) -> Vec<u
         "type": "event_callback",
         "event_id": event_id,
         "event_time": now(),
+        "authorizations": [{
+            "enterprise_id": null,
+            "team_id": TEAM,
+            "user_id": "U0BOT",
+            "is_bot": true,
+            "is_enterprise_install": false,
+        }],
+        "is_ext_shared_channel": false,
+        "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ",
         "event": {
             "type": event_type,
             "user": user,
@@ -730,10 +741,20 @@ fn dm(user: &str, event_id: &str, text: &str) -> Vec<u8> {
     event_with(user, event_id, "message", text, json!({ "channel_type": "im" }))
 }
 
+/// The ledger, task, plan and delegation counts: what a command would change.
+async fn footprint(h: &TestHub) -> (i64, i64, i64, i64) {
+    (
+        scalar(h, "SELECT COUNT(*) FROM event_log").await,
+        task_count(h).await,
+        scalar(h, "SELECT COUNT(*) FROM plans").await,
+        scalar(h, "SELECT COUNT(*) FROM delegations").await,
+    )
+}
+
 #[tokio::test]
-async fn a_direct_message_may_start_with_a_bare_command_word() {
+async fn a_marked_command_in_a_direct_message_runs() {
     let h = TestHub::new(slack_config());
-    let body = dm(DEV, "Ev0DM1", "task write the report");
+    let body = dm(DEV, "Ev0DM1", "!task write the report");
     assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
     settle(&h).await;
     assert_eq!(task_count(&h).await, 1);
@@ -742,14 +763,31 @@ async fn a_direct_message_may_start_with_a_bare_command_word() {
 }
 
 #[tokio::test]
-async fn free_text_and_bare_words_in_channels_change_nothing() {
+async fn a_marked_command_in_a_channel_mention_runs() {
     let h = TestHub::new(slack_config());
-    let before = total_changes(&h).await;
+    let body = event_body(DEV, "Ev0CH1", "app_mention", "<@U0BOT> !Task write the report");
+    assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
+    settle(&h).await;
+    assert_eq!(task_count(&h).await, 1);
+}
+
+#[tokio::test]
+async fn ordinary_conversation_never_writes_to_the_hub() {
+    let h = TestHub::new(slack_config());
+    let before = footprint(&h).await;
+    let changes = total_changes(&h).await;
     for (i, body) in [
-        dm(DEV, "Ev0FT1", "tasks are piling up, can you help"),
-        dm(DEV, "Ev0FT2", "please task fix it"),
-        event_body(DEV, "Ev0FT3", "app_mention", "<@U0BOT> task fix it"),
-        event_with(DEV, "Ev0FT4", "message", "task fix it", json!({ "channel_type": "channel" })),
+        // The reviewer's probe sentences, as a mapped human in a DM.
+        dm(HUMAN, "Ev0FT1", "Plan looks good to me"),
+        dm(HUMAN, "Ev0FT2", "Task done, thanks!"),
+        dm(HUMAN, "Ev0FT3", "Assign it to Bob tomorrow"),
+        // Other bare words, in DMs and channels.
+        dm(DEV, "Ev0FT4", "task fix it"),
+        dm(DEV, "Ev0FT5", "status task-1"),
+        dm(DEV, "Ev0FT6", "! task fix it"),
+        dm(DEV, "Ev0FT7", "!tasks are piling up"),
+        event_body(DEV, "Ev0FT8", "app_mention", "<@U0BOT> task fix it"),
+        event_with(DEV, "Ev0FT9", "message", "!task fix it", json!({ "channel_type": "channel" })),
     ]
     .into_iter()
     .enumerate()
@@ -758,18 +796,52 @@ async fn free_text_and_bare_words_in_channels_change_nothing() {
         assert_eq!(r.status(), 200, "case {i}");
     }
     settle(&h).await;
-    assert_eq!(total_changes(&h).await, before);
+    assert_eq!(footprint(&h).await, before, "no ledger row, task, plan or delegation");
+    assert_eq!(total_changes(&h).await, changes, "no database write at all");
 }
 
 #[tokio::test]
-async fn approve_as_a_bare_word_in_a_direct_message_is_refused() {
+async fn a_direct_message_without_a_bot_authorization_is_ignored() {
+    let h = TestHub::new(slack_config());
+    let changes = total_changes(&h).await;
+    // Delivered to a user-scoped `message.im` subscription: only a user
+    // authorization, or none at all.
+    let user_auth = json!([{ "enterprise_id": null, "team_id": TEAM, "user_id": DEV, "is_bot": false, "is_enterprise_install": false }]);
+    for (i, auth) in [Some(user_auth), None].into_iter().enumerate() {
+        let mut v: Value = serde_json::from_slice(&dm(DEV, &format!("Ev0UA{i}"), "!task write it")).unwrap();
+        match auth {
+            Some(a) => v["authorizations"] = a,
+            None => {
+                v.as_object_mut().unwrap().remove("authorizations");
+            }
+        }
+        let body = v.to_string().into_bytes();
+        assert_eq!(h.send(signed(slack_api_events(), "application/json", &body, now())).await.status(), 200);
+    }
+    settle(&h).await;
+    assert_eq!(total_changes(&h).await, changes);
+    assert_eq!(task_count(&h).await, 0);
+}
+
+#[tokio::test]
+async fn approve_is_refused_on_events_in_every_spelling() {
     let h = TestHub::new(slack_config());
     let id = pending_approval(&h, &agent("builder-9")).await;
-    let body = dm(HUMAN, "Ev0DMA", &format!("approve {id}"));
-    h.send(signed(slack_api_events(), "application/json", &body, now())).await;
+    let bodies = [
+        dm(HUMAN, "Ev0AP1", &format!("!approve {id}")),
+        dm(HUMAN, "Ev0AP2", &format!("!APPROVE {id}")),
+        dm(HUMAN, "Ev0AP3", "!approve 5"),
+        event_body(HUMAN, "Ev0AP4", "app_mention", &format!("<@U0BOT> !Approve {id}")),
+    ];
+    for body in &bodies {
+        h.send(signed(slack_api_events(), "application/json", body, now())).await;
+    }
     settle(&h).await;
     assert_eq!(approval(&h, id).await.0, "pending");
-    assert_eq!(events(&h, "agent.slack.request.refused").await[0].1["reason"], "approve_needs_slash_command");
+    let refused = events(&h, "agent.slack.request.refused").await;
+    assert_eq!(refused.len(), bodies.len());
+    assert!(refused.iter().all(|(_, p)| p["reason"] == "approve_needs_slash_command"));
+    assert!(executed(&h).await.is_empty());
 }
 
 #[tokio::test]

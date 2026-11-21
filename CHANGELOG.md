@@ -65,9 +65,10 @@ from its commit history.
   opt-in and then follows `approval_resolve`'s rules. Slash-command results
   go to `response_url` on `hooks.slack.com` only. Repeated event ids and
   trigger ids are dropped (`slack_seen_deliveries`), and a command accepted
-  before a stop but never finished is ledgered at startup as
-  `agent.slack.request.abandoned`. Direct messages to the app may start
-  with a bare command word. Interactions, bot-token posting and Socket Mode
+  before a stop with no recorded outcome is ledgered at startup as
+  `agent.slack.request.abandoned` (outcome unknown). Messages run only when
+  marked (`!task …`, or `/task` after a mention), and direct messages only
+  when delivered to the app's bot. Interactions, bot-token posting and Socket Mode
   are not included.
 
 ### Changed

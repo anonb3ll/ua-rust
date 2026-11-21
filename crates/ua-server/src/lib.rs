@@ -98,13 +98,13 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
 /// Serve HTTP until `ct` is cancelled.
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
     let bind = state.hub.cfg().bind;
-    // Before anything is served: Slack commands lost when the hub last
-    // stopped are ledgered as abandoned.
+    // Before anything is served: Slack commands admitted before the hub last
+    // stopped, with no recorded outcome, are ledgered (outcome unknown).
     match slack_api::sweep_abandoned(&state.hub).await {
         Ok(0) => {}
         Ok(n) => tracing::warn!(
             n,
-            "Slack commands accepted before the last stop never finished; ledgered as abandoned"
+            "Slack commands admitted before the last stop have no recorded outcome; ledgered as abandoned (outcome unknown, check tool_calls)"
         ),
         Err(e) => tracing::warn!(code = e.code(), "could not sweep abandoned Slack commands"),
     }
