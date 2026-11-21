@@ -213,6 +213,26 @@ from its commit history.
 - The stale-worktree scan works on macOS, where it reads processes with
   `proc_pidinfo`.
 
+### Behaviour changes
+
+- Operator authority is a verified human (`human_identities`). Dispatch and
+  governance agree on it: acting for another agent in dispatch, and
+  confirming or retrying a cancellation, need an operator, not the
+  `operator` profile. Agents listed in `lifecycle_operators` keep their
+  fleet-maintenance operations under a separate grant (closing, parking and
+  folding tasks, releasing claims and holds, worktree cleanup, handoff
+  recovery, workflow records, wake handling, skill registry and harness
+  config administration, node-queue administration, agent and node
+  lifecycle), but are no longer operators: secret administration (and the
+  default MCP read rule), provider-account administration, node command
+  adoption, the hub view, reading every mailbox or conversation, and
+  `vault_move` need a verified human.
+- The `coordinator` and `operator` profiles grant no authority. The hub
+  view, reading every mailbox or conversation, and `vault_move` need an
+  operator. A coordinator agent that read every mailbox to route work cannot
+  any more; organization roles will replace that. What an unverified caller
+  (auth enforcement off) can read in messaging is unchanged and under review.
+
 ### Security
 
 - An unverified caller (auth off) that names a configured human or lifecycle

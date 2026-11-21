@@ -87,7 +87,7 @@ the approval queue.
 | `url`, `address_scope` | streamable_http only. See [Address scope](#address-scope). |
 | `secrets` | Managed secrets injected by name: `bearer` (HTTP `Authorization`), `header:<Name>` (another HTTP header) or `env:<NAME>` (a stdio child's environment). Each must be bound to consumer `mcp:<name>`. At most 8. |
 | `tools` | Every downstream tool the gateway may call, classified `read` or `write` by the reviewer. 1-256 entries. Nothing the server says about its own tools (annotations, its tool list) changes this. |
-| `read_profiles` | Profiles whose sessions may call the read tools. Empty: humans and configured operator identities (`human_identities`, `lifecycle_operators`) only, so a server meant for agents names their profiles. An anonymous caller never reads from a server with `secrets`. |
+| `read_profiles` | Profiles whose sessions may call the read tools. Empty: operators (verified humans, `human_identities`) only, so a server meant for agents names their profiles. An anonymous caller never reads from a server with `secrets`. |
 | `timeout_s` | One call's budget, connection included: 1-120, default 30. |
 
 `mcp_server_review` renews the review window for `review_days` from now

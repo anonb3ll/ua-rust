@@ -77,6 +77,15 @@ here for memory columns, owners and defaults.
   an unverified caller naming a configured human as its actor is no longer a
   workflow-record operator.
 
+- Authority comes from identity, never from a profile (two owner
+  decisions). `Operator` is a verified human; `LifecycleOperator` is a
+  separate fleet-maintenance grant for agents in `lifecycle_operators`,
+  never operator authority, named at each call site that admits it next to
+  `Operator`. The coordinator and operator profiles grant nothing; the
+  profile-as-authority count in the guard is 0. Unverified mailbox reads
+  (auth enforcement off) are unchanged and under review
+  (`LocalTrustReader`).
+
 Not yet: the tenant parts, the label and launch-key indexes, the
 `memory_versions_capture` trigger, `hash_v = 2`, and everything after
 `organization.v1`.

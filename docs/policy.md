@@ -177,12 +177,24 @@ rather than store the secret. The full status table is in
 A profile is a capability tier bound to the verified identity and the client
 session. `profiles` in the hub config sets each identity's default
 (unlisted identities get `developer`, OAuth identities get `oauth_profile`);
+**A profile is a permission set, never authority.** It decides which tools a
+session sees. Who may act on another agent's work, read every mailbox or
+conversation, see the hub's boundaries, or move vault notes comes from
+identity (`ua_org::authz`): an operator is a verified human (`human_identities`),
+and an agent in `lifecycle_operators` holds a separate fleet-maintenance grant
+(closing, parking and folding tasks, releasing claims and holds, worktree
+cleanup, handoff recovery, workflow records, wake handling, node-queue
+administration, and agent and node lifecycle), never operator authority. The
+Python hub let the coordinator and operator profiles carry authority; ua-rust
+does not. A coordinator agent that read every mailbox to route work cannot do
+so any more; organization roles (`docs/organization.md`) are what replace it.
+
 `profile_activate` moves a session to a profile no more privileged than that
 default, and a `profile_defaults` overlay (below) can only lower it.
 
 | Profile | Rank | Surface |
 |---|---|---|
-| `coordinator` | 8 | Every tool. Holds config authority: a profile overlay may not demote the last identity configured with it. Moves vault notes, reads every mailbox. |
+| `coordinator` | 8 | Every tool. A profile overlay may not demote the last identity configured with it (a lockout guard for config revisions). It grants no authority: moving vault notes and reading every mailbox need an operator (a verified human). |
 | `lead` | 7 | The developer surface plus `LEAD_EXTRA_TOOLS` (today all of those are already visible to developer), ranked above it. |
 | `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, migration manifests (`export_migration_manifest`, `compare_migration_manifests`, also through `export_data`), and profile switching (deny list: new tools are visible). |
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
