@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod node_api;
 pub mod oauth;
 pub mod platform_api;
+pub mod slack_api;
 pub mod ui;
 
 use std::sync::Arc;
@@ -67,7 +68,8 @@ pub const NO_MCP_SERVER_WARNING: &str = "built without the mcp-server feature: t
 route, no `ua mcp`); MCP clients cannot connect. The JSON API (/api/tools), the UI and OAuth for /api still work.";
 
 /// Build the full HTTP router: `/mcp` (with the `mcp-server` feature),
-/// `/api`, health. Cancelling `ct` ends MCP sessions and open event streams.
+/// `/api`, health, and the Slack routes when configured
+/// ([`slack_api::mount_status`]). Cancelling `ct` ends MCP sessions and open event streams.
 pub fn router(state: AppState, ct: CancellationToken) -> Router {
     let state = AppState { shutdown: ct.clone(), ..state };
     #[cfg(feature = "mcp-server")]
@@ -85,6 +87,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(github_api::routes())
         .merge(node_api::routes())
         .merge(platform_api::routes())
+        .merge(slack_api::routes(state.hub.cfg()))
         .merge(ui::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::authenticate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), guard::protect))
@@ -95,10 +98,28 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
 /// Serve HTTP until `ct` is cancelled.
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
     let bind = state.hub.cfg().bind;
+    // Before anything is served: Slack commands admitted before the hub last
+    // stopped, with no recorded outcome, are ledgered (outcome unknown).
+    match slack_api::sweep_abandoned(&state.hub).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            n,
+            "Slack commands admitted before the last stop have no recorded outcome; ledgered as abandoned (outcome unknown, check tool_calls)"
+        ),
+        Err(e) => tracing::warn!(code = e.code(), "could not sweep abandoned Slack commands"),
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, tools = state.registry.len(), mcp = MCP_SERVER, "hub listening");
     if !MCP_SERVER {
         tracing::warn!("{NO_MCP_SERVER_WARNING}");
+    }
+    match slack_api::mount_status(state.hub.cfg()) {
+        Ok(_) => tracing::info!(
+            commands = slack_api::COMMANDS_PATH,
+            events = slack_api::EVENTS_PATH,
+            "Slack routes mounted"
+        ),
+        Err(why) => tracing::info!("{why}"),
     }
     let app = router(state, ct.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).with_graceful_shutdown(async move { ct.cancelled_owned().await }).await?;

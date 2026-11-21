@@ -209,6 +209,22 @@ reviewer-1 = "reviewer"
 # get_page = "read"
 # put_page = "write"
 
-# Slack request signing (no route serves Slack yet; see docs/slack.md). Set
-# the signing secret in the hub's environment as UA_SLACK_SIGNING_SECRET, not
-# in this file. The value is never logged or stored.
+# Slack ingress (docs/slack.md): slash commands at /api/slack/commands and
+# Events API callbacks at /api/slack/events. Off by default; both routes
+# answer 404 unless slack_enabled is on AND UA_SLACK_SIGNING_SECRET is set in
+# the hub's environment (never in this file; the value is never logged or
+# stored). The routes need a public HTTPS URL (Socket Mode is planned
+# separately). Each Slack user who may use them is mapped by (team_id,
+# user_id) to a hub identity, which must be in human_identities (never an
+# agent label); anyone else is refused. Slack's user_name is never used.
+# Commands run as that identity through the normal profile, policy and
+# approval checks, recorded with transport "slack". /approve is refused
+# unless the mapping sets can_approve = true, so turning Slack on does not
+# widen who can approve.
+# slack_enabled = false              # UA_SLACK_ENABLED also sets it
+#
+# [[slack_identities]]
+# team_id = "T0000000000"
+# user_id = "U0000000000"
+# identity = "operator"
+# can_approve = false

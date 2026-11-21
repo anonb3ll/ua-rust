@@ -11,7 +11,8 @@
 //! - CSRF on the JSON API: a state-changing `/api` request must not be
 //!   cross-site (`Sec-Fetch-Site`, `Origin`), and a body must be sent as
 //!   `application/json`, which a cross-site page cannot do without a CORS
-//!   preflight this server never grants. The `/ui` forms have their own
+//!   preflight this server never grants (except the signed Slack routes,
+//!   which take a form and no credential). The `/ui` forms have their own
 //!   double-submit token check (`ui::csrf`).
 
 use std::collections::HashSet;
@@ -153,7 +154,10 @@ pub async fn protect(State(state): State<AppState>, req: Request, next: Next) ->
         if !same_origin(h, req.uri()) {
             return refuse(StatusCode::FORBIDDEN, "cross-site request");
         }
-        if has_body(h) && !is_json(h) {
+        // Slack sends slash commands as a form. Those routes take no cookie
+        // or bearer, so a cross-site form gains nothing; they authenticate by
+        // signature over the raw body.
+        if has_body(h) && !is_json(h) && !crate::slack_api::is_slack_path(path) {
             return refuse(StatusCode::UNSUPPORTED_MEDIA_TYPE, "send the body as application/json");
         }
     }

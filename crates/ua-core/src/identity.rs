@@ -28,6 +28,10 @@ pub enum Transport {
     Cli,
     Ui,
     Internal,
+    /// The signed Slack routes (`/api/slack/*`): a person typing in Slack,
+    /// mapped to a human identity by `slack_identities`. Never treated as
+    /// more trusted than `Http`; it is not a browser or passkey session.
+    Slack,
 }
 
 /// The verified caller of one tool invocation.
