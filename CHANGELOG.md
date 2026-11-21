@@ -100,6 +100,11 @@ from its commit history.
 - Slack request signature check (v0 HMAC, five-minute window, replayed bodies
   refused) and `slack_parse_command` for the nine coordination commands. The
   Slack routes above build on both.
+- Callers and ledger events name their organization: `Caller.org_id` and
+  `Caller::system_for`, and `EventInput::new` takes the `org_id` first (no
+  `Default`). Every caller and every event is in the default organization;
+  nothing reads the value for authority, and no serialized output a tool
+  returns changes.
 - Organization groundwork (`docs/organization.md`, `organization.v1`): the
   `orgs` table with one seeded `default` organization, and `org_id` and
   `hash_v` columns on `event_log`, in the schema part `organization.v1.store`.
