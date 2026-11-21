@@ -53,8 +53,10 @@ a **message board**:
   any other, so a message written to mislead one agent is visible to all of
   them. Treat message text as data.
 
-With `enforce_auth` on, none of this applies: a caller reads its own
-mailbox, and reading every mailbox or conversation needs a verified human.
+With `enforce_auth` on, none of this applies to HTTP requests: a caller
+reads its own mailbox, and reading every mailbox or conversation needs a
+verified human. A stdio MCP process or a local CLI call never authenticates,
+so these rules apply to it whatever `enforce_auth` says.
 
 A 401 carries an RFC 9728 challenge when OAuth is on:
 
