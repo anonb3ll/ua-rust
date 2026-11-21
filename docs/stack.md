@@ -33,7 +33,7 @@ were considered and are not used are under [Planned or not adopted](#planned-or-
 | Config | figment 0.10 (defaults → TOML → `UA_*` env) | confique 0.4 | Layered with source-aware errors. |
 | Secrets in memory | secrecy 0.10 | — | Redacted `Debug`, zeroized on drop. |
 | `.env` | dotenvy 0.15 | — | Local development only. |
-| Logging | tracing + tracing-subscriber | — | Console and JSON output. There is no OpenTelemetry export. |
+| Logging | tracing + tracing-subscriber | — | Plain-text output. There is no JSON layer and no OpenTelemetry export. |
 | Git | The `git` CLI, run through the workspace command runner | gix 0.90, git2 0.21 | gix cannot yet remove worktrees or run merges. |
 | HTTP client | reqwest 0.13 (rustls) | ureq 3 | rustls is now the default backend. |
 | Content extraction | dom_smoothie 0.19 + htmd 0.6 | trafilatura 0.6 | Readability-style main content, then Markdown. dom_smoothie is behind the `readability` cargo feature (on by default); without it the whole page is converted and results say `extraction: "full-page"`. |
@@ -44,8 +44,8 @@ were considered and are not used are under [Planned or not adopted](#planned-or-
 | Process execution | `tokio::process`, argv allowlist, timeout, output cap | process-wrap 10 | No shell, kill the whole process group on timeout. |
 | Sandboxing | Path resolvers in `ua-core` confine file and command tools to a workspace root | landlock 0.4, nono | No kernel sandbox is used. |
 | Cron | croner 4.0 | cron 0.17 | |
-| GitHub, Slack, Zulip | reqwest, with a small hand-written client for each | octocrab 0.54, slack-morphism 2.34 | The GitHub client is bound to configured repositories, and the Slack and Zulip code needs only a few calls. |
-| IDs | uuid 1.29 (v7, v4) and ulid 3 | — | Time-ordered. Existing integer task ids stay integers. |
+| GitHub, Slack, Zulip | Own REST client on reqwest for GitHub and Zulip; own Slack code (signature check, parser, Socket Mode on tokio-tungstenite) | octocrab 0.54, slack-morphism 2.34 | The GitHub client is bound to configured repositories. No Slack SDK: the hub needs only request signing, `apps.connections.open` and the Socket Mode envelope protocol. Zulip has no maintained crate. |
+| IDs | ulid 3 and uuid 1.29 (v4) | — | ULIDs are time-ordered; the code generates only v4 UUIDs, though the `v7` feature is enabled. Existing integer task ids stay integers. |
 | Time | jiff 1.0 (`ua-tools` also uses chrono 0.4 for cron) | time 0.3 | |
 | Tests and CI | cargo-nextest, Swatinem/rust-cache | cargo-audit | `cargo fmt`, `clippy` and `nextest` run in CI, with and without default features, plus a macOS dispatch job. |
 
@@ -87,6 +87,7 @@ build has.
 | `readability` | on | dom_smoothie | The article pass in `web_fetch` and `dash_view` | The whole page is converted; results carry `extraction: "full-page"`. |
 | `mcp-gateway` | on | rmcp (client) | `mcp_gateway`, the downstream MCP client | No `mcp_gateway`; `mcp_server_register` refuses, and the `mcp_server_*` descriptions and results say no gateway is compiled in. |
 | `mcp-server` | on | rmcp (server) | The `/mcp` route, `ua mcp`, the `/mcp` OAuth protected resource | `ua serve` warns at startup and serves the JSON API and UI only; OAuth issues hub-wide tokens; `ua mcp` exits with an error naming the feature. |
+| `slack-socket` | on | tokio-tungstenite 0.28 (WebSocket protocol only, no TLS feature; TLS is tokio-rustls with the rustls/ring stack and platform verifier reqwest already uses, so no second TLS implementation) | Slack Socket Mode in `ua serve` (an outbound WebSocket; no public URL) | `slack_socket_mode = true` is reported as not compiled in (startup log, `system_doctor`); the signed HTTP routes still work. |
 | `embeddings` | off | fastembed | Semantic memory search (see the Embeddings row) | Memory search is lexical (FTS5). |
 
 ## Protocol notes

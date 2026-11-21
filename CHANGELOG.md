@@ -68,8 +68,19 @@ from its commit history.
   before a stop with no recorded outcome is ledgered at startup as
   `agent.slack.request.abandoned` (outcome unknown). Messages run only when
   marked (`!task …`, or `/task` after a mention), and direct messages only
-  when delivered to the app's bot. Interactions, bot-token posting and Socket Mode
-  are not included.
+  when delivered to the app's bot. Interactions and bot-token posting are
+  not included.
+- Slack Socket Mode, off by default (`slack_socket_mode = true` plus the
+  app-level token in `UA_SLACK_APP_TOKEN`, never the config file): `ua serve`
+  opens an outbound WebSocket to Slack, so a hub with no public URL can serve
+  Slack. Envelopes go through the same admission and execution as the HTTP
+  routes; a redelivered envelope is acknowledged and runs nothing (its
+  envelope id goes into the replay table). Slash-command answers ride in the
+  acknowledgement. The socket URL must be `wss` on `slack.com`; reconnects
+  back off with jitter, and a refused token stops the transport with one log
+  line. `system_doctor` reports the transport's state. Behind the new
+  default-on cargo feature `slack-socket` (tokio-tungstenite, on the existing
+  rustls stack).
 - The TypeScript SDK under `sdk/typescript` (`@unified-agent/protocol` and
   `@unified-agent/client`; not published), with workflows that typecheck,
   test and check codegen, and run the live conformance suite against a
@@ -146,9 +157,11 @@ from its commit history.
   read that finds every pooled reader busy opens a short-lived extra reader
   (at most four) instead of queueing behind the writer, and a panic in a read
   no longer leaks a reader.
-- A successful read-only call made for a UI page or `GET /api/board` leaves no
-  `tool_calls` row. `memory_search` and `memory_get` are marked read-only, and
-  a failed access-counter update no longer fails the read.
+- A successful read-only call made for a UI page, or for `GET /api/board` from
+  a signed-in browser session, leaves no `tool_calls` row; other callers of
+  `GET /api/board` get one summary row. `memory_search` and `memory_get` are
+  marked read-only but still record a row, because they update access
+  counters, and a failed counter update no longer fails the read.
 - `ua serve` stops on SIGTERM as well as Ctrl-C: one cancellation token stops
   the server and the background loops, and the WAL is checkpointed on exit.
 - Canonical JSON for approval payloads, digests and fingerprints sorts keys

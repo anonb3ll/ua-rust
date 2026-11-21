@@ -199,17 +199,22 @@ fn local_caller_with(
     c
 }
 
-/// Whether rmcp at `level` is dropped. rmcp logs whole requests and
-/// responses at debug and trace: tool arguments (a managed_secret_set value)
-/// and downstream MCP results (a reflected credential).
-fn rmcp_capped(target: &str, level: &tracing::Level) -> bool {
-    (target == "rmcp" || target.starts_with("rmcp::"))
+/// Crates whose debug and trace logs are always dropped. rmcp logs whole
+/// requests and responses: tool arguments (a managed_secret_set value) and
+/// downstream MCP results (a reflected credential). tungstenite and
+/// tokio-tungstenite (Slack Socket Mode) log the WebSocket handshake
+/// request, whose URL carries Slack's one-time connection ticket.
+const CAPPED_TARGETS: [&str; 3] = ["rmcp", "tungstenite", "tokio_tungstenite"];
+
+/// Whether a log at `level` from `target` is dropped ([`CAPPED_TARGETS`]).
+fn capped(target: &str, level: &tracing::Level) -> bool {
+    CAPPED_TARGETS.iter().any(|c| target == *c || target.strip_prefix(c).is_some_and(|r| r.starts_with("::")))
         && matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE)
 }
 
 /// The log layer: `filter` (from UA_LOG), then a cap no directive can lift
-/// (not even a more specific one such as `rmcp::service=debug`): rmcp never
-/// logs below info.
+/// (not even a more specific one such as `rmcp::service=debug`): rmcp,
+/// tungstenite and tokio-tungstenite never log below info.
 fn log_layer<S, W>(
     filter: tracing_subscriber::EnvFilter,
     writer: W,
@@ -220,7 +225,7 @@ where
 {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::{FilterExt, filter_fn};
-    let cap = filter_fn(|meta| !rmcp_capped(meta.target(), meta.level()));
+    let cap = filter_fn(|meta| !capped(meta.target(), meta.level()));
     tracing_subscriber::fmt::layer().with_writer(writer).with_filter(filter.and(cap))
 }
 
@@ -677,6 +682,36 @@ mod tests {
         }
     }
 
+    /// The Socket Mode handshake request (with the ticket in its URL) is
+    /// logged by tungstenite at trace through the `log` bridge, under module
+    /// targets; none of it passes, whatever UA_LOG says.
+    #[test]
+    fn tungstenite_never_logs_below_info() {
+        use tracing_subscriber::layer::SubscriberExt;
+        for directive in ["trace", "info,tungstenite=trace,tokio_tungstenite=trace", "debug"] {
+            let buf = Buf::default();
+            let filter = tracing_subscriber::EnvFilter::new(directive);
+            let sub = tracing_subscriber::registry().with(log_layer(filter, buf.clone()));
+            tracing::subscriber::with_default(sub, || {
+                tracing::trace!(target: "tungstenite::handshake::client", "GET /link/?ticket=SECRET-TICKET");
+                tracing::debug!(target: "tungstenite::protocol", "SECRET-FRAME");
+                tracing::trace!(target: "tokio_tungstenite::compat", "SECRET-POLL");
+                tracing::debug!(target: "tokio_tungstenite", "SECRET-ROOT");
+                tracing::info!(target: "tungstenite::protocol", "tungstenite info kept");
+                tracing::debug!(target: "tungstenitex", "lookalike kept");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("SECRET"), "{directive}: {out}");
+            assert!(out.contains("tungstenite info kept"), "{directive}: {out}");
+            if directive != "info,tungstenite=trace,tokio_tungstenite=trace" {
+                assert!(out.contains("lookalike kept"), "{directive}: {out}");
+            }
+        }
+        assert!(capped("tungstenite::handshake::client", &tracing::Level::TRACE));
+        assert!(capped("tokio_tungstenite", &tracing::Level::DEBUG));
+        assert!(!capped("tungstenite", &tracing::Level::INFO));
+    }
+
     #[test]
     fn rmcp_never_logs_below_info() {
         for directive in [
@@ -763,8 +798,8 @@ mod tests {
         assert!(!text.contains("SECRET"), "{text}");
         assert!(text.contains("rmcp-info-kept") && text.contains("other-debug-kept"), "{text}");
         assert!(text.contains("lookalike-kept"), "{text}");
-        assert!(rmcp_capped("rmcp::transport::worker", &tracing::Level::TRACE));
-        assert!(!rmcp_capped("rmcp", &tracing::Level::WARN));
+        assert!(capped("rmcp::transport::worker", &tracing::Level::TRACE));
+        assert!(!capped("rmcp", &tracing::Level::WARN));
     }
 
     #[test]
