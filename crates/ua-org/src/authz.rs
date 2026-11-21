@@ -168,10 +168,11 @@ mod tests {
     use ua_core::identity::Transport;
 
     fn cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.human_identities = vec!["operator".into()];
-        cfg.lifecycle_operators = Some(vec!["fleet-bot".into()]);
-        cfg
+        Config {
+            human_identities: vec!["operator".into()],
+            lifecycle_operators: Some(vec!["fleet-bot".into()]),
+            ..Config::default()
+        }
     }
 
     fn caller(label: &str, kind: ActorKind, profile: Profile) -> Caller {
