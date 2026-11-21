@@ -59,7 +59,8 @@ call). Named policies are constants in `ua_ingress::policy`;
 with an empty host list, a zero or unbounded cap or timeout, or more than
 ten redirects builds no client.
 
-Each property is enforced in the crate and has a test there:
+Each property is enforced in the crate and has a test there, with one
+exception: no test yet makes the peer-address re-check refuse a connection.
 
 - **No proxy.** `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the system
   proxy settings are ignored (`tests/no_proxy.rs` shows a default client
@@ -82,6 +83,13 @@ Each property is enforced in the crate and has a test there:
 - **Timeouts.** Connect (which also bounds the DNS lookup), per request
   including the body, and a deadline for the whole call that also bounds
   body reads.
+
+No policy allows redirects yet. Before one does, a hop to another origin
+has to be tightened: today a 307 or 308 resends the request body there,
+headers set with `Request::header` follow to any origin, and the
+credential-name check is a word list that a differently named header can
+miss. The fix is to drop the body and every header not explicitly allowed
+on a cross-origin hop, or to refuse such hops.
 
 Errors never include the request URL's path or query or any header value.
 `OutboundError` converts into `UaError` (`ssrf_blocked` for an address
@@ -139,6 +147,11 @@ below it, lower the baseline in the same change. It also checks that each
 category is caught. The baseline when the crate landed: `client_builder` 5
 in `ua-tools` and 1 in `ua-server`, `address_classifier` 5 in `ua-tools`,
 `delivery_table` 4 in `ua-tools`.
+
+What it does not count yet: connections dialled directly on a socket or a
+WebSocket (the Slack Socket Mode connector does this today), address checks
+written inline or over a socket address, and a delivery table under a name
+not listed above.
 
 ## Consumers
 
