@@ -37,12 +37,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::lifecycle::stop_runs;
-use super::{clean_reason, is_operator, now};
+use super::{clean_reason, now};
 use crate::families::agents::verified;
 use crate::families::dispatch::{load_run, states};
 use crate::families::node_queue;
 use crate::families::tasks::{acting_identity, subtree_ids};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const CHANNEL: &str = "agent.task.hold";
 const MODES: [&str; 4] = ["pause", "cancel", "resume", "restore"];
@@ -484,7 +485,11 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
     }
     let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
     let is_verified = verified(&ctx.caller).is_some();
-    let operator = is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let operator = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     let reason = clean_reason(
         a.reason.as_deref(),
         matches!(verb.as_str(), "pause" | "cancel").then_some("hold a subtree"),

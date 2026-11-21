@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use ua_core::{ActorKind, Caller, Profile, UaError, UaResult};
+use ua_core::{ActorKind, Caller, UaError, UaResult};
 
 use super::executor::{self, LaunchSpec};
 use super::{
@@ -223,12 +223,12 @@ fn verified(caller: &Caller, tool: &str) -> UaResult<()> {
     Ok(())
 }
 
-fn operator(caller: &Caller, tool: &str) -> UaResult<()> {
+fn operator(cfg: &ua_core::Config, caller: &Caller, tool: &str) -> UaResult<()> {
     verified(caller, tool)?;
-    if caller.profile != Profile::Operator {
+    if !super::is_operator(cfg, caller) {
         return Err(UaError::denied(
             "operator_authorization_required",
-            format!("{tool} requires the authenticated operator profile"),
+            format!("{tool} requires an operator (a verified human)"),
         ));
     }
     Ok(())
@@ -1071,7 +1071,7 @@ fn reconcilable_for_retry(run: &super::Run) -> bool {
 }
 
 async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
-    operator(&ctx.caller, "dispatch_retry_cancellation")?;
+    operator(ctx.hub.cfg(), &ctx.caller, "dispatch_retry_cancellation")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
     if !reconcilable_for_retry(&run) {
@@ -1097,7 +1097,7 @@ async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
 }
 
 async fn confirm_cancellation(ctx: ToolCtx, a: ConfirmArgs) -> UaResult<Value> {
-    operator(&ctx.caller, "dispatch_confirm_cancellation")?;
+    operator(ctx.hub.cfg(), &ctx.caller, "dispatch_confirm_cancellation")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
     if !matches!(run.state.as_str(), "cancelled" | "blocked")

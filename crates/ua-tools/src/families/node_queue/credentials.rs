@@ -50,13 +50,12 @@ use ua_core::time::{format_ts, parse_ts};
 use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
-use super::{
-    LEASE_GRACE_S, check_item_id, device_agent, is_operator, load_item, load_node, owned_node, run_gate,
-};
+use super::{LEASE_GRACE_S, check_item_id, device_agent, load_item, load_node, owned_node, run_gate};
 use crate::families::{governance, nodes};
 use crate::grant::SessionGrant;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "session_credentials.v1",
@@ -682,7 +681,11 @@ pub struct RevokeArgs {
 /// the revoked ids and their metadata, never a value.
 pub(crate) async fn session_credential_revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
     let who = super::verified_caller(&ctx.caller, "revoking session credentials")?;
-    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied("not_operator", "revoking session credentials is an operator action"));
     }
     let chosen =

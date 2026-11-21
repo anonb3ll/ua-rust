@@ -20,7 +20,7 @@ use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, UaResult
 /// One authority a caller may hold. All of these are transitional (see the
 /// module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Authority<'a> {
+pub enum Authority {
     /// Operator authority: a **verified human**, that is a caller of kind
     /// human, or a verified caller whose label is a configured human identity
     /// (`human_identities`). A label listed only in `lifecycle_operators` is
@@ -51,21 +51,6 @@ pub enum Authority<'a> {
     /// Replaced by `HubOwner` and `OrgRole` once `users` and memberships
     /// exist (`organization.v2`).
     TransitionalHuman,
-    /// Operator authority over other agents' work: a **verified** caller
-    /// (agent or human) that is a human, or whose label `who` is a configured
-    /// human identity or lifecycle operator. `who` is the label the call site
-    /// acts as; an unverified caller never holds this, whatever it claims.
-    ///
-    /// Replaced by `OrgRole { min: OrgAdmin }` of the target's organization,
-    /// and `LifecycleOperator` for node retirement (`organization.v2`).
-    TransitionalOperator { who: &'a str },
-    /// Acting for another agent in dispatch: a caller that is not anonymous
-    /// and is a human or runs under the `operator` profile. A configured
-    /// lifecycle operator does **not** hold it.
-    ///
-    /// **Profile used as authority; the design forbids this; kept to preserve
-    /// behaviour.** Replaced by `OrgRole { min: OrgAdmin }`.
-    TransitionalProfileOperator,
     /// Seeing the hub's boundaries in the capability catalog (read-only): a
     /// human, a caller under the `coordinator` or `operator` profile, or a
     /// verified caller whose label is a configured human or lifecycle
@@ -94,7 +79,7 @@ pub enum Authority<'a> {
     TransitionalLocalMailboxReader,
 }
 
-impl Authority<'_> {
+impl Authority {
     /// A stable name for messages and logs (not the Rust variant name).
     pub fn name(&self) -> &'static str {
         match self {
@@ -102,8 +87,6 @@ impl Authority<'_> {
             Authority::LifecycleOperator => "lifecycle operator",
             Authority::LocalTrustReader => "local trust reader",
             Authority::TransitionalHuman => "human",
-            Authority::TransitionalOperator { .. } => "operator (transitional)",
-            Authority::TransitionalProfileOperator => "dispatch operator",
             Authority::TransitionalHubView => "hub view",
             Authority::TransitionalMailboxReader => "mailbox reader",
             Authority::TransitionalLocalMailboxReader => "local mailbox reader",
@@ -145,12 +128,12 @@ impl<'a> Authz<'a> {
     /// Until organizations other than the default exist, `target_org` must
     /// be [`DEFAULT_ORG`] and the caller's organization; anything else holds
     /// nothing (it is refused, not ignored).
-    pub fn holds(&self, caller: &Caller, need: &[Authority<'_>], target_org: &str) -> bool {
+    pub fn holds(&self, caller: &Caller, need: &[Authority], target_org: &str) -> bool {
         self.org_ok(caller, target_org).is_ok() && need.iter().any(|a| self.holds_one(caller, a))
     }
 
     /// [`Authz::holds`] as a refusal naming what was needed.
-    pub fn require(&self, caller: &Caller, need: &[Authority<'_>], target_org: &str) -> UaResult<()> {
+    pub fn require(&self, caller: &Caller, need: &[Authority], target_org: &str) -> UaResult<()> {
         self.org_ok(caller, target_org)?;
         if need.iter().any(|a| self.holds_one(caller, a)) {
             return Ok(());
@@ -183,19 +166,13 @@ impl<'a> Authz<'a> {
         self.cfg.is_human(label) || self.cfg.is_lifecycle_operator(label)
     }
 
-    fn holds_one(&self, caller: &Caller, a: &Authority<'_>) -> bool {
+    fn holds_one(&self, caller: &Caller, a: &Authority) -> bool {
         let verified = verified_label(caller);
         match *a {
             Authority::Operator => operator_rule(self.cfg, caller),
             Authority::LocalTrustReader => verified.is_none(),
             Authority::LifecycleOperator => verified.is_some_and(|l| self.cfg.is_lifecycle_operator(l)),
             Authority::TransitionalHuman => human(caller),
-            Authority::TransitionalOperator { who } => {
-                verified.is_some() && (human(caller) || self.configured(who))
-            }
-            Authority::TransitionalProfileOperator => {
-                caller.kind != ActorKind::Anonymous && (human(caller) || caller.profile == Profile::Operator)
-            }
             Authority::TransitionalHubView => {
                 human(caller)
                     || matches!(caller.profile, Profile::Coordinator | Profile::Operator)
@@ -231,7 +208,7 @@ mod tests {
         Caller { kind, profile, ..Caller::local(label, Transport::Http) }
     }
 
-    fn holds(c: &Caller, a: Authority<'_>) -> bool {
+    fn holds(c: &Caller, a: Authority) -> bool {
         let cfg = cfg();
         Authz::new(&cfg).holds(c, &[a], DEFAULT_ORG)
     }
@@ -320,51 +297,6 @@ mod tests {
                 "{kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn operator_needs_a_verified_caller() {
-        let human = caller("operator", ActorKind::Human, Profile::Operator);
-        assert!(holds(&human, Authority::TransitionalOperator { who: "operator" }));
-        let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Developer);
-        assert!(holds(&fleet, Authority::TransitionalOperator { who: "fleet-bot" }));
-        let dev = caller("builder-1", ActorKind::Agent, Profile::Operator);
-        assert!(
-            !holds(&dev, Authority::TransitionalOperator { who: "builder-1" }),
-            "a profile is not operator"
-        );
-        // An unverified caller naming a configured human or lifecycle
-        // operator never holds it (this is the rule a future unverified
-        // call site would be held to).
-        for who in ["operator", "fleet-bot"] {
-            let anon = caller(who, ActorKind::Anonymous, Profile::Developer);
-            assert!(!holds(&anon, Authority::TransitionalOperator { who }), "{who}");
-        }
-        let system = Caller::system();
-        assert!(
-            !holds(&system, Authority::TransitionalOperator { who: "operator" }),
-            "system is not verified"
-        );
-    }
-
-    #[test]
-    fn profile_operator_is_the_operator_profile_and_not_a_lifecycle_operator() {
-        assert!(holds(
-            &caller("builder-1", ActorKind::Agent, Profile::Operator),
-            Authority::TransitionalProfileOperator
-        ));
-        assert!(holds(
-            &caller("operator", ActorKind::Human, Profile::Developer),
-            Authority::TransitionalProfileOperator
-        ));
-        assert!(!holds(
-            &caller("fleet-bot", ActorKind::Agent, Profile::Developer),
-            Authority::TransitionalProfileOperator
-        ));
-        assert!(!holds(
-            &caller("local", ActorKind::Anonymous, Profile::Operator),
-            Authority::TransitionalProfileOperator
-        ));
     }
 
     #[test]

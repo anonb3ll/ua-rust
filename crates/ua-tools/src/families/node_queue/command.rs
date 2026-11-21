@@ -13,12 +13,12 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{
-    Item, check_item_id, clip, is_operator, load_item, now, record, request_dispatch, validate_new,
-    verified_caller,
+    Item, check_item_id, clip, load_item, now, record, request_dispatch, validate_new, verified_caller,
 };
 use crate::families::{agents, messaging};
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 /// The sender of command notices.
 pub const NOTICE_SENDER: &str = "hub-node";
@@ -318,7 +318,14 @@ pub(crate) async fn node_command_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
             let hidden = || UaError::not_found(format!("no command item {id} visible to you"));
             let item = load_item(c, &id)?.ok_or_else(hidden)?;
             let cmd = load(c, &id)?.ok_or_else(hidden)?;
-            if !(cmd.owner_agent == who || item.created_by == who || is_operator(&hub, &caller, &who)) {
+            if !(cmd.owner_agent == who
+                || item.created_by == who
+                || Authz::new(hub.cfg()).holds(
+                    &caller,
+                    &[Authority::Operator, Authority::LifecycleOperator],
+                    ua_core::DEFAULT_ORG,
+                ))
+            {
                 return Err(hidden());
             }
             let receipt = item.receipt().unwrap_or(Value::Null);
@@ -367,7 +374,7 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
             let hidden = || UaError::not_found(format!("no command item {id} visible to you"));
             let item = load_item(tx, &id)?.ok_or_else(hidden)?;
             let cmd = load(tx, &id)?.ok_or_else(hidden)?;
-            let operator = hub.cfg().is_lifecycle_operator(&who) || caller.is_human();
+            let operator = Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
             if cmd.owner_agent != who && !operator {
                 return Err(UaError::denied(
                     "not_command_owner",

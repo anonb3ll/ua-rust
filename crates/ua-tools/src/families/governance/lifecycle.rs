@@ -44,12 +44,13 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
-use super::{clean_reason, is_operator, now, verified_actor};
+use super::{clean_reason, now, verified_actor};
 use crate::families::agents::validate_label;
 use crate::families::dispatch;
 use crate::families::{node_queue, tokens};
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const CHANNEL: &str = "agent.lifecycle";
 const MAX_OWNER: usize = 120;
@@ -513,7 +514,11 @@ async fn change(
         Some(o) => Some(validate_label(Some(o), "owner")?),
     };
     let who = verified_actor(&ctx.caller, "changing an agent's lifecycle")?;
-    let operator = is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let operator = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     let (l2, w2, r2) = (label.clone(), who.clone(), reason.clone());
     let out = ctx
         .hub

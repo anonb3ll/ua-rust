@@ -60,6 +60,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 use super::agents::verified;
 use super::{governance, node_queue, nodes};
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "wake.v1",
@@ -1280,7 +1281,12 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
     // A decline only restricts, so any verified human may make one, as may a
     // lifecycle operator or the session's own agent.
     let human = ctx.caller.is_human();
-    let operator = human || governance::is_operator(ctx.hub.cfg(), &ctx.caller, &actor);
+    let operator = human
+        || Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        );
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -1367,7 +1373,11 @@ fn state_json(r: &Row<'_>) -> rusqlite::Result<Value> {
 
 pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
     let who = verified_identity(&ctx.caller, "session_wake_status")?;
-    let operator = governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let operator = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     let sid = a.session_id.as_deref().map(check_session_id).transpose()?;
     ctx.hub
         .db()

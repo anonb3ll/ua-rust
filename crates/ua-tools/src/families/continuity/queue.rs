@@ -59,6 +59,7 @@ use crate::families::tasks::{
     str_field, subtree_ids,
 };
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const DEFAULT_STALE_DAYS: i64 = 30;
 const ACTIVE_STATUSES: [&str; 4] = ["open", "doing", "waiting_review", "blocked"];
@@ -156,7 +157,11 @@ pub(super) struct Writer {
 pub(super) fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> UaResult<Writer> {
     acting_identity(&ctx.caller, actor)?;
     let who = governance::verified_actor(&ctx.caller, verb)?;
-    let operator = governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let operator = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     if !operator && !QUEUE_WRITER_PROFILES.contains(&ctx.caller.profile) {
         return Err(UaError::denied(
             "profile_denied",

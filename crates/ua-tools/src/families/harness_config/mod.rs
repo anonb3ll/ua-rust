@@ -67,11 +67,12 @@ use self::render::{
     Bundle, MAX_BUNDLE_BYTES, MAX_PROPOSALS_PER_REPORT, MAX_SKILLS, Rendered, Skill, content_hash, py_strip,
     render_all, render_surface, valid_surface,
 };
-use super::node_queue::{device_agent, is_operator, owned_node, verified_caller};
+use super::node_queue::{device_agent, owned_node, verified_caller};
 use super::skill_registry;
 use crate::approvals::{self, GateOutcome, RequestState};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "harness_config.v1",
@@ -1060,7 +1061,11 @@ fn publish_payload(b: &Bundle) -> Value {
 
 async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
     let who = verified_caller(&ctx.caller, "publishing a harness config bundle")?;
-    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "operator_required",
             "publishing a harness config bundle is an operator action (a human or a lifecycle operator)",
@@ -1139,7 +1144,12 @@ async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
     }
     let who = verified_caller(&ctx.caller, "reading the harness config status")?;
     // Operators see every node's proposals; anyone else only their own nodes'.
-    let scope: Option<String> = (!is_operator(&ctx.hub, &ctx.caller, &who)).then_some(who);
+    let scope: Option<String> = (!Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ))
+    .then_some(who);
     ctx.hub
         .db()
         .read_async(move |c| {

@@ -56,6 +56,7 @@ use crate::Hub;
 use crate::families::github::client::{BoundRepo, GitHub, full_sha};
 use crate::families::tasks::{emit, int_field, str_field};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.github.closed_on_merge";
 const OFF_BRANCH_CHANNEL: &str = "agent.github.merged_to_non_default";
@@ -377,8 +378,12 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
     if !dry_run {
         // Closing other agents' tasks in bulk is an operator act: a lifecycle
         // operator or a human. Each close is a task_update as them.
-        let who = crate::families::governance::verified_actor(&ctx.caller, "close merged tasks")?;
-        if !crate::families::governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+        crate::families::governance::verified_actor(&ctx.caller, "close merged tasks")?;
+        if !Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        ) {
             return Err(UaError::denied(
                 "operator_required",
                 "queue_close_merged with dry_run=false is for a lifecycle operator or a human; a dry run is open to all",

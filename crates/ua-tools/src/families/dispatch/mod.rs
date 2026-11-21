@@ -631,11 +631,10 @@ pub(crate) fn classify_termination(termination: &str) -> &'static str {
     }
 }
 
-/// Whether `caller` may act for another agent: a human, or the operator
-/// profile (a profile used as authority; see
-/// [`Authority::TransitionalProfileOperator`]).
+/// Whether `caller` may act for another agent: an operator (a verified
+/// human), the same rule governance uses. A profile grants nothing.
 pub(crate) fn is_operator(cfg: &ua_core::Config, caller: &ua_core::Caller) -> bool {
-    Authz::new(cfg).holds(caller, &[Authority::TransitionalProfileOperator], ua_core::DEFAULT_ORG)
+    Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 /// Check that a verified caller is `agent` itself or an operator.

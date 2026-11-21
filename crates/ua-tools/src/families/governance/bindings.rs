@@ -18,9 +18,10 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::{is_operator, now, verified_actor};
+use super::{now, verified_actor};
 use crate::families::tasks::{acting_identity, check_slug, row_object};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 /// Forge hosts a binding may name.
 const ALLOWED_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
@@ -160,7 +161,11 @@ pub struct ListArgs {}
 fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult<String> {
     let who = verified_actor(&ctx.caller, doing)?;
     acting_identity(&ctx.caller, named)?;
-    if !is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "not_lifecycle_operator",
             format!("{doing} is for a lifecycle operator or a human; {who:?} is neither"),

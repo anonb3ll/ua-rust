@@ -44,6 +44,7 @@ use super::node_queue::{self, ITEM_COLS, item_from_row};
 use super::platform::object_ref;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 /// Every run kind this hub records.
 pub const KINDS: [&str; 4] = ["dispatch", "session", "workflow", "node"];
@@ -113,7 +114,12 @@ struct Viewer {
 impl Viewer {
     fn of(hub: &Hub, caller: &Caller) -> Self {
         let who = verified(caller).map(str::to_string);
-        let operator = who.as_deref().is_some_and(|w| node_queue::is_operator(hub, caller, w));
+        let operator = who.is_some()
+            && Authz::new(hub.cfg()).holds(
+                caller,
+                &[Authority::Operator, Authority::LifecycleOperator],
+                ua_core::DEFAULT_ORG,
+            );
         Self { who, operator }
     }
 }

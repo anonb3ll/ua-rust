@@ -44,6 +44,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 use super::agents::verified;
 use super::governance;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "provider_accounts.v1",
@@ -558,7 +559,7 @@ fn operator(ctx: &ToolCtx, verb: &str) -> UaResult<String> {
     let who = verified(&ctx.caller).map(str::to_string).ok_or_else(|| {
         UaError::denied("identity_required", format!("{verb} requires an authenticated identity"))
     })?;
-    if !governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
             "operator_required",
             format!("{verb} is for operators (a human or a lifecycle operator); {who:?} is neither"),

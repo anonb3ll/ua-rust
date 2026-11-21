@@ -1303,3 +1303,38 @@ async fn an_unverified_caller_naming_a_human_is_not_a_workflow_operator() {
     h.act_ok(&human(), "task_workflow_set", json!({ "task_id": t, "focus": "the lexer" })).await;
     h.act_ok(&lifecycle_op(), "task_workflow_set", json!({ "task_id": t, "focus": "the parser" })).await;
 }
+
+/// The lifecycle-operator grant: an agent listed in `lifecycle_operators`
+/// keeps the fleet-maintenance operations (here: writing another task's
+/// workflow record, releasing another agent's claim) but never human-only ones
+/// (provider accounts, reading other mailboxes). An unverified
+/// caller claiming that label holds neither.
+#[tokio::test]
+async fn a_lifecycle_operator_keeps_fleet_maintenance_but_not_human_only_operations() {
+    let h = H::new();
+    let t = h.task("Ship the parser", None).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let anon = Caller::local("lead-op", Transport::Mcp);
+
+    // Fleet maintenance: the lifecycle operator may; a peer and an unverified
+    // caller claiming its label may not.
+    h.act_ok(&lifecycle_op(), "task_workflow_set", json!({ "task_id": t, "stage": "plan" })).await;
+    let e = h
+        .act_err(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": "lead-op" }))
+        .await;
+    assert_eq!(reason(&e), "not_task_owner");
+    let release = json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "stale" });
+    assert_eq!(
+        reason(&h.act_err(&other(), "task_claim_release", release.clone()).await),
+        "not_lifecycle_operator"
+    );
+    assert_eq!(reason(&h.act_err(&anon, "task_claim_release", release.clone()).await), "identity_required");
+    h.act_ok(&lifecycle_op(), "task_claim_release", release).await;
+
+    // Human-only: provider accounts, other agents' mailboxes.
+    let args = json!({ "provider": "anthropic", "label": "acct-1", "billing": "subscription" });
+    let e = h.call(&lifecycle_op(), "provider_account_register", args.clone()).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required");
+    let e = h.call(&lifecycle_op(), "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
+    assert!(e.to_string().contains("outside your mailbox"), "{e}");
+}
