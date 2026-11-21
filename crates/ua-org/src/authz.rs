@@ -71,6 +71,20 @@ pub enum Authority<'a> {
     TransitionalLocalMailboxReader,
 }
 
+impl Authority<'_> {
+    /// A stable name for messages and logs (not the Rust variant name).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Authority::TransitionalHuman => "human",
+            Authority::TransitionalOperator { .. } => "operator",
+            Authority::TransitionalProfileOperator => "dispatch operator",
+            Authority::TransitionalHubView => "hub view",
+            Authority::TransitionalMailboxReader => "mailbox reader",
+            Authority::TransitionalLocalMailboxReader => "local mailbox reader",
+        }
+    }
+}
+
 /// The caller's verified label: an authenticated agent or human. Anonymous,
 /// system and internal callers have none.
 fn verified_label(caller: &Caller) -> Option<&str> {
@@ -112,7 +126,11 @@ impl<'a> Authz<'a> {
         }
         Err(UaError::denied(
             "authority_required",
-            format!("{:?} holds none of the required authorities: {need:?}", caller.label),
+            format!(
+                "{:?} holds none of the required authorities: {}",
+                caller.label,
+                need.iter().map(Authority::name).collect::<Vec<_>>().join(", ")
+            ),
         ))
     }
 
@@ -302,7 +320,16 @@ mod tests {
         let dev = caller("builder-1", ActorKind::Agent, Profile::Developer);
         let err = authz.require(&dev, &[Authority::TransitionalHuman], DEFAULT_ORG).unwrap_err();
         assert_eq!(err.reason_code(), Some("authority_required"));
-        assert!(err.to_string().contains("TransitionalHuman"), "{err}");
+        assert!(err.to_string().ends_with("holds none of the required authorities: human"), "{err}");
+        assert!(!err.to_string().contains("Transitional"), "{err}");
+        let err = authz
+            .require(
+                &dev,
+                &[Authority::TransitionalHuman, Authority::TransitionalOperator { who: "x" }],
+                DEFAULT_ORG,
+            )
+            .unwrap_err();
+        assert!(err.to_string().ends_with("authorities: human, operator"), "{err}");
         let coord = caller("lead-1", ActorKind::Agent, Profile::Coordinator);
         let any = [Authority::TransitionalHuman, Authority::TransitionalMailboxReader];
         assert!(authz.require(&coord, &any, DEFAULT_ORG).is_ok());
