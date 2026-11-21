@@ -460,7 +460,7 @@ pub fn revoke_family(tx: &rusqlite::Transaction<'_>, family_id: &str, reason: &s
 }
 
 async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
-    match a.action.trim() {
+    match crate::routes::action_of("oauth_device_manage", Some(&a.action))? {
         "list" => {
             let sessions = ctx.hub.db().read_async(list_oauth_sessions).await?;
             Ok(json!({
@@ -531,7 +531,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                 })
                 .await
         }
-        other => Err(UaError::invalid(format!("action must be list or revoke, not {other:?}"))),
+        other => Err(crate::routes::unhandled("oauth_device_manage", other)),
     }
 }
 

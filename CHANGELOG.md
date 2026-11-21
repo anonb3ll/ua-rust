@@ -207,6 +207,33 @@ from its commit history.
   `argument-hint`, `model`; skills also `license`, `version` and a
   `metadata` map of plain values) with plain values; front matter that does
   not parse is refused.
+- A gate on a tool holds when a consolidated tool runs it as an action.
+  `plan_manage`, `delegation_manage`, `coordination_manage`,
+  `observability_manage`, `autonomous_cycle_manage` and `export_data` ran
+  their actions' handlers directly, so `approval_tools = ["plan_delete"]` or
+  a policy rule on `plan_delete` did not stop `plan_manage` action `delete`.
+  Such a call now passes the profile check, policy rules, approval gate and
+  prod-action check of the standalone tool too, and its approval binds what
+  a direct call binds, so one approval runs one action once through either
+  tool. An action with no standalone tool is
+  gated as `tool:action` (`plan_manage:close`) in `approval_tools` and policy
+  rules; `system_doctor` flags a key that matches nothing. Rate limits and
+  cooldowns on the standalone name count calls through the consolidated
+  tool. An unknown action is refused before the tool runs. `tool_calls`
+  gains `action_tool` (schema part `core.v4`), gateway decisions name it,
+  and approval events carry `via`. `delegation_manage` `create` is gated
+  once, as `delegate`, and can be requested ahead. `handoff` is held to
+  `delegate`'s profile entry, policy rules and approval gate (a reviewer
+  session could hand off what it may not delegate). A call with no `action`
+  is gated as the tool's default action. A `tool:action` spelling of an
+  action that has a standalone tool (`plan_manage:delete`) restricts that
+  tool in `approval_tools` and restrictive policy rules; an `allow` so
+  spelled stays literal, so no existing policy is loosened.
+  A plan object read through `platform_object_get` is also checked as
+  `plan_get`. Upgrading: an approval for `delegation_manage` `create` or for
+  `handoff` requested before the upgrade and not yet used bound the old
+  payload (the normalized request); it no longer matches and must be
+  requested and approved again, as `delegate`.
 - `POST /api/approvals/request` runs the same profile, policy and prod-action
   checks as a tool call before it parks a request, and refuses a tool that
   binds its own approval or marks its arguments secret (409). A payload that

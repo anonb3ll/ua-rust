@@ -1047,8 +1047,9 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
 }
 
 async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
-    blocking(move || match action.as_str() {
+    let raw = a.action.trim().to_ascii_lowercase();
+    let action = crate::routes::action_of("skill_registry", Some(&a.action))?;
+    blocking(move || match action {
         "publish" => publish(&ctx, params(a.params)?),
         "list" => list(&ctx, params(a.params)?),
         "get" => get(&ctx, params(a.params)?),
@@ -1057,14 +1058,12 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "resolve" => resolve_action(&ctx, params(a.params)?),
         "drift" => drift(&ctx, params(a.params)?),
         "catalog" | "install" | "team_install" | "starter_preview" | "starter_install" => {
-            Err(UaError::invalid(format!("action {action:?} (the skill catalog) is not ported to this hub")))
+            Err(UaError::invalid(format!("action {raw:?} (the skill catalog) is not ported to this hub")))
         }
-        a if a.starts_with("source_") => {
-            Err(UaError::invalid(format!("action {a:?} (git skill sources) is not ported to this hub")))
+        "source_" => {
+            Err(UaError::invalid(format!("action {raw:?} (git skill sources) is not ported to this hub")))
         }
-        other => Err(UaError::invalid(format!(
-            "action must be one of publish, list, get, assign, unassign, resolve, drift; got {other:?}"
-        ))),
+        other => Err(crate::routes::unhandled("skill_registry", other)),
     })
     .await
 }

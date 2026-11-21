@@ -172,6 +172,25 @@ impl Profile {
         }
     }
 
+    /// Whether the profile may run, through a consolidated `*_manage` tool
+    /// it may call, an action whose handler is the standalone tool `tool`:
+    /// the profile exposes `tool`, or (for an allow-list profile) one of its
+    /// action lists names `tool`, which is how such a profile is granted a
+    /// manager action without the standalone tool.
+    pub fn allows_routed(self, tool: &str) -> bool {
+        if self.allows_tool(tool) {
+            return true;
+        }
+        let s = &*SETS;
+        match self {
+            Profile::Research => s.research_actions.contains(tool),
+            Profile::RemoteAssistant | Profile::RemoteVaultCurator => {
+                s.remote_assistant_actions.contains(tool)
+            }
+            _ => false,
+        }
+    }
+
     /// Legacy tool names superseded by a consolidated manager. Hidden from
     /// profile-filtered listings, still callable by unfiltered local clients.
     pub fn is_legacy_alias(tool: &str) -> bool {
@@ -306,6 +325,22 @@ mod tests {
         for t in ["memory_get", "memory_list", "memory_save", "memory_search"] {
             assert!(!Profile::AcpSession.allows_tool(t), "{t}");
         }
+    }
+
+    #[test]
+    fn a_routed_action_needs_the_standalone_tool_or_an_action_grant() {
+        // Deny-list profiles: the standalone tool's own entry decides.
+        assert!(!Profile::Reviewer.allows_routed("plan_delete"));
+        assert!(Profile::Developer.allows_routed("plan_delete"));
+        assert!(!Profile::Developer.allows_routed("export_migration_manifest"));
+        // Allow-list profiles reach manager actions by the standalone name in
+        // their action lists, without seeing the standalone tool itself.
+        assert!(!Profile::Research.allows_tool("plan_create"));
+        assert!(Profile::Research.allows_routed("plan_create"));
+        assert!(!Profile::Research.allows_routed("plan_delete"));
+        assert!(Profile::RemoteAssistant.allows_routed("agent_list"));
+        assert!(!Profile::RemoteAssistant.allows_routed("agent_activity"));
+        assert!(!Profile::Public.allows_routed("plan_create"));
     }
 
     #[test]
