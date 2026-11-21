@@ -385,8 +385,9 @@ pub struct ManageArgs {
 // ---------------------------------------------------------------------------
 // Create.
 
-/// `entry_tool` is the registered tool the call came through; the registry
-/// has already gated it if it is listed in `approval_tools`.
+/// `entry_tool` is the registered tool the call came through, or the one its
+/// action is gated as (`delegate`, for `delegation_manage` create); the
+/// registry has already gated it if it is listed in `approval_tools`.
 fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
     let task_spec = a.task_spec.trim().to_string();
     if task_spec.is_empty() {
@@ -952,7 +953,7 @@ fn spec_build(a: SpecBuildArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // The consolidated entry point and registration.
 
-const ACTIONS: [&str; 13] = [
+pub(crate) const ACTIONS: [&str; 13] = [
     "create",
     "list",
     "claim",
@@ -990,7 +991,8 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
     let p = params;
     let f = "delegation";
     match act {
-        "create" => create(ctx, parse_params(f, act, p)?, "delegation_manage"),
+        // The registry gated this action as `delegate` (see `crate::routes`).
+        "create" => create(ctx, parse_params(f, act, p)?, "delegate"),
         "list" => list(ctx, parse_params(f, act, p)?),
         "claim" => claim(ctx, parse_params(f, act, p)?),
         "release" => release(ctx, parse_params(f, act, p)?),
@@ -1018,7 +1020,6 @@ pub fn register(r: &mut Registry) {
              lookup, spec_check, spec_template, spec_build. `params` holds the action's arguments.",
             |ctx: ToolCtx, a: ManageArgs| blocking(move || dispatch(&ctx, &a.action, a.params)),
         )
-        .handler_may_gate(crate::HandlerGate::Actions(&["create"]))
         .family("delegation"),
     );
     r.add(

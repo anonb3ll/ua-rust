@@ -544,10 +544,35 @@ pub fn load(path: &Path) -> Result<Arc<Policy>, String> {
         Ok(text) => parse_policy(&text).map(Arc::new).map_err(|e| format!("invalid policy file: {e}")),
         Err(e) => Err(format!("cannot read the policy file: {e}")),
     };
+    if let Ok(p) = &loaded {
+        let unknown = unknown_action_keys(p);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                "policy rules name no known tool action, so they match nothing: {}",
+                unknown.join("; ")
+            );
+        }
+    }
     if let Ok(mut c) = CACHE.lock() {
         c.insert(path.to_path_buf(), CacheEntry { stamp, loaded: loaded.clone() });
     }
     loaded
+}
+
+/// Rules whose `tool` is a plain `tool:action` name that no consolidated
+/// tool's action is gated as (see [`crate::routes::check_gate_name`]), each
+/// with the reason. Such a rule matches no call. Glob patterns and plain
+/// tool names are not checked, as before.
+pub fn unknown_action_keys(policy: &Policy) -> Vec<String> {
+    policy
+        .rules
+        .iter()
+        .filter(|r| r.tool.contains(':') && crate::routes::is_plain_name(&r.tool))
+        .filter_map(|r| {
+            crate::routes::check_gate_name(&r.tool).err().map(|e| format!("rule {:?}: {e}", r.name))
+        })
+        .collect()
 }
 
 /// Drop the cached parse of `path` (after a write through config revisions).
@@ -770,15 +795,17 @@ fn age_seconds(ts: &str) -> Option<f64> {
     Some((ua_core::time::now_ms() - t.as_millisecond()) as f64 / 1000.0)
 }
 
-/// Completed calls of `tool` by `label` inside the last `window` seconds.
-/// Timestamps have second precision: a call counts while `now - start < window`.
+/// Completed calls of `tool` by `label` inside the last `window` seconds,
+/// including calls of a consolidated tool whose action ran `tool`
+/// (`action_tool`). Timestamps have second precision: a call counts while
+/// `now - start < window`.
 pub fn recent_calls(conn: &Connection, tool: &str, label: &str, window: f64) -> rusqlite::Result<i64> {
     let cutoff_ms = ua_core::time::now_ms() - (window * 1000.0) as i64;
     let cutoff = jiff::Timestamp::from_millisecond(cutoff_ms)
         .map(ua_core::time::format_ts)
         .unwrap_or_else(|_| ua_core::time::now());
     conn.query_row(
-        "SELECT COUNT(*) FROM tool_calls WHERE tool = ?1 AND caller = ?2 AND started_at > ?3",
+        "SELECT COUNT(*) FROM tool_calls WHERE (tool = ?1 OR action_tool = ?1) AND caller = ?2 AND started_at > ?3",
         params![tool, label, cutoff],
         |r| r.get(0),
     )
@@ -793,11 +820,38 @@ pub fn evaluate(
     tool: &str,
     args: &Value,
 ) -> Result<Verdict, Refusal> {
+    evaluate_with(conn, policy, caller, tool, args, policy.default_deny)
+}
+
+/// Evaluate `policy` for the action a consolidated tool's call runs, under
+/// the action's own name (a standalone tool, or `tool:action`; see
+/// [`crate::routes`]) and on the action's arguments. Every rule applies as
+/// for a direct call, except `default_action: deny`: the consolidated tool
+/// itself was already held to it, and a rule allowing that tool must not be
+/// undone because no rule names each of its actions.
+pub fn evaluate_routed(
+    conn: &Connection,
+    policy: &Policy,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+) -> Result<Verdict, Refusal> {
+    evaluate_with(conn, policy, caller, tool, args, false)
+}
+
+fn evaluate_with(
+    conn: &Connection,
+    policy: &Policy,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+    default_deny: bool,
+) -> Result<Verdict, Refusal> {
     if !policy.enabled {
         return Ok(Verdict::Allow);
     }
     let tool_matched: Vec<&PolicyRule> = policy.rules.iter().filter(|r| r.matches_tool(tool)).collect();
-    if tool_matched.is_empty() && !policy.default_deny {
+    if tool_matched.is_empty() && !default_deny {
         return Ok(Verdict::Allow);
     }
     let mut scope = Scope { agent: scope_agent(caller), claims: Vec::new() };
@@ -815,7 +869,7 @@ pub fn evaluate(
         })
         .collect();
     let has_permission_rule = matching.iter().any(|r| r.kind != RuleKind::RateLimit);
-    if !has_permission_rule && policy.default_deny {
+    if !has_permission_rule && default_deny {
         return Err(Refusal::new(
             "default_deny",
             "",
@@ -913,7 +967,8 @@ pub fn evaluate(
                         // Per caller: one identity's call must not put every
                         // other identity into cooldown.
                         .query_row(
-                            "SELECT MAX(started_at) FROM tool_calls WHERE tool = ?1 AND caller = ?2",
+                            "SELECT MAX(started_at) FROM tool_calls WHERE (tool = ?1 OR action_tool = ?1) \
+                             AND caller = ?2",
                             params![tool, caller.label],
                             |r| r.get(0),
                         )

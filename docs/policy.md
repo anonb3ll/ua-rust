@@ -32,12 +32,90 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+A call of a tool that takes an `action` (`plan_manage`, `delegation_manage`,
+...) runs steps 1-4 twice: under the tool's own name, and under the name of
+the action it runs (see [Consolidated tools](#consolidated-tools)).
+
+## Consolidated tools
+
+Several tools dispatch on an `action` argument. Many of their actions run
+the same handler as a standalone tool: `plan_manage` with
+`{"action": "delete", "params": {"plan_id": ...}}` deletes exactly what
+`plan_delete {"plan_id": ...}` deletes. A gate names a tool, so a gate on
+`plan_delete` holds whichever of the two the caller uses:
+
+- **Profile.** Besides the consolidated tool (and its action, for the
+  profiles with action lists), the profile must allow the standalone tool.
+  An allow-list profile may instead name it in its action list
+  (`RESEARCH_ALLOWED_ACTIONS` lists `plan_create`, so `research` creates
+  plans through `plan_manage` without seeing `plan_create`).
+- **Policy rules.** Rules are evaluated for the consolidated tool's name on
+  the call's arguments, and again for the standalone name on the action's
+  `params` (so a `threshold` field path is the standalone tool's). Either
+  refusal refuses the call. A rate limit or cooldown on the standalone name
+  counts calls through the consolidated tool too. `default_action: deny` is
+  applied to the consolidated tool's name only: a rule allowing
+  `plan_manage` does not need one for each of its actions.
+- **Approvals.** `approval_tools`, a `require_approval` rule and an
+  always-gated flag on the standalone name gate the call. The approval binds
+  the standalone tool's name and the action's `params` (through the
+  standalone tool's `gate_payload` projection, when it has one): exactly
+  what a direct call binds. A pass approved for `plan_delete {"plan_id":
+  "p-1"}` therefore runs that delete once, through either tool, and nothing
+  else. When the consolidated tool's own name is gated as well, the one
+  approval covers the call; every other action still parks under the
+  consolidated tool's name, as before.
+- **Prod-action check.** An always-gated standalone tool's identity check
+  applies to the consolidated call as well.
+
+An action with no standalone tool is gated under the key `tool:action`, for
+example `plan_manage:close` or `coordination_manage:queue_park`. List it in
+`approval_tools` or name it in a rule's `tool` (a glob such as
+`plan_manage:step_*` works too); its approval binds the whole call
+(`{action, params}`). An action of `export_data` that makes a governed call
+itself (`manifest`, `compare`) is gated once, by that inner call, under its
+own name. For a tool whose handler binds its own approval (`relay_manage`), its keys
+take policy rules; an `approval_tools` entry adds nothing, since the handler
+already asks a human for every send.
+
+An `action` that the routing table does not know is refused
+(`invalid_argument`) before the tool runs. The `agent.gateway.decision`
+event of a refused call names the tool called in `tool` and the action in
+`action_tool`; an approval's `agent.approval.requested` and
+`agent.approval.consumed` events carry `via` (the tool called) when it binds
+a different name; the call's `tool_calls` row carries `action_tool`.
+
+`system_doctor` reports an `approval_tools` entry or a plain-named policy
+rule `tool:action` that matches nothing as `DEGRADED` (the policy file also
+logs a warning when it loads), and names the standalone tool when the action
+has one: `plan_manage:delete` is gated as `plan_delete`.
+
+The table (`crates/ua-tools/src/routes.rs`) decides every action of every
+such tool; a test fails when a tool or an action has no entry.
+
+| Tool | Action → standalone tool | Gated as `tool:action` |
+|---|---|---|
+| `plan_manage` | `create` → `plan_create`, `update` → `plan_update`, `get` → `plan_get`, `list` → `plan_list`, `checkpoint` → `plan_checkpoint`, `resume` → `plan_resume`, `step_retry` → `plan_step_retry`, `step_claim` → `plan_step_claim`, `handoff` → `plan_handoff`, `delete` → `plan_delete` | `close`, `step_add`, `step_edit`, `step_remove`, `step_reorder`, `edit` |
+| `delegation_manage` | `create` → `delegate`, `list` → `delegate_list`, `claim` → `delegate_claim`, `release` → `delegate_release`, `cancel` → `delegate_cancel`, `spec_check` → `delegation_spec_check`, `spec_template` → `delegation_spec_template`, `spec_build` → `delegation_spec_build` | `fail`, `complete`, `retry`, `get`, `lookup` |
+| `observability_manage` | `activity` → `agent_activity`, `metrics` → `metrics_snapshot`, `anomalies` → `check_anomalies`, `performance` → `perf_summary`, `agents` → `agent_list`, `context` → `agent_context` | `delegation_stats` |
+| `coordination_manage` | `agent_list` → `agent_list`, `agent_context` → `agent_context` | every other action (61) |
+| `autonomous_cycle_manage` | `start`, `get`, `transition`, `kill`, `record_usage`, `list` → `autonomous_cycle_<action>` | `get_for_task` |
+| `export_data` | `tasks` → `export_tasks`, `memory` → `export_memory`, `journal` → `export_journal`; `manifest` and `compare` call `export_migration_manifest` and `compare_migration_manifests` as governed calls | (`import` and `rollback` are refused) |
+| `config_revision_manage`, `relay_manage`, `oauth_device_manage`, `mcp_gateway`, `skill_registry`, `node_config`, `task_comment`, `goal_manage` | none | every action |
+
+Legacy spellings the tools accept (`plan_delete` as a `plan_manage` action,
+`delegate_claim` for `delegation_manage`, `perf_summary` for
+`observability_manage`) resolve to the same entry.
+
 ### Requesting an approval ahead of a call
 
 `POST /api/approvals/request` runs steps 1-3 for the named tool and its
 arguments (a refusal is the same `403` a call would get), checks the
 arguments against the tool's typed argument struct, and parks the payload
 the tool's gate would bind, without running anything or consuming a pass.
+For a consolidated tool's action that is gated under its own name, the
+request parks that name and payload, and the response's `tool` says so
+(`plan_delete` for `plan_manage` action `delete`).
 It answers `409` for a tool step 4 would not gate: only approval-gated tools
 can be requested. It also answers `409` for a tool whose handler asks the
 gate itself on values it resolves (marked `gates_in_handler`,
@@ -150,7 +228,7 @@ rules:
 | `tool` | `tool`, `action` | Applies `action` to matching tools. `action` defaults to `deny`. |
 | `role` | `tool`, `roles` | Allow-list: callers whose identity label or profile is not in `roles` are refused (`role_denied`). An entry `agent:<label>` names an identity, `profile:<name>` a profile; a bare entry is a profile when it is a profile name (current or legacy), else an identity label, so a label that equals a profile name never stands in for that profile. |
 | `threshold` | `tool`, `field`, `max` and/or `min`, `action` | Applies `action` when the argument at `field` is above `max` or below `min` (`threshold_breached`). A missing or non-numeric value refuses the call (`threshold_invalid`). |
-| `rate_limit` | `tool`, `max_calls`, `window_seconds` | At most `max_calls` completed calls of the tool by the same caller within the window, counted from the `tool_calls` table (`rate_limited`). Checked after every deny and before any approval is parked. Rule names must be unique among rate-limit rules. |
+| `rate_limit` | `tool`, `max_calls`, `window_seconds` | At most `max_calls` completed calls of the tool by the same caller within the window, counted from the `tool_calls` table (`rate_limited`), including calls of a consolidated tool whose action runs it. Checked after every deny and before any approval is parked. Rule names must be unique among rate-limit rules. |
 | `cooldown` | `tool`, `cooldown_seconds` | Minimum gap between two calls of the tool by the same caller (`episode_limited`). |
 | `max_calls_per_episode`, `fatigue_band_cap` | `bands`, ... | Accepted and validated, but callers carry no episode here, so a matching rule refuses the call (`episode_limited`). A `cooldown` with `require_episode: true` does the same. |
 
@@ -160,7 +238,8 @@ hub; always set `type` explicitly.
 ### Common fields
 
 - `name`: shown in refusals and ledger events.
-- `tool`: glob, default `*`.
+- `tool`: glob, default `*`. It matches tool names and the `tool:action`
+  keys of [consolidated tools](#consolidated-tools).
 - `roles`: on kinds other than `role`, a filter; the rule applies only to
   callers whose label or profile is listed.
 - `bind`: restricts the rule to a scope. Keys: `agent`, `project`, `task`,

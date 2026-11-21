@@ -1298,7 +1298,7 @@ fn edit(ctx: &ToolCtx, a: EditArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // The consolidated entry point and registration.
 
-const ACTIONS: [&str; 16] = [
+pub(crate) const ACTIONS: [&str; 16] = [
     "create",
     "update",
     "get",

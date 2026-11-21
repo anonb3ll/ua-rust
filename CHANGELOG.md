@@ -136,5 +136,21 @@ from its commit history.
   `argument-hint`, `model`; skills also `license`, `version` and a
   `metadata` map of plain values) with plain values; front matter that does
   not parse is refused.
+- A gate on a tool holds when a consolidated tool runs it as an action.
+  `plan_manage`, `delegation_manage`, `coordination_manage`,
+  `observability_manage`, `autonomous_cycle_manage` and `export_data` ran
+  their actions' handlers directly, so `approval_tools = ["plan_delete"]` or
+  a policy rule on `plan_delete` did not stop `plan_manage` action `delete`.
+  Such a call now passes the profile check, policy rules, approval gate and
+  prod-action check of the standalone tool too, and its approval binds what
+  a direct call binds, so one approval runs one action once through either
+  tool. An action with no standalone tool is
+  gated as `tool:action` (`plan_manage:close`) in `approval_tools` and policy
+  rules; `system_doctor` flags a key that matches nothing. Rate limits and
+  cooldowns on the standalone name count calls through the consolidated
+  tool. An unknown action is refused before the tool runs. `tool_calls`
+  gains `action_tool` (schema part `core.v4`), gateway decisions name it,
+  and approval events carry `via`. `delegation_manage` `create` is gated
+  once, as `delegate`, and can be requested ahead.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

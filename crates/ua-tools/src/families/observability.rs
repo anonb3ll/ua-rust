@@ -788,7 +788,7 @@ pub struct ManageArgs {
     pub params: Option<Value>,
 }
 
-const ACTIONS: [&str; 7] =
+pub(crate) const ACTIONS: [&str; 7] =
     ["activity", "metrics", "anomalies", "performance", "agents", "context", "delegation_stats"];
 
 pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
@@ -977,8 +977,17 @@ fn bind_check(cfg: &Config) -> Value {
 
 fn approval_check(cfg: &Config, reg: &Registry) -> Value {
     let always: Vec<&str> = reg.all().filter(|t| t.always_gated).map(|t| t.name).collect();
-    let unknown: Vec<&str> =
-        cfg.approval_tools.iter().map(String::as_str).filter(|t| reg.get(t).is_none()).collect();
+    // A `tool:action` key names an action of a consolidated tool with no
+    // standalone tool (see `crate::routes`); any other name must be a tool.
+    let unknown: Vec<String> = cfg
+        .approval_tools
+        .iter()
+        .filter(|t| reg.get(t).is_none())
+        .filter_map(|t| match t.contains(':') {
+            true => crate::routes::check_gate_name(t).err(),
+            false => Some(t.clone()),
+        })
+        .collect();
     let configured = cfg.approval_tools.len();
     let mut detail = format!("{configured} configured gated tool(s); {} always-gated tool(s)", always.len());
     let status = if configured == 0 && always.is_empty() {
@@ -1370,7 +1379,17 @@ fn policy_check(cfg: &Config) -> Value {
     let gate = "UA_POLICY_FILE";
     match &cfg.policy_file {
         None => finding("policy_file", DORMANT, "no policy file is configured", gate),
-        Some(p) if p.is_file() => finding("policy_file", LIVE, "policy file present", gate),
+        Some(p) if p.is_file() => {
+            match crate::policy::load(p).map(|p| crate::policy::unknown_action_keys(&p)) {
+                Ok(unknown) if !unknown.is_empty() => finding(
+                    "policy_file",
+                    DEGRADED,
+                    format!("policy file present; rules name no known tool action: {}", unknown.join("; ")),
+                    gate,
+                ),
+                _ => finding("policy_file", LIVE, "policy file present", gate),
+            }
+        }
         Some(_) => finding("policy_file", MISCONFIGURED, "the configured policy file does not exist", gate),
     }
 }

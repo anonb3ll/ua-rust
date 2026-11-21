@@ -1087,7 +1087,8 @@ async fn resolve(ctx: ToolCtx, p: ResolveParams) -> UaResult<Value> {
 
 // --- registration ------------------------------------------------------------------------------
 
-const ACTIONS: [&str; 8] = ["check", "draft", "request_send", "send", "status", "list", "cancel", "resolve"];
+pub(crate) const ACTIONS: [&str; 8] =
+    ["check", "draft", "request_send", "send", "status", "list", "cancel", "resolve"];
 
 async fn relay_manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
     let action = a.action.trim().to_ascii_lowercase();
