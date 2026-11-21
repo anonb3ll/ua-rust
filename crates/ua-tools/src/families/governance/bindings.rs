@@ -155,20 +155,18 @@ pub struct GetArgs {
 pub struct ListArgs {}
 
 /// The verified operator changing a binding. A binding names the repository
-/// a task's CI checks are verified against, so only a lifecycle operator or
-/// a human may change it, under its own name: `named` (the legacy `bound_by`
-/// / `unbound_by`) must be that caller when given.
+/// a task's CI checks are verified against, and the repository merges and
+/// policy authorizations name, and it is not approval-gated, so only an
+/// operator (a verified human) may change it, under its own name: `named`
+/// (the legacy `bound_by` / `unbound_by`) must be that caller when given. A
+/// lifecycle operator may not.
 fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult<String> {
     let who = verified_actor(&ctx.caller, doing)?;
     acting_identity(&ctx.caller, named)?;
-    if !Authz::new(ctx.hub.cfg()).holds(
-        &ctx.caller,
-        &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
-    ) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
-            "not_lifecycle_operator",
-            format!("{doing} is for a lifecycle operator or a human; {who:?} is neither"),
+            "operator_required",
+            format!("{doing} is for an operator (a verified human); {who:?} is not one"),
         ));
     }
     Ok(who)

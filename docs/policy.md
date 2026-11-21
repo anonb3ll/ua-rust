@@ -419,9 +419,10 @@ decision), `work_proposal_get`, `work_proposal_list` and
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
 repository on an allowed forge host. The binding is the repository a task's
-CI checks are verified against, so bind and unbind are for a verified
-lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
-attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+CI checks are verified against and the repository merges and policy
+authorizations name, and it is not approval-gated, so bind and unbind are for
+an operator, a verified human (`operator_required` otherwise; a lifecycle
+operator does not qualify), and are attributed to that caller; `bound_by` / `unbound_by`, when given, must name
 it. Get and list are open.
 
 ### Maintenance tools
