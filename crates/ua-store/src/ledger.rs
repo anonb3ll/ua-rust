@@ -325,6 +325,19 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
     let org_columns = has_org_columns(tx)?;
     if org_columns {
         refuse_newer_hash_form(tx)?;
+        // The organization must exist: one primary-key lookup in `orgs` (a
+        // handful of rows), in the same write transaction as the insert.
+        // `event_log` has no existence trigger, so this is the check.
+        let known: bool = tx
+            .query_row("SELECT 1 FROM orgs WHERE id = ?1", [&input.org_id], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !known {
+            return Err(UaError::invalid(format!(
+                "unknown organization {:?}; the event was not recorded",
+                input.org_id
+            )));
+        }
     } else if input.org_id != ua_core::DEFAULT_ORG {
         // Nowhere to record another organization: refuse rather than drop it.
         return Err(UaError::conflict(format!(
@@ -781,6 +794,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("org_id must not be empty"), "{err}");
+        // An organization `orgs` does not hold is refused, and nothing is written.
+        let err = db
+            .write(|tx| {
+                append(
+                    tx,
+                    EventInput {
+                        org_id: "nope".into(),
+                        ..EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))
+                    },
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown organization \"nope\""), "{err}");
+        let n: i64 =
+            db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 1);
 
         let legacy = Db::open_in_memory(&[SCHEMA]).unwrap();
         legacy
