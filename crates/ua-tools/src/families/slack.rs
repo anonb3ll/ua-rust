@@ -172,11 +172,16 @@ pub fn remember_signed_request(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8
 /// event: prune, then insert the signed base's hash. `Err` with `replayed`
 /// when it was recorded before. Returns the hash.
 fn record_signature(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8], now: i64) -> UaResult<String> {
+    record_replay_key(tx, signed_request_sha(timestamp, body), now)
+}
+
+/// Insert one replay-table key (pruning first); `Err` with `replayed` when it
+/// was recorded before.
+fn record_replay_key(tx: &mut WriteTx<'_>, sha: String, now: i64) -> UaResult<String> {
     tx.execute(
         "DELETE FROM slack_seen_signatures WHERE seen_at < ?1",
         params![now.saturating_sub(SEEN_RETENTION_S)],
     )?;
-    let sha = signed_request_sha(timestamp, body);
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO slack_seen_signatures (request_sha, seen_at) VALUES (?1, ?2)",
         params![sha, now],
@@ -185,6 +190,27 @@ fn record_signature(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8], now: i64
         return Err(UaError::denied("replayed", "this signed Slack request was already accepted"));
     }
     Ok(sha)
+}
+
+/// The replay-table key of a Socket Mode envelope: SHA-256 of
+/// `socket-envelope:{envelope_id}`. It shares `slack_seen_signatures` with
+/// signed HTTP requests; the prefix keeps the two key spaces apart (an HTTP
+/// key hashes `v0:{timestamp}:{body}`).
+pub fn envelope_sha(envelope_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"socket-envelope:");
+    hasher.update(envelope_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// What makes one delivery unique before its event or trigger id is read:
+/// the signed bytes of an HTTP request, or the envelope id of a Socket Mode
+/// envelope (which carries no signature; the WebSocket itself is
+/// authenticated by the app token).
+#[derive(Debug, Clone, Copy)]
+pub enum ReplayKey<'a> {
+    Signed { timestamp: &'a str, body: &'a [u8] },
+    Envelope { envelope_id: &'a str },
 }
 
 fn ledger_signature(tx: &mut WriteTx<'_>, sha: &str, timestamp: &str) -> UaResult<()> {
@@ -305,13 +331,41 @@ pub fn admit(
     now: i64,
     d: &Delivery,
 ) -> UaResult<Admission> {
-    let sha = record_signature(tx, timestamp, body, now)?;
+    admit_keyed(tx, cfg, ReplayKey::Signed { timestamp, body }, now, d)
+}
+
+/// [`admit`] for either transport. A Socket Mode envelope records
+/// [`envelope_sha`] in the replay table (a redelivered envelope is
+/// `replayed`) and, once the identity is known, ledgers
+/// `agent.slack.envelope_accepted` instead of `agent.slack.signature_accepted`.
+/// Everything after that (identity, `can_approve`, dedupe on the event or
+/// trigger id, the ledger events) is the same, so a delivery seen on both
+/// transports runs once.
+pub fn admit_keyed(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    key: ReplayKey<'_>,
+    now: i64,
+    d: &Delivery,
+) -> UaResult<Admission> {
+    let sha = match key {
+        ReplayKey::Signed { timestamp, body } => record_signature(tx, timestamp, body, now)?,
+        ReplayKey::Envelope { envelope_id } => record_replay_key(tx, envelope_sha(envelope_id), now)?,
+    };
     let kind = d.kind.request();
     let Some(mapping) = cfg.slack_identity(&d.team_id, &d.user_id) else {
         return Ok(Admission::Refused { reason: "unmapped_identity", identity: None });
     };
     let identity = mapping.identity.clone();
-    ledger_signature(tx, &sha, timestamp)?;
+    match key {
+        ReplayKey::Signed { timestamp, .. } => ledger_signature(tx, &sha, timestamp)?,
+        ReplayKey::Envelope { .. } => {
+            ledger::append(
+                tx,
+                EventInput::new("agent.slack.envelope_accepted", json!({ "envelope_sha": sha })).by("system"),
+            )?;
+        }
+    }
     // `/approve` needs a per-mapping opt-in; the route's own refusals (a
     // malformed payload, `approve` sent as a message) come first.
     let refusal = d.refusal.or_else(|| {
@@ -799,6 +853,267 @@ pub async fn post_reply(cfg: &Config, url: &url::Url, text: &str) -> Result<(), 
         .await
         .map_err(|e| if e.is_timeout() { "timeout" } else { "transport" })?;
     if resp.status().is_success() { Ok(()) } else { Err("status") }
+}
+
+// --- Socket Mode -----------------------------------------------------------------
+
+/// Where the Socket Mode transport stands in this process. `ua serve` sets
+/// it; `system_doctor` reads it. Never carries the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SocketState {
+    /// Not configured, or `slack_socket_mode` is off.
+    Off = 0,
+    /// Configured, but this binary lacks the `slack-socket` feature.
+    NotCompiled = 1,
+    /// Opening or re-opening a connection.
+    Connecting = 2,
+    /// Slack said `hello` on the current connection.
+    Connected = 3,
+    /// Slack refused the app token; the transport stopped retrying.
+    AuthFailed = 4,
+    /// The transport stopped (shutdown).
+    Stopped = 5,
+    /// A connection failed or its task panicked; reconnecting with backoff.
+    Restarting = 6,
+}
+
+impl SocketState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SocketState::Off => "off",
+            SocketState::NotCompiled => "not_compiled",
+            SocketState::Connecting => "connecting",
+            SocketState::Connected => "connected",
+            SocketState::AuthFailed => "auth_failed",
+            SocketState::Stopped => "stopped",
+            SocketState::Restarting => "restarting",
+        }
+    }
+}
+
+static SOCKET_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Whether any `ua serve` in this process has started the transport (the
+/// state is meaningless in a process that never serves, such as `ua doctor`).
+static SOCKET_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_socket_state(state: SocketState) {
+    SOCKET_REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    SOCKET_STATE.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The transport's state, or `None` when this process does not run it.
+pub fn socket_state() -> Option<SocketState> {
+    if !SOCKET_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(match SOCKET_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => SocketState::NotCompiled,
+        2 => SocketState::Connecting,
+        3 => SocketState::Connected,
+        4 => SocketState::AuthFailed,
+        5 => SocketState::Stopped,
+        6 => SocketState::Restarting,
+        _ => SocketState::Off,
+    })
+}
+
+/// Envelopes the transport turned away because a connection was at its
+/// in-flight cap (this process, since start).
+static SOCKET_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one envelope turned away at the in-flight cap.
+pub fn record_socket_busy() {
+    SOCKET_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Envelopes turned away at the in-flight cap since the process started.
+pub fn socket_busy_count() -> u64 {
+    SOCKET_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether this binary was built with the `slack-socket` feature.
+pub const SOCKET_COMPILED: bool = cfg!(feature = "slack-socket");
+
+/// The production Slack Web API base.
+pub const SLACK_API: &str = "https://slack.com/api";
+
+/// The gate for Socket Mode: the app token when the transport should run,
+/// else why not (one line for the startup log). Never includes the token.
+pub fn socket_status(cfg: &Config) -> Result<secrecy::SecretString, &'static str> {
+    use secrecy::ExposeSecret;
+    if !cfg.slack_socket_mode {
+        return Err("Slack Socket Mode off: slack_socket_mode is false");
+    }
+    if !SOCKET_COMPILED {
+        return Err("Slack Socket Mode not started: this binary was built without the slack-socket feature");
+    }
+    let Some(token) = cfg.slack_app_token() else {
+        return Err(
+            "Slack Socket Mode not started: slack_socket_mode is on but UA_SLACK_APP_TOKEN is not set",
+        );
+    };
+    if !token.expose_secret().starts_with("xapp-") {
+        return Err("Slack Socket Mode not started: UA_SLACK_APP_TOKEN is not an app-level token (xapp-...)");
+    }
+    if cfg.check_slack_identities().is_err() {
+        return Err("Slack Socket Mode not started: slack_identities is invalid");
+    }
+    Ok(token)
+}
+
+/// Why `apps.connections.open` gave no usable URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// Slack refused the token or the app (`invalid_auth`, `not_authed`,
+    /// `token_revoked`, ...): retrying cannot help.
+    Auth(String),
+    /// Slack answered with a URL this hub will not connect to.
+    BadUrl(&'static str),
+    /// Anything else (network, rate limit, a Slack-side error): retry later.
+    Transient(String),
+}
+
+/// `apps.connections.open` errors that a retry cannot fix.
+const PERMANENT_OPEN_ERRORS: [&str; 17] = [
+    "access_denied",
+    "account_inactive",
+    "ekm_access_denied",
+    "enterprise_is_restricted",
+    "forbidden_team",
+    "invalid_auth",
+    "missing_args",
+    "missing_scope",
+    "no_permission",
+    "not_allowed_token_type",
+    "not_authed",
+    "org_login_required",
+    "team_access_not_granted",
+    "token_expired",
+    "token_revoked",
+    "two_factor_setup_required",
+    "deprecated_endpoint",
+];
+
+/// The longest `apps.connections.open` response read.
+const OPEN_RESPONSE_MAX: usize = 16 * 1024;
+
+/// A socket URL from `apps.connections.open` this hub will connect to:
+/// `wss`, host `slack.com` or ending in `.slack.com`, the default port, no
+/// user info or fragment, at most 2048 bytes. With `allow_loopback_ws` (the
+/// test hook only), also `ws` to a loopback IP.
+pub fn socket_url(raw: &str, allow_loopback_ws: bool) -> Result<url::Url, &'static str> {
+    if raw.is_empty() || raw.len() > 2048 {
+        return Err("bad_length");
+    }
+    let u = url::Url::parse(raw).map_err(|_| "unparseable")?;
+    if !u.username().is_empty() || u.password().is_some() || u.fragment().is_some() {
+        return Err("userinfo_or_fragment");
+    }
+    let loopback = match u.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if allow_loopback_ws && u.scheme() == "ws" && loopback {
+        return Ok(u);
+    }
+    if u.scheme() != "wss" {
+        return Err("not_wss");
+    }
+    let slack =
+        matches!(u.host(), Some(url::Host::Domain(h)) if h == "slack.com" || h.ends_with(".slack.com"));
+    if !slack {
+        return Err("not_slack_host");
+    }
+    if u.port().is_some() {
+        return Err("non_default_port");
+    }
+    Ok(u)
+}
+
+/// Ledger a socket URL the hub refused to connect to, by reason class only
+/// (the URL carries a connection ticket; it is not recorded).
+pub fn record_socket_url_refused(tx: &mut WriteTx<'_>, reason: &'static str) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new("agent.slack.socket.url_refused", json!({ "reason": reason })).by("system"),
+    )?;
+    Ok(())
+}
+
+/// Ledger a Socket Mode envelope that was acknowledged after the deadline
+/// and then failed admission: outcome unknown, by envelope hash and reason
+/// class only (Slack will not redeliver an acknowledged envelope).
+pub fn record_envelope_outcome_unknown(
+    tx: &mut WriteTx<'_>,
+    envelope_sha: &str,
+    reason: &'static str,
+) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new(
+            "agent.slack.envelope.outcome_unknown",
+            json!({ "envelope_sha": envelope_sha, "reason": reason, "outcome": "unknown" }),
+        )
+        .by("system"),
+    )?;
+    Ok(())
+}
+
+/// Call `apps.connections.open` with the app token (in the `Authorization`
+/// header, never a parameter) and return the WebSocket URL to connect to.
+/// The request goes only to `https://slack.com/api` (or the test hook's
+/// base) through the guarded web client: no redirects, no proxy, public
+/// addresses only. The response is read up to 16 KiB. The token is never
+/// logged and never part of an error.
+pub async fn open_socket_url(cfg: &Config, token: &secrecy::SecretString) -> Result<url::Url, OpenError> {
+    use secrecy::ExposeSecret;
+    let test = cfg.slack_socket_test_api.as_deref();
+    let base = test.unwrap_or(SLACK_API).trim_end_matches('/');
+    let mut guarded = cfg.clone();
+    guarded.fetch_allow_loopback = test.is_some();
+    let client =
+        crate::families::web::http_client(&guarded).map_err(|_| OpenError::Transient("client".into()))?;
+    let resp = client
+        .post(format!("{base}/apps.connections.open"))
+        .bearer_auth(token.expose_secret())
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| {
+            OpenError::Transient(if e.is_timeout() { "timeout".into() } else { "transport".into() })
+        })?;
+    let status = resp.status();
+    let mut body = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.map_err(|_| OpenError::Transient("transport".into()))? {
+        if body.len() + chunk.len() > OPEN_RESPONSE_MAX {
+            return Err(OpenError::Transient("response_too_large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(OpenError::Transient(format!("http_{}", status.as_u16())));
+    }
+    let v: Value = serde_json::from_slice(&body).map_err(|_| OpenError::Transient("not_json".into()))?;
+    if v["ok"].as_bool() != Some(true) {
+        let code: String = v["error"]
+            .as_str()
+            .unwrap_or("unknown")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(64)
+            .collect();
+        return Err(if PERMANENT_OPEN_ERRORS.contains(&code.as_str()) {
+            OpenError::Auth(code)
+        } else {
+            OpenError::Transient(code)
+        });
+    }
+    let raw = v["url"].as_str().unwrap_or_default();
+    socket_url(raw, test.is_some()).map_err(OpenError::BadUrl)
 }
 
 // --- tools --------------------------------------------------------------------

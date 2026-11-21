@@ -16,6 +16,8 @@ pub mod node_api;
 pub mod oauth;
 pub mod platform_api;
 pub mod slack_api;
+#[cfg(feature = "slack-socket")]
+pub mod slack_socket;
 pub mod ui;
 
 use std::sync::Arc;
@@ -95,6 +97,43 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .with_state(state)
 }
 
+/// Start the Slack Socket Mode transport on the task tracker when
+/// configured ([`ua_tools::families::slack::socket_status`]), and log one line
+/// saying whether it runs and, if not, why. It stops when `ct` is cancelled.
+pub fn start_slack_socket(state: &AppState, ct: &CancellationToken) {
+    use ua_tools::families::slack::{self, SocketState};
+    let cfg = state.hub.cfg();
+    match slack::socket_status(cfg) {
+        #[cfg(feature = "slack-socket")]
+        Ok(token) => {
+            tracing::info!("Slack Socket Mode starting");
+            slack::set_socket_state(SocketState::Connecting);
+            state.calls.spawn(slack_socket::run(state.clone(), token, ct.clone()));
+        }
+        // ua-tools reports the feature on while this crate was built without
+        // it (feature unification): the transport is not here either.
+        #[cfg(not(feature = "slack-socket"))]
+        Ok(_) => {
+            let _ = ct;
+            slack::set_socket_state(SocketState::NotCompiled);
+            tracing::warn!(
+                "Slack Socket Mode not started: ua-server was built without the slack-socket feature"
+            );
+        }
+        Err(why) => {
+            let _ = ct;
+            if cfg.slack_socket_mode && !slack::SOCKET_COMPILED {
+                slack::set_socket_state(SocketState::NotCompiled);
+                tracing::warn!("{why}");
+            } else if cfg.slack_socket_mode {
+                tracing::warn!("{why}");
+            } else {
+                tracing::info!("{why}");
+            }
+        }
+    }
+}
+
 /// Serve HTTP until `ct` is cancelled.
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
     let bind = state.hub.cfg().bind;
@@ -121,6 +160,7 @@ pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Resul
         ),
         Err(why) => tracing::info!("{why}"),
     }
+    start_slack_socket(&state, &ct);
     let app = router(state, ct.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).with_graceful_shutdown(async move { ct.cancelled_owned().await }).await?;
     Ok(())

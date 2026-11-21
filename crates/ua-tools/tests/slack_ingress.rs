@@ -640,3 +640,80 @@ async fn an_accepted_row_is_not_pruned_before_the_sweep() {
     let db = e.hub.db().clone();
     assert_eq!(db.write_async(move |tx| slack::sweep_abandoned(tx, far)).await.unwrap(), 1);
 }
+
+// --- Socket Mode -------------------------------------------------------------------
+
+#[test]
+fn socket_urls_are_limited_to_slack_over_wss() {
+    for ok in ["wss://wss-primary.slack.com/link/?ticket=1&app_id=A0", "wss://slack.com/link"] {
+        assert!(slack::socket_url(ok, false).is_ok(), "{ok}");
+    }
+    for (bad, why) in [
+        ("ws://wss-primary.slack.com/link", "not_wss"),
+        ("https://wss-primary.slack.com/link", "not_wss"),
+        ("wss://evil.example.com/link", "not_slack_host"),
+        ("wss://slack.com.example.com/link", "not_slack_host"),
+        ("wss://evilslack.com/link", "not_slack_host"),
+        ("wss://wss.slack.com:8443/link", "non_default_port"),
+        ("wss://user@wss.slack.com/link", "userinfo_or_fragment"),
+        ("wss://wss.slack.com/link#x", "userinfo_or_fragment"),
+        ("wss://127.0.0.1/link", "not_slack_host"),
+        ("ws://127.0.0.1:9/link", "not_wss"),
+        ("", "bad_length"),
+    ] {
+        assert_eq!(slack::socket_url(bad, false).unwrap_err(), why, "{bad}");
+    }
+    // Only the test hook admits a loopback ws URL.
+    assert!(slack::socket_url("ws://127.0.0.1:9/link", true).is_ok());
+    assert!(slack::socket_url("ws://example.com/link", true).is_err());
+}
+
+#[test]
+fn socket_mode_needs_the_gate_an_xapp_token_and_the_feature() {
+    use secrecy::SecretString;
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    assert!(slack::socket_status(&cfg).unwrap_err().contains("slack_socket_mode is false"));
+    cfg.slack_socket_mode = true;
+    if !slack::SOCKET_COMPILED {
+        assert!(slack::socket_status(&cfg).unwrap_err().contains("without the slack-socket feature"));
+        return;
+    }
+    assert!(slack::socket_status(&cfg).unwrap_err().contains("UA_SLACK_APP_TOKEN is not set"));
+    cfg.slack_app_token_value = Some(SecretString::from("xoxb-not-an-app-token".to_string()));
+    let why = slack::socket_status(&cfg).unwrap_err();
+    assert!(why.contains("not an app-level token") && !why.contains("xoxb"), "{why}");
+    cfg.slack_app_token_value = Some(SecretString::from("xapp-1-test".to_string()));
+    assert!(slack::socket_status(&cfg).is_ok());
+}
+
+#[tokio::test]
+async fn an_envelope_is_admitted_once_and_shares_the_delivery_dedupe() {
+    let e = slack_env();
+    let now = 1_700_000_000;
+    let admit = |key: &'static str, id: &'static str| {
+        let (hub, db) = (e.hub.clone(), e.hub.db().clone());
+        async move {
+            db.write_async(move |tx| {
+                slack::admit_keyed(
+                    tx,
+                    hub.cfg(),
+                    slack::ReplayKey::Envelope { envelope_id: key },
+                    now,
+                    &delivery("U0HUMAN", id),
+                )
+            })
+            .await
+        }
+    };
+    assert_eq!(
+        admit("env-1", "9.9.a").await.unwrap(),
+        slack::Admission::Accepted { identity: "operator".into() }
+    );
+    assert_eq!(admit("env-1", "9.9.a").await.unwrap_err().reason_code(), Some("replayed"));
+    assert_eq!(
+        admit("env-2", "9.9.a").await.unwrap(),
+        slack::Admission::Deduped { identity: "operator".into() }
+    );
+    // The envelope key never matches an HTTP key.
+    assert_ne!(slack::envelope_sha("x"), slack::signed_request_sha("x", b""));
+}
