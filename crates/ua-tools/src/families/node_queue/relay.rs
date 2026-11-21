@@ -433,8 +433,9 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
         return Err(UaError::invalid("idempotency_key must be 8-128 of [A-Za-z0-9_.:-]"));
     }
     // Only a human writes without a gate; an agent's follow-up is new
-    // instructions to a running session and needs its own approval.
-    let operator = ctx.caller.is_human() || ctx.hub.cfg().is_human(&who);
+    // instructions to a running session and needs its own approval. A routine
+    // running unattended under a human's label is an agent here.
+    let operator = Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
     if !operator
         && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, FOLLOWUP_GATE)
     {

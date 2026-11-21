@@ -500,6 +500,15 @@ async fn an_operator_claim_release_is_fenced() {
         )
         .await;
     assert_eq!(reason(&e), "not_lifecycle_operator");
+    // A routine running unattended under the human's label is an agent.
+    let e = h
+        .act_err(
+            &caller("operator", ActorKind::Agent),
+            "task_claim_release",
+            json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "x" }),
+        )
+        .await;
+    assert_eq!(reason(&e), "not_lifecycle_operator");
     let e = h
         .act_err(
             &human(),
@@ -544,6 +553,18 @@ async fn an_operator_claim_release_is_fenced() {
     assert!(out["task"]["notes"].as_str().unwrap().contains("[claim-released]"));
     assert!(out["released"]["event_ulid"].is_string());
     h.ok(&lead(), "task_claim", json!({ "id": t })).await;
+
+    // A listed agent releases under its own, separately named authority.
+    h.ok(&lead(), "task_update", json!({ "id": t, "release_claim": true })).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let out = h
+        .act_ok(
+            &caller("fleet-bot", ActorKind::Agent),
+            "task_claim_release",
+            json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "stale" }),
+        )
+        .await;
+    assert_eq!(out["released"]["authority"], "lifecycle_operator");
 
     // A finished task has no claim to transfer.
     let done = h.task("Finished", None).await;
@@ -664,6 +685,15 @@ async fn approved_proposal_items_become_tasks_whose_contract_is_rechecked_at_cla
     let e = h.err(&builder(), "task_update", json!({ "id": t2, "status": "doing" })).await;
     assert_eq!(reason(&e), "contract_mismatch");
 
+    // Filing in another identity's name is the human's alone. A routine
+    // running unattended under the human's label is an agent.
+    let named = json!({ "title": "For the lead", "proposer": "lead-1", "items": [{ "title": "One" }] });
+    let e = h.act_err(&caller("operator", ActorKind::Agent), "work_proposal_file", named.clone()).await;
+    assert_eq!(reason(&e), "identity_mismatch");
+    let p = h.act_ok(&human(), "work_proposal_file", named).await;
+    assert_eq!(p["proposal"]["proposer"], "lead-1");
+    h.act_ok(&lead(), "work_proposal_withdraw", json!({ "proposal_id": p["proposal"]["id"] })).await;
+
     // Withdraw: the proposer only, before any decision.
     let e = h.act_err(&lead(), "work_proposal_withdraw", json!({ "proposal_id": pid })).await;
     assert_eq!(e.code(), "conflict");
@@ -679,7 +709,11 @@ async fn approved_proposal_items_become_tasks_whose_contract_is_rechecked_at_cla
     assert_eq!(w["proposal"]["status"], "withdrawn");
 
     let list = h.act_ok(&lead(), "work_proposal_list", json!({ "proposer": "lead-1" })).await;
-    assert_eq!(list["proposals"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        list["proposals"].as_array().unwrap().len(),
+        4,
+        "three of its own and the human's in its name"
+    );
     assert_eq!(
         h.act_ok(&lead(), "work_proposal_get", json!({ "proposal_id": pid })).await["proposal"]["id"],
         pid

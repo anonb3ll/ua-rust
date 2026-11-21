@@ -76,11 +76,12 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             ),
         ));
     }
-    let authority = if ctx.caller.is_human() || ctx.hub.cfg().is_human(&who) {
-        "human_operator"
-    } else {
-        "lifecycle_operator"
-    };
+    let authority =
+        if Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+            "human_operator"
+        } else {
+            "lifecycle_operator"
+        };
     let reason = clean_reason(a.reason.as_deref(), Some("release another agent's claim"))?;
     let expected_claimed_at = match a.expected_claimed_at.as_deref().map(str::trim) {
         Some("") => return Err(UaError::invalid("expected_claimed_at must be a non-empty claim generation")),
