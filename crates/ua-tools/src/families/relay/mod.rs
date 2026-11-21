@@ -992,8 +992,9 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                 if let Some(new) = new {
                     tx.execute(
                         "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = COALESCE(resolved_by, ?4), \
-                         resolved_at = COALESCE(resolved_at, ?5), updated_at = ?5 WHERE id = ?1",
-                        params![a, new, reason, caller.label, now],
+                         resolved_at = COALESCE(resolved_at, ?5), updated_at = ?5, \
+                         resolved_transport = COALESCE(resolved_transport, ?6) WHERE id = ?1",
+                        params![a, new, reason, caller.label, now, approvals::transport_name(&caller)],
                     )?;
                     approval_status = Some(new);
                 }

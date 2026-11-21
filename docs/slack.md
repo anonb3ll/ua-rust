@@ -134,8 +134,13 @@ gated call parks an approval like any other.
 **`/approve`** needs `can_approve` on the mapping, then resolves as the
 mapped identity with `approval_resolve`'s own rule: the approver must be a
 verified human other than the requester, and the profile must allow
-`approval_resolve`. The approval row's `reason` is `approved from Slack`
-and the `approval_resolve` call is recorded with transport `slack`.
+`approval_resolve`. Approvals from Slack are therefore opt-in per
+identity, and each one is recorded as coming from Slack: the approval row's
+`resolved_transport` is `slack` (every decision records the adapter it came
+through: `ui`, `http`, `mcp`, `cli`, `slack`), the `agent.approval.resolved`
+ledger event carries `transport: "slack"`, the Control Center inbox shows
+it in the "Via" column, and the `approval_resolve` call's `tool_calls` row
+has transport `slack`. The row's `reason` is `approved from Slack`.
 `approve` is accepted **only as a slash command**: sent as a
 message through the Events API, in any spelling (`!approve`, `/approve`,
 any case), it is refused (`approve_needs_slash_command`

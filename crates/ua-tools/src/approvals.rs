@@ -36,6 +36,25 @@ CREATE INDEX IF NOT EXISTS idx_approvals_lookup ON approvals(tool, status, reque
 ",
 };
 
+/// `approvals.resolved_transport`: which adapter the resolving call came
+/// through (`ui`, `http`, `mcp`, `cli`, `slack`, ...), so an approval made
+/// from chat is told apart from one made in the Control Center. Evidence
+/// only: no rule reads it. NULL for rows resolved before this part.
+pub const SCHEMA_V2: SchemaPart = SchemaPart {
+    name: "approvals.v2",
+    sql: "
+ALTER TABLE approvals ADD COLUMN resolved_transport TEXT;
+",
+};
+
+/// The caller's transport as stored and ledgered (`"slack"`, `"ui"`, ...).
+pub(crate) fn transport_name(caller: &Caller) -> String {
+    serde_json::to_value(caller.transport)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Result of the gate check for one call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateOutcome {
@@ -253,6 +272,9 @@ pub struct ApprovalRow {
     pub status: String,
     pub reason: Option<String>,
     pub resolved_by: Option<String>,
+    /// The adapter the decision came through (`ui`, `http`, `slack`, ...);
+    /// `None` for a row resolved before this was recorded.
+    pub resolved_transport: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub resolved_at: Option<String>,
@@ -286,6 +308,7 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
         status: r.get("status")?,
         reason: r.get("reason")?,
         resolved_by: r.get("resolved_by")?,
+        resolved_transport: r.get("resolved_transport")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         resolved_at: r.get("resolved_at")?,
@@ -457,10 +480,11 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
                 return Err(UaError::denied("not_human", "only a human or the requester can deny or revoke"));
             }
         }
+        let transport = transport_name(&caller);
         tx.execute(
-            "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, updated_at = ?5 \
-             WHERE id = ?1",
-            params![row.id, new_status, args.reason, resolver, now],
+            "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, updated_at = ?5, \
+             resolved_transport = ?6 WHERE id = ?1",
+            params![row.id, new_status, args.reason, resolver, now, transport],
         )?;
         if row.tool == crate::families::relay::TOOL {
             // The relay keeps a message's text in its approval only while
@@ -471,7 +495,13 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             tx,
             EventInput::new(
                 "agent.approval.resolved",
-                json!({ "approval_id": row.id, "tool": row.tool, "decision": args.decision, "resolved_by": resolver }),
+                json!({
+                    "approval_id": row.id,
+                    "tool": row.tool,
+                    "decision": args.decision,
+                    "resolved_by": resolver,
+                    "transport": transport,
+                }),
             )
             .by(caller.label.clone()),
         )?;

@@ -281,6 +281,65 @@ async fn approving_through_the_inbox_form_lets_the_retry_through() {
     assert_eq!(approval_status(&state, id), "consumed");
 }
 
+/// The inbox shows which adapter each live pass was approved through;
+/// a row resolved before that was recorded reads "unknown".
+#[tokio::test]
+async fn the_inbox_shows_how_each_pass_was_approved() {
+    let (app, state) = app(gated_config());
+    let via_ui = park(&state, "Approved in the inbox").await;
+    let via_slack = park(&state, "Approved from chat").await;
+    let csrf = csrf_cookie(&app, Some(OPERATOR_TOKEN)).await;
+    let resp = send(
+        &app,
+        form(
+            &format!("/ui/approvals/{via_ui}/resolve"),
+            Some(OPERATOR_TOKEN),
+            Some(&csrf),
+            None,
+            &format!("_csrf={csrf}&decision=approve&reason=ok"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let slack_human = ua_core::Caller {
+        label: "operator".into(),
+        kind: ua_core::ActorKind::Human,
+        profile: ua_core::Profile::Coordinator,
+        enforce_profile: true,
+        session_key: None,
+        transport: ua_core::identity::Transport::Slack,
+    };
+    call(&state, &slack_human, "approval_resolve", json!({ "id": via_slack, "decision": "approve" }))
+        .await
+        .unwrap();
+    // A pass resolved before the transport was recorded.
+    let old = park(&state, "Approved long ago").await;
+    let now = ua_core::time::now();
+    state
+        .hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2, \
+                 resolved_transport = NULL WHERE id = ?1",
+                rusqlite::params![old, now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let html = body_text(send(&app, get("/ui/inbox", Some(OPERATOR_TOKEN))).await).await;
+    let row = |id: i64| {
+        let start = html.find(&format!("id=\"approval-{id}\"")).unwrap_or_else(|| panic!("row {id}: {html}"));
+        let end = html[start..].find("</tr>").unwrap() + start;
+        html[start..end].to_string()
+    };
+    assert!(row(via_ui).contains("<td>ui</td>"), "{}", row(via_ui));
+    assert!(row(via_slack).contains("<td>slack</td>"), "{}", row(via_slack));
+    assert!(row(old).contains("<td>unknown</td>"), "{}", row(old));
+    assert!(html.contains("<th scope=\"col\">Via</th>"));
+}
+
 #[tokio::test]
 async fn deny_and_revoke_go_through_the_same_form_with_the_header_token() {
     let (app, state) = app(gated_config());
