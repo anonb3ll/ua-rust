@@ -735,7 +735,10 @@ pub struct ManifestStats {
 }
 
 /// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
-/// rolling_hash}` over the whole event log, ordered by ulid.
+/// rolling_hash}` over the whole event log, ordered by ulid. When `chain_ok`
+/// is `false`, `first_bad_seq` (when available) and `chain_error` report where
+/// and why the chain broke; both are omitted on healthy logs so healthy key
+/// sets and manifest fingerprints stay unchanged.
 ///
 /// `chain_ok` is [`ledger::verify`] (seq-order `prev_hash` linkage from
 /// [`ledger::GENESIS_HASH`], no hashless row after a hashed one, and a legacy
@@ -757,10 +760,12 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let mut hasher = Sha256::new();
     let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
     let has_log = has_table(c, "event_log")?;
-    let ledger_ok = !has_log || ledger::verify(c)?.ok;
+    let ledger_report = if has_log { Some(ledger::verify(c)?) } else { None };
+    let ledger_ok = ledger_report.as_ref().is_none_or(|r| r.ok);
     if has_log {
         let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
         want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+        // Separate from ledger::verify (seq order): rolling_hash and ulid bounds follow ulid order, which can differ in imported logs.
         for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
             let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
             if count == 0 {
@@ -808,13 +813,26 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
             Ok(())
         })?;
     }
+    let chain_ok = ledger_ok && mismatches == 0;
     let mut out = Map::new();
-    out.insert("chain_ok".into(), json!(ledger_ok && mismatches == 0));
+    out.insert("chain_ok".into(), json!(chain_ok));
     out.insert("count".into(), json!(count));
     out.insert("entry_hash_mismatches".into(), json!(mismatches));
     out.insert("first_ulid".into(), first);
     out.insert("last_ulid".into(), last);
     out.insert("rolling_hash".into(), json!(hex::encode(hasher.finalize())));
+    if !chain_ok {
+        if let Some(rep) = ledger_report.as_ref().filter(|r| !r.ok) {
+            if let Some(seq) = rep.first_bad_seq {
+                out.insert("first_bad_seq".into(), json!(seq));
+            }
+            if let Some(reason) = &rep.reason {
+                out.insert("chain_error".into(), json!(reason));
+            }
+        } else if mismatches > 0 {
+            out.insert("chain_error".into(), json!("entry_hash mismatch"));
+        }
+    }
     Ok(out)
 }
 
@@ -1241,6 +1259,7 @@ async fn side_manifest(
 }
 
 /// One side's event-log summary, checked.
+#[derive(Debug)]
 struct EventLog {
     count: u64,
     first: Option<String>,
@@ -1248,16 +1267,26 @@ struct EventLog {
     rolling_hash: String,
     /// `chain_ok` as the export stated it (absent: not stated).
     chain_ok: Option<bool>,
+    first_bad_seq: Option<i64>,
+    chain_error: Option<String>,
     /// The cursor and, per ulid listed after it, a hash of the row.
     rows: Option<(String, BTreeMap<String, String>)>,
 }
 
-fn opt_ulid(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
+fn opt_str(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
     match log.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(UaError::invalid(format!("{side} event_log.{key} must be a string or null"))),
     }
+}
+
+fn opt_i64(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<i64>> {
+    let Some(v) = log.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let Some(n) = v.as_i64() else {
+        return Err(UaError::invalid(format!("{side} event_log.{key} must be an integer or null")));
+    };
+    Ok(Some(n))
 }
 
 fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
@@ -1276,9 +1305,9 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
         .and_then(Value::as_str)
         .ok_or_else(|| UaError::invalid(format!("{side} event_log.rolling_hash must be a string")))?
         .to_string();
-    let first = opt_ulid(side, log, "first_ulid")?;
-    let last = opt_ulid(side, log, "last_ulid")?;
-    let rows = match (log.get("rows"), opt_ulid(side, log, "since_ulid")?) {
+    let first = opt_str(side, log, "first_ulid")?;
+    let last = opt_str(side, log, "last_ulid")?;
+    let rows = match (log.get("rows"), opt_str(side, log, "since_ulid")?) {
         (None, None) => None,
         (Some(rows), Some(since)) => {
             let rows = object_rows(Some(rows), &format!("{side} event_log.rows"))?;
@@ -1307,7 +1336,9 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(UaError::invalid(format!("{side} event_log.chain_ok must be a boolean"))),
     };
-    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, rows }))
+    let first_bad_seq = opt_i64(side, log, "first_bad_seq")?;
+    let chain_error = opt_str(side, log, "chain_error")?;
+    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, first_bad_seq, chain_error, rows }))
 }
 
 /// Compare the two event-log summaries and, when both sides listed rows,
@@ -1368,7 +1399,14 @@ fn compare_event_logs(
     }
     for (name, e) in [("left", &l), ("right", &r)] {
         if e.chain_ok == Some(false) {
-            conflicts.push(json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"}));
+            let mut conflict = json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"});
+            if let Some(seq) = e.first_bad_seq {
+                conflict["first_bad_seq"] = json!(seq);
+            }
+            if let Some(err) = &e.chain_error {
+                conflict["chain_error"] = json!(err);
+            }
+            conflicts.push(conflict);
         }
     }
     if !(count_match && range_match && rolling_hash_match) || rows_differ {
@@ -1631,7 +1669,9 @@ pub fn register(r: &mut Registry) {
              must match the length the import recorded in ledger_meta (stores imported before that record \
              existed report false, as event_log_verify does); each row's entry hash is recomputed \
              from its contents, and the rolling hash is SHA-256 over the ulid-ordered recomputed hashes (the \
-             canonical row where a row has none). The summary has no anchor: compare against an earlier \
+             canonical row where a row has none). When chain_ok is false, first_bad_seq (when available) \
+             and chain_error report where and why the chain broke (omitted on healthy logs). The summary has \
+             no anchor: compare against an earlier \
              manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
              client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
@@ -1819,12 +1859,16 @@ mod tests {
         let before = summary(&c);
         assert_eq!(before["chain_ok"], true);
         assert_eq!(before["entry_hash_mismatches"], 0);
+        assert!(before.get("first_bad_seq").is_none());
+        assert!(before.get("chain_error").is_none());
         // Rewrite the payload and keep the stored entry_hash.
         c.execute_batch("DROP TRIGGER event_log_no_update;").unwrap();
         c.execute("UPDATE event_log SET payload = '{\"n\":2}' WHERE ulid = '01B'", []).unwrap();
         let after = summary(&c);
         assert_eq!(after["chain_ok"], false);
         assert_eq!(after["entry_hash_mismatches"], 1);
+        assert_eq!(after["first_bad_seq"], 1);
+        assert!(after["chain_error"].as_str().is_some_and(|s| s.contains("entry_hash")));
         assert_ne!(after["rolling_hash"], before["rolling_hash"]);
         assert_eq!(after["count"], before["count"]);
     }
@@ -1862,6 +1906,8 @@ mod tests {
         assert_eq!(s["chain_ok"], false);
         assert_eq!(s["entry_hash_mismatches"], 0);
         assert_eq!(s["count"], 2);
+        assert_eq!(s["first_bad_seq"], 3);
+        assert!(s["chain_error"].as_str().is_some_and(|m| m.contains("prev_hash")));
     }
 
     #[test]
@@ -2063,6 +2109,8 @@ mod tests {
         let unrecorded = event_log_summary(&c).unwrap();
         assert_eq!(unrecorded["chain_ok"], false);
         assert_eq!(unrecorded["entry_hash_mismatches"], 0);
+        assert_eq!(unrecorded["first_bad_seq"], 1);
+        assert!(unrecorded["chain_error"].as_str().is_some_and(|s| s.contains("legacy prefix")));
 
         c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '2')", [ledger::LEGACY_PREFIX_KEY])
             .unwrap();
@@ -2070,5 +2118,46 @@ mod tests {
         assert_eq!(recorded["chain_ok"], true);
         assert_eq!(recorded["entry_hash_mismatches"], 0);
         assert_eq!(recorded["count"], 4);
+        assert!(recorded.get("first_bad_seq").is_none());
+        assert!(recorded.get("chain_error").is_none());
+    }
+
+    #[test]
+    fn event_log_of_validates_break_fields_and_missing_legacy_prefix_omits_first_bad_seq() {
+        let c = db();
+        insert_chained(&c, &[("01A", "a", "{}", "t0")], ledger::GENESIS_HASH);
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '2')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert!(s.get("first_bad_seq").is_none());
+        assert!(s["chain_error"].as_str().is_some_and(|m| m.contains("legacy prefix")));
+
+        let base = json!({
+            "event_log": {
+                "count": 1,
+                "first_ulid": "01A",
+                "last_ulid": "01A",
+                "rolling_hash": "0".repeat(64),
+                "chain_ok": false,
+                "first_bad_seq": null,
+                "chain_error": null,
+            }
+        });
+        let parsed = event_log_of("left", &base).unwrap().unwrap();
+        assert_eq!(parsed.first_bad_seq, None);
+        assert_eq!(parsed.chain_error, None);
+
+        let mut bad_seq = base.clone();
+        bad_seq["event_log"]["first_bad_seq"] = json!("not-an-int");
+        assert!(event_log_of("left", &bad_seq).unwrap_err().to_string().contains("first_bad_seq"));
+
+        let mut bad_float = base.clone();
+        bad_float["event_log"]["first_bad_seq"] = json!(1.5);
+        assert!(event_log_of("left", &bad_float).unwrap_err().to_string().contains("first_bad_seq"));
+
+        let mut bad_err = base;
+        bad_err["event_log"]["chain_error"] = json!(42);
+        assert!(event_log_of("right", &bad_err).unwrap_err().to_string().contains("chain_error"));
     }
 }
