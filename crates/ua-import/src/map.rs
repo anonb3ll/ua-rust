@@ -34,19 +34,13 @@ pub(crate) enum Kind {
     /// host facts do not. ua-rust stores only facts it bounded on write, so
     /// `facts_json` starts empty and the node's next registration fills it.
     Nodes,
-    /// Tasks: stale `current_run_id` and `current_run_agent` pointers (not in
-    /// target `dispatch_runs`) are cleared to NULL.
+    /// Tasks: `current_run_id` and `current_run_agent` are cleared to NULL
+    /// because `dispatch_runs` are not imported.
     Tasks,
-    /// Work proposals: coerce NULL `status`/`reporting_mode` to defaults.
-    WorkProposals,
-    /// Work proposal items: keep frozen title/notes/scope_json/digests intact
-    /// and coerce NULL defaults from older schemas.
-    WorkProposalItems,
-    /// Task subtree holds: coerce NULL defaults and refuse duplicate active holds.
+    /// Task subtree holds: require valid `status` and refuse duplicate active holds.
     TaskHolds,
-    /// Task hold members: coerce NULL `cancel_requested_by_hold` to `0`.
-    TaskHoldMembers,
-    /// Project repository bindings: validate `project` slug, `repo`, and branch.
+    /// Project repository bindings: validate `project` slug and `repo`, and
+    /// normalize `default_branch` (clearing invalid values to NULL).
     ProjectRepoBindings,
 }
 
@@ -108,20 +102,16 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_steps") },
     TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_checkpoints") },
     TableMap { refs: &[TASK_REF], ..plain("delegations") },
-    TableMap { kind: Kind::WorkProposals, ..plain("work_proposals") },
+    plain("work_proposals"),
     TableMap {
         refs: &[Ref { col: "proposal_id", table: "work_proposals", key: "id" }],
-        kind: Kind::WorkProposalItems,
         ..plain("work_proposal_items")
     },
-    TableMap {
-        refs: &[Ref { col: "root_task_id", table: "tasks", key: "id" }],
-        kind: Kind::TaskHolds,
-        ..plain("task_holds")
-    },
+    // Neither schema has an FK from task_holds.root_task_id to tasks: hold
+    // records intentionally outlive deleted tasks, while members keep their task FK.
+    TableMap { kind: Kind::TaskHolds, ..plain("task_holds") },
     TableMap {
         refs: &[Ref { col: "hold_id", table: "task_holds", key: "id" }, TASK_REF],
-        kind: Kind::TaskHoldMembers,
         ..plain("task_hold_members")
     },
     TableMap { kind: Kind::ProjectRepoBindings, ..plain("project_repo_bindings") },

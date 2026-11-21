@@ -99,7 +99,10 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ImportCmd {
     /// Import a Python hub database (opened read-only). Re-running resumes
-    /// and skips rows already copied. Prints a JSON report.
+    /// and skips rows already copied. Prints a JSON report. Take a target
+    /// snapshot first when importing into a non-empty database: post-import
+    /// ledger verification runs after batches commit, so a failed verification
+    /// leaves imported rows in place without rollback.
     PythonHub {
         /// Path to the Python hub's SQLite database.
         #[arg(long = "from")]

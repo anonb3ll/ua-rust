@@ -1,9 +1,13 @@
-//! Regression tests for P0 #2702 import fidelity:
+//! Regression tests for P0 #2702 import fidelity and PR #57 review fixes:
 //! - `--drop-org-scope` enforcement on `harness_config_bundles.org_id` + P0 tables
-//! - clearing stale `tasks.current_run_id` / `current_run_agent` (`queue_park` / `queue_health`)
+//! - unconditional clearing of `tasks.current_run_id` / `current_run_agent` (including `doing` tasks)
+//!   with separate `task_runs_cleared` count and capped `task_runs_cleared_ids`
 //! - `work_proposals` / `work_proposal_items` frozen contracts & `work_proposal_recover`
-//! - `task_holds` / `task_hold_members` defaults, active-root uniqueness & `task_hold(mode="resume")`
-//! - `project_repo_bindings` slug + branch + GitHub URL normalization & `project_repo_get`
+//! - `task_holds` / `task_hold_members`: real DDL, deleted-root holds preserved, NULL status skipped,
+//!   cross-org active-root uniqueness & `task_hold(mode="resume")`
+//! - `project_repo_bindings`: shared `ua-tools` normalization, clearing invalid `default_branch` to NULL,
+//!   and dry-run/import refusals
+//! - `batch_size = 1` resume across the P0 tables
 
 use std::path::PathBuf;
 
@@ -11,14 +15,18 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, Config, Profile, canonical, identity::Transport};
-use ua_import::{Options, Report};
+use ua_import::{MAX_REPORTED_TASK_RUN_IDS, Options, Report};
 use ua_store::Db;
 use ua_store::ledger;
+use ua_tools::families::governance::normalize_repo as tools_normalize_repo;
 use ua_tools::{Hub, builtin_registry};
 
 const T0: &str = "2026-01-01T00:00:00+00:00";
 const T_OLD: &str = "2025-11-01T00:00:00+00:00";
 
+/// Real Python hub DDL for the P0 tables (`work_proposals`, `work_proposal_items`,
+/// `task_holds` with `idx_task_holds_active_root`, `task_hold_members`,
+/// `project_repo_bindings`, `harness_config_bundles`, plus `agents`/`tasks`/`event_log`).
 const PY_P0_SCHEMA: &str = "
 CREATE TABLE agents (
   label TEXT PRIMARY KEY,
@@ -51,54 +59,56 @@ CREATE TABLE tasks (
 );
 CREATE TABLE work_proposals (
   id TEXT PRIMARY KEY,
+  org_id TEXT,
   title TEXT NOT NULL,
   proposer TEXT NOT NULL,
-  status TEXT DEFAULT 'pending',
-  reporting_mode TEXT DEFAULT 'final_only',
+  status TEXT NOT NULL DEFAULT 'pending',
+  reporting_mode TEXT NOT NULL DEFAULT 'final_only',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  withdrawn_at TEXT,
-  org_id TEXT
+  withdrawn_at TEXT
 );
 CREATE TABLE work_proposal_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
   proposal_id TEXT NOT NULL,
   idx INTEGER NOT NULL,
+  org_id TEXT,
   title TEXT NOT NULL,
-  notes TEXT DEFAULT '',
-  scope_json TEXT DEFAULT '{}',
-  priority TEXT DEFAULT 'med',
-  status TEXT DEFAULT 'pending',
+  notes TEXT NOT NULL DEFAULT '',
+  scope_json TEXT NOT NULL DEFAULT '{}',
+  priority TEXT NOT NULL DEFAULT 'med',
+  status TEXT NOT NULL DEFAULT 'pending',
   filed_digest TEXT NOT NULL,
   contract_digest TEXT NOT NULL,
-  edited INTEGER DEFAULT 0,
+  edited INTEGER NOT NULL DEFAULT 0,
   approving_by TEXT,
   approving_at TEXT,
   decided_by TEXT,
   decided_at TEXT,
   task_id INTEGER,
-  org_id TEXT
+  PRIMARY KEY (proposal_id, idx)
 );
--- Intentionally omit idx_task_holds_active_root so tests can simulate legacy duplicate active holds.
 CREATE TABLE task_holds (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   root_task_id INTEGER NOT NULL,
-  mode TEXT NOT NULL,
-  status TEXT DEFAULT 'active',
-  reason TEXT DEFAULT '',
-  release_policy TEXT DEFAULT 'manual',
+  mode TEXT NOT NULL CHECK(mode IN ('pause','cancel')),
+  status TEXT NOT NULL CHECK(status IN ('active','released')),
+  reason TEXT NOT NULL DEFAULT '',
+  release_policy TEXT NOT NULL DEFAULT 'manual'
+    CHECK(release_policy IN ('manual','after_active_runs_finish')),
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
   released_by TEXT,
   released_at TEXT,
-  cancelling_at TEXT,
-  org_id TEXT
+  org_id TEXT,
+  cancelling_at TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_holds_active_root
+  ON task_holds(root_task_id, COALESCE(org_id, '')) WHERE status='active';
 CREATE TABLE task_hold_members (
-  hold_id INTEGER NOT NULL,
+  hold_id INTEGER NOT NULL REFERENCES task_holds(id),
   task_id INTEGER NOT NULL,
   status_at_hold TEXT NOT NULL,
-  cancel_requested_by_hold INTEGER DEFAULT 0,
+  cancel_requested_by_hold INTEGER NOT NULL DEFAULT 0,
   cancelled_run_id TEXT,
   cancelled_run_agent TEXT,
   restored_at TEXT,
@@ -141,11 +151,11 @@ struct Fixture {
     path: PathBuf,
 }
 
-fn new_source() -> (Fixture, Connection) {
+fn new_source_with_schema(schema: &str) -> (Fixture, Connection) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("py_p0.db");
     let c = Connection::open(&path).unwrap();
-    c.execute_batch(PY_P0_SCHEMA).unwrap();
+    c.execute_batch(schema).unwrap();
     let hash = ledger::compute_entry_hash(
         None,
         "01J0000000000000000000000",
@@ -164,6 +174,10 @@ fn new_source() -> (Fixture, Connection) {
     )
     .unwrap();
     (Fixture { _dir: dir, path }, c)
+}
+
+fn new_source() -> (Fixture, Connection) {
+    new_source_with_schema(PY_P0_SCHEMA)
 }
 
 fn target() -> Db {
@@ -288,30 +302,47 @@ fn p0_tables_and_harness_config_bundles_enforce_drop_org_scope() {
 }
 
 #[tokio::test]
-async fn stale_current_run_id_and_orphan_agent_clear_and_unblock_queue_park() {
+async fn current_run_id_and_agent_clear_unconditionally_including_doing_tasks_and_cap_ids() {
     let t_fresh = ua_core::time::now();
     let (f, c) = new_source();
     c.execute_batch(&format!(
         "INSERT INTO agents (label, kind, created_at, updated_at) VALUES ('agent-1', 'claude', '{T0}', '{T0}');
-         INSERT INTO tasks (id, title, status, created_at, updated_at, current_run_id, current_run_agent) VALUES
-           (1, 'Stale task with dangling run', 'open', '{T_OLD}', '{T_OLD}', 'run-stale-1', 'agent-1'),
-           (2, 'Orphan run agent task', 'open', '{t_fresh}', '{t_fresh}', NULL, 'agent-1'),
-           (3, 'Fresh claimable task', 'open', '{t_fresh}', '{t_fresh}', NULL, NULL);"
+         INSERT INTO tasks (id, title, status, claimed_by, created_at, updated_at, current_run_id, current_run_agent) VALUES
+           (1, 'Old open task with run', 'open', NULL, '{T_OLD}', '{T_OLD}', 'run-stale-1', 'agent-1'),
+           (2, 'Orphan run agent task', 'open', NULL, '{t_fresh}', '{t_fresh}', NULL, 'agent-1'),
+           (3, 'Doing task with active-looking run', 'doing', 'agent-1', '{t_fresh}', '{t_fresh}', 'run-doing-3', 'agent-1'),
+           (4, 'Fresh claimable task', 'open', NULL, '{t_fresh}', '{t_fresh}', NULL, NULL);"
     ))
     .unwrap();
     drop(c);
 
+    let dry = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(dry.task_runs_cleared, 3);
+    assert_eq!(dry.task_runs_cleared_ids, vec![1, 2, 3]);
+    assert!(
+        dry.notes.iter().any(|note| {
+            note.contains("3 task(s) had current_run_id/current_run_agent cleared")
+                && note.contains("#1, #2, #3")
+        }),
+        "{:?}",
+        dry.notes
+    );
+
     let db = target();
     let r = ua_import::import(&db, &f.path, &opts()).unwrap();
-    assert_eq!(table(&r, "tasks").dangling_refs_nulled, 2);
+    assert_eq!(table(&r, "tasks").dangling_refs_nulled, 0, "run clearing is counted separately");
+    assert_eq!(r.task_runs_cleared, 3);
+    assert_eq!(r.task_runs_cleared_ids, vec![1, 2, 3]);
     assert!(
-        r.notes
-            .iter()
-            .any(|note| note.contains("2 task(s) had stale current_run_id/current_run_agent cleared")),
+        r.notes.iter().any(|note| {
+            note.contains("3 task(s) had current_run_id/current_run_agent cleared")
+                && note.contains("dispatch_runs are not imported")
+                && note.contains("#1, #2, #3")
+        }),
         "{:?}",
         r.notes
     );
-    for id in [1, 2] {
+    for id in [1, 2, 3] {
         let run_cols: (Option<String>, Option<String>) = db
             .read(|conn| {
                 Ok(conn.query_row(
@@ -323,6 +354,10 @@ async fn stale_current_run_id_and_orphan_agent_clear_and_unblock_queue_park() {
             .unwrap();
         assert_eq!(run_cols, (None, None), "task {id}");
     }
+    let doing_status: String = db
+        .read(|conn| Ok(conn.query_row("SELECT status FROM tasks WHERE id = 3", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(doing_status, "doing");
 
     let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
     let reg = builtin_registry();
@@ -352,12 +387,32 @@ async fn stale_current_run_id_and_orphan_agent_clear_and_unblock_queue_park() {
     let err = reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 1 })).await.unwrap_err();
     assert_eq!(err.reason_code(), Some("task_parked"), "{err:?}");
 
-    let claimed = reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 3 })).await.unwrap();
+    let claimed = reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 4 })).await.unwrap();
     assert_eq!(claimed["claimed"], json!(true), "{claimed}");
+
+    // Cap check: 55 tasks with current_run_id report count = 55 and 50 sample IDs.
+    let (f_cap, c_cap) = new_source();
+    for id in 1..=55i64 {
+        c_cap
+            .execute(
+                "INSERT INTO tasks (id, title, status, created_at, updated_at, current_run_id) \
+                 VALUES (?1, 'Run task', 'open', ?2, ?2, ?3)",
+                params![id, T0, format!("run-{id}")],
+            )
+            .unwrap();
+    }
+    drop(c_cap);
+    let db_cap = target();
+    let r_cap = ua_import::import(&db_cap, &f_cap.path, &opts()).unwrap();
+    assert_eq!(r_cap.task_runs_cleared, 55);
+    assert_eq!(r_cap.task_runs_cleared_ids.len(), MAX_REPORTED_TASK_RUN_IDS);
+    assert_eq!(r_cap.task_runs_cleared_ids[0], 1);
+    assert_eq!(r_cap.task_runs_cleared_ids[49], 50);
+    assert!(r_cap.notes.iter().any(|note| note.contains("first 50 of 55 task ids")), "{:?}", r_cap.notes);
 }
 
 #[tokio::test]
-async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
+async fn work_proposals_preserve_contracts_and_recover() {
     let (f, c) = new_source();
     let scope = json!({ "files": ["src/lib.rs"], "repo": "example/repo" });
     // Deliberately non-canonical key order / spacing for item 0 to verify byte-identical copy.
@@ -385,7 +440,7 @@ async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
     c.execute(
         "INSERT INTO work_proposals (id, title, proposer, status, reporting_mode, created_at, updated_at) VALUES \
          ('wp_0123456789ab', 'Prop A', 'agent-1', 'pending', 'final_only', ?1, ?1), \
-         ('wp_fedcba987654', 'Prop B', 'agent-1', NULL, NULL, ?1, ?1)",
+         ('wp_fedcba987654', 'Prop B', 'agent-1', 'pending', 'final_only', ?1, ?1)",
         [T0],
     )
     .unwrap();
@@ -395,7 +450,6 @@ async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
          VALUES \
          ('wp_0123456789ab', 0, 'Approved contract', 'Follow spec', ?1, 'high', 'approved', ?2, ?2, 0, 'operator', ?3, 'operator', ?3, 10), \
          ('wp_0123456789ab', 1, 'Frozen title', 'Original spec', ?4, 'med', 'approved', ?5, ?5, 0, 'operator', ?3, 'operator', ?3, 11), \
-         ('wp_0123456789ab', 2, 'Null defaults item', NULL, NULL, NULL, NULL, 'fd', 'cd', NULL, NULL, NULL, NULL, NULL, NULL), \
          ('wp_fedcba987654', 0, 'Interrupted approval rollback', 'Never spawned', ?4, 'med', 'approving', ?6, ?6, 0, 'operator', ?7, NULL, NULL, NULL), \
          ('wp_fedcba987654', 1, 'Interrupted approval forward', 'Spawned before crash', ?4, 'med', 'approving', ?8, ?8, 0, 'operator', ?7, NULL, NULL, NULL), \
          ('wp_missing0000', 0, 'Orphaned item', 'No parent proposal', ?4, 'med', 'pending', 'fd', 'cd', 0, NULL, NULL, NULL, NULL, NULL)",
@@ -406,7 +460,7 @@ async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
 
     let db = target();
     let r = ua_import::import(&db, &f.path, &opts()).unwrap();
-    assert_eq!(table(&r, "work_proposal_items").copied, 5);
+    assert_eq!(table(&r, "work_proposal_items").copied, 4);
     assert_eq!(table(&r, "work_proposal_items").skipped.get("missing_proposal_id"), Some(&1));
 
     // Verify byte-identical preservation of non-canonical scope_json on item 0.
@@ -420,19 +474,6 @@ async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
         })
         .unwrap();
     assert_eq!(copied_scope, noncanonical_scope);
-
-    // Check NULL -> DEFAULT coercions landed cleanly.
-    let item2: (String, String, String, String, i64) = db
-        .read(|conn| {
-            Ok(conn.query_row(
-                "SELECT notes, scope_json, priority, status, edited FROM work_proposal_items \
-                 WHERE proposal_id = 'wp_0123456789ab' AND idx = 2",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )?)
-        })
-        .unwrap();
-    assert_eq!(item2, ("".into(), "{}".into(), "med".into(), "pending".into(), 0));
 
     let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
     let reg = builtin_registry();
@@ -466,39 +507,30 @@ async fn work_proposals_preserve_contracts_coerce_defaults_and_recover() {
 }
 
 #[tokio::test]
-async fn task_holds_coerce_defaults_block_claim_and_resume_unblocks() {
+async fn task_holds_preserve_deleted_root_holds_block_claim_and_resume_unblocks() {
     let (f, c) = new_source();
     c.execute_batch(&format!(
         "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (20, 'Held task', 'open', '{T0}', '{T0}');
          INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at, released_by, released_at) VALUES
-           (1, 20, 'pause', NULL, NULL, NULL, 'operator', '{T0}', NULL, NULL),
+           (1, 20, 'pause', 'active', 'hold-one', 'manual', 'operator', '{T0}', NULL, NULL),
            (2, 20, 'pause', 'released', 'past', 'manual', 'operator', '{T_OLD}', 'operator', '{T_OLD}'),
-           (3, 999, 'pause', 'active', 'orphan hold', 'manual', 'operator', '{T0}', NULL, NULL);
+           (3, 999, 'pause', 'released', 'deleted root outlives task', 'manual', 'operator', '{T_OLD}', 'operator', '{T_OLD}');
          INSERT INTO task_hold_members (hold_id, task_id, status_at_hold, cancel_requested_by_hold) VALUES
-           (1, 20, 'open', NULL),
-           (1, 999, 'open', 0);"
+           (1, 20, 'open', 0),
+           (1, 999, 'open', 0),
+           (3, 20, 'open', 0);"
     ))
     .unwrap();
     drop(c);
 
     let db = target();
     let r = ua_import::import(&db, &f.path, &opts()).unwrap();
-    assert_eq!(table(&r, "task_holds").copied, 2);
-    assert_eq!(table(&r, "task_holds").skipped.get("missing_root_task_id"), Some(&1));
-    assert_eq!(table(&r, "task_hold_members").copied, 1);
+    // Hold 3 (root_task_id=999, deleted task) IS preserved alongside holds 1 & 2,
+    // and its member pointing to existing task 20 IS kept while member (1, 999) is skipped.
+    assert_eq!(table(&r, "task_holds").copied, 3);
+    assert!(table(&r, "task_holds").skipped.is_empty(), "{:?}", table(&r, "task_holds").skipped);
+    assert_eq!(table(&r, "task_hold_members").copied, 2);
     assert_eq!(table(&r, "task_hold_members").skipped.get("missing_task_id"), Some(&1));
-
-    let coerced: (String, String, String, i64) = db
-        .read(|conn| {
-            Ok(conn.query_row(
-                "SELECT h.status, h.reason, h.release_policy, m.cancel_requested_by_hold \
-                 FROM task_holds h JOIN task_hold_members m ON m.hold_id = h.id WHERE h.id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?)
-        })
-        .unwrap();
-    assert_eq!(coerced, ("active".into(), "".into(), "manual".into(), 0));
 
     let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
     let reg = builtin_registry();
@@ -525,22 +557,72 @@ async fn task_holds_coerce_defaults_block_claim_and_resume_unblocks() {
 }
 
 #[test]
-fn task_holds_duplicate_active_root_refuses_before_writing() {
-    // 1. Intra-source duplicate active holds.
+fn task_holds_null_status_skipped_and_never_coerced_to_active() {
+    let nullable_hold_schema = "
+CREATE TABLE task_holds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  root_task_id INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  status TEXT,
+  reason TEXT NOT NULL DEFAULT '',
+  release_policy TEXT NOT NULL DEFAULT 'manual',
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE event_log (
+  ulid TEXT PRIMARY KEY,
+  channel TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  originator TEXT,
+  episode_id TEXT,
+  causal_parent_id TEXT,
+  created_at TEXT NOT NULL,
+  dedupe_key TEXT,
+  prev_hash TEXT,
+  entry_hash TEXT
+);";
+    let (f, c) = new_source_with_schema(nullable_hold_schema);
+    c.execute_batch(&format!(
+        "INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at) VALUES
+           (1, 20, 'pause', NULL, 'null status 1', 'manual', 'operator', '{T0}'),
+           (2, 20, 'pause', NULL, 'null status 2', 'manual', 'operator', '{T0}'),
+           (3, 20, 'pause', 'unknown', 'bad status', 'manual', 'operator', '{T0}');"
+    ))
+    .unwrap();
+    drop(c);
+
+    let dry = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(table(&dry, "task_holds").copied, 0);
+    assert_eq!(table(&dry, "task_holds").skipped.get("invalid_status"), Some(&3));
+
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(table(&r, "task_holds").copied, 0);
+    assert_eq!(table(&r, "task_holds").skipped.get("invalid_status"), Some(&3));
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_holds"), 0);
+}
+
+#[test]
+fn task_holds_duplicate_active_root_across_orgs_and_target_refuse_before_writing() {
+    // 1. Same root_task_id with distinct org_ids under real idx_task_holds_active_root:
+    // both dry_run and import(--drop-org-scope) refuse before writing.
     let (f1, c1) = new_source();
     c1.execute_batch(&format!(
         "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (20, 'T', 'open', '{T0}', '{T0}');
-         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at) VALUES
-           (1, 20, 'pause', 'active', 'first', 'manual', 'operator', '{T0}'),
-           (2, 20, 'pause', NULL, 'second', 'manual', 'operator', '{T0}');"
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at, org_id) VALUES
+           (1, 20, 'pause', 'active', 'org-a hold', 'manual', 'operator', '{T0}', 'org-a'),
+           (2, 20, 'pause', 'active', 'org-b hold', 'manual', 'operator', '{T0}', 'org-b');"
     ))
     .unwrap();
     drop(c1);
 
+    let dry_err = ua_import::dry_run(&f1.path).unwrap_err();
+    assert!(format!("{dry_err:#}").contains("active holds"), "{dry_err:#}");
+
     let db1 = target();
     let err1 = ua_import::import(&db1, &f1.path, &opts()).unwrap_err();
     let msg1 = format!("{err1:#}");
-    assert!(msg1.contains("multiple") || msg1.contains("active holds"), "{msg1}");
+    assert!(msg1.contains("active holds") && msg1.contains("nothing was written"), "{msg1}");
     assert_eq!(n(&db1, "SELECT COUNT(*) FROM tasks"), 0);
     assert_eq!(n(&db1, "SELECT COUNT(*) FROM task_holds"), 0);
 
@@ -572,31 +654,46 @@ fn task_holds_duplicate_active_root_refuses_before_writing() {
 }
 
 #[tokio::test]
-async fn project_repo_bindings_normalize_validate_branch_and_refuse_overlaps() {
+async fn project_repo_bindings_normalize_clear_bad_branch_and_refuse_overlaps() {
+    let port_url = "https://github.com:8443/Example/Port-Repo.git";
     let (f, c) = new_source();
     c.execute_batch(&format!(
         "INSERT INTO project_repo_bindings (project, repo, default_branch, bound_by, bound_at) VALUES
            (' alpha-proj ', 'https://github.com/Example/Alpha-Repo.git', ' main ', 'operator', '{T0}'),
            ('beta-proj', 'git@github.com:Example/Beta-Repo.git', '', 'operator', '{T0}'),
            ('gamma-proj', 'ssh://git@github.com/Example/Gamma.git', NULL, 'operator', '{T0}'),
+           ('port-proj', '{port_url}', '--orphan', 'operator', '{T0}'),
            ('bad-host', 'https://gitlab.example.com/owner/repo.git', NULL, 'operator', '{T0}'),
-           ('bad-branch', 'owner/repo', '--orphan', 'operator', '{T0}'),
+           ('bad-creds', 'https://user:pw@github.com/owner/repo.git', NULL, 'operator', '{T0}'),
            ('-bad-slug', 'owner/repo', NULL, 'operator', '{T0}');"
     ))
     .unwrap();
     drop(c);
 
+    // Parity check with ua_tools::families::governance::normalize_repo on ports and credentials.
+    assert_eq!(tools_normalize_repo(port_url).unwrap(), "example/port-repo");
+    assert!(tools_normalize_repo("https://user:pw@github.com/owner/repo.git").is_err());
+
     let dry = ua_import::dry_run(&f.path).unwrap();
     let b_dry = table(&dry, "project_repo_bindings");
-    assert_eq!(b_dry.copied, 3);
-    assert_eq!(b_dry.skipped.get("invalid_repo"), Some(&1));
-    assert_eq!(b_dry.skipped.get("invalid_default_branch"), Some(&1));
+    assert_eq!(b_dry.copied, 4);
+    assert_eq!(b_dry.skipped.get("invalid_repo"), Some(&2));
     assert_eq!(b_dry.skipped.get("invalid_project"), Some(&1));
+    assert_eq!(b_dry.skipped.get("invalid_default_branch"), None);
+    assert_eq!(dry.binding_branches_cleared, 1);
+    assert!(
+        dry.notes
+            .iter()
+            .any(|note| note.contains("1 project_repo_bindings row(s) had an invalid default_branch cleared")),
+        "{:?}",
+        dry.notes
+    );
 
     let db = target();
     let r = ua_import::import(&db, &f.path, &opts()).unwrap();
-    assert_eq!(table(&r, "project_repo_bindings").copied, 3);
-    assert_eq!(n(&db, "SELECT COUNT(*) FROM project_repo_bindings"), 3);
+    assert_eq!(table(&r, "project_repo_bindings").copied, 4);
+    assert_eq!(r.binding_branches_cleared, 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM project_repo_bindings"), 4);
 
     let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
     let reg = builtin_registry();
@@ -626,22 +723,24 @@ async fn project_repo_bindings_normalize_validate_branch_and_refuse_overlaps() {
     assert_eq!(beta["binding"]["repo"], json!("example/beta-repo"), "{beta}");
     assert_eq!(beta["binding"]["default_branch"], Value::Null, "{beta}");
 
-    let gamma = reg
+    let port = reg
         .call(
             &hub,
             &dev,
             "coordination_manage",
-            json!({ "action": "project_repo_get", "params": { "project": "gamma-proj" } }),
+            json!({ "action": "project_repo_get", "params": { "project": "port-proj" } }),
         )
         .await
         .unwrap();
-    assert_eq!(gamma["binding"]["repo"], json!("example/gamma"), "{gamma}");
+    assert_eq!(port["binding"]["repo"], json!("example/port-repo"), "{port}");
+    assert_eq!(port["binding"]["default_branch"], Value::Null, "{port}");
 
     // Idempotent rerun copies 0 rows.
     let rerun = ua_import::import(&db, &f.path, &opts()).unwrap();
     assert!(rerun.tables.iter().all(|t| t.copied == 0), "{:?}", rerun.tables);
+    assert_eq!(rerun.binding_branches_cleared, 0);
 
-    // Intra-source duplicate trimmed project slug refuses before writing.
+    // Intra-source duplicate trimmed project slug refuses in both dry_run and import before writing.
     let (f_dup, c_dup) = new_source();
     c_dup
         .execute_batch(&format!(
@@ -652,6 +751,8 @@ async fn project_repo_bindings_normalize_validate_branch_and_refuse_overlaps() {
         ))
         .unwrap();
     drop(c_dup);
+    let err_dup_dry = ua_import::dry_run(&f_dup.path).unwrap_err();
+    assert!(format!("{err_dup_dry:#}").contains("duplicate project slug"));
     let db_dup = target();
     let err_dup = ua_import::import(&db_dup, &f_dup.path, &opts()).unwrap_err();
     assert!(format!("{err_dup:#}").contains("duplicate project slug"));
@@ -683,4 +784,68 @@ async fn project_repo_bindings_normalize_validate_branch_and_refuse_overlaps() {
     assert!(msg_hit.contains("already holds a row"), "{msg_hit}");
     assert_eq!(n(&db_hit, "SELECT COUNT(*) FROM tasks"), 0);
     assert_eq!(n(&db_hit, "SELECT COUNT(*) FROM project_repo_bindings"), 1);
+}
+
+#[test]
+fn p0_tables_resume_across_small_batches_without_false_refusals() {
+    let (f, c) = new_source();
+    c.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES
+           (1, 'T1', 'open', '{T0}', '{T0}'),
+           (2, 'T2', 'open', '{T0}', '{T0}');
+         INSERT INTO work_proposals (id, title, proposer, status, reporting_mode, created_at, updated_at) VALUES
+           ('wp_a', 'Prop A', 'agent-1', 'pending', 'final_only', '{T0}', '{T0}'),
+           ('wp_b', 'Prop B', 'agent-1', 'pending', 'final_only', '{T0}', '{T0}');
+         INSERT INTO work_proposal_items (proposal_id, idx, title, filed_digest, contract_digest) VALUES
+           ('wp_a', 0, 'Item A0', 'f1', 'c1'),
+           ('wp_b', 0, 'Item B0', 'f2', 'c2');
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at) VALUES
+           (1, 1, 'pause', 'active', 'hold 1', 'manual', 'operator', '{T0}'),
+           (2, 2, 'pause', 'released', 'hold 2', 'manual', 'operator', '{T0}');
+         INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) VALUES
+           (1, 1, 'open'),
+           (2, 2, 'open');
+         INSERT INTO project_repo_bindings (project, repo, bound_by, bound_at) VALUES
+           ('proj-a', 'owner/a', 'operator', '{T0}'),
+           ('proj-b', 'owner/b', 'operator', '{T0}');"
+    ))
+    .unwrap();
+
+    let db = target();
+    let small = Options { batch_size: 1, drop_org_scope: true };
+    let first = ua_import::import(&db, &f.path, &small).unwrap();
+    for tbl in
+        ["work_proposals", "work_proposal_items", "task_holds", "task_hold_members", "project_repo_bindings"]
+    {
+        assert_eq!(table(&first, tbl).copied, 2, "{tbl}");
+    }
+
+    // Append new rows to the source after initial commit; resume must pick up only new rows
+    // and must NOT falsely refuse on already-imported active holds or bindings.
+    c.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES (3, 'T3', 'open', '{T0}', '{T0}');
+         INSERT INTO work_proposals (id, title, proposer, status, reporting_mode, created_at, updated_at) VALUES
+           ('wp_c', 'Prop C', 'agent-1', 'pending', 'final_only', '{T0}', '{T0}');
+         INSERT INTO work_proposal_items (proposal_id, idx, title, filed_digest, contract_digest) VALUES
+           ('wp_c', 0, 'Item C0', 'f3', 'c3');
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at) VALUES
+           (3, 3, 'pause', 'active', 'hold 3', 'manual', 'operator', '{T0}');
+         INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) VALUES
+           (3, 3, 'open');
+         INSERT INTO project_repo_bindings (project, repo, bound_by, bound_at) VALUES
+           ('proj-c', 'owner/c', 'operator', '{T0}');"
+    ))
+    .unwrap();
+    drop(c);
+
+    let resumed = ua_import::import(&db, &f.path, &small).unwrap();
+    for tbl in
+        ["work_proposals", "work_proposal_items", "task_holds", "task_hold_members", "project_repo_bindings"]
+    {
+        let rep = table(&resumed, tbl);
+        assert_eq!(rep.already_imported, 2, "{tbl}");
+        assert_eq!(rep.copied, 1, "{tbl}");
+        assert_eq!(rep.total_copied, 3, "{tbl}");
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {tbl}")), 3, "{tbl}");
+    }
 }

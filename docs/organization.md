@@ -68,12 +68,13 @@ instead.
 in `ua-tools/tests/tasks.rs`), because its parameter structs deny unknown
 fields. That stays: the organization never comes from tool arguments.
 
-`ua-import` refuses source rows that carry an `org_id` only when `org_id` is an
-**unmapped** column (`ua-import/src/lib.rs`); `--drop-org-scope` overrides and
-records that boundaries were dropped. Where a target table already has an
-`org_id` column (today `harness_config_bundles`), the source value is copied
-silently. See [The importer](#the-importer) for why that must change in the
-same change that adds the columns.
+`ua-import` never copies `org_id` as a column on any table (including
+`harness_config_bundles`, `work_proposals`, `work_proposal_items`, `task_holds`,
+and `project_repo_bindings`): any non-NULL `org_id` rows are reported in
+`org_scoped_rows` and refused unless `--drop-org-scope` is passed (which drops
+the tenant boundary and leaves target `org_id` NULL on tables that carry the
+column). See [The importer](#the-importer) for the multi-tenant import design when org
+columns are introduced.
 
 ## The model
 

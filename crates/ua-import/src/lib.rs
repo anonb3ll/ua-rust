@@ -24,7 +24,10 @@
 //! ULIDs, `prev_hash` and `entry_hash`. The whole source chain is verified
 //! before anything is written; a row that does not verify, or cannot be stored
 //! byte-exactly (a non-text value in a hashed column), stops the import with an
-//! error instead of rewriting history. The target chain is verified after.
+//! error instead of rewriting history. The target chain is verified after;
+//! because batches commit as they go, take a target snapshot first when
+//! importing into a non-empty database (a failed post-import verification leaves
+//! imported rows in place without rollback).
 //!
 //! Runs are idempotent and resumable: `import_runs` records, per source (a
 //! SHA-256 of its canonical path) and table, the rows copied and skipped and
@@ -47,6 +50,8 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::ledger::{self, GENESIS_HASH, VerifyReport};
 use ua_store::{Db, SchemaPart};
+use ua_tools::families::governance::{check_default_branch, normalize_repo};
+use ua_tools::families::tasks::check_slug;
 
 use map::{Kind, LEDGER_COLUMNS, MAPS, Ref, TableMap};
 
@@ -111,6 +116,9 @@ pub struct SourceLedgerReport {
     pub reason: Option<String>,
 }
 
+/// Maximum task IDs listed in [`Report::task_runs_cleared_ids`].
+pub const MAX_REPORTED_TASK_RUN_IDS: usize = 50;
+
 /// What a run did, or (dry run) would do.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -130,6 +138,15 @@ pub struct Report {
     /// Rows per table whose source `org_id` is non-NULL. ua-rust has no tenant
     /// scope: a real import refuses unless `drop_org_scope` is set.
     pub org_scoped_rows: BTreeMap<String, u64>,
+    /// Tasks whose `current_run_id` or `current_run_agent` was cleared
+    /// because `dispatch_runs` are not imported.
+    pub task_runs_cleared: u64,
+    /// Sample of task IDs (capped at [`MAX_REPORTED_TASK_RUN_IDS`]) whose run
+    /// pointers were cleared.
+    pub task_runs_cleared_ids: Vec<i64>,
+    /// `project_repo_bindings` rows whose invalid `default_branch` was
+    /// cleared to `NULL` rather than dropping the binding.
+    pub binding_branches_cleared: u64,
     /// Verification of the target chain after the import (not in a dry run).
     pub target_ledger: Option<VerifyReport>,
     pub notes: Vec<String>,
@@ -154,14 +171,24 @@ pub fn source_hash(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(Sha256::digest(canon.to_string_lossy().as_bytes())))
 }
 
-/// Report counts, unmapped tables and columns and the source chain's
-/// verification without writing anything anywhere.
+/// Report counts, unmapped tables and columns, source-only conflict checks
+/// and the source chain's verification without writing anything anywhere.
 pub fn dry_run(source: &Path) -> anyhow::Result<Report> {
     let src = open_source(source)?;
     src.execute_batch("BEGIN")?;
     // An empty in-memory ua-rust database describes the target columns.
     let shape = Db::open_in_memory(&schema_parts())?;
     let mut report = survey(&src, &shape, source_hash(source)?, true)?;
+    for map in MAPS {
+        if !report.tables.iter().any(|t| t.table == map.source && t.present) {
+            continue;
+        }
+        match map.kind {
+            Kind::TaskHolds => check_source_active_holds(&src, 0)?,
+            Kind::ProjectRepoBindings => check_source_bindings_overlap(&src, &shape, map, 0)?,
+            _ => {}
+        }
+    }
     for map in MAPS {
         if map.kind == Kind::Ledger {
             continue;
@@ -176,15 +203,40 @@ pub fn dry_run(source: &Path) -> anyhow::Result<Report> {
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let vals = row_values(r, 0, plan.cols.len())?;
-            match filter(map.kind, &plan.cols, &vals) {
-                Some(reason) => *rep.skipped.entry(reason.into()).or_default() += 1,
-                None => rep.copied += 1,
+            if let Some(reason) = filter(map.kind, &plan.cols, &vals) {
+                *rep.skipped.entry(reason.into()).or_default() += 1;
+                continue;
+            }
+            rep.copied += 1;
+            match map.kind {
+                Kind::Tasks => {
+                    let has_run = col_value(&plan.cols, &vals, "current_run_id")
+                        .is_some_and(|v| *v != SqlValue::Null)
+                        || col_value(&plan.cols, &vals, "current_run_agent")
+                            .is_some_and(|v| *v != SqlValue::Null);
+                    if has_run {
+                        record_cleared_task_run(
+                            &mut report.task_runs_cleared,
+                            &mut report.task_runs_cleared_ids,
+                            col_value(&plan.cols, &vals, "id"),
+                        );
+                    }
+                }
+                Kind::ProjectRepoBindings => {
+                    if let Some(v) = col_value(&plan.cols, &vals, "default_branch")
+                        && matches!(normalize_binding_branch(v), BranchNorm::ClearedInvalid)
+                    {
+                        report.binding_branches_cleared += 1;
+                    }
+                }
+                _ => {}
             }
         }
     }
     if let Some(rep) = report.tables.iter_mut().find(|t| t.table == "event_log") {
         rep.copied = if report.source_ledger.ok { rep.source_rows } else { 0 };
     }
+    append_clear_notes(&mut report);
     report.notes.push("dry run: nothing was written; missing references are counted on a real run".into());
     src.execute_batch("COMMIT")?;
     Ok(report)
@@ -210,7 +262,9 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
         report.notes.push("org_id dropped (--drop-org-scope): tenant boundaries are not kept".into());
     }
     let mut copied_any = false;
-    let mut stale_runs_cleared = 0u64;
+    let mut cleared_runs = 0u64;
+    let mut cleared_run_ids = Vec::new();
+    let mut cleared_branches = 0u64;
     for map in MAPS {
         let idx = report
             .tables
@@ -225,7 +279,14 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             copy_ledger(&src, db, &hash, batch, rep)?;
         } else {
             let plan = plan_table(&src, db, map)?;
-            stale_runs_cleared += copy_table(&src, db, &hash, &plan, batch, rep)?;
+            let eff = copy_table(&src, db, &hash, &plan, batch, rep)?;
+            cleared_runs += eff.task_runs_cleared;
+            for id in eff.task_runs_cleared_ids {
+                if cleared_run_ids.len() < MAX_REPORTED_TASK_RUN_IDS {
+                    cleared_run_ids.push(id);
+                }
+            }
+            cleared_branches += eff.binding_branches_cleared;
             if let Some(sr) = map.self_ref {
                 fix_self_ref(&src, db, map, sr)?;
             }
@@ -234,11 +295,10 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
     }
     src.execute_batch("COMMIT")?;
 
-    if stale_runs_cleared > 0 {
-        report.notes.push(format!(
-            "{stale_runs_cleared} task(s) had stale current_run_id/current_run_agent cleared (missing from dispatch_runs)"
-        ));
-    }
+    report.task_runs_cleared = cleared_runs;
+    report.task_runs_cleared_ids = cleared_run_ids;
+    report.binding_branches_cleared = cleared_branches;
+    append_clear_notes(&mut report);
 
     let parked = translate_parked(db)?;
     if parked > 0 {
@@ -422,6 +482,9 @@ fn survey(src: &Connection, target: &Db, source_hash: String, dry_run: bool) -> 
         unmapped_columns,
         source_ledger,
         org_scoped_rows,
+        task_runs_cleared: 0,
+        task_runs_cleared_ids: Vec::new(),
+        binding_branches_cleared: 0,
         target_ledger: None,
         notes: Vec::new(),
     })
@@ -523,102 +586,62 @@ fn as_text(v: Option<&SqlValue>) -> Option<&str> {
     }
 }
 
-const ALLOWED_REPO_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
-
-fn valid_ident_chars(v: &str, max_len: usize) -> bool {
-    !v.is_empty()
-        && v.len() <= max_len
-        && v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+enum BranchNorm {
+    Keep(SqlValue),
+    ClearedInvalid,
 }
 
-fn valid_slug(value: &str) -> Option<String> {
-    let v = value.trim();
-    valid_ident_chars(v, 64).then(|| v.to_string())
-}
-
-fn valid_branch(value: &str) -> bool {
-    let b = value.trim();
-    b.is_empty() || (b.len() <= 200 && !b.starts_with('-') && !b.chars().any(char::is_whitespace))
-}
-
-fn normalize_repo(raw: &str) -> Option<String> {
-    let text = raw.trim();
-    if text.is_empty() || text.chars().any(char::is_whitespace) || text.contains('\\') {
-        return None;
+fn normalize_binding_branch(v: &SqlValue) -> BranchNorm {
+    match v {
+        SqlValue::Null => BranchNorm::Keep(SqlValue::Null),
+        SqlValue::Text(s) => match check_default_branch(Some(s)) {
+            Ok(Some(b)) => BranchNorm::Keep(SqlValue::Text(b)),
+            Ok(None) => BranchNorm::Keep(SqlValue::Null),
+            Err(_) => BranchNorm::ClearedInvalid,
+        },
+        _ => BranchNorm::ClearedInvalid,
     }
-    let (host, path): (&str, &str) = if text.starts_with("ssh://") || text.contains("://") {
-        let (scheme, after) = text.split_once("://")?;
-        let scheme_lc = scheme.to_ascii_lowercase();
-        if !matches!(scheme_lc.as_str(), "ssh" | "https" | "http") {
-            return None;
-        }
-        let (authority, path) = after.split_once('/')?;
-        let host_port = match authority.rsplit_once('@') {
-            Some((user, hp)) => {
-                if scheme_lc != "ssh" || (!user.is_empty() && user != "git") {
-                    return None;
-                }
-                hp
-            }
-            None => authority,
-        };
-        let host = match host_port.split_once(':') {
-            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-            Some(_) => return None,
-            None => host_port,
-        };
-        if path.contains('?') || path.contains('#') {
-            return None;
-        }
-        (host, path)
-    } else if let Some(rest) = text.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        if host.contains('/') {
-            return None;
-        }
-        (host, path)
-    } else if let Some((first, rest)) = text.split_once('/') {
-        if first.contains('@') {
-            return None;
-        }
-        if ALLOWED_REPO_HOSTS.contains(&first.to_ascii_lowercase().trim_end_matches('.')) {
-            (first, rest)
+}
+
+fn record_cleared_task_run(count: &mut u64, ids: &mut Vec<i64>, id_val: Option<&SqlValue>) {
+    *count += 1;
+    if ids.len() < MAX_REPORTED_TASK_RUN_IDS
+        && let Some(SqlValue::Integer(tid)) = id_val
+    {
+        ids.push(*tid);
+    }
+}
+
+fn append_clear_notes(report: &mut Report) {
+    if report.task_runs_cleared > 0 {
+        let n = report.task_runs_cleared;
+        let ids: Vec<String> = report.task_runs_cleared_ids.iter().map(|id| format!("#{id}")).collect();
+        let note = if (n as usize) > ids.len() && !ids.is_empty() {
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported (first {} of {n} task ids: {})",
+                ids.len(),
+                ids.join(", ")
+            )
+        } else if !ids.is_empty() {
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported (task ids: {})",
+                ids.join(", ")
+            )
         } else {
-            ("github.com", text)
-        }
-    } else {
-        return None;
-    };
-    let host_lc = host.to_ascii_lowercase();
-    if !ALLOWED_REPO_HOSTS.contains(&host_lc.trim_end_matches('.')) {
-        return None;
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported"
+            )
+        };
+        report.notes.push(note);
     }
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut parts = path.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-        return None;
-    };
-    if !valid_ident_chars(owner, 100) || !valid_ident_chars(name, 100) {
-        return None;
-    }
-    Some(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
-}
-
-fn coerce_null_text(cols: &[String], vals: &mut [SqlValue], col: &str, default: &str) {
-    if let Some(i) = cols.iter().position(|c| c == col)
-        && vals[i] == SqlValue::Null
-    {
-        vals[i] = SqlValue::Text(default.to_string());
-    }
-}
-
-fn coerce_null_int(cols: &[String], vals: &mut [SqlValue], col: &str, default: i64) {
-    if let Some(i) = cols.iter().position(|c| c == col)
-        && vals[i] == SqlValue::Null
-    {
-        vals[i] = SqlValue::Integer(default);
+    if report.binding_branches_cleared > 0 {
+        report.notes.push(format!(
+            "{} project_repo_bindings row(s) had an invalid default_branch cleared to NULL",
+            report.binding_branches_cleared
+        ));
     }
 }
 
@@ -637,15 +660,16 @@ fn filter(kind: Kind, cols: &[String], vals: &[SqlValue]) -> Option<&'static str
             let hex64 = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
             if algo == Some("sha256") && hex64 { None } else { Some("unsupported_token_hash") }
         }
+        Kind::TaskHolds => match as_text(col_value(cols, vals, "status")) {
+            Some("active") | Some("released") => None,
+            _ => Some("invalid_status"),
+        },
         Kind::ProjectRepoBindings => {
-            if as_text(col_value(cols, vals, "project")).and_then(valid_slug).is_none() {
-                Some("invalid_project")
-            } else if as_text(col_value(cols, vals, "repo")).and_then(normalize_repo).is_none() {
-                Some("invalid_repo")
-            } else if col_value(cols, vals, "default_branch")
-                .is_some_and(|v| *v != SqlValue::Null && as_text(Some(v)).is_none_or(|b| !valid_branch(b)))
+            if as_text(col_value(cols, vals, "project")).and_then(|s| check_slug("project", s).ok()).is_none()
             {
-                Some("invalid_default_branch")
+                Some("invalid_project")
+            } else if as_text(col_value(cols, vals, "repo")).and_then(|r| normalize_repo(r).ok()).is_none() {
+                Some("invalid_repo")
             } else {
                 None
             }
@@ -699,17 +723,12 @@ fn check_target(src: &Connection, db: &Db, report: &Report, opts: &Options) -> a
 
 fn check_source_active_holds(src: &Connection, last: i64) -> anyhow::Result<()> {
     let cols = columns(src, "task_holds")?;
-    if !cols.iter().any(|c| c == "root_task_id") {
+    if !cols.iter().any(|c| c == "root_task_id") || !cols.iter().any(|c| c == "status") {
         return Ok(());
     }
-    let sql = if cols.iter().any(|c| c == "status") {
-        "SELECT root_task_id, COUNT(*) FROM task_holds \
-         WHERE rowid > ?1 AND root_task_id IS NOT NULL AND COALESCE(status, 'active') = 'active' \
-         GROUP BY root_task_id HAVING COUNT(*) > 1 LIMIT 1"
-    } else {
-        "SELECT root_task_id, COUNT(*) FROM task_holds \
-         WHERE rowid > ?1 AND root_task_id IS NOT NULL GROUP BY root_task_id HAVING COUNT(*) > 1 LIMIT 1"
-    };
+    let sql = "SELECT root_task_id, COUNT(*) FROM task_holds \
+               WHERE rowid > ?1 AND root_task_id IS NOT NULL AND status = 'active' \
+               GROUP BY root_task_id HAVING COUNT(*) > 1 LIMIT 1";
     if let Some((root_id, n)) =
         src.query_row(sql, [last], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).optional()?
     {
@@ -736,7 +755,8 @@ fn check_source_bindings_overlap(src: &Connection, db: &Db, map: &TableMap, last
         if filter(map.kind, &plan.cols, &vals).is_some() {
             continue;
         }
-        if let Some(slug) = as_text(col_value(&plan.cols, &vals, "project")).and_then(valid_slug)
+        if let Some(slug) =
+            as_text(col_value(&plan.cols, &vals, "project")).and_then(|s| check_slug("project", s).ok())
             && !seen.insert(slug.clone())
         {
             bail!(
@@ -844,7 +864,8 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                             let raw = col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null);
                             if map.kind == Kind::ProjectRepoBindings
                                 && k == "project"
-                                && let Some(norm) = as_text(Some(&raw)).and_then(valid_slug)
+                                && let Some(norm) =
+                                    as_text(Some(&raw)).and_then(|s| check_slug("project", s).ok())
                             {
                                 return SqlValue::Text(norm);
                             }
@@ -862,8 +883,8 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                 }
             }
             if let Some(probe) = active_hold_probe.as_mut() {
-                let eff_status = as_text(col_value(&plan.cols, &vals, "status")).unwrap_or("active");
-                if eff_status == "active"
+                let eff_status = as_text(col_value(&plan.cols, &vals, "status"));
+                if eff_status == Some("active")
                     && let Some(root_val) = col_value(&plan.cols, &vals, "root_task_id")
                     && *root_val != SqlValue::Null
                     && probe.exists([root_val])?
@@ -891,6 +912,13 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
     Ok(())
 }
 
+#[derive(Default)]
+struct CopyEffects {
+    task_runs_cleared: u64,
+    task_runs_cleared_ids: Vec<i64>,
+    binding_branches_cleared: u64,
+}
+
 fn copy_table(
     src: &Connection,
     db: &Db,
@@ -898,7 +926,7 @@ fn copy_table(
     plan: &Plan<'_>,
     batch: usize,
     rep: &mut TableReport,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<CopyEffects> {
     let map = plan.map;
     let select = format!(
         "SELECT rowid, {} FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
@@ -910,13 +938,14 @@ fn copy_table(
         format!("INSERT INTO {} ({}) VALUES ({marks})", q(map.target), select_list(&plan.insert_cols));
     let seq_idx = plan.insert_cols.iter().position(|c| c == "event_seq");
     let ulid_idx = plan.insert_cols.iter().position(|c| c == "event_ulid");
+    let id_idx = plan.cols.iter().position(|c| c == "id");
     let run_id_idx = plan.cols.iter().position(|c| c == "current_run_id");
     let run_agent_idx = plan.cols.iter().position(|c| c == "current_run_agent");
     let proj_idx = plan.cols.iter().position(|c| c == "project");
     let repo_idx = plan.cols.iter().position(|c| c == "repo");
     let branch_idx = plan.cols.iter().position(|c| c == "default_branch");
     let mut last_key = rep.last_key;
-    let mut stale_runs_cleared = 0u64;
+    let mut effects = CopyEffects::default();
     loop {
         let rows: Vec<(i64, Vec<SqlValue>)> = {
             let mut stmt = src.prepare_cached(&select)?;
@@ -926,13 +955,15 @@ fn copy_table(
             rows.collect::<Result<_, _>>()?
         };
         let Some(&(batch_last, _)) = rows.last() else { break };
-        let (copied, skipped, nulled, batch_stale_cleared) = db
+        let (copied, skipped, nulled, batch_runs_cleared, batch_run_ids, batch_branches_cleared) = db
             .write(|tx| {
                 tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
                 let mut copied = 0u64;
                 let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
                 let mut nulled = 0u64;
-                let mut batch_stale_cleared = 0u64;
+                let mut batch_runs_cleared = 0u64;
+                let mut batch_run_ids = Vec::new();
+                let mut batch_branches_cleared = 0u64;
                 'rows: for (rowid, mut vals) in rows {
                     if let Some(reason) = filter(map.kind, &plan.cols, &vals) {
                         bump(&mut skipped, reason);
@@ -958,19 +989,21 @@ fn copy_table(
                         vals[i] = SqlValue::Null;
                     }
                     if map.kind == Kind::Tasks {
-                        let stale_run = run_id_idx.is_some_and(|ri| vals[ri] != SqlValue::Null)
-                            && !exists(tx, "dispatch_runs", "run_id", &vals[run_id_idx.expect("checked")])?;
-                        let orphan_agent = run_agent_idx.is_some_and(|ai| vals[ai] != SqlValue::Null)
-                            && run_id_idx.is_none_or(|ri| vals[ri] == SqlValue::Null || stale_run);
-                        if stale_run || orphan_agent {
-                            if stale_run && let Some(ri) = run_id_idx {
+                        let has_run = run_id_idx.is_some_and(|ri| vals[ri] != SqlValue::Null)
+                            || run_agent_idx.is_some_and(|ai| vals[ai] != SqlValue::Null);
+                        if has_run {
+                            if let Some(ri) = run_id_idx {
                                 vals[ri] = SqlValue::Null;
                             }
                             if let Some(ai) = run_agent_idx {
                                 vals[ai] = SqlValue::Null;
                             }
-                            nulled += 1;
-                            batch_stale_cleared += 1;
+                            let id_val = id_idx.map(|ii| vals[ii].clone());
+                            record_cleared_task_run(
+                                &mut batch_runs_cleared,
+                                &mut batch_run_ids,
+                                id_val.as_ref(),
+                            );
                         }
                     }
                     if map.kind == Kind::Nodes
@@ -978,46 +1011,27 @@ fn copy_table(
                     {
                         vals[i] = SqlValue::Text("{}".into());
                     }
-                    match map.kind {
-                        Kind::WorkProposals => {
-                            coerce_null_text(&plan.cols, &mut vals, "status", "pending");
-                            coerce_null_text(&plan.cols, &mut vals, "reporting_mode", "final_only");
+                    if map.kind == Kind::ProjectRepoBindings {
+                        if let Some(pi) = proj_idx
+                            && let Some(slug) =
+                                as_text(Some(&vals[pi])).and_then(|s| check_slug("project", s).ok())
+                        {
+                            vals[pi] = SqlValue::Text(slug);
                         }
-                        Kind::WorkProposalItems => {
-                            coerce_null_text(&plan.cols, &mut vals, "notes", "");
-                            coerce_null_text(&plan.cols, &mut vals, "scope_json", "{}");
-                            coerce_null_text(&plan.cols, &mut vals, "priority", "med");
-                            coerce_null_text(&plan.cols, &mut vals, "status", "pending");
-                            coerce_null_int(&plan.cols, &mut vals, "edited", 0);
+                        if let Some(ri) = repo_idx
+                            && let Some(repo) = as_text(Some(&vals[ri])).and_then(|r| normalize_repo(r).ok())
+                        {
+                            vals[ri] = SqlValue::Text(repo);
                         }
-                        Kind::TaskHolds => {
-                            coerce_null_text(&plan.cols, &mut vals, "status", "active");
-                            coerce_null_text(&plan.cols, &mut vals, "reason", "");
-                            coerce_null_text(&plan.cols, &mut vals, "release_policy", "manual");
-                        }
-                        Kind::TaskHoldMembers => {
-                            coerce_null_int(&plan.cols, &mut vals, "cancel_requested_by_hold", 0);
-                        }
-                        Kind::ProjectRepoBindings => {
-                            if let Some(pi) = proj_idx
-                                && let Some(slug) = as_text(Some(&vals[pi])).and_then(valid_slug)
-                            {
-                                vals[pi] = SqlValue::Text(slug);
-                            }
-                            if let Some(ri) = repo_idx
-                                && let Some(repo) = as_text(Some(&vals[ri])).and_then(normalize_repo)
-                            {
-                                vals[ri] = SqlValue::Text(repo);
-                            }
-                            if let Some(bi) = branch_idx {
-                                let trimmed = as_text(Some(&vals[bi]))
-                                    .map(str::trim)
-                                    .filter(|b| !b.is_empty())
-                                    .map(str::to_string);
-                                vals[bi] = trimmed.map_or(SqlValue::Null, SqlValue::Text);
+                        if let Some(bi) = branch_idx {
+                            match normalize_binding_branch(&vals[bi]) {
+                                BranchNorm::Keep(v) => vals[bi] = v,
+                                BranchNorm::ClearedInvalid => {
+                                    vals[bi] = SqlValue::Null;
+                                    batch_branches_cleared += 1;
+                                }
                             }
                         }
-                        _ => {}
                     }
                     if map.rowid_to.is_some() {
                         vals.push(SqlValue::Integer(rowid));
@@ -1050,21 +1064,27 @@ fn copy_table(
                 }
                 let n_skipped: u64 = skipped.values().sum();
                 save_state(tx, source_hash, map.source, batch_last, copied, n_skipped)?;
-                Ok((copied, skipped, nulled, batch_stale_cleared))
+                Ok((copied, skipped, nulled, batch_runs_cleared, batch_run_ids, batch_branches_cleared))
             })
             .with_context(|| format!("importing {}", map.source))?;
         rep.copied += copied;
         rep.total_copied += copied;
         rep.total_skipped += skipped.values().sum::<u64>();
         rep.dangling_refs_nulled += nulled;
-        stale_runs_cleared += batch_stale_cleared;
+        effects.task_runs_cleared += batch_runs_cleared;
+        for id in batch_run_ids {
+            if effects.task_runs_cleared_ids.len() < MAX_REPORTED_TASK_RUN_IDS {
+                effects.task_runs_cleared_ids.push(id);
+            }
+        }
+        effects.binding_branches_cleared += batch_branches_cleared;
         for (k, v) in skipped {
             *rep.skipped.entry(k).or_default() += v;
         }
         last_key = batch_last;
         rep.last_key = batch_last;
     }
-    Ok(stale_runs_cleared)
+    Ok(effects)
 }
 
 /// Restore self-references that pointed forward when their row was copied.
