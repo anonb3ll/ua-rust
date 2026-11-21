@@ -169,8 +169,9 @@ events the same way.
 | `GET /api/evidence/export`, `GET /api/platform/provenance-graph` | `501` |
 | `org_unit`, `org_proposal`, `agent_token` platform objects | not declared |
 
-Work products (submit, named-reviewer approval, release) are not ported
-pending an explicit product decision.
+Work products (submit, named-reviewer approval, release) are not ported as
+they were: they are being redesigned as generic deliverables reviewed through
+task stages ([parity.md](parity.md)).
 Until that decision, `/api/work-products*` answers `501` and the manifest
 lists `work_product` with `served: false`.
 

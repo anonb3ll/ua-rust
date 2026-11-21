@@ -6,11 +6,20 @@ tool surface: shared tasks, plans, delegation, messaging, memory and a
 knowledge vault, behind one identity, policy and approval gate, with a
 tamper-evident event ledger.
 
-ua-rust keeps the tool contract of the original implementation, the Python
-unified-agent hub: the same tool names, argument shapes and HTTP routes, so an
-existing MCP client can point at this process unchanged. That program is a
-separate codebase. Building and running this repository does not require it.
-The storage schema and some of the user interface are new.
+ua-rust is the next version of the Python unified-agent hub, not a copy of it.
+Parity is measured at three levels, set out in [docs/parity.md](docs/parity.md):
+
+- **Contract**: the tool names, argument shapes and HTTP routes a client
+  depends on are kept, so an existing MCP client can point at this process
+  unchanged for the families that are in. A change is deliberate and listed
+  under that family's "Differences from the Python hub".
+- **Capability**: what a person or an agent can get done is the measure. It is
+  reached or exceeded.
+- **Implementation**: how the Python hub does it is not preserved. Duplicated
+  paths are merged, not ported.
+
+That program is a separate codebase. Building and running this repository does
+not require it. The storage schema and some of the user interface are new.
 
 > **Status: alpha.** 214 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
@@ -195,8 +204,9 @@ provenance graph and evidence export (`/api/platform/*` paths other than the
 manifest and objects, and `/api/evidence/export`, answer 501), discovered
 native sessions (`/api/nodes/*` other than `/api/nodes/acceptance`, 501),
 billing and usage ledgers, and tenancy (`org_id`). Work products
-(`/api/work-products*`) are not ported pending an explicit product decision
-and answer 501.
+(`/api/work-products*`) are not ported as they were: they are being redesigned
+as generic deliverables reviewed through task stages
+([docs/parity.md](docs/parity.md)), and the routes answer 501 until then.
 
 ## License
 
