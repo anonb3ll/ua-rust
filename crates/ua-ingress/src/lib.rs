@@ -10,14 +10,17 @@
 //!   ports and addresses it may reach, whether redirects are followed, the
 //!   response body cap and the timeouts.
 //!
-//! Inbound delivery handling (signature checks and duplicate-delivery
-//! tables) moves here in later slices. A ratchet test
+//! - [`inbound`]: the one inbound-delivery table (first sight, duplicates,
+//!   deliveries taken on and never finished), with its schema parts.
+//!
+//! Signature checks for inbound deliveries move here in later slices. A ratchet test
 //! (`tests/ingress_guard.rs`) counts the duplicates that are still outside
 //! the crate; the counts may only go down.
 //!
-//! The crate depends on `ua-core` and third-party crates only.
+//! The crate depends on `ua-core`, `ua-store` and third-party crates only.
 
 pub mod addr;
+pub mod inbound;
 pub mod outbound;
 pub mod policy;
 

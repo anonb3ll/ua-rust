@@ -55,6 +55,11 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(ua_store::org::STORE_PART.into());
     parts.extend(families::schema_parts().into_iter().map(Part::from));
     parts.push(config_revisions::SCHEMA.into());
+    // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
+    // family's delivery rows into it. Both need `organization.v1.store` and
+    // the GitHub parts above.
+    parts.extend(ua_ingress::inbound::schema_parts());
+    parts.push(families::github::INBOUND_COPY.into());
     parts
 }
 

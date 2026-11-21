@@ -23,7 +23,8 @@ here for memory columns, owners and defaults.
   `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
 - `ua_store::org::tenant_part`. It takes the full part name
   (`organization.v1.<crate>`) rather than the owner alone, so the part stays a
-  constant. No table uses it yet.
+  constant. Its first user is `organization.v1.ingress`, for
+  `inbound_deliveries`, a table that carries `org_id` from its first part.
 - `ua_core::DEFAULT_ORG`.
 - The importer exclusion: `org_id` is never mapped by column name.
 - The classification test (`crates/ua-tools/tests/org_classification.rs`,
@@ -1180,7 +1181,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols` | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols`, `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
