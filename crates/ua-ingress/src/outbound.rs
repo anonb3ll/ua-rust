@@ -7,8 +7,9 @@
 //!   `ALL_PROXY` and the system settings are ignored).
 //! - **No redirects** unless the policy allows them. Allowed redirects are
 //!   followed by hand, and each hop is checked against the policy again.
-//!   Headers and the body belong to the origin of the request URL: a hop to
-//!   another origin carries only `accept` and `accept-language`, a 307 or
+//!   Headers and the body belong to the origin of the request URL: once a
+//!   chain leaves it, every later hop (a return included) carries only
+//!   `accept` and `accept-language`, a 307 or
 //!   308 that would resend the body to another origin is refused, and so is
 //!   a hop from https to http unless the policy allows it (none does).
 //! - **A body cap** on every read path of a [`Response`].
@@ -415,17 +416,21 @@ impl Outbound {
     }
 
     /// The hops of one call. Headers and the body belong to the origin of
-    /// the request URL (`home`): a hop there gets them all; a hop to any
-    /// other origin gets only [`CROSS_ORIGIN_HEADERS`] and secret headers
-    /// bound to it (none, as built), and a redirect that would resend the
+    /// the request URL (`home`): a hop there gets them all, but only until
+    /// the chain first leaves it. From the first hop to any other origin on,
+    /// every hop (a return to `home` included) gets only
+    /// [`CROSS_ORIGIN_HEADERS`], so an intermediate origin cannot choose
+    /// which path on `home` receives them. A redirect that would resend the
     /// body to another origin, or move from https to http, is refused.
     async fn send_hops(&self, mut req: Request, deadline: Instant) -> Result<Response, OutboundError> {
         let max = self.policy.max_redirects;
         let home = req.url.origin();
+        let mut left_home = false;
         for hop in 0..=max {
             self.policy.check_url(&req.url)?;
             let origin = req.url.origin();
-            let headers = if origin == home {
+            left_home |= origin != home;
+            let headers = if !left_home {
                 req.headers.clone()
             } else {
                 let mut kept = HeaderMap::new();
@@ -437,7 +442,7 @@ impl Outbound {
                 kept
             };
             let mut rb = self.client.request(req.method.clone(), req.url.clone()).headers(headers);
-            for s in req.secrets.iter().filter(|s| s.origin == origin) {
+            for s in req.secrets.iter().filter(|s| !left_home && s.origin == origin) {
                 rb = rb.header(s.name.clone(), s.value.clone());
             }
             if let Some(b) = &req.body {

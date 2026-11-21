@@ -599,3 +599,41 @@ async fn the_slack_reply_policy_never_follows_a_redirect() {
     assert_eq!(hooks.seen().len(), 1);
     assert!(other.seen().is_empty(), "the Location was not followed");
 }
+
+#[tokio::test]
+async fn a_chain_that_leaves_the_origin_never_brings_credentials_back() {
+    // A sends the client to B; B sends it back to a path of its choosing on
+    // A. Each server learns the other's address once both are listening.
+    let to_b: Arc<Mutex<String>> = Arc::default();
+    let to_a: Arc<Mutex<String>> = Arc::default();
+    let (tb, ta) = (to_b.clone(), to_a.clone());
+    let a = Server::start(move |req| {
+        if req.starts_with("GET /start ") { redirect(302, &tb.lock().unwrap()) } else { ok("chosen") }
+    })
+    .await;
+    let b = Server::start(move |_| redirect(302, &ta.lock().unwrap())).await;
+    *to_b.lock().unwrap() = b.url("/bounce").to_string();
+    *to_a.lock().unwrap() = a.url("/chosen-by-b").to_string();
+
+    let out = Outbound::new(Policy { max_redirects: 3, ..LOCAL }).unwrap();
+    let req = Request::get(a.url("/start"))
+        .header("X-Custom-Auth", "hunter2")
+        .unwrap()
+        .header("Accept", "text/plain")
+        .unwrap()
+        .secret_header("Authorization", "Bearer s3cr3t")
+        .unwrap();
+    let resp = out.send(req).await.unwrap();
+    assert_eq!(resp.url().path(), "/chosen-by-b");
+    assert_eq!(resp.body().await.unwrap().bytes, b"chosen");
+
+    let seen = a.seen();
+    let start = seen.iter().find(|r| r.starts_with("GET /start ")).unwrap().to_ascii_lowercase();
+    assert!(start.contains("x-custom-auth: hunter2") && start.contains("authorization: bearer s3cr3t"));
+    let back = seen.iter().find(|r| r.starts_with("GET /chosen-by-b ")).unwrap().to_ascii_lowercase();
+    assert!(back.contains("accept: text/plain"), "the allow list still travels: {back}");
+    assert!(!back.contains("hunter2") && !back.contains("x-custom-auth"), "{back}");
+    assert!(!back.contains("s3cr3t") && !back.contains("authorization"), "{back}");
+    let at_b = b.seen().join("\n").to_ascii_lowercase();
+    assert!(!at_b.contains("hunter2") && !at_b.contains("s3cr3t"), "{at_b}");
+}

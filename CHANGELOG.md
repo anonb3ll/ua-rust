@@ -36,6 +36,11 @@ from its commit history.
   counts connections dialled by hand, inline address range checks, and
   delivery tables recognised by name marks or columns instead of a fixed
   list. No change for Slack replies, which follow no redirect.
+- `ua-ingress`: once a redirect chain leaves the request's origin, the
+  caller's headers and secret headers are dropped for the rest of the
+  chain, including a hop back to the original origin (only `Accept` and
+  `Accept-Language` travel from then on), so an intermediate origin cannot
+  choose which path on the original origin receives them.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.

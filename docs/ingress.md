@@ -105,8 +105,14 @@ URL it was built for. On each redirect hop:
   is followed.
 - **Headers on a hop to another origin** are `Accept` and
   `Accept-Language` only (and the client's own `User-Agent`). Every other
-  header, plain or secret, whatever its name, is not sent there. A later
-  hop back to the request's own origin carries them again.
+  header, plain or secret, whatever its name, is not sent there.
+- **Once a chain has left the request's origin, it stays stripped.** A
+  later hop back to that origin carries only the same short list: the
+  caller's headers and secret headers are dropped for the rest of the
+  chain. Otherwise the intermediate origin could choose which path on the
+  original origin receives them. The return hop is followed rather than
+  refused, so a round trip through another host still reaches its page;
+  it simply arrives without credentials.
 
 Errors never include the request URL's path or query or any header value.
 `OutboundError` converts into `UaError` (`ssrf_blocked` for an address
