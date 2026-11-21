@@ -24,16 +24,25 @@ pub enum Authority<'a> {
     /// Operator authority: a **verified human**, that is a caller of kind
     /// human, or a verified caller whose label is a configured human identity
     /// (`human_identities`). A label listed only in `lifecycle_operators` is
-    /// not an operator, unless [`OPERATOR_ADMITS_LIFECYCLE`] is set.
+    /// never an operator.
     ///
     /// Replaced by `OrgRole { min: OrgAdmin }` (and `HubOwner` for hub-scoped
     /// rows) once users and memberships exist (`organization.v2`).
     Operator,
     /// A configured lifecycle operator (`lifecycle_operators`, which defaults
-    /// to `human_identities`), verified. It holds only where the design gives
-    /// it: pausing, terminating or retiring an agent, and retiring,
-    /// unretiring and viewing the full facts of a node.
+    /// to `human_identities`), verified. A separate, explicitly named grant,
+    /// **not** operator authority: it never satisfies a requirement for
+    /// [`Authority::Operator`]. It holds at the design's agent and node
+    /// lifecycle sites, and at the fleet-maintenance sites that list it next
+    /// to `Operator` (closing, parking and folding tasks, releasing holds,
+    /// worktree cleanup, handoff recovery, wake handling, workflow records and
+    /// node-queue administration).
     LifecycleOperator,
+    /// An **unverified** caller: the local full-surface model when auth
+    /// enforcement is off (stdio, or HTTP without `enforce_auth`). It is what
+    /// lets such a caller read every mailbox in the messaging tools today.
+    /// Auth enforcement off; behaviour under review.
+    LocalTrustReader,
     /// A caller of kind human: a label in `human_identities` that
     /// authenticated as itself (bearer token, browser session, or a local CLI
     /// `--label` after confirmation).
@@ -90,6 +99,7 @@ impl Authority<'_> {
         match self {
             Authority::Operator => "operator",
             Authority::LifecycleOperator => "lifecycle operator",
+            Authority::LocalTrustReader => "local trust reader",
             Authority::TransitionalHuman => "human",
             Authority::TransitionalOperator { .. } => "operator (transitional)",
             Authority::TransitionalProfileOperator => "dispatch operator",
@@ -100,18 +110,9 @@ impl Authority<'_> {
     }
 }
 
-/// Whether a configured lifecycle operator also holds [`Authority::Operator`].
-/// `false`: operator authority belongs to humans only. Flipping it is the
-/// whole change; the tests run the authority matrix under both values.
-pub const OPERATOR_ADMITS_LIFECYCLE: bool = false;
-
-/// The operator rule as a pure predicate, with whether lifecycle operators
-/// are admitted as a parameter ([`OPERATOR_ADMITS_LIFECYCLE`] chooses it in
-/// [`Authz`]).
-pub fn operator_rule(cfg: &Config, caller: &Caller, admits_lifecycle: bool) -> bool {
-    verified_label(caller).is_some_and(|label| {
-        human(caller) || cfg.is_human(label) || (admits_lifecycle && cfg.is_lifecycle_operator(label))
-    })
+/// The operator rule as a pure predicate: a verified human.
+pub fn operator_rule(cfg: &Config, caller: &Caller) -> bool {
+    verified_label(caller).is_some_and(|label| human(caller) || cfg.is_human(label))
 }
 
 /// The caller's verified label: an authenticated agent or human. Anonymous,
@@ -184,7 +185,8 @@ impl<'a> Authz<'a> {
     fn holds_one(&self, caller: &Caller, a: &Authority<'_>) -> bool {
         let verified = verified_label(caller);
         match *a {
-            Authority::Operator => operator_rule(self.cfg, caller, OPERATOR_ADMITS_LIFECYCLE),
+            Authority::Operator => operator_rule(self.cfg, caller),
+            Authority::LocalTrustReader => verified.is_none(),
             Authority::LifecycleOperator => verified.is_some_and(|l| self.cfg.is_lifecycle_operator(l)),
             Authority::TransitionalHuman => human(caller),
             Authority::TransitionalOperator { who } => {
@@ -250,24 +252,37 @@ mod tests {
         }
     }
 
-    /// The operator rule under both settings of the one constant.
+    /// A lifecycle operator is never an operator, and only a site that
+    /// lists both admits it.
     #[test]
-    fn the_operator_rule_admits_lifecycle_operators_only_when_flipped() {
+    fn lifecycle_operator_is_a_separate_grant_never_an_operator() {
         let cfg = cfg();
+        let authz = Authz::new(&cfg);
         let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Developer);
+        assert!(!operator_rule(&cfg, &fleet));
+        assert!(!authz.holds(&fleet, &[Authority::Operator], DEFAULT_ORG));
+        assert!(authz.holds(&fleet, &[Authority::Operator, Authority::LifecycleOperator], DEFAULT_ORG));
         let human = caller("operator", ActorKind::Human, Profile::Developer);
-        let anon = caller("fleet-bot", ActorKind::Anonymous, Profile::Developer);
-        let dev = caller("builder-1", ActorKind::Agent, Profile::Operator);
-        for admits in [false, true] {
-            assert_eq!(operator_rule(&cfg, &fleet, admits), admits, "lifecycle agent, admits={admits}");
-            assert!(operator_rule(&cfg, &human, admits));
-            assert!(!operator_rule(&cfg, &anon, admits), "never unverified");
-            assert!(!operator_rule(&cfg, &dev, admits), "never by profile");
+        assert!(authz.holds(&human, &[Authority::Operator, Authority::LifecycleOperator], DEFAULT_ORG));
+        // An unverified caller claiming a lifecycle or human label holds neither.
+        for label in ["fleet-bot", "operator"] {
+            let anon = caller(label, ActorKind::Anonymous, Profile::Coordinator);
+            assert!(!authz.holds(&anon, &[Authority::Operator, Authority::LifecycleOperator], DEFAULT_ORG));
         }
-        assert_eq!(
-            operator_rule(&cfg, &fleet, OPERATOR_ADMITS_LIFECYCLE),
-            holds(&fleet, Authority::Operator)
-        );
+    }
+
+    #[test]
+    fn local_trust_reader_is_an_unverified_caller_only() {
+        assert!(holds(
+            &caller("local", ActorKind::Anonymous, Profile::Developer),
+            Authority::LocalTrustReader
+        ));
+        for kind in [ActorKind::Agent, ActorKind::Human, ActorKind::System] {
+            assert!(
+                !holds(&caller("x", kind, Profile::Coordinator), Authority::LocalTrustReader),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
