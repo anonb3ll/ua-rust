@@ -142,6 +142,7 @@ impl Db {
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
         schema::apply(&mut writer, parts)?;
+        crate::ledger::check_hash_form(&writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
             readers.push(open_reader(path)?);
@@ -154,6 +155,7 @@ impl Db {
         let mut writer = Connection::open_in_memory()?;
         writer.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::apply(&mut writer, parts)?;
+        crate::ledger::check_hash_form(&writer)?;
         Ok(Self::from_parts(None, writer, Vec::new()))
     }
 
