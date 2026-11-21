@@ -71,6 +71,11 @@ pub struct Manager {
     pub default_action: Option<&'static str>,
     /// Action-name prefixes the handler refuses wholesale.
     pub refused_prefixes: &'static [&'static str],
+    /// Own actions whose handler always takes its own one-time human
+    /// approval (on values it resolves). Their `tool:action` key takes
+    /// policy rules, but the registry parks no second approval for it: one
+    /// logical call, one approval.
+    pub handler_gated: &'static [&'static str],
     /// Every action the handler accepts, with what it runs.
     pub actions: &'static [(&'static str, Target)],
 }
@@ -85,6 +90,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("create", Standalone("plan_create")),
             ("update", Standalone("plan_update")),
@@ -110,6 +116,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("create", Standalone("delegate")),
             ("list", Standalone("delegate_list")),
@@ -132,6 +139,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("activity", Standalone("agent_activity")),
             ("metrics", Standalone("metrics_snapshot")),
@@ -148,6 +156,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &["node_command_start", "node_item_restart"],
         actions: &[
             ("agent_context", Standalone("agent_context")),
             ("agent_list", Standalone("agent_list")),
@@ -220,6 +229,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("start", Standalone("autonomous_cycle_start")),
             ("get", Standalone("autonomous_cycle_get")),
@@ -242,6 +252,7 @@ pub const MANAGERS: &[Manager] = &[
         ],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("tasks", Standalone("export_tasks")),
             ("memory", Standalone("export_memory")),
@@ -258,6 +269,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: Some("list"),
         refused_prefixes: &[],
+        handler_gated: &["commit", "rollback"],
         actions: &[
             ("list", Own),
             ("diff", Own),
@@ -273,6 +285,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("check", Own),
             ("draft", Own),
@@ -288,8 +301,9 @@ pub const MANAGERS: &[Manager] = &[
         tool: "oauth_device_manage",
         norm: Norm::Trim,
         aliases: &[],
-        default_action: None,
+        default_action: Some("list"),
         refused_prefixes: &[],
+        handler_gated: &["revoke"],
         actions: &[("list", Own), ("revoke", Own)],
     },
     Manager {
@@ -298,6 +312,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: Some("call"),
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[("call", Own), ("list", Own)],
     },
     Manager {
@@ -306,6 +321,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &["source_"],
+        handler_gated: &[],
         actions: &[
             ("publish", Own),
             ("list", Own),
@@ -327,6 +343,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: Some("get"),
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[("get", Own), ("report", Own), ("applied", Own)],
     },
     Manager {
@@ -335,6 +352,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("append", Own),
             ("list", Own),
@@ -351,6 +369,7 @@ pub const MANAGERS: &[Manager] = &[
         aliases: &[],
         default_action: None,
         refused_prefixes: &[],
+        handler_gated: &[],
         actions: &[
             ("add", Own),
             ("list", Own),
@@ -451,6 +470,12 @@ impl Route {
         }
     }
 
+    /// An own action whose handler always takes its own human approval (see
+    /// [`Manager::handler_gated`]).
+    pub fn handler_gated(&self) -> bool {
+        self.target == Own && manager(self.manager).is_some_and(|m| m.handler_gated.contains(&self.action))
+    }
+
     /// The standalone tool whose definition (gate flags, projection) applies.
     pub fn standalone(&self) -> Option<&'static str> {
         match self.target {
@@ -465,6 +490,14 @@ impl Route {
 /// with no default (the handler refuses its arguments). An action the table
 /// does not know is refused here, before anything runs.
 pub fn route(tool: &str, args: &Value) -> Result<Option<Route>, UaError> {
+    if let Some(d) = DOORS.iter().find(|d| d.tool == tool) {
+        return Ok(Some(Route {
+            manager: d.tool,
+            action: d.action,
+            target: Standalone(d.target),
+            args: (d.args)(args),
+        }));
+    }
     let Some(m) = manager(tool) else { return Ok(None) };
     let raw = match args.get("action") {
         None | Some(Value::Null) => match m.default_action {
@@ -490,6 +523,70 @@ pub fn route(tool: &str, args: &Value) -> Result<Option<Route>, UaError> {
     Ok(Some(Route { manager: m.tool, action, target, args }))
 }
 
+/// A standalone tool that is a second door to another tool's operation: it
+/// runs the same creation path on arguments it maps. A call of it passes the
+/// other tool's profile entry, policy rules and approval gate too, on the
+/// mapped arguments, exactly as a consolidated tool's routed action does.
+pub struct Door {
+    pub tool: &'static str,
+    /// The operation's name in messages.
+    pub action: &'static str,
+    /// The tool whose gates apply.
+    pub target: &'static str,
+    /// The door's arguments as the target tool's arguments. The door's
+    /// handler builds its call from the same mapping.
+    pub args: fn(&Value) -> Value,
+}
+
+/// Every door to another tool's operation.
+pub const DOORS: &[Door] =
+    &[Door { tool: "handoff", action: "create", target: "delegate", args: delegation::handoff_as_delegate }];
+
+/// The canonical action of a call of `tool`, as the registry routed it:
+/// each consolidated tool's handler dispatches on this, so the registry's
+/// gates and the handler always agree on which action runs, including the
+/// action of a call that names none.
+pub fn action_of(tool: &str, raw: Option<&str>) -> Result<&'static str, UaError> {
+    let m = manager(tool).ok_or_else(|| UaError::internal(format!("{tool} is not in routes::MANAGERS")))?;
+    let raw = match raw.or(m.default_action) {
+        Some(r) => r,
+        None => return Err(UaError::invalid(format!("{tool}: action is required"))),
+    };
+    m.resolve(raw).map(|(a, _)| a).ok_or_else(|| {
+        UaError::invalid(format!(
+            "{tool}: unknown action {raw:?}; it is one of {}",
+            m.action_names().join(", ")
+        ))
+    })
+}
+
+/// The error of a handler that has no arm for an action the table resolves.
+/// The `routes` tests call every action of every tool and fail on it.
+pub fn unhandled(tool: &str, action: &str) -> UaError {
+    UaError::internal(format!("{tool}: action {action:?} is in routes::MANAGERS but has no handler"))
+}
+
+/// The name an `approval_tools` entry or a plain policy `tool` stands for.
+/// A `tool:action` spelling of an action that has a standalone tool reads as
+/// that tool (`plan_manage:delete` is `plan_delete`), and an alias spelling
+/// of an own action as its canonical key, so the operator's intent holds;
+/// [`check_gate_name`] still flags the spelling. Anything else is as written.
+pub fn canonical_gate_name(entry: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let Some((tool, action)) = entry.split_once(':') else { return Cow::Borrowed(entry) };
+    let Some(m) = manager(tool) else { return Cow::Borrowed(entry) };
+    match m.resolve(action) {
+        Some((_, Standalone(t) | Nested(t))) => Cow::Borrowed(t),
+        Some((a, Own)) if a != action => Cow::Owned(own_key(tool, a)),
+        _ => Cow::Borrowed(entry),
+    }
+}
+
+/// Whether `approval_tools` gates `name` (a tool or a `tool:action` key).
+pub fn listed(cfg: &ua_core::Config, name: &str) -> bool {
+    cfg.approval_tools.iter().any(|t| canonical_gate_name(t) == name)
+}
+
 /// Every `tool:action` gate key (actions with no standalone tool).
 pub fn own_keys() -> impl Iterator<Item = String> {
     MANAGERS
@@ -513,10 +610,13 @@ pub fn check_gate_name(name: &str) -> Result<(), String> {
     let Some(m) = manager(tool) else {
         return Err(format!("{name}: {tool} takes no action argument"));
     };
-    match m.actions.iter().find(|(a, _)| *a == action).map(|(_, t)| *t) {
-        Some(Own) => Ok(()),
-        Some(Standalone(t)) | Some(Nested(t)) => Err(format!("{name}: that action is gated as {t}")),
-        Some(Refused) => Err(format!("{name}: {tool} refuses that action")),
+    match m.resolve(action) {
+        Some((a, Own)) if a == action => Ok(()),
+        Some((a, Own)) => Err(format!("{name}: read as {}; write that", own_key(tool, a))),
+        Some((_, Standalone(t) | Nested(t))) => {
+            Err(format!("{name}: that action is gated as {t} (this entry is read as {t}; write {t})"))
+        }
+        Some((_, Refused)) => Err(format!("{name}: {tool} refuses that action")),
         None => Err(format!("{name}: {tool} has no action {action:?}")),
     }
 }
@@ -536,7 +636,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::families::{delegation, observability, plans, relay};
+    use crate::families::{delegation, observability, plans};
 
     fn registered(name: &str) -> bool {
         crate::builtin_registry_shared().get(name).is_some()
@@ -568,15 +668,27 @@ mod tests {
 
     #[test]
     fn every_manager_action_has_a_mapping_decision() {
-        // Tools with their own action list: the table must name exactly it.
+        // Tools that resolve actions with their own canonicalizer and list:
+        // the table must name exactly that list. Every other tool here
+        // dispatches on `action_of`, so the table is its list by
+        // construction, and the `manager_gates` tests run every action of
+        // every tool to check each reaches a handler arm.
         let own = |list: &[&'static str]| list.iter().copied().collect::<BTreeSet<_>>();
-        let cases: [(&str, BTreeSet<&str>); 5] = [
+        let cases: [(&str, BTreeSet<&str>); 4] = [
             ("plan_manage", own(&plans::ACTIONS)),
             ("delegation_manage", own(&delegation::ACTIONS)),
             ("observability_manage", own(&observability::ACTIONS)),
             ("coordination_manage", own(messaging::COORDINATION_ACTIONS)),
-            ("relay_manage", own(&relay::ACTIONS)),
         ];
+        for m in MANAGERS {
+            if !cases.iter().any(|(t, _)| *t == m.tool) {
+                assert!(
+                    !matches!(m.norm, Norm::Custom(_)),
+                    "{}: a custom canonicalizer needs its action list compared here",
+                    m.tool
+                );
+            }
+        }
         for (tool, actions) in cases {
             assert_eq!(table_actions(tool), actions, "{tool}: every action needs a mapping decision");
         }
@@ -597,6 +709,69 @@ mod tests {
                 assert!(m.actions.iter().any(|(a, _)| a == to), "{}: alias {alias} -> {to}", m.tool);
             }
         }
+    }
+
+    #[test]
+    fn a_call_with_no_action_resolves_to_the_handlers_default() {
+        // The handler's default comes from its argument struct: a required
+        // `action` has none; a serde default shows in the schema; an optional
+        // `action` with no schema default is resolved by `action_of`, i.e.
+        // by this table, so the table must have one.
+        let reg = crate::builtin_registry_shared();
+        for m in MANAGERS {
+            let Some(def) = reg.get(m.tool) else { continue };
+            let schema = &def.input_schema;
+            let required = schema["required"].as_array().is_some_and(|r| r.iter().any(|v| v == "action"));
+            let schema_default = schema["properties"]["action"].get("default").and_then(Value::as_str);
+            match (required, schema_default) {
+                (true, _) => assert_eq!(m.default_action, None, "{}: action is required", m.tool),
+                (false, Some(d)) => assert_eq!(m.default_action, Some(d), "{}: handler default", m.tool),
+                (false, None) => {
+                    assert!(m.default_action.is_some(), "{}: optional action needs a default", m.tool)
+                }
+            }
+            // A call with none routes exactly as one naming the default.
+            let none = route(m.tool, &json!({})).unwrap().map(|r| (r.action, r.target));
+            let named = m.default_action.map(|d| route(m.tool, &json!({ "action": d })).unwrap().unwrap());
+            assert_eq!(none, named.map(|r| (r.action, r.target)), "{}", m.tool);
+            assert_eq!(
+                action_of(m.tool, None).ok(),
+                m.default_action.and_then(|d| m.resolve(d)).map(|(a, _)| a)
+            );
+        }
+    }
+
+    #[test]
+    fn doors_name_registered_tools_and_map_their_arguments() {
+        for d in DOORS {
+            assert!(registered(d.tool) && registered(d.target), "{} -> {}", d.tool, d.target);
+            assert!(manager(d.tool).is_none(), "{} is a door, not a manager", d.tool);
+        }
+        let mapped = delegation::handoff_as_delegate(&json!({
+            "task_spec": "s", "to_agent": "b", "agent": "a", "deadline": null, "priority": "high"
+        }));
+        assert_eq!(
+            mapped,
+            json!({ "task_spec": "s", "to_agent": "b", "from_agent": "a", "priority": "high", "callback": "none" })
+        );
+        let reg = crate::builtin_registry_shared();
+        reg.get("delegate").unwrap().check_args(&mapped).unwrap();
+    }
+
+    #[test]
+    fn a_misspelled_key_reads_as_the_standalone_tool() {
+        assert_eq!(canonical_gate_name("plan_manage:delete"), "plan_delete");
+        assert_eq!(canonical_gate_name("plan_manage:PLAN_DELETE"), "plan_delete");
+        assert_eq!(canonical_gate_name("export_data:manifest"), "export_migration_manifest");
+        assert_eq!(canonical_gate_name("delegation_manage:delegate_retry"), "delegation_manage:retry");
+        assert_eq!(canonical_gate_name("plan_manage:close"), "plan_manage:close");
+        assert_eq!(canonical_gate_name("plan_delete"), "plan_delete");
+        assert_eq!(canonical_gate_name("plan_manage:nope"), "plan_manage:nope");
+        assert!(
+            check_gate_name("delegation_manage:delegate_retry")
+                .unwrap_err()
+                .contains("delegation_manage:retry")
+        );
     }
 
     #[test]

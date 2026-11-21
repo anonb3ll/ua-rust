@@ -448,7 +448,7 @@ impl Registry {
         route: Option<&'a Route>,
         route_policy_gated: bool,
     ) -> GatePlan<'a> {
-        let listed = |t: &str| cfg.approval_tools.iter().any(|x| x == t);
+        let listed = |t: &str| crate::routes::listed(cfg, t);
         let door_gated = def.always_gated || policy_gated || listed(name);
         let mut key_gated = false;
         let mut bind = None;
@@ -463,7 +463,9 @@ impl Registry {
                 Some(d) => (d, &r.args),
                 None => (def, args),
             };
-            if key_gated && !bdef.handler_gates(bargs) {
+            // An own action whose handler always asks a human itself takes
+            // that one approval only.
+            if key_gated && !bdef.handler_gates(bargs) && !r.handler_gated() {
                 bind = Some(Bind { name: key, def: bdef, args: bargs });
             }
         }
@@ -504,7 +506,15 @@ impl Registry {
         }
         let standalone =
             route.as_ref().and_then(|r| r.standalone().and_then(|s| self.tools.get(s)).zip(Some(r)));
-        if def.handler_decides(&args) || standalone.is_some_and(|(d, r)| d.handler_decides(&r.args)) {
+        // An own `tool:action` key the registry binds is requestable: it is
+        // exactly what the call parks first. Otherwise a handler that may
+        // gate decides on values only it resolves.
+        let own_bind = route.as_ref().zip(plan.bind.as_ref()).is_some_and(|(r, b)| {
+            r.target == crate::routes::Target::Own && r.gate_name().as_deref() == Some(b.name.as_str())
+        });
+        if !own_bind
+            && (def.handler_decides(&args) || standalone.is_some_and(|(d, r)| d.handler_decides(&r.args)))
+        {
             return Ok(ApprovalRequest::GatesInHandler);
         }
         // The arguments must be a call the tool would accept: what a human

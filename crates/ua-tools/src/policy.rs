@@ -370,7 +370,15 @@ fn parse_rule(item: &Value) -> Result<PolicyRule, String> {
         }
     };
     let tool = str_of("tool", "*");
-    let matcher = Glob::new(&tool)
+    // A plain `tool:action` spelling of an action that has a standalone tool
+    // matches that tool, so the rule holds as meant (and is still flagged by
+    // `unknown_action_keys`).
+    let pattern = if crate::routes::is_plain_name(&tool) {
+        crate::routes::canonical_gate_name(&tool).into_owned()
+    } else {
+        tool.clone()
+    };
+    let matcher = Glob::new(&pattern)
         .map_err(|e| format!("policy rule {name:?}: invalid tool pattern {tool:?}: {e}"))?
         .compile_matcher();
     let roles = match r.get("roles") {
@@ -560,9 +568,10 @@ pub fn load(path: &Path) -> Result<Arc<Policy>, String> {
     loaded
 }
 
-/// Rules whose `tool` is a plain `tool:action` name that no consolidated
-/// tool's action is gated as (see [`crate::routes::check_gate_name`]), each
-/// with the reason. Such a rule matches no call. Glob patterns and plain
+/// Rules whose `tool` is a plain `tool:action` name that is not a gate key
+/// as written (see [`crate::routes::check_gate_name`]), each with the
+/// reason: a key that matches nothing, or a spelling read as another name
+/// (`plan_manage:delete` matches `plan_delete`). Glob patterns and plain
 /// tool names are not checked, as before.
 pub fn unknown_action_keys(policy: &Policy) -> Vec<String> {
     policy

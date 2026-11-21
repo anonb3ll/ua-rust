@@ -155,6 +155,15 @@ from its commit history.
   tool. An unknown action is refused before the tool runs. `tool_calls`
   gains `action_tool` (schema part `core.v4`), gateway decisions name it,
   and approval events carry `via`. `delegation_manage` `create` is gated
-  once, as `delegate`, and can be requested ahead.
+  once, as `delegate`, and can be requested ahead. `handoff` is held to
+  `delegate`'s profile entry, policy rules and approval gate (a reviewer
+  session could hand off what it may not delegate). A call with no `action`
+  is gated as the tool's default action. A `tool:action` spelling of an
+  action that has a standalone tool (`plan_manage:delete`) gates that tool.
+  A plan object read through `platform_object_get` is also checked as
+  `plan_get`. Upgrading: an approval for `delegation_manage` `create` or for
+  `handoff` requested before the upgrade and not yet used bound the old
+  payload (the normalized request); it no longer matches and must be
+  requested and approved again, as `delegate`.
 
 [Unreleased]: https://github.com/anonb3ll/ua-rust/commits/main

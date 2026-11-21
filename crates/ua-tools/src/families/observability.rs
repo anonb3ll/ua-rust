@@ -850,7 +850,7 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
             let args: DelegationStatsArgs = parse_params("observability", act, p)?;
             read(&ctx, move |c| delegation_stats(c, args)).await
         }
-        other => Err(UaError::invalid(format!("unknown observability action {other:?}"))),
+        other => Err(crate::routes::unhandled("observability_manage", other)),
     }
 }
 

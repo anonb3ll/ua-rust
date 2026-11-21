@@ -1354,7 +1354,7 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
         "step_remove" => step_remove(ctx, parse_params("plan", act, p)?),
         "step_reorder" => step_reorder(ctx, parse_params("plan", act, p)?),
         "edit" => edit(ctx, parse_params("plan", act, p)?),
-        other => Err(UaError::invalid(format!("unknown plan action {other:?}"))),
+        other => Err(crate::routes::unhandled("plan_manage", other)),
     }
 }
 

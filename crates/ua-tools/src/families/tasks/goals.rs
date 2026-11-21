@@ -116,9 +116,9 @@ fn author(ctx: &ToolCtx, claimed: Option<&str>) -> UaResult<String> {
 }
 
 async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
+    let action = crate::routes::action_of("goal_manage", Some(&a.action))?;
     let db = ctx.hub.db().clone();
-    match action.as_str() {
+    match action {
         "add" => {
             let p: AddParams = parse_params("add", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
@@ -155,7 +155,7 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
             db.write_async(move |tx| edit(tx, p, &who)).await
         }
         "close" | "reopen" => {
-            let p: StatusParams = parse_params(&action, a.params)?;
+            let p: StatusParams = parse_params(action, a.params)?;
             let status = if action == "reopen" {
                 "open".to_string()
             } else {
@@ -172,9 +172,7 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
             let p: TaskIdParams = parse_params("ancestry", a.params)?;
             db.read_async(move |c| why_chain(c, p.task_id)).await
         }
-        other => Err(UaError::invalid(format!(
-            "action must be one of add, list, tree, get, link, unlink, edit, close, reopen, ancestry, not {other:?}"
-        ))),
+        other => Err(crate::routes::unhandled("goal_manage", other)),
     }
 }
 

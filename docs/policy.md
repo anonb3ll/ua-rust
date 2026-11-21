@@ -68,6 +68,12 @@ the same handler as a standalone tool: `plan_manage` with
 - **Prod-action check.** An always-gated standalone tool's identity check
   applies to the consolidated call as well.
 
+`handoff` is a door to `delegate` in the same way: it creates a delegation
+with `callback: "none"`, so it is held to `delegate`'s profile entry, policy
+rules and approval gate, on the arguments of the equivalent `delegate` call
+(`agent` as `from_agent`, plus `callback: "none"`). A pass for that
+`delegate` call serves the handoff, once.
+
 An action with no standalone tool is gated under the key `tool:action`, for
 example `plan_manage:close` or `coordination_manage:queue_park`. List it in
 `approval_tools` or name it in a rule's `tool` (a glob such as
@@ -76,7 +82,19 @@ example `plan_manage:close` or `coordination_manage:queue_park`. List it in
 itself (`manifest`, `compare`) is gated once, by that inner call, under its
 own name. For a tool whose handler binds its own approval (`relay_manage`), its keys
 take policy rules; an `approval_tools` entry adds nothing, since the handler
-already asks a human for every send.
+already asks a human for every send. The same holds for the own actions
+whose handler always asks a human itself (`oauth_device_manage:revoke`,
+`coordination_manage:node_command_start`,
+`coordination_manage:node_item_restart`, `config_revision_manage:commit`
+and `:rollback`): the call takes that one approval, and a request ahead
+answers `409` as for the tool itself. Any other own key the registry binds
+can be requested ahead under its key.
+
+A call with no `action` is the tool's default action (`list` for
+`oauth_device_manage` and `config_revision_manage`, `call` for
+`mcp_gateway`, `get` for `node_config`) and is gated as that action. Each
+consolidated tool's handler dispatches on the action the table resolves, so
+the registry and the handler always agree on which action runs.
 
 An `action` that the routing table does not know is refused
 (`invalid_argument`) before the tool runs. The `agent.gateway.decision`
@@ -85,10 +103,31 @@ event of a refused call names the tool called in `tool` and the action in
 `agent.approval.consumed` events carry `via` (the tool called) when it binds
 a different name; the call's `tool_calls` row carries `action_tool`.
 
-`system_doctor` reports an `approval_tools` entry or a plain-named policy
-rule `tool:action` that matches nothing as `DEGRADED` (the policy file also
-logs a warning when it loads), and names the standalone tool when the action
-has one: `plan_manage:delete` is gated as `plan_delete`.
+An `approval_tools` entry or a plain-named policy rule written
+`tool:action` for an action that has a standalone tool is read as that tool
+(`plan_manage:delete` gates `plan_delete`, through either door), and an
+alias spelling of an own action as its key. `system_doctor` still reports
+such a spelling, and a `tool:action` name that matches nothing, as
+`DEGRADED` (the policy file also logs a warning when it loads), naming the
+name to write.
+
+A platform object read through a consolidated tool (`platform_object_get`
+for a `plan`, whose `profile_tool` is `plan_manage`) is also checked as that
+tool's `get` action: `plan_get`'s profile entry, policy rules and
+`approval_tools` entry apply to the read.
+
+Other tools that share a handler or a creation path with a differently
+named tool were checked: `handoff` (above) is the only second door to
+another tool's operation. The rest are distinct operations with their own
+names and gates: `graph_canvas_restore` writes a stored revision back and is
+gated as itself, separately from `graph_canvas_write`; `workflow_run`,
+`langgraph_run`, `langgraph_workflow_run` and `routine_fire` start
+different run kinds, and every step of a run is itself a governed call;
+`dispatch_resume` and `dispatch_task` gate in their handlers under their own
+names; agent lifecycle actions (`agent_terminate`, `agent_retire`) cancel
+node items and runs and revoke credentials as consequences of the lifecycle
+change, not as calls of `dispatch_cancel` or the revoke tools;
+`profile_reset` and `profile_activate` share a binding helper only.
 
 The table (`crates/ua-tools/src/routes.rs`) decides every action of every
 such tool; a test fails when a tool or an action has no entry.

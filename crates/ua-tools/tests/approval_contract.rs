@@ -180,7 +180,6 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                 ],
             ),
         ),
-        ("families/delegation.rs", (1, vec![("handoff", json!({}))])),
         (
             "families/dispatch/tools.rs",
             (2, vec![("dispatch_task", json!({})), ("dispatch_resume", json!({}))]),
@@ -293,7 +292,7 @@ fn every_tool_that_gates_in_its_handler_is_marked() {
         }
     }
     // A tool nothing in its handler gates stays requestable.
-    for tool in ["task_add", "task_update", "crew_intervene", "delegate"] {
+    for tool in ["task_add", "task_update", "crew_intervene", "delegate", "handoff"] {
         assert!(!reg.get(tool).unwrap().handler_decides(&json!({})), "{tool}");
     }
 }

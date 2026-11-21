@@ -515,3 +515,173 @@ async fn the_doctor_flags_an_unknown_action_key() {
     assert_eq!(policy["status"], "DEGRADED", "{policy}");
     assert!(policy["detail"].as_str().unwrap().contains("gated as plan_delete"), "{policy}");
 }
+
+// ---------------------------------------------------------------------------
+// Every action reaches a handler arm; calls with no action
+
+/// Arguments every call of `tool` needs besides `action`, so a call reaches
+/// the handler's dispatch.
+fn base_args(tool: &str) -> Value {
+    match tool {
+        "mcp_gateway" => json!({ "server": "s" }),
+        "node_config" => json!({ "node": "n" }),
+        "config_revision_manage" | "oauth_device_manage" => json!({}),
+        _ => json!({ "params": {} }),
+    }
+}
+
+#[tokio::test]
+async fn every_action_in_the_table_reaches_a_handler_arm() {
+    // The table is each tool's dispatch list (handlers dispatch on
+    // `routes::action_of`): an action listed without an arm answers
+    // `routes::unhandled`, which this test refuses.
+    let e = env(None, |_| {});
+    let me = agent("coord-1", Profile::Coordinator);
+    for m in ua_tools::routes::MANAGERS {
+        if e.reg.get(m.tool).is_none() {
+            continue;
+        }
+        for (action, _) in m.actions {
+            let mut args = base_args(m.tool);
+            args["action"] = json!(action);
+            let call = e.call(&me, m.tool, args);
+            let out = tokio::time::timeout(std::time::Duration::from_secs(20), call).await;
+            if let Ok(Err(err)) = out {
+                assert!(!err.to_string().contains("has no handler"), "{}:{action}: {err}", m.tool);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_call_with_no_action_is_gated_as_its_default_action() {
+    // oauth_device_manage `{}` lists sessions: a rule on its `list` key must
+    // hold for it, as for every tool whose action has a default.
+    let defaults: Vec<(&str, &str)> = ua_tools::routes::MANAGERS
+        .iter()
+        .filter(|m| builtin_registry().get(m.tool).is_some())
+        .filter_map(|m| m.default_action.map(|d| (m.tool, d)))
+        .collect();
+    assert!(defaults.contains(&("oauth_device_manage", "list")), "{defaults:?}");
+    let keys: Vec<String> = defaults.iter().map(|(t, d)| format!("{t}:{d}")).collect();
+    let e = env(Some(&rules("deny", &keys)), |_| {});
+    let me = agent("coord-1", Profile::Coordinator);
+    for (tool, default) in defaults {
+        let none = e.call(&me, tool, base_args(tool)).await.unwrap_err();
+        assert_eq!(reason(&none), "policy_deny", "{tool} with no action: {none}");
+        let mut named = base_args(tool);
+        named["action"] = json!(default);
+        assert_eq!(reason(&e.call(&me, tool, named).await.unwrap_err()), "policy_deny", "{tool}");
+    }
+    let calls = e.tool_calls();
+    assert!(calls.is_empty() || calls.iter().all(|c| c.2 != "ok"), "{calls:?}");
+}
+
+// ---------------------------------------------------------------------------
+// handoff is a door to delegate
+
+#[tokio::test]
+async fn handoff_is_held_to_delegates_profile_entry() {
+    let e = env(None, |_| {});
+    let reviewer = agent("reviewer-1", Profile::Reviewer);
+    let args = json!({ "task_spec": SPEC, "to_agent": "builder-1" });
+    assert_eq!(reason(&e.call(&reviewer, "delegate", args.clone()).await.unwrap_err()), "profile_denied");
+    let err = e.call(&reviewer, "handoff", args.clone()).await.unwrap_err();
+    assert_eq!(reason(&err), "profile_denied", "{err}");
+    // A profile that may delegate may hand off.
+    let out = e.call(&agent("lead-1", Profile::Developer), "handoff", args).await.unwrap();
+    assert_eq!(out["status"], "pending");
+}
+
+#[tokio::test]
+async fn handoff_is_held_to_delegates_policy_rules() {
+    let e = env(Some(&rules("deny", &["delegate".to_string()])), |_| {});
+    let me = agent("lead-1", Profile::Developer);
+    let args = json!({ "task_spec": SPEC, "to_agent": "builder-1" });
+    let err = e.call(&me, "handoff", args.clone()).await.unwrap_err();
+    assert_eq!(reason(&err), "policy_deny", "{err}");
+    let decisions = e.events("agent.gateway.decision").await;
+    let d = decisions.iter().find(|d| d["payload"]["tool"] == "handoff").expect("a decision for handoff");
+    assert_eq!(d["payload"]["action_tool"], "delegate");
+
+    let e = env(Some(&rules("require_approval", &["delegate".to_string()])), |_| {});
+    let (tool, id) = pending(e.call(&me, "handoff", args.clone()).await.unwrap_err());
+    assert_eq!(tool, "delegate");
+    e.approve(id).await;
+    assert_eq!(e.call(&me, "handoff", args.clone()).await.unwrap()["status"], "pending");
+    // The approval binds what the equivalent `delegate` call binds.
+    let direct = json!({ "task_spec": SPEC, "to_agent": "builder-1", "callback": "none" });
+    let (_, id) = pending(e.call(&me, "delegate", direct).await.unwrap_err());
+    e.approve(id).await;
+    e.call(&me, "handoff", args).await.unwrap();
+    assert_eq!(e.approvals().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// A misspelled key still gates; a handler's own approval is the only one
+
+#[tokio::test]
+async fn a_manager_spelling_of_a_standalone_action_gates_the_standalone_tool() {
+    let e = env(None, |c| c.approval_tools = vec!["plan_manage:delete".into()]);
+    let me = dev();
+    let a = e.plan(&me).await;
+    let (tool, _) = pending(e.call(&me, "plan_delete", json!({ "plan_id": a })).await.unwrap_err());
+    assert_eq!(tool, "plan_delete");
+    let (tool, _) =
+        pending(e.manage(&me, "plan_manage", "delete", json!({ "plan_id": a })).await.unwrap_err());
+    assert_eq!(tool, "plan_delete");
+
+    let e = env(Some(&rules("deny", &["plan_manage:delete".to_string()])), |_| {});
+    let a = e.plan(&me).await;
+    assert_eq!(
+        reason(&e.call(&me, "plan_delete", json!({ "plan_id": a })).await.unwrap_err()),
+        "policy_deny"
+    );
+    let err = e.manage(&me, "plan_manage", "delete", json!({ "plan_id": a })).await.unwrap_err();
+    assert_eq!(reason(&err), "policy_deny");
+}
+
+#[tokio::test]
+async fn an_own_key_on_a_handler_gated_action_asks_once() {
+    let e = env(None, |c| c.approval_tools = vec!["oauth_device_manage:revoke".into()]);
+    let me = agent("coord-1", Profile::Coordinator);
+    let args = json!({ "action": "revoke", "identity": "agent-x" });
+    // Request-ahead agrees with the call: the handler binds the approval.
+    let ahead = e.reg.approval_request(&e.hub, &me, "oauth_device_manage", args.clone()).await.unwrap();
+    assert_eq!(ahead, ApprovalRequest::GatesInHandler);
+    let (tool, id) = pending(e.call(&me, "oauth_device_manage", args.clone()).await.unwrap_err());
+    assert_eq!(tool, "oauth_device_manage");
+    e.approve(id).await;
+    e.call(&me, "oauth_device_manage", args).await.unwrap();
+    assert_eq!(e.approvals().len(), 1, "{:?}", e.approvals());
+}
+
+#[tokio::test]
+async fn an_own_key_the_registry_binds_is_requestable() {
+    let e = env(None, |c| c.approval_tools = vec!["plan_manage:close".into()]);
+    let me = dev();
+    let a = e.plan(&me).await;
+    let args = json!({ "action": "close", "params": { "plan_id": a, "reason": "r" } });
+    let ahead = e.reg.approval_request(&e.hub, &me, "plan_manage", args.clone()).await.unwrap();
+    assert_eq!(ahead, ApprovalRequest::Payload { tool: "plan_manage:close".into(), payload: args });
+}
+
+// ---------------------------------------------------------------------------
+// The read side
+
+#[tokio::test]
+async fn a_plan_object_read_is_held_to_plan_get() {
+    let e = env(Some(&rules("deny", &["plan_get".to_string()])), |_| {});
+    let me = dev();
+    let a = e.plan(&me).await;
+    let err = e.call(&me, "platform_object_get", json!({ "kind": "plan", "id": a })).await.unwrap_err();
+    assert_eq!(reason(&err), "policy_deny", "{err}");
+
+    let e = env(None, |c| c.approval_tools = vec!["plan_get".into()]);
+    let a = e.plan(&me).await;
+    let err = e.call(&me, "platform_object_get", json!({ "kind": "plan", "id": a })).await.unwrap_err();
+    assert_eq!(reason(&err), "approval_required", "{err}");
+    let e = env(None, |_| {});
+    let a = e.plan(&me).await;
+    e.call(&me, "platform_object_get", json!({ "kind": "plan", "id": a })).await.unwrap();
+}

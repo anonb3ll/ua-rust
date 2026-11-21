@@ -173,10 +173,10 @@ async fn mcp_gateway(ctx: ToolCtx, a: GatewayArgs) -> UaResult<Value> {
 }
 
 async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value> {
-    t.action = match a.action.as_deref().unwrap_or("call") {
+    t.action = match crate::routes::action_of("mcp_gateway", a.action.as_deref())? {
         "call" => "call",
         "list" => "list",
-        other => return Err(UaError::invalid(format!("action must be call or list, not {other:?}"))),
+        other => return Err(crate::routes::unhandled("mcp_gateway", other)),
     };
     check_server_name(&a.server)?;
     let (cfg, name) = (ctx.hub.cfg().clone(), a.server.clone());
