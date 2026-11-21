@@ -67,7 +67,7 @@ Facts the first draft did not record:
   auto-apply supersession above a 0.98 threshold without review
   (`UA_CONSOLIDATE_AUTO_APPLY`); `sleep_pass.py` classified nightly. It also
   taught one lesson this design keeps: untrusted note titles rendered into a
-  parseable proposal file became `apply` commands (task #2012).
+  parseable proposal file became `apply` commands.
 - **Memory scope is not one code path.** About a dozen tools read the `memory`
   table directly, not through `Filter`. See the inventory in §3.
 - **The clock is called directly.** `ua_core::time::now()` is called in
