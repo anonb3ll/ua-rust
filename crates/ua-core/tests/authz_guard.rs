@@ -16,10 +16,11 @@
 //!   predicates (today each is a one-line delegation to authz);
 //! - `profile_check`: comparisons of a profile with `Profile::…` (`==`,
 //!   `!=`, `matches!`), the shape of a profile used as an authority decision;
-//! - `profile_authority_use`: uses of the transitional authorities that are a
-//!   profile used as authority (`TransitionalProfileOperator`,
+//! - `profile_authority_use`: uses of the authorities that once made a
+//!   profile an authority (`TransitionalProfileOperator`,
 //!   `TransitionalHubView`, `TransitionalMailboxReader`,
-//!   `TransitionalLocalMailboxReader`);
+//!   `TransitionalLocalMailboxReader`). They are deleted; the count is 0 in
+//!   every crate and must stay 0;
 //! - `actor_kind_check`: `ActorKind::Human`, `::Agent` or `::Anonymous`
 //!   compared (`==`/`!=`), used as a `match` arm, or inside `matches!(..)`
 //!   (over any number of lines). Building a value with a kind is not counted;
@@ -56,13 +57,11 @@ const BASELINE: &[(&str, &str, usize)] = &[
     ("ua-server", "config_identity_read", 2),
     ("ua-server", "is_human_call", 13),
     ("ua-server", "is_human_def", 1),
-    ("ua-tools", "actor_kind_check", 46),
+    ("ua-tools", "actor_kind_check", 43),
     ("ua-tools", "config_identity_read", 4),
-    ("ua-tools", "is_human_call", 35),
-    ("ua-tools", "lifecycle_call", 4),
-    ("ua-tools", "operator_fn_def", 4),
-    ("ua-tools", "profile_authority_use", 4),
-    ("ua-tools", "profile_check", 15),
+    ("ua-tools", "is_human_call", 32),
+    ("ua-tools", "operator_fn_def", 2),
+    ("ua-tools", "profile_check", 13),
 ];
 
 const CATEGORIES: &[&str] = &[
