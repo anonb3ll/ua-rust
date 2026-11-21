@@ -55,8 +55,10 @@ a **message board**:
 
 With `enforce_auth` on, none of this applies to HTTP requests: a caller
 reads its own mailbox, and reading every mailbox or conversation needs a
-verified human. A stdio MCP process or a local CLI call never authenticates,
-so these rules apply to it whatever `enforce_auth` says.
+verified human. A stdio MCP process or a local CLI call does not
+authenticate, so these rules apply to it whatever `enforce_auth` says. The
+one exception is a CLI `--label` that names a configured human identity and
+is confirmed on an interactive terminal: that caller acts as the human.
 
 A 401 carries an RFC 9728 challenge when OAuth is on:
 
