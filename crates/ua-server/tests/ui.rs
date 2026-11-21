@@ -51,6 +51,7 @@ fn builder() -> Caller {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -307,6 +308,7 @@ async fn the_inbox_shows_how_each_pass_was_approved() {
         profile: ua_core::Profile::Coordinator,
         enforce_profile: true,
         session_key: None,
+        org_id: ua_core::DEFAULT_ORG.into(),
         transport: ua_core::identity::Transport::Slack,
     };
     call(&state, &slack_human, "approval_resolve", json!({ "id": via_slack, "decision": "approve" }))

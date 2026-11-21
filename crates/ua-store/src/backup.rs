@@ -27,9 +27,9 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::SchemaPart;
 use crate::ledger::{self, EventInput, VerifyReport};
 use crate::schema;
+use crate::schema::Part;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -133,7 +133,7 @@ pub struct RestoreOptions {
     /// and node session credentials in the restore transaction.
     pub revoke_sessions: bool,
     /// Optional `(required, optional)` schema parts from the running build.
-    pub expected_schema: Option<(Vec<SchemaPart>, Vec<SchemaPart>)>,
+    pub expected_schema: Option<(Vec<Part>, Vec<Part>)>,
 }
 
 /// Result of verifying (with `dry_run`) or installing a backup over a hub database.
@@ -384,11 +384,12 @@ fn read_master_objects(conn: &Connection) -> anyhow::Result<MasterObjectMap> {
 
 /// Verify `schema_parts` checksums and `sqlite_master` tables, views, indexes,
 /// and triggers in `conn` against the schemas registered in the current build.
-pub fn check_schema_compatibility(
+pub fn check_schema_compatibility<E: Into<Part> + Copy>(
     conn: &Connection,
-    expected: &[SchemaPart],
-    optional: &[SchemaPart],
+    expected: &[E],
+    optional: &[Part],
 ) -> anyhow::Result<SchemaCompatibility> {
+    let expected = schema::parts(expected);
     if !table_exists(conn, "schema_parts")? {
         bail!("database is missing the schema_parts table");
     }
@@ -408,10 +409,10 @@ pub fn check_schema_compatibility(
     let mut applied_parts = Vec::new();
     let mut full_parts = Vec::with_capacity(expected.len() + optional.len());
 
-    for part in expected {
+    for part in &expected {
         known.insert(part.name);
         full_parts.push(*part);
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
+        let sum = part.checksum();
         match applied.get(part.name) {
             None => missing.push(part.name.to_string()),
             Some(s) => {
@@ -425,7 +426,7 @@ pub fn check_schema_compatibility(
     for part in optional {
         known.insert(part.name);
         full_parts.push(*part);
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
+        let sum = part.checksum();
         if let Some(s) = applied.get(part.name) {
             applied_parts.push(*part);
             if *s != sum {
@@ -1210,6 +1211,7 @@ fn post_install_finalize(
         let ev = ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "ops.restored",
                 json!({
                     "source_sha256": sha256,
@@ -1773,6 +1775,7 @@ fn restore_database_with_hooks(
 mod tests {
     use super::*;
     use crate::Db;
+    use crate::SchemaPart;
     use crate::ledger::{EventInput, META_SCHEMA, SCHEMA as LEDGER_SCHEMA};
     use serde_json::json;
 
@@ -1788,8 +1791,8 @@ mod tests {
         (dir, path, db)
     }
 
-    fn schema_pair() -> Option<(Vec<SchemaPart>, Vec<SchemaPart>)> {
-        Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], Vec::new()))
+    fn schema_pair() -> Option<(Vec<Part>, Vec<Part>)> {
+        Some((schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]), Vec::new()))
     }
 
     #[test]
@@ -1799,7 +1802,11 @@ mod tests {
             for i in 0..25 {
                 db.write(|tx| {
                     tx.execute("INSERT INTO items (val) VALUES (?1)", [format!("row-{i}")])?;
-                    ledger::append(tx, EventInput::new("backup.test", json!({ "i": i })).by("builder-1"))?;
+                    ledger::append(
+                        tx,
+                        EventInput::new(ua_core::DEFAULT_ORG, "backup.test", json!({ "i": i }))
+                            .by("builder-1"),
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1854,7 +1861,10 @@ mod tests {
                 writer_db
                     .write(|tx| {
                         tx.execute("INSERT INTO items (val) VALUES (?1)", [format!("w-{i}")])?;
-                        ledger::append(tx, EventInput::new("concurrent.write", json!({ "i": i })))?;
+                        ledger::append(
+                            tx,
+                            EventInput::new(ua_core::DEFAULT_ORG, "concurrent.write", json!({ "i": i })),
+                        )?;
                         Ok(())
                     })
                     .unwrap();
@@ -1908,7 +1918,7 @@ mod tests {
         for i in 0..3 {
             db.write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES (?1)", [format!("pre-{i}")])?;
-                ledger::append(tx, EventInput::new("test.ev", json!({ "i": i })))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.ev", json!({ "i": i })))?;
                 Ok(())
             })
             .unwrap();
@@ -1980,18 +1990,82 @@ mod tests {
         assert_eq!(has_wal_row, 1);
     }
 
+    /// A backup taken before `organization.v1.store` existed restores into a
+    /// build that has it: the part is reported missing, not refused, and
+    /// applies on the next open, after which the ledger still verifies.
+    #[test]
+    fn an_older_backup_without_the_org_part_restores_and_upgrades() {
+        let (dir, live_path, db) = test_db();
+        for i in 0..3 {
+            db.write(|tx| {
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "before.upgrade", json!({ "i": i })))
+            })
+            .unwrap();
+        }
+        drop(db);
+        let bak = dir.path().join("old.db");
+        let rep = backup_database(&live_path, &bak, false).unwrap();
+
+        let full = vec![
+            Part::from(LEDGER_SCHEMA),
+            Part::from(META_SCHEMA),
+            Part::from(crate::org::STORE_PART),
+            Part::from(EXTRA),
+        ];
+        let dest = dir.path().join("restored.db");
+        let restored = restore_database(
+            &bak,
+            &dest,
+            RestoreOptions {
+                expected_sha256: Some(rep.sha256),
+                expected_schema: Some((full.clone(), Vec::new())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let compat = restored.schema.unwrap();
+        assert_eq!(compat.missing, ["organization.v1.store"], "{compat:?}");
+        assert!(!compat.has_tampering_or_unowned_objects(), "{compat:?}");
+
+        let db = Db::open(&dest, &full).unwrap();
+        let (orgs, hash_forms): (i64, i64) = db
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM orgs WHERE id = 'default'", [], |r| r.get(0))?,
+                    c.query_row(
+                        "SELECT COUNT(*) FROM event_log WHERE org_id = 'default' AND hash_v = 1",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(orgs, 1);
+        assert!(hash_forms >= 3, "every restored row is backfilled ({hash_forms})");
+        db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "after.upgrade", json!({}))))
+            .unwrap();
+        let report = db.read(ledger::verify).unwrap();
+        assert!(report.ok, "{report:?}");
+    }
+
     #[test]
     fn restore_enforces_pinning_schema_triggers_and_records_ops_restored_event() {
         let (_dir, live_path, db) = test_db();
         for i in 0..5 {
-            db.write(|tx| ledger::append(tx, EventInput::new("phase.one", json!({ "i": i })))).unwrap();
+            db.write(|tx| {
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "phase.one", json!({ "i": i })))
+            })
+            .unwrap();
         }
         let bak_dir = tempfile::tempdir().unwrap();
         let bak_path = bak_dir.path().join("good.db");
         let bak_rep = backup_database(&live_path, &bak_path, false).unwrap();
 
         for i in 5..8 {
-            db.write(|tx| ledger::append(tx, EventInput::new("phase.two", json!({ "i": i })))).unwrap();
+            db.write(|tx| {
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "phase.two", json!({ "i": i })))
+            })
+            .unwrap();
         }
         drop(db);
 
@@ -2062,7 +2136,7 @@ mod tests {
         let (_sdir, src_path, db) = test_db();
         db.write(|tx| {
             tx.execute("INSERT INTO items (val) VALUES ('row-0')", [])?;
-            ledger::append(tx, EventInput::new("ev", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -2097,7 +2171,9 @@ mod tests {
 
         // Planted trigger refused (even with allow_newer if attached to a known table).
         let (_tdir, trig_src, trig_db) = test_db();
-        trig_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        trig_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         trig_db
             .write(|tx| {
                 tx.execute_batch("CREATE TRIGGER evil_trig AFTER INSERT ON items BEGIN SELECT 1; END;")?;
@@ -2126,7 +2202,9 @@ mod tests {
 
         // Dropped expected trigger (`event_log_no_update`) refused.
         let (_ddir, drop_trig_src, drop_trig_db) = test_db();
-        drop_trig_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        drop_trig_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         drop_trig_db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
         drop(drop_trig_db);
         let drop_trig_bak = dir.path().join("drop-trig.db");
@@ -2142,7 +2220,9 @@ mod tests {
 
         // Missing expected table (`DROP TABLE items`) refused.
         let (_mdir, miss_tbl_src, miss_tbl_db) = test_db();
-        miss_tbl_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        miss_tbl_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         miss_tbl_db.write(|tx| Ok(tx.execute_batch("DROP TABLE items;")?)).unwrap();
         drop(miss_tbl_db);
         let miss_tbl_bak = dir.path().join("miss-tbl.db");
@@ -2158,7 +2238,9 @@ mod tests {
 
         // Altered expected table DDL (`ALTER TABLE items ADD COLUMN rogue TEXT`) refused.
         let (_adir, alt_src, alt_db) = test_db();
-        alt_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        alt_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         alt_db.write(|tx| Ok(tx.execute_batch("ALTER TABLE items ADD COLUMN rogue TEXT;")?)).unwrap();
         drop(alt_db);
         let alt_bak = dir.path().join("altered.db");
@@ -2184,7 +2266,7 @@ mod tests {
         new_db
             .write(|tx| {
                 tx.execute("INSERT INTO future_things (label) VALUES ('ok')", [])?;
-                ledger::append(tx, EventInput::new("ev", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -2215,7 +2297,9 @@ mod tests {
 
         // Rogue table with NO unknown `schema_parts` refuses EVEN with allow_newer=true.
         let (_rdir, rogue_src, rogue_db) = test_db();
-        rogue_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        rogue_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         rogue_db.write(|tx| Ok(tx.execute_batch("CREATE TABLE rogue_tbl (x INT);")?)).unwrap();
         drop(rogue_db);
         let rogue_bak = dir.path().join("rogue.db");
@@ -2264,7 +2348,7 @@ mod tests {
             for i in 0..3 {
                 db.write(|tx| {
                     tx.execute("INSERT INTO items (val) VALUES (?1)", [format!("orig-{i}")])?;
-                    ledger::append(tx, EventInput::new("orig", json!({ "i": i })))?;
+                    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "orig", json!({ "i": i })))?;
                     Ok(())
                 })
                 .unwrap();
@@ -2278,7 +2362,7 @@ mod tests {
 
         db.write(|tx| {
             tx.execute("INSERT INTO items (val) VALUES ('extra-before-swap')", [])?;
-            ledger::append(tx, EventInput::new("orig.more", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "orig.more", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -2388,7 +2472,7 @@ mod tests {
         // Dry-run stages next to destination (without creating missing destination parent)
         // and cleans up its staging dir on completion.
         let (_sdir, src, db) = test_db();
-        db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))).unwrap();
         drop(db);
         let bak = dir.path().join("snap.db");
         let bak_rep = backup_database(&src, &bak, false).unwrap();
@@ -2474,7 +2558,7 @@ mod tests {
             tx.execute("INSERT INTO oauth_codes (code_hash) VALUES ('c1')", [])?;
             tx.execute("INSERT INTO oauth_requests (id_hash) VALUES ('r1')", [])?;
             tx.execute("INSERT INTO session_credentials (credential_id) VALUES ('sc1')", [])?;
-            ledger::append(tx, EventInput::new("seed", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -2513,7 +2597,7 @@ mod tests {
         const DEP_ALTER: SchemaPart =
             SchemaPart { name: "dep_base.v2", sql: "ALTER TABLE dep_tbl ADD COLUMN note TEXT;" };
         let parts = vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA, DEP_BASE, DEP_ALTER];
-        let optional = vec![schema::IMPORT_SCHEMA];
+        let optional = schema::parts(&[schema::IMPORT_SCHEMA]);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("dest.db");
 
@@ -2521,7 +2605,7 @@ mod tests {
         //    must still fail closed AND detect dropped `event_log` triggers (no `--allow-newer` & `--allow-newer`).
         let p1_src = dir.path().join("p1.db");
         let p1_db = Db::open(&p1_src, &parts).unwrap();
-        p1_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p1_db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))).unwrap();
         p1_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2556,7 +2640,7 @@ mod tests {
                 RestoreOptions {
                     allow_unpinned: true,
                     allow_newer,
-                    expected_schema: Some((parts.clone(), optional.clone())),
+                    expected_schema: Some((schema::parts(&parts), schema::parts(&optional))),
                     ..Default::default()
                 },
             )
@@ -2568,7 +2652,9 @@ mod tests {
         // Also deleting `ledger.v1` row while `event_log` exists must trigger `conflicting_objects`.
         let p1b_src = dir.path().join("p1b.db");
         let p1b_db = Db::open(&p1b_src, &[LEDGER_SCHEMA, META_SCHEMA, EXTRA]).unwrap();
-        p1b_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p1b_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         p1b_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2587,7 +2673,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2597,7 +2686,7 @@ mod tests {
 
         // 2. `sqlite_` LIKE wildcard / case-insensitivity bypass (`sqlitexevil`, `Sqlite1rogue`).
         let (_s2dir, p2_src, p2_db) = test_db();
-        p2_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p2_db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))).unwrap();
         p2_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2624,7 +2713,10 @@ mod tests {
             &dest,
             RestoreOptions {
                 allow_unpinned: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2634,7 +2726,7 @@ mod tests {
 
         // 3. Mixed/uppercase table target in trigger (`ON EVENT_LOG`) with fake `future.v1` + `--allow-newer`.
         let (_s3dir, p3_src, p3_db) = test_db();
-        p3_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p3_db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))).unwrap();
         p3_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2653,7 +2745,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2663,7 +2758,7 @@ mod tests {
 
         // 6a. Unexpected index on a known table (`ON EVENT_LOG`) with fake `future.v1` + `--allow-newer`.
         let (_s6dir, p6_src, p6_db) = test_db();
-        p6_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p6_db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({})))).unwrap();
         p6_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2682,7 +2777,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2692,7 +2790,9 @@ mod tests {
 
         // 6b. View shadowing an optional unapplied table (`import_runs`) with fake `future.v1` + `--allow-newer`.
         let (_s6bdir, p6b_src, p6b_db) = test_db();
-        p6b_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        p6b_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         p6b_db
             .write(|tx| {
                 tx.execute_batch(
@@ -2711,7 +2811,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional.clone())),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2736,7 +2839,9 @@ mod tests {
         };
         let legit_src = dir.path().join("legit-newer.db");
         let legit_db = Db::open(&legit_src, &[LEDGER_SCHEMA, META_SCHEMA, EXTRA, LEGIT_NEWER]).unwrap();
-        legit_db.write(|tx| ledger::append(tx, EventInput::new("ev", json!({})))).unwrap();
+        legit_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "ev", json!({}))))
+            .unwrap();
         drop(legit_db);
         let legit_bak = dir.path().join("legit-bak.db");
         backup_database(&legit_src, &legit_bak, false).unwrap();
@@ -2746,7 +2851,10 @@ mod tests {
             RestoreOptions {
                 allow_unpinned: true,
                 allow_newer: true,
-                expected_schema: Some((vec![LEDGER_SCHEMA, META_SCHEMA, EXTRA], optional)),
+                expected_schema: Some((
+                    schema::parts(&[LEDGER_SCHEMA, META_SCHEMA, EXTRA]),
+                    schema::parts(&optional),
+                )),
                 ..Default::default()
             },
         )
@@ -2763,7 +2871,7 @@ mod tests {
         src_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('restored-only')", [])?;
-                ledger::append(tx, EventInput::new("seed.restored", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed.restored", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -2777,7 +2885,7 @@ mod tests {
         orig_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('committed-main')", [])?;
-                ledger::append(tx, EventInput::new("orig.main", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "orig.main", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -2794,7 +2902,7 @@ mod tests {
                 orig_db
                     .write(|tx| {
                         tx.execute("INSERT INTO items (val) VALUES ('hot-wal-row')", [])?;
-                        ledger::append(tx, EventInput::new("orig.hot", json!({})))?;
+                        ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "orig.hot", json!({})))?;
                         Ok(())
                     })
                     .unwrap();
@@ -2884,7 +2992,7 @@ mod tests {
         let db = Db::open(&src, &tokens_parts()).unwrap();
         db.write(|tx| {
             tx.execute("INSERT INTO agent_tokens (id, status) VALUES ('tok-1', 'active')", [])?;
-            ledger::append(tx, EventInput::new("seed", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -2922,7 +3030,7 @@ mod tests {
         RestoreOptions {
             allow_unpinned: true,
             allow_newer,
-            expected_schema: Some((parts, Vec::new())),
+            expected_schema: Some((schema::parts(&parts), Vec::new())),
             ..Default::default()
         }
     }
@@ -3046,8 +3154,8 @@ mod tests {
             }
             // Deleted rows leave the counter above MAX(rowid); that is legitimate.
             tx.execute("DELETE FROM counted WHERE id >= 4", [])?;
-            ledger::append(tx, EventInput::new("a", json!({})))?;
-            ledger::append(tx, EventInput::new("b", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "a", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "b", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -3146,8 +3254,8 @@ mod tests {
         let db = Db::open(&src, &parts).unwrap();
         db.write(|tx| {
             tx.execute("INSERT INTO counted (v) VALUES ('a')", [])?;
-            ledger::append(tx, EventInput::new("a", json!({})))?;
-            ledger::append(tx, EventInput::new("b", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "a", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "b", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -3254,7 +3362,9 @@ mod tests {
     fn restore_refuses_when_existing_wal_cannot_be_checkpointed() {
         let dir = tempfile::tempdir().unwrap();
         let (_sdir, src_path, src_db) = test_db();
-        src_db.write(|tx| ledger::append(tx, EventInput::new("seed", json!({})))).unwrap();
+        src_db
+            .write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({}))))
+            .unwrap();
         drop(src_db);
         let bak = dir.path().join("bak.db");
         backup_database(&src_path, &bak, false).unwrap();
@@ -3264,7 +3374,7 @@ mod tests {
         live_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('live-row')", [])?;
-                ledger::append(tx, EventInput::new("live", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "live", json!({})))?;
                 Ok(())
             })
             .unwrap();

@@ -377,6 +377,7 @@ fn run_inner(
                     ua_store::ledger::append(
                         tx,
                         ua_store::EventInput::new(
+                            ua_core::DEFAULT_ORG,
                             "agent.token.revoked",
                             json!({ "agent": &label, "reason": "ua_init_failed", "revoked_at": &now }),
                         )

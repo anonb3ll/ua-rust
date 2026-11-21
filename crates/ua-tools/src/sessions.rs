@@ -134,7 +134,7 @@ async fn bind(ctx: ToolCtx, profile: Option<Profile>) -> UaResult<Value> {
             };
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.profile.changed",
                     json!({ "identity": label2, "profile": profile.map(Profile::as_str) }),
                 )

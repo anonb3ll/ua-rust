@@ -100,9 +100,38 @@ from its commit history.
 - Slack request signature check (v0 HMAC, five-minute window, replayed bodies
   refused) and `slack_parse_command` for the nine coordination commands. The
   Slack routes above build on both.
+- Callers and ledger events name their organization: `Caller.org_id` and
+  `Caller::system_for`, and `EventInput::new` takes the `org_id` first (no
+  `Default`). Every caller and every event is in the default organization;
+  nothing reads the value for authority, and no serialized output a tool
+  returns changes.
+- Organization groundwork (`docs/organization.md`, `organization.v1`): the
+  `orgs` table with one seeded `default` organization, and `org_id` and
+  `hash_v` columns on `event_log`, in the schema part `organization.v1.store`.
+  Every event belongs to `default` and keeps the existing hash form
+  (`hash_v = 1`); `org_id` is not covered by that hash yet, so it is not
+  tamper-evident. Ledger verification refuses any other `hash_v`, and the
+  store refuses to open, or append to, a ledger whose newest row has a newer
+  `hash_v` than this build writes (a rollback fence). No tool and no
+  permission changes.
+- Procedure schema parts: a part that runs a Rust function once, records its
+  version, arguments and the SQL it generated (`schema_procedures`), and
+  refuses a version or argument change under the same name. A `standalone` procedure runs outside
+  the shared migration transaction. `ua_store::org::tenant_part` builds the
+  part that gives a crate's tables `org_id` and its guard triggers.
+- A test that classifies every table for organization scoping and fails on
+  an unclassified one.
 
 ### Changed
 
+- `ua import python-hub` never copies a source `org_id` by column name, even
+  where the target has the column (`event_log`, the harness config tables).
+  Such rows are refused unless `--drop-org-scope` is given. Before this,
+  `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: a backup taken after `organization.v1.store` applied cannot be
+  restored by an earlier build, even with `--allow-newer`, because that build
+  sees `event_log` as an altered table and refuses. Older backups restore into
+  this build as before (see `docs/operations.md`).
 - Session profile names are neutral capability tiers. Older names are accepted
   only as aliases.
 - Acting as a human from the CLI requires an interactive confirmation. Each

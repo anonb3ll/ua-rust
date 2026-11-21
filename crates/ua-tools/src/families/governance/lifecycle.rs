@@ -363,7 +363,7 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
     if !token_ids.is_empty() {
         ledger::append(
             tx,
-            EventInput::new(
+            EventInput::new(ua_core::DEFAULT_ORG,
                 "agent.token.revoked",
                 json!({ "agent": agent, "token_ids": token_ids, "reason": "agent_retired", "revoked_at": at }),
             )
@@ -374,6 +374,7 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.oauth.sessions_revoked",
                 json!({
                     "identity": agent,
@@ -406,6 +407,7 @@ fn release_claims(tx: &mut WriteTx<'_>, agent: &str, who: &str, reason: &str) ->
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.task.claim_released",
                     json!({
                         "task_id": id,
@@ -597,7 +599,7 @@ async fn change(
                 payload["owner"] = json!(owner);
                 payload["revoked"] = revoked.clone().unwrap_or(Value::Null);
             }
-            ledger::append(tx, EventInput::new(CHANNEL, payload).by(who.clone()))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(who.clone()))?;
 
             // Stops on what the hub can reach. Runs are cancelled after commit.
             let mut stops = Vec::new();
@@ -639,7 +641,7 @@ async fn change(
         ctx.hub
             .db()
             .write_async(move |tx| {
-                ledger::append(tx, EventInput::new(CHANNEL, payload).by(by))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by))?;
                 Ok(())
             })
             .await?;

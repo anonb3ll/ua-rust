@@ -686,7 +686,12 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
                 }
                 ledger::append(
                     tx,
-                    EventInput::new("agent.state.resynced", json!({ "fts_indexes": names })).by(by),
+                    EventInput::new(
+                        ua_core::DEFAULT_ORG,
+                        "agent.state.resynced",
+                        json!({ "fts_indexes": names }),
+                    )
+                    .by(by),
                 )?;
                 Ok(())
             })
@@ -826,7 +831,7 @@ async fn evidence_append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
                     ),
                 ));
             }
-            let mut input = EventInput::new(channel, payload).by(label);
+            let mut input = EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(label);
             if let Some(k) = &stored_key {
                 input = input.dedupe(k.clone());
             }

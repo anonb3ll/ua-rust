@@ -492,6 +492,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.memory.saved",
             json!({
                 "id": id,
@@ -640,6 +641,7 @@ fn create(
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.memory.superseded",
                 json!({ "id": target.id, "superseded_by": id, "valid_to": valid_to, "actor": author }),
             )
@@ -657,6 +659,7 @@ fn create(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.memory.saved",
             json!({
                 "id": id,

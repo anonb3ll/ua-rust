@@ -403,7 +403,10 @@ async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value
             ctx.hub
                 .db()
                 .write_async(move |tx| {
-                    ledger::append(tx, EventInput::new("agent.git.worktrees_cleaned", payload).by(by))?;
+                    ledger::append(
+                        tx,
+                        EventInput::new(ua_core::DEFAULT_ORG, "agent.git.worktrees_cleaned", payload).by(by),
+                    )?;
                     Ok(())
                 })
                 .await?;

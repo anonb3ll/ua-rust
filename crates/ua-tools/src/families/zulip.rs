@@ -595,7 +595,10 @@ fn begin_send(
         // A blocked topic may hold what the gates refused: keep it out.
         checked["topic"] = Value::Null;
     }
-    ledger::append(tx, EventInput::new("agent.zulip.send_checked", checked).by(caller.label.clone()))?;
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.zulip.send_checked", checked).by(caller.label.clone()),
+    )?;
     if !p.findings.is_empty() {
         let shown: Vec<&Value> = p.findings.iter().take(gates::MAX_FINDINGS_SHOWN).collect();
         return Ok(Err(UaError::denied(
@@ -645,6 +648,7 @@ fn begin_send(
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.zulip.sending",
             p.event(json!({ "send_id": send_id, "approval_id": approval_id })),
         )
@@ -710,7 +714,7 @@ async fn zulip_send_message(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     channel,
                     pp.event(json!({
                         "send_id": send_id, "approval_id": approval_id, "http_status": http_status,
@@ -821,7 +825,7 @@ async fn zulip_resolve_send(ctx: ToolCtx, a: ResolveArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.zulip.resolved",
                     json!({
                         "send_id": a.send_id, "previous_status": previous, "outcome": a.outcome.trim(),
@@ -1001,6 +1005,7 @@ async fn zulip_fetch_messages(ctx: ToolCtx, a: FetchArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.zulip.fetched",
                     json!({
                         "agent": &by,

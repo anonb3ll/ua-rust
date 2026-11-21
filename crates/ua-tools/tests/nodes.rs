@@ -29,6 +29,7 @@ fn caller(label: &str, kind: ActorKind) -> Caller {
         enforce_profile: true,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

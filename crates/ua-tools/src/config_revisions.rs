@@ -477,6 +477,7 @@ fn record(tx: &mut WriteTx<'_>, n: NewRevision<'_>) -> UaResult<Value> {
     let event = ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             CHANNEL,
             json!({
                 "schema": 1,

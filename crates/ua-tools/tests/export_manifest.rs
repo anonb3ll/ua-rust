@@ -40,6 +40,7 @@ fn caller(label: &str, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some(format!("{label}-key")),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 

@@ -18,6 +18,9 @@
    versioned name such as `"memory.v1"`. Use `CREATE TABLE IF NOT EXISTS`.
    Never edit a released part; add `"memory.v2"` instead. Tables shared by
    several families (tasks, agents, agent_sessions) live in `core_schema.rs`.
+   Classify every new table in `crates/ua-tools/tests/org_classification.rs`
+   (see `docs/organization.md`, Scoping per subsystem); an unclassified table
+   fails that test.
 3. Tools: one argument struct per tool deriving `Deserialize` and
    `JsonSchema` with `#[serde(deny_unknown_fields)]`. Document each field with
    a `///` comment: it becomes the schema description agents read.

@@ -160,7 +160,12 @@ pub(crate) fn issue_agent_token(
         )?;
         ua_store::ledger::append(
             tx,
-            ua_store::EventInput::new("agent.token.issued", serde_json::json!({ "agent": label })).by(by),
+            ua_store::EventInput::new(
+                ua_core::DEFAULT_ORG,
+                "agent.token.issued",
+                serde_json::json!({ "agent": label }),
+            )
+            .by(by),
         )?;
         Ok(())
     })?;
@@ -595,6 +600,7 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
                                     ua_store::ledger::append(
                                         tx,
                                         ua_store::EventInput::new(
+                                            ua_core::DEFAULT_ORG,
                                             "agent.token.revoked",
                                             serde_json::json!({ "agent": label }),
                                         )

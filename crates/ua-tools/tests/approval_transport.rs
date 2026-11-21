@@ -22,6 +22,7 @@ fn agent() -> Caller {
         profile: Profile::Developer,
         enforce_profile: true,
         session_key: None,
+        org_id: ua_core::DEFAULT_ORG.into(),
         transport: Transport::Mcp,
     }
 }
@@ -33,6 +34,7 @@ fn human(transport: Transport) -> Caller {
         profile: Profile::Coordinator,
         enforce_profile: true,
         session_key: None,
+        org_id: ua_core::DEFAULT_ORG.into(),
         transport,
     }
 }

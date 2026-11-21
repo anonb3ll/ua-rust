@@ -958,7 +958,10 @@ async fn record_decision_routed(
     let res = hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new("agent.gateway.decision", payload).by(originator))?;
+            ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.gateway.decision", payload).by(originator),
+            )?;
             Ok(())
         })
         .await;
