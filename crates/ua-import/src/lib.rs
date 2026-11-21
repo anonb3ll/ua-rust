@@ -45,7 +45,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::ledger::{self, GENESIS_HASH, VerifyReport};
-use ua_store::{Db, SchemaPart};
+use ua_store::{Db, Part, SchemaPart};
 
 use map::{Kind, LEDGER_COLUMNS, MAPS, Ref, TableMap};
 
@@ -53,9 +53,9 @@ use map::{Kind, LEDGER_COLUMNS, MAPS, Ref, TableMap};
 pub const SCHEMA: SchemaPart = ua_store::schema::IMPORT_SCHEMA;
 
 /// Every ua-rust schema part plus the import bookkeeping table.
-pub fn schema_parts() -> Vec<SchemaPart> {
+pub fn schema_parts() -> Vec<Part> {
     let mut parts = ua_tools::schema_parts();
-    parts.push(SCHEMA);
+    parts.push(SCHEMA.into());
     parts
 }
 
