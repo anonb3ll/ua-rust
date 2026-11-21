@@ -689,3 +689,40 @@ fn the_loopback_test_hook_widens_only_addresses_schemes_hosts_and_ports() {
     assert!(hooked.check_url(&Url::parse("http://127.0.0.1:9/").unwrap()).is_ok());
     assert!(hooked.check_url(&Url::parse("http://10.0.0.1/").unwrap()).is_err());
 }
+
+#[tokio::test]
+async fn a_same_origin_hop_after_a_return_stays_stripped() {
+    // A -> B -> A (/back) -> A (/again): the last hop is within A, but the
+    // chain left A once, so it still carries no caller header.
+    let to_b: Arc<Mutex<String>> = Arc::default();
+    let to_a: Arc<Mutex<String>> = Arc::default();
+    let (tb, ta) = (to_b.clone(), to_a.clone());
+    let a = Server::start(move |req| {
+        if req.starts_with("GET /start ") {
+            redirect(302, &tb.lock().unwrap())
+        } else if req.starts_with("GET /back ") {
+            redirect(302, "/again")
+        } else {
+            ok("again")
+        }
+    })
+    .await;
+    let b = Server::start(move |_| redirect(302, &ta.lock().unwrap())).await;
+    *to_b.lock().unwrap() = b.url("/bounce").to_string();
+    *to_a.lock().unwrap() = a.url("/back").to_string();
+
+    let out = Outbound::new(Policy { max_redirects: 4, ..LOCAL }).unwrap();
+    let req = Request::get(a.url("/start"))
+        .header("X-Custom-Auth", "hunter2")
+        .unwrap()
+        .secret_header("Authorization", "Bearer s3cr3t")
+        .unwrap();
+    let resp = out.send(req).await.unwrap();
+    assert_eq!(resp.url().path(), "/again");
+    let seen = a.seen();
+    for path in ["/back", "/again"] {
+        let r = seen.iter().find(|r| r.starts_with(&format!("GET {path} "))).unwrap().to_ascii_lowercase();
+        assert!(!r.contains("hunter2") && !r.contains("x-custom-auth"), "{path}: {r}");
+        assert!(!r.contains("s3cr3t") && !r.contains("authorization"), "{path}: {r}");
+    }
+}

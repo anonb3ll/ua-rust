@@ -321,7 +321,10 @@ from its commit history.
     `Accept-Language`, are not sent once a redirect chain changes origin,
     where before they were dropped only when the host changed (a change of
     scheme or port kept them); a credentialled endpoint URL is refused;
-  - Zulip, the relay and Slack: nothing beyond the first item. None of them
+  - Slack Socket Mode's `apps.connections.open` call is now pinned to its
+    one host: the `slack.web_api` policy accepts only `https://slack.com` on
+    the default port (before, only the hard-coded base URL kept it there);
+  - Zulip and the relay: nothing beyond the first item. None of these
     follows redirects, before or now.
 
 ### Security
