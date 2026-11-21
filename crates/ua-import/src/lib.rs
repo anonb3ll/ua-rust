@@ -265,6 +265,7 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
     let mut cleared_runs = 0u64;
     let mut cleared_run_ids = Vec::new();
     let mut cleared_branches = 0u64;
+    let src_has_sqlite_sequence = has_sqlite_sequence(&src)?;
     for map in MAPS {
         let idx = report
             .tables
@@ -289,6 +290,9 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             cleared_branches += eff.binding_branches_cleared;
             if let Some(sr) = map.self_ref {
                 fix_self_ref(&src, db, map, sr)?;
+            }
+            if src_has_sqlite_sequence {
+                carry_sqlite_sequence(&src, db, map)?;
             }
         }
         copied_any |= rep.copied > 0;
@@ -1111,6 +1115,72 @@ fn fix_self_ref(src: &Connection, db: &Db, map: &TableMap, sr: Ref) -> anyhow::R
         Ok(())
     })
     .with_context(|| format!("restoring {}.{}", map.target, sr.col))
+}
+
+fn has_sqlite_sequence(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// Raise a non-ledger target AUTOINCREMENT table's `sqlite_sequence` counter
+/// to at least the source's counter so post-cutover inserts never reuse a
+/// deleted or skipped id (for example, a deleted task id still referenced by
+/// an active `task_holds.root_task_id`, or a skipped approval id).
+///
+/// Never touches `event_log`, never lowers an existing target sequence or
+/// `MAX(rowid)`, never creates duplicate `sqlite_sequence` rows, and skips
+/// target tables that do not use `AUTOINCREMENT`.
+fn carry_sqlite_sequence(src: &Connection, db: &Db, map: &TableMap) -> anyhow::Result<()> {
+    let source_seq: Option<i64> = src.query_row(
+        "SELECT MAX(seq) FROM sqlite_sequence WHERE name = ?1 AND typeof(seq) = 'integer'",
+        [map.source],
+        |r| r.get(0),
+    )?;
+    let Some(source_seq) = source_seq.filter(|&s| s > 0) else {
+        return Ok(());
+    };
+    db.write(|tx| {
+        let target_is_autoinc: bool = tx
+            .query_row(
+                "SELECT COALESCE(upper(sql), '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [map.target],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|sql| sql.contains("AUTOINCREMENT") && !sql.contains("WITHOUT ROWID"));
+        if !target_is_autoinc {
+            return Ok(());
+        }
+        let max_rowid: i64 =
+            tx.query_row(&format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", q(map.target)), [], |r| {
+                r.get(0)
+            })?;
+        let (existing_seq, row_count): (Option<i64>, i64) = tx.query_row(
+            "SELECT MAX(seq), COUNT(*) FROM sqlite_sequence WHERE name = ?1",
+            [map.target],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let floor = existing_seq.unwrap_or(0).max(max_rowid);
+        if source_seq > floor {
+            if row_count == 0 {
+                tx.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    params![map.target, source_seq],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = ?2",
+                    params![source_seq, map.target],
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .with_context(|| format!("carrying sqlite_sequence for {}", map.target))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
