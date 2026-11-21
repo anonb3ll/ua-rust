@@ -4,8 +4,10 @@
 //!
 //! - accepts only `http` and `https`,
 //! - resolves the host and refuses it when any address is not public
-//!   (loopback, private, link-local and cloud metadata, CGNAT, multicast,
-//!   documentation and reserved ranges, and IPv6 forms that embed one),
+//!   (`ua_ingress::addr`: loopback, private, link-local and cloud metadata,
+//!   CGNAT, multicast, documentation and reserved ranges, IPv6 forms that
+//!   embed one, and the NAT64, 6to4 and IPv4-compatible forms whatever they
+//!   embed),
 //! - connects through a resolver that applies the same check, so a DNS answer
 //!   that changes between the check and the connection is refused too,
 //! - follows at most five redirects by hand, checking each hop again,
@@ -19,7 +21,7 @@
 //! reliably in-process, so PDFs come back as base64 with a note saying so.
 
 use std::error::Error as StdError;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -71,110 +73,13 @@ CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched ON web_search_cache(fetc
 // SSRF guard
 // ---------------------------------------------------------------------------
 
-/// Why `ip` must not be fetched, or `None` for a public address.
-pub fn non_public_reason(ip: IpAddr) -> Option<&'static str> {
-    match ip {
-        IpAddr::V4(v4) => v4_reason(v4),
-        IpAddr::V6(v6) => v6_reason(v6),
-    }
-}
-
-fn v4_reason(ip: Ipv4Addr) -> Option<&'static str> {
-    let o = ip.octets();
-    if o[0] == 0 {
-        return Some("unspecified");
-    }
-    if ip.is_loopback() {
-        return Some("loopback");
-    }
-    if ip.is_private() {
-        return Some("private");
-    }
-    if ip.is_link_local() {
-        return Some("link-local (includes cloud metadata)");
-    }
-    if o[0] == 100 && (o[1] & 0xC0) == 64 {
-        return Some("shared address space");
-    }
-    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
-        return Some("IETF protocol assignment");
-    }
-    if ip.is_documentation() {
-        return Some("documentation");
-    }
-    if o[0] == 198 && (o[1] & 0xFE) == 18 {
-        return Some("benchmarking");
-    }
-    if ip.is_multicast() {
-        return Some("multicast");
-    }
-    if o[0] >= 240 {
-        return Some("reserved");
-    }
-    None
-}
-
 /// The IPv4 destination an IPv6 address stands for (mapped, compatible,
-/// translated, NAT64 and 6to4 forms), judged instead of the wrapper.
-pub(crate) fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
-    let s = ip.segments();
-    let from = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return Some(v4);
-    }
-    if s[..6] == [0; 6] && !(s[6] == 0 && s[7] <= 1) {
-        return Some(from(s[6], s[7])); // ::a.b.c.d (deprecated compatible form)
-    }
-    if s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0 {
-        return Some(from(s[6], s[7])); // ::ffff:0:a.b.c.d (translated)
-    }
-    if s[0] == 0x64 && s[1] == 0xff9b && (s[2..6] == [0; 4] || s[2] == 1) {
-        return Some(from(s[6], s[7])); // NAT64, well-known and local-use
-    }
-    if s[0] == 0x2002 {
-        return Some(from(s[1], s[2])); // 6to4
-    }
-    None
-}
-
-fn v6_reason(ip: Ipv6Addr) -> Option<&'static str> {
-    if let Some(v4) = embedded_v4(ip) {
-        return v4_reason(v4);
-    }
-    let s = ip.segments();
-    if ip.is_unspecified() {
-        return Some("unspecified");
-    }
-    if ip.is_loopback() {
-        return Some("loopback");
-    }
-    if (s[0] & 0xfe00) == 0xfc00 {
-        return Some("unique local");
-    }
-    if (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xffc0) == 0xfec0 {
-        return Some("link-local");
-    }
-    if (s[0] & 0xff00) == 0xff00 {
-        return Some("multicast");
-    }
-    if (s[0] & 0xe000) != 0x2000 {
-        return Some("reserved");
-    }
-    if s[0] == 0x2001 && s[1] == 0x0db8 || s[0] == 0x3fff && s[1] < 0x1000 {
-        return Some("documentation");
-    }
-    if s[0] == 0x2001 && s[1] < 0x0200 {
-        return Some("IETF protocol assignment");
-    }
-    None
-}
-
-fn is_loopback(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-    }
-}
+/// translated, NAT64 and 6to4 forms).
+pub(crate) use ua_ingress::addr::embedded_v4;
+use ua_ingress::addr::is_loopback;
+/// Why `ip` must not be fetched, or `None` for a public address. The one
+/// classifier lives in `ua_ingress::addr`; this is a re-export of it.
+pub use ua_ingress::addr::non_public_reason;
 
 /// `Err` with the reason when `ip` may not be fetched.
 fn vet_ip(ip: IpAddr, allow_loopback: bool) -> Result<(), String> {
@@ -1016,6 +921,11 @@ mod tests {
         }
         for s in ["93.184.215.14", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
             assert!(non_public_reason(s.parse().unwrap()).is_none(), "{s} should be allowed");
+        }
+        // Refused since the classifier became the union with the OAuth one:
+        // NAT64, 6to4 and IPv4-compatible forms of a public address.
+        for s in ["64:ff9b::808:808", "2002:808:808::", "::8.8.8.8"] {
+            assert!(non_public_reason(s.parse().unwrap()).is_some(), "{s} should be refused");
         }
         assert!(vet_ip("127.0.0.1".parse().unwrap(), true).is_ok());
         assert!(vet_ip("10.0.0.1".parse().unwrap(), true).is_err());

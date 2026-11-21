@@ -7,9 +7,10 @@
 //! - the URL must be canonical `https` with a DNS host, a path, and no port,
 //!   credentials, query, fragment or dot segments; an optional host allowlist
 //!   (`oauth_cimd_allow`) narrows it further;
-//! - every address the host resolves to must be globally routable (no
-//!   loopback, private, link-local, CGNAT, documentation, multicast, IPv4
-//!   mapped or translated ranges), and the connection is pinned to the vetted
+//! - every address the host resolves to must be globally routable
+//!   (`ua_ingress::addr`: no loopback, private, link-local, CGNAT,
+//!   documentation, multicast or reserved ranges, and no IPv6 form that
+//!   embeds a non-public IPv4 address), and the connection is pinned to the vetted
 //!   address, so DNS rebinding cannot swap it afterwards;
 //! - no redirects, no proxy, a 5 s timeout and a 5 KiB body cap;
 //! - at most four fetches run at once;
@@ -19,7 +20,7 @@
 //! describe a public client (`token_endpoint_auth_method` `none`).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -131,48 +132,9 @@ pub fn validate_client_id_url(client_id: &str, allow: &[String]) -> Result<Strin
     Ok(host)
 }
 
-/// True only for globally routable unicast addresses.
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => is_public_v6(v6),
-    }
-}
-
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_multicast()
-        || o[0] == 0                                   // 0.0.0.0/8
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)        // 100.64.0.0/10 shared (CGNAT)
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // 192.0.0.0/24 protocol assignments
-        || (o[0] == 198 && (o[1] & 0xfe) == 18)        // 198.18.0.0/15 benchmarking
-        || o[0] >= 240) // 240.0.0.0/4 reserved
-}
-
-fn is_public_v6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_public_v4(v4);
-    }
-    let s = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (s[0] & 0xfe00) == 0xfc00                   // fc00::/7 unique local
-        || (s[0] & 0xffc0) == 0xfe80                   // fe80::/10 link-local
-        || (s[0] & 0xffc0) == 0xfec0                   // fec0::/10 site-local
-        || (s[0] == 0x2001 && s[1] == 0x0db8)          // documentation
-        || (s[0] == 0x2001 && s[1] == 0)               // Teredo
-        || s[0] == 0x2002                              // 6to4
-        || (s[0] == 0x64 && s[1] == 0xff9b)            // NAT64
-        || (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // discard
-        || s[..6] == [0, 0, 0, 0, 0, 0]) // IPv4-compatible and other ::/96
-}
+/// True only for globally routable unicast addresses. The one classifier
+/// lives in `ua_ingress::addr`; this is a re-export of it.
+pub use ua_ingress::addr::is_public as is_public_ip;
 
 /// Vet resolved addresses: every one must be public. Returns the address to
 /// pin the connection to.
@@ -334,6 +296,8 @@ async fn fetch(client_id: &str, host: &str) -> Result<Vec<u8>, CimdError> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     const ID: &str = "https://app.example.com/oauth/client.json";
@@ -398,6 +362,15 @@ mod tests {
         for ip in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_public_ip(ip), "{ip} is public");
+        }
+        // Refused since the classifier became the union with the web one:
+        // translated forms of non-public IPv4, the 3fff::/20 documentation
+        // range, IETF assignments in 2001::/23, and space outside 2000::/3.
+        for ip in
+            ["::ffff:0:127.0.0.1", "::ffff:0:10.0.0.1", "3fff::1", "2001:100::1", "4000::1", "::1:0:0:1"]
+        {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(ip), "{ip} must not be public");
         }
     }
 

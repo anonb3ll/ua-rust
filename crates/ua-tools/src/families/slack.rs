@@ -826,10 +826,9 @@ pub fn reply_text(command: &str, identity: &str, outcome: &UaResult<Value>) -> S
 
 // --- response_url --------------------------------------------------------------
 
-/// The only host a reply is posted to.
+/// The only host a reply is posted to (the host of
+/// [`ua_ingress::policy::SLACK_RESPONSE_URL`]).
 pub const RESPONSE_URL_HOST: &str = "hooks.slack.com";
-/// How long one reply may take, connect included.
-const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Slack's `response_url`, if it is safe to post to: `https`, exactly the
 /// host [`RESPONSE_URL_HOST`] on the default port, no user info, no fragment,
@@ -849,27 +848,26 @@ pub fn response_url(raw: &str) -> Option<url::Url> {
     .then_some(u)
 }
 
-/// Post `text` as an ephemeral reply to a checked [`response_url`]. The
-/// client is the web tools' guarded client: no redirects, no proxy, every
-/// resolved address must be public (loopback refused here whatever
-/// `fetch_allow_loopback` says), bounded by [`REPLY_TIMEOUT`]. The response
-/// body is never read. Errors are reason classes: `timeout`, `transport`,
-/// `status`.
-pub async fn post_reply(cfg: &Config, url: &url::Url, text: &str) -> Result<(), &'static str> {
+/// Post `text` as an ephemeral reply to a checked [`response_url`], through
+/// `ua_ingress::Outbound` under the `slack.response_url` policy: https to
+/// [`RESPONSE_URL_HOST`] only, no redirects, no proxy, every address the
+/// connection may reach must be public (loopback is refused whatever
+/// `fetch_allow_loopback` says, so the config changes nothing), 10 seconds for
+/// the whole call. The response body is never read. Errors are reason
+/// classes: `response_url_refused`, `timeout`, `transport`, `status`.
+pub async fn post_reply(_cfg: &Config, url: &url::Url, text: &str) -> Result<(), &'static str> {
+    use ua_ingress::{Outbound, OutboundError, Request, policy};
     if response_url(url.as_str()).is_none() {
         return Err("response_url_refused");
     }
-    let mut guarded = cfg.clone();
-    guarded.fetch_allow_loopback = false;
-    let client = crate::families::web::http_client(&guarded).map_err(|_| "transport")?;
+    let client = Outbound::new(policy::SLACK_RESPONSE_URL).map_err(|_| "transport")?;
     let body = json!({ "response_type": "ephemeral", "replace_original": false, "text": text });
-    let resp = client
-        .post(url.clone())
-        .timeout(REPLY_TIMEOUT)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport" })?;
+    let req = Request::post(url.clone()).json(&body).map_err(|_| "transport")?;
+    let resp = client.send(req).await.map_err(|e| match e {
+        OutboundError::Timeout => "timeout",
+        OutboundError::UrlRefused { .. } => "response_url_refused",
+        _ => "transport",
+    })?;
     if resp.status().is_success() { Ok(()) } else { Err("status") }
 }
 

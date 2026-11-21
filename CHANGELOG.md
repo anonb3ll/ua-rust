@@ -14,6 +14,19 @@ from its commit history.
 
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
+- Crate `ua-ingress` (`docs/ingress.md`): one address classifier
+  (`ua_ingress::addr`) and one guarded outbound HTTP client (`Outbound`)
+  built from a named policy per destination class. The client ignores proxy
+  settings, follows redirects only when the policy allows (checking every
+  hop), caps every body read, checks addresses at connect time through its
+  resolver and again on the connection's peer address, sends a secret header
+  only to the origin it was built for, and bounds connect, request and total
+  time. An unknown policy is refused. Slack slash-command replies are its
+  first consumer (policy `slack.response_url`); their refusals and failure
+  reasons (`response_url_refused`, `timeout`, `transport`, `status`) are
+  unchanged. A ratchet test counts `reqwest` client builders, address
+  classifiers and inbound delivery tables outside the crate; the counts may
+  only go down.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.
@@ -244,6 +257,20 @@ from its commit history.
   operator. A coordinator agent that read every mailbox to route work cannot
   any more; organization roles will replace that. What an unverified caller
   (auth enforcement off) can read in messaging is unchanged and under review.
+
+- The web tools' and the OAuth client-metadata fetch's address checks are
+  now one classifier that refuses the union of what each refused. Newly
+  refused by the web tools (`web_fetch`, `web_search`, Zulip, the relay's
+  GitHub client, GitHub REST, Slack replies and the Socket Mode `wss` host,
+  and the public scope of `mcp_gateway` servers, which already refused
+  these): IPv4-compatible IPv6 (`::a.b.c.d`), NAT64 (`64:ff9b::/32`) and 6to4
+  (`2002::/16`) addresses that embed a public IPv4 address. On an IPv6-only
+  network behind DNS64 and NAT64, IPv4-only sites are therefore refused.
+  Newly refused by the client-metadata fetch: translated IPv6
+  (`::ffff:0:a.b.c.d`) of a non-public IPv4 address, `3fff::/20`
+  (documentation), `2001::/23` beyond Teredo (IETF protocol assignments),
+  and every IPv6 address outside `2000::/3` not refused before. Nothing is
+  allowed that was refused before.
 
 ### Security
 

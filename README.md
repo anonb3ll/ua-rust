@@ -34,6 +34,7 @@ a rule is written once and holds for every client.
 | Crate | Holds |
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
+| `ua-ingress` | The boundary to other systems: the address classifier and the guarded outbound HTTP client with named destination policies ([docs/ingress.md](docs/ingress.md)) |
 | `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |

@@ -16,3 +16,5 @@ crates/ua-tools/src/families/web.rs      "100\.64\.0\.1"
 crates/ua-tools/tests/web.rs             "http://100\.64\.0\.1/"
 crates/ua-tools/src/families/mcp/scope.rs  100\.64\.0\.0/10|"100\.64\.0\.1"
 docs/mcp.md                              `100\.64\.0\.0/10`
+crates/ua-ingress/src/addr.rs           100\.64\.0\.0/10|"100\.64\.0\.1"|"100\.127\.255\.255"
+docs/ingress.md                          `100\.64\.0\.0/10`

@@ -1,0 +1,24 @@
+[package]
+name = "ua-ingress"
+description = "The ua-rust boundary to the outside world: one address classifier and one guarded outbound HTTP client with named destination policies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+# Depends on ua-core and third-party crates only. ua-tools and ua-server may
+# depend on this crate, never the other way (tests/dependencies.rs).
+[dependencies]
+ua-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url = "2.5"
+# The same TLS setup as ua-tools and ua-server: rustls with the ring provider
+# (no C toolchain). No new crate: all of these are already in Cargo.lock.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
