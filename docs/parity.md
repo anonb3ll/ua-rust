@@ -1,7 +1,8 @@
 # Parity with the Python hub
 
-> **Status: draft for the maintainer's review.** Nothing here is in force until
-> it is approved. The dispositions in the tables below are proposals.
+> **Status: draft for the maintainer's review.** The measure of parity (the
+> three levels below) and the dispositions marked "Approved" are decided. The
+> rest is proposed and not in force until the page is approved.
 
 ua-rust is the next version of the Python unified-agent hub, not a copy of it.
 This page says what "parity" means for that work, what is deliberately left
@@ -134,24 +135,25 @@ family's page under "Differences from the Python hub".
    README's lists are updated, the importer maps or excludes the family's
    tables, and no ratchet count went up.
 
-## Families still to bring over (proposed dispositions)
+## Families still to bring over
 
-Taken from the README's "Not yet ported" list. These are proposals for review.
+Taken from the README's "Not yet ported" list. A disposition is a proposal
+unless the last column says it is approved.
 
-| Family | Proposed | Note |
-|---|---|---|
-| Queue-health and node-session routes the SDK calls | Keep | Contract the SDK already depends on |
-| Session-handoff failover | Keep | Completes a family that is otherwise in |
-| Native-session resume and adopt | Redesign | On the node work queue and its fences, not a separate path |
-| Discovered native sessions | Defer | Waits for the redesign above |
-| GitHub writes (labels, held pull requests, the app installation flow) | Merge | Into the relay's approved-write path; one gate for every outbound write |
-| Slack interactions, bot-token posting and live chat | Redesign | Outbound through the relay's gates; inbound through the one delivery table |
-| Role workflows | Redesign | On organization roles once memberships exist, not on profiles |
-| Provenance graph and evidence export | Redesign | Derived from the ledger, with the manifest's hash checks |
-| Billing and usage ledgers | Redesign | Scoped by organization; waits for the organization keys |
-| Tenancy | In progress | The organization foundation is in; tables gain `org_id` slice by slice |
-| Cloud executors | Defer | Waits for the dispatch contract and budgets |
-| Work products | Undecided | Needs a product decision before any disposition |
+| Family | Disposition | Note | State |
+|---|---|---|---|
+| Queue-health and node-session routes the SDK calls | Keep | Contract the SDK already depends on | Proposed |
+| Session-handoff failover | Keep | Completes a family that is otherwise in | Proposed |
+| Native-session resume and adopt | Redesign | On the node work queue and its fences, not a separate path | Proposed |
+| Discovered native sessions | Defer | Waits for the redesign above | Proposed |
+| GitHub writes (labels, held pull requests, the app installation flow) | Merge | Into the relay's approved-write path; one gate for every outbound write | Approved |
+| Slack interactions, bot-token posting and live chat | Redesign | Outbound through the relay's gates; inbound through the one delivery table | Proposed |
+| Role workflows | Redesign | On organization roles once memberships exist, not on profiles | Approved |
+| Provenance graph and evidence export | Redesign | Derived from the ledger, with the manifest's hash checks | Proposed |
+| Billing and usage ledgers | Redesign | Scoped by organization; waits for the organization keys | Proposed |
+| Tenancy | In progress | The organization foundation is in; tables gain `org_id` slice by slice | Under way |
+| Cloud executors | Defer | Waits for the dispatch contract and budgets | Proposed |
+| Work products | Redesign | As generic deliverables reviewed through task stages, not a port of the Python work-product tools | Approved |
 
 ## Overlaps to merge inside ua-rust
 
@@ -165,13 +167,7 @@ The port itself has copied some duplication. These are tracked the same way.
 | Most of the code living in `ua-tools` | New families go in their own crates; existing ones move out by family |
 | Tables without an organization key | A frozen list that may only shrink |
 
-## Open questions for the maintainer
+## Open question for the maintainer
 
-1. Is "capability, not tool count" the right measure, and should the README's
-   opening statement about keeping the Python tool contract be reworded to
-   match the three levels above?
-2. Are the proposed dispositions right, in particular merging GitHub writes
-   into the relay and redesigning role workflows on organization roles?
-3. Should a dropped tool keep answering with a clear refusal that names its
-   replacement, for one release, or simply not exist?
-4. Work products: port, redesign as generic deliverables, or drop?
+Should a dropped tool keep answering for one release with a clear refusal that
+names its replacement, or simply not exist? This is not decided yet.
