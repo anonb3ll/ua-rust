@@ -76,7 +76,7 @@ pub struct Policy {
     /// Redirects followed by hand, each hop checked against this policy
     /// again. With 0 a redirect response is returned as it is.
     pub max_redirects: u8,
-    /// Follow a redirect from https to http. No shipped policy does.
+    /// Follow a redirect from https to http. Only `WEB_PAGE` does.
     pub allow_scheme_downgrade: bool,
     /// Largest response body any read path returns.
     pub max_body_bytes: usize,
@@ -104,8 +104,70 @@ pub const SLACK_RESPONSE_URL: Policy = Policy {
     total_timeout: Duration::from_secs(10),
 };
 
+/// Slack Web API calls (`apps.connections.open` for Socket Mode): https to
+/// `slack.com` on the default port, public addresses, no redirects, a
+/// 16 KiB body, 15 seconds for the whole call.
+pub const SLACK_WEB_API: Policy = Policy {
+    name: "slack.web_api",
+    schemes: Schemes::HttpsOnly,
+    hosts: Hosts::Exactly(&["slack.com"]),
+    default_port_only: true,
+    addresses: Addresses::Public,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    max_body_bytes: 16 * 1024,
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(15),
+    total_timeout: Duration::from_secs(15),
+};
+
+/// `web_fetch`: any public http or https page. Up to five redirects, each
+/// hop checked again; a redirect from https to http is followed, because
+/// the tool sends no credentials and may fetch plain http pages directly.
+/// A 2 MB body (cut, not refused), 20 seconds a request, 45 for the call.
+pub const WEB_PAGE: Policy = Policy {
+    name: "web.page",
+    schemes: Schemes::HttpOrHttps,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::Public,
+    max_redirects: 5,
+    allow_scheme_downgrade: true,
+    max_body_bytes: 2 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(20),
+    total_timeout: Duration::from_secs(45),
+};
+
+/// `web_search` providers (DuckDuckGo, Brave, Tavily): as [`WEB_PAGE`], but
+/// a redirect from https to http is refused, since requests may carry an
+/// API key.
+pub const WEB_SEARCH: Policy = Policy { name: "web.search", allow_scheme_downgrade: false, ..WEB_PAGE };
+
+/// The Zulip REST API at the configured site: https, any host (the site
+/// comes from config and is pinned by the caller), public addresses, no
+/// redirects, a 4 MiB body, 20 seconds for the call.
+pub const ZULIP_API: Policy = Policy {
+    name: "zulip.api",
+    schemes: Schemes::HttpsOnly,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::Public,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    max_body_bytes: 4 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(20),
+    total_timeout: Duration::from_secs(20),
+};
+
+/// The relay's GitHub REST calls at the configured API base: as
+/// [`ZULIP_API`] with a 256 KiB body.
+pub const RELAY_GITHUB: Policy = Policy { name: "relay.github", max_body_bytes: 256 * 1024, ..ZULIP_API };
+
 /// Every named policy.
-pub const POLICIES: &[&Policy] = &[&SLACK_RESPONSE_URL];
+pub const POLICIES: &[&Policy] =
+    &[&SLACK_RESPONSE_URL, &SLACK_WEB_API, &WEB_PAGE, &WEB_SEARCH, &ZULIP_API, &RELAY_GITHUB];
 
 /// The policy called `name`. An unknown name is refused.
 pub fn lookup(name: &str) -> Result<&'static Policy, OutboundError> {
@@ -118,6 +180,21 @@ const MAX_TIMEOUT_CEILING: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS_CEILING: u8 = 10;
 
 impl Policy {
+    /// The policy under a loopback test hook (`fetch_allow_loopback`, the
+    /// Slack test API base): loopback admitted besides public addresses,
+    /// plain http allowed, any host and port. Everything else is unchanged.
+    /// Only test configuration reaches this; TOML and the environment
+    /// cannot set those hooks.
+    pub const fn loopback_test_hook(self) -> Policy {
+        Policy {
+            schemes: Schemes::HttpOrHttps,
+            hosts: Hosts::Any,
+            default_port_only: false,
+            addresses: Addresses::PublicOrLoopback,
+            ..self
+        }
+    }
+
     /// Refuse a policy that is empty or unbounded.
     pub(crate) fn validate(&self) -> Result<(), OutboundError> {
         let bad = |why: &'static str| Err(OutboundError::InvalidPolicy { policy: self.name, why });

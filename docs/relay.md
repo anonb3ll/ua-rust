@@ -135,8 +135,9 @@ with `managed_secret_set`, and set `relay_github_secret = "relay-github"`.
 The token is decrypted in-process at send time and sent only as the
 `Authorization` header. The target is `owner/repo#123`; the comment is
 `POST /repos/{owner}/{repo}/issues/{number}/comments`, which covers issues and
-pull requests. Requests use the web family's client: no redirects, no proxy,
-a 20-second timeout, and non-public addresses refused.
+pull requests. Requests go through `ua_ingress::Outbound` under the
+`relay.github` policy ([ingress.md](ingress.md)): no redirects, no proxy, 20
+seconds, a 256 KiB reply, and non-public addresses refused at connect time.
 
 Outcomes:
 

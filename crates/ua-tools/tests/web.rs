@@ -383,3 +383,12 @@ async fn search_reports_bot_challenges_and_bad_providers() {
     let err = env.call("web_search", json!({ "query": "x" })).await.unwrap_err();
     assert_eq!(reason(&err), "ssrf_blocked");
 }
+
+#[tokio::test]
+async fn credentials_in_the_url_are_refused_before_any_request() {
+    let srv = spawn_server().await;
+    let env = env_with(|c| c.fetch_allow_loopback = true);
+    let err = env.fetch(&format!("http://user:pw@{}/article", srv.addr)).await.unwrap_err();
+    assert_eq!(err.code(), "invalid_argument", "{err}");
+    assert!(err.to_string().contains("credentials in the URL"), "{err}");
+}

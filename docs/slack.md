@@ -351,9 +351,9 @@ id or trigger id across both, so one that arrives on each runs once.
 ### How it works
 
 1. The hub POSTs `https://slack.com/api/apps.connections.open` with the token
-   in the `Authorization` header, through the guarded web client (no
-   redirects, no proxy, public addresses only; the response is read up to
-   16 KiB). It answers a one-time `wss://` URL.
+   in the `Authorization` header, through `ua_ingress::Outbound` under the
+   `slack.web_api` policy (https to `slack.com` only, no redirects, no proxy,
+   public addresses only, 15 seconds; the response is read up to 16 KiB). It answers a one-time `wss://` URL.
 2. The URL must be `wss`, on `slack.com` or a subdomain, on the default port,
    with no user info; otherwise it is refused and the hub retries later. The
    first refusal of each reason is ledgered as `agent.slack.socket.url_refused`

@@ -70,9 +70,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // bind or host checks in `observability.rs` (2) and `vault/obsidian.rs`
     // (1).
     ("ua-tools", "inline_address_check", 11),
-    // `web::http_client`, `github::client`, `mcp::gateway`, `notify`,
-    // `vault::obsidian`.
-    ("ua-tools", "client_builder", 5),
+    // `github::client`, `mcp::gateway`, `notify`, `vault::obsidian`
+    // (`web::http_client` is gone: its consumers use `Outbound`).
+    ("ua-tools", "client_builder", 4),
     // `github_deliveries`, `github_delivery_bodies` (github/mod.rs) and
     // `slack_seen_signatures`, `slack_seen_deliveries` (slack.rs).
     ("ua-tools", "delivery_table", 4),

@@ -11,7 +11,7 @@
 //!   chain leaves it, every later hop (a return included) carries only
 //!   `accept` and `accept-language`, a 307 or
 //!   308 that would resend the body to another origin is refused, and so is
-//!   a hop from https to http unless the policy allows it (none does).
+//!   a hop from https to http unless the policy allows it (only `web.page`).
 //! - **A body cap** on every read path of a [`Response`].
 //! - **A connect-time address check.** The client's DNS resolver classifies
 //!   every address a name resolves to and fails the lookup when any one is
@@ -68,15 +68,35 @@ pub enum OutboundError {
         policy: &'static str,
         why: &'static str,
     },
-    /// An address the request would reach, or did reach, is outside the
-    /// policy's address class.
+    /// An address the request would reach is outside the policy's address
+    /// class (an IP-literal host, or a name that resolves there). Nothing
+    /// was sent.
     AddressRefused {
         host: String,
         ip: IpAddr,
         reason: &'static str,
     },
+    /// The name could not be resolved (`why`: the resolver's error, or
+    /// `timed out`, or `no address`). Nothing was sent.
+    Lookup {
+        host: String,
+        why: String,
+    },
+    /// No connection was made, or the request could not be built, so
+    /// nothing was sent. `timed_out` when the connect timed out.
+    NotSent {
+        why: String,
+        timed_out: bool,
+    },
+    /// The connection that carried the response reached a peer outside the
+    /// policy's address class. The request was sent.
+    PeerRefused {
+        host: String,
+        ip: IpAddr,
+        reason: &'static str,
+    },
     /// The connection's peer address could not be read, so it could not be
-    /// checked.
+    /// checked. The request was sent.
     Unverified,
     /// A header was refused (a credential-like name passed as a plain header,
     /// or a value that is not a valid header).
@@ -103,6 +123,11 @@ impl std::fmt::Display for OutboundError {
             Self::AddressRefused { host, ip, reason } => {
                 write!(f, "{host:?} resolves to {ip}, a non-public address ({reason})")
             }
+            Self::Lookup { host, why } => write!(f, "could not resolve host {host:?}: {why}"),
+            Self::NotSent { why, .. } => write!(f, "outbound request not sent: {why}"),
+            Self::PeerRefused { host, ip, reason } => {
+                write!(f, "the connection to {host:?} reached {ip}, a non-public address ({reason})")
+            }
             Self::Unverified => f.write_str("the connection's peer address could not be checked"),
             Self::HeaderRefused(why) => write!(f, "header refused: {why}"),
             Self::Redirect(why) => write!(f, "redirect refused: {why}"),
@@ -120,7 +145,9 @@ impl From<OutboundError> for ua_core::UaError {
     fn from(e: OutboundError) -> Self {
         let msg = e.to_string();
         match e {
-            OutboundError::AddressRefused { .. } => ua_core::UaError::denied("ssrf_blocked", msg),
+            OutboundError::AddressRefused { .. } | OutboundError::PeerRefused { .. } => {
+                ua_core::UaError::denied("ssrf_blocked", msg)
+            }
             OutboundError::UrlRefused { .. } => ua_core::UaError::denied("outbound_refused", msg),
             OutboundError::UnknownPolicy(_) | OutboundError::InvalidPolicy { .. } => {
                 ua_core::UaError::internal(msg)
@@ -147,6 +174,21 @@ impl std::fmt::Display for RefusedAtConnect {
 
 impl StdError for RefusedAtConnect {}
 
+/// A lookup that failed for another reason than the address check.
+#[derive(Debug)]
+struct LookupFailed {
+    host: String,
+    why: String,
+}
+
+impl std::fmt::Display for LookupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not resolve {:?}: {}", self.host, self.why)
+    }
+}
+
+impl StdError for LookupFailed {}
+
 fn error_chain(e: &dyn StdError) -> String {
     let mut s = e.to_string();
     let mut cur = e.source();
@@ -168,7 +210,13 @@ fn send_error(e: reqwest::Error) -> OutboundError {
         if let Some(r) = inner.downcast_ref::<RefusedAtConnect>() {
             return OutboundError::AddressRefused { host: r.host.clone(), ip: r.ip, reason: r.reason };
         }
+        if let Some(l) = inner.downcast_ref::<LookupFailed>() {
+            return OutboundError::Lookup { host: l.host.clone(), why: l.why.clone() };
+        }
         cur = inner.source();
+    }
+    if e.is_connect() || e.is_builder() {
+        return OutboundError::NotSent { why: error_chain(&e), timed_out: e.is_timeout() };
     }
     if e.is_timeout() {
         return OutboundError::Timeout;
@@ -205,15 +253,16 @@ impl reqwest::dns::Resolve for GuardedResolver {
         let (rule, timeout) = (self.addresses, self.timeout);
         let pending = (self.lookup)(&host);
         Box::pin(async move {
+            let failed = |host: &str, why: String| {
+                Err(Box::new(LookupFailed { host: host.to_string(), why }) as Box<dyn StdError + Send + Sync>)
+            };
             let addrs = match tokio::time::timeout(timeout, pending).await {
                 Ok(Ok(addrs)) => addrs,
-                Ok(Err(e)) => return Err(Box::new(e) as Box<dyn StdError + Send + Sync>),
-                Err(_) => {
-                    return Err(Box::new(io::Error::new(io::ErrorKind::TimedOut, "lookup timed out")) as _);
-                }
+                Ok(Err(e)) => return failed(&host, e.to_string()),
+                Err(_) => return failed(&host, "timed out".into()),
             };
             if addrs.is_empty() {
-                return Err(Box::new(io::Error::new(io::ErrorKind::NotFound, "no address")) as _);
+                return failed(&host, "no address".into());
             }
             for a in &addrs {
                 if let Err(reason) = rule.check(a.ip()) {
@@ -275,6 +324,11 @@ fn header_parts(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), Ou
 impl Request {
     pub fn new(method: Method, url: Url) -> Self {
         Self { method, url, headers: HeaderMap::new(), secrets: Vec::new(), body: None }
+    }
+
+    /// The URL the request was built for.
+    pub fn url(&self) -> &Url {
+        &self.url
     }
 
     pub fn get(url: Url) -> Self {
@@ -454,7 +508,7 @@ impl Outbound {
             }
             let resp = rb.send().await.map_err(send_error)?;
             let remote = (self.peer_of)(&resp).ok_or(OutboundError::Unverified)?;
-            self.policy.addresses.check(remote.ip()).map_err(|reason| OutboundError::AddressRefused {
+            self.policy.addresses.check(remote.ip()).map_err(|reason| OutboundError::PeerRefused {
                 host: req.url.host_str().unwrap_or_default().to_string(),
                 ip: remote.ip(),
                 reason,
@@ -487,9 +541,10 @@ impl Outbound {
         status: StatusCode,
         location: Option<&str>,
     ) -> Result<(), OutboundError> {
-        let loc = location
-            .ok_or_else(|| OutboundError::Redirect(format!("HTTP {} without a Location", status.as_u16())))?;
-        let next = req.url.join(loc).map_err(|_| OutboundError::Redirect("bad Location".into()))?;
+        let loc = location.ok_or_else(|| {
+            OutboundError::Redirect(format!("HTTP {} without a Location header", status.as_u16()))
+        })?;
+        let next = req.url.join(loc).map_err(|_| OutboundError::Redirect("bad redirect target".into()))?;
         if req.url.scheme() == "https" && next.scheme() == "http" && !self.policy.allow_scheme_downgrade {
             return Err(OutboundError::Redirect("refusing a redirect from https to http".into()));
         }
@@ -558,6 +613,13 @@ impl Response {
 
     /// The whole body, or [`OutboundError::TooLarge`] past the cap.
     pub async fn bytes(self) -> Result<Vec<u8>, OutboundError> {
+        Ok(self.read(true).await?.bytes)
+    }
+
+    /// The whole body, or [`OutboundError::TooLarge`] past `limit` (or the
+    /// policy's cap, whichever is smaller).
+    pub async fn bytes_within(mut self, limit: usize) -> Result<Vec<u8>, OutboundError> {
+        self.cap = self.cap.min(limit);
         Ok(self.read(true).await?.bytes)
     }
 

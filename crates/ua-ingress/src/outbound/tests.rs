@@ -197,11 +197,16 @@ async fn one_bad_address_poisons_the_whole_answer() {
 }
 
 #[tokio::test]
-async fn a_failed_lookup_is_a_transport_error() {
+async fn a_failed_lookup_is_a_lookup_error() {
     let policy = Policy { hosts: Hosts::Exactly(&["other.test"]), ..LOCAL };
     let out = Outbound::with_lookup(policy, fake_lookup("svc.test", vec![])).unwrap();
     let err = out.send(Request::get(Url::parse("http://other.test/").unwrap())).await.err().unwrap();
-    assert!(matches!(err, OutboundError::Transport(_)), "{err:?}");
+    assert!(matches!(err, OutboundError::Lookup { ref host, .. } if host == "other.test"), "{err:?}");
+    // An empty answer is a lookup failure too.
+    let policy = Policy { hosts: Hosts::Exactly(&["svc.test"]), ..LOCAL };
+    let out = Outbound::with_lookup(policy, fake_lookup("svc.test", vec![])).unwrap();
+    let err = out.send(Request::get(Url::parse("http://svc.test/").unwrap())).await.err().unwrap();
+    assert_eq!(err, OutboundError::Lookup { host: "svc.test".into(), why: "no address".into() });
 }
 
 // --- redirects -------------------------------------------------------------------
@@ -532,9 +537,22 @@ fn a_redirect_from_https_to_http_is_refused_unless_the_policy_allows_it() {
     let mut req = Request::get(Url::parse("https://a.example.com/start").unwrap());
     lax.follow(&mut req, &home, StatusCode::FOUND, Some("http://a.example.com/next")).unwrap();
     assert_eq!(req.url.scheme(), "http");
+    // Only `web.page` follows a downgrade: it carries no credentials, and
+    // its callers may fetch plain http pages directly anyway.
     for p in crate::policy::POLICIES {
-        assert!(!p.allow_scheme_downgrade, "{} allows a downgrade", p.name);
+        assert_eq!(p.allow_scheme_downgrade, p.name == "web.page", "{}", p.name);
     }
+    // A downgrade changes the origin, so it carries no caller header.
+    let page = Request::get(Url::parse("https://a.example.com/").unwrap())
+        .header("X-Trace", "t")
+        .unwrap()
+        .secret_header("Authorization", "Bearer x")
+        .unwrap();
+    assert_ne!(
+        Url::parse("http://a.example.com/").unwrap().origin(),
+        page.url().origin(),
+        "the scheme is part of the origin"
+    );
 }
 
 // --- the peer-address re-check ----------------------------------------------------------------
@@ -556,7 +574,7 @@ async fn a_peer_outside_the_class_is_refused_after_the_resolver_passed_it() {
     let url = Url::parse(&format!("http://svc.test:{}/", server.addr.port())).unwrap();
     let err = out.send(Request::get(url)).await.err().unwrap();
     assert!(
-        matches!(err, OutboundError::AddressRefused { reason: "loopback", ref host, .. } if host == "svc.test"),
+        matches!(err, OutboundError::PeerRefused { reason: "loopback", ref host, .. } if host == "svc.test"),
         "{err:?}"
     );
     // The check runs after the response head: the request did go out.
@@ -636,4 +654,38 @@ async fn a_chain_that_leaves_the_origin_never_brings_credentials_back() {
     assert!(!back.contains("s3cr3t") && !back.contains("authorization"), "{back}");
     let at_b = b.seen().join("\n").to_ascii_lowercase();
     assert!(!at_b.contains("hunter2") && !at_b.contains("s3cr3t"), "{at_b}");
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_not_sent() {
+    // Port 1 is privileged and never handed out, so nothing listens there.
+    let out = Outbound::new(LOCAL).unwrap();
+    let err = out.send(Request::get(Url::parse("http://127.0.0.1:1/").unwrap())).await.err().unwrap();
+    assert!(matches!(err, OutboundError::NotSent { timed_out: false, .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn bytes_within_takes_the_smaller_limit() {
+    let server = Server::start(|_| ok(&"y".repeat(500))).await;
+    let out = Outbound::new(LOCAL).unwrap();
+    let err = out.send(Request::get(server.url("/"))).await.unwrap().bytes_within(100).await.err().unwrap();
+    assert_eq!(err, OutboundError::TooLarge { limit: 100 });
+    let b = out.send(Request::get(server.url("/"))).await.unwrap().bytes_within(10_000).await.unwrap();
+    assert_eq!(b.len(), 500, "under both limits");
+}
+
+#[test]
+fn the_loopback_test_hook_widens_only_addresses_schemes_hosts_and_ports() {
+    let hooked = crate::policy::SLACK_WEB_API.loopback_test_hook();
+    assert_eq!(hooked.addresses, Addresses::PublicOrLoopback);
+    assert_eq!(
+        (hooked.schemes, hooked.hosts, hooked.default_port_only),
+        (Schemes::HttpOrHttps, Hosts::Any, false)
+    );
+    assert_eq!(
+        (hooked.max_redirects, hooked.allow_scheme_downgrade, hooked.max_body_bytes, hooked.total_timeout),
+        (0, false, 16 * 1024, Duration::from_secs(15))
+    );
+    assert!(hooked.check_url(&Url::parse("http://127.0.0.1:9/").unwrap()).is_ok());
+    assert!(hooked.check_url(&Url::parse("http://10.0.0.1/").unwrap()).is_err());
 }
