@@ -681,12 +681,11 @@ pub struct RevokeArgs {
 /// the revoked ids and their metadata, never a value.
 pub(crate) async fn session_credential_revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
     let who = super::verified_caller(&ctx.caller, "revoking session credentials")?;
-    if !Authz::new(ctx.hub.cfg()).holds(
-        &ctx.caller,
-        &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
-    ) {
-        return Err(UaError::denied("not_operator", "revoking session credentials is an operator action"));
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+        return Err(UaError::denied(
+            "not_operator",
+            "revoking session credentials is for an operator (a verified human)",
+        ));
     }
     let chosen =
         [a.credential_id.is_some(), a.item_id.is_some(), a.node.is_some()].iter().filter(|b| **b).count();

@@ -1061,14 +1061,10 @@ fn publish_payload(b: &Bundle) -> Value {
 
 async fn publish(ctx: ToolCtx, a: PublishArgs) -> UaResult<Value> {
     let who = verified_caller(&ctx.caller, "publishing a harness config bundle")?;
-    if !Authz::new(ctx.hub.cfg()).holds(
-        &ctx.caller,
-        &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
-    ) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
             "operator_required",
-            "publishing a harness config bundle is an operator action (a human or a lifecycle operator)",
+            "publishing a harness config bundle is for an operator (a verified human)",
         ));
     }
     let bundle = policy::validate(&a.bundle)?;

@@ -52,6 +52,7 @@ impl H {
     fn with(f: impl FnOnce(&mut Config)) -> Self {
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.human_identities = vec!["operator".into()];
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]);
         f(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry() }
     }
@@ -404,8 +405,12 @@ async fn a_credential_lapses_slides_and_is_revoked() {
     let off = Hub::new(cfg, h.hub.db().clone());
     assert_eq!(credentials::verify(&off, &value).unwrap_err().check, "flag_off");
 
-    // Operators revoke; nobody else does.
+    // Operators (verified humans) revoke; nobody else does, a lifecycle
+    // operator included.
     let e = h.manage(&lead(), "session_credential_revoke", json!({ "item_id": item })).await.unwrap_err();
+    assert_eq!(reason(&e), "not_operator");
+    let fleet = Caller { label: "fleet-bot".into(), ..lead() };
+    let e = h.manage(&fleet, "session_credential_revoke", json!({ "item_id": item })).await.unwrap_err();
     assert_eq!(reason(&e), "not_operator");
     let e = h.manage(&human(), "session_credential_revoke", json!({ "item_id": item, "node": NODE })).await;
     assert!(matches!(e, Err(UaError::InvalidArgument(_))));
