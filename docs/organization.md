@@ -29,8 +29,15 @@ here for memory columns, owners and defaults.
 - The classification test (`crates/ua-tools/tests/org_classification.rs`,
   until `ua-org` exists). It uses the classes in
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
-  as a hub table. Its list of tenant tables still missing `org_id` (today all
-  of them) is a temporary relaxation of the tenant check, and may only shrink.
+  as a hub table. **The test is the authority on classification**; the table
+  in that section is a copy kept in step with it. Two temporary relaxations
+  may only shrink: the tenant tables still missing `org_id` (all 68 today,
+  frozen as a baseline that a new table cannot join), and the grant tables
+  `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
+- The procedure checksum covers the part's name, `version` and arguments,
+  so a table added to a released tenant part is refused, not skipped.
+- A rollback fence: opening the store, and every append, refuses a ledger
+  whose newest row has a `hash_v` above the build's.
 
 Not yet: `Caller.org_id` and `Caller::system_for`, `EventInput` taking an
 `org_id`, the tenant parts, the label and launch-key indexes, the
@@ -442,9 +449,9 @@ backfills for exactly the listed tables, so the rules are written once.
 | Kind | Body | Checksum covers |
 |---|---|---|
 | `Static` | a `&'static str` of SQL | that SQL, as today |
-| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name and the `version` |
+| `Procedure` | a named Rust function and an explicit `version` number, run with a connection (and, if flagged `standalone`, outside the shared transaction) | the part name, the `version` and the procedure's static arguments (for a tenant part, its table list) |
 
-An applied procedure is checked by name and `version` only, because the SQL it
+An applied procedure is checked by name, `version` and arguments only, because the SQL it
 generates may depend on the database it ran on; that generated SQL is stored
 beside the checksum for audit and is never regenerated or compared on later
 starts. A procedure that changes must bump its `version`, which makes it a new
@@ -1107,7 +1114,9 @@ escaped text.
 ## Scoping per subsystem
 
 Every table is classified, and a test over `sqlite_master` fails on any table
-missing from `ua-org`'s classification list. For every **tenant** table it also
+missing from `ua-org`'s classification list. That list (today in
+`crates/ua-tools/tests/org_classification.rs`) is the authority; the table
+below is kept in step with it. For every **tenant** table it also
 checks, through `PRAGMA table_info`, that `org_id` exists and is `NOT NULL`,
 and that its `org_exists` and `org_immutable` triggers exist.
 

@@ -143,6 +143,19 @@ Key restore safeguards:
    with the same or a newer build. A backup taken before the part applied
    restores into a newer build as before, and the part applies on the next
    start.
+   **Rolling back a live database** (running an earlier binary on a database
+   a later build already upgraded) is different from a restore. An earlier
+   build from before `organization.v1.store` still starts and serves: it
+   ignores parts it does not know, and the new `event_log` columns have
+   defaults, so its writes succeed. But `ua doctor` and `system_doctor`
+   report the schema as degraded, with an extra part
+   (`organization.v1.store`) and a modified `event_log`. Treat that as a
+   temporary state: roll forward again as soon as you can, or restore a
+   backup taken before the upgrade (losing the writes made since). A build
+   that has `organization.v1.store` refuses to open, or to append to, a
+   ledger whose newest row has a newer `hash_v` than it writes, so once a
+   later build has written such rows, rolling back to it is refused with an
+   error naming both forms; run the later build instead.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when

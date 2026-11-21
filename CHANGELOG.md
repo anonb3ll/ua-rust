@@ -105,11 +105,13 @@ from its commit history.
   `hash_v` columns on `event_log`, in the schema part `organization.v1.store`.
   Every event belongs to `default` and keeps the existing hash form
   (`hash_v = 1`); `org_id` is not covered by that hash yet, so it is not
-  tamper-evident. Ledger verification refuses any other `hash_v`. No tool and
-  no permission changes.
+  tamper-evident. Ledger verification refuses any other `hash_v`, and the
+  store refuses to open, or append to, a ledger whose newest row has a newer
+  `hash_v` than this build writes (a rollback fence). No tool and no
+  permission changes.
 - Procedure schema parts: a part that runs a Rust function once, records its
-  version and the SQL it generated (`schema_procedures`), and refuses a
-  version change under the same name. A `standalone` procedure runs outside
+  version, arguments and the SQL it generated (`schema_procedures`), and
+  refuses a version or argument change under the same name. A `standalone` procedure runs outside
   the shared migration transaction. `ua_store::org::tenant_part` builds the
   part that gives a crate's tables `org_id` and its guard triggers.
 - A test that classifies every table for organization scoping and fails on
