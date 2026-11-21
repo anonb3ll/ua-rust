@@ -85,9 +85,31 @@ from its commit history.
   `@unified-agent/client`; not published), with workflows that typecheck,
   test and check codegen, and run the live conformance suite against a
   `ua serve` built from the commit.
+- Organization groundwork (`docs/organization.md`, `organization.v1`): the
+  `orgs` table with one seeded `default` organization, and `org_id` and
+  `hash_v` columns on `event_log`, in the schema part `organization.v1.store`.
+  Every event belongs to `default` and keeps the existing hash form
+  (`hash_v = 1`); `org_id` is not covered by that hash yet, so it is not
+  tamper-evident. Ledger verification refuses any other `hash_v`. No tool and
+  no permission changes.
+- Procedure schema parts: a part that runs a Rust function once, records its
+  version and the SQL it generated (`schema_procedures`), and refuses a
+  version change under the same name. A `standalone` procedure runs outside
+  the shared migration transaction. `ua_store::org::tenant_part` builds the
+  part that gives a crate's tables `org_id` and its guard triggers.
+- A test that classifies every table for organization scoping and fails on
+  an unclassified one.
 
 ### Changed
 
+- `ua import python-hub` never copies a source `org_id` by column name, even
+  where the target has the column (`event_log`, the harness config tables).
+  Such rows are refused unless `--drop-org-scope` is given. Before this,
+  `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: a backup taken after `organization.v1.store` applied cannot be
+  restored by an earlier build, even with `--allow-newer`, because that build
+  sees `event_log` as an altered table and refuses. Older backups restore into
+  this build as before (see `docs/operations.md`).
 - Session profile names are neutral capability tiers. Older names are accepted
   only as aliases.
 - Acting as a human from the CLI requires an interactive confirmation. Each

@@ -1,9 +1,41 @@
 # Organization model
 
-Status: **design, not implemented.** This document is the review gate for the
-`organization.*` schema parts and the `ua-org` crate. Nothing here is in the
-tree yet. Its companion is `docs/memory.md` (PR #40), which relies on the
-decisions recorded here for memory columns, owners and defaults.
+Status: **design, first infrastructure in the tree.** This document is the
+review gate for the `organization.*` schema parts and the `ua-org` crate. Its
+companion is `docs/memory.md` (PR #40), which relies on the decisions recorded
+here for memory columns, owners and defaults.
+
+`organization.v1` lands in several PRs rather than one. What is in the tree:
+
+- The `Procedure` part kind with `version` refusal and the `standalone` flag
+  ([Schema](#schema)). It departs from the wording below in one way:
+  `SchemaPart` stays the static kind, unchanged, and both kinds convert into
+  a `Part` that `schema::apply` takes, so existing static parts did not
+  change. A procedure's generated SQL is stored in a `schema_procedures`
+  table, created with the first procedure that runs, rather than in a column
+  of `schema_parts`, so an older database and an older backup keep exactly
+  the objects they had.
+- `organization.v1.store`: `orgs` (created without `IF NOT EXISTS`, so a
+  database holding another `orgs` table refuses the part), the seed, and
+  `event_log.org_id` and `event_log.hash_v`. Every row is written with
+  `hash_v = 1`, the nine-field form, which does **not** cover `org_id`: until
+  rows are written with `hash_v = 2`, a row's `org_id` can be changed without
+  `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
+- `ua_store::org::tenant_part`. It takes the full part name
+  (`organization.v1.<crate>`) rather than the owner alone, so the part stays a
+  constant. No table uses it yet.
+- `ua_core::DEFAULT_ORG`.
+- The importer exclusion: `org_id` is never mapped by column name.
+- The classification test (`crates/ua-tools/tests/org_classification.rs`,
+  until `ua-org` exists). It uses the classes in
+  [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
+  as a hub table. Its list of tenant tables still missing `org_id` (today all
+  of them) is a temporary relaxation of the tenant check, and may only shrink.
+
+Not yet: `Caller.org_id` and `Caller::system_for`, `EventInput` taking an
+`org_id`, the tenant parts, the label and launch-key indexes, the
+`memory_versions_capture` trigger, `hash_v = 2`, and everything after
+`organization.v1`.
 
 ## Decision
 

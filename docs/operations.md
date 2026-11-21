@@ -136,6 +136,13 @@ Key restore safeguards:
    under `--allow-newer`, including one added by a genuine newer build: the running
    build does not know that child table, so its writes to the known parent could fail
    or cascade. Restore such a backup with a build that knows that schema part.
+   **Upgrade note (`organization.v1.store`):** that part adds columns to the
+   existing `event_log` table. A backup taken after it applied cannot be
+   restored by a build from before it, even with `--allow-newer`: the older
+   build sees `event_log` as an altered known table and refuses. Restore it
+   with the same or a newer build. A backup taken before the part applied
+   restores into a newer build as before, and the part applies on the next
+   start.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when
