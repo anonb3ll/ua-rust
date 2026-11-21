@@ -3574,7 +3574,7 @@ mod tests {
         src_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
-                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -3620,7 +3620,7 @@ mod tests {
         src_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
-                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -3632,7 +3632,7 @@ mod tests {
         let (_adir, a_seed, a_db) = test_db();
         a_db.write(|tx| {
             tx.execute("INSERT INTO items (val) VALUES ('a-row')", [])?;
-            ledger::append(tx, EventInput::new("a.seed", json!({})))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "a.seed", json!({})))?;
             Ok(())
         })
         .unwrap();
@@ -3668,7 +3668,7 @@ mod tests {
         b_db.read(|_| {
             b_db.write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('hot-frame-row')", [])?;
-                ledger::append(tx, EventInput::new("b.hot", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "b.hot", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -3712,7 +3712,7 @@ mod tests {
         src_db
             .write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('clean-src')", [])?;
-                ledger::append(tx, EventInput::new("seed", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "seed", json!({})))?;
                 Ok(())
             })
             .unwrap();
@@ -3732,7 +3732,7 @@ mod tests {
             }
             b_db.write(|tx| {
                 tx.execute("INSERT INTO items (val) VALUES ('hot-frame-row')", [])?;
-                ledger::append(tx, EventInput::new("b.hot", json!({})))?;
+                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "b.hot", json!({})))?;
                 Ok(())
             })
             .unwrap();
