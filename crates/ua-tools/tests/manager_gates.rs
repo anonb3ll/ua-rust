@@ -545,8 +545,10 @@ async fn every_action_in_the_table_reaches_a_handler_arm() {
             let mut args = base_args(m.tool);
             args["action"] = json!(action);
             let call = e.call(&me, m.tool, args);
-            let out = tokio::time::timeout(std::time::Duration::from_secs(20), call).await;
-            if let Ok(Err(err)) = out {
+            let out = tokio::time::timeout(std::time::Duration::from_secs(20), call)
+                .await
+                .unwrap_or_else(|_| panic!("{}:{action} did not answer within 20s", m.tool));
+            if let Err(err) = out {
                 assert!(!err.to_string().contains("has no handler"), "{}:{action}: {err}", m.tool);
             }
         }
@@ -684,4 +686,179 @@ async fn a_plan_object_read_is_held_to_plan_get() {
     let e = env(None, |_| {});
     let a = e.plan(&me).await;
     e.call(&me, "platform_object_get", json!({ "kind": "plan", "id": a })).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// A mapped action is the same operation as its standalone tool
+
+/// What one hub was seeded with, for building arguments.
+struct Seed {
+    plan_id: String,
+    delegation_id: i64,
+    cycle_id: String,
+}
+
+async fn seed(e: &Env, me: &Caller) -> Seed {
+    let plan = e.call(me, "plan_create", json!({ "goal": "g", "steps": ["a", "b"] })).await.unwrap();
+    let lead = agent("lead-1", Profile::Developer);
+    let d = e.call(&lead, "delegate", json!({ "task_spec": SPEC, "to_agent": me.label })).await.unwrap();
+    let c =
+        e.call(me, "autonomous_cycle_start", json!({ "agent": me.label, "max_rework": 1 })).await.unwrap();
+    let cycle_id =
+        c["cycle_id"].as_str().or_else(|| c["cycle"]["id"].as_str()).unwrap_or_default().to_string();
+    assert!(!cycle_id.is_empty(), "{c}");
+    Seed {
+        plan_id: plan["plan_id"].as_str().unwrap().to_string(),
+        delegation_id: d["delegation_id"].as_i64().unwrap(),
+        cycle_id,
+    }
+}
+
+/// Arguments for each standalone tool a consolidated action runs: a call
+/// that succeeds where the seed allows, so the two doors' results compare.
+fn fixture(tool: &str, s: &Seed, me: &str) -> Value {
+    let (p, d, c) = (&s.plan_id, s.delegation_id, &s.cycle_id);
+    match tool {
+        "plan_create" => json!({ "goal": "g2", "steps": ["x"] }),
+        "plan_update" => json!({ "plan_id": p, "step_idx": 0, "note": "n" }),
+        "plan_get" | "plan_resume" | "plan_delete" => json!({ "plan_id": p }),
+        "plan_list" => json!({ "status": "all" }),
+        "plan_checkpoint" => json!({ "plan_id": p, "note": "n" }),
+        "plan_step_retry" => json!({ "plan_id": p, "step_idx": 0, "reason": "r" }),
+        "plan_step_claim" => json!({ "plan_id": p, "step_idx": 0 }),
+        "plan_handoff" => json!({ "plan_id": p, "step_idx": 0 }),
+        "delegate" => json!({ "task_spec": SPEC, "to_agent": "builder-9" }),
+        "delegate_list" => json!({ "status": "all" }),
+        "delegate_claim" => json!({ "id": d }),
+        "delegate_release" => json!({ "id": d }),
+        "delegate_cancel" => json!({ "id": d, "reason": "r" }),
+        "delegation_spec_check" => json!({ "task_spec": SPEC }),
+        "delegation_spec_template" => json!({}),
+        "delegation_spec_build" => json!({ "objective": "o", "auto_validate": false }),
+        "agent_activity" | "metrics_snapshot" | "check_anomalies" | "perf_summary" | "agent_list"
+        | "agent_context" => {
+            json!({})
+        }
+        "autonomous_cycle_start" => json!({ "agent": me, "max_rework": 1 }),
+        "autonomous_cycle_get" => json!({ "cycle_id": c }),
+        "autonomous_cycle_list" => json!({}),
+        "autonomous_cycle_kill" => json!({ "cycle_id": c, "agent": me, "reason": "r" }),
+        "autonomous_cycle_record_usage" => {
+            json!({ "cycle_id": c, "agent": me, "elapsed_s": 1.0, "tokens": 1, "retries": 0, "cost_cents": 0.0 })
+        }
+        "autonomous_cycle_transition" => {
+            json!({ "cycle_id": c, "to_state": "implement", "idempotency_key": "k-1", "agent": me })
+        }
+        "export_tasks" | "export_memory" | "export_journal" => json!({ "write_to_vault": false }),
+        other => panic!("no fixture for {other}: add one so its mapping is checked"),
+    }
+}
+
+/// A result's shape: its top-level keys, or the error code and the message
+/// with the hub's own ids replaced.
+fn shape(out: &Result<Value, UaError>, s: &Seed) -> String {
+    match out {
+        Ok(v) => match v.as_object() {
+            Some(o) => format!("ok {:?}", o.keys().collect::<Vec<_>>()),
+            None => format!("ok {v}"),
+        },
+        Err(e) => {
+            let msg = e
+                .to_string()
+                .replace(&s.plan_id, "<plan>")
+                .replace(&s.cycle_id, "<cycle>")
+                .replace(&s.delegation_id.to_string(), "<delegation>");
+            // The consolidated tool names the action in front of the error.
+            let core = msg.rsplit(": ").next().unwrap_or(&msg).to_string();
+            format!("err {} {core}", e.code())
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_mapped_action_is_the_same_operation_as_its_standalone_tool() {
+    let me = agent("coord-1", Profile::Coordinator);
+    for m in ua_tools::routes::MANAGERS {
+        for (action, target) in m.actions {
+            let ua_tools::routes::Target::Standalone(standalone) = target else { continue };
+            // The same argument struct: an unknown field is refused with the
+            // struct's whole field list.
+            let e = env(None, |_| {});
+            let probe = json!({ "__probe": true });
+            let direct = e.call(&me, standalone, probe.clone()).await.unwrap_err().to_string();
+            let routed = e.manage(&me, m.tool, action, probe).await.unwrap_err().to_string();
+            let fields = |m: &str| m.find("unknown field").map(|i| m[i..].to_string());
+            assert!(fields(&direct).is_some(), "{standalone}: {direct}");
+            assert_eq!(fields(&direct), fields(&routed), "{}:{action} -> {standalone}", m.tool);
+
+            // The same effect: each door on the same arguments in an
+            // identically seeded hub answers with the same shape.
+            let (a, b) = (env(None, |_| {}), env(None, |_| {}));
+            let (sa, sb) = (seed(&a, &me).await, seed(&b, &me).await);
+            let one = a.call(&me, standalone, fixture(standalone, &sa, &me.label)).await;
+            let two = b.manage(&me, m.tool, action, fixture(standalone, &sb, &me.label)).await;
+            assert_eq!(shape(&one, &sa), shape(&two, &sb), "{}:{action} -> {standalone}", m.tool);
+            // And the same state afterwards.
+            let after = |e: &Env| {
+                e.hub
+                    .db()
+                    .read(|c| {
+                        let n = |t: &str| -> i64 {
+                            c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap_or(-1)
+                        };
+                        Ok((
+                            n("plans"),
+                            n("plan_steps"),
+                            n("delegations"),
+                            n("autonomous_cycles"),
+                            n("event_log"),
+                        ))
+                    })
+                    .unwrap()
+            };
+            assert_eq!(after(&a), after(&b), "{}:{action} -> {standalone}: state differs", m.tool);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An alias spelling restricts, never permits
+
+#[tokio::test]
+async fn an_allow_written_as_a_manager_spelling_opens_nothing_else() {
+    // Under default deny, allows for plan_manage, plan_create and the
+    // spelling plan_manage:delete: a direct plan_delete stays refused, as it
+    // was before the spelling was read.
+    let yaml = "default_action: deny\nrules:\n  - {name: a, type: tool, tool: plan_manage, action: allow}\n  - {name: b, type: tool, tool: plan_create, action: allow}\n  - {name: c, type: tool, tool: \"plan_manage:delete\", action: allow}\n";
+    let e = env(Some(yaml), |_| {});
+    let me = dev();
+    let a = e.plan(&me).await;
+    let err = e.call(&me, "plan_delete", json!({ "plan_id": a })).await.unwrap_err();
+    assert_eq!(reason(&err), "default_deny", "{err}");
+    // The manager door is allowed by its own name, as before.
+    assert_eq!(
+        e.manage(&me, "plan_manage", "delete", json!({ "plan_id": a })).await.unwrap()["deleted"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn a_deny_written_either_way_holds_through_both_doors() {
+    for spelling in ["plan_delete", "plan_manage:delete"] {
+        let yaml = format!("rules:\n  - {{name: d, type: tool, tool: \"{spelling}\", action: deny}}\n");
+        let e = env(Some(&yaml), |_| {});
+        let me = dev();
+        let a = e.plan(&me).await;
+        let direct = e.call(&me, "plan_delete", json!({ "plan_id": a })).await.unwrap_err();
+        assert_eq!(reason(&direct), "policy_deny", "{spelling}: {direct}");
+        let routed = e.manage(&me, "plan_manage", "delete", json!({ "plan_id": a })).await.unwrap_err();
+        assert_eq!(reason(&routed), "policy_deny", "{spelling}: {routed}");
+    }
+    // A require_approval spelled the manager way parks either door, and does
+    // not count as a permission under default deny.
+    let yaml = "default_action: deny\nrules:\n  - {name: r, type: tool, tool: \"plan_manage:delete\", action: require_approval}\n";
+    let e = env(Some(yaml), |_| {});
+    let me = dev();
+    let err = e.call(&me, "plan_delete", json!({ "plan_id": "p" })).await.unwrap_err();
+    assert_eq!(reason(&err), "default_deny", "{err}");
 }

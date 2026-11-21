@@ -134,11 +134,25 @@ pub struct PolicyRule {
     pub require_episode: bool,
     pub bind: BTreeMap<String, String>,
     matcher: GlobMatcher,
+    /// The name a plain `tool:action` spelling reads as, when it differs.
+    alias: Option<String>,
 }
 
 impl PolicyRule {
     pub fn matches_tool(&self, tool: &str) -> bool {
         self.matcher.is_match(tool)
+    }
+
+    /// Whether this rule restricts `tool` only through its alias spelling
+    /// (`tool: plan_manage:delete` for `plan_delete`). Such a match takes
+    /// the rule's restrictive effect alone: an `allow` (a `tool` or
+    /// `threshold` allow) is skipped, and no alias match counts as a
+    /// permission rule against `default_action: deny`, so an upgrade that
+    /// reads the alias can tighten a policy but never loosen it.
+    fn restricts_alias(&self, tool: &str) -> bool {
+        self.alias.as_deref() == Some(tool)
+            && !(matches!(self.kind, RuleKind::Tool | RuleKind::Threshold)
+                && self.action == RuleAction::Allow)
     }
 
     /// False only for rules whose match can let a call through: a `tool`,
@@ -370,17 +384,16 @@ fn parse_rule(item: &Value) -> Result<PolicyRule, String> {
         }
     };
     let tool = str_of("tool", "*");
-    // A plain `tool:action` spelling of an action that has a standalone tool
-    // matches that tool, so the rule holds as meant (and is still flagged by
-    // `unknown_action_keys`).
-    let pattern = if crate::routes::is_plain_name(&tool) {
-        crate::routes::canonical_gate_name(&tool).into_owned()
-    } else {
-        tool.clone()
-    };
-    let matcher = Glob::new(&pattern)
+    let matcher = Glob::new(&tool)
         .map_err(|e| format!("policy rule {name:?}: invalid tool pattern {tool:?}: {e}"))?
         .compile_matcher();
+    // A plain `tool:action` spelling of an action that has a standalone tool
+    // (`plan_manage:delete` for `plan_delete`) also restricts that tool, so a
+    // deny, approval, role, threshold or limit holds as meant. It never
+    // permits it: see [`PolicyRule::restricts_alias`].
+    let alias = crate::routes::is_plain_name(&tool)
+        .then(|| crate::routes::canonical_gate_name(&tool).into_owned())
+        .filter(|c| *c != tool);
     let roles = match r.get("roles") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(s)) => {
@@ -436,6 +449,7 @@ fn parse_rule(item: &Value) -> Result<PolicyRule, String> {
         require_episode,
         bind,
         matcher,
+        alias,
         name,
     };
     validate_rule(&rule)?;
@@ -859,7 +873,8 @@ fn evaluate_with(
     if !policy.enabled {
         return Ok(Verdict::Allow);
     }
-    let tool_matched: Vec<&PolicyRule> = policy.rules.iter().filter(|r| r.matches_tool(tool)).collect();
+    let tool_matched: Vec<&PolicyRule> =
+        policy.rules.iter().filter(|r| r.matches_tool(tool) || r.restricts_alias(tool)).collect();
     if tool_matched.is_empty() && !default_deny {
         return Ok(Verdict::Allow);
     }
@@ -877,7 +892,7 @@ fn evaluate_with(
                 && (r.kind == RuleKind::Role || roles_apply(r, &who))
         })
         .collect();
-    let has_permission_rule = matching.iter().any(|r| r.kind != RuleKind::RateLimit);
+    let has_permission_rule = matching.iter().any(|r| r.kind != RuleKind::RateLimit && r.matches_tool(tool));
     if !has_permission_rule && default_deny {
         return Err(Refusal::new(
             "default_deny",

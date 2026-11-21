@@ -104,9 +104,13 @@ event of a refused call names the tool called in `tool` and the action in
 a different name; the call's `tool_calls` row carries `action_tool`.
 
 An `approval_tools` entry or a plain-named policy rule written
-`tool:action` for an action that has a standalone tool is read as that tool
-(`plan_manage:delete` gates `plan_delete`, through either door), and an
-alias spelling of an own action as its key. `system_doctor` still reports
+`tool:action` for an action that has a standalone tool also restricts that
+tool (`plan_manage:delete` gates `plan_delete`, through either door), and an
+alias spelling of an own action restricts its key. The reading only ever
+restricts: a `deny`, `require_approval`, `role`, `threshold`, rate limit or
+cooldown applies to the standalone tool too, while an `allow` stays literal
+(it allows the `plan_manage` door's `delete` key, nothing else), and an
+alias match never counts as a permission under `default_action: deny`. `system_doctor` still reports
 such a spelling, and a `tool:action` name that matches nothing, as
 `DEGRADED` (the policy file also logs a warning when it loads), naming the
 name to write.
@@ -120,7 +124,10 @@ Other tools that share a handler or a creation path with a differently
 named tool were checked: `handoff` (above) is the only second door to
 another tool's operation. The rest are distinct operations with their own
 names and gates: `graph_canvas_restore` writes a stored revision back and is
-gated as itself, separately from `graph_canvas_write`; `workflow_run`,
+gated as itself, separately from `graph_canvas_write`. The scene it writes
+once passed `graph_canvas_write`, but a deny on `graph_canvas_write` does
+not stop a restore, so to freeze canvases deny both (`tool:
+"graph_canvas_*"` covers them); `workflow_run`,
 `langgraph_run`, `langgraph_workflow_run` and `routine_fire` start
 different run kinds, and every step of a run is itself a governed call;
 `dispatch_resume` and `dispatch_task` gate in their handlers under their own

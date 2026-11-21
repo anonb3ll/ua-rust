@@ -159,7 +159,9 @@ from its commit history.
   `delegate`'s profile entry, policy rules and approval gate (a reviewer
   session could hand off what it may not delegate). A call with no `action`
   is gated as the tool's default action. A `tool:action` spelling of an
-  action that has a standalone tool (`plan_manage:delete`) gates that tool.
+  action that has a standalone tool (`plan_manage:delete`) restricts that
+  tool in `approval_tools` and restrictive policy rules; an `allow` so
+  spelled stays literal, so no existing policy is loosened.
   A plan object read through `platform_object_get` is also checked as
   `plan_get`. Upgrading: an approval for `delegation_manage` `create` or for
   `handoff` requested before the upgrade and not yet used bound the old
