@@ -1468,10 +1468,12 @@ async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path().join("home"));
     cfg.github_webhook_secret_value = Some(SECRET.to_string().into());
-    let new_parts = ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy"];
+    // Every part from the inbound table on (the Slack copy needs the table too).
+    let new_parts =
+        ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
-    assert_eq!(old.len() + 3, ua_tools::schema_parts().len());
+    assert_eq!(old.len() + new_parts.len(), ua_tools::schema_parts().len());
     let ping = json!({ "zen": "before the upgrade", "repository": { "full_name": REPO } });
     let hash = body_hash(&ping);
     let seen_at = ua_core::time::now();
@@ -1549,7 +1551,9 @@ fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::for_home(dir.path().join("home"));
     drop(Hub::open(cfg.clone()).unwrap());
-    let new_parts = ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy"];
+    // Every part from the inbound table on (the Slack copy needs the table too).
+    let new_parts =
+        ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
     assert!(ua_store::Db::open(&cfg.db_path(), &old).is_ok());

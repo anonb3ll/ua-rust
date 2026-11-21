@@ -339,7 +339,11 @@ async fn every_bad_signature_is_a_401_before_any_database_write() {
     settle(&h).await;
     assert_eq!(total_changes(&h).await, before, "a refused signature wrote to the database");
     assert_eq!(scalar(&h, "SELECT COUNT(*) FROM event_log").await, ledger_before);
-    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_signatures").await, 0);
+    assert_eq!(
+        scalar(&h, "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'request_sha'")
+            .await,
+        0
+    );
     assert_eq!(task_count(&h).await, 0);
 }
 
@@ -367,7 +371,11 @@ async fn a_replayed_signed_request_is_refused() {
     assert_eq!(again.status(), 401, "the same signed bytes are accepted once");
     settle(&h).await;
     assert_eq!(task_count(&h).await, 1);
-    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_signatures").await, 1);
+    assert_eq!(
+        scalar(&h, "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'request_sha'")
+            .await,
+        1
+    );
 }
 
 // --- url_verification -----------------------------------------------------------
@@ -406,7 +414,14 @@ async fn an_unmapped_user_is_refused_with_no_side_effects() {
     settle(&h).await;
     assert_eq!(task_count(&h).await, 0);
     assert_eq!(scalar(&h, "SELECT COUNT(*) FROM tool_calls").await, 0);
-    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_deliveries").await, 0);
+    assert_eq!(
+        scalar(
+            &h,
+            "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind IN ('event', 'trigger')"
+        )
+        .await,
+        0
+    );
     assert_eq!(scalar(&h, "SELECT COUNT(*) FROM event_log").await, ledger_before, "no ledger row");
     assert!(executed(&h).await.is_empty());
     assert!(events(&h, "agent.slack.request.accepted").await.is_empty());
@@ -685,7 +700,11 @@ async fn unmapped_signed_requests_never_grow_the_ledger_and_replays_stay_refused
     // The signatures were still remembered: a replay is refused.
     let replay = h.send(signed(slack_api_commands(), FORM, &first_command, ts)).await;
     assert_eq!(replay.status(), 401);
-    assert_eq!(scalar(&h, "SELECT COUNT(*) FROM slack_seen_signatures").await, 40);
+    assert_eq!(
+        scalar(&h, "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'request_sha'")
+            .await,
+        40
+    );
 }
 
 #[tokio::test]

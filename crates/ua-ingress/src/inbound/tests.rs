@@ -240,7 +240,10 @@ fn sweep_expires_rows_but_never_an_accepted_one() {
     take(&db, "old-running", T0);
     db.write(|tx| record(tx, d("young"), T0 + 3000, RULES, None)).unwrap();
     let rules = SweepRules { max_per_kind: None, abandon_after_s: None };
+    // At its expiry second a row is kept; one second later it goes.
     let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 3600, rules)).unwrap();
+    assert_eq!(swept.expired, 0);
+    let swept = db.write(|tx| sweep(tx, ua_core::DEFAULT_ORG, "demo", T0 + 3601, rules)).unwrap();
     assert_eq!(swept.expired, 2);
     assert_eq!(state(&db, d("old-seen")), None);
     assert_eq!(state(&db, d("old-done")), None);
@@ -384,4 +387,28 @@ fn a_sweep_touches_only_its_organization() {
     let swept = db.write(|tx| sweep(tx, "acme", "demo", T0 + 99_999, rules)).unwrap();
     assert_eq!(swept.abandoned.len(), 1);
     assert!(swept.abandoned.iter().all(|a| a.org_id == "acme"));
+}
+
+#[test]
+fn abandon_all_accepted_takes_every_accepted_row_whatever_its_claim() {
+    let db = db();
+    take(&db, "mine", T0);
+    take(&db, "theirs", T0);
+    orphan(&db, "theirs");
+    db.write(|tx| record(tx, d("only-seen"), T0, RULES, None)).unwrap();
+    let rows = db.write(|tx| abandon_all_accepted(tx, ua_core::DEFAULT_ORG, "demo", T0)).unwrap();
+    let keys: Vec<&str> = rows.iter().map(|a| a.key.as_str()).collect();
+    assert_eq!(keys, ["mine", "theirs"]);
+    assert_eq!(state(&db, d("mine")).as_deref(), Some("abandoned"));
+    assert_eq!(state(&db, d("only-seen")).as_deref(), Some("seen"));
+    assert!(db.write(|tx| abandon_all_accepted(tx, ua_core::DEFAULT_ORG, "demo", T0)).unwrap().is_empty());
+}
+
+#[test]
+fn claim_of_reports_the_claim_a_row_was_accepted_under() {
+    let db = db();
+    let claim = take(&db, "a", T0);
+    assert_eq!(db.write(|tx| claim_of(tx, d("a"))).unwrap(), Some(claim.clone()));
+    assert_eq!(db.write(|tx| claim_of(tx, d("none"))).unwrap(), None);
+    assert_eq!(db.write(|tx| finish(tx, d("a"), &claim, T0)).unwrap(), Settle::Settled);
 }

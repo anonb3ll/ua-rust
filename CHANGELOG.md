@@ -36,6 +36,18 @@ from its commit history.
   counts connections dialled by hand, inline address range checks, and
   delivery tables recognised by name marks or columns instead of a fixed
   list. No change for Slack replies, which follow no redirect.
+- Slack's replay keys (signed bytes, Socket Mode envelopes) and delivery
+  ids (`trigger_id`, `event_id`) moved onto `inbound_deliveries` (source
+  `slack`; kinds `request_sha`, `trigger`, `event`). Slack never takes a
+  stale delivery on again (`Stale::Duplicate`): a command admitted and
+  never finished is refused as a repeat and reported by the startup sweep
+  as before. Every HTTP response and Socket Mode acknowledgement, every
+  reply text and every ledger event is unchanged. `slack.inbound.v1.copy`
+  carries the old rows across with their states; `slack_seen_signatures`
+  and `slack_seen_deliveries` stay, unread and unwritten, until a later
+  release drops them. `ua_ingress::inbound` gains `abandon_all_accepted`
+  (the startup sweep) and `claim_of`, and an expired row is now kept
+  through its expiry second (as both families did before).
 - `ua-ingress::inbound`: one inbound-delivery table, `inbound_deliveries`
   (parts `ingress.inbound.v1`, `organization.v1.ingress`; a tenant table
   from birth), with `record`, `accept`, `finish`, `release` and `sweep` and
