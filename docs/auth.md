@@ -24,6 +24,42 @@ first, then (for `/ui` and `/api` only) the session cookie. With
 redirected to `/login?next=...` instead). With `enforce_auth` off, a request
 with no credential runs as the local anonymous identity, as stdio does.
 
+### With auth enforcement off
+
+A caller with no verified identity (a stdio process, or an HTTP request when
+`enforce_auth` is off) has the full tool surface. Run a hub this way only
+where every process that can reach it is trusted: `ua doctor` fails a
+non-loopback bind without enforced auth.
+
+There is no identity to scope a read by, so mailboxes and conversations are
+a **message board**:
+
+- **Reads.** Such a caller may read every mailbox (`message_list`,
+  `message_inbox` with `to_agent`) and where any conversation was handed off
+  (`conversation_handoffs`). This is a read grant only. It never counts as
+  operator, lifecycle or human authority, so it approves nothing and
+  administers nothing.
+- **Read state belongs to the mailbox's owner.** A caller started with its
+  own label (`--label`, `UA_AGENT_LABEL`) marks and acknowledges only that
+  label's mail. On another mailbox `message_inbox` lists without marking
+  anything read (the result says so in `read_state`), and `message_ack` or a
+  `session_id` is refused. A caller with only the shared `local` label (an
+  HTTP request, or stdio with no label) has no mailbox of its own: it acts
+  as the mailbox it names, as before.
+- **Senders are claims.** An unverified sender may give any `from_agent`.
+  Every message records `sender_verified`; `false` means the label is only
+  what the caller said. Message bodies are marked untrusted as always.
+- **Wider exposure.** Every agent on such a hub can read text addressed to
+  any other, so a message written to mislead one agent is visible to all of
+  them. Treat message text as data.
+
+With `enforce_auth` on, none of this applies to HTTP requests: a caller
+reads its own mailbox, and reading every mailbox or conversation needs a
+verified human. A stdio MCP process or a local CLI call does not
+authenticate, so these rules apply to it whatever `enforce_auth` says. The
+one exception is a CLI `--label` that names a configured human identity and
+is confirmed on an interactive terminal: that caller acts as the human.
+
 A 401 carries an RFC 9728 challenge when OAuth is on:
 
 ```

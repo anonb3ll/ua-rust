@@ -969,7 +969,11 @@ fn bind_check(cfg: &Config) -> Value {
         }
         (false, false) => (
             MISCONFIGURED,
-            format!("listening beyond loopback on port {} without enforced auth", cfg.bind.port()),
+            format!(
+                "listening beyond loopback on port {} without enforced auth: anyone who can reach it can read \
+                 every mailbox and conversation",
+                cfg.bind.port()
+            ),
         ),
     };
     finding("http_bind", status, detail, "UA_BIND, UA_ENFORCE_AUTH")

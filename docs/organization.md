@@ -84,9 +84,10 @@ here for memory columns, owners and defaults.
   separate fleet-maintenance grant for agents in `lifecycle_operators`,
   never operator authority, named at each call site that admits it next to
   `Operator`. The coordinator and operator profiles grant nothing; the
-  profile-as-authority count in the guard is 0. Unverified mailbox reads
-  (auth enforcement off) are unchanged and under review
-  (`LocalTrustReader`).
+  profile-as-authority count in the guard is 0. With auth enforcement off,
+  mailboxes and conversations are a message board: `LocalTrustReader` is a
+  read grant for a caller with no verified identity, and never satisfies
+  another authority ([auth.md](auth.md#with-auth-enforcement-off)).
 
 Not yet: the tenant parts, the label and launch-key indexes, the
 `memory_versions_capture` trigger, `hash_v = 2`, and everything after

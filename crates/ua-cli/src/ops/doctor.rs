@@ -205,7 +205,11 @@ fn check_origin_security(cfg: &Config, allow_non_loopback: bool) -> CheckResult 
         return check(
             "origin_security",
             Status::Fail,
-            format!("bind {} is non-loopback while enforce_auth is false", cfg.bind),
+            format!(
+                "bind {} is non-loopback while enforce_auth is false: anyone who can reach it can call every \
+                 tool and read every mailbox and conversation",
+                cfg.bind
+            ),
         );
     }
     if let Some(warning) = ua_server::login::insecure_origin_warning(cfg) {

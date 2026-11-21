@@ -20,7 +20,7 @@ event in the same transaction.
 | `session_handoff_recover` | The session's owner, the note's receiver, lifecycle operator, human | The session's latest sealed note |
 | `session_handoff_ack` | The agent the note was handed to | Acknowledge it |
 | `conversation_handoff` | A participant (or a human) | Link or create a task that points at a conversation |
-| `conversation_handoffs` | A verified participant (or a human) | Where a conversation was handed off |
+| `conversation_handoffs` | A verified participant, a human, or any caller when auth enforcement is off | Where a conversation was handed off |
 | `queue_health` | Anyone (the research profile too) | Open, parked, stale and milestone counts |
 | `queue_stale` | Anyone | Stale tasks, oldest first |
 | `queue_sweep` | Anyone | Proposed parks and folds; writes nothing |
@@ -161,7 +161,9 @@ apply as they do to a direct call. Creating is idempotent per conversation,
 title, project and priority.
 
 `conversation_handoffs` has the same caller rule (a verified caller that can
-see the conversation; anyone else reads `not_found`). The handoff ledger
+see the conversation; anyone else reads `not_found`), and is also open to a
+caller with no verified identity, for whom conversations are a message board
+([auth.md](auth.md#with-auth-enforcement-off)). The handoff ledger
 event is the audited record: `handoffs` lists the tasks an
 `agent.conversation.handoff` event links, with who handed off, when, and
 `note_reference` (whether the notes line is still there). A task whose

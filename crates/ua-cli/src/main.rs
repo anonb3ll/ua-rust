@@ -200,7 +200,7 @@ fn local_caller_with(
     confirm: impl FnOnce(&str) -> bool,
 ) -> Caller {
     let explicit = label.is_some() && agent_env.is_none();
-    let mut c = Caller::local(label.unwrap_or_else(|| "local".into()), Transport::Cli);
+    let mut c = Caller::local(label.unwrap_or_else(|| ua_core::identity::LOCAL_LABEL.into()), Transport::Cli);
     if explicit && cfg.is_human(&c.label) && confirm(&c.label) {
         c.kind = ActorKind::Human;
     }
