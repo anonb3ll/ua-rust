@@ -888,10 +888,30 @@ async fn a_non_string_action_is_refused_before_any_handler_runs() {
 
 #[tokio::test]
 async fn a_null_action_is_gated_as_the_default() {
+    // route() has one rule: null is absent, so the call is gated as the
+    // default action. oauth_device_manage's handler then refuses null for its
+    // defaulted String action, so the call never runs, whatever the gates say.
     let e = env(Some(&rules("deny", &["oauth_device_manage:list".to_string()])), |_| {});
     let me = agent("coord-1", Profile::Coordinator);
     let err = e.call(&me, "oauth_device_manage", json!({ "action": null })).await.unwrap_err();
     assert_eq!(reason(&err), "policy_deny", "{err}");
+
+    let e = env(None, |_| {});
+    let err = e.call(&me, "oauth_device_manage", json!({ "action": null })).await.unwrap_err();
+    assert_eq!(err.code(), "invalid_argument", "{err}");
+    let calls = e.tool_calls();
+    assert_eq!(
+        calls,
+        vec![(
+            "oauth_device_manage".into(),
+            Some("oauth_device_manage:list".into()),
+            "invalid_argument".into()
+        )],
+        "gated as the default, then refused by the handler; nothing ran"
+    );
+    // config_revision_manage defaults a String action the same way.
+    let ok = e.call(&me, "config_revision_manage", json!({ "action": null })).await;
+    assert_eq!(ok.unwrap_err().code(), "invalid_argument", "config_revision_manage refuses null too");
 }
 
 // ---------------------------------------------------------------------------

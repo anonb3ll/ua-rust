@@ -612,7 +612,7 @@ impl Registry {
                 record_decision_routed(hub, &caller, name, routed, &err, "").await;
                 return Err(err);
             }
-            if let Some(action) = args.get("action").and_then(Value::as_str)
+            if let Some(action) = profile_action(name, &args)
                 && !caller.profile.allows_action(name, action)
             {
                 let err = UaError::denied(
@@ -753,6 +753,19 @@ impl Bind<'_> {
             None if self.def.secret_args => Err(unprojected_secret(&self.name)),
             None => Ok(self.args.clone()),
         }
+    }
+}
+
+/// The action a profile's action allow-list is checked against: the
+/// `action` as the caller wrote it (the lists name actions that way, e.g.
+/// `plan_create` for `plan_manage`), or, when the call names none (absent or
+/// `null`), the tool's default action, which is what the call runs (see
+/// [`crate::routes::action_of`]). `None` for a tool with no action.
+fn profile_action<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    match args.get("action") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        None | Some(Value::Null) => crate::routes::manager(name).and_then(|m| m.default_action),
+        Some(_) => None,
     }
 }
 
@@ -996,5 +1009,41 @@ async fn release_reservation(hub: &Hub, reservation: Option<i64>) {
         .await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "could not release a tool_calls reservation");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use ua_core::Profile;
+
+    use super::profile_action;
+
+    #[test]
+    fn a_call_with_no_action_is_filtered_as_the_default_action() {
+        // Absent and null are the default action; a written action is as
+        // written; a tool without actions has none.
+        assert_eq!(profile_action("oauth_device_manage", &json!({})), Some("list"));
+        assert_eq!(profile_action("oauth_device_manage", &json!({ "action": null })), Some("list"));
+        assert_eq!(profile_action("config_revision_manage", &json!({})), Some("list"));
+        assert_eq!(profile_action("mcp_gateway", &json!({})), Some("call"));
+        assert_eq!(profile_action("node_config", &json!({})), Some("get"));
+        assert_eq!(profile_action("oauth_device_manage", &json!({ "action": "revoke" })), Some("revoke"));
+        assert_eq!(profile_action("plan_manage", &json!({ "action": "plan_create" })), Some("plan_create"));
+        assert_eq!(profile_action("plan_manage", &json!({})), None, "no default: route() refuses it");
+        assert_eq!(profile_action("task_add", &json!({})), None);
+        // So an allow-list that excludes the default refuses a call naming
+        // none, as it refuses one naming the default. No shipped allow-list
+        // profile sees a default-action tool, so this is the filter itself:
+        // research sees plan_manage and lists `plan_create` but not `list`.
+        let filter = |p: Profile, tool: &str, args: serde_json::Value| {
+            profile_action(tool, &args).is_none_or(|a| p.allows_action(tool, a))
+        };
+        assert!(!filter(Profile::Research, "plan_manage", json!({ "action": "list" })));
+        assert!(filter(Profile::Research, "plan_manage", json!({ "action": "plan_create" })));
+        for tool in ["oauth_device_manage", "config_revision_manage", "mcp_gateway", "node_config"] {
+            assert!(!filter(Profile::Research, tool, json!({})), "{tool}");
+            assert!(filter(Profile::Coordinator, tool, json!({})), "{tool}");
+        }
     }
 }
