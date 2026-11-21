@@ -418,11 +418,17 @@ mod tests {
         assert_eq!(applied, ["alone.v1", "after.v1"]);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_parts WHERE name = 'alone.v1'"), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM schema_procedures WHERE name = 'alone.v1'"), 1);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM alone WHERE id = 7"), 1, "the first run's data survives");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM alone WHERE id = 7"),
+            1,
+            "the first run's data survives"
+        );
         assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1, "the procedure restored foreign keys");
         let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
         assert_eq!(check, "ok");
-        assert!(apply(&mut conn, &[Part::from(BEFORE), alone_part(&[]), Part::from(AFTER)]).unwrap().is_empty());
+        assert!(
+            apply(&mut conn, &[Part::from(BEFORE), alone_part(&[]), Part::from(AFTER)]).unwrap().is_empty()
+        );
     }
 
     #[test]
