@@ -22,8 +22,8 @@
 //! table is in; the design's table is kept in step with it.
 //!
 //! `TENANT_MISSING_ORG_ID` is a temporary relaxation of the design, which
-//! requires the tenant check for every tenant table: no tenant table carries
-//! `org_id` yet. Each `organization.v1.<crate>` part removes its tables from
+//! requires the tenant check for every tenant table: most tenant tables do not
+//! carry `org_id` yet. Each `organization.v1.<crate>` part removes its tables from
 //! the list, and the list may only shrink. A new tenant table gets its
 //! `org_id` and triggers in the part that creates it, and is never added here.
 //!
@@ -130,8 +130,10 @@ const TENANT: &[&str] = &[
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
-/// Today that is every tenant table: `harness_config_bundles` and
-/// `harness_config_proposals` carry a nullable `org_id` and no triggers.
+/// Today that is every tenant table except `inbound_deliveries` (born with
+/// its `org_id`) and `code_symbols` (`organization.v1.tools.code`):
+/// `harness_config_bundles` and `harness_config_proposals` carry a nullable
+/// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -141,7 +143,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "autonomous_cycle_transitions",
     "autonomous_cycle_usage",
     "autonomous_cycles",
-    "code_symbols",
     "delegations",
     "dispatch_receipts",
     "dispatch_runs",
@@ -621,12 +622,19 @@ fn a_new_tenant_table_cannot_be_parked_on_the_missing_list() {
     l.classes.push((Class::Tenant, tenant.as_slice()));
     l.missing = &missing;
     let found = problems(&conn, &l);
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
+    assert_eq!(found.len(), 1, "{found:?}");
     assert!(
-        found[1].starts_with("new_widgets: listed as missing org_id but not in the frozen baseline"),
+        found[0].starts_with("new_widgets: listed as missing org_id but not in the frozen baseline"),
         "{found:?}"
     );
+
+    // A list longer than the baseline fails on its length alone (the list has
+    // shrunk below the baseline, so pad it with entries already on it).
+    let padded: Vec<&str> =
+        TENANT_MISSING_ORG_ID.iter().copied().cycle().take(TENANT_MISSING_BASELINE_LEN + 1).collect();
+    let found = problems(&schema(), &Lists { missing: &padded, ..lists() });
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
 }
 
 #[test]

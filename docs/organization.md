@@ -32,8 +32,9 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (all 68 today,
-  frozen as a baseline that a new table cannot join), and the grant tables
+  may only shrink: the tenant tables still missing `org_id` (67 of the frozen
+  baseline of 68 today, `code_symbols` having left it; a new table cannot
+  join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
@@ -97,9 +98,24 @@ here for memory columns, owners and defaults.
   read grant for a caller with no verified identity, and never satisfies
   another authority ([auth.md](auth.md#with-auth-enforcement-off)).
 
-Not yet: the tenant parts, the label and launch-key indexes, the
-`memory_versions_capture` trigger, `hash_v = 2`, and everything after
-`organization.v1`.
+- The first tenant part for an existing table family,
+  `organization.v1.tools.code`, for the code family's `code_symbols`: `org_id`
+  added `NOT NULL DEFAULT 'default'` (existing rows backfilled), and the
+  generated triggers. The part is named for the owning crate **and family**
+  (`organization.v1.<crate>.<family>`) rather than one
+  `organization.v1.tools` for all of `ua-tools`, because the procedure
+  checksum covers its table list: a part for one family cannot later take
+  another family's tables, so each family gets its own part. Every query of
+  the symbol tools filters on the caller's `org_id`; indexing for an
+  organization `orgs` does not hold is refused before any row changes. The
+  `agent.code.indexed` event still names `DEFAULT_ORG`, which is the indexed
+  rows' organization for every caller until memberships exist; the
+  `org_guard` test admits no other value yet, and lifting it is part of the
+  resolver work.
+
+Not yet: the tenant parts for the other families, the label and launch-key
+indexes, the `memory_versions_capture` trigger, `hash_v = 2`, and everything
+after `organization.v1`.
 
 ## Decision
 
@@ -1188,7 +1204,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols`, `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |

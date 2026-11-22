@@ -16,7 +16,7 @@ pub mod lang;
 pub mod lint;
 pub mod media;
 
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
 use crate::registry::Registry;
 
@@ -43,6 +43,13 @@ CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(workspace, file
 CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(workspace, symbol_name);
 ",
 };
+
+/// `organization.v1.tools.code`: `code_symbols.org_id` (existing rows
+/// backfilled to the default organization) and the generated
+/// `code_symbols_org_exists` / `code_symbols_org_immutable` triggers. Applied
+/// after `code.v1` and `organization.v1.store` (see `ua_tools::schema_parts`).
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.code", &["code_symbols"]);
 
 pub fn schema_parts() -> Vec<SchemaPart> {
     vec![SCHEMA]
