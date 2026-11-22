@@ -290,8 +290,11 @@ from its commit history.
   organization's rows; another organization's plan answers as a missing
   one, and a write for an organization `orgs` does not hold is refused
   (`unknown_organization`) before anything changes. Plan events stay in the
-  default organization's ledger, with another organization's goal, scope
-  and close reason left out (`null`). The importer writes legacy plans to
+  default organization's ledger, with another organization's text and
+  labels left out (`null`): `goal` and `scope` on `agent.plan.created`,
+  `owner` on `agent.plan.step_updated`, `agent` on
+  `agent.plan.step_claimed`, `agent` and `next_owner` on
+  `agent.plan.handoff`, and `reason` on `agent.plan.closed`. The importer writes legacy plans to
   `default`. Results and events in the default organization are unchanged,
   except that plan rows now carry `org_id`.
 - An insert guard beside the classification test: it fails when an

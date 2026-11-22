@@ -18,6 +18,10 @@ const ORG_B: &str = "org-b";
 const UNKNOWN: &str = "missing-org";
 const PARTS: [&str; 2] = ["organization.v1.tools.plans", "plans.v2.org_scope"];
 const TABLES: [&str; 3] = ["plans", "plan_steps", "plan_checkpoints"];
+/// Organization-B labels that must never reach the default organization's
+/// ledger: a step owner, and the agent a system caller claims to act as.
+const B_OWNER: &str = "Project Falcon acquisition";
+const B_AGENT: &str = "Kestrel night-shift runner";
 
 fn old_parts() -> Vec<ua_store::Part> {
     ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
@@ -133,15 +137,15 @@ impl H {
             .unwrap()
     }
 
-    fn created_payloads(&self) -> Vec<Value> {
+    /// Every ledger payload on `channel`, oldest first.
+    fn payloads(&self, channel: &str) -> Vec<Value> {
+        let channel = channel.to_string();
         self.hub
             .db()
-            .read(|c| {
+            .read(move |c| {
                 let rows: Vec<String> = c
-                    .prepare(
-                        "SELECT payload FROM event_log WHERE channel = 'agent.plan.created' ORDER BY seq",
-                    )?
-                    .query_map([], |r| r.get(0))?
+                    .prepare("SELECT payload FROM event_log WHERE channel = ?1 ORDER BY seq")?
+                    .query_map([&channel], |r| r.get(0))?
                     .collect::<Result<_, _>>()?;
                 Ok(rows.iter().map(|p| serde_json::from_str(p).unwrap()).collect())
             })
@@ -402,7 +406,7 @@ async fn organization_b_writes_land_in_organization_b() {
         ("step_reorder", json!({ "plan_id": id, "order": [0, 1, 3, 2] })),
         ("step_remove", json!({ "plan_id": id, "step_idx": 2 })),
         ("edit", json!({ "plan_id": id, "title": "Beta, renamed" })),
-        ("update", json!({ "plan_id": id, "step_idx": 2, "note": "noted", "owner": "builder-1" })),
+        ("update", json!({ "plan_id": id, "step_idx": 1, "note": "noted", "owner": B_OWNER })),
         ("checkpoint", json!({ "plan_id": id, "note": "saved" })),
         ("step_claim", json!({ "plan_id": id, "step_idx": 0 })),
         ("handoff", json!({ "plan_id": id, "step_idx": 0, "outputs": { "k": "v" } })),
@@ -410,6 +414,10 @@ async fn organization_b_writes_land_in_organization_b() {
     ] {
         h.ok(&b, action, params).await;
     }
+    // A system caller keeps the agent label it claims (`write_identity`).
+    let sys = Caller::system_for(ORG_B);
+    h.ok(&sys, "step_claim", json!({ "plan_id": id, "step_idx": 2, "agent": B_AGENT })).await;
+    h.ok(&sys, "handoff", json!({ "plan_id": id, "step_idx": 2, "agent": B_AGENT })).await;
     let got = h.ok(&b, "get", json!({ "plan_id": id })).await;
     assert_eq!(got["plan"]["title"], "Beta, renamed");
     assert_eq!(got["plan"]["org_id"], ORG_B);
@@ -419,25 +427,40 @@ async fn organization_b_writes_land_in_organization_b() {
         .iter()
         .map(|s| (s["description"].as_str().unwrap(), s["status"].as_str().unwrap()))
         .collect();
-    assert_eq!(steps, [("first", "done"), ("second", "failed"), ("third", "open")]);
-    assert_eq!(got["checkpoints"].as_array().unwrap().len(), 2, "{got}");
+    assert_eq!(steps, [("first", "done"), ("second", "failed"), ("third", "done")]);
+    assert_eq!(got["steps"][1]["owner"], B_OWNER, "organization B keeps its own owner text: {got}");
+    assert_eq!(got["steps"][2]["owner"], B_AGENT, "{got}");
+    assert_eq!(got["checkpoints"].as_array().unwrap().len(), 3, "{got}");
     h.ok(&b, "close", json!({ "plan_id": id, "reason": "beta secret reason" })).await;
 
     assert_eq!(h.orgs_of("plans", &id), [ORG_B]);
     assert_eq!(h.orgs_of("plan_steps", &id), [ORG_B; 3]);
-    assert_eq!(h.orgs_of("plan_checkpoints", &id), [ORG_B; 3]);
+    assert_eq!(h.orgs_of("plan_checkpoints", &id), [ORG_B; 4]);
     let a_after: Vec<Vec<String>> = TABLES.iter().map(|t| h.orgs_of(t, &a_id)).collect();
     assert_eq!(a_after, a_before);
 
-    // Organization B's free text never reaches the default organization's ledger.
-    let created = h.created_payloads();
+    // Organization B's free text and labels never reach the default
+    // organization's ledger: the fields stay, as null.
+    let created = h.payloads("agent.plan.created");
     assert_eq!(created[0]["goal"], "Alpha plan");
     assert_eq!(created[0]["scope"], "shared-scope");
     assert_eq!((created[1]["goal"].clone(), created[1]["scope"].clone()), (Value::Null, Value::Null));
     assert_eq!(created[1]["plan_id"], id.as_str());
-    let leaked =
-        h.count("SELECT COUNT(*) FROM event_log WHERE payload LIKE '%Beta%' OR payload LIKE '%beta secret%'");
-    assert_eq!(leaked, 0);
+    for needle in ["Beta", "beta secret", B_OWNER, B_AGENT] {
+        let leaked = h.count(&format!("SELECT COUNT(*) FROM event_log WHERE payload LIKE '%{needle}%'"));
+        assert_eq!(leaked, 0, "{needle:?} reached the default organization's ledger");
+    }
+    let updated = h.payloads("agent.plan.step_updated");
+    assert_eq!((updated.len(), updated[0]["owner"].clone()), (1, Value::Null), "{updated:?}");
+    let claimed = h.payloads("agent.plan.step_claimed");
+    assert_eq!(claimed.len(), 2, "{claimed:?}");
+    assert!(claimed.iter().all(|p| p["agent"].is_null()), "{claimed:?}");
+    let handoffs = h.payloads("agent.plan.handoff");
+    assert_eq!(handoffs.len(), 2, "{handoffs:?}");
+    for p in &handoffs {
+        assert_eq!((p["agent"].clone(), p["next_owner"].clone()), (Value::Null, Value::Null), "{p}");
+        assert_eq!(p["next_step_idx"], 1, "{p}");
+    }
 
     let d = h.ok(&b, "delete", json!({ "plan_id": id })).await;
     assert_eq!(d, json!({ "deleted": true }));
@@ -445,6 +468,52 @@ async fn organization_b_writes_land_in_organization_b() {
         assert_eq!(h.count(&format!("SELECT COUNT(*) FROM {t} WHERE org_id = 'org-b'")), 0, "{t}");
     }
     assert_eq!(h.snapshot(), a_rows, "organization A's rows survive B's delete");
+
+    // The default organization's own labels are still recorded.
+    let me = agent(DEFAULT_ORG);
+    h.ok(&me, "update", json!({ "plan_id": a_id, "step_idx": 0, "owner": "alpha-owner" })).await;
+    h.ok(&me, "step_claim", json!({ "plan_id": a_id, "step_idx": 2 })).await;
+    let h0 = h.ok(&me, "handoff", json!({ "plan_id": a_id, "step_idx": 2 })).await;
+    assert_eq!(h0["next_step"]["step_idx"], 0, "{h0}");
+    assert_eq!(h.payloads("agent.plan.step_updated").last().unwrap()["owner"], "alpha-owner");
+    assert_eq!(h.payloads("agent.plan.step_claimed").last().unwrap()["agent"], "builder-1");
+    let last = h.payloads("agent.plan.handoff").pop().unwrap();
+    assert_eq!(
+        (last["agent"].as_str(), last["next_owner"].as_str()),
+        (Some("builder-1"), Some("alpha-owner"))
+    );
+}
+
+/// A step or checkpoint cannot be moved under another organization's plan
+/// (`*_org_parent_update`). Seeded by SQL: no tool rewrites a `plan_id`.
+#[tokio::test]
+async fn a_step_or_checkpoint_cannot_move_to_another_organizations_plan() {
+    let h = H::new();
+    let a_id = h.create(&agent(DEFAULT_ORG), "Alpha plan").await;
+    let a_other = h.create(&agent(DEFAULT_ORG), "Alpha second plan").await;
+    h.ok(&agent(DEFAULT_ORG), "checkpoint", json!({ "plan_id": a_id })).await;
+    let b_id = h.create(&agent(ORG_B), "Beta plan").await;
+    let before = h.snapshot();
+    let (a, other, b) = (a_id.clone(), a_other.clone(), b_id.clone());
+    h.hub
+        .db()
+        .write(move |tx| {
+            for t in ["plan_steps", "plan_checkpoints"] {
+                let err = tx
+                    .execute(&format!("UPDATE {t} SET plan_id = ?1 WHERE plan_id = ?2"), [&b, &a])
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("plan belongs to another organization"), "{t}: {err}");
+            }
+            // Within one organization the trigger stays out of the way.
+            let n =
+                tx.execute("UPDATE plan_checkpoints SET plan_id = ?1 WHERE plan_id = ?2", [&other, &a])?;
+            assert_eq!(n, 1);
+            tx.execute("UPDATE plan_checkpoints SET plan_id = ?1 WHERE plan_id = ?2", [&a, &other])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(h.snapshot(), before);
 }
 
 // --- unknown organization ----------------------------------------------------------------------
@@ -527,4 +596,10 @@ async fn another_organizations_rows_under_a_plan_id_are_never_read() {
     let o =
         h.reg.call(&h.hub, &me, "platform_object_get", json!({ "kind": "plan", "id": id })).await.unwrap();
     assert_eq!(o["plan"]["steps"].as_array().unwrap().len(), 3, "{o}");
+    let added = h.ok(&me, "step_add", json!({ "plan_id": id, "description": "fourth" })).await;
+    assert_eq!(
+        added["step"]["step_idx"], 3,
+        "numbered against the caller's organization's steps only: {added}"
+    );
+    assert_eq!(added["steps"].as_array().unwrap().len(), 4, "{added}");
 }

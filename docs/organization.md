@@ -249,9 +249,12 @@ here for memory columns, owners and defaults.
   changes. Plans do not link to tasks, so no `TASK_ORG` rule applies, and
   no plan action has an approval gate of its own. The `agent.plan.*`
   events are `ORG-EVENT-DEFAULT` sites: for a plan outside the default
-  organization their free text (`goal` and `scope` on `created`, `reason`
-  on `closed`) is `null`, so it never reaches the default organization's
-  ledger; the payload keeps its shape. The importer writes legacy plans,
+  organization their free text and caller-supplied labels are `null`
+  (`goal` and `scope` on `created`, `owner` on `step_updated`, `agent` on
+  `step_claimed`, `agent` and `next_owner` on `handoff`, `reason` on
+  `closed`), so none of it reaches the default organization's ledger; the
+  payload keeps its shape. The other fields are ids, counts, step indexes
+  and enumerated statuses. The importer writes legacy plans,
   steps and checkpoints to `default`. `crates/ua-tools/tests/plans_tenant.rs`
   holds the upgrade and the isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an

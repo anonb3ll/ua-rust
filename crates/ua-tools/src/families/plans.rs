@@ -191,7 +191,15 @@ pub(crate) fn parse_params<T: DeserializeOwned>(
         .map_err(|e| UaError::invalid(format!("invalid params for {family} action {action:?}: {e}")))
 }
 
+/// Append a ledger event attributed to the caller.
+///
+/// Shared by the plans, cycles and delegation families.
 pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
+    // ORG-EVENT-DEFAULT: use the row's organization once callers can resolve
+    // to other organizations and org_guard allows it. The cycles and
+    // delegation families share this function; the `agent.plan.*` callers
+    // pass another organization's free text and labels through `ledger_text`
+    // or `ledger_label`, so only ids, counts and statuses reach this ledger.
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
@@ -228,6 +236,16 @@ fn require_org(c: &Connection, org: &str) -> UaResult<()> {
 /// rather than recorded there; the payload keeps its shape.
 fn ledger_text(org: &str, text: &str) -> Value {
     if org == ua_core::DEFAULT_ORG { json!(text) } else { Value::Null }
+}
+
+/// An optional caller-supplied label (a step owner, a claiming or finishing
+/// agent) for a plan event's payload, under the same rule as `ledger_text`:
+/// another organization's label is `null` in the default ledger.
+fn ledger_label(org: &str, label: Option<&str>) -> Value {
+    match label {
+        Some(l) => ledger_text(org, l),
+        None => Value::Null,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -807,7 +825,12 @@ fn update(ctx: &ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             tx,
             &caller,
             "agent.plan.step_updated",
-            json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "status": a.status, "owner": a.owner }),
+            json!({
+                "plan_id": a.plan_id,
+                "step_idx": a.step_idx,
+                "status": a.status,
+                "owner": ledger_label(&org, a.owner.as_deref()),
+            }),
         )?;
         maybe_autocomplete(tx, &caller, &org, &a.plan_id, &ts)?;
         let steps = load_steps(tx, &org, &a.plan_id)?;
@@ -1004,7 +1027,7 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             tx,
             &caller,
             "agent.plan.step_claimed",
-            json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "agent": agent }),
+            json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "agent": ledger_text(&org, &agent) }),
         )?;
         let steps = load_steps(tx, &org, &a.plan_id)?;
         Ok(json!({
@@ -1057,9 +1080,9 @@ fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
             json!({
                 "plan_id": a.plan_id,
                 "step_idx": a.step_idx,
-                "agent": finisher,
+                "agent": ledger_label(&org, finisher.as_deref()),
                 "next_step_idx": next_idx,
-                "next_owner": next_step.and_then(|s| s.owner.clone()),
+                "next_owner": ledger_label(&org, next_step.and_then(|s| s.owner.as_deref())),
             }),
         )?;
         let next_json = next_step.map(|s| s.json.clone());
