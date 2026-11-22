@@ -16,6 +16,6 @@ pub mod ledger;
 pub mod org;
 pub mod schema;
 
-pub use db::{Db, WriteTx};
+pub use db::{Db, Fence, WriteTx};
 pub use ledger::{Event, EventInput};
-pub use schema::{Part, Procedure, SchemaPart};
+pub use schema::{NewerSchema, Part, Procedure, SchemaPart};

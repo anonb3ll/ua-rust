@@ -67,8 +67,22 @@ pub fn schema_parts() -> Vec<Part> {
 
 /// Optional schema parts recognized by this build (applied only by optional
 /// commands such as `ua import`, not on every `Hub::open`).
+///
+/// A part that only some builds of this version apply (one gated by a Cargo
+/// feature) must still be named by every build: when its feature is off, list
+/// it here. Otherwise a lean build takes a database a full build of the same
+/// version made for one from a newer build, and refuses it
+/// ([`known_schema_part_names`]).
 pub fn optional_schema_parts() -> Vec<Part> {
     vec![ua_store::schema::IMPORT_SCHEMA.into()]
+}
+
+/// Every part name this build knows: [`schema_parts`] and
+/// [`optional_schema_parts`]. A database that records any other part was
+/// written by a newer build, and opening it for serving or writing is refused
+/// (`docs/operations.md`, "Older builds and a newer database").
+pub fn known_schema_part_names() -> Vec<&'static str> {
+    schema_parts().iter().chain(optional_schema_parts().iter()).map(|p| p.name).collect()
 }
 
 /// The full registry of built-in tools.

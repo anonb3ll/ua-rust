@@ -38,7 +38,14 @@ here for memory columns, owners and defaults.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
 - A rollback fence: opening the store, and every append, refuses a ledger
-  whose newest row has a `hash_v` above the build's.
+  whose newest row has a `hash_v` above the build's. It sits beside the
+  unknown-part fence (`docs/operations.md`, "Older builds and a newer
+  database"), which refuses, before any part is applied, a database that
+  records a schema part the build does not know. The two are independent:
+  the unknown-part fence catches a newer schema, this one a newer ledger
+  form, and `--allow-newer-schema` lifts only the first (and never for
+  `ua serve`). A build is never allowed to append a row in an older hash
+  form after a newer one. Both stop only builds that contain them.
 
 - `Caller.org_id` (always `DEFAULT_ORG`; a serialized caller without it
   reads as the default) and `Caller::system_for(org_id)`, with

@@ -1544,10 +1544,13 @@ async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
 }
 
 #[test]
-fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
-    // The documented limit (docs/ingress.md, Limits): no fence refuses a
-    // build that does not know these parts. If one is added, this flips.
-    use ua_store::Part;
+fn an_older_build_refuses_a_database_with_the_inbound_parts() {
+    // The fence mechanism, on the inbound parts. No real build both has the
+    // fence and lacks these parts (every build without them predates the
+    // fence), so this simulates one; it does not cover a real downgrade, which
+    // nothing refuses (docs/ingress.md, Limits). The fence protects against
+    // builds from the fence on meeting parts added later.
+    use ua_store::{Fence, Part};
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::for_home(dir.path().join("home"));
     drop(Hub::open(cfg.clone()).unwrap());
@@ -1556,7 +1559,24 @@ fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
         ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
-    assert!(ua_store::Db::open(&cfg.db_path(), &old).is_ok());
+    let old_optional: Vec<&str> = ua_tools::optional_schema_parts().iter().map(|p| p.name).collect();
+    let older = Fence { also_known: &old_optional, allow_newer: false };
+    let err = ua_store::Db::open_with(&cfg.db_path(), &old, older).err().expect("refused").to_string();
+    assert!(err.contains("written by a newer build"), "{err}");
+    for name in new_parts {
+        assert!(err.contains(name), "names {name}: {err}");
+    }
+    // The override opens it, and says which parts it ignores.
+    let opened = ua_store::Db::open_with(&cfg.db_path(), &old, Fence { allow_newer: true, ..older }).unwrap();
+    let mut ignored = opened.ignored_newer_parts().to_vec();
+    ignored.sort();
+    let mut want: Vec<String> = new_parts.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(ignored, want);
+    drop(opened);
+    // The current build still opens it, with nothing ignored.
+    let hub = Hub::open(cfg).unwrap();
+    assert!(hub.db().ignored_newer_parts().is_empty());
 }
 
 #[tokio::test]
