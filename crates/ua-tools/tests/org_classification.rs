@@ -147,7 +147,7 @@ const TENANT: &[&str] = &[
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
 /// Today that is every tenant table except `inbound_deliveries` (born with
-/// its `org_id`) and `code_symbols` (`organization.v1.tools.code`):
+/// its `org_id`), `code_symbols`, and the two graph canvas tables.
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
@@ -163,8 +163,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "goals",
-    "graph_canvas_revisions",
-    "graph_canvas_scenes",
     "harness_config_bundles",
     "harness_config_drift",
     "harness_config_proposals",

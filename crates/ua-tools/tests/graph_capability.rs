@@ -161,8 +161,8 @@ async fn new_boards_are_capped_per_agent_and_per_hub_but_updates_are_not() {
     hub.db()
         .write(|tx| {
             tx.execute(
-                "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) \
-                 VALUES ('imported', '{}', 'py', '2026-01-01T00:00:00Z')",
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at) \
+                 VALUES ('default', 'imported', '{}', 'py', '2026-01-01T00:00:00Z')",
                 [],
             )?;
             Ok(())
@@ -324,9 +324,9 @@ async fn a_corrupt_stored_scene_reads_as_corrupt() {
     hub.db()
         .write(|tx| {
             tx.execute(
-                "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) \
-                 VALUES ('bad', '{not json', 'py', '2026-01-01T00:00:00Z'), \
-                        ('list', '[1, 2]', 'py', '2026-01-01T00:00:00Z')",
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at) \
+                 VALUES ('default', 'bad', '{not json', 'py', '2026-01-01T00:00:00Z'), \
+                        ('default', 'list', '[1, 2]', 'py', '2026-01-01T00:00:00Z')",
                 [],
             )?;
             Ok(())

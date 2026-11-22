@@ -37,6 +37,7 @@ github.v1
 github.hardening.v1
 governance.v1
 graph_canvas.v1
+graph_canvas.v2.tenant_keys
 harness_config.v1
 harness_config.v2
 managed_secrets.v1
@@ -66,3 +67,4 @@ github.inbound.v1.copy
 slack.inbound.v1.copy
 import.v1
 organization.v1.tools.code
+organization.v1.tools.graph
