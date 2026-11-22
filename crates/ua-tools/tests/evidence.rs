@@ -141,6 +141,60 @@ async fn ledger_hides_handoff_note_and_conversation_handoff_events_from_outsider
     assert_eq!(handoff_channels(&reg, &hub, &operator).await, want);
 }
 
+#[tokio::test]
+async fn evidence_tool_call_counts_cover_only_the_readers_own_calls() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (a, b, outsider) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let board = Caller::local("local", Transport::Stdio);
+    let task = call(&reg, &hub, &a, "task_add", json!({ "title": "Review the change" })).await["id"]
+        .as_i64()
+        .unwrap();
+    call(&reg, &hub, &a, "task_claim", json!({ "id": task })).await;
+    call(&reg, &hub, &b, "task_update", json!({ "id": task, "append_note": "progress" })).await;
+    // A tool only B calls, so B's activity is recognisable in by_tool.
+    {
+        let caller = b.label.clone();
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome) \
+                     VALUES ('synthetic_probe', ?1, 'developer', 'mcp', ?2, 10, 'ok')",
+                    rusqlite::params![caller, ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let calls_of = |report: &Value| report["records"][0]["tool_calls"].clone();
+
+    // The outsider counts nobody's calls but still sees the participants.
+    let report = call(&reg, &hub, &outsider, "evidence_report", json!({ "task_id": task })).await;
+    let calls = calls_of(&report);
+    assert_eq!(calls["scope"], "own_calls");
+    assert_eq!(calls["counted_callers"], json!([]));
+    assert_eq!(calls["callers"], json!(["builder-1", "builder-2"]));
+    assert_eq!(calls["total"], 0);
+    assert_eq!(calls["errors"], 0);
+    assert_eq!(calls["by_tool"], json!({}));
+
+    // A participant counts only its own calls: B's tool never appears.
+    let report = call(&reg, &hub, &a, "evidence_report", json!({ "task_id": task })).await;
+    let calls = calls_of(&report);
+    assert_eq!(calls["scope"], "own_calls");
+    assert_eq!(calls["counted_callers"], json!(["builder-1"]));
+    assert!(calls["total"].as_i64().unwrap() >= 2, "{calls}");
+    assert!(calls["by_tool"].get("synthetic_probe").is_none(), "{calls}");
+
+    // A mail-unrestricted reader counts every participant.
+    let report = call(&reg, &hub, &board, "evidence_report", json!({ "task_id": task })).await;
+    let calls = calls_of(&report);
+    assert_eq!(calls["scope"], "all");
+    assert_eq!(calls["counted_callers"], json!(["builder-1", "builder-2"]));
+    assert_eq!(calls["by_tool"]["synthetic_probe"]["calls"], 1);
+}
+
 fn exec(hub: &Hub, sql: &str) {
     let sql = sql.to_string();
     hub.db()

@@ -14,7 +14,9 @@
 //! (with their hashes), the task row, its approvals and delegations, and the
 //! tool calls its participants made inside the task's lifetime, plus the
 //! ledger's chain verification. Tool calls carry no task id, so they are
-//! attributed by window and caller, and labelled as such.
+//! attributed by window and caller, and labelled as such. A reader who may
+//! read every mailbox counts every participant's calls; anyone else counts
+//! only their own, so another agent's private activity stays invisible.
 //!
 //! An `sdk.` event is whatever its client wrote, `task_id` included, so it
 //! never attributes a task, makes a participant or counts as proof. Events
@@ -219,20 +221,37 @@ fn grouped(
     Ok(out)
 }
 
-fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, until: &str) -> UaResult<Value> {
-    if callers.is_empty() {
+/// Governed-call counts for `callers` in the window. A mail-unrestricted
+/// reader counts every participant's calls (`scope: "all"`); anyone else
+/// counts only their own (`scope: "own_calls"`), so another agent's private
+/// activity never moves the numbers. `callers` still lists the participants.
+fn tool_call_window(
+    c: &Connection,
+    reader: &EventReader,
+    callers: &BTreeSet<String>,
+    since: &str,
+    until: &str,
+) -> UaResult<Value> {
+    let scope = if reader.unrestricted() { "all" } else { "own_calls" };
+    let counted: Vec<&String> = if reader.unrestricted() {
+        callers.iter().collect()
+    } else {
+        callers.iter().filter(|l| Some(l.as_str()) == reader.party()).collect()
+    };
+    if counted.is_empty() {
         return Ok(json!({
             "attribution": "caller_and_window",
             "window": { "since": since, "until": until },
-            "callers": [], "total": 0, "errors": 0, "by_tool": {},
+            "callers": callers, "counted_callers": [], "scope": scope,
+            "total": 0, "errors": 0, "by_tool": {},
         }));
     }
-    let marks = vec!["?"; callers.len()].join(",");
+    let marks = vec!["?"; counted.len()].join(",");
     let sql = format!(
         "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
          WHERE caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 GROUP BY tool ORDER BY tool"
     );
-    let mut args: Vec<String> = callers.iter().cloned().collect();
+    let mut args: Vec<String> = counted.iter().map(|l| (*l).clone()).collect();
     args.push(since.to_string());
     args.push(until.to_string());
     let mut stmt = c.prepare(&sql)?;
@@ -251,6 +270,8 @@ fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, unt
         "attribution": "caller_and_window",
         "window": { "since": since, "until": until },
         "callers": callers,
+        "counted_callers": counted,
+        "scope": scope,
         "total": total,
         "errors": errors,
         "by_tool": by_tool,
@@ -470,7 +491,7 @@ fn build_report(
         }
         let window_since = s("created_at").unwrap_or_default();
         let window_until = s("completed_at").unwrap_or_else(|| now.clone());
-        let calls = tool_call_window(c, &participants, &window_since, &window_until)?;
+        let calls = tool_call_window(c, reader, &participants, &window_since, &window_until)?;
 
         let human = apps
             .iter()
@@ -869,7 +890,8 @@ pub fn register(r: &mut Registry) {
             "evidence_report",
             "Read-only evidence for task completion: per task, the ledger events that mention it with their \
              hashes, the task row, approvals, delegations, PR/commit references, and tool-call counts by its \
-             participants inside the task's lifetime (attributed by caller and window), plus the ledger chain \
+             participants inside the task's lifetime (attributed by caller and window; a mail-unrestricted \
+             reader counts every participant, anyone else only their own calls), plus the ledger chain \
              verification. Client sdk. events never attribute a task; those naming it are listed apart under \
              client_asserted (payloads marked untrusted). project_id (a [project-spec] root) reports its \
              subtree with a project_chain. limit defaults to 50 (max 500).",

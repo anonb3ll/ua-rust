@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 42 pass, 2 fail, 18 not-built.
+62 checks: 43 pass, 1 fail, 18 not-built.
 
 ### 1. Plan and delegate
 
@@ -175,7 +175,7 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `isolation.same-org-ledger-read` | pass | `event_log_query`: builder-3's view is identical before and after the hidden records exist; message, handoff-note and conversation-handoff rows outside its access are filtered. |
 | `isolation.same-org-stream` | pass | Event stream: builder-3's view is identical before and after the hidden records exist; the backfill applies the same filter as ledger reads. |
 | `isolation.same-org-handoffs-in-retrieval` | pass | `session_packet(task_id)`: builder-3's view is identical before and after the hidden records exist. |
-| `isolation.same-org-evidence` | fail | Scored: the same restriction applied to evidence reports. The hidden events no longer appear, but the record's `tool_calls` window still counts the governed calls the participants made while writing them (counts only, no payloads). |
+| `isolation.same-org-evidence` | pass | `evidence_report(task_id)`: builder-3's view is identical before and after the hidden records exist; `tool_calls` counts only the reader's own calls unless it may read every mailbox. |
 | `isolation.same-org-exports` | pass | Export: builder-3's view is identical before and after the hidden records exist. |
 | `isolation.same-org-retrieval-and-explanations` | pass | `memory_search` and ranked `task_list`: builder-3's view is identical before and after the hidden records exist. |
 
