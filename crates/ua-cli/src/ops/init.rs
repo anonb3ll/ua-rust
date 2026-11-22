@@ -314,7 +314,7 @@ fn run_inner(
     let issued_token = if let Some(agent_label) = agent.as_deref() {
         let db_path = cfg.db_path();
         let _lock = ua_import::HubLock::acquire_shared(&db_path, "init")?;
-        let hub = Hub::open_guarded(cfg.clone(), allow_newer_schema, Some(ua_import::refuse_if_served))?;
+        let hub = Hub::open_with(cfg.clone(), allow_newer_schema)?;
         let prev_max_id: i64 = hub
             .db()
             .read(|c| Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_tokens", [], |r| r.get(0))?))
