@@ -35,11 +35,13 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (60 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (56 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
-  `skill_assignments`, `skill_publish_staging` and `project_repo_bindings`
-  having left it; a new table cannot join it), and the grant tables
+  `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
+  `harness_config_bundles`, `harness_config_proposals`,
+  `harness_config_drift` and `harness_config_report_window` having left it;
+  a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
@@ -177,6 +179,32 @@ here for memory columns, owners and defaults.
   the default organization's ledger. They must move to the binding's
   organization with the `ORG-EVENT-DEFAULT` switch, in the same change that
   lets a second organization bind; the payload shape stays as it is.
+- The harness config family applies the standalone procedure
+  `harness_config.v3.tenant_keys` to rebuild `harness_config_bundles` around
+  `UNIQUE(org_id, version)`, `harness_config_proposals` with a `NOT NULL`
+  `org_id` (its key is a hub-global random id), and
+  `harness_config_report_window` around `PRIMARY KEY (org_id, node)`, in one
+  transaction, keeping the bundles' ids and AUTOINCREMENT sequence, every
+  index, trigger and view, and adding indexes led by `org_id`. Existing rows,
+  including the legacy `NULL` `org_id`s, move to `default`. The same
+  transaction expires open `harness_config_publish` and
+  `harness_config_apply` approvals whose payload does not bind `org_id`.
+  `organization.v1.tools.harness_config` then adds `org_id` to
+  `harness_config_drift` and installs the organization triggers on all four.
+  Each organization has its own versions and its own active bundle;
+  `harness_config_publish`, `harness_config_status` and every `node_config`
+  action (`get`, `report`, `applied`) use the caller's organization (for a
+  node, its agent's), another organization's bundle or proposal answers as a
+  missing one, and a publish, report or applied call for an organization
+  `orgs` does not hold is refused (`unknown_organization`) before anything
+  changes. Publish and apply approvals bind `org_id`, so a pass is never
+  consumed across organizations. Publishing still needs `ua_org::authz`,
+  which admits only the default organization until memberships exist. Closing
+  a reassigned or forgotten node's open proposals (`ORG-NODE-HUB`) spans
+  every organization, since node names are one hub namespace and nodes carry
+  no `org_id` yet; it must take the node's organization when nodes gain one.
+  The `agent.harness_config` events are `ORG-EVENT-DEFAULT` sites. The
+  importer writes legacy bundles to `default`.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -757,8 +785,9 @@ global key in the tree is classified:
 | `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`. |
 | `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`, rebuilt in the standalone procedure `skill_registry.v2.tenant_keys`. |
 | `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`, rebuilt in `skill_registry.v2.tenant_keys` together with `skill_versions`. |
-| `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`. |
-| `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`. |
+| `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`, rebuilt in the standalone procedure `harness_config.v3.tenant_keys`. |
+| `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`, rebuilt in `harness_config.v3.tenant_keys`; the key stays a hub-global random id. |
+| `harness_config_report_window.node` | **Rebuild** | Key becomes `(org_id, node)`, rebuilt in `harness_config.v3.tenant_keys`, so the rate-limit upsert never updates another organization's window (node names are hub-wide, but a node can be reassigned to another organization's agent). |
 | `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
@@ -1293,7 +1322,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
-| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
+| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |

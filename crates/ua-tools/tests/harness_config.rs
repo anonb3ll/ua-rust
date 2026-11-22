@@ -361,14 +361,15 @@ async fn a_node_gets_reports_drift_and_applies_only_with_an_approved_pass() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM harness_config_drift"), json!(2));
     assert_eq!(h.events("harness_config_report"), 1);
 
-    // The approval binds node, surface, path, version, hash and the base the
-    // change starts from (nothing applied yet), all deterministic; the
-    // approver is shown the hub's own diff beside it (all added).
+    // The approval binds the organization, node, surface, path, version,
+    // hash and the base the change starts from (nothing applied yet), all
+    // deterministic; the approver is shown the hub's own diff beside it (all
+    // added).
     let approval_id = r1["proposals"][0]["approval_id"].as_i64().unwrap();
     assert_eq!(
         h.approval_payload(approval_id),
         json!({
-            "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
+            "org_id": "default", "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
             "desired_hash": claude["hash"],
             "change_summary": { "base": "none", "from_bundle_version": null, "from_hash": null, "from_text_sha256": null },
         })
@@ -1312,11 +1313,16 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path());
     cfg.workspace = Some(dir.path().to_path_buf());
-    let parts: Vec<_> =
-        ua_tools::schema_parts().into_iter().filter(|p| p.name != "harness_config.v2").collect();
+    // A database from before `harness_config.v2` (and so before the later
+    // harness config parts, which need it).
+    let later =
+        ["harness_config.v2", "harness_config.v3.tenant_keys", "organization.v1.tools.harness_config"];
+    let parts: Vec<_> = ua_tools::schema_parts().into_iter().filter(|p| !later.contains(&p.name)).collect();
     let old =
         json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "diff": "+x\n" } });
     let new = json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    let scoped = json!({ "org_id": "default", "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    let scoped_publish = json!({ "org_id": "default", "version": "v1", "bundle_sha256": "ab" });
     {
         let db = ua_store::Db::open(&cfg.db_path(), &parts).unwrap();
         db.write(|tx| {
@@ -1326,6 +1332,8 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
                 ("harness_config_apply", &old, "consumed"),
                 ("harness_config_apply", &new, "pending"),
                 ("harness_config_publish", &old, "pending"),
+                ("harness_config_apply", &scoped, "pending"),
+                ("harness_config_publish", &scoped_publish, "approved"),
             ] {
                 tx.execute(
                     "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
@@ -1338,14 +1346,23 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
         .unwrap();
     }
     let hub = Hub::open(cfg).unwrap();
-    let statuses: Vec<String> = hub
+    let rows: Vec<(String, Option<String>)> = hub
         .db()
         .read(|c| {
-            let mut stmt = c.prepare("SELECT status FROM approvals ORDER BY id")?;
-            Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            let mut stmt = c.prepare("SELECT status, reason FROM approvals ORDER BY id")?;
+            Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
         })
         .unwrap();
-    assert_eq!(statuses, ["expired", "expired", "consumed", "pending", "pending"]);
+    let statuses: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    // `harness_config.v2` expires the diff-binding apply shape; then
+    // `harness_config.v3.tenant_keys` expires every open apply or publish
+    // approval that does not bind `org_id`. A consumed one is history, and
+    // an approval that binds `org_id` stays open.
+    assert_eq!(statuses, ["expired", "expired", "consumed", "expired", "expired", "pending", "approved"]);
+    let reasons: Vec<Option<&str>> = rows.iter().map(|r| r.1.as_deref()).collect();
+    assert!(reasons[0].unwrap().contains("changed shape"), "{reasons:?}");
+    assert!(reasons[3].unwrap().contains("bind org_id"), "{reasons:?}");
+    assert!(reasons[4].unwrap().contains("bind org_id"), "{reasons:?}");
 }
 
 #[test]

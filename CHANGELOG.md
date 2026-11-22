@@ -242,6 +242,24 @@ from its commit history.
   proves another organization's binding of the same project is never read. The
   importer writes imported bindings to `default`. Tool results and event
   payloads keep their shapes.
+- Harness config bundles, drift proposals, drift reports and report windows
+  (`harness_config_bundles`, `harness_config_proposals`,
+  `harness_config_drift`, `harness_config_report_window`) are
+  organization-scoped. The standalone rebuild `harness_config.v3.tenant_keys`
+  makes the bundle key `UNIQUE(org_id, version)`, makes the proposals'
+  nullable `org_id` `NOT NULL`, and keys report windows by `(org_id, node)`,
+  keeping the bundles' ids and AUTOINCREMENT sequence, indexes, triggers and
+  views, and adding indexes led by `org_id`; `organization.v1.tools.harness_config`
+  adds `org_id` to the drift table and installs the organization triggers on
+  all four. Existing rows, including legacy `NULL` `org_id`s, migrate to
+  `default`. Each organization has its own bundle versions and active bundle:
+  `harness_config_publish`, `harness_config_status` and `node_config`
+  (`get`, `report`, `applied`) use the caller's organization, another
+  organization's bundle or proposal answers as a missing one, and a publish,
+  report or applied call for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes. The importer writes
+  legacy bundles to `default`. Event payloads and tool results keep their
+  shapes.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -375,6 +393,12 @@ from its commit history.
 
 ### Behaviour changes
 
+- `harness_config_publish` and `harness_config_apply` approval payloads now
+  carry `org_id`, the organization the bundle or surface write belongs to, so
+  an approval is never consumed across organizations. Upgrading expires every
+  open (pending, or approved and unused) approval of either tool in the old
+  payload shape: retry a publish, and a node's next drift report parks a new
+  apply approval.
 - `git_merge_task` now enforces the review-at-head gate whenever `"review"` is
   in the task's `expected_checks` (for both policy-authorization and one-time
   approval merges, including `dry_run=true`, and not bypassed by `force=true`).

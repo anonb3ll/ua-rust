@@ -76,3 +76,5 @@ skill_registry.v2.tenant_keys
 organization.v1.tools.skills
 governance.v2.project_bindings_tenant_keys
 organization.v1.tools.project_bindings
+harness_config.v3.tenant_keys
+organization.v1.tools.harness_config

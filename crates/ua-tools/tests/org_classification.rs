@@ -154,11 +154,11 @@ const TENANT: &[&str] = &[
 /// `org_id`), `code_symbols`, the two graph canvas tables,
 /// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`),
 /// the three skill registry tables (`skill_registry.v2.tenant_keys`,
-/// `organization.v1.tools.skills`), and `project_repo_bindings`
+/// `organization.v1.tools.skills`), `project_repo_bindings`
 /// (`governance.v2.project_bindings_tenant_keys`,
-/// `organization.v1.tools.project_bindings`):
-/// `harness_config_bundles` and `harness_config_proposals` carry a nullable
-/// `org_id` and no triggers.
+/// `organization.v1.tools.project_bindings`), and the four harness config
+/// tables (`harness_config.v3.tenant_keys`,
+/// `organization.v1.tools.harness_config`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -172,10 +172,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "goals",
-    "harness_config_bundles",
-    "harness_config_drift",
-    "harness_config_proposals",
-    "harness_config_report_window",
     "idempotency_keys",
     "managed_secrets",
     "memory",
