@@ -27,18 +27,18 @@ pub const ALLOW_NEWER_SCHEMA_ENV: &str = "UA_ALLOW_NEWER_SCHEMA";
 /// records a part this build does not know ([`crate::known_schema_part_names`]),
 /// unless `allow_newer`, which opens it and logs a warning naming the parts.
 ///
-/// `before_migrating`, when given, is called before an open that would apply
-/// a part the database does not record yet (see [`ua_store::Fence`]); the
-/// `ua` command passes one that refuses while a `ua serve` holds the database.
+/// It also runs the migration guard ([`ua_store::Fence`]): an open that would
+/// apply a part the database does not record yet is refused while another
+/// process holds the database's serve lock. `serving` is the only way to skip
+/// that: the caller's own held [`ua_store::ServeLock`] for this database.
 pub fn open_db(
     path: &std::path::Path,
     parts: &[ua_store::Part],
     allow_newer: bool,
-    before_migrating: Option<ua_store::MigrationGuard>,
+    serving: Option<&ua_store::ServeLock>,
 ) -> anyhow::Result<Db> {
     let known = crate::known_schema_part_names();
-    let db =
-        Db::open_with(path, parts, ua_store::Fence { also_known: &known, allow_newer, before_migrating })?;
+    let db = Db::open_with(path, parts, ua_store::Fence { also_known: &known, allow_newer, serving })?;
     let ignored = db.ignored_newer_parts();
     if !ignored.is_empty() {
         tracing::warn!(
@@ -62,32 +62,31 @@ pub fn open_db(
 
 impl Hub {
     /// Open the hub database described by `cfg`, applying every schema part.
-    /// A database written by a newer build is refused ([`open_db`]).
-    ///
-    /// This does **not** run the guard that refuses to migrate underneath a
-    /// running `ua serve`: that needs the serve lock, which lives with the
-    /// command line. A caller that may migrate a database another process
-    /// serves must use [`Hub::open_guarded`] with that guard, as every `ua`
-    /// command except `ua serve` does.
+    /// A database written by a newer build is refused ([`open_db`]), and so is
+    /// a migration (an open that would apply a part the database does not
+    /// record yet) while another process holds the database's serve lock: a
+    /// running `ua serve`. Every caller but the serving process uses this (or
+    /// [`Hub::open_with`]); an open with nothing to apply is never refused by
+    /// the guard.
     pub fn open(cfg: Config) -> anyhow::Result<Self> {
         Self::open_with(cfg, false)
     }
 
     /// [`Hub::open`], opening a database written by a newer build anyway when
-    /// `allow_newer` (recovery only; logged). Like [`Hub::open`], it does not
-    /// run the migration guard.
+    /// `allow_newer` (recovery only; logged). The migration guard still runs.
     pub fn open_with(cfg: Config, allow_newer: bool) -> anyhow::Result<Self> {
-        Self::open_guarded(cfg, allow_newer, None)
+        let db = open_db(&cfg.db_path(), &crate::schema_parts(), allow_newer, None)?;
+        Ok(Self::new(cfg, db))
     }
 
-    /// [`Hub::open_with`], calling `before_migrating` before an open that would
-    /// apply a part the database does not record yet ([`open_db`]).
-    pub fn open_guarded(
-        cfg: Config,
-        allow_newer: bool,
-        before_migrating: Option<ua_store::MigrationGuard>,
-    ) -> anyhow::Result<Self> {
-        let db = open_db(&cfg.db_path(), &crate::schema_parts(), allow_newer, before_migrating)?;
+    /// The open for the process that serves the database (`ua serve`, or a
+    /// program that embeds the server): `serving` is its held serve lock for
+    /// this database, taken before the open, and is the only way to migrate
+    /// without the migration guard's probe (which would see that same lock).
+    /// A lock held for another database is no proof; the guard then runs as
+    /// in [`Hub::open`]. A database written by a newer build is always refused.
+    pub fn open_serving(cfg: Config, serving: &ua_store::ServeLock) -> anyhow::Result<Self> {
+        let db = open_db(&cfg.db_path(), &crate::schema_parts(), false, Some(serving))?;
         Ok(Self::new(cfg, db))
     }
 

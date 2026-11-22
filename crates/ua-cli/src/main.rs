@@ -461,7 +461,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                             &cfg.db_path(),
                             &ua_import::schema_parts(),
                             allow_newer()?,
-                            Some(ua_import::refuse_if_served),
+                            None,
                         )?;
                         let opts = ua_import::Options { drop_org_scope, ..Default::default() };
                         ua_import::import(&db, &from, &opts)?
@@ -489,11 +489,12 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                     // Refuses a database a newer build wrote, unless overridden (docs/operations.md).
                     // `ua serve` refuses it even then: serving it reopens the replay window.
                     let override_on = allow_newer()?;
-                    let hub = if let Cmd::Serve = cmd {
-                        open_for_serve(&cfg, override_on)?
-                    } else {
-                        // Not the serving process: refuse to migrate under a running `ua serve`.
-                        Hub::open_guarded(cfg.clone(), override_on, Some(ua_import::refuse_if_served))?
+                    let hub = match held.serve.as_ref() {
+                        // The serving process migrates under its own serve lock.
+                        Some(serving) => open_for_serve(&cfg, override_on, serving)?,
+                        // Every other command: the default open refuses to migrate
+                        // underneath a running `ua serve`.
+                        None => Hub::open_with(cfg.clone(), override_on)?,
                     };
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());
@@ -705,9 +706,13 @@ fn allow_newer_schema(flag: bool, value: Option<std::ffi::OsString>) -> anyhow::
 /// deliveries while reading only the delivery tables this build knows, which
 /// reopens the replay window the fence closes. The fenced open runs first, so
 /// a refused serve has written nothing.
-fn open_for_serve(cfg: &ua_core::Config, override_on: bool) -> anyhow::Result<Hub> {
+fn open_for_serve(
+    cfg: &ua_core::Config,
+    override_on: bool,
+    serving: &ua_import::ServeLock,
+) -> anyhow::Result<Hub> {
     let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
-    match Hub::open_with(cfg.clone(), false) {
+    match Hub::open_serving(cfg.clone(), serving) {
         Ok(hub) => {
             if override_on {
                 tracing::warn!(

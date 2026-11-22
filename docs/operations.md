@@ -252,8 +252,9 @@ covered anyway:
   open that would apply at least one part the database does not record yet
   (a real migration; an open with nothing to apply is unaffected, so
   everyday use beside a serve of the same build keeps working), every
-  command except `ua serve` itself probes the serve lock and refuses if
-  another process holds it, before applying anything:
+  open of the database file except the serving process's own probes the
+  serve lock and refuses if another process holds it, before applying
+  anything:
 
   ```text
   Error: a running `ua serve` holds the database /path/to/ua.db: this command would migrate it (apply the schema parts [...]) underneath that serve, which may be from a build that does not know them. Stop the running `ua serve`, or upgrade it to this build, first; then retry
@@ -268,9 +269,14 @@ covered anyway:
   it; that serve opens the database after the migration's first transaction
   has committed (and, should a migration ever include a step that commits on
   its own, possibly between steps), so the fence decides whether it runs.
-  The guard is run by the `ua` commands; a program that embeds the hub and
-  opens it with the plain open functions does not get it and must pass the
-  guard itself. After the `ua` binary is replaced in place under a running
+  The guard is part of the store's open (`ua_store::Db::open`, and so
+  `Hub::open` and `Hub::open_with`), so a program that embeds the hub gets
+  it by default. The only way to skip it is to show the held serve lock of
+  that same database (`ua_store::Fence::serving`, or `Hub::open_serving`),
+  which only the process that took that lock can do; `ua serve` does
+  exactly that. An embedding program that serves inbound traffic must take
+  `ua_store::ServeLock` itself before it opens the hub, and open it with
+  `Hub::open_serving`. After the `ua` binary is replaced in place under a running
   older serve, commands that serve starts (and anything else that runs the
   new `ua`) are refused a migration until the serve is restarted on the new
   build: that is the guard working.
@@ -353,7 +359,9 @@ data volume.
 On a platform without `flock` (not Unix) nothing is locked: a second
 `ua serve` is NOT refused there, and `ua` prints a warning saying so. The
 lock is taken by the `ua` command. A program that embeds `ua-server` and
-calls `serve_http` itself must take `ua_import::ServeLock` first.
+calls `serve_http` itself must take `ua_store::ServeLock` first (also
+reachable as `ua_import::ServeLock`) and open the hub with
+`Hub::open_serving`; its other opens get the migration guard by default.
 
 ### Shutdown
 
