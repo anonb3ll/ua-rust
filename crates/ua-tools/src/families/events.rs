@@ -22,7 +22,7 @@ pub const MAX_LIMIT: usize = 1000;
 
 // The mailbox index owns the sender and recipient binding. A label-only
 // ledger read cannot receive mail addressed to a specific session.
-const VISIBLE_MESSAGE: &str = "channel NOT GLOB 'agent.message.*' OR (
+pub(super) const VISIBLE_MESSAGE: &str = "channel NOT GLOB 'agent.message.*' OR (
     org_id = ? AND (? OR EXISTS (
         SELECT 1 FROM message_index i WHERE i.event_ulid = event_log.ulid
           AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
@@ -45,7 +45,7 @@ impl EventReader {
         }
     }
 
-    fn bindings(&self) -> [&dyn ToSql; 4] {
+    pub(super) fn bindings(&self) -> [&dyn ToSql; 4] {
         [&DEFAULT_ORG, &self.unrestricted, &self.party, &self.party]
     }
 
