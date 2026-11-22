@@ -164,8 +164,10 @@ match" for "the hub is honest".
   the bundle.
 - Rotation: old public keys stay in the verifier's trust file so old bundles
   still verify; a bundle signed by a key the verifier does not have is `2`.
-- Custody is a decision, not a default (see open questions). The hub holding the
-  key protects against database editors, not against the hub's operator.
+- Custody is operator-held (decided 2026-11-22): the hub never holds the signing
+  key. It writes the checkpoint digest and the operator signs it offline, so a
+  compromised hub cannot mint a bundle. A hub-owned key would protect only against
+  database editors, which the hash chain already covers.
 
 ## What must never be in a bundle
 
@@ -196,18 +198,23 @@ The format is testable without a hub:
 | S3 | `ua evidence export` and the bundle writer | Red tier — data egress |
 | S4 | `ua evidence verify` CLI and fixtures | Ships with S3 |
 | S5 | A receipt for every approval, resolved at decision time | Red tier — approval semantics |
-| S6 | External anchor (timestamp authority or signed commit) | Red tier |
+| S6 | Anchor: the signed commit is recorded in the manifest and its signature verified | Red tier |
 
 S3 without S2 is not shippable: an unsigned bundle proves integrity only, and
 shipping it would invite the wrong reading.
 
-## Open decisions
+## Decisions (recorded 2026-11-22)
 
-1. **Anchor.** RFC 3161 timestamp authority, or a signed git commit in a
-   repository the organization already controls? The commit is cheaper and
-   already understood; a TSA is independent of our infrastructure.
-2. **Artifact content.** Hash-only by default is recommended. Content inclusion
-   is opt-in per export and recorded in the manifest class.
-3. **Key custody.** Hub-held key (protects against database edits) or
-   operator-held key (also protects against a compromised hub)? The second is
-   stronger and needs a signing step the operator can perform offline.
+1. **Anchor: a signed git commit in a repository the organization controls.** No
+   timestamp authority is added. The bundle records the anchor commit and the ref
+   it sits on; the verifier checks that commit's signature against a pinned key
+   and reads the time from the commit. The manifest's `anchor` object keeps a
+   class field so an RFC 3161 token can be added later without a format change;
+   an anchor class the verifier does not know is `2` (cannot verify), never a pass.
+2. **Artifact content: hash-only by default.** Content inclusion is opt-in per
+   export and recorded in the manifest class.
+3. **Key custody: operator-held.** The signing key is held offline by the owner
+   and never by the hub process. The hub assembles the bundle and writes the
+   checkpoint digest; signing is a separate operator step over that digest. A
+   hub-held key would only protect against database editors, which the hash chain
+   already covers, and it would let a compromised hub forge an export.
