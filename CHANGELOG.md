@@ -441,7 +441,8 @@ from its commit history.
 - GitHub REST: `github_api_url` spelled with a trailing dot or in another
   case (`https://API.GitHub.com.`) is the public API, gets `github.rest`, and
   is normalised to `api.github.com`; before, a trailing dot selected
-  `github.enterprise`.
+  `github.enterprise`. Any other host keeps the spelling the operator wrote,
+  trailing dot included.
 
 ### Security
 

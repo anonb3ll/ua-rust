@@ -215,10 +215,12 @@ pub(crate) fn api_base(cfg: &Config) -> Result<Url, GhError> {
     if url.host_str().is_none_or(str::is_empty) {
         return Err(bad("it has no host"));
     }
-    // One spelling per host (the parser lowercases): `api.github.com.` is
-    // the public API too, and must get its policy.
-    if let Some(host) = url.host_str().and_then(|h| h.strip_suffix('.')).map(str::to_string) {
-        url.set_host(Some(&host)).map_err(|_| bad("it has no host"))?;
+    // One spelling for the public API (the parser lowercases):
+    // `api.github.com.` is the public API too, and must get its policy. Any
+    // other host keeps the spelling the operator wrote: a trailing dot there
+    // can be deliberate (it stops the resolver from trying search domains).
+    if url.host_str() == Some("api.github.com.") {
+        url.set_host(Some("api.github.com")).map_err(|_| bad("it has no host"))?;
     }
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(&path);
@@ -404,6 +406,11 @@ mod tests {
             assert!(policy_for(&base, false).check_url(&base).is_ok(), "{spelling}");
             assert_eq!(policy_for(&Url::parse(spelling).unwrap(), false).name, "github.rest", "{spelling}");
         }
+        // An enterprise host keeps the spelling the operator wrote.
+        let cfg = Config { github_api_url: "https://ghe.example.com./api/v3".into(), ..Config::default() };
+        let base = api_base(&cfg).unwrap();
+        assert_eq!(base.host_str(), Some("ghe.example.com."));
+        assert_eq!(policy_for(&base, false).name, "github.enterprise");
         let hooked = policy_for(&Url::parse("http://127.0.0.1:9").unwrap(), true);
         assert!(hooked.check_url(&Url::parse("http://127.0.0.1:9/repos/a/b").unwrap()).is_ok());
     }
