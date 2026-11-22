@@ -143,6 +143,38 @@ async fn packet_is_bounded_historical_context() {
 }
 
 #[tokio::test]
+async fn packet_selects_the_latest_handoff_visible_to_the_caller() {
+    let e = Env::new();
+    let (sender, recipient, other) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task = e.ok(&sender, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+    let session = e.start(&recipient, json!({ "task_id": task })).await;
+    let sibling = e.start(&recipient, json!({ "task_id": task })).await;
+    let send = |to_session, next_action| {
+        json!({
+            "act": "handoff", "to_agent": recipient.label, "to_session": to_session,
+            "task_id": task, "body": "Ready for review", "handoff": { "done": ["prepare"], "next_action": next_action },
+        })
+    };
+    e.ok(&sender, "message_send", send(None, "Review the summary")).await;
+    e.ok(&sender, "message_send", send(Some(session.as_str()), "Review the attachment")).await;
+
+    for (caller, args, expected) in [
+        (&recipient, json!({ "task_id": task }), "Review the summary"),
+        (&recipient, json!({ "session_id": sibling }), "Review the summary"),
+        (&recipient, json!({ "session_id": session }), "Review the attachment"),
+        (&sender, json!({ "task_id": task }), "Review the attachment"),
+        (&human(), json!({ "task_id": task }), "Review the attachment"),
+        (&Caller::local("local", Transport::Stdio), json!({ "task_id": task }), "Review the attachment"),
+    ] {
+        let packet = e.ok(caller, "session_packet", args).await;
+        assert_eq!(packet["prior_handoff"]["handoff"]["next_action"], expected);
+    }
+    let packet =
+        e.ok(&other, "session_packet", json!({ "session_id": session, "agent": recipient.label })).await;
+    assert_eq!(packet["prior_handoff"], Value::Null);
+}
+
+#[tokio::test]
 async fn an_oversized_packet_is_trimmed_to_the_cap() {
     let e = Env::new();
     let b = agent("builder-1");
