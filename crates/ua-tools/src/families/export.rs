@@ -1763,8 +1763,13 @@ mod tests {
         c.execute_batch(
             "INSERT INTO schema_parts (name, checksum, applied_at)
              VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);
-             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);",
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT);
+             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
+             -- The columns VISIBLE_EVENT joins on, minimal versions of the
+             -- real tables.
+             CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY, agent TEXT,
+                 assigned_to TEXT, delivered_to TEXT);
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT);",
         )
         .unwrap();
         c

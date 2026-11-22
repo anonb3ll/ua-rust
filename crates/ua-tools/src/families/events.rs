@@ -56,6 +56,9 @@ pub(super) const VISIBLE_EVENT: &str = "(
           WHERE t.id = json_extract(event_log.payload, '$.task_id')
             AND ? IN (t.claimed_by, t.next_owner)
     )))
+    -- The writer of a restricted row sees its own write; lifecycle_record
+    -- rows carry no note or session to join against.
+    OR (org_id = ? AND event_log.originator = ?)
 )";
 
 /// Record visibility for a ledger reader. A stream keeps the reader it
@@ -87,7 +90,7 @@ impl EventReader {
         }
     }
 
-    pub(super) fn bindings(&self) -> [&dyn ToSql; 13] {
+    pub(super) fn bindings(&self) -> [&dyn ToSql; 15] {
         [
             &DEFAULT_ORG,
             &self.unrestricted,
@@ -101,6 +104,8 @@ impl EventReader {
             &self.unrestricted,
             &self.party,
             &self.party,
+            &self.party,
+            &DEFAULT_ORG,
             &self.party,
         ]
     }
