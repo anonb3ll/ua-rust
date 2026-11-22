@@ -3,16 +3,19 @@
 # identifier (private-network addresses, home directories, mail addresses).
 #
 # Usage: scripts/vocab-check.sh            (from anywhere inside the repo)
+#        scripts/vocab-check.sh --parse-allowlist
+#                                       print how each allowlist entry parsed
 #
 # Intended mentions (compatibility aliases, SSRF test addresses) are listed in
 # scripts/vocab-allowlist.txt, one per line: a path glob, then optionally
 # whitespace and an extended regex the matching line must also match. A path
-# alone allows every match in that file. An optional trailing field scopes the
-# entry to one pattern class, because the classes exist for different reasons
-# and one must never silence the other:
+# alone allows every match in that file. A trailing field scopes the entry to
+# one pattern class, because the classes exist for different reasons and one
+# must never silence the other:
 #
 #   <path glob> <line regex> vocab     only the role-name patterns
 #   <path glob> <line regex> private   only the address/path/tailnet patterns
+#   <path glob> <class>                that class in that file, any line
 #   <path glob> <line regex>           either (unchanged for older entries)
 #
 # Without that field a rule written for a compatibility alias would also hide
@@ -48,6 +51,12 @@ insensitive=(
 )
 sensitive_class=private
 insensitive_class=(vocab vocab private private)
+# Index-aligned with `insensitive`; a pattern added without a class would fail
+# closed (only unscoped entries could silence it), so catch the drift instead.
+if ((${#insensitive[@]} != ${#insensitive_class[@]})); then
+  echo "vocab-check: insensitive_class does not match insensitive; nothing was checked." >&2
+  exit 2
+fi
 
 allow_paths=()
 allow_res=()
@@ -55,6 +64,7 @@ allow_classes=()
 if [[ -f $allowlist ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
     [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    line=${line%"${line##*[![:space:]]}"}   # trailing whitespace is not part of a regex
     path=${line%%[[:space:]]*}
     rest=""
     if [[ $line =~ ^[^[:space:]]+[[:space:]]+(.+)$ ]]; then
@@ -62,7 +72,11 @@ if [[ -f $allowlist ]]; then
     fi
     re=$rest
     cls=""
-    if [[ $rest =~ ^(.+)[[:space:]]+(vocab|private)$ ]]; then
+    if [[ $rest =~ ^(vocab|private)$ ]]; then
+      # "<path> <class>": that class in that file, no line condition.
+      re=""
+      cls=$rest
+    elif [[ $rest =~ ^(.+)[[:space:]]+(vocab|private)$ ]]; then
       re=${BASH_REMATCH[1]}
       cls=${BASH_REMATCH[2]}
     fi
@@ -70,6 +84,14 @@ if [[ -f $allowlist ]]; then
     allow_res+=("$re")
     allow_classes+=("$cls")
   done <"$allowlist"
+fi
+
+if [[ ${1:-} == --parse-allowlist ]]; then
+  for i in "${!allow_paths[@]}"; do
+    printf '%s\t%s\t%s\n' "${allow_paths[$i]}" \
+      "${allow_classes[$i]:--}" "${allow_res[$i]:--}"
+  done
+  exit 0
 fi
 
 allowed() { # path content class

@@ -3,7 +3,8 @@
 # alone allows every match in that file. The optional trailing field scopes the
 # entry to one pattern class ("vocab" for the role names, "private" for
 # addresses, home paths and tailnet names): an entry scoped to one class never
-# silences a finding of the other class, even on the same line.
+# silences a finding of the other class, even on the same line. The regex may be
+# omitted ("<path glob> <class>") to allow that class anywhere in the file.
 
 # Legacy profile names, accepted as aliases for compatibility with the Python
 # hub, and the tests and docs that pin that compatibility.
