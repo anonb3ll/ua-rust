@@ -17,7 +17,7 @@ same range tables:
 
 | Class | Functions | Used by |
 |---|---|---|
-| `Class::Public` | `non_public_reason`, `is_public` | `ua_tools::families::web::non_public_reason` (a re-export): the web tools, Zulip, the relay's GitHub client, GitHub REST, Slack replies and Socket Mode; outbound policies with `Addresses::Public` or `PublicOrLoopback` |
+| `Class::Public` | `non_public_reason`, `is_public` | `ua_tools::families::web::non_public_reason` (a re-export): the web tools, Zulip, the relay's GitHub client, GitHub REST, Slack replies and Socket Mode; outbound policies with `Addresses::Public`, `PublicOrLoopback` or `OperatorConfigured` |
 | `Class::GlobalUnicastOnly` | `non_global_unicast_reason`, `is_global_unicast` | `ua_server::oauth::cimd::is_public_ip` (a re-export); outbound policies with `Addresses::GlobalUnicastOnly` |
 
 Refused in both classes:
@@ -36,6 +36,14 @@ Refused in both classes:
   and no current transition mechanism produces it, so no reachable
   destination has such an address.
 
+`addr::is_cloud_metadata` names the well-known cloud instance-metadata
+addresses that are not link-local: `100.100.100.200` (in the shared address
+space), `fd00:ec2::254` and `fd20:ce::254` (in unique local space), and any
+IPv6 form that carries the IPv4 one. Both classes refuse them anyway; every
+outbound address rule (`Addresses::check`) refuses them first, with the
+reason `cloud metadata`, before any relaxation applies. The common
+`169.254.169.254` is link-local and refused as such.
+
 The classes differ only on NAT64 and 6to4 forms of a public IPv4 address:
 `Public` judges them by that address and admits them (on an IPv6-only
 network behind DNS64, every IPv4-only site resolves to a NAT64 address);
@@ -52,12 +60,45 @@ refused.
 `ua_ingress::Outbound` is built from a `Policy`, one per destination class.
 A policy fixes the schemes, the hosts (an exact list, or any), whether a
 URL may name a port, the address class a connection may reach (`Public`,
-`GlobalUnicastOnly`, or `PublicOrLoopback`), how many redirects are followed, the response body
+`GlobalUnicastOnly`, `PublicOrLoopback`, `OperatorConfigured`, or
+`LoopbackOnly`), how many redirects are followed, whether TLS certificates
+are verified, the response body
 cap, and three timeouts (connect, one request with its body, the whole
 call). Named policies are constants in `ua_ingress::policy`;
 `Outbound::named` and `policy::lookup` refuse any other name, and a policy
-with an empty host list, a zero or unbounded cap or timeout, or more than
-ten redirects builds no client.
+with an empty host list, a zero or unbounded cap or timeout, more than
+ten redirects, an operator-configured class that follows redirects, or
+unverified certificates on anything but a loopback-only policy without
+redirects builds no client.
+
+`Addresses::OperatorConfigured` is for a destination the operator set in
+configuration, never for a URL a caller supplies: the public class plus
+loopback and private networks (`addr::is_private_network`: RFC 1918, the
+shared address space `100.64.0.0/10` that carrier-grade NAT and mesh VPNs
+use, unique local `fc00::/7`, and the IPv4-mapped form of the IPv4 ranges).
+It still refuses the cloud-metadata addresses above (including the ones
+inside the shared and unique local ranges it otherwise admits), unspecified,
+link-local, multicast, broadcast and reserved, documentation, benchmarking
+and IETF protocol addresses, and every IPv6 form of a private IPv4 address
+other than the mapped one. Only `Addresses::check` decides: the class's
+base range table is private to it, so no caller can judge an address by a
+looser class than the rule. A policy with this class follows no redirect, since a redirect
+target is the server's choice, not the operator's. Only `ua_ingress::policy`
+names the class, and each policy that uses it is named by one consumer
+file only (`tests/ingress_guard.rs`, `relaxed_policies_stay_with_their_one_consumer`).
+
+`Policy::accept_invalid_certs` turns certificate verification off (any
+certificate, any name). Only `obsidian.local_rest` sets it: the Obsidian
+Local REST API plugin serves https on this host with a self-signed
+certificate. `validate` refuses it unless the class is `LoopbackOnly` and no
+redirect is followed, the loopback test hook never widens a `LoopbackOnly`
+class, and the same ratchet test keeps the field's name out of every other
+crate.
+
+A limit that predates this policy: the client cannot tell the plugin from
+any other local process. Whatever answers on the configured loopback port,
+over plain http or with any certificate, receives the API key. Run the hub
+only where no untrusted local process can bind that port.
 
 Each property is enforced in the crate and has a test there:
 
@@ -85,6 +126,8 @@ Each property is enforced in the crate and has a test there:
 - **Timeouts.** Connect (which also bounds the DNS lookup), per request
   including the body, and a deadline for the whole call that also bounds
   body reads.
+- **TLS certificates are verified**, except under the one loopback-only
+  policy above.
 
 ### The cross-origin rule
 
@@ -382,7 +425,7 @@ category is caught, and that the lookalikes above are not. Baselines:
 | `ua-server` | `direct_dial` | 3 | `slack_socket.rs::connect`: `TcpStream::connect`, the rustls `TlsConnector`, the WebSocket client handshake |
 | `ua-server` | `inline_address_check` | 5 | loopback checks in `oauth/register.rs` (3) and `login.rs` (2) |
 | `ua-cli` | `inline_address_check` | 1 | `ops/doctor.rs`, the bind address |
-| `ua-tools` | `client_builder` | 4 | `github/client`, `mcp/gateway`, `notify`, `vault/obsidian` (`web::http_client` was removed when its consumers moved onto `Outbound`) |
+| `ua-tools` | `client_builder` | 1 | `mcp/gateway` (`web::http_client`, the GitHub REST client, the Obsidian client and the notify client were removed when their consumers moved onto `Outbound`) |
 | `ua-tools` | `address_classifier` | 4 | `mcp/scope.rs` `classify`, `classify_v4`; `relay/gates.rs` `v4_kind`, `v6_kind` |
 | `ua-tools` | `inline_address_check` | 11 | loopback URL hosts in `slack.rs`, `zulip.rs`, `github/client.rs`, `harness_config/policy.rs` (2 each); `observability.rs` (2); `vault/obsidian.rs` (1) |
 | `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies` (still created, no longer read or written; dropped one release later), `slack_seen_signatures`, `slack_seen_deliveries`. `inbound_deliveries` is in `ua-ingress` and not counted |
@@ -400,18 +443,25 @@ calls `ua_ingress::addr`, so it no longer counts.
 | `web_search` (DuckDuckGo, Brave, Tavily) | `web.search`: as `web.page`, but a redirect from https to http is refused |
 | Zulip (`zulip_send_message`, `zulip_fetch_messages`) | `zulip.api`: https to the configured site, public addresses, no redirects, 4 MiB cap (each call reads less), 20 s |
 | The relay's GitHub comments (`relay/github.rs`) | `relay.github`: https to `relay_github_api_url`, public addresses, no redirects, 256 KiB cap (cut), 20 s |
+| GitHub REST (`github/client.rs`: CI checks, polling, merged pull requests), public API | `github.rest`: https to `api.github.com`, public addresses, no redirects, 8 MiB cap (refused past it), 10 s to connect, 20 s for the call; one client per API base, reused |
+| GitHub REST against a GHES root in `github_api_url` | `github.enterprise`: as `github.rest` for any host, with `OperatorConfigured` addresses |
+| The Obsidian Local REST API (`vault/obsidian.rs`: `obsidian_status`, `_open`, `_active_note`, `_search`, `_append`) | `obsidian.local_rest`: http or https to `obsidian_api_url` (which must name `localhost` or a loopback address), `LoopbackOnly` addresses, certificates not verified, no redirects, 16 MiB cap (refused past it), 20 s for everything |
+| Notification webhook (`notify.rs`: `notify`, `batch_notify`, `flush_digest`, hub events such as `review_ready`) | `notify.webhook`: http or https to `notify_webhook_url`, any host and port, `OperatorConfigured` addresses, no redirects, the body never read (64 KiB cap), 120 s, with each attempt bounded by the caller's timeout (1 to 120 s, default 60; 20 for hub events) |
 
 The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
 neither settable from TOML or the environment) apply
 `Policy::loopback_test_hook`: loopback admitted besides public addresses,
-plain http, any host and port; everything else unchanged.
+plain http, any host and port; everything else unchanged. A policy whose
+class already admits loopback keeps its class: `OperatorConfigured` stays
+operator-configured, and `LoopbackOnly` (the Obsidian policy) stays
+loopback-only, so the hook never lets an unverified-certificate policy
+reach a public address.
 
 ## Planned slices
 
-1. Move the remaining HTTP client consumers onto policies (GitHub REST,
-   the MCP gateway, notify webhooks, the Obsidian client, the client ID
-   metadata fetch; the web, Zulip, relay and Slack Web API consumers have
-   moved).
+1. Move the remaining HTTP client consumers onto policies (the MCP
+   gateway and the client ID metadata fetch; the web, Zulip, relay, Slack
+   Web API, GitHub REST, Obsidian and notify consumers have moved).
 2. One inbound-delivery table, with a cut-over for GitHub deliveries
    (done: [Inbound deliveries](#inbound-deliveries)).
 3. Slack's signed HTTP routes and Socket Mode onto it (the replay keys and

@@ -18,3 +18,11 @@ crates/ua-tools/src/families/mcp/scope.rs  100\.64\.0\.0/10|"100\.64\.0\.1"
 docs/mcp.md                              `100\.64\.0\.0/10`
 crates/ua-ingress/src/addr.rs           100\.64\.0\.0/10|"100\.64\.0\.1"|"100\.127\.255\.255"
 docs/ingress.md                          `100\.64\.0\.0/10`
+
+# The well-known cloud instance-metadata address in the shared address space,
+# refused by every outbound address rule, its neighbour in the tests, and the
+# docs that name it.
+crates/ua-ingress/src/addr.rs           "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]"
+crates/ua-ingress/src/policy.rs         "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]"
+docs/ingress.md                          `100\.100\.100\.200`
+CHANGELOG.md                             `100\.100\.100\.200`

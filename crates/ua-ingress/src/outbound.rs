@@ -444,6 +444,8 @@ impl Outbound {
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .https_only(policy.schemes == Schemes::HttpsOnly)
+            // `validate` allows this only for a loopback-only policy.
+            .danger_accept_invalid_certs(policy.accept_invalid_certs)
             .connect_timeout(policy.connect_timeout)
             .timeout(policy.request_timeout)
             .dns_resolver(resolver)

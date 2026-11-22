@@ -4,17 +4,21 @@
 //!   `https://api.github.com`; a GitHub Enterprise Server API root works the
 //!   same). The URL must be `https` without credentials, query or fragment
 //!   (plain `http` only to loopback under the `fetch_allow_loopback` test
-//!   hook). For the public API the connection goes through the same guarded
-//!   resolver as `web_fetch`, so a DNS answer pointing at a private address
-//!   is refused. A GHES host is the operator's choice and may be private.
+//!   hook). Requests go through `ua_ingress::Outbound`: the public API under
+//!   the `github.rest` policy (that one host, public addresses only, checked
+//!   at connect time and again on the connection's peer), any other base
+//!   under `github.enterprise` (the operator's GHES host may be on a private
+//!   network or this host; link-local, multicast and reserved addresses are
+//!   still refused). No proxy is used.
 //! - **No redirects.** A 3xx other than 304 is an error, never followed, so
-//!   the token is never sent anywhere else.
+//!   the token is never sent anywhere else. The token is a secret header,
+//!   bound to the API base's origin.
 //! - **Bound repositories only.** Every call takes a [`BoundRepo`], which
 //!   exists only for a repository some project is bound to
 //!   (`project_repo_bind`). Paths are built from the normalized `owner/name`
 //!   and numeric ids, never from caller text.
 //! - **Bounded.** 20 seconds per request, 8 MiB per body, JSON only.
-//! - **One connection pool per API base.** The HTTP client for a base URL
+//! - **One connection pool per API base.** The `Outbound` client for a base URL
 //!   is built once and reused by every later request (connections and TLS
 //!   sessions are kept), never rebuilt per call.
 //! - **Rate-limit aware.** `x-ratelimit-remaining: 0` (or a 403/429 that says
@@ -27,20 +31,18 @@
 //!   token's source.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, ETAG, HeaderValue, IF_NONE_MATCH};
+use reqwest::header::ETAG;
 use reqwest::{StatusCode, Url};
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use ua_core::{Config, UaError, UaResult};
+use ua_ingress::{Outbound, OutboundError, Request, policy};
 
-use crate::families::web::{GuardedResolver, USER_AGENT, error_chain, install_crypto_provider};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_BODY: usize = 8 * 1024 * 1024;
+/// The policies' body cap (both GitHub policies have the same).
+const MAX_BODY: usize = policy::GITHUB_REST.max_body_bytes;
 const API_VERSION: &str = "2022-11-28";
 /// Longest a rate-limit block is honoured, whatever the server says.
 const MAX_BLOCK_S: i64 = 3600;
@@ -134,38 +136,40 @@ pub(crate) enum Got {
 /// A GitHub REST client pinned to one API host.
 pub(crate) struct GitHub {
     base: Url,
-    http: reqwest::Client,
+    http: Arc<Outbound>,
     token: SecretString,
 }
 
-/// The HTTP clients built so far, one per (API base, loopback test hook).
-fn clients() -> &'static Mutex<HashMap<(String, bool), reqwest::Client>> {
-    static CLIENTS: OnceLock<Mutex<HashMap<(String, bool), reqwest::Client>>> = OnceLock::new();
+/// The clients built so far, one per (API base, loopback test hook).
+type Clients = Mutex<HashMap<(String, bool), Arc<Outbound>>>;
+
+fn clients() -> &'static Clients {
+    static CLIENTS: OnceLock<Clients> = OnceLock::new();
     CLIENTS.get_or_init(Mutex::default)
+}
+
+/// The policy for `base`: `github.rest` for the public API, else
+/// `github.enterprise`; under the loopback test hook when it is on.
+fn policy_for(base: &Url, allow_loopback: bool) -> ua_ingress::Policy {
+    let public_api = base
+        .host_str()
+        .is_some_and(|h| h.strip_suffix('.').unwrap_or(h).eq_ignore_ascii_case("api.github.com"));
+    let p = if public_api { policy::GITHUB_REST } else { policy::GITHUB_ENTERPRISE };
+    if allow_loopback { p.loopback_test_hook() } else { p }
 }
 
 /// The shared client for `base`, built on first use. The second value says
 /// whether this call built it.
-fn shared_client(base: &Url, allow_loopback: bool) -> Result<(reqwest::Client, bool), GhError> {
+fn shared_client(base: &Url, allow_loopback: bool) -> Result<(Arc<Outbound>, bool), GhError> {
     let key = (base.as_str().to_string(), allow_loopback);
     let mut map =
         clients().lock().map_err(|_| GhError::NotConfigured("HTTP client cache poisoned".into()))?;
     if let Some(c) = map.get(&key) {
         return Ok((c.clone(), false));
     }
-    install_crypto_provider();
-    let public_api = base.host_str().is_some_and(|h| h.eq_ignore_ascii_case("api.github.com"));
-    let mut builder = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(Duration::from_secs(10));
-    if public_api {
-        builder = builder.dns_resolver(GuardedResolver { allow_loopback });
-    }
-    let http =
-        builder.build().map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
+    let http = Outbound::new(policy_for(base, allow_loopback))
+        .map(Arc::new)
+        .map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
     if map.len() >= 16 {
         // Only a reconfigured base adds entries; keep the cache bounded anyway.
         map.clear();
@@ -210,6 +214,13 @@ pub(crate) fn api_base(cfg: &Config) -> Result<Url, GhError> {
     }
     if url.host_str().is_none_or(str::is_empty) {
         return Err(bad("it has no host"));
+    }
+    // One spelling for the public API (the parser lowercases):
+    // `api.github.com.` is the public API too, and must get its policy. Any
+    // other host keeps the spelling the operator wrote: a trailing dot there
+    // can be deliberate (it stops the resolver from trying search domains).
+    if url.host_str() == Some("api.github.com.") {
+        url.set_host(Some("api.github.com")).map_err(|_| bad("it has no host"))?;
     }
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(&path);
@@ -265,21 +276,17 @@ impl GitHub {
             return Err(GhError::RateLimited(Some(until)));
         }
         let url = self.url(repo, path)?;
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.token.expose_secret()))
-            .map_err(|_| GhError::NotConfigured("the GitHub token is not a valid header value".into()))?;
-        auth.set_sensitive(true);
-        let mut req = self
-            .http
-            .get(url)
-            .header(AUTHORIZATION, auth)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("x-github-api-version", API_VERSION);
-        if let Some(tag) = etag
-            && let Ok(v) = HeaderValue::from_str(tag)
-        {
-            req = req.header(IF_NONE_MATCH, v);
+        let mut req = Request::get(url)
+            .secret_header("authorization", &format!("Bearer {}", self.token.expose_secret()))
+            .map_err(|_| GhError::NotConfigured("the GitHub token is not a valid header value".into()))?
+            .header("accept", "application/vnd.github+json")
+            .and_then(|r| r.header("x-github-api-version", API_VERSION))
+            .map_err(|e| GhError::Network(e.to_string()))?;
+        if let Some(tag) = etag {
+            // An unusable stored tag is skipped, as before.
+            req = req.clone().header("if-none-match", tag).unwrap_or(req);
         }
-        let mut resp = req.send().await.map_err(|e| GhError::Network(error_chain(&e)))?;
+        let resp = self.http.send(req).await.map_err(network)?;
         let status = resp.status();
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let remaining = header("x-ratelimit-remaining").and_then(|v| v.trim().parse::<i64>().ok());
@@ -313,13 +320,7 @@ impl GitHub {
             _ => {}
         }
         let etag = header(ETAG.as_str());
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| GhError::Network(error_chain(&e)))? {
-            if body.len() + chunk.len() > MAX_BODY {
-                return Err(GhError::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = resp.bytes().await.map_err(network)?;
         let body: Value = serde_json::from_slice(&body).map_err(|e| GhError::Decode(e.to_string()))?;
         Ok(Got::Fresh { etag, body })
     }
@@ -330,6 +331,15 @@ impl GitHub {
             Got::Fresh { body, .. } => Ok(body),
             Got::NotModified => Err(GhError::Status(304)),
         }
+    }
+}
+
+/// A failed send or body read. A body past the cap is [`GhError::TooLarge`];
+/// everything else is a network failure, as before.
+fn network(e: OutboundError) -> GhError {
+    match e {
+        OutboundError::TooLarge { .. } => GhError::TooLarge,
+        other => GhError::Network(other.to_string()),
     }
 }
 
@@ -378,6 +388,31 @@ mod tests {
         GitHub::from_config(&cfg).unwrap().unwrap();
         let (_, built) = shared_client(&api_base(&cfg).unwrap(), false).unwrap();
         assert!(!built, "from_config shares the cached client");
+    }
+
+    #[test]
+    fn the_public_api_and_an_enterprise_host_get_their_own_policies() {
+        let public = Url::parse("https://api.github.com").unwrap();
+        let ghe = Url::parse("https://ghe.example.com/api/v3").unwrap();
+        assert_eq!(policy_for(&public, false).name, "github.rest");
+        assert_eq!(policy_for(&ghe, false).name, "github.enterprise");
+        // Case and a trailing dot do not turn the public API into an
+        // enterprise host.
+        for spelling in ["https://API.GitHub.com", "https://api.github.com.", "https://Api.Github.Com./"] {
+            let cfg = Config { github_api_url: spelling.into(), ..Config::default() };
+            let base = api_base(&cfg).unwrap();
+            assert_eq!(base.host_str(), Some("api.github.com"), "{spelling}");
+            assert_eq!(policy_for(&base, false).name, "github.rest", "{spelling}");
+            assert!(policy_for(&base, false).check_url(&base).is_ok(), "{spelling}");
+            assert_eq!(policy_for(&Url::parse(spelling).unwrap(), false).name, "github.rest", "{spelling}");
+        }
+        // An enterprise host keeps the spelling the operator wrote.
+        let cfg = Config { github_api_url: "https://ghe.example.com./api/v3".into(), ..Config::default() };
+        let base = api_base(&cfg).unwrap();
+        assert_eq!(base.host_str(), Some("ghe.example.com."));
+        assert_eq!(policy_for(&base, false).name, "github.enterprise");
+        let hooked = policy_for(&Url::parse("http://127.0.0.1:9").unwrap(), true);
+        assert!(hooked.check_url(&Url::parse("http://127.0.0.1:9/repos/a/b").unwrap()).is_ok());
     }
 
     #[test]

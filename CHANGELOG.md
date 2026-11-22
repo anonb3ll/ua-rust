@@ -191,6 +191,11 @@ from its commit history.
   where the target has the column (`event_log`, the harness config tables).
   Such rows are refused unless `--drop-org-scope` is given. Before this,
   `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: notification webhooks (`notify_webhook_url`) no longer use
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or the system proxy settings; they
+  connect directly. An operator whose hub reaches its webhook receiver only
+  through a proxy must make the receiver reachable directly (the Obsidian
+  client, which also honoured them, talks to loopback only).
 - Upgrade note: a backup taken after `organization.v1.store` applied cannot be
   restored by an earlier build, even with `--allow-newer`, because that build
   sees `event_log` as an altered table and refuses. Older backups restore into
@@ -365,6 +370,79 @@ from its commit history.
     the default port (before, only the hard-coded base URL kept it there);
   - Zulip and the relay: nothing beyond the first item. None of these
     follows redirects, before or now.
+- The GitHub REST client (CI check verification, polling, merged pull
+  requests) now goes through `ua_ingress::Outbound`: `github.rest` for
+  `api.github.com`, `github.enterprise` for a GHES root in `github_api_url`
+  (`docs/ingress.md`). Its client is still built once per API base. The
+  host, https, the loopback test hook, no proxy, no redirects (a 3xx is an
+  error), the 8 MiB cap, 20 seconds and its errors are as before. The new
+  address class `OperatorConfigured` (public, loopback and private networks:
+  RFC 1918, the RFC 6598 shared address space, `fc00::/7`) serves the GHES case and follows no
+  redirect. Stricter:
+  - a GHES host was not address-checked at all; now a name or address in
+    link-local (cloud metadata), unspecified, multicast, broadcast and
+    reserved, documentation, benchmarking or IETF protocol ranges is
+    refused, at connect time and on the connection's peer. Private and
+    loopback addresses are still reached;
+  - the public API's connection peer is checked again after the response
+    arrives;
+  - a network failure's detail is `ua_ingress`'s message rather than the
+    HTTP library's error chain (it never quotes the URL).
+- The Obsidian tools (`obsidian_status`, `obsidian_open`,
+  `obsidian_active_note`, `obsidian_search`, `obsidian_append`) now go
+  through `ua_ingress::Outbound` under `obsidian.local_rest`. The URL check
+  (`obsidian_url`), http or https, the bearer key, 20 seconds, the 412
+  conflict and the error prefix `Obsidian request failed:` are as before,
+  and TLS certificates are still not verified (the plugin's certificate is
+  self-signed): `Policy::accept_invalid_certs` exists for this one policy
+  and is refused on any policy that is not loopback-only (new class
+  `LoopbackOnly`) or that follows redirects. Stricter:
+  - every address a connection reaches must be loopback, checked when it is
+    made and again on its peer (before, only the configured URL's host was
+    checked, so `localhost` resolving elsewhere was followed);
+  - redirects are not followed (up to ten were, with the key dropped only
+    on a host change); a 3xx now reads `HTTP 3xx` as any other non-success;
+  - proxy environment variables are ignored (they were honoured, so the key
+    could travel through a proxy);
+  - a reply larger than 16 MiB is refused (there was no cap); from
+    `obsidian_append`, whose patch has already been applied, such a reply
+    reads as `response: null` instead;
+  - replies are decoded as UTF-8 (lossy) whatever charset they declare;
+  - requests carry the hub's `User-Agent` (there was none).
+- Notification webhooks (`notify`, `batch_notify`, `flush_digest`, hub
+  events such as `review_ready`) now go through `ua_ingress::Outbound`
+  under `notify.webhook`: http or https to `notify_webhook_url`, any host
+  and port, `OperatorConfigured` addresses (private networks and this host
+  are still reached), no redirects, each attempt bounded by its timeout as
+  before. The configured secret header (also over plain http, as before),
+  retries on network errors, 429 and 5xx, the outbox and its error texts
+  are unchanged. Credentials in the URL are still sent as basic auth, now
+  as a header bound to the URL's origin. Stricter:
+  - a URL whose host is or resolves to a link-local (cloud metadata),
+    unspecified, multicast, broadcast and reserved, documentation,
+    benchmarking or IETF protocol address is refused (nothing was checked),
+    with `webhook address refused (<reason>)` and no retry; the peer
+    address is checked again after the response;
+  - proxy environment variables are ignored (they were honoured, so the
+    secret header could travel through a proxy);
+  - requests carry the hub's `User-Agent` (`ua-rust/<version>`; there was
+    none).
+- Every outbound address rule now refuses the well-known cloud
+  instance-metadata addresses that are not link-local, with the reason
+  `cloud metadata`: `100.100.100.200` and `fd00:ec2::254`, `fd20:ce::254`,
+  and any IPv6 form that carries the IPv4 one (mapped, translated, NAT64,
+  6to4). `OperatorConfigured` (GHES, notify webhooks) admitted them inside
+  the shared address space and unique local space; the rest of both ranges
+  is still reachable. The public classes refused them already, under their
+  range's reason.
+- `Addresses::class()` is gone: it returned the public range table for
+  `LoopbackOnly` too, so a caller deciding by it would have admitted public
+  addresses. Every decision goes through `Addresses::check`.
+- GitHub REST: `github_api_url` spelled with a trailing dot or in another
+  case (`https://API.GitHub.com.`) is the public API, gets `github.rest`, and
+  is normalised to `api.github.com`; before, a trailing dot selected
+  `github.enterprise`. Any other host keeps the spelling the operator wrote,
+  trailing dot included.
 
 ### Security
 

@@ -89,6 +89,47 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+/// A private-network address: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`,
+/// `192.168.0.0/16`), the shared address space `100.64.0.0/10` (where
+/// carrier-grade NAT and mesh VPNs number hosts), IPv6 unique local
+/// `fc00::/7`, and the IPv4-mapped form of the IPv4 ranges. Loopback,
+/// link-local (cloud metadata), multicast, documentation and reserved
+/// addresses are not private networks.
+pub fn is_private_network(ip: IpAddr) -> bool {
+    let v4 = |v4: Ipv4Addr| {
+        let o = v4.octets();
+        v4.is_private() || (o[0] == 100 && (o[1] & 0xC0) == 64)
+    };
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => (a.segments()[0] & 0xfe00) == 0xfc00 || a.to_ipv4_mapped().is_some_and(v4),
+    }
+}
+
+/// Well-known cloud instance-metadata addresses outside link-local, which
+/// sit inside ranges a class may otherwise admit: one provider's IPv4
+/// metadata service in the shared address space, and two providers' IPv6
+/// metadata services in unique local space. (The common `169.254.169.254`
+/// and other link-local metadata addresses are refused as link-local.)
+const CLOUD_METADATA_V4: &[Ipv4Addr] = &[Ipv4Addr::new(100, 100, 100, 200)];
+const CLOUD_METADATA_V6: &[Ipv6Addr] = &[
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+];
+
+/// A well-known cloud instance-metadata address outside link-local
+/// ([`CLOUD_METADATA_V4`], [`CLOUD_METADATA_V6`]), also inside any IPv6 form
+/// that carries an IPv4 address. Every outbound address class refuses it,
+/// with the reason `cloud metadata`.
+pub fn is_cloud_metadata(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => CLOUD_METADATA_V4.contains(&a),
+        IpAddr::V6(a) => {
+            CLOUD_METADATA_V6.contains(&a) || embedded_v4(a).is_some_and(|v4| CLOUD_METADATA_V4.contains(&v4))
+        }
+    }
+}
+
 /// The IPv4 destination an IPv6 address stands for (mapped, compatible,
 /// translated, NAT64 and 6to4 forms).
 pub fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -209,6 +250,60 @@ mod tests {
 
     fn reason(s: &str) -> Option<&'static str> {
         non_public_reason(s.parse().unwrap_or_else(|_| panic!("{s} is not an address")))
+    }
+
+    #[test]
+    fn cloud_metadata_addresses() {
+        for yes in [
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+            "::ffff:0:100.100.100.200",
+            "64:ff9b::100.100.100.200",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+        ] {
+            assert!(is_cloud_metadata(yes.parse().unwrap()), "{yes}");
+        }
+        for no in ["100.100.100.201", "100.64.0.1", "fd00:ec2::253", "fd20:ce::1", "fd00::254", "10.0.0.1"] {
+            assert!(!is_cloud_metadata(no.parse().unwrap()), "{no}");
+        }
+    }
+
+    #[test]
+    fn private_networks() {
+        for yes in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "fc00::1",
+            "fd12:3456::1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert!(is_private_network(yes.parse().unwrap()), "{yes}");
+        }
+        for no in [
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.18.0.1",
+            "172.32.0.1",
+            "100.128.0.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "64:ff9b::a00:1",
+            "2002:a00:1::",
+            "::10.0.0.1",
+        ] {
+            assert!(!is_private_network(no.parse().unwrap()), "{no}");
+        }
     }
 
     #[test]

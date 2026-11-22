@@ -99,6 +99,7 @@ const LOCAL: Policy = Policy {
     addresses: Addresses::PublicOrLoopback,
     max_redirects: 0,
     allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
     max_body_bytes: 1024,
     connect_timeout: Duration::from_secs(5),
     request_timeout: Duration::from_secs(5),
@@ -725,4 +726,18 @@ async fn a_same_origin_hop_after_a_return_stays_stripped() {
         assert!(!r.contains("hunter2") && !r.contains("x-custom-auth"), "{path}: {r}");
         assert!(!r.contains("s3cr3t") && !r.contains("authorization"), "{path}: {r}");
     }
+}
+
+#[tokio::test]
+async fn the_loopback_only_policy_reaches_loopback_and_nothing_else() {
+    let server = Server::start(|_| ok("live")).await;
+    let out = Outbound::new(crate::policy::OBSIDIAN_LOCAL).unwrap();
+    let resp = out.send(Request::get(server.url("/"))).await.unwrap();
+    assert_eq!(resp.body().await.unwrap().bytes, b"live");
+    // A name that resolves off this host is refused before anything is sent.
+    let public: SocketAddr = "93.184.215.14:443".parse().unwrap();
+    let out = Outbound::with_lookup(crate::policy::OBSIDIAN_LOCAL, fake_lookup("vault.test", vec![public]))
+        .unwrap();
+    let err = out.send(Request::get(Url::parse("https://vault.test/").unwrap())).await.err().unwrap();
+    assert!(matches!(err, OutboundError::AddressRefused { reason: "not loopback", .. }), "{err:?}");
 }
