@@ -279,22 +279,27 @@ pub const NOTIFY_WEBHOOK: Policy = Policy {
 };
 
 /// Every named policy.
-pub const POLICIES: &[&Policy] = &[
-    &SLACK_RESPONSE_URL,
-    &SLACK_WEB_API,
-    &WEB_PAGE,
-    &WEB_SEARCH,
-    &ZULIP_API,
-    &RELAY_GITHUB,
-    &GITHUB_REST,
-    &GITHUB_ENTERPRISE,
-    &OBSIDIAN_LOCAL,
-    &NOTIFY_WEBHOOK,
-];
+///
+/// These are the policies obtainable by name ([`lookup`],
+/// [`crate::Outbound::named`]). None of them is relaxed
+/// ([`Policy::is_relaxed`]); the relaxed ones are in [`RELAXED`], which is
+/// not public, and only [`crate::Outbound::pinned`] builds a client from one.
+pub const POLICIES: &[&Policy] =
+    &[&SLACK_RESPONSE_URL, &SLACK_WEB_API, &WEB_PAGE, &WEB_SEARCH, &ZULIP_API, &RELAY_GITHUB, &GITHUB_REST];
 
-/// The policy called `name`. An unknown name is refused.
+/// The relaxed policies: an operator-configured address class or
+/// unverified certificates. Not obtainable by name; a client built from one
+/// is pinned to the one origin it was built for.
+pub(crate) const RELAXED: &[&Policy] = &[&GITHUB_ENTERPRISE, &OBSIDIAN_LOCAL, &NOTIFY_WEBHOOK];
+
+/// The policy called `name`. An unknown name, or the name of a relaxed
+/// policy, is refused.
 pub fn lookup(name: &str) -> Result<&'static Policy, OutboundError> {
-    POLICIES.iter().copied().find(|p| p.name == name).ok_or_else(|| OutboundError::UnknownPolicy(name.into()))
+    POLICIES
+        .iter()
+        .copied()
+        .find(|p| p.name == name && !p.is_relaxed())
+        .ok_or_else(|| OutboundError::UnknownPolicy(name.into()))
 }
 
 /// Largest values a policy may carry: a policy is a bound, not a way out.
@@ -323,6 +328,40 @@ impl Policy {
             addresses,
             ..self
         }
+    }
+
+    /// Whether the policy relaxes a default: an operator-configured address
+    /// class or unverified certificates. A relaxed policy builds a client
+    /// only through [`crate::Outbound::pinned`], and only when it is one of
+    /// [`RELAXED`] (or that policy under the loopback test hook).
+    pub fn is_relaxed(&self) -> bool {
+        self.addresses == Addresses::OperatorConfigured || self.accept_invalid_certs
+    }
+
+    /// Refuse a relaxed policy for an unpinned client (one that may be sent
+    /// to any URL the policy admits), on top of [`Policy::validate`].
+    pub(crate) fn validate_unpinned(&self) -> Result<(), OutboundError> {
+        self.validate()?;
+        if self.is_relaxed() {
+            return Err(OutboundError::InvalidPolicy {
+                policy: self.name,
+                why: "a relaxed policy builds only a client pinned to its configured origin",
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a relaxed policy that is not one of [`RELAXED`] (or one of
+    /// them under the loopback test hook), on top of [`Policy::validate`].
+    pub(crate) fn validate_pinned(&self) -> Result<(), OutboundError> {
+        self.validate()?;
+        if self.is_relaxed() && !RELAXED.iter().any(|r| **r == *self || r.loopback_test_hook() == *self) {
+            return Err(OutboundError::InvalidPolicy {
+                policy: self.name,
+                why: "not one of the relaxed policies ua_ingress defines",
+            });
+        }
+        Ok(())
     }
 
     /// Refuse a policy that is empty or unbounded.
@@ -415,10 +454,42 @@ mod tests {
 
     #[test]
     fn every_named_policy_is_valid_and_unique() {
-        for p in POLICIES {
+        for p in POLICIES.iter().chain(RELAXED) {
             p.validate().unwrap();
-            assert_eq!(POLICIES.iter().filter(|q| q.name == p.name).count(), 1, "{}", p.name);
+            assert_eq!(POLICIES.iter().chain(RELAXED).filter(|q| q.name == p.name).count(), 1, "{}", p.name);
         }
+        for p in POLICIES {
+            p.validate_unpinned().unwrap();
+        }
+    }
+
+    #[test]
+    fn relaxed_policies_are_not_obtainable_by_name() {
+        for r in RELAXED {
+            assert!(r.is_relaxed(), "{}", r.name);
+            r.validate_pinned().unwrap();
+            r.loopback_test_hook().validate_pinned().unwrap();
+            assert!(matches!(r.validate_unpinned(), Err(OutboundError::InvalidPolicy { .. })), "{}", r.name);
+            assert!(
+                !POLICIES.iter().any(|p| p.name == r.name || *p == *r),
+                "{} is in the public list",
+                r.name
+            );
+            // Also a name built at run time.
+            let built = format!("{}{}", &r.name[..3], &r.name[3..]);
+            assert!(matches!(lookup(&built), Err(OutboundError::UnknownPolicy(_))), "{}", r.name);
+        }
+        assert!(POLICIES.iter().all(|p| !p.is_relaxed()));
+        // A hand-made relaxed policy is not one of ua_ingress's.
+        for odd in [
+            Policy { name: "odd.op", addresses: Addresses::OperatorConfigured, ..ZULIP_API },
+            Policy { max_body_bytes: 1, ..NOTIFY_WEBHOOK },
+            Policy { total_timeout: Duration::from_secs(300), ..GITHUB_ENTERPRISE },
+        ] {
+            assert!(matches!(odd.validate_pinned(), Err(OutboundError::InvalidPolicy { .. })), "{odd:?}");
+        }
+        // A strict policy may be pinned too.
+        ZULIP_API.validate_pinned().unwrap();
     }
 
     #[test]
@@ -513,6 +584,8 @@ mod tests {
             ("::ffff:100.100.100.200", "cloud metadata"),
             ("::ffff:0:100.100.100.200", "cloud metadata"),
             ("64:ff9b::100.100.100.200", "cloud metadata"),
+            ("2002:6464:64c8::", "cloud metadata"),
+            ("::100.100.100.200", "cloud metadata"),
             ("fd00:ec2::254", "cloud metadata"),
             ("fd20:ce::254", "cloud metadata"),
             ("169.254.169.254", "link-local (includes cloud metadata)"),
@@ -532,11 +605,8 @@ mod tests {
             assert_eq!(op.check(no.parse().unwrap()), Err(why), "{no}");
         }
         // The class is only used by policies for operator-set destinations.
-        let users: Vec<&str> = POLICIES
-            .iter()
-            .filter(|p| p.addresses == Addresses::OperatorConfigured)
-            .map(|p| p.name)
-            .collect();
+        let users: Vec<&str> =
+            RELAXED.iter().filter(|p| p.addresses == Addresses::OperatorConfigured).map(|p| p.name).collect();
         assert_eq!(users, ["github.enterprise", "notify.webhook"]);
     }
 
@@ -584,7 +654,7 @@ mod tests {
         assert_eq!(Addresses::LoopbackOnly.check("10.0.0.1".parse().unwrap()), Err("private"));
         // The test hook does not widen it, and unverified TLS appears nowhere else.
         assert_eq!(p.loopback_test_hook().addresses, Addresses::LoopbackOnly);
-        let lax: Vec<&str> = POLICIES.iter().filter(|p| p.accept_invalid_certs).map(|p| p.name).collect();
+        let lax: Vec<&str> = RELAXED.iter().filter(|p| p.accept_invalid_certs).map(|p| p.name).collect();
         assert_eq!(lax, ["obsidian.local_rest"]);
     }
 

@@ -26,3 +26,4 @@ crates/ua-ingress/src/addr.rs           "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\
 crates/ua-ingress/src/policy.rs         "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]"
 docs/ingress.md                          `100\.100\.100\.200`
 CHANGELOG.md                             `100\.100\.100\.200`
+crates/ua-ingress/src/policy.rs         "::100\.100\.100\.200"
