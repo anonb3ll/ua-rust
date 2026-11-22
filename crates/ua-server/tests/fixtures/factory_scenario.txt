@@ -1,0 +1,68 @@
+# The expected scorecard of the software factory acceptance scenario
+# (crates/ua-server/tests/factory_scenario.rs; docs/software-factory-status.md).
+#
+# One line per check: <step> <check-id> <status>, status one of pass, fail,
+# not-built. The test fails when its scorecard differs from this file in any
+# line. This file is the truth about what works at this commit, and it only
+# moves forward: change a line from not-built or fail to pass in the same
+# change that makes the check pass. Never move a line away from pass.
+
+1 delegate.task-delegated-to-first-harness pass
+1 delegate.team-accepts-task not-built
+1 delegate.task-claimed-with-review-requirement pass
+1 delegate.handoff-tied-to-revision pass
+1 delegate.session-handoff-sealed pass
+1 delegate.deliverable-revision-object not-built
+
+2 review.second-harness-opens-same-task pass
+2 review.packet-carries-handoff-at-revision pass
+2 review.packet-cites-decisions-and-constraints pass
+2 review.packet-excludes-superseded-decision pass
+2 review.packet-marks-superseded-decision not-built
+2 review.superseded-decision-identifiable pass
+2 review.checks-verified-at-exact-revision pass
+2 review.resumed-attempt-keeps-task-link pass
+2 review.interrupted-attempt-fenced pass
+2 review.at-most-one-external-effect not-built
+2 review.uncertain-outcome-visible pass
+
+3 release.expired-approval-refused pass
+3 release.expired-refusal-audited fail
+3 release.changed-revision-refused pass
+3 release.changed-revision-refusal-audited fail
+3 release.changed-target-refused pass
+3 release.changed-target-refusal-audited fail
+3 release.verified-human-approves-exact-action pass
+3 release.approved-attempt-produces-artifact pass
+3 release.one-time-approval-binds-revision fail
+
+4 isolation.other-org-direct-reads not-built
+4 isolation.other-org-retrieval-and-explanations not-built
+4 isolation.other-org-handoffs not-built
+4 isolation.other-org-streams not-built
+4 isolation.other-org-exports not-built
+4 isolation.same-org-restricted-memory not-built
+4 isolation.same-org-hidden-task not-built
+4 isolation.same-org-mailbox-direct-read pass
+4 isolation.same-org-handoff-note pass
+4 isolation.same-org-conversation-handoffs pass
+4 isolation.same-org-own-inbox pass
+4 isolation.same-org-ledger-read fail
+4 isolation.same-org-stream fail
+4 isolation.same-org-handoffs-in-retrieval fail
+4 isolation.same-org-evidence pass
+4 isolation.same-org-exports pass
+
+5 verify.trace-artifact-to-task pass
+5 verify.trace-artifact-to-handoff pass
+5 verify.trace-artifact-to-approval pass
+5 verify.trace-artifact-to-policy pass
+5 verify.trace-artifact-to-run-attempt not-built
+5 verify.trace-artifact-to-checks-at-revision pass
+5 verify.integrity-checked-offline pass
+5 verify.rejects-tampered-ledger-row not-built
+5 verify.rejects-incomplete-bundle not-built
+5 verify.authenticity-against-trusted-key not-built
+5 verify.asserted-evidence-labelled pass
+5 verify.unavailable-and-unhashed-evidence-reported not-built
+5 verify.private-content-kept-out fail
