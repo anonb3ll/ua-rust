@@ -367,7 +367,9 @@ pub struct Swept {
     pub abandoned: Vec<Abandoned>,
 }
 
-/// Housekeeping for `source` at `now`:
+/// Housekeeping for `source` in one organization at `now` (rows of other
+/// organizations are untouched, so a caller ledgers what it abandoned under
+/// the organization it swept):
 ///
 /// 1. `accepted` rows whose claim is gone or past `abandon_after_s` become
 ///    `abandoned` and are returned, so the caller can record them. They are
@@ -375,56 +377,93 @@ pub struct Swept {
 ///    effects happened, and releasing would let a non-idempotent delivery
 ///    run again unnoticed. A source with idempotent effects gets the
 ///    redelivery anyway through [`Stale::Redeliver`].
-/// 2. Expired rows are deleted, except `accepted` ones (they wait for
-///    step 1, however old).
+/// 2. Expired rows (`expires_at` before `now`; a row at its expiry second
+///    is kept) are deleted, except `accepted` ones (they wait for step 1,
+///    however old).
 /// 3. Rows past `max_per_kind` are deleted, oldest first, `accepted` ones
 ///    excepted.
-pub fn sweep(tx: &WriteTx<'_>, source: &str, now: i64, rules: SweepRules) -> UaResult<Swept> {
+pub fn sweep(tx: &WriteTx<'_>, org_id: &str, source: &str, now: i64, rules: SweepRules) -> UaResult<Swept> {
     let mut out = Swept::default();
     if let Some(after) = rules.abandon_after_s {
-        let rows: Vec<Abandoned> = {
-            let mut stmt = tx.prepare(
-                "SELECT org_id, kind, delivery_key, received_at, identity FROM inbound_deliveries \
-                 WHERE source = ?1 AND state = 'accepted' \
-                 AND (claim IS NULL OR substr(claim, 1, length(?2)) != ?2 OR updated_at < ?3) \
-                 ORDER BY received_at, kind, delivery_key",
-            )?;
-            stmt.query_map(params![source, process_prefix(), now.saturating_sub(after)], |r| {
-                Ok(Abandoned {
-                    org_id: r.get(0)?,
-                    kind: r.get(1)?,
-                    key: r.get(2)?,
-                    received_at: r.get(3)?,
-                    identity: r.get(4)?,
-                })
-            })?
-            .collect::<Result<_, _>>()?
-        };
-        for a in &rows {
-            tx.execute(
-                "UPDATE inbound_deliveries SET state = 'abandoned', updated_at = ?5 \
-                 WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4",
-                params![a.org_id, source, a.kind, a.key, now],
-            )?;
-        }
-        out.abandoned = rows;
+        out.abandoned = abandon(tx, org_id, source, now, Some(now.saturating_sub(after)))?;
     }
     out.expired = tx.execute(
-        "DELETE FROM inbound_deliveries WHERE source = ?1 AND expires_at <= ?2 AND state != 'accepted'",
-        params![source, now],
+        "DELETE FROM inbound_deliveries WHERE org_id = ?3 AND source = ?1 AND expires_at < ?2 \
+         AND state != 'accepted'",
+        params![source, now, org_id],
     )?;
     if let Some(max) = rules.max_per_kind {
         out.capped = tx.execute(
             "DELETE FROM inbound_deliveries WHERE rowid IN ( \
                SELECT rowid FROM ( \
                  SELECT rowid, state, ROW_NUMBER() OVER ( \
-                   PARTITION BY org_id, kind ORDER BY received_at DESC, rowid DESC) AS n \
-                 FROM inbound_deliveries WHERE source = ?1) \
+                   PARTITION BY kind ORDER BY received_at DESC, rowid DESC) AS n \
+                 FROM inbound_deliveries WHERE org_id = ?3 AND source = ?1) \
                WHERE n > ?2 AND state != 'accepted')",
-            params![source, max.max(0)],
+            params![source, max.max(0), org_id],
         )?;
     }
     Ok(out)
+}
+
+/// Mark `accepted` rows of `source` in `org_id` abandoned and return them:
+/// those whose claim is not this process's, or (with `older_than`) whose
+/// `updated_at` is before it; with `older_than` `None`, every one.
+fn abandon(
+    tx: &WriteTx<'_>,
+    org_id: &str,
+    source: &str,
+    now: i64,
+    older_than: Option<i64>,
+) -> UaResult<Vec<Abandoned>> {
+    let rows: Vec<Abandoned> = {
+        let mut stmt = tx.prepare(
+            "SELECT org_id, kind, delivery_key, received_at, identity FROM inbound_deliveries \
+             WHERE org_id = ?4 AND source = ?1 AND state = 'accepted' \
+             AND (?3 IS NULL OR claim IS NULL OR substr(claim, 1, length(?2)) != ?2 OR updated_at < ?3) \
+             ORDER BY received_at, kind, delivery_key",
+        )?;
+        stmt.query_map(params![source, process_prefix(), older_than, org_id], |r| {
+            Ok(Abandoned {
+                org_id: r.get(0)?,
+                kind: r.get(1)?,
+                key: r.get(2)?,
+                received_at: r.get(3)?,
+                identity: r.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    for a in &rows {
+        tx.execute(
+            "UPDATE inbound_deliveries SET state = 'abandoned', updated_at = ?5 \
+             WHERE org_id = ?1 AND source = ?2 AND kind = ?3 AND delivery_key = ?4",
+            params![a.org_id, source, a.kind, a.key, now],
+        )?;
+    }
+    Ok(rows)
+}
+
+/// Mark every `accepted` row of `source` in `org_id` abandoned, whatever
+/// its claim or age, and return them. For a sweep that runs before any
+/// handler of this process has taken a delivery on (a hub's startup), when
+/// every `accepted` row is one whose handler is gone.
+pub fn abandon_all_accepted(
+    tx: &WriteTx<'_>,
+    org_id: &str,
+    source: &str,
+    now: i64,
+) -> UaResult<Vec<Abandoned>> {
+    abandon(tx, org_id, source, now, None)
+}
+
+/// The claim a delivery is held under, if it has a row with one. For a
+/// source that never takes a delivery over ([`Stale::Duplicate`]): its rows
+/// keep the claim they were accepted under, so the handler that accepted a
+/// row can settle it with the claim the row carries.
+pub fn claim_of(tx: &WriteTx<'_>, d: Delivery<'_>) -> UaResult<Option<Claim>> {
+    check(&d)?;
+    Ok(current(tx, &d)?.and_then(|(_, c, _)| c).map(Claim))
 }
 
 #[cfg(test)]

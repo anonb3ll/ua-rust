@@ -1468,10 +1468,12 @@ async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path().join("home"));
     cfg.github_webhook_secret_value = Some(SECRET.to_string().into());
-    let new_parts = ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy"];
+    // Every part from the inbound table on (the Slack copy needs the table too).
+    let new_parts =
+        ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
-    assert_eq!(old.len() + 3, ua_tools::schema_parts().len());
+    assert_eq!(old.len() + new_parts.len(), ua_tools::schema_parts().len());
     let ping = json!({ "zen": "before the upgrade", "repository": { "full_name": REPO } });
     let hash = body_hash(&ping);
     let seen_at = ua_core::time::now();
@@ -1549,8 +1551,44 @@ fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::for_home(dir.path().join("home"));
     drop(Hub::open(cfg.clone()).unwrap());
-    let new_parts = ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy"];
+    // Every part from the inbound table on (the Slack copy needs the table too).
+    let new_parts =
+        ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
     assert!(ua_store::Db::open(&cfg.db_path(), &old).is_ok());
+}
+
+#[tokio::test]
+async fn an_internal_failure_releases_the_records_and_the_redelivery_is_processed() {
+    let h = H::new().await;
+    h.bind().await;
+    let run = json!({
+        "action": "completed",
+        "check_run": { "head_sha": FULL, "completed_at": now_ts() },
+        "repository": { "full_name": REPO },
+    });
+    // Make handling fail inside the hub: the checks table is briefly gone.
+    let rename = |from: &'static str, to: &'static str| {
+        h.hub
+            .db()
+            .write(move |tx| {
+                tx.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))?;
+                Ok(())
+            })
+            .unwrap()
+    };
+    rename("task_checks", "task_checks_away");
+    let err = h.deliver("check_run", "flaky", &run).await.unwrap_err();
+    assert!(matches!(err, WebhookError::Internal(_)), "{err:?}");
+    assert_eq!(err.http_status(), 500);
+    // Both records were released under this delivery's claims: nothing left.
+    assert!(states(&h, "flaky").await.is_empty(), "{:?}", states(&h, "flaky").await);
+    // GitHub's redelivery is processed, not refused as a replay.
+    rename("task_checks_away", "task_checks");
+    let done = h.deliver("check_run", "flaky", &run).await.unwrap();
+    assert_eq!(done["handled"], "reverified", "{done}");
+    assert_eq!(states(&h, "flaky").await, ["body_sha256=finished", "delivery_id=finished"]);
+    assert_eq!(h.events("agent.github.webhook.received").await.len(), 2, "one per attempt");
+    assert_eq!(h.deliver("check_run", "flaky", &run).await.unwrap_err(), WebhookError::Replayed);
 }

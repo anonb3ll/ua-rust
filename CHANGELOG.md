@@ -36,6 +36,21 @@ from its commit history.
   counts connections dialled by hand, inline address range checks, and
   delivery tables recognised by name marks or columns instead of a fixed
   list. No change for Slack replies, which follow no redirect.
+- Slack's replay keys (signed bytes, Socket Mode envelopes) and delivery
+  ids (`trigger_id`, `event_id`) moved onto `inbound_deliveries` (source
+  `slack`; kinds `request_sha`, `trigger`, `event`). Slack never takes a
+  stale delivery on again (`Stale::Duplicate`): a command admitted and
+  never finished is refused as a repeat and reported by the startup sweep
+  as before. Every HTTP response and Socket Mode acknowledgement, every
+  reply text and every ledger event is unchanged. `slack.inbound.v1.copy`
+  carries the old rows across with their states; `slack_seen_signatures`
+  and `slack_seen_deliveries` stay, unread and unwritten, until a later
+  release drops them. `ua_ingress::inbound` gains `abandon_all_accepted`
+  (the startup sweep) and `claim_of`, and an expired row is now kept
+  through its expiry second (as both families did before). Downgrading past
+  this change while Slack takes traffic lets a Slack retry of a command the
+  newer build already ran run again for about a day (`docs/ingress.md`,
+  Limits).
 - `ua-ingress::inbound`: one inbound-delivery table, `inbound_deliveries`
   (parts `ingress.inbound.v1`, `organization.v1.ingress`; a tenant table
   from birth), with `record`, `accept`, `finish`, `release` and `sweep` and
@@ -261,7 +276,8 @@ from its commit history.
   whose record the sweep abandoned still finishes it, so a later copy stays
   a replay. When the sweep abandons deliveries it appends one
   `agent.github.webhook.abandoned` event (counts and up to 50 delivery ids,
-  no body). Downgrading past this change reopens a replay window for
+  no body) under the organization it swept; a sweep covers one
+  organization. Downgrading past this change reopens a replay window for
   deliveries handled since: nothing refuses an older binary, which reads
   only the old GitHub tables (`docs/ingress.md`, Limits).
 
