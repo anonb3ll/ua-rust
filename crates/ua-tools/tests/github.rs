@@ -1544,10 +1544,11 @@ async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
 }
 
 #[test]
-fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
-    // The documented limit (docs/ingress.md, Limits): no fence refuses a
-    // build that does not know these parts. If one is added, this flips.
-    use ua_store::Part;
+fn an_older_build_refuses_a_database_with_the_inbound_parts() {
+    // The fence (docs/ingress.md, Limits; docs/operations.md): a build that
+    // does not know these parts refuses the database instead of reading only
+    // the old delivery tables and accepting copies the newer build handled.
+    use ua_store::{Fence, Part};
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::for_home(dir.path().join("home"));
     drop(Hub::open(cfg.clone()).unwrap());
@@ -1556,7 +1557,59 @@ fn an_older_build_still_opens_a_database_with_the_inbound_parts() {
         ["ingress.inbound.v1", "organization.v1.ingress", "github.inbound.v1.copy", "slack.inbound.v1.copy"];
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
-    assert!(ua_store::Db::open(&cfg.db_path(), &old).is_ok());
+    let old_optional: Vec<&str> = ua_tools::optional_schema_parts().iter().map(|p| p.name).collect();
+    let older = Fence { also_known: &old_optional, allow_newer: false };
+    let err = ua_store::Db::open_with(&cfg.db_path(), &old, older).err().expect("refused").to_string();
+    assert!(err.contains("written by a newer build"), "{err}");
+    for name in new_parts {
+        assert!(err.contains(name), "names {name}: {err}");
+    }
+    // The override opens it, and says which parts it ignores.
+    let opened = ua_store::Db::open_with(&cfg.db_path(), &old, Fence { allow_newer: true, ..older }).unwrap();
+    let mut ignored = opened.ignored_newer_parts().to_vec();
+    ignored.sort();
+    let mut want: Vec<String> = new_parts.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(ignored, want);
+    drop(opened);
+    // The current build still opens it, with nothing ignored.
+    let hub = Hub::open(cfg).unwrap();
+    assert!(hub.db().ignored_newer_parts().is_empty());
+}
+
+#[test]
+fn a_lean_build_of_the_same_version_opens_a_full_builds_database() {
+    // A lean build (a feature compiled out) applies fewer parts but knows
+    // every name this version has (`ua_tools::optional_schema_parts`), so a
+    // part it does not apply is not taken for one from a newer build.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_home(dir.path().join("home"));
+    let mut full = ua_tools::schema_parts();
+    full.extend(ua_tools::optional_schema_parts());
+    drop(ua_store::Db::open(&cfg.db_path(), &full).unwrap());
+    // The lean build's view: `code.v1` is not applied, and (as the rule on
+    // `optional_schema_parts` requires) it is named among the optional parts.
+    let lean: Vec<ua_store::Part> =
+        ua_tools::schema_parts().into_iter().filter(|p| p.name != "code.v1").collect();
+    let mut lean_optional: Vec<&str> = ua_tools::optional_schema_parts().iter().map(|p| p.name).collect();
+    lean_optional.push("code.v1");
+    let fence = ua_store::Fence { also_known: &lean_optional, allow_newer: false };
+    let db = ua_store::Db::open_with(&cfg.db_path(), &lean, fence).unwrap();
+    assert!(db.ignored_newer_parts().is_empty());
+    drop(db);
+    // Without naming it, the lean build would refuse: why the rule exists.
+    let bare = ua_store::Fence { also_known: &lean_optional[..lean_optional.len() - 1], allow_newer: false };
+    let err = ua_store::Db::open_with(&cfg.db_path(), &lean, bare).err().expect("refused").to_string();
+    assert!(err.contains("[code.v1]"), "{err}");
+    // This build's own list knows every part of this version.
+    let known = ua_tools::known_schema_part_names();
+    for p in &full {
+        assert!(known.contains(&p.name), "{}", p.name);
+    }
+    drop(ua_tools::hub::open_db(&cfg.db_path(), &ua_tools::schema_parts(), false).unwrap());
+    // And a database the current build created opens again.
+    drop(Hub::open(cfg.clone()).unwrap());
+    drop(Hub::open(cfg).unwrap());
 }
 
 #[tokio::test]

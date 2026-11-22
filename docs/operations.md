@@ -61,7 +61,7 @@ Checks performed:
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
-9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, objects using the reserved `sqlite_` name prefix, unexpected tables with foreign keys into known tables, or unowned objects without an `extra` part fail; `missing`/`extra` parts warn). Only SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and automatic indexes are exempt from the comparison.
+9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, objects using the reserved `sqlite_` name prefix, unexpected tables with foreign keys into known tables, or unowned objects without an `extra` part fail; `extra` parts, which mean a newer build wrote the database and the serving and writing commands refuse it (see [Older builds and a newer database](#older-builds-and-a-newer-database)), fail; `missing` parts warn). Only SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and automatic indexes are exempt from the comparison.
 10. `ledger`: verifies the tamper-evident `event_log` hash chain cleanly (`ledger::verify`).
 11. `pre_restore_backups`: warns when leftover `*.pre-restore-*.bak*` recovery files remain in `$UA_HOME` so they can be pruned once verified.
 12. `restore_staging`: warns when leftover `.ua.db.restore.*.d` rollback directories remain (indicating a failed rollback requiring inspection).
@@ -144,18 +144,18 @@ Key restore safeguards:
    restores into a newer build as before, and the part applies on the next
    start.
    **Rolling back a live database** (running an earlier binary on a database
-   a later build already upgraded) is different from a restore. An earlier
-   build from before `organization.v1.store` still starts and serves: it
-   ignores parts it does not know, and the new `event_log` columns have
-   defaults, so its writes succeed. But `ua doctor` and `system_doctor`
-   report the schema as degraded, with an extra part
-   (`organization.v1.store`) and a modified `event_log`. Treat that as a
-   temporary state: roll forward again as soon as you can, or restore a
-   backup taken before the upgrade (losing the writes made since). A build
-   that has `organization.v1.store` refuses to open, or to append to, a
-   ledger whose newest row has a newer `hash_v` than it writes, so once a
-   later build has written such rows, rolling back to it is refused with an
-   error naming both forms; run the later build instead.
+   a later build already upgraded) is different from a restore, and is
+   refused by any build that has the unknown-part fence: see
+   [Older builds and a newer database](#older-builds-and-a-newer-database).
+   An earlier build from before the fence (for example one from before
+   `organization.v1.store`) still starts and serves: it ignores parts it
+   does not know, and the new `event_log` columns have defaults, so its
+   writes succeed, while `ua doctor` and `system_doctor` report the schema
+   as degraded. Do not do that; restore a backup taken before the upgrade
+   instead (losing the writes made since). A build that has
+   `organization.v1.store` also refuses to open, or to append to, a ledger
+   whose newest row has a newer `hash_v` than it writes, with an error
+   naming both forms; run the later build instead.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when
@@ -174,6 +174,61 @@ Key restore safeguards:
    transaction; **note that `--revoke-sessions` does not revoke `agent_tokens`,
    static `UA_AGENT_TOKENS`, or `managed_secrets` ciphertext**—rotate compromised agent
    tokens (`ua token revoke`/`rotate`) and managed secrets separately.
+
+### Older builds and a newer database
+
+A build refuses to open, for serving or writing, a database that records in
+`schema_parts` a part this build does not know: one a newer build applied.
+"Knows" means the full list of part names for this version
+(`ua_tools::known_schema_part_names`: the parts every open applies plus the
+optional ones), so a lean build (`--no-default-features`) opening a
+database a full build of the same version made is not refused. The check
+runs when the store opens, before any part is applied, so a refused open
+writes nothing. The refusal names the unknown parts, says a newer build
+wrote the database and what to do:
+
+```text
+Error: the database /path/to/ua.db was written by a newer build: it records schema parts this build does not know ([future.v9]). This build refuses to open it for serving or writing, ...
+```
+
+On a refused database:
+
+| Refuses | Runs |
+|---|---|
+| `ua serve`, `ua mcp`, `ua call`, `ua tools`, `ua token`, `ua login-link`, `ua init` (when it opens the hub), `ua import` | `ua doctor` (read-only; its `schema` check fails with `extra=[...]`), `ua backup` (a read-only snapshot), `ua restore` (see below), `ua config` |
+
+What to do: run the newer build (or a later one) again. If you must go
+back, restore a backup taken before the upgrade with `ua restore` (losing
+the writes made since); an older build then opens it.
+
+**Override, for recovery only.** `--allow-newer-schema` (a global flag) or
+`UA_ALLOW_NEWER_SCHEMA=1` opens the database anyway, ignoring the unknown
+parts, as builds before the fence did. Every open under it logs a warning
+naming the parts (`OPENING A DATABASE WRITTEN BY A NEWER BUILD`), and a
+warning when it is set with nothing to ignore. `UA_ALLOW_NEWER_SCHEMA`
+takes `1`/`true`/`yes` or `0`/`false`/`no`; any other value is refused.
+The risk is whatever the newer parts changed. For the inbound-delivery
+table (`docs/ingress.md`, Limits) it is a replay window: the older build
+reads only the old delivery tables, so copies of GitHub deliveries handled
+since the upgrade are accepted again (within 30 days), and a Slack retry of
+a command the newer build already ran is run again (within about a day).
+Use the override to inspect or export, not to serve traffic.
+
+It is the same rule `ua restore` applies to a backup: a backup with parts
+this build does not know is refused without `--allow-newer`. Restoring
+with `--allow-newer` brings such a database in, and the fence then still
+refuses it until the override is set: each step asks for its own consent.
+The ledger's `hash_v` rollback fence (`docs/organization.md`) is separate
+and not lifted by the override.
+
+**What the fence cannot stop:** it works only in builds that contain it. A
+build from before it still opens an upgraded database and ignores the parts
+it does not know (no version has been released; on `main`, that is every
+build before this change). Do not run a build older than this change
+against a database a newer build has opened; restore a pre-upgrade backup
+instead. Because any new part name refuses every build that has the fence,
+a later change that must stop older builds without changing the schema can
+ship an empty marker part; no separate minimum-reader record is needed.
 
 ## 5. Graceful shutdown & process managers
 

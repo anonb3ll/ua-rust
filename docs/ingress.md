@@ -287,21 +287,27 @@ redelivers stale rows processes the next copy anyway.
   process's own in-flight deliveries stale, with the same effect as a
   second process for the deliveries in flight at that moment. A backward
   step only makes rows look younger, so they stay duplicates longer.
-- **Downgrading.** Nothing refuses an older binary on a database that has
-  these parts. Recorded parts a build does not know are ignored when the
-  store opens, and the rollback fence (`docs/organization.md`) refuses only
-  a ledger whose newest row has a `hash_v` above the build's, which these
-  parts do not write. `ua doctor` and `system_doctor` report the parts as
-  from another build, and `ua restore` refuses them without
-  `--allow-newer`, but `ua serve` starts. An older binary reads only the old
-  GitHub tables, which stopped being written at the cut-over, so a downgrade
-  reopens a replay window: a copy of any GitHub delivery handled since the
-  upgrade (within its 30-day retention, and inside the payload-timestamp
-  window) is accepted again. The same holds for Slack, where it matters
-  more: an older binary reads only the old Slack tables, so for about a day
-  (the delivery-id retention) a Slack retry of a command the newer build
-  already ran is run again, and Slack commands are not idempotent. Do not
-  downgrade past this change while either endpoint takes traffic.
+- **Downgrading.** A build that does not know these parts refuses the
+  database: opening the store compares the parts recorded in
+  `schema_parts` with every part name the build knows (optional and
+  feature-gated ones included) and refuses, before applying anything,
+  when one is unknown, naming it (`docs/operations.md`, "Older builds and
+  a newer database"). `ua serve`, `ua mcp`, `ua call` and the other
+  commands that open the hub refuse; `ua doctor` and `ua backup` run. That
+  matters because an older binary reads only the old GitHub and Slack
+  tables, which stopped being written at the cut-over: it would accept
+  again a copy of any GitHub delivery handled since the upgrade (within its
+  30-day retention and the payload-timestamp window) and, for about a day
+  (the delivery-id retention), run again a Slack retry of a command the
+  newer build already ran; Slack commands are not idempotent. The
+  override (`--allow-newer-schema` or `UA_ALLOW_NEWER_SCHEMA=1`) opens the
+  database anyway, logged at every open, and reopens exactly that window.
+  **What remains:** the fence stops only builds that contain it. A build
+  from before it (any build of `main` from the inbound table up to this
+  change; no version has been released) still opens an upgraded database
+  and ignores the parts it does not know. Do not run such a build against
+  a database a newer build has opened; restore a backup taken before the
+  upgrade instead.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from

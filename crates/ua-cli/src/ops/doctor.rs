@@ -301,7 +301,21 @@ fn check_schema(db_path: &Path) -> CheckResult {
             }
             check("schema", Status::Fail, parts.join(", "))
         }
-        Ok(c) if !c.missing.is_empty() || !c.extra.is_empty() => check(
+        // The unknown-part fence: serving and writing commands refuse this
+        // database (docs/operations.md, "Older builds and a newer database").
+        Ok(c) if !c.extra.is_empty() => check(
+            "schema",
+            Status::Fail,
+            format!(
+                "written by a newer build: extra=[{}] are schema parts this build does not know, so ua serve, \
+                 ua mcp, ua call and the other writing commands refuse this database (override: \
+                 --allow-newer-schema or UA_ALLOW_NEWER_SCHEMA=1, recovery only); run the newer build, or \
+                 restore a backup taken before the upgrade; missing=[{}]",
+                c.extra.join(", "),
+                c.missing.join(", ")
+            ),
+        ),
+        Ok(c) if !c.missing.is_empty() => check(
             "schema",
             Status::Warn,
             format!("missing=[{}], extra=[{}]", c.missing.join(", "), c.extra.join(", ")),

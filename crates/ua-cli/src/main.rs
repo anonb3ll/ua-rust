@@ -38,6 +38,11 @@ struct Cli {
     /// Config file (default: $UA_CONFIG, then $UA_HOME/config.toml).
     #[arg(long, global = true, env = "UA_CONFIG")]
     config: Option<std::path::PathBuf>,
+    /// Open a database written by a newer build anyway, ignoring the schema
+    /// parts this build does not know (also `UA_ALLOW_NEWER_SCHEMA=1`). For
+    /// recovery only: logged at every open; see docs/operations.md.
+    #[arg(long, global = true)]
+    allow_newer_schema: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -420,6 +425,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     }
 
     let explicit_config = cli.config.clone();
+    let allow_newer_flag = cli.allow_newer_schema;
     match cli.cmd {
         Cmd::Init(args) => {
             ops::init::run(args, explicit_config.as_deref())?;
@@ -447,7 +453,11 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                     } else {
                         // Held until the import ends: no hub may run on this database.
                         let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
-                        let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
+                        let db = ua_tools::hub::open_db(
+                            &cfg.db_path(),
+                            &ua_import::schema_parts(),
+                            allow_newer_schema(allow_newer_flag)?,
+                        )?;
                         let opts = ua_import::Options { drop_org_scope, ..Default::default() };
                         ua_import::import(&db, &from, &opts)?
                     };
@@ -471,7 +481,8 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                     if let Cmd::Serve = cmd {
                         held.serve = Some(ua_import::ServeLock::acquire(&cfg.db_path())?);
                     }
-                    let hub = Hub::open(cfg.clone())?;
+                    // Refuses a database a newer build wrote, unless overridden (docs/operations.md).
+                    let hub = Hub::open_with(cfg.clone(), allow_newer_schema(allow_newer_flag)?)?;
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());
 
@@ -654,6 +665,27 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                 }
             }
         }
+    }
+}
+
+/// Whether to open a database written by a newer build anyway: the
+/// `--allow-newer-schema` flag, or `UA_ALLOW_NEWER_SCHEMA` set to `1`. Any value
+/// other than an explicit yes or no is refused rather than guessed at.
+fn allow_newer_schema(flag: bool) -> anyhow::Result<bool> {
+    if flag {
+        return Ok(true);
+    }
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    match std::env::var(var) {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(true),
+            "" | "0" | "false" | "no" => Ok(false),
+            _ => anyhow::bail!(
+                "{var} must be 1 (open a database written by a newer build anyway) or 0, not {v:?}"
+            ),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{var} must be 1 or 0"),
     }
 }
 

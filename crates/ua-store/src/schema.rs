@@ -163,6 +163,37 @@ CREATE TABLE IF NOT EXISTS import_runs (
 ",
 };
 
+/// The parts recorded in `schema_parts` whose names are not in `known`,
+/// sorted. A database without the tracking table (a new file) has none.
+pub fn unknown_parts(conn: &Connection, known: &[&str]) -> anyhow::Result<Vec<String>> {
+    let has: bool = conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_parts'", [], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    if !has {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT name FROM schema_parts ORDER BY name")?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(names.into_iter().filter(|n| !known.contains(&n.as_str())).collect())
+}
+
+/// The refusal when a database records parts this build does not know
+/// (`docs/operations.md`, "Older builds and a newer database").
+pub fn newer_build_refusal(db: &str, unknown: &[String]) -> String {
+    format!(
+        "the database {db} was written by a newer build: it records schema parts this build does not know \
+         ([{}]). This build refuses to open it for serving or writing, because it would ignore what those parts \
+         changed (for the inbound-delivery table: it would accept again deliveries the newer build already \
+         handled). Run the newer build (or a later one), or restore a backup taken before the upgrade with \
+         `ua restore`. `ua doctor` and `ua backup` still run. To open it anyway for recovery, set \
+         UA_ALLOW_NEWER_SCHEMA=1 or pass --allow-newer-schema (docs/operations.md)",
+        unknown.join(", ")
+    )
+}
+
 /// Whether `part` still has to run: `false` when it is recorded with the same
 /// checksum, an error when it is recorded with a different one.
 fn pending(conn: &Connection, part: &Part) -> anyhow::Result<bool> {
@@ -289,6 +320,19 @@ pub fn apply<P: Into<Part> + Copy>(conn: &mut Connection, parts: &[P]) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_parts_are_the_recorded_names_outside_the_known_list() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(unknown_parts(&conn, &[]).unwrap().is_empty(), "no tracking table yet");
+        let a = SchemaPart { name: "a.v1", sql: "CREATE TABLE a (id INTEGER);" };
+        let b = SchemaPart { name: "b.v1", sql: "CREATE TABLE b (id INTEGER);" };
+        apply(&mut conn, &[a, b]).unwrap();
+        assert!(unknown_parts(&conn, &["a.v1", "b.v1"]).unwrap().is_empty());
+        assert!(unknown_parts(&conn, &["a.v1", "b.v1", "c.v1"]).unwrap().is_empty(), "known, not applied");
+        assert_eq!(unknown_parts(&conn, &["a.v1"]).unwrap(), ["b.v1"]);
+        assert_eq!(unknown_parts(&conn, &[]).unwrap(), ["a.v1", "b.v1"]);
+    }
 
     #[test]
     fn a_changed_released_part_is_a_startup_error() {

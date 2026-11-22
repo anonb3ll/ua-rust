@@ -271,6 +271,22 @@ from its commit history.
 
 ### Behaviour changes
 
+- An unknown schema part refuses to open the database. Opening the store
+  compares the parts recorded in `schema_parts` with every part name the
+  build knows (optional and feature-gated parts included, so a lean build
+  of the same version is not refused) and, before applying anything,
+  refuses a database a newer build wrote, naming the unknown parts and
+  saying to run the newer build or restore a backup taken before the
+  upgrade. `ua serve`, `ua mcp`, `ua call` and the other commands that
+  open the hub refuse; `ua doctor` (whose `schema` check now fails on
+  `extra` parts), `ua backup` and `ua restore` run. `--allow-newer-schema`
+  or `UA_ALLOW_NEWER_SCHEMA=1` opens it anyway for recovery, logged at
+  every open; for the inbound-delivery table that reopens a replay window.
+  `system_doctor` reports such a hub as degraded. The fence stops only
+  builds that contain it: a build from before this change still opens an
+  upgraded database, so do not run one against a database a newer build
+  has opened; restore a pre-upgrade backup instead (`docs/operations.md`,
+  "Older builds and a newer database").
 - A second `ua serve` on the same database is refused. `ua serve` holds a
   serve-only lock (`<db>.serve.lock`, next to the database, links
   resolved) exclusively for the life of the process, beside the shared hub
@@ -293,8 +309,9 @@ from its commit history.
   `agent.github.webhook.abandoned` event (counts and up to 50 delivery ids,
   no body) under the organization it swept; a sweep covers one
   organization. Downgrading past this change reopens a replay window for
-  deliveries handled since: nothing refuses an older binary, which reads
-  only the old GitHub tables (`docs/ingress.md`, Limits).
+  deliveries handled since, because an older binary reads only the old
+  GitHub tables; builds with the unknown-part fence (below) refuse such a
+  database, builds before it do not (`docs/ingress.md`, Limits).
 
 - Operator authority is a verified caller of kind human, nothing else.
   Dispatch and governance agree on it: acting for another agent in dispatch,
