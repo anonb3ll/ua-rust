@@ -33,7 +33,7 @@ use ua_store::SchemaPart;
 
 pub(crate) use conversation::{conversation_handoff, conversation_handoffs};
 pub(crate) use handoff::{
-    latest_committed_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
+    recover_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
     session_handoff_recover, session_handoff_seal, session_handoff_update,
 };
 pub(crate) use merged::queue_close_merged;
