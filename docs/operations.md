@@ -177,6 +177,35 @@ Key restore safeguards:
 
 ## 5. Graceful shutdown & process managers
 
+### One `ua serve` per database
+
+`ua serve` takes a second lock beside the shared hub lock: `<db>.serve.lock`
+(`ua.db.serve.lock` by default), next to the database file, held exclusively
+for the life of the process. "The same database" means the same file after
+symbolic links and `..` are resolved, so two configurations that reach one
+`ua.db` by different paths still meet on one lock. A second `ua serve` on that
+database exits at once, before it opens the database, binds its port or
+touches any inbound-delivery state, with:
+
+```text
+Error: another `ua serve` holds the database /path/to/ua.db: a second `ua serve` on the same database is refused (two would each take the other's in-flight inbound deliveries for stale ones). Stop the running `ua serve` first, or point this one at a different database
+```
+
+The operating system releases the lock when the process exits, a crash or
+`SIGKILL` included, so there is no lock file to clean up: the file stays and
+is harmless. Only `ua serve` takes this lock. `ua mcp`, `ua call`, `ua tools`,
+`ua token`, `ua backup` and `ua doctor` run beside a serving hub as before.
+`ua restore` and `ua import` still refuse while it runs, on the shared hub
+lock (they take it exclusively). A process manager that starts a new `ua serve`
+before the old one has finished draining sees the refusal until the old one
+exits; stop, then start (systemd and the compose file already do), and do not
+run two containers or units on one data volume.
+
+The lock is taken by the `ua` command. A program that embeds `ua-server` and
+calls `serve_http` itself must take `ua_import::ServeLock` first.
+
+### Shutdown
+
 `ua serve` handles `SIGINT` and `SIGTERM`:
 
 - Open HTTP/SSE and MCP requests, tool calls in flight, active dispatches, and

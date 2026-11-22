@@ -271,6 +271,16 @@ from its commit history.
 
 ### Behaviour changes
 
+- A second `ua serve` on the same database is refused. `ua serve` holds a
+  serve-only lock (`<db>.serve.lock`, next to the database, links
+  resolved) exclusively for the life of the process, beside the shared hub
+  lock; a second one exits before it opens the database or binds a port,
+  with an error naming the database and saying another `ua serve` holds
+  it. The OS releases the lock when the process exits or crashes. `ua mcp`,
+  `ua call`, backups and the other commands are unaffected; `ua restore` and
+  `ua import` still refuse while a serve runs (`docs/operations.md`,
+  section 5).
+
 - GitHub webhook: a delivery that the hub recorded but never finished
   handling (it stopped in between, or the delivery has been in flight for
   15 minutes) is processed when GitHub redelivers it, instead of being

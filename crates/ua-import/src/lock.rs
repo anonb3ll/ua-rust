@@ -6,6 +6,12 @@
 //! it cannot start while any of them runs, and none can start during an
 //! import. The OS releases the lock when the holder exits, so a crash leaves
 //! nothing stale.
+//!
+//! `ua serve` also holds a second lock, [`ServeLock`], exclusively: only one
+//! serving process may run per database, because the inbound-delivery table
+//! judges a stale in-flight delivery by "a claim that is not this process's"
+//! (`docs/ingress.md`, Limits). Other commands never take it, so `ua mcp`,
+//! `ua call`, backups and the rest run beside a serve as before.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -49,7 +55,7 @@ impl HubLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening lock file {}", path.display()))?;
-        if !try_lock(&file, exclusive)? {
+        if !try_lock(&file, exclusive, &path)? {
             if exclusive {
                 bail!(
                     "the database {} is in use by a running hub process (ua serve, ua mcp, ua call, ...) \
@@ -66,8 +72,69 @@ impl HubLock {
     }
 }
 
+/// The serve lock file for a database: `<canonical db>.serve.lock`, next to
+/// the database file itself (symbolic links resolved).
+pub fn serve_lock_path(db_path: &Path) -> anyhow::Result<PathBuf> {
+    let db = canonical_db_path(db_path)?;
+    let mut name = db.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".serve.lock");
+    Ok(db.with_file_name(name))
+}
+
+/// What identifies "the same database": the database file's canonical path.
+/// When the file does not exist yet, its directory (created if missing) is
+/// canonicalized and the file name joined, so a first `ua serve` and a second
+/// one started before the database is created still meet on one lock.
+pub fn canonical_db_path(db_path: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(db_path) {
+        return Ok(p);
+    }
+    let name = db_path
+        .file_name()
+        .with_context(|| format!("database path {} has no file name", db_path.display()))?;
+    let dir = match db_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => d.to_path_buf(),
+        None => PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dir = std::fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
+    Ok(dir.join(name))
+}
+
+/// The one-serving-process lock. `ua serve` takes it exclusively for the life
+/// of the process, before it opens the database; the OS releases it when the
+/// process exits or crashes.
+#[derive(Debug)]
+pub struct ServeLock {
+    _file: File,
+}
+
+impl ServeLock {
+    /// Take the serve lock, or fail naming the database and saying another
+    /// `ua serve` holds it.
+    pub fn acquire(db_path: &Path) -> anyhow::Result<ServeLock> {
+        let db = canonical_db_path(db_path)?;
+        let path = serve_lock_path(&db)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening lock file {}", path.display()))?;
+        if !try_lock(&file, true, &path)? {
+            bail!(
+                "another `ua serve` holds the database {}: a second `ua serve` on the same database is refused \
+                 (two would each take the other's in-flight inbound deliveries for stale ones). Stop the running \
+                 `ua serve` first, or point this one at a different database",
+                db.display()
+            );
+        }
+        Ok(ServeLock { _file: file })
+    }
+}
+
 #[cfg(unix)]
-fn try_lock(file: &File, exclusive: bool) -> anyhow::Result<bool> {
+fn try_lock(file: &File, exclusive: bool, _path: &Path) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd;
     let mode = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
     // SAFETY: `flock` on a descriptor owned by `file`, which outlives the call.
@@ -84,11 +151,13 @@ fn try_lock(file: &File, exclusive: bool) -> anyhow::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn try_lock(_file: &File, exclusive: bool) -> anyhow::Result<bool> {
+fn try_lock(_file: &File, exclusive: bool, path: &Path) -> anyhow::Result<bool> {
     // No advisory lock on this platform yet. Say so instead of pretending.
     if exclusive {
         eprintln!(
-            "warning: database locking is not supported on this platform; make sure no hub process is running"
+            "warning: database locking is not supported on this platform ({} is not locked); make sure no other \
+             process that this lock guards against is running",
+            path.display()
         );
     }
     Ok(true)
@@ -125,6 +194,56 @@ mod tests {
         let err = HubLock::acquire_shared(&db, "serve").unwrap_err().to_string();
         assert!(err.contains("being imported"), "{err}");
         drop(import);
+    }
+
+    #[test]
+    fn a_second_serve_is_refused_until_the_first_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let first = ServeLock::acquire(&db).unwrap();
+        assert!(serve_lock_path(&db).unwrap().is_file());
+        let err = ServeLock::acquire(&db).unwrap_err().to_string();
+        assert!(err.contains("another `ua serve` holds the database"), "{err}");
+        let canonical = std::fs::canonicalize(dir.path()).unwrap().join("ua.db");
+        assert!(err.contains(&canonical.display().to_string()), "{err}");
+        drop(first);
+        ServeLock::acquire(&db).unwrap();
+    }
+
+    #[test]
+    fn the_serve_lock_leaves_the_shared_hub_lock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let _serve_shared = HubLock::acquire_shared(&db, "serve").unwrap();
+        let _serve = ServeLock::acquire(&db).unwrap();
+        // `ua mcp`, `ua call`, backups: shared, so they still run.
+        HubLock::acquire_shared(&db, "mcp").unwrap();
+        // An import or restore still refuses, on the shared lock as before.
+        assert!(HubLock::acquire(&db, "restore").is_err());
+    }
+
+    #[test]
+    fn the_same_database_by_another_path_shares_the_serve_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Not created yet, reached through a directory link and a `..` hop.
+        let _first = ServeLock::acquire(&real.join("ua.db")).unwrap();
+        assert!(ServeLock::acquire(&link.join("ua.db")).is_err());
+        assert!(ServeLock::acquire(&real.join("..").join("real").join("ua.db")).is_err());
+        // A database file that is itself a link to the real one.
+        std::fs::write(real.join("ua.db"), b"").unwrap();
+        std::os::unix::fs::symlink(real.join("ua.db"), dir.path().join("alias.db")).unwrap();
+        assert!(ServeLock::acquire(&dir.path().join("alias.db")).is_err());
+    }
+
+    #[test]
+    fn serve_locks_are_per_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let _a = ServeLock::acquire(&dir.path().join("a.db")).unwrap();
+        ServeLock::acquire(&dir.path().join("b.db")).unwrap();
     }
 
     #[test]

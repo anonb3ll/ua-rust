@@ -371,10 +371,19 @@ async fn serve_until_shutdown(
     served
 }
 
+/// The locks a command holds until the process is about to exit.
+#[derive(Default)]
+struct Held {
+    /// The shared hub lock (every command that opens the hub).
+    hub: Option<ua_import::HubLock>,
+    /// The one-serving-process lock (`ua serve` only).
+    serve: Option<ua_import::ServeLock>,
+}
+
 /// Build the runtime, run the command, then give the runtime
-/// [`RUNTIME_SHUTDOWN`] for what is still running. The shared hub lock is
-/// released only after that, so an import cannot start while this process's
-/// tasks may still write.
+/// [`RUNTIME_SHUTDOWN`] for what is still running. The locks are released
+/// only after that, so an import (or a second `ua serve`) cannot start while
+/// this process's tasks may still write.
 fn main() -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -383,10 +392,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut hub_lock = None;
-    let result = rt.block_on(run(&mut hub_lock));
+    let mut held = Held::default();
+    let result = rt.block_on(run(&mut held));
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
-    drop(hub_lock);
+    drop(held);
     match result {
         Ok(code) => code,
         Err(e) => {
@@ -401,7 +410,7 @@ fn main() -> ExitCode {
 const NO_MCP_SERVER: &str = "ua mcp: this ua was built without the mcp-server feature, so it serves no MCP. \
 Rebuild with default features (or `--features mcp-server`), or call tools with `ua call` or the JSON API.";
 
-async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCode> {
+async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
     {
@@ -456,7 +465,12 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
                 cmd => {
                     // Every command that opens the hub holds a shared lock while it runs, so an
                     // import or restore (which takes it exclusively) refuses while any of them is live.
-                    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
+                    held.hub = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
+                    // One `ua serve` per database (docs/ingress.md, Limits): taken before the
+                    // database is opened, a port is bound or any inbound state is touched.
+                    if let Cmd::Serve = cmd {
+                        held.serve = Some(ua_import::ServeLock::acquire(&cfg.db_path())?);
+                    }
                     let hub = Hub::open(cfg.clone())?;
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());

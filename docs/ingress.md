@@ -268,13 +268,20 @@ redelivers stale rows processes the next copy anyway.
 ### Limits
 
 - **One `ua serve` per database.** Only `ua serve` hosts the routes that
-  record inbound deliveries. Two of them on one database would each see
-  the other's claims as a stopped process's: each treats the other's
-  in-flight deliveries as stale, so with `Stale::Redeliver` a delivery can
-  be handled by both, and the sweep of either abandons the other's work in
-  progress. The serve command takes only a shared hub lock today (the one
-  an import or restore takes exclusively), so nothing refuses a second
-  `ua serve`.
+  record inbound deliveries (the GitHub webhook, the Slack routes and Slack
+  Socket Mode). Two of them on one database would each see the other's
+  claims as a stopped process's: each treats the other's in-flight
+  deliveries as stale, so with `Stale::Redeliver` a delivery can be handled
+  by both, and the sweep of either abandons the other's work in progress.
+  This is enforced: `ua serve` holds `<db>.serve.lock` exclusively for its
+  whole life and a second `ua serve` on the same database (same file, links
+  resolved) is refused before it opens the database or binds a port
+  (`docs/operations.md`, section 5). What remains: the lock is advisory and
+  taken by the `ua` command, so a program that embeds `ua-server` and calls
+  `serve_http` without taking `ua_import::ServeLock` is not covered, and on
+  a platform without `flock` (not Unix) nothing is locked. Two hosts that
+  share one database file over a network file system are covered only if
+  that file system honours `flock` across hosts; do not do that.
 - **The clock.** Staleness is judged against the wall clock. A forward
   step past the in-flight bound (15 minutes for GitHub) makes this
   process's own in-flight deliveries stale, with the same effect as a
