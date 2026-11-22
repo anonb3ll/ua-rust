@@ -343,6 +343,19 @@ from its commit history.
 
 ### Behaviour changes
 
+- `git_merge_task` now enforces the review-at-head gate whenever `"review"` is
+  in the task's `expected_checks` (for both policy-authorization and one-time
+  approval merges, including `dry_run=true`, and not bypassed by `force=true`).
+  The merge requires a passing (`outcome: "pass"`), uncontradicted `review`
+  check (`attested` or `verified`) recorded at the exact 40-hex commit being
+  merged (`review_required`), and when a commit deliverable revision matches
+  that commit, refuses a self-review by its `producer` (`self_review_refused`).
+  Under a policy authorization, authorization coverage is validated first so
+  expired or mismatched authorizations still emit `agent.approval.refused`, and
+  the review gate runs before the authorization is consumed so an unreviewed
+  head does not burn it. The software-factory scenario check
+  `release.requires-review-at-head` now passes (Step 3 is 10/10).
+
 - A one-time approval of `git_merge_task` no longer covers a later commit.
   The approval now binds the head (full SHA), branch, target branch and the
   task project's bound repository resolved when the merge is called, plus a

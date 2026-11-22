@@ -25,8 +25,11 @@
 //!   row at an older head, shown as `stale_head`).
 //!
 //! A reference that contradicts the claim leaves the grade `attested` and is
-//! listed in `summary.contradicted`. Report mode: nothing here gates a claim
-//! or a merge.
+//! listed in `summary.contradicted`. When `"review"` is in `expected_checks`,
+//! `git_merge_task` requires a passing, uncontradicted `review` check at the
+//! exact commit being merged (and, when a commit deliverable revision matches
+//! that commit, refuses a self-review by its producer). Other checks are
+//! advisory.
 //!
 //! **What may be verified.** A caller cannot pick what the hub looks up:
 //!
@@ -714,6 +717,87 @@ pub(crate) fn capsule_head(conn: &Connection, task_id: i64) -> UaResult<Option<S
         .query_row("SELECT head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
         .optional()?
         .flatten())
+}
+
+/// Enforce the review-at-head gate before merging `head` of `task_id`.
+///
+/// Applies whenever the task's `expected_checks` includes `"review"`. Requires
+/// a passing (`outcome == "pass"`), uncontradicted (`verification.verdict !=
+/// "mismatch"`) `review` check (`grade` `attested` or `verified`) recorded at
+/// the exact 40-hex `head`. When the task has a commit deliverable revision
+/// matching `head`, refuses a self-review (`recorded_by == producer`).
+pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str) -> UaResult<()> {
+    let expected_raw: Option<String> = conn
+        .query_row("SELECT expected_json FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .optional()?;
+    let expected = json_list(expected_raw);
+    if !expected.iter().any(|n| n == "review") {
+        return Ok(());
+    }
+
+    let head = head.trim().to_ascii_lowercase();
+    let short = &head[..head.len().min(12)];
+    let row: Option<CheckRow> = conn
+        .query_row(
+            &format!(
+                "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = 'review' AND head_sha = ?2"
+            ),
+            params![task_id, head],
+            check_row,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        let stale: Option<String> = conn
+            .query_row(
+                "SELECT head_sha FROM task_checks WHERE task_id = ?1 AND name = 'review' \
+                 ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let detail = match stale {
+            Some(s) => format!(
+                "task {task_id} requires a passing review at head {short}; latest recorded review is for {}",
+                &s[..s.len().min(12)]
+            ),
+            None => {
+                format!("task {task_id} requires a passing review at head {short}; no review is recorded")
+            }
+        };
+        return Err(UaError::denied("review_required", detail));
+    };
+
+    if row.outcome != "pass" {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} did not pass (outcome: {:?})", row.outcome),
+        ));
+    }
+    if row.verification.as_ref().and_then(|v| v["verdict"].as_str()) == Some("mismatch") {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} was contradicted by verification"),
+        ));
+    }
+    if row.grade != ATTESTED && row.grade != VERIFIED {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} has unaccepted grade {:?}", row.grade),
+        ));
+    }
+    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, ua_core::DEFAULT_ORG, task_id, &head)?
+        && same_label(Some(&rev.producer), &row.recorded_by)
+    {
+        return Err(UaError::denied(
+            "self_review_refused",
+            format!(
+                "task {task_id}'s review at head {short} was recorded by its producer {:?}; an independent \
+                 reviewer is required",
+                row.recorded_by
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `coordination_manage(action="task_check_record")`.
