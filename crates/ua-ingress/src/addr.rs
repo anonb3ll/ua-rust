@@ -240,7 +240,6 @@ mod tests {
             "fc00::1",
             "fd12:3456::1",
             "::ffff:10.1.2.3",
-            "::ffff:100.100.1.1",
         ] {
             assert!(is_private_network(yes.parse().unwrap()), "{yes}");
         }

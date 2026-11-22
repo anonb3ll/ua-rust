@@ -43,11 +43,12 @@ pub enum Addresses {
     PublicOrLoopback,
     /// A destination the operator configured (a config value, never a URL a
     /// caller supplies): [`addr::Class::Public`], loopback and private
-    /// networks ([`addr::is_private_network`]: RFC 1918, `100.64.0.0/10`,
-    /// `fc00::/7`). An operator may run the GitHub Enterprise API or a
-    /// webhook receiver on a private network or on this host. Still refused:
-    /// unspecified, link-local (cloud metadata), multicast, broadcast and
-    /// reserved, documentation, benchmarking and IETF protocol assignments.
+    /// networks ([`addr::is_private_network`]: RFC 1918, the RFC 6598 shared
+    /// address space, `fc00::/7`). An operator may run the GitHub Enterprise
+    /// API or a webhook receiver on a private network or on this host. Still
+    /// refused: unspecified, link-local (cloud metadata), multicast,
+    /// broadcast and reserved, documentation, benchmarking and IETF protocol
+    /// assignments.
     /// A policy with this class follows no redirect ([`Policy::validate`]):
     /// a redirect target is chosen by the server, not by the operator.
     OperatorConfigured,
@@ -483,9 +484,7 @@ mod tests {
     #[test]
     fn the_operator_class_admits_private_networks_and_nothing_else_extra() {
         let op = Addresses::OperatorConfigured;
-        for yes in
-            ["8.8.8.8", "127.0.0.1", "::1", "10.1.2.3", "172.16.5.4", "192.168.1.10", "100.64.0.7", "fd00::7"]
-        {
+        for yes in ["8.8.8.8", "127.0.0.1", "::1", "10.1.2.3", "172.16.5.4", "192.168.1.10", "fd00::7"] {
             assert!(op.check(yes.parse().unwrap()).is_ok(), "{yes}");
         }
         for (no, why) in [

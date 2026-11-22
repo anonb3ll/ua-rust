@@ -356,7 +356,7 @@ from its commit history.
   host, https, the loopback test hook, no proxy, no redirects (a 3xx is an
   error), the 8 MiB cap, 20 seconds and its errors are as before. The new
   address class `OperatorConfigured` (public, loopback and private networks:
-  RFC 1918, `100.64.0.0/10`, `fc00::/7`) serves the GHES case and follows no
+  RFC 1918, the RFC 6598 shared address space, `fc00::/7`) serves the GHES case and follows no
   redirect. Stricter:
   - a GHES host was not address-checked at all; now a name or address in
     link-local (cloud metadata), unspecified, multicast, broadcast and
