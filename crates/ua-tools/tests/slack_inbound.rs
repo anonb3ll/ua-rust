@@ -373,3 +373,60 @@ fn an_upgraded_hub_keeps_every_state_and_still_refuses_what_it_saw() {
         assert_eq!(old_rows, 4);
     });
 }
+
+#[tokio::test]
+async fn a_late_outcome_settles_only_the_row_its_admission_created() {
+    let e = env();
+    let db = e.hub.db().clone();
+    let cfg = e.hub.cfg().clone();
+    let d = delivery(DeliveryKind::Trigger, "U0HUMAN", "1.2.late");
+    let (d1, cfg1) = (d.clone(), cfg.clone());
+    let (first, old_claim) = db
+        .write_async(move |tx| {
+            let k = ReplayKey::Signed { timestamp: "1700000000", body: b"a" };
+            slack::admit_claimed(tx, &cfg1, k, T0, &d1)
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, accepted("operator"));
+    let old_claim = old_claim.expect("an accepted delivery has a claim");
+    // The row goes away (as after its retention) and the same id is admitted
+    // again: a newer row, under a newer claim.
+    db.write_async(|tx| {
+        tx.execute("DELETE FROM inbound_deliveries WHERE delivery_key = '1.2.late'", [])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (d2, cfg2) = (d.clone(), cfg.clone());
+    let (second, new_claim) = db
+        .write_async(move |tx| {
+            let k = ReplayKey::Signed { timestamp: "1700000001", body: b"b" };
+            slack::admit_claimed(tx, &cfg2, k, T0 + 1, &d2)
+        })
+        .await
+        .unwrap();
+    assert_eq!(second, accepted("operator"));
+    assert_ne!(new_claim.unwrap(), old_claim);
+    // The first admission's outcome arrives very late: it is ledgered, and the
+    // newer row stays accepted.
+    db.write_async(move |tx| {
+        slack::record_executed_under(
+            tx,
+            Some(&old_claim),
+            "operator",
+            DeliveryKind::Trigger,
+            "1.2.late",
+            "task",
+            None,
+            &Ok(Value::Null),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rows(&e.hub).await,
+        [("trigger".into(), "1.2.late".into(), "accepted".into(), Some("operator".into()))]
+    );
+    assert_eq!(channel(&e.hub, "agent.slack.request.executed").await.len(), 1);
+}

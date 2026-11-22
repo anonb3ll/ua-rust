@@ -286,6 +286,9 @@ async fn every_bad_signature_is_a_401_before_any_database_write() {
     let h = TestHub::new(slack_config());
     let body = command_body(HUMAN, "/task", "write the report", "1.2.a");
     let ts = now().to_string();
+    // One reading for the stale case, so its signature always matches its
+    // timestamp and it can only fail as stale.
+    let stale = (now() - 301).to_string();
     let good = slack::slack_signature(SECRET, &ts, &body);
     let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
         ("missing both headers", vec![]),
@@ -309,8 +312,8 @@ async fn every_bad_signature_is_a_401_before_any_database_write() {
         (
             "stale",
             vec![
-                ("x-slack-request-timestamp", (now() - 301).to_string()),
-                ("x-slack-signature", slack::slack_signature(SECRET, &(now() - 301).to_string(), &body)),
+                ("x-slack-request-timestamp", stale.clone()),
+                ("x-slack-signature", slack::slack_signature(SECRET, &stale, &body)),
             ],
         ),
         (
@@ -897,4 +900,107 @@ async fn a_finished_command_is_not_swept_as_abandoned() {
         assert_eq!(ua_server::slack_api::sweep_abandoned(&h.state.hub).await.unwrap(), 0);
     }
     assert!(events(&h, "agent.slack.request.abandoned").await.is_empty());
+}
+
+// --- a command never runs twice ---------------------------------------------------
+
+/// An `accepted` Slack delivery row as a stopped process left it: admitted
+/// under another process's claim, no outcome recorded.
+async fn plant_accepted(h: &TestHub, kind: &'static str, key: &'static str, at: i64) {
+    h.state
+        .hub
+        .db()
+        .write_async(move |tx| {
+            tx.execute(
+                "INSERT INTO inbound_deliveries (org_id, source, kind, delivery_key, state, received_at, \
+                 updated_at, expires_at, claim, identity) \
+                 VALUES ('default', 'slack', ?1, ?2, 'accepted', ?3, ?3, ?4, 'a-stopped-process:0', 'dev-human')",
+                rusqlite::params![kind, key, at, at + 86_400],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn state_of(h: &TestHub, key: &'static str) -> String {
+    h.state
+        .hub
+        .db()
+        .read_async(move |c| {
+            Ok(c.query_row(
+                "SELECT state FROM inbound_deliveries WHERE source = 'slack' AND delivery_key = ?1",
+                [key],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_delivery_admitted_and_never_finished_never_runs_through_the_routes() {
+    let h = TestHub::new(slack_config());
+    // One clock reading: every request below is signed at `t`.
+    let t = now();
+    // Abandoned by the startup sweep, then one a stopped process left behind.
+    plant_accepted(&h, "trigger", "1.2.swept", t - 60).await;
+    plant_accepted(&h, "event", "Ev0SWEPT", t - 60).await;
+    assert_eq!(ua_server::slack_api::sweep_abandoned(&h.state.hub).await.unwrap(), 2);
+    plant_accepted(&h, "trigger", "1.2.stopped", t - 60).await;
+    plant_accepted(&h, "event", "Ev0STOPPED", t - 60).await;
+    assert_eq!(state_of(&h, "1.2.swept").await, "abandoned");
+    assert_eq!(state_of(&h, "1.2.stopped").await, "accepted");
+
+    for trigger in ["1.2.stopped", "1.2.swept"] {
+        let body = command_body(DEV, "/task", "write the report", trigger);
+        let r = h.send(signed(slack_api_commands(), FORM, &body, t)).await;
+        assert_eq!(r.status(), 200, "{trigger}");
+        assert_eq!(json_body(r).await["text"], "Already received.", "{trigger}");
+    }
+    for event_id in ["Ev0STOPPED", "Ev0SWEPT"] {
+        let body = event_body(DEV, event_id, "app_mention", "<@U0BOT> /task write the report");
+        let r = h.send(signed(slack_api_events(), "application/json", &body, t)).await;
+        assert_eq!(r.status(), 200, "{event_id}");
+    }
+    settle(&h).await;
+    assert_eq!(task_count(&h).await, 0, "nothing ran");
+    assert!(events(&h, "agent.slack.request.accepted").await.is_empty());
+    assert!(executed(&h).await.is_empty());
+    assert_eq!(events(&h, "agent.slack.request.deduped").await.len(), 4);
+    // The rows keep their state: nothing settled them on the repeat.
+    assert_eq!(state_of(&h, "1.2.stopped").await, "accepted");
+    assert_eq!(state_of(&h, "Ev0SWEPT").await, "abandoned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_identical_signed_requests_sent_together_run_one_command() {
+    let h = TestHub::new(slack_config());
+    let t = now();
+    let body = command_body(DEV, "/task", "write the report", "1.2.twin");
+    let (a, b) = tokio::join!(
+        h.send(signed(slack_api_commands(), FORM, &body, t)),
+        h.send(signed(slack_api_commands(), FORM, &body, t)),
+    );
+    let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 401], "the same signed bytes are accepted once");
+    // Two signatures over one trigger id, sent together: one runs, one is a
+    // duplicate.
+    let body = command_body(DEV, "/task", "write another", "1.2.pair");
+    let (a, b) = tokio::join!(
+        h.send(signed(slack_api_commands(), FORM, &body, t)),
+        h.send(signed(slack_api_commands(), FORM, &body, t - 1)),
+    );
+    let mut texts = [
+        json_body(a).await["text"].as_str().unwrap().to_string(),
+        json_body(b).await["text"].as_str().unwrap().to_string(),
+    ];
+    texts.sort();
+    assert!(texts[0].starts_with("Accepted /task"), "{texts:?}");
+    assert_eq!(texts[1], "Already received.");
+    settle(&h).await;
+    assert_eq!(task_count(&h).await, 2, "one command per trigger id");
+    assert_eq!(events(&h, "agent.slack.request.accepted").await.len(), 2);
+    assert_eq!(executed(&h).await.len(), 2);
 }

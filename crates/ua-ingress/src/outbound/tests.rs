@@ -731,13 +731,81 @@ async fn a_same_origin_hop_after_a_return_stays_stripped() {
 #[tokio::test]
 async fn the_loopback_only_policy_reaches_loopback_and_nothing_else() {
     let server = Server::start(|_| ok("live")).await;
-    let out = Outbound::new(crate::policy::OBSIDIAN_LOCAL).unwrap();
+    let out = Outbound::pinned(crate::policy::OBSIDIAN_LOCAL, &server.url("/")).unwrap();
     let resp = out.send(Request::get(server.url("/"))).await.unwrap();
     assert_eq!(resp.body().await.unwrap().bytes, b"live");
     // A name that resolves off this host is refused before anything is sent.
     let public: SocketAddr = "93.184.215.14:443".parse().unwrap();
-    let out = Outbound::with_lookup(crate::policy::OBSIDIAN_LOCAL, fake_lookup("vault.test", vec![public]))
-        .unwrap();
-    let err = out.send(Request::get(Url::parse("https://vault.test/").unwrap())).await.err().unwrap();
+    let vault = Url::parse("https://vault.test/").unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::OBSIDIAN_LOCAL,
+        &vault,
+        fake_lookup("vault.test", vec![public]),
+    )
+    .unwrap();
+    let err = out.send(Request::get(vault)).await.err().unwrap();
     assert!(matches!(err, OutboundError::AddressRefused { reason: "not loopback", .. }), "{err:?}");
+}
+
+// --- relaxed policies and pinned clients -----------------------------------------
+
+#[test]
+fn a_relaxed_policy_builds_no_unpinned_client() {
+    use crate::policy::{GITHUB_ENTERPRISE, NOTIFY_WEBHOOK, OBSIDIAN_LOCAL};
+    for p in [GITHUB_ENTERPRISE, NOTIFY_WEBHOOK, OBSIDIAN_LOCAL] {
+        assert!(matches!(Outbound::new(p), Err(OutboundError::InvalidPolicy { .. })), "{}", p.name);
+        assert!(
+            matches!(Outbound::new(p.loopback_test_hook()), Err(OutboundError::InvalidPolicy { .. })),
+            "{}",
+            p.name
+        );
+        assert!(matches!(Outbound::named(p.name), Err(OutboundError::UnknownPolicy(_))), "{}", p.name);
+    }
+    // Nor a hand-made one, pinned or not.
+    let odd = Policy { addresses: Addresses::OperatorConfigured, ..LOCAL };
+    let origin = Url::parse("http://127.0.0.1:9/").unwrap();
+    assert!(matches!(Outbound::new(odd), Err(OutboundError::InvalidPolicy { .. })));
+    assert!(matches!(Outbound::pinned(odd, &origin), Err(OutboundError::InvalidPolicy { .. })));
+    let odd_tls = Policy { accept_invalid_certs: true, ..OBSIDIAN_LOCAL };
+    assert!(Outbound::pinned(odd_tls, &origin).is_ok(), "the same values are OBSIDIAN_LOCAL itself");
+    let odd_tls = Policy { name: "odd.tls", ..OBSIDIAN_LOCAL };
+    assert!(matches!(Outbound::pinned(odd_tls, &origin), Err(OutboundError::InvalidPolicy { .. })));
+}
+
+#[tokio::test]
+async fn a_pinned_origin_outside_the_policy_is_refused_on_use() {
+    let metadata = Url::parse("http://169.254.169.254/").unwrap();
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &metadata).unwrap();
+    let err = out.send(Request::post(metadata)).await.err().unwrap();
+    assert!(matches!(err, OutboundError::AddressRefused { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_pinned_client_sends_only_to_its_origin() {
+    let home = Server::start(|_| ok("home")).await;
+    let other = Server::start(|_| ok("other")).await;
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &home.url("/hooks/x")).unwrap();
+    let resp = out.send(Request::post(home.url("/another/path"))).await.unwrap();
+    assert_eq!(resp.body().await.unwrap().bytes, b"home", "any path on the origin");
+
+    let port = home.addr.port();
+    let elsewhere = [
+        other.url("/hooks/x").to_string(),                   // another port
+        format!("https://127.0.0.1:{port}/hooks/x"),         // another scheme
+        format!("http://localhost:{port}/hooks/x"),          // another host, same address
+        format!("http://[::ffff:127.0.0.1]:{port}/hooks/x"), // an IP literal that is not the origin
+        format!("http://127.0.0.2:{port}/hooks/x"),          // another host
+    ];
+    for url in elsewhere {
+        let err = out.send(Request::post(Url::parse(&url).unwrap())).await.err().unwrap();
+        assert!(
+            matches!(err, OutboundError::UrlRefused { why: "not the origin this client is pinned to", .. }),
+            "{url}: {err:?}"
+        );
+    }
+    assert!(other.seen().is_empty(), "nothing reached another origin");
+    assert_eq!(home.seen().len(), 1);
+    // A strict policy may be pinned too, with the same effect.
+    let strict = Outbound::pinned(LOCAL, &home.url("/")).unwrap();
+    assert!(strict.send(Request::get(other.url("/"))).await.is_err());
 }
