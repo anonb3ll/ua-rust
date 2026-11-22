@@ -205,6 +205,11 @@ from its commit history.
   can use the same board names independently, with separate board quotas and
   revision retention. Canvas tool results and event payloads retain their
   existing shapes.
+- Web search cache rows (`web_search_cache`) have organization-scoped keys
+  and triggers (`web.v2.tenant_keys`, `organization.v1.tools.web`). Existing
+  cached entries migrate to `default`. Organizations cache identical queries
+  independently, and one organization's TTL eviction does not remove another
+  organization's cached entries.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

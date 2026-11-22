@@ -58,6 +58,7 @@ slack.v2
 wake.v1
 wake.v2
 web.v1
+web.v2.tenant_keys
 workflows.v1
 zulip.v1
 config_revisions.v1
@@ -70,3 +71,4 @@ organization.v1.tools.code
 deliverables.v1
 organization.v1.deliverables
 organization.v1.tools.graph
+organization.v1.tools.web
