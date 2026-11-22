@@ -186,8 +186,9 @@ it on again (for idempotent effects), `Duplicate` refuses it.
 A caller, inside one write transaction that also holds its own records (its
 ledger event, for one):
 
-1. `sweep(source, now, rules)`: abandon `accepted` rows whose claim is gone
-   or past `abandon_after_s`, delete expired rows (never an `accepted` one),
+1. `sweep(org, source, now, rules)`: within one organization, abandon `accepted` rows whose claim is gone
+   or past `abandon_after_s`, delete expired rows (those whose `expires_at`
+   is before `now`; never an `accepted` one),
    and keep at most `max_per_kind` rows per organization and kind (never
    dropping an `accepted` one). Stuck rows are marked `abandoned` rather
    than released: the sweep cannot know whether their effects happened, and
@@ -246,8 +247,11 @@ redelivers stale rows processes the next copy anyway.
   GitHub tables, which stopped being written at the cut-over, so a downgrade
   reopens a replay window: a copy of any GitHub delivery handled since the
   upgrade (within its 30-day retention, and inside the payload-timestamp
-  window) is accepted again. Do not downgrade past this change while the
-  webhook takes traffic.
+  window) is accepted again. The same holds for Slack, where it matters
+  more: an older binary reads only the old Slack tables, so for about a day
+  (the delivery-id retention) a Slack retry of a command the newer build
+  already ran is run again, and Slack commands are not idempotent. Do not
+  downgrade past this change while either endpoint takes traffic.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from
@@ -273,7 +277,10 @@ and `Stale::Redeliver`:
 | A slow original that fails after a redelivery took over | the original deleted the newer record | the original's `release` is `NotMine`; the newer record stands |
 
 When the sweep abandons GitHub deliveries it appends one
-`agent.github.webhook.abandoned` event per sweep (actor `hub-github`) with
+`agent.github.webhook.abandoned` event per sweep (actor `hub-github`), under
+the organization it swept (each sweep covers one, so every abandoned row is
+in the event's organization; the webhook serves the default organization
+today), with
 `count`, `kinds` (`delivery_id` and `body_sha256` counts), `delivery_ids` (at
 most 50) and `delivery_ids_truncated`; never a body or a body hash. Each is
 a delivery that may never have been handled.
@@ -287,6 +294,56 @@ refused, as it was before. The old tables stay in the schema, unread and
 unwritten, and are dropped one release later. The importer does not map
 them from the Python hub (they are reported as unmapped), and it does not
 map `inbound_deliveries` either.
+
+### Slack
+
+Slack is the second consumer, under source `slack` in the default
+organization:
+
+| Kind | Key | Kept | Written |
+|---|---|---|---|
+| `request_sha` | SHA-256 of the signed base `v0:{timestamp}:{body}` (HTTP) or of `socket-envelope:{envelope_id}` (Socket Mode) | 600 s | `seen`, at admission, before the identity is looked up |
+| `trigger`, `event` | the slash command's `trigger_id` or the event's `event_id` | a day | `seen` then `accepted` with the mapped identity, in the admission transaction; `finished` when the outcome is ledgered |
+
+Slack commands are not idempotent (a slash command or an approval must
+never run twice), so Slack uses `Stale::Duplicate`: a delivery taken on and
+never finished is refused like any other repeat ("Already received."),
+never taken on again. That is the opposite of GitHub, whose effects are
+idempotent and whose redelivery is how a lost event is recovered. What
+happened to such a Slack delivery is reported instead: at startup, before
+the routes take traffic, `abandon_all_accepted` marks every `accepted` row
+`abandoned` (all of them belong to a process that has stopped), and the
+Slack family ledgers each as `agent.slack.request.abandoned` with
+`outcome: "unknown"`, as it did before. If the outcome does arrive later
+(a slow handler), it is still ledgered, and the row is finished when it
+still carries the claim it was accepted under. Two cases differ, and in
+neither does anything run twice: a row the upgrade copy carried over has no
+claim, so a late outcome is ledgered and the row stays `abandoned`; and if
+a settled row has expired and the same id was recorded again (a day or more
+later), a very late outcome for the first settles the newer row.
+
+`record_executed` takes no claim: Slack never takes a delivery over, so an
+`accepted` row keeps the claim it was accepted under, and the handler
+settles it with that claim (`claim_of`).
+
+Every response is as before: a byte replay is 401 `replayed` on the HTTP
+routes (a redelivered envelope is acknowledged again and runs nothing), a
+duplicate delivery is answered "Already received.", and every refusal and
+reply text is unchanged.
+
+`slack.inbound.v1.copy` carries the rows of `slack_seen_signatures` (as
+`seen`) and `slack_seen_deliveries` (each in its own state: `seen`,
+`accepted`, `finished` or `abandoned`, with its identity) into the table,
+keeping `seen_at` as the receipt time and each kind's retention. A row the
+old hub had `accepted` stays `accepted` with no claim, so the next startup
+sweep reports it as abandoned, exactly as before; nothing becomes
+`finished`. The old tables stay, unread and unwritten, until a later
+release drops them; the ratchet's `delivery_table` count stays 4 meanwhile.
+
+The Socket Mode connector (`slack_socket.rs::connect`) has not moved into
+this crate: it checks resolved addresses only for `wss`, and plain `ws` is
+the tests' loopback hook, so moving it without changing behaviour needs its
+own slice. It stays counted as `direct_dial` 3.
 
 ## The ratchet
 
@@ -357,6 +414,8 @@ plain http, any host and port; everything else unchanged.
    moved).
 2. One inbound-delivery table, with a cut-over for GitHub deliveries
    (done: [Inbound deliveries](#inbound-deliveries)).
-3. Slack's signed HTTP routes and Socket Mode onto it.
+3. Slack's signed HTTP routes and Socket Mode onto it (the replay keys and
+   delivery ids are done: [Slack](#slack); the Socket Mode connector is
+   still to move).
 4. GitHub REST and the MCP gateway.
 5. Retire the old delivery tables one release later.

@@ -47,7 +47,13 @@ impl Env {
     async fn seen_rows(&self) -> i64 {
         self.hub
             .db()
-            .read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM slack_seen_signatures", [], |r| r.get(0))?))
+            .read_async(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'request_sha'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
             .await
             .unwrap()
     }
@@ -412,7 +418,7 @@ async fn admission_maps_identity_dedupes_and_ledgers() {
     let deliveries: i64 = e
         .hub
         .db()
-        .read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM slack_seen_deliveries", [], |r| r.get(0))?))
+        .read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind IN ('event', 'trigger')", [], |r| r.get(0))?))
         .await
         .unwrap();
     assert_eq!(deliveries, 2);
@@ -619,9 +625,11 @@ async fn an_accepted_but_unfinished_delivery_is_ledgered_abandoned_once() {
         .hub
         .db()
         .read_async(|c| {
-            Ok(c.query_row("SELECT COUNT(*) FROM slack_seen_deliveries WHERE kind = 'trigger'", [], |r| {
-                r.get(0)
-            })?)
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'trigger'",
+                [],
+                |r| r.get(0),
+            )?)
         })
         .await
         .unwrap();
