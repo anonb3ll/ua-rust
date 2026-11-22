@@ -35,11 +35,11 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (60 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (57 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
-  `skill_assignments`, `skill_publish_staging` and `project_repo_bindings`
-  having left it; a new table cannot join it), and the grant tables
+  `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
+  `notify_outbox`, `pending_notifications` and `zulip_sends` having left it; a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
@@ -177,6 +177,30 @@ here for memory columns, owners and defaults.
   the default organization's ledger. They must move to the binding's
   organization with the `ORG-EVENT-DEFAULT` switch, in the same change that
   lets a second organization bind; the payload shape stays as it is.
+- The notification tables: `organization.v1.tools.notify` gives
+  `notify_outbox` and `pending_notifications` their `org_id` and triggers,
+  `notify.v2.org_indexes` adds indexes led by `org_id`, and
+  `organization.v1.tools.zulip` does the same for `zulip_sends`. No rebuild:
+  their only keys are AUTOINCREMENT ids, and the keys that matter between
+  organizations are query keys (the digest category count, the Zulip
+  duplicate check on stream, topic and content hash), which now filter on
+  `org_id`. Every notify tool and Zulip send or resolve reads and writes only
+  the caller's organization's rows; an unknown organization is refused before
+  any write. The notification webhook and the Zulip site, account and
+  channels live in the hub configuration and are the **default
+  organization's destinations**: another organization's notifications are
+  kept in its outbox as `not_configured`, never sent to them, and its
+  `zulip_send_message` is refused before anything is recorded, until
+  organizations configure their own destinations. A hub-originated
+  notification takes the organization of the row it is about, never a
+  caller's: `review_ready` uses its task's (`TASK_ORG`, `ORG-TASK-DEFAULT`).
+  `review_ready_notices` stays with the tasks family: it belongs to the task
+  workflow (continuity), is keyed by the hub-global task id, and is read in
+  the same transaction as `task_workflow`, so it converts with `tasks`. The
+  queued, settled and Zulip events are `ORG-EVENT-DEFAULT` sites; their
+  payloads carry ids, counts, hashes and categories, never message text.
+  `crates/ua-tools/tests/notify_tenant.rs` holds the upgrade and the
+  isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -764,6 +788,8 @@ global key in the tree is classified:
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`, rebuilt in the standalone procedure `governance.v2.project_bindings_tenant_keys`. |
+| `notify_outbox`, `pending_notifications`, `zulip_sends` | No key | AUTOINCREMENT ids only, so no rebuild (`organization.v1.tools.notify`, `organization.v1.tools.zulip`). The digest category count and the Zulip duplicate check (`stream, topic, content_sha256`) are query keys and filter on `org_id`. |
+| `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
@@ -1292,7 +1318,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
-| Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
+| Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
