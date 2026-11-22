@@ -316,7 +316,8 @@ redelivers stale rows processes the next copy anyway.
   it opens the database or binds a port (`docs/operations.md`, section 5).
   What remains: the lock is advisory and taken by the `ua` command, so a
   program that embeds `ua-server` and calls `serve_http` without taking
-  `ua_import::ServeLock` is not covered; two hard links to one database
+  `ua_store::ServeLock` is not covered (its plain opens still refuse to
+  migrate underneath another serve, which is the default); two hard links to one database
   file are two databases to the lock (never use a database through two
   hard links; SQLite's WAL files are per name); on a platform without
   `flock` (not Unix) nothing is locked; and two hosts that share one
