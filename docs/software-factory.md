@@ -74,4 +74,6 @@ to continue the work.
 
 Use runnable evidence from the scenario to track progress. Each milestone
 should make a step work through its normal entry point or close a measured
-gap in quality, isolation, recovery, or auditability.
+gap in quality, isolation, recovery, or auditability. The
+[scenario status page](software-factory-status.md) describes the scored test
+that runs the scenario and its current scorecard.

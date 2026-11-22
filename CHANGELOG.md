@@ -184,6 +184,12 @@ from its commit history.
   part that gives a crate's tables `org_id` and its guard triggers.
 - A test that classifies every table for organization scoping and fails on
   an unclassified one.
+- The software factory acceptance scenario as a scored test
+  (`crates/ua-server/tests/factory_scenario.rs`): each step of the scenario in
+  `docs/software-factory.md` is a set of named checks, each `pass`, `fail` or
+  `not-built`, compared against a checked-in scorecard
+  (`tests/fixtures/factory_scenario.txt`) that only moves forward. Status
+  page: `docs/software-factory-status.md`. Tests and docs only.
 - The first existing table family with an organization key: the code
   family's `code_symbols` gets `org_id` (existing rows backfilled to
   `default`) and its `org_exists` / `org_immutable` triggers in the schema
