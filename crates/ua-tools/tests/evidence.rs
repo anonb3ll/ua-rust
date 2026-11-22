@@ -90,6 +90,17 @@ async fn ledger_paginates_the_callers_visible_message_rows() {
     let recent =
         call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 2 })).await;
     assert_eq!(recent["events"], json!([first_page["events"][0], second_page["events"][0]]));
+
+    // `count` and `next_after_seq` describe the caller's visible rows only:
+    // hidden message rows between the tasks consume neither.
+    let page =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 100 })).await;
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["next_after_seq"], second_page["events"][0]["seq"]);
+    let hidden_only =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": ["agent.message.inform"] })).await;
+    assert_eq!(hidden_only["count"], 0);
+    assert_eq!(hidden_only["next_after_seq"], Value::Null);
 }
 
 #[tokio::test]
@@ -134,9 +145,14 @@ async fn ledger_hides_handoff_note_and_conversation_handoff_events_from_outsider
     )
     .await;
 
+    // The task's holder is let in on the conversation-handoff link.
+    let holder = agent("builder-4");
+    call(&reg, &hub, &holder, "task_claim", json!({ "id": task })).await;
+
     let want = ["agent.conversation.handoff", "agent.lifecycle.handoff"].map(String::from);
     assert_eq!(handoff_channels(&reg, &hub, &outsider).await, Vec::<String>::new());
     assert_eq!(handoff_channels(&reg, &hub, &participant).await, want[..1]);
+    assert_eq!(handoff_channels(&reg, &hub, &holder).await, want[..1]);
     assert_eq!(handoff_channels(&reg, &hub, &owner).await, want);
     assert_eq!(handoff_channels(&reg, &hub, &operator).await, want);
 }

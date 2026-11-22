@@ -4,7 +4,7 @@
 //! A stream is opened with one governed `event_log_query` call as the
 //! caller, so the profile, policy and decision row apply exactly as they do
 //! to the tool. Live and backfilled rows share the tool's channel filters
-//! and mailbox visibility.
+//! and event visibility.
 //!
 //! The caller stays authorized only while it would still be let in: every
 //! [`RECHECK_EVERY`], and soon after a token-revoked, logout,

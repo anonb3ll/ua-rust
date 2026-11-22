@@ -20,7 +20,7 @@
 //!
 //! An `sdk.` evidence event's payload is client-written: its read carries a
 //! `trust` label marking it untrusted.
-//! Message events use the same mailbox visibility as the ledger query.
+//! Restricted event rows use the same visibility as the ledger query.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;

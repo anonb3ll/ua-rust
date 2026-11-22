@@ -24,11 +24,14 @@
 //!   Listing handoffs follows the same rule, and is also open to a caller
 //!   with no verified identity (auth enforcement off), for whom mailboxes
 //!   and conversations are a message board to read.
-//! - Linking checks that the task exists and that the caller's profile
-//!   allows `task_update`, the write a direct link would have needed.
-//!   Creating calls the registered `task_add` through the governed
-//!   registry as the caller, so the caller's profile, the policy file and
-//!   the approval gate apply exactly as to a direct call.
+//! - Linking applies `task_update`'s read gate (profile allow-list and
+//!   policy file, the same refusal codes as a call would get) before it
+//!   checks the task exists, so a refused caller cannot probe task ids.
+//!   The `coordination_manage` call itself already passed the registry's
+//!   policy and approval gate. Creating calls the registered `task_add`
+//!   through the governed registry as the caller, so the caller's profile,
+//!   the policy file and the approval gate apply exactly as to a direct
+//!   call.
 //! - Creating is idempotent per conversation, title, project and priority
 //!   (a `task_add` idempotency key derived from them): a repeat returns the
 //!   same task. Relinking appends nothing new (the handoff event is
@@ -154,7 +157,16 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
     let (task_id, created) = match (a.task_id, title) {
         (Some(id), _) => {
             // The link is only the audited handoff event below: the task's
-            // notes and updated_at stay untouched.
+            // notes and updated_at stay untouched. The profile and policy
+            // check runs before the task's existence, so a refused caller
+            // learns nothing about task ids.
+            crate::families::platform::check_read(
+                &ctx.hub,
+                &ctx.caller,
+                "conversation handoff",
+                "task_update",
+            )
+            .await?;
             let exists: bool = ctx
                 .hub
                 .db()
@@ -164,12 +176,6 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 .await?;
             if !exists {
                 return Err(UaError::not_found(format!("no task with id {id}")));
-            }
-            if !crate::families::platform::may_read(&ctx.caller, "task_update") {
-                return Err(UaError::denied(
-                    "profile_denied",
-                    format!("tool task_update is not available to profile {}", ctx.caller.profile),
-                ));
             }
             (id, false)
         }

@@ -11,8 +11,9 @@
 //! new file under `exports/` in the caller's workspace (capped at 32 MB). The
 //! file name carries a UTC timestamp and a counter, and is created exclusively
 //! so concurrent exports never overwrite each other. Writes are recorded on
-//! `agent.export.written`. The manifest applies mailbox visibility to message
-//! event rows, which carry only their id and stored hash when restricted.
+//! `agent.export.written`. The manifest applies the ledger's event visibility
+//! to message, session-handoff and conversation-handoff event rows, which
+//! carry only their id and stored hash when restricted.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -1703,8 +1704,10 @@ pub fn register(r: &mut Registry) {
              and chain_error report where and why the chain broke (omitted on healthy logs). The summary has \
              no anchor: compare against an earlier \
              manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
-             client evidence (sdk. channels) carrying a trust label. Restricted message rows contain \
-             only their ULID, stored entry hash, and a redacted flag. Row comparisons compare the \
+             client evidence (sdk. channels) carrying a trust label. Restricted message, session-handoff and \
+             conversation-handoff rows contain \
+             only their ULID, stored entry hash, and a redacted flag — the accepted integrity exception \
+             that keeps the chain checkable without revealing the rows. Row comparisons compare the \
              listed views. The listing and cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \

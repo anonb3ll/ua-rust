@@ -821,6 +821,24 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         return Err(UaError::conflict(format!("message_id {mid:?} is already used by another message")));
     }
     let inherited = check_reply(tx, reply.as_deref(), &sender)?;
+    if let Some(cid) = &explicit_conversation
+        && !v.unrestricted
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1)",
+            [cid],
+            |r| r.get::<_, bool>(0),
+        )?
+        && !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+             AND (sender = ?2 OR recipient = ?2))",
+            params![cid, sender],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        // Joining an existing conversation needs to be a party to it;
+        // "missing" and "not yours" read alike.
+        return Err(UaError::not_found("conversation not found"));
+    }
     let conversation = explicit_conversation.or(inherited).unwrap_or_else(new_id);
     let mut hop = requested_hop;
     let mut loop_warning = None;

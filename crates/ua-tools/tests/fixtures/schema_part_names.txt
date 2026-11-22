@@ -72,3 +72,7 @@ deliverables.v1
 organization.v1.deliverables
 organization.v1.tools.graph
 organization.v1.tools.web
+skill_registry.v2.tenant_keys
+organization.v1.tools.skills
+governance.v2.project_bindings_tenant_keys
+organization.v1.tools.project_bindings

@@ -40,10 +40,24 @@ pub(crate) enum Kind {
     /// Task subtree holds: require valid `status` and refuse duplicate active holds.
     TaskHolds,
     /// Project repository bindings: validate `project` slug and `repo`, and
-    /// normalize `default_branch` (clearing invalid values to NULL).
+    /// normalize `default_branch` (clearing invalid values to NULL). Legacy
+    /// bindings are imported into the default organization.
     ProjectRepoBindings,
     /// Legacy canvas boards are imported into the default organization.
     GraphCanvas,
+    /// Legacy skill versions and assignments are imported into the default
+    /// organization.
+    SkillRegistry,
+}
+
+impl Kind {
+    /// Rows of this kind are written with `org_id = 'default'` named
+    /// explicitly: the target table is keyed by organization, and the
+    /// Python source has no organization to copy. A source `org_id` is never
+    /// copied by column name.
+    pub(crate) fn writes_default_org(self) -> bool {
+        matches!(self, Kind::GraphCanvas | Kind::SkillRegistry | Kind::ProjectRepoBindings)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,8 +138,8 @@ pub(crate) const MAPS: &[TableMap] = &[
     // Skill versions are immutable (insert only) and keep their ids; drift
     // proposals and reports are not copied, since their apply approvals are
     // pending or unconsumed passes, which are never imported.
-    plain("skill_versions"),
-    plain("skill_assignments"),
+    TableMap { kind: Kind::SkillRegistry, ..plain("skill_versions") },
+    TableMap { kind: Kind::SkillRegistry, ..plain("skill_assignments") },
     plain("harness_config_bundles"),
     TableMap { kind: Kind::GraphCanvas, ..plain("graph_canvas_scenes") },
     TableMap { kind: Kind::Ledger, ..plain("event_log") },

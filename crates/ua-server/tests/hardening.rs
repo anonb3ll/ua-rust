@@ -19,6 +19,7 @@ use ua_store::ledger;
 
 const AGENT_A: &str = "agent-a-test-token-0001";
 const AGENT_B: &str = "agent-b-test-token-0002";
+const AGENT_C: &str = "agent-c-test-token-0004";
 const OPERATOR: &str = "operator-test-token-0003";
 
 /// Two agents with tokens: `agent-a` on the default profile, `agent-b` on
@@ -26,8 +27,9 @@ const OPERATOR: &str = "operator-test-token-0003";
 fn stream_config() -> Config {
     let mut cfg = common::config();
     cfg.oauth_enabled = false;
-    cfg.agent_tokens =
-        Some(SecretString::from(format!("agent-a:{AGENT_A},agent-b:{AGENT_B},operator:{OPERATOR}")));
+    cfg.agent_tokens = Some(SecretString::from(format!(
+        "agent-a:{AGENT_A},agent-b:{AGENT_B},agent-c:{AGENT_C},operator:{OPERATOR}"
+    )));
     cfg.profiles.insert("agent-b".into(), "public".into());
     cfg
 }
@@ -106,6 +108,99 @@ async fn streams_share_mailbox_visibility_for_replayed_and_live_messages() {
         let text = read_sse(resp, |t| t.contains(&format!("id: {live}\n"))).await;
         assert_eq!(sse_ids(&text), vec![replayed, live], "{path}: {text}");
     }
+}
+
+#[tokio::test]
+async fn streams_hide_committed_handoff_rows_from_outsiders() {
+    use ua_tools::families::events::EventReader;
+
+    let hub = TestHub::new(stream_config());
+    let agent = |label: &str| Caller {
+        label: label.into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Developer,
+        enforce_profile: true,
+        session_key: None,
+        transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
+    };
+    let call = async |who: &Caller, tool: &str, args: Value| -> Value {
+        hub.state.registry.call(&hub.state.hub, who, tool, args).await.unwrap()
+    };
+    let builder = agent("builder-1");
+
+    // Committed rows before the streams open: a private message and a
+    // conversation handoff agent-a is a party to, plus a sealed handoff note
+    // that is builder-1's alone.
+    call(
+        &builder,
+        "message_send",
+        json!({ "act": "request", "to_agent": "agent-a", "body": "plan", "conversation_id": "conv-live" }),
+    )
+    .await;
+    let task = call(&builder, "task_add", json!({ "title": "handed off" })).await["id"].clone();
+    call(
+        &builder,
+        "coordination_manage",
+        json!({ "action": "conversation_handoff",
+                "params": { "conversation_id": "conv-live", "task_id": task } }),
+    )
+    .await;
+    let sid = call(&builder, "session_start", json!({ "kind": "interactive" })).await["session_id"].clone();
+    let note = call(
+        &builder,
+        "coordination_manage",
+        json!({ "action": "session_handoff_propose",
+                "params": { "session_id": sid, "done": ["a"], "next_steps": ["b"] } }),
+    )
+    .await;
+    call(
+        &builder,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note["id"] } }),
+    )
+    .await;
+    let last_of = |channel: &str| -> i64 {
+        let ch = channel.to_string();
+        hub.state
+            .hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row("SELECT MAX(seq) FROM event_log WHERE channel = ?1", [&ch], |r| r.get(0))?)
+            })
+            .unwrap()
+    };
+    let conv_seq = last_of("agent.conversation.handoff");
+    let note_seq = last_of("agent.lifecycle.handoff");
+    let sentinel = append(&hub, "test.keep", 0);
+
+    // `EventReader::includes` agrees: the committed rows authorize per reader.
+    for (label, seq, want) in
+        [("agent-a", conv_seq, true), ("agent-c", conv_seq, false), ("agent-c", note_seq, false)]
+    {
+        let reader = EventReader::new(hub.state.hub.cfg(), &agent(label));
+        let seen = hub.state.hub.db().read(|c| reader.includes(c, seq)).unwrap();
+        assert_eq!(seen, want, "{label} includes(seq {seq})");
+    }
+
+    // Backfilled streams follow the same rule: the participant gets the
+    // conversation-handoff row, the outsider gets neither restricted row.
+    let open = |token: &str| {
+        let mut req = get("/api/events/stream", None, Some(token));
+        req.headers_mut().insert("last-event-id", "0".parse().unwrap());
+        req
+    };
+    let resp_a = hub.send(open(AGENT_A)).await;
+    let resp_c = hub.send(open(AGENT_C)).await;
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert_eq!(resp_c.status(), StatusCode::OK);
+    let done = move |t: &str| t.contains(&format!("id: {sentinel}\n"));
+    let text_a = read_sse(resp_a, done).await;
+    let text_c = read_sse(resp_c, done).await;
+    assert!(sse_ids(&text_a).contains(&conv_seq), "participant stream: {text_a}");
+    assert!(!sse_ids(&text_a).contains(&note_seq), "participant stream: {text_a}");
+    assert!(!sse_ids(&text_c).contains(&conv_seq), "outsider stream: {text_c}");
+    assert!(!sse_ids(&text_c).contains(&note_seq), "outsider stream: {text_c}");
 }
 
 #[tokio::test]

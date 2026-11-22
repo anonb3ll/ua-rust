@@ -163,8 +163,11 @@ a notes line, `[conversation: <id>] handed off from the agent conversation`;
 handoff reports whether the line is still there (`note_reference`). The
 caller must have sent or received a
 message in the conversation (an operator, a verified human, sees every
-conversation; a profile grants nothing). Linking checks that the task exists
-and that the caller's profile allows `task_update`; creating goes through
+conversation; a profile grants nothing). Linking applies `task_update`'s
+read gate — the profile allow-list and the policy file, with the same
+refusal codes a call would get — before it checks the task exists; the
+`coordination_manage` call itself already passed the registry's policy and
+approval gate. Creating goes through
 the registry as `task_add`, so the caller's profile, the policy file and the
 approval gate apply as they do to a direct call. Creating is idempotent per
 conversation, title, project and priority.

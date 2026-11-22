@@ -128,6 +128,14 @@ pub(crate) const UNCLAIMABLE_LANES: [&str; 1] = ["tracking"];
 pub(crate) const DEFAULT_LEASE_SECONDS: i64 = 3600;
 pub(crate) const MAX_LEASE_SECONDS: i64 = 7 * 86400;
 pub(crate) const PROJECT_SPEC_MARKER: &str = "[project-spec]";
+
+/// ORG-TASK-DEFAULT: the organization every task is in. Tasks carry no
+/// `org_id` yet, so every lookup that starts from a task (its project's
+/// repository binding, its deliverables, authority over it) names this
+/// organization. Every use is a site of the resolver work item in
+/// `docs/organization.md`: when tasks gain `org_id`, each must take the
+/// task's organization instead, in the same change.
+pub(crate) const TASK_ORG: &str = ua_core::DEFAULT_ORG;
 /// Active statuses in rollup order: the first present wins `derived_status`.
 const ROLLUP_ORDER: [&str; 4] = ["blocked", "doing", "waiting_review", "open"];
 

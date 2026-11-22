@@ -31,12 +31,12 @@ use rusqlite::types::Value as Sql;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use ua_core::{DEFAULT_ORG, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_deliverables::{Kind, NewDeliverable, NewRevision, REVISIONS_PER_READ};
 use ua_store::Part;
 
 use crate::families::continuity::{capsule_head, require_writer, review_ready, task_repo, write_capsule};
-use crate::families::tasks::{acting_identity, require_task};
+use crate::families::tasks::{TASK_ORG, acting_identity, require_task};
 use crate::registry::{Registry, ToolCtx, tool};
 
 const FAMILY: &str = "deliverables";
@@ -94,10 +94,6 @@ pub struct ListArgs {
 fn positive(id: i64, field: &str) -> UaResult<i64> {
     if id > 0 { Ok(id) } else { Err(UaError::invalid(format!("{field} must be a positive integer"))) }
 }
-
-/// The organization a task's rows are in. Tasks carry no `org_id` yet, so
-/// every task is in the default organization.
-const TASK_ORG: &str = DEFAULT_ORG;
 
 /// Refuse a caller of an unknown organization, or of another organization
 /// than the task's.

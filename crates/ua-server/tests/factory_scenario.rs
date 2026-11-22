@@ -1527,6 +1527,10 @@ impl View {
 
 /// Fields that change with the clock or with every ledger append (the
 /// caller's own appends included), never with someone else's hidden record.
+/// The chain fields among them (head_ulid, head_hash, total_verified) are
+/// also the owner-accepted integrity exception for task 2775: ledger chain
+/// metadata stays visible to restricted readers so the chain still proves
+/// intact, and the scorecard strips it here rather than scoring it.
 const VOLATILE: [&str; 9] = [
     "generated_at",
     "until",
@@ -1541,7 +1545,9 @@ const VOLATILE: [&str; 9] = [
 
 /// `v` without the [`VOLATILE`] fields, without rows the caller wrote itself
 /// (`originator`, `created_by` or `author` naming it) and without its own
-/// sentinel tasks.
+/// sentinel tasks. Chain metadata on a compared row (seq, prev_hash,
+/// entry_hash) is left in place: it is the owner-accepted integrity
+/// exception for task 2775 and stays identical while the visible rows do.
 fn normalized(v: Value, me: &str) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -1707,6 +1713,30 @@ async fn outsider_view(
         }
     }
     v.surfaces.insert("ledger", normalized(Value::Array(ledger), "builder-3"));
+    v.surfaces.insert(
+        "observability",
+        json!({
+            "activity builder-1": shown(
+                s.call(&me, "observability_manage", json!({ "action": "activity", "params": { "agent": "builder-1" } })).await,
+            ),
+            "activity builder-2": shown(
+                s.call(&me, "observability_manage", json!({ "action": "activity", "params": { "agent": "builder-2" } })).await,
+            ),
+            // Only the per-agent event counts are compared: the rest of the
+            // snapshot (task counts, tool-call totals, db size) is not
+            // visibility-scoped and moves with builder-3's own calls.
+            "metrics": match s.call(&me, "observability_manage", json!({ "action": "metrics", "params": {} })).await
+            {
+                Ok(mut v) => {
+                    if let Some(m) = v["events_last_7_days"].as_object_mut() {
+                        m.remove("builder-3");
+                    }
+                    normalized(v["events_last_7_days"].clone(), "builder-3")
+                }
+                Err(e) => Value::String(format!("refused: {}", reason(&e))),
+            },
+        }),
+    );
     v.surfaces.insert(
         "handoff-note",
         shown(s.act(&me, "session_handoff_recover", json!({ "session_id": hidden_session })).await),
@@ -1884,13 +1914,19 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
     card.check(
         4,
         "isolation.same-org-ledger-read",
-        compared(
-            "ledger",
-            "event_log_query",
-            "Ledger reads (event_log_query) are not scoped per caller: message and handoff events are returned to \
-             every caller whose profile allows ledger reads",
-            "the mailbox and handoff restriction applied to ledger reads",
-        ),
+        match unchanged("ledger").and_then(|()| unchanged("observability")) {
+            Ok(()) => Ok(
+                "event_log_query and observability: builder-3's view is identical before and after the hidden \
+                 records exist"
+                    .to_string(),
+            ),
+            Err(d) => Err(format!(
+                "scored: the mailbox and handoff restriction applied to ledger reads. Ledger reads \
+                 (event_log_query) and observability (agent_activity, metrics_snapshot) are not scoped per \
+                 caller: message and handoff events are returned to every caller whose profile allows them. \
+                 builder-3's ledger/observability view changes once the hidden records exist: {d}"
+            )),
+        },
     );
     card.check(
         4,

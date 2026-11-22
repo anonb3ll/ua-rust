@@ -304,6 +304,82 @@ async fn activity_metrics_and_task_anomalies() {
 }
 
 #[tokio::test]
+async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
+    let hub = mem_hub();
+    let reg = builtin_registry();
+    let (owner, peer, outsider) = (
+        agent("builder-1", Profile::Developer),
+        agent("builder-2", Profile::Developer),
+        agent("builder-3", Profile::Developer),
+    );
+    let task = call(&reg, &hub, &owner, "task_add", json!({ "title": "review" })).await["id"].clone();
+
+    // One row on each restricted channel, all originated by builder-1.
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "message_send",
+        json!({ "act": "request", "to_agent": peer.label, "body": "private", "conversation_id": "conv-1",
+                "task_id": task }),
+    )
+    .await;
+    let sid = call(&reg, &hub, &owner, "session_start", json!({ "kind": "interactive", "task_id": task }))
+        .await["session_id"]
+        .clone();
+    let note = call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "session_handoff_propose",
+                "params": { "session_id": sid, "done": ["a"], "next_steps": ["b"] } }),
+    )
+    .await;
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note["id"] } }),
+    )
+    .await;
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "conversation_handoff", "params": { "conversation_id": "conv-1", "task_id": task } }),
+    )
+    .await;
+
+    let restricted = ["message", "lifecycle", "conversation"];
+    let kinds = |v: &Value| -> Vec<String> {
+        v["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect()
+    };
+    let activity = json!({ "action": "activity", "params": { "agent": "builder-1" } });
+    let metrics = json!({ "action": "metrics", "params": {} });
+
+    // The outsider's activity and metrics carry none of the restricted rows.
+    let out = call(&reg, &hub, &outsider, "observability_manage", activity.clone()).await;
+    assert!(kinds(&out).iter().all(|k| !restricted.contains(&k.as_str())), "{out}");
+    let out_metrics = call(&reg, &hub, &outsider, "observability_manage", metrics.clone()).await;
+    let out_b1 = &out_metrics["events_last_7_days"]["builder-1"];
+    assert!(restricted.iter().all(|k| out_b1.get(*k).is_none()), "{out_b1}");
+
+    // A party to the rows sees them in both views.
+    let own = call(&reg, &hub, &owner, "observability_manage", activity).await;
+    for k in restricted {
+        assert!(kinds(&own).iter().any(|x| x == k), "{k} missing for the party: {own}");
+    }
+    let own_metrics = call(&reg, &hub, &owner, "observability_manage", metrics).await;
+    let own_b1 = &own_metrics["events_last_7_days"]["builder-1"];
+    for k in restricted {
+        assert!(own_b1[k].as_i64().unwrap_or(0) >= 1, "{k} missing for the party: {own_b1}");
+    }
+}
+
+#[tokio::test]
 async fn remote_assistant_reaches_only_its_actions() {
     let hub = mem_hub();
     let reg = builtin_registry();
