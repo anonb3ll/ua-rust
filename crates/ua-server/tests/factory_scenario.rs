@@ -1527,8 +1527,9 @@ impl View {
 
 /// Fields that change with the clock or with every ledger append (the
 /// caller's own appends included), never with someone else's hidden record.
-const VOLATILE: [&str; 8] = [
+const VOLATILE: [&str; 9] = [
     "generated_at",
+    "until",
     "head_hash",
     "head_ulid",
     "total_verified",
