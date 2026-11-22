@@ -20,17 +20,19 @@
 //!
 //! An `sdk.` evidence event's payload is client-written: its read carries a
 //! `trust` label marking it untrusted.
+//! Message events use the same mailbox visibility as the ledger query.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
+use super::events::{EventReader, VISIBLE_MESSAGE};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::injection;
 use super::memory::mark_untrusted;
@@ -637,14 +639,13 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             }
         }
         "evidence_event" => {
-            let row = c
-                .query_row(
-                    "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
-                     prev_hash, entry_hash FROM event_log WHERE ulid = ?1",
-                    [id],
-                    row_map,
-                )
-                .optional()?;
+            let reader = EventReader::new(hub.cfg(), caller);
+            let sql = format!(
+                "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
+                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_MESSAGE})"
+            );
+            let bindings = std::iter::once(&id as &dyn ToSql).chain(reader.bindings());
+            let row = c.query_row(&sql, params_from_iter(bindings), row_map).optional()?;
             row.map(|mut r| {
                 let parsed = r.get("payload").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok());
                 r.insert("payload_parsed".into(), parsed.unwrap_or(Value::Null));

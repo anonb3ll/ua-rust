@@ -85,6 +85,41 @@ fn exec(hub: &Hub, sql: &str) {
 }
 
 #[tokio::test]
+async fn an_evidence_object_follows_the_message_row_visibility_rule() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let sent = call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": recipient.label, "body": "Build update" }),
+    )
+    .await;
+    let args = json!({ "kind": "evidence_event", "id": sent["event_ulid"] });
+
+    let hidden = reg.call(&hub, &observer, "platform_object_get", args.clone()).await.unwrap_err();
+    assert_eq!(hidden.code(), "not_found");
+    let absent = reg
+        .call(
+            &hub,
+            &observer,
+            "platform_object_get",
+            json!({ "kind": "evidence_event", "id": "00000000000000000000000000" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(absent.code(), hidden.code());
+
+    for viewer in [&sender, &recipient] {
+        let found = call(&reg, &hub, viewer, "platform_object_get", args.clone()).await;
+        assert_eq!(found["evidence_event"]["ulid"], sent["event_ulid"]);
+        assert_eq!(found["evidence_event"]["payload_parsed"]["body"], "Build update");
+    }
+}
+
+#[tokio::test]
 async fn evidence_uses_only_visible_messages_for_events_and_agent_attribution() {
     let hub = hub();
     let reg = builtin_registry();
