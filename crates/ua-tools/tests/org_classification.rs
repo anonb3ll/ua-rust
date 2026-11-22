@@ -151,8 +151,10 @@ const TENANT: &[&str] = &[
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
 /// Today that is every tenant table except `inbound_deliveries` (born with
 /// its `org_id`), `deliverables` and `deliverable_revisions` (born with their
-/// `org_id`), `code_symbols`, the two graph canvas tables, and
-/// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`):
+/// `org_id`), `code_symbols`, the two graph canvas tables,
+/// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`), and
+/// the three skill registry tables (`skill_registry.v2.tenant_keys`,
+/// `organization.v1.tools.skills`):
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
@@ -202,9 +204,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "session_profiles",
     "session_wake",
     "session_wake_offers",
-    "skill_assignments",
-    "skill_publish_staging",
-    "skill_versions",
     "task_checks",
     "task_comment_threads",
     "task_comments",
