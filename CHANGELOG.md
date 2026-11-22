@@ -367,6 +367,26 @@ from its commit history.
     arrives;
   - a network failure's detail is `ua_ingress`'s message rather than the
     HTTP library's error chain (it never quotes the URL).
+- The Obsidian tools (`obsidian_status`, `obsidian_open`,
+  `obsidian_active_note`, `obsidian_search`, `obsidian_append`) now go
+  through `ua_ingress::Outbound` under `obsidian.local_rest`. The URL check
+  (`obsidian_url`), http or https, the bearer key, 20 seconds, the 412
+  conflict and the error prefix `Obsidian request failed:` are as before,
+  and TLS certificates are still not verified (the plugin's certificate is
+  self-signed): `Policy::accept_invalid_certs` exists for this one policy
+  and is refused on any policy that is not loopback-only (new class
+  `LoopbackOnly`) or that follows redirects. Stricter:
+  - every address a connection reaches must be loopback, checked when it is
+    made and again on its peer (before, only the configured URL's host was
+    checked, so `localhost` resolving elsewhere was followed);
+  - redirects are not followed (up to ten were, with the key dropped only
+    on a host change); a 3xx now reads `HTTP 3xx` as any other non-success;
+  - proxy environment variables are ignored (they were honoured, so the key
+    could travel through a proxy);
+  - a reply larger than 16 MiB is refused (there was no cap); from
+    `obsidian_append`, whose patch has already been applied, such a reply
+    reads as `response: null` instead;
+  - replies are decoded as UTF-8 (lossy) whatever charset they declare.
 
 ### Security
 

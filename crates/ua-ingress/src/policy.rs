@@ -51,21 +51,31 @@ pub enum Addresses {
     /// A policy with this class follows no redirect ([`Policy::validate`]):
     /// a redirect target is chosen by the server, not by the operator.
     OperatorConfigured,
+    /// Loopback only (IPv4, IPv6 or IPv4-mapped): a service on this host.
+    LoopbackOnly,
 }
 
 impl Addresses {
     /// The address class this rule is built on.
     pub fn class(self) -> addr::Class {
         match self {
-            Addresses::Public | Addresses::PublicOrLoopback | Addresses::OperatorConfigured => {
-                addr::Class::Public
-            }
+            Addresses::Public
+            | Addresses::PublicOrLoopback
+            | Addresses::OperatorConfigured
+            | Addresses::LoopbackOnly => addr::Class::Public,
             Addresses::GlobalUnicastOnly => addr::Class::GlobalUnicastOnly,
         }
     }
 
     /// `Err` with the reason when a connection to `ip` is not allowed.
     pub fn check(self, ip: IpAddr) -> Result<(), &'static str> {
+        if self == Addresses::LoopbackOnly {
+            return if addr::is_loopback(ip) {
+                Ok(())
+            } else {
+                Err(addr::non_public_reason(ip).unwrap_or("not loopback"))
+            };
+        }
         match addr::reason_in(ip, self.class()) {
             None => Ok(()),
             Some(_) if self == Addresses::PublicOrLoopback && addr::is_loopback(ip) => Ok(()),
@@ -96,6 +106,10 @@ pub struct Policy {
     pub max_redirects: u8,
     /// Follow a redirect from https to http. Only `WEB_PAGE` does.
     pub allow_scheme_downgrade: bool,
+    /// Accept any TLS certificate (self-signed, expired, another name). Only
+    /// with [`Addresses::LoopbackOnly`] ([`Policy::validate`]); only
+    /// `OBSIDIAN_LOCAL` sets it.
+    pub accept_invalid_certs: bool,
     /// Largest response body any read path returns.
     pub max_body_bytes: usize,
     pub connect_timeout: Duration,
@@ -116,6 +130,7 @@ pub const SLACK_RESPONSE_URL: Policy = Policy {
     addresses: Addresses::Public,
     max_redirects: 0,
     allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
     max_body_bytes: 64 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),
@@ -133,6 +148,7 @@ pub const SLACK_WEB_API: Policy = Policy {
     addresses: Addresses::Public,
     max_redirects: 0,
     allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
     max_body_bytes: 16 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(15),
@@ -151,6 +167,7 @@ pub const WEB_PAGE: Policy = Policy {
     addresses: Addresses::Public,
     max_redirects: 5,
     allow_scheme_downgrade: true,
+    accept_invalid_certs: false,
     max_body_bytes: 2 * 1024 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(20),
@@ -173,6 +190,7 @@ pub const ZULIP_API: Policy = Policy {
     addresses: Addresses::Public,
     max_redirects: 0,
     allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
     max_body_bytes: 4 * 1024 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(20),
@@ -195,6 +213,7 @@ pub const GITHUB_REST: Policy = Policy {
     addresses: Addresses::Public,
     max_redirects: 0,
     allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
     max_body_bytes: 8 * 1024 * 1024,
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(20),
@@ -211,6 +230,26 @@ pub const GITHUB_ENTERPRISE: Policy = Policy {
     ..GITHUB_REST
 };
 
+/// The Obsidian Local REST API plugin on this host (`obsidian_api_url`):
+/// http or https, loopback only, no redirects, a 16 MiB body, 20 seconds
+/// for everything. The plugin serves https with a self-signed certificate,
+/// so certificates are not verified; that is allowed only because every
+/// address this policy reaches is loopback.
+pub const OBSIDIAN_LOCAL: Policy = Policy {
+    name: "obsidian.local_rest",
+    schemes: Schemes::HttpOrHttps,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::LoopbackOnly,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    accept_invalid_certs: true,
+    max_body_bytes: 16 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(20),
+    request_timeout: Duration::from_secs(20),
+    total_timeout: Duration::from_secs(20),
+};
+
 /// Every named policy.
 pub const POLICIES: &[&Policy] = &[
     &SLACK_RESPONSE_URL,
@@ -221,6 +260,7 @@ pub const POLICIES: &[&Policy] = &[
     &RELAY_GITHUB,
     &GITHUB_REST,
     &GITHUB_ENTERPRISE,
+    &OBSIDIAN_LOCAL,
 ];
 
 /// The policy called `name`. An unknown name is refused.
@@ -237,12 +277,14 @@ impl Policy {
     /// The policy under a loopback test hook (`fetch_allow_loopback`, the
     /// Slack test API base): loopback admitted besides public addresses,
     /// plain http allowed, any host and port. A class that already admits
-    /// loopback ([`Addresses::OperatorConfigured`]) is kept as it is.
+    /// loopback ([`Addresses::OperatorConfigured`], [`Addresses::LoopbackOnly`])
+    /// is kept as it is.
     /// Everything else is unchanged. Only test configuration reaches this;
     /// TOML and the environment cannot set those hooks.
     pub const fn loopback_test_hook(self) -> Policy {
         let addresses = match self.addresses {
             Addresses::OperatorConfigured => Addresses::OperatorConfigured,
+            Addresses::LoopbackOnly => Addresses::LoopbackOnly,
             _ => Addresses::PublicOrLoopback,
         };
         Policy {
@@ -273,6 +315,10 @@ impl Policy {
         }
         if self.addresses == Addresses::OperatorConfigured && self.max_redirects > 0 {
             return bad("an operator-configured destination follows no redirect");
+        }
+        if self.accept_invalid_certs && (self.addresses != Addresses::LoopbackOnly || self.max_redirects > 0)
+        {
+            return bad("certificates may go unverified only for loopback, without redirects");
         }
         if let Hosts::Exactly(names) = self.hosts
             && (names.is_empty() || names.iter().any(|n| n.is_empty()))
@@ -360,6 +406,9 @@ mod tests {
             Policy { hosts: Hosts::Exactly(&[]), ..base },
             Policy { hosts: Hosts::Exactly(&[""]), ..base },
             Policy { max_redirects: 1, ..GITHUB_ENTERPRISE },
+            Policy { accept_invalid_certs: true, ..base },
+            Policy { accept_invalid_certs: true, addresses: Addresses::PublicOrLoopback, ..OBSIDIAN_LOCAL },
+            Policy { max_redirects: 1, ..OBSIDIAN_LOCAL },
         ] {
             assert!(matches!(bad.validate(), Err(OutboundError::InvalidPolicy { .. })), "{bad:?}");
         }
@@ -434,6 +483,28 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(users, ["github.enterprise"]);
+    }
+
+    #[test]
+    fn the_obsidian_policy_is_loopback_only() {
+        let p = OBSIDIAN_LOCAL;
+        for ok in [
+            "https://127.0.0.1:27124/",
+            "http://127.0.0.1:27123/",
+            "https://[::1]:27124/",
+            "https://localhost:27124/",
+        ] {
+            assert!(p.check_url(&url(ok)).is_ok(), "{ok}");
+        }
+        for bad in ["https://10.0.0.1:27124/", "https://93.184.215.14/", "https://[fd00::1]/"] {
+            assert!(matches!(p.check_url(&url(bad)), Err(OutboundError::AddressRefused { .. })), "{bad}");
+        }
+        assert_eq!(Addresses::LoopbackOnly.check("8.8.8.8".parse().unwrap()), Err("not loopback"));
+        assert_eq!(Addresses::LoopbackOnly.check("10.0.0.1".parse().unwrap()), Err("private"));
+        // The test hook does not widen it, and unverified TLS appears nowhere else.
+        assert_eq!(p.loopback_test_hook().addresses, Addresses::LoopbackOnly);
+        let lax: Vec<&str> = POLICIES.iter().filter(|p| p.accept_invalid_certs).map(|p| p.name).collect();
+        assert_eq!(lax, ["obsidian.local_rest"]);
     }
 
     #[test]

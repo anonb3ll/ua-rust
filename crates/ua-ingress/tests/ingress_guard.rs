@@ -70,9 +70,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // bind or host checks in `observability.rs` (2) and `vault/obsidian.rs`
     // (1).
     ("ua-tools", "inline_address_check", 11),
-    // `mcp::gateway`, `notify`, `vault::obsidian` (`web::http_client` and
-    // `github::client` are gone: their consumers use `Outbound`).
-    ("ua-tools", "client_builder", 3),
+    // `mcp::gateway`, `notify` (`web::http_client`, `github::client` and
+    // `vault::obsidian` are gone: their consumers use `Outbound`).
+    ("ua-tools", "client_builder", 2),
     // `github_deliveries`, `github_delivery_bodies` (github/mod.rs) and
     // `slack_seen_signatures`, `slack_seen_deliveries` (slack.rs).
     ("ua-tools", "delivery_table", 4),
@@ -494,11 +494,14 @@ fn drift_is_reported_both_ways() {
 /// outside `ua-ingress` that may name each (by constant or by name).
 /// `github.enterprise` admits private networks for the operator's
 /// `github_api_url`; never for a URL a caller supplies.
-const EXCEPTION_POLICIES: &[(&str, &str, &str)] =
-    &[("GITHUB_ENTERPRISE", "\"github.enterprise\"", "ua-tools/src/families/github/client.rs")];
+/// `obsidian.local_rest` accepts any TLS certificate, on loopback only.
+const EXCEPTION_POLICIES: &[(&str, &str, &str)] = &[
+    ("GITHUB_ENTERPRISE", "\"github.enterprise\"", "ua-tools/src/families/github/client.rs"),
+    ("OBSIDIAN_LOCAL", "\"obsidian.local_rest\"", "ua-tools/src/families/vault/obsidian.rs"),
+];
 
 /// Relaxations that only `ua-ingress` itself may write.
-const RELAXATIONS: &[&str] = &["OperatorConfigured"];
+const RELAXATIONS: &[&str] = &["OperatorConfigured", "accept_invalid_certs"];
 
 #[test]
 fn relaxed_policies_stay_with_their_one_consumer() {
