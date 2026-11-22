@@ -274,40 +274,40 @@ redelivers stale rows processes the next copy anyway.
   deliveries as stale, so with `Stale::Redeliver` a delivery can be handled
   by both, and the sweep of either abandons the other's work in progress.
   This is enforced: `ua serve` holds `<db>.serve.lock` exclusively for its
-  whole life and a second `ua serve` on the same database (same file, links
-  resolved) is refused before it opens the database or binds a port
-  (`docs/operations.md`, section 5). What remains: the lock is advisory and
-  taken by the `ua` command, so a program that embeds `ua-server` and calls
-  `serve_http` without taking `ua_import::ServeLock` is not covered, and on
-  a platform without `flock` (not Unix) nothing is locked. Two hosts that
-  share one database file over a network file system are covered only if
-  that file system honours `flock` across hosts; do not do that.
+  whole life and a second `ua serve` on the same database (the same file,
+  every symbolic link followed, dangling ones included) is refused before
+  it opens the database or binds a port (`docs/operations.md`, section 5).
+  What remains: the lock is advisory and taken by the `ua` command, so a
+  program that embeds `ua-server` and calls `serve_http` without taking
+  `ua_import::ServeLock` is not covered; two hard links to one database
+  file are two databases to the lock (never use a database through two
+  hard links; SQLite's WAL files are per name); on a platform without
+  `flock` (not Unix) nothing is locked; and two hosts that share one
+  database file over a network file system are covered only if that file
+  system honours `flock` across hosts; do not do that.
 - **The clock.** Staleness is judged against the wall clock. A forward
   step past the in-flight bound (15 minutes for GitHub) makes this
   process's own in-flight deliveries stale, with the same effect as a
   second process for the deliveries in flight at that moment. A backward
   step only makes rows look younger, so they stay duplicates longer.
-- **Downgrading.** A build that does not know these parts refuses the
-  database: opening the store compares the parts recorded in
-  `schema_parts` with every part name the build knows (optional and
-  feature-gated ones included) and refuses, before applying anything,
-  when one is unknown, naming it (`docs/operations.md`, "Older builds and
-  a newer database"). `ua serve`, `ua mcp`, `ua call` and the other
-  commands that open the hub refuse; `ua doctor` and `ua backup` run. That
-  matters because an older binary reads only the old GitHub and Slack
-  tables, which stopped being written at the cut-over: it would accept
-  again a copy of any GitHub delivery handled since the upgrade (within its
-  30-day retention and the payload-timestamp window) and, for about a day
-  (the delivery-id retention), run again a Slack retry of a command the
-  newer build already ran; Slack commands are not idempotent. The
-  override (`--allow-newer-schema` or `UA_ALLOW_NEWER_SCHEMA=1`) opens the
-  database anyway, logged at every open, and reopens exactly that window.
-  **What remains:** the fence stops only builds that contain it. A build
-  from before it (any build of `main` from the inbound table up to this
-  change; no version has been released) still opens an upgraded database
-  and ignores the parts it does not know. Do not run such a build against
-  a database a newer build has opened; restore a backup taken before the
-  upgrade instead.
+- **Downgrading.** Nothing refuses the dangerous downgrade. A build from
+  before these parts reads only the old GitHub and Slack tables, which
+  stopped being written at the cut-over: it accepts again a copy of any
+  GitHub delivery handled since the upgrade (within its 30-day retention
+  and the payload-timestamp window) and, for about a day (the delivery-id
+  retention), runs again a Slack retry of a command the newer build already
+  ran; Slack commands are not idempotent. Every such build also predates
+  the unknown-part fence (`docs/operations.md`, "Older builds and a newer
+  database"), so it opens the database and ignores the parts it does not
+  know. The fence protects only from this change on: a build that has it
+  refuses a database that records parts added after it, and `ua serve`
+  refuses such a database even under the recovery override, so a later
+  change to inbound storage is covered. **What remains:** a build from
+  before this change (every build before the inbound table included; no
+  version has been released) is refused by nothing. Never run a build older
+  than this change against a database a newer build has opened, and do not
+  downgrade past the inbound table while either endpoint takes traffic;
+  restore a backup taken before the upgrade instead.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from

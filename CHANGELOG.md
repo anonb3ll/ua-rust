@@ -274,28 +274,47 @@ from its commit history.
 - An unknown schema part refuses to open the database. Opening the store
   compares the parts recorded in `schema_parts` with every part name the
   build knows (optional and feature-gated parts included, so a lean build
-  of the same version is not refused) and, before applying anything,
-  refuses a database a newer build wrote, naming the unknown parts and
-  saying to run the newer build or restore a backup taken before the
-  upgrade. `ua serve`, `ua mcp`, `ua call` and the other commands that
-  open the hub refuse; `ua doctor` (whose `schema` check now fails on
-  `extra` parts), `ua backup` and `ua restore` run. `--allow-newer-schema`
-  or `UA_ALLOW_NEWER_SCHEMA=1` opens it anyway for recovery, logged at
-  every open; for the inbound-delivery table that reopens a replay window.
-  `system_doctor` reports such a hub as degraded. The fence stops only
-  builds that contain it: a build from before this change still opens an
-  upgraded database, so do not run one against a database a newer build
-  has opened; restore a pre-upgrade backup instead (`docs/operations.md`,
-  "Older builds and a newer database").
+  of the same version is not refused) and, inside the first migration
+  transaction before anything is applied, refuses a database a newer build
+  wrote, naming the unknown parts and saying to run the newer build or
+  restore a backup taken before the upgrade. `ua serve`, `ua mcp`,
+  `ua call`, `ua init` (when it mints a token), `ua import` and the other
+  commands that open the hub refuse; `ua doctor`, `ua backup` and
+  `ua restore` run. `--allow-newer-schema` or `UA_ALLOW_NEWER_SCHEMA=1` (the
+  real environment only; a `.env` file cannot set it) opens it anyway for
+  recovery, logged at every open, but `ua serve` refuses such a database
+  even then. `system_doctor` reports a hub under the override as degraded.
+  A checked-in list of every shipped part name is pinned by a test: part
+  names are never retired or renamed. The fence protects only from this
+  change on, against parts added later: every earlier build (every build
+  from before the inbound-delivery table included) still opens an upgraded
+  database and is refused by nothing, so never run a build older than this
+  change against a database a newer build has opened; restore a
+  pre-upgrade backup instead (`docs/operations.md`, "Older builds and a
+  newer database").
+- `ua doctor`: the `schema` check fails, where it warned, when the database
+  records parts this build does not know, and leads with that explanation
+  before any object findings. A plain `ua doctor` (without `--strict`) now
+  exits non-zero on such a database.
 - A second `ua serve` on the same database is refused. `ua serve` holds a
-  serve-only lock (`<db>.serve.lock`, next to the database, links
-  resolved) exclusively for the life of the process, beside the shared hub
-  lock; a second one exits before it opens the database or binds a port,
-  with an error naming the database and saying another `ua serve` holds
-  it. The OS releases the lock when the process exits or crashes. `ua mcp`,
-  `ua call`, backups and the other commands are unaffected; `ua restore` and
-  `ua import` still refuse while a serve runs (`docs/operations.md`,
-  section 5).
+  serve-only lock (`<db>.serve.lock`, owner-only, next to the database)
+  exclusively for the life of the process, beside the shared hub lock; a
+  second one exits before it opens the database or binds a port, with an
+  error naming the database and saying another `ua serve` holds it. The OS
+  releases the lock when the process exits or crashes. "The same database"
+  is the file SQLite opens, with every symbolic link followed (dangling
+  ones included) and `.`/`..` resolved; hard links are not covered. On a
+  platform without `flock` nothing is locked and a warning says so.
+  `ua mcp`, `ua call`, backups and the other commands are unaffected;
+  `ua restore` and `ua import` still refuse while a serve runs
+  (`docs/operations.md`, section 5).
+- The shared hub lock (`<db>.hub.lock`) now uses the same path resolution
+  and is created owner-only, so an import or restore that reaches the
+  database by another spelling refuses beside a running hub. For a
+  database reached through a link or an unusual spelling, a process from
+  before this change and one from after it use different hub-lock files
+  during the transition: stop every old process before an import or
+  restore.
 
 - GitHub webhook: a delivery that the hub recorded but never finished
   handling (it stopped in between, or the delivery has been in flight for
@@ -310,8 +329,8 @@ from its commit history.
   no body) under the organization it swept; a sweep covers one
   organization. Downgrading past this change reopens a replay window for
   deliveries handled since, because an older binary reads only the old
-  GitHub tables; builds with the unknown-part fence (below) refuse such a
-  database, builds before it do not (`docs/ingress.md`, Limits).
+  GitHub tables, and nothing refuses it: every such build predates the
+  unknown-part fence (`docs/ingress.md`, Limits).
 
 - Operator authority is a verified caller of kind human, nothing else.
   Dispatch and governance agree on it: acting for another agent in dispatch,

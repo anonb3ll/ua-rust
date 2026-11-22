@@ -61,7 +61,7 @@ Checks performed:
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
-9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, objects using the reserved `sqlite_` name prefix, unexpected tables with foreign keys into known tables, or unowned objects without an `extra` part fail; `extra` parts, which mean a newer build wrote the database and the serving and writing commands refuse it (see [Older builds and a newer database](#older-builds-and-a-newer-database)), fail; `missing` parts warn). Only SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and automatic indexes are exempt from the comparison.
+9. `schema`: shares `check_schema_compatibility` with `system_doctor`—compares `schema_parts` checksums and all `sqlite_master` tables, views, indexes, and triggers against the running build (`drifted`, missing/altered objects, unexpected triggers on known tables, objects using the reserved `sqlite_` name prefix, unexpected tables with foreign keys into known tables, or unowned objects without an `extra` part fail; `extra` parts, which mean a newer build wrote the database and the serving and writing commands refuse it (see [Older builds and a newer database](#older-builds-and-a-newer-database)), fail and are reported first, before any object findings a newer part may explain; `missing` parts warn). **Exit-code change:** `extra` parts used to warn, so a plain `ua doctor` (without `--strict`) now exits non-zero on a database a newer build wrote. Only SQLite's own `sqlite_sequence`, `sqlite_stat1`, `sqlite_stat4`, and automatic indexes are exempt from the comparison.
 10. `ledger`: verifies the tamper-evident `event_log` hash chain cleanly (`ledger::verify`).
 11. `pre_restore_backups`: warns when leftover `*.pre-restore-*.bak*` recovery files remain in `$UA_HOME` so they can be pruned once verified.
 12. `restore_staging`: warns when leftover `.ua.db.restore.*.d` rollback directories remain (indicating a failed rollback requiring inspection).
@@ -177,15 +177,27 @@ Key restore safeguards:
 
 ### Older builds and a newer database
 
-A build refuses to open, for serving or writing, a database that records in
-`schema_parts` a part this build does not know: one a newer build applied.
-"Knows" means the full list of part names for this version
-(`ua_tools::known_schema_part_names`: the parts every open applies plus the
-optional ones), so a lean build (`--no-default-features`) opening a
-database a full build of the same version made is not refused. The check
-runs when the store opens, before any part is applied, so a refused open
-writes nothing. The refusal names the unknown parts, says a newer build
-wrote the database and what to do:
+A build refuses to open a database that records in `schema_parts` a part
+this build does not know: one a newer build applied. "Knows" means the full
+list of part names for this version (`ua_tools::known_schema_part_names`:
+the parts every open applies plus the optional ones), so a lean build
+(`--no-default-features`) opening a database a full build of the same
+version made is not refused. A checked-in list of every part name ever
+shipped (`crates/ua-tools/tests/fixtures/schema_part_names.txt`) and a test
+that runs in both configurations keep it that way: a part name is never
+retired or renamed, because the build that stopped knowing it would refuse
+every database an earlier build made.
+
+The check runs when the store opens, inside the first `BEGIN IMMEDIATE`
+transaction of the migration, before the tracking table is created or any
+part is applied: no other process can record a part between the check and
+the apply, and a refused open applies nothing. (The connection setup before
+it sets `journal_mode = WAL`, which converts a database file not yet in WAL
+mode; every database `ua` creates already is.) A process that is already
+running is not re-checked: an older-build `ua mcp` session started before
+the upgrade keeps writing until it exits, so stop every hub process before
+upgrading. The refusal names the unknown parts, says a newer build wrote
+the database and what to do:
 
 ```text
 Error: the database /path/to/ua.db was written by a newer build: it records schema parts this build does not know ([future.v9]). This build refuses to open it for serving or writing, ...
@@ -193,26 +205,37 @@ Error: the database /path/to/ua.db was written by a newer build: it records sche
 
 On a refused database:
 
-| Refuses | Runs |
-|---|---|
-| `ua serve`, `ua mcp`, `ua call`, `ua tools`, `ua token`, `ua login-link`, `ua init` (when it opens the hub), `ua import` | `ua doctor` (read-only; its `schema` check fails with `extra=[...]`), `ua backup` (a read-only snapshot), `ua restore` (see below), `ua config` |
+| Command | Without the override | With the override |
+|---|---|---|
+| `ua serve` | refuses | **refuses** (see below) |
+| `ua mcp`, `ua call`, `ua tools`, `ua token`, `ua login-link`, `ua init` (when it mints a token), `ua import` | refuse | run, with a warning at every open |
+| `ua doctor` | runs (read-only; its `schema` check fails with `extra=[...]`) | the same |
+| `ua backup` | runs (a read-only snapshot) | the same |
+| `ua restore` | runs (see below) | the same |
+| `ua config` | runs (does not open the database) | the same |
 
 What to do: run the newer build (or a later one) again. If you must go
 back, restore a backup taken before the upgrade with `ua restore` (losing
 the writes made since); an older build then opens it.
 
 **Override, for recovery only.** `--allow-newer-schema` (a global flag) or
-`UA_ALLOW_NEWER_SCHEMA=1` opens the database anyway, ignoring the unknown
-parts, as builds before the fence did. Every open under it logs a warning
-naming the parts (`OPENING A DATABASE WRITTEN BY A NEWER BUILD`), and a
-warning when it is set with nothing to ignore. `UA_ALLOW_NEWER_SCHEMA`
+`UA_ALLOW_NEWER_SCHEMA=1` in the process environment opens the database
+anyway, ignoring the unknown parts, as builds before the fence did. A `.env`
+file cannot switch it on: the variable is read before `ua` loads `.env`, and
+a value that only a `.env` file sets is ignored. `UA_ALLOW_NEWER_SCHEMA`
 takes `1`/`true`/`yes` or `0`/`false`/`no`; any other value is refused.
-The risk is whatever the newer parts changed. For the inbound-delivery
-table (`docs/ingress.md`, Limits) it is a replay window: the older build
-reads only the old delivery tables, so copies of GitHub deliveries handled
-since the upgrade are accepted again (within 30 days), and a Slack retry of
-a command the newer build already ran is run again (within about a day).
-Use the override to inspect or export, not to serve traffic.
+Every open under it logs a warning naming the parts (`OPENING A DATABASE
+WRITTEN BY A NEWER BUILD`), and a warning when it is set with nothing to
+ignore. The risk is whatever the newer parts changed. For the
+inbound-delivery table (`docs/ingress.md`, Limits) it would be a replay
+window: a build that reads only the old delivery tables accepts again
+copies of GitHub deliveries handled since the upgrade (within 30 days),
+and runs again a Slack retry of a command the newer build already ran
+(within about a day). That is why **`ua serve` refuses a database written
+by a newer build even with the override**, naming the unknown parts and
+saying why; only `ua serve` takes GitHub and Slack deliveries. Use the
+override to inspect, export or repair through `ua call`, `ua tools` or
+`ua mcp`, and `ua backup` (which needs no override).
 
 It is the same rule `ua restore` applies to a backup: a backup with parts
 this build does not know is refused without `--allow-newer`. Restoring
@@ -221,14 +244,18 @@ refuses it until the override is set: each step asks for its own consent.
 The ledger's `hash_v` rollback fence (`docs/organization.md`) is separate
 and not lifted by the override.
 
-**What the fence cannot stop:** it works only in builds that contain it. A
-build from before it still opens an upgraded database and ignores the parts
-it does not know (no version has been released; on `main`, that is every
-build before this change). Do not run a build older than this change
-against a database a newer build has opened; restore a pre-upgrade backup
-instead. Because any new part name refuses every build that has the fence,
-a later change that must stop older builds without changing the schema can
-ship an empty marker part; no separate minimum-reader record is needed.
+**What the fence cannot stop.** It works only in builds that contain it,
+and it refuses only parts added after it. Every build from before this
+change opens an upgraded database and ignores the parts it does not know.
+That includes every build from before the inbound-delivery table
+(`ingress.inbound.v1`), the downgrade `docs/ingress.md` warns about: such a
+build reads only the old delivery tables, and nothing refuses it. No
+version has been released; on `main`, that is every build before this
+change. Never run a build older than this change against a database a
+newer build has opened; restore a backup taken before the upgrade instead.
+Because any new part name refuses every build that has the fence, a later
+change that must stop older builds without changing the schema can ship an
+empty marker part; no separate minimum-reader record is needed.
 
 ## 5. Graceful shutdown & process managers
 
@@ -236,27 +263,47 @@ ship an empty marker part; no separate minimum-reader record is needed.
 
 `ua serve` takes a second lock beside the shared hub lock: `<db>.serve.lock`
 (`ua.db.serve.lock` by default), next to the database file, held exclusively
-for the life of the process. "The same database" means the same file after
-symbolic links and `..` are resolved, so two configurations that reach one
-`ua.db` by different paths still meet on one lock. A second `ua serve` on that
-database exits at once, before it opens the database, binds its port or
-touches any inbound-delivery state, with:
+for the life of the process. A second `ua serve` on that database exits at
+once, before it opens the database, binds its port or touches any
+inbound-delivery state, with:
 
 ```text
 Error: another `ua serve` holds the database /path/to/ua.db: a second `ua serve` on the same database is refused (two would each take the other's in-flight inbound deliveries for stale ones). Stop the running `ua serve` first, or point this one at a different database
 ```
 
-The operating system releases the lock when the process exits, a crash or
-`SIGKILL` included, so there is no lock file to clean up: the file stays and
-is harmless. Only `ua serve` takes this lock. `ua mcp`, `ua call`, `ua tools`,
-`ua token`, `ua backup` and `ua doctor` run beside a serving hub as before.
-`ua restore` and `ua import` still refuse while it runs, on the shared hub
-lock (they take it exclusively). A process manager that starts a new `ua serve`
-before the old one has finished draining sees the refusal until the old one
-exits; stop, then start (systemd and the compose file already do), and do not
-run two containers or units on one data volume.
+"The same database" is the file SQLite opens: the configured path made
+absolute, with every symbolic link followed (a chain, a relative target, and
+a link whose target does not exist yet, so a database not created yet behind
+a link meets the same lock as the created one) and `.` and `..` resolved.
+Every spelling of one database file gives one lock file. Hard links are not
+resolved: two hard links to one file are two databases to the lock. Do not
+reach a database through two hard links at all; SQLite's `-wal` and `-shm`
+files are per name, so that is unsafe without any `ua` involved.
 
-The lock is taken by the `ua` command. A program that embeds `ua-server` and
+The shared hub lock (`<db>.hub.lock`) uses the same resolution, so a
+`ua restore` or `ua import` that reaches the database by another spelling
+still refuses while a serve (or any other hub process) runs. **Upgrade
+note:** builds before this change put the hub lock beside the path as
+written. For a database reached through a link or an unusual spelling, a
+process from before the change and one from after it use different
+hub-lock files during the transition, so stop every old process before
+running an import or restore with the new build.
+
+Both lock files are created owner-only (`0600`), so another local account
+cannot hold them. The operating system releases a lock when the process
+exits, a crash or `SIGKILL` included, so there is nothing to clean up: the
+file stays and is harmless. Only `ua serve` takes the serve lock. `ua mcp`,
+`ua call`, `ua tools`, `ua token`, `ua backup` and `ua doctor` run beside a
+serving hub as before. `ua restore` and `ua import` still refuse while it
+runs, on the shared hub lock (they take it exclusively). A process manager
+that starts a new `ua serve` before the old one has finished draining sees
+the refusal until the old one exits; stop, then start (systemd and the
+compose file already do), and do not run two containers or units on one
+data volume.
+
+On a platform without `flock` (not Unix) nothing is locked: a second
+`ua serve` is NOT refused there, and `ua` prints a warning saying so. The
+lock is taken by the `ua` command. A program that embeds `ua-server` and
 calls `serve_http` itself must take `ua_import::ServeLock` first.
 
 ### Shutdown
