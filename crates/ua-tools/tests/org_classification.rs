@@ -22,17 +22,33 @@
 //! table is in; the design's table is kept in step with it.
 //!
 //! `TENANT_MISSING_ORG_ID` is a temporary relaxation of the design, which
-//! requires the tenant check for every tenant table: no tenant table carries
-//! `org_id` yet. Each `organization.v1.<crate>` part removes its tables from
-//! the list, and the list may only shrink. A new tenant table gets its
+//! requires the tenant check for every tenant table: most tenant tables do not
+//! carry `org_id` yet. Each family's part (`organization.v1.<crate>.<family>`;
+//! one per family, because a generated part's checksum covers its table list,
+//! so a released part can never take another family's tables) removes its
+//! tables from the list, and the list may only shrink. A new tenant table gets its
 //! `org_id` and triggers in the part that creates it, and is never added here.
 //!
 //! The lists hold only tables that exist today. A table the design names but
 //! no part creates yet (`users`, `teams`, ...) is added with its part.
+//!
+//! The same lists drive the insert guard at the end of this file
+//! (`docs/organization.md`, `organization.v1`, guard 2): every `INSERT` into a
+//! tenant table that already carries its organization key (a [`TENANT`]
+//! table not in [`TENANT_MISSING_ORG_ID`]) must name `org_id`, in the
+//! non-test source of every workspace crate and in every trigger body in
+//! `sqlite_master`. The column's default is the default organization, so an
+//! insert that leaves it out would write there silently.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension};
+
+// The source scanner shared with `ua-core`'s guard tests (`org_guard`,
+// `authz_guard`): comment and string masking, `#[cfg(test)]` removal, and the
+// workspace's non-test source files.
+#[path = "../../ua-core/tests/support/mod.rs"]
+mod support;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -130,8 +146,10 @@ const TENANT: &[&str] = &[
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
-/// Today that is every tenant table: `harness_config_bundles` and
-/// `harness_config_proposals` carry a nullable `org_id` and no triggers.
+/// Today that is every tenant table except `inbound_deliveries` (born with
+/// its `org_id`) and `code_symbols` (`organization.v1.tools.code`):
+/// `harness_config_bundles` and `harness_config_proposals` carry a nullable
+/// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -141,7 +159,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "autonomous_cycle_transitions",
     "autonomous_cycle_usage",
     "autonomous_cycles",
-    "code_symbols",
     "delegations",
     "dispatch_receipts",
     "dispatch_runs",
@@ -621,12 +638,19 @@ fn a_new_tenant_table_cannot_be_parked_on_the_missing_list() {
     l.classes.push((Class::Tenant, tenant.as_slice()));
     l.missing = &missing;
     let found = problems(&conn, &l);
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
+    assert_eq!(found.len(), 1, "{found:?}");
     assert!(
-        found[1].starts_with("new_widgets: listed as missing org_id but not in the frozen baseline"),
+        found[0].starts_with("new_widgets: listed as missing org_id but not in the frozen baseline"),
         "{found:?}"
     );
+
+    // A list longer than the baseline fails on its length alone (the list has
+    // shrunk below the baseline, so pad it with entries already on it).
+    let padded: Vec<&str> =
+        TENANT_MISSING_ORG_ID.iter().copied().cycle().take(TENANT_MISSING_BASELINE_LEN + 1).collect();
+    let found = problems(&schema(), &Lists { missing: &padded, ..lists() });
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
 }
 
 #[test]
@@ -647,4 +671,222 @@ fn grant_tables_are_tracked_until_they_carry_org_id() {
         problems(&conn, &lists()),
         ["ui_sessions: now has a NOT NULL org_id; remove it from GRANT_MISSING_ORG_ID"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Insert guard
+// ---------------------------------------------------------------------------
+
+/// Tenant tables that carry their organization key: [`TENANT`] minus
+/// [`TENANT_MISSING_ORG_ID`]. `every_table_is_classified` proves each of them
+/// has a `NOT NULL` `org_id` and both triggers.
+fn keyed_tenant_tables() -> BTreeSet<&'static str> {
+    TENANT.iter().copied().filter(|t| !TENANT_MISSING_ORG_ID.contains(t)).collect()
+}
+
+/// One `INSERT` (any `OR <conflict>` form, upserts included) or `REPLACE`
+/// statement found in text: its table and its column list, if it has one.
+struct Insert {
+    at: usize,
+    table: String,
+    columns: Option<String>,
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Skip whitespace and the `\` of a Rust string's line continuation.
+fn skip_space(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'\\') {
+        i += 1;
+    }
+    i
+}
+
+/// The keyword `kw` (upper case, whole word) at `i`; the index after it.
+fn keyword(b: &[u8], i: usize, kw: &str) -> Option<usize> {
+    let end = i + kw.len();
+    (b.get(i..end) == Some(kw.as_bytes()) && b.get(end).is_none_or(|c| !is_ident_byte(*c))).then_some(end)
+}
+
+/// Every insert statement in `text`. SQL in this tree is upper case; a table
+/// name built at run time (`{table}`) is not a name and is skipped.
+fn inserts(text: &str) -> Vec<Insert> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    for start in 0..b.len() {
+        if start > 0 && is_ident_byte(b[start - 1]) {
+            continue;
+        }
+        let mut i = if let Some(e) = keyword(b, start, "INSERT") {
+            let j = skip_space(b, e);
+            match keyword(b, j, "OR") {
+                Some(e) => {
+                    let k = skip_space(b, e);
+                    let w = b[k..].iter().take_while(|c| c.is_ascii_alphabetic()).count();
+                    k + w
+                }
+                None => j,
+            }
+        } else if let Some(e) = keyword(b, start, "REPLACE") {
+            // `INSERT OR REPLACE` was taken at its `INSERT`.
+            let before = text[..start].trim_end_matches(|c: char| c.is_whitespace() || c == '\\');
+            if before.ends_with("OR") {
+                continue;
+            }
+            e
+        } else {
+            continue;
+        };
+        i = skip_space(b, i);
+        let Some(e) = keyword(b, i, "INTO") else { continue };
+        i = skip_space(b, e);
+        // An optional quote around the name (`"t"`, `\"t\"` in Rust source,
+        // `` `t` ``, `[t]`) and an optional `main.` schema.
+        while i < b.len() && matches!(b[i], b'"' | b'\\' | b'`' | b'[') {
+            i += 1;
+        }
+        if let Some(e) = keyword(b, i, "main").filter(|e| b.get(*e) == Some(&b'.')) {
+            i = e + 1;
+        }
+        let n = b[i..].iter().take_while(|c| is_ident_byte(**c)).count();
+        if n == 0 {
+            continue;
+        }
+        let table = text[i..i + n].to_string();
+        i += n;
+        while i < b.len() && matches!(b[i], b'"' | b'\\' | b'`' | b']') {
+            i += 1;
+        }
+        i = skip_space(b, i);
+        let columns = (b.get(i) == Some(&b'(')).then(|| {
+            let mut depth = 0usize;
+            let mut end = b.len();
+            for (k, c) in b[i..].iter().enumerate() {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            text[i + 1..end].to_string()
+        });
+        out.push(Insert { at: start, table, columns });
+    }
+    out
+}
+
+/// Whether a column list names `org_id` as a whole word.
+fn names_org_id(columns: &str) -> bool {
+    columns.match_indices("org_id").any(|(at, _)| {
+        let b = columns.as_bytes();
+        (at == 0 || !is_ident_byte(b[at - 1])) && b.get(at + 6).is_none_or(|c| !is_ident_byte(*c))
+    })
+}
+
+/// Findings for the inserts in `text` (named `origin`) into `keyed` tables,
+/// and how many such inserts there were.
+fn insert_findings(origin: &str, text: &str, keyed: &BTreeSet<&str>) -> (Vec<String>, usize) {
+    let mut out = Vec::new();
+    let mut seen = 0;
+    for ins in inserts(text) {
+        if !keyed.contains(ins.table.as_str()) {
+            continue;
+        }
+        seen += 1;
+        let line = support::line_of(text, ins.at);
+        match &ins.columns {
+            None => out.push(format!(
+                "{origin}:{line}: INSERT INTO {} has no column list; name org_id explicitly",
+                ins.table
+            )),
+            Some(cols) if !names_org_id(cols) => out.push(format!(
+                "{origin}:{line}: INSERT INTO {} does not name org_id (its default is the default organization)",
+                ins.table
+            )),
+            Some(_) => {}
+        }
+    }
+    (out, seen)
+}
+
+#[test]
+fn every_insert_into_a_keyed_tenant_table_names_org_id() {
+    let keyed = keyed_tenant_tables();
+    assert!(keyed.contains("code_symbols") && keyed.contains("inbound_deliveries"), "{keyed:?}");
+    let mut found = Vec::new();
+    let mut seen = 0;
+    let files = support::sources();
+    assert!(files.len() > 100, "found only {} source files", files.len());
+    for (path, src) in &files {
+        let (f, n) = insert_findings(&path.display().to_string(), &support::without_tests_raw(src), &keyed);
+        found.extend(f);
+        seen += n;
+    }
+    // Trigger bodies insert too, and no Rust string shows them.
+    let conn = schema();
+    let triggers: Vec<(String, String)> = conn
+        .prepare("SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!triggers.is_empty());
+    for (name, sql) in &triggers {
+        let (f, n) = insert_findings(&format!("trigger {name}"), sql, &keyed);
+        found.extend(f);
+        seen += n;
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+    // The scan sees the inserts it is meant to: the code family's, the
+    // inbound table's and its two copies (GitHub, Slack).
+    assert!(seen >= 5, "saw only {seen} inserts into keyed tenant tables");
+}
+
+#[test]
+fn the_insert_guard_catches_a_missing_org_id_and_accepts_a_named_one() {
+    let keyed: BTreeSet<&str> = ["code_symbols", "inbound_deliveries"].into();
+    let bad = [
+        "INSERT INTO code_symbols (workspace, file_path) VALUES (?1, ?2)",
+        "INSERT OR REPLACE INTO code_symbols (workspace) VALUES (?1)",
+        "INSERT OR IGNORE INTO code_symbols(workspace) VALUES (?1)",
+        "REPLACE INTO code_symbols (workspace) VALUES (?1)",
+        "INSERT INTO inbound_deliveries (source, kind) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        "INSERT INTO code_symbols VALUES (1, 'w')",
+        "INSERT INTO \\\"code_symbols\\\" (workspace) VALUES (?1)",
+        "INSERT INTO main.code_symbols (workspace) VALUES (?1)",
+        "INSERT INTO code_symbols \\\n    (org_id_shadow, workspace) VALUES (?1, ?2)",
+        "INSERT INTO code_symbols (workspace) SELECT workspace FROM other",
+    ];
+    for sql in bad {
+        let (found, seen) = insert_findings("demo.rs", &format!("let q = \"{sql}\";"), &keyed);
+        assert_eq!((found.len(), seen), (1, 1), "{sql}: {found:?}");
+    }
+    let good = [
+        "INSERT INTO code_symbols (org_id, workspace) VALUES (?1, ?2)",
+        "INSERT OR REPLACE INTO code_symbols \\\n    (workspace, org_id) VALUES (?1, ?2)",
+        "INSERT INTO inbound_deliveries (org_id, source) SELECT 'default', source FROM old",
+        // Not a keyed tenant table, a longer name, or a name built at run time.
+        "INSERT INTO tasks (title) VALUES (?1)",
+        "INSERT INTO code_symbols_extra (workspace) VALUES (?1)",
+        "INSERT INTO {table} (workspace) VALUES (?1)",
+        // Not a statement.
+        "REINSERT INTO code_symbols (workspace)",
+    ];
+    for sql in good {
+        let (found, _) = insert_findings("demo.rs", &format!("let q = \"{sql}\";"), &keyed);
+        assert!(found.is_empty(), "{sql}: {found:?}");
+    }
+    // A trigger body is checked the same way.
+    let body =
+        "CREATE TRIGGER t AFTER UPDATE ON x BEGIN INSERT INTO code_symbols (workspace) VALUES (1); END";
+    assert_eq!(insert_findings("trigger t", body, &keyed).0.len(), 1);
 }

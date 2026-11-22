@@ -184,6 +184,21 @@ from its commit history.
   part that gives a crate's tables `org_id` and its guard triggers.
 - A test that classifies every table for organization scoping and fails on
   an unclassified one.
+- The first existing table family with an organization key: the code
+  family's `code_symbols` gets `org_id` (existing rows backfilled to
+  `default`) and its `org_exists` / `org_immutable` triggers in the schema
+  part `organization.v1.tools.code`. `fs_index_symbols`, `fs_list_symbols`,
+  `fs_search_symbols` and `fs_repo_map` read and write only the caller's
+  organization's symbols, and indexing for an organization `orgs` does not
+  hold is refused (`invalid_argument`) before anything changes. A hub with
+  only the default organization sees no change in any tool result or event.
+  As with every new part, a database that has applied it is refused by an
+  earlier build (the unknown-part fence).
+- An insert guard beside the classification test: it fails when an
+  `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
+  table that carries its organization key does not name `org_id`, in any
+  crate's non-test source or any trigger body. It cannot see a table name
+  built at run time, nor check what an `INSERT … SELECT` supplies.
 
 ### Fixed
 
