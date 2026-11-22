@@ -286,6 +286,9 @@ async fn every_bad_signature_is_a_401_before_any_database_write() {
     let h = TestHub::new(slack_config());
     let body = command_body(HUMAN, "/task", "write the report", "1.2.a");
     let ts = now().to_string();
+    // One reading for the stale case, so its signature always matches its
+    // timestamp and it can only fail as stale.
+    let stale = (now() - 301).to_string();
     let good = slack::slack_signature(SECRET, &ts, &body);
     let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
         ("missing both headers", vec![]),
@@ -309,8 +312,8 @@ async fn every_bad_signature_is_a_401_before_any_database_write() {
         (
             "stale",
             vec![
-                ("x-slack-request-timestamp", (now() - 301).to_string()),
-                ("x-slack-signature", slack::slack_signature(SECRET, &(now() - 301).to_string(), &body)),
+                ("x-slack-request-timestamp", stale.clone()),
+                ("x-slack-signature", slack::slack_signature(SECRET, &stale, &body)),
             ],
         ),
         (

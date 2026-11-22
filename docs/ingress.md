@@ -320,8 +320,12 @@ redelivers stale rows processes the next copy anyway.
   window) is accepted again. The same holds for Slack, where it matters
   more: an older binary reads only the old Slack tables, so for about a day
   (the delivery-id retention) a Slack retry of a command the newer build
-  already ran is run again, and Slack commands are not idempotent. Do not
-  downgrade past this change while either endpoint takes traffic.
+  already ran is run again, and Slack commands are not idempotent. An older
+  binary also no longer sees Slack's replay keys (the signed-request hashes
+  are in `inbound_deliveries` now), so signed bytes captured from a request
+  the newer build accepted would be accepted again inside Slack's
+  five-minute timestamp window. Do not downgrade past this change while
+  either endpoint takes traffic.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from

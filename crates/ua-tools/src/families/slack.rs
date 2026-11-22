@@ -479,7 +479,14 @@ pub fn admit_keyed(
         )
         .by(identity.clone()),
     )?;
-    inbound::accept(tx, record_key(d.kind.as_str(), &d.delivery_id), &claim, now, Some(&identity))?;
+    if !inbound::accept(tx, record_key(d.kind.as_str(), &d.delivery_id), &claim, now, Some(&identity))? {
+        // Not expected: the row was recorded under this claim in this same
+        // transaction. Logged, behaviour unchanged.
+        tracing::info!(
+            delivery_id = d.delivery_id.as_str(),
+            "a Slack delivery was not `seen` under its claim when accepted; admitted anyway"
+        );
+    }
     Ok(Admission::Accepted { identity })
 }
 

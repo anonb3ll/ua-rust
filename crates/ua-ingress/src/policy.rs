@@ -584,6 +584,8 @@ mod tests {
             ("::ffff:100.100.100.200", "cloud metadata"),
             ("::ffff:0:100.100.100.200", "cloud metadata"),
             ("64:ff9b::100.100.100.200", "cloud metadata"),
+            ("2002:6464:64c8::", "cloud metadata"),
+            ("::100.100.100.200", "cloud metadata"),
             ("fd00:ec2::254", "cloud metadata"),
             ("fd20:ce::254", "cloud metadata"),
             ("169.254.169.254", "link-local (includes cloud metadata)"),
