@@ -194,6 +194,11 @@ from its commit history.
   only the default organization sees no change in any tool result or event.
   As with every new part, a database that has applied it is refused by an
   earlier build (the unknown-part fence).
+- An insert guard beside the classification test: it fails when an
+  `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
+  table that carries its organization key does not name `org_id`, in any
+  crate's non-test source or any trigger body. It cannot see a table name
+  built at run time, nor check what an `INSERT … SELECT` supplies.
 
 ### Fixed
 

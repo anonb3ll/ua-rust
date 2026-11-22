@@ -280,9 +280,11 @@ pub(super) async fn index(ctx: &ToolCtx, path: String) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             store(tx, &org, &ws2, &prefix, &files)?;
-            // The rows are the caller's organization's. The event names
-            // DEFAULT_ORG, which is that organization for every caller until
-            // memberships exist (the org_guard test holds every event there).
+            // ORG-EVENT-DEFAULT: the rows are the caller's organization's. The
+            // event names DEFAULT_ORG, which is that organization for every
+            // caller until memberships exist (the org_guard test holds every
+            // event there). It must name the rows' organization in the same
+            // change that lets a second organization have callers.
             ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.code.indexed", event).by(by))?;
             Ok(())
         })
@@ -391,14 +393,14 @@ fn like_escape(q: &str) -> String {
 fn search_symbols(conn: &Connection, org: &str, ws: &str, query: &str, semantic: bool) -> UaResult<Value> {
     let q = query.trim();
     let mut stmt = conn.prepare(
-        "SELECT * FROM code_symbols WHERE org_id = ?5 AND workspace = ?1 AND symbol_name LIKE ?2 ESCAPE '\\' \
-         ORDER BY (lower(symbol_name) = lower(?3)) DESC, \
-                  (substr(lower(symbol_name), 1, length(?3)) = lower(?3)) DESC, \
+        "SELECT * FROM code_symbols WHERE org_id = ?1 AND workspace = ?2 AND symbol_name LIKE ?3 ESCAPE '\\' \
+         ORDER BY (lower(symbol_name) = lower(?4)) DESC, \
+                  (substr(lower(symbol_name), 1, length(?4)) = lower(?4)) DESC, \
                   length(symbol_name), symbol_name, file_path, line_no \
-         LIMIT ?4",
+         LIMIT ?5",
     )?;
     let results: Vec<Value> = stmt
-        .query_map(rusqlite::params![ws, like_escape(q), q, SEARCH_LIMIT, org], |r| row_json(r, true))?
+        .query_map(rusqlite::params![org, ws, like_escape(q), q, SEARCH_LIMIT], |r| row_json(r, true))?
         .collect::<Result<_, _>>()?;
     let mut out = json!({ "results": results, "degraded": false });
     if semantic {

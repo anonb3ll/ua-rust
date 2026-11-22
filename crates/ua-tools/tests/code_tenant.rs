@@ -30,7 +30,7 @@ fn caller(org: &str) -> Caller {
     Caller {
         label: "builder-1".into(),
         kind: ActorKind::Agent,
-        profile: Profile::Developer,
+        profile: PROFILE,
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
@@ -38,13 +38,19 @@ fn caller(org: &str) -> Caller {
     }
 }
 
+/// The profile every test caller uses.
+const PROFILE: Profile = Profile::Developer;
+
+/// A second organization that allows the test callers' profile, so the tests
+/// do not depend on `allowed_profiles` being unchecked.
 fn add_org(hub: &Hub, id: &str) {
+    let profiles = serde_json::to_string(&[PROFILE.as_str()]).unwrap();
     hub.db()
-        .write(|tx| {
+        .write(move |tx| {
             tx.execute(
                 "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
-                 VALUES (?1, ?1, ?1, '[]', '2026-01-01T00:00:00+00:00')",
-                [id],
+                 VALUES (?1, ?1, ?1, ?2, '2026-01-01T00:00:00+00:00')",
+                [id, profiles.as_str()],
             )?;
             Ok(())
         })
