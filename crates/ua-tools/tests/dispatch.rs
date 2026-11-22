@@ -100,6 +100,25 @@ impl H {
         serde_json::from_str(text.as_str().unwrap()).unwrap()
     }
 
+    /// The payloads of the `agent.approval.refused` events, oldest first.
+    fn refused(&self) -> Vec<Value> {
+        self.hub
+            .db()
+            .read(|c| {
+                ua_store::ledger::query(
+                    c,
+                    &ua_store::ledger::EventQuery {
+                        channels: Some(vec!["agent.approval.refused".into()]),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect()
+    }
+
     fn sql(&self, stmt: &str) {
         let stmt = stmt.to_string();
         self.hub
@@ -518,6 +537,18 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
     assert_eq!(reason(&e), "approval_binding_changed", "{e}");
     assert!(e.to_string().contains("prompt_sha256"), "{e}");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM dispatch_runs"), json!(0), "nothing ran");
+    // The refusal is ledgered with the pass it no longer matches.
+    let refused = h.refused();
+    let r = refused.last().expect("a binding_changed refusal event");
+    assert_eq!(
+        (r["reason"].as_str(), r["approval_id"].as_i64()),
+        (Some("binding_changed"), Some(approval_id)),
+        "{r}"
+    );
+    assert_eq!((r["tool"].as_str(), r["task_id"].as_i64()), (Some("dispatch_task"), Some(tid)), "{r}");
+    assert_eq!(r["changed_fields"], json!(["prompt_sha256", "prompt_bytes", "prompt_text"]), "{r}");
+    assert_ne!(r["approved_payload_sha256"], r["presented_payload_sha256"], "{r}");
+    assert!(!r.to_string().contains("backups"), "no payload content: {r}");
     assert_eq!(
         h.scalar(&format!("SELECT status FROM approvals WHERE id = {approval_id}")),
         "approved",
@@ -922,6 +953,15 @@ mod spawn {
         let e = h.err(&agent("agent-1"), "dispatch_resume", json!({ "run_id": rid })).await;
         assert_eq!(reason(&e), "approval_binding_changed", "{e}");
         assert!(e.to_string().contains("timeout_s, output_cap_bytes"), "{e}");
+        // Refused inside the resume's write, which rolls back; the event stays.
+        let refused = h.refused();
+        let r = refused.last().expect("a binding_changed refusal event");
+        assert_eq!(
+            (r["reason"].as_str(), r["tool"].as_str()),
+            (Some("binding_changed"), Some("dispatch_resume")),
+            "{r}"
+        );
+        assert_eq!(r["changed_fields"], json!(["timeout_s", "output_cap_bytes"]), "{r}");
     }
 
     #[tokio::test]

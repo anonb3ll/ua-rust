@@ -787,6 +787,13 @@ async fn policy_authorizations_are_recorded_consumed_and_expire() {
         .await
         .unwrap_err();
     assert_eq!(reason(&e), "policy_authorization_mismatch", "{e:?}");
+    // The refusal is a ledger event although the refused call rolled back.
+    let refused = h.events("agent.approval.refused").await;
+    let p = &refused.last().expect("the expired authorization's refusal is ledgered")["payload"];
+    assert_eq!((p["reason"].as_str(), p["authorization_id"].as_i64()), (Some("expired"), Some(auth2)), "{p}");
+    assert_eq!((p["tool"].as_str(), p["task_id"].as_i64()), (Some("git_merge_task"), Some(t2)), "{p}");
+    assert_eq!(p["expired_at"], "2020-01-01T00:00:00+00:00");
+    assert_eq!(p["approved_payload_sha256"].as_str().map(str::len), Some(64), "{p}");
     // Nor does one recorded for another task.
     let e = h
         .call(
@@ -804,6 +811,19 @@ async fn policy_authorizations_are_recorded_consumed_and_expire() {
         .await
         .unwrap_err();
     assert_eq!(reason(&e), "policy_authorization_mismatch");
+    let refused = h.events("agent.approval.refused").await;
+    let p = &refused.last().unwrap()["payload"];
+    assert_eq!(p["reason"], "binding_changed", "{p}");
+    assert_eq!(p["authorization_id"], wrong);
+    assert_eq!(p["changed_fields"], json!(["head_sha"]), "{p}");
+    assert_ne!(p["approved_payload_sha256"], p["presented_payload_sha256"], "{p}");
+    // The event names what was refused without carrying it.
+    let text = p.to_string();
+    assert!(!text.contains(OTHER_FULL) && !text.contains(head.as_str()), "{p}");
+    // The recorded event carries the hash the refusal names as approved.
+    let recorded = h.events("agent.github.policy_authorization.recorded").await;
+    let rec_wrong = recorded.iter().find(|e| e["payload"]["authorization_id"] == wrong).unwrap();
+    assert_eq!(rec_wrong["payload"]["payload_sha256"], p["approved_payload_sha256"]);
     // A dry run reports coverage and spends nothing; without the id the approval gate applies.
     let dry = h
         .ok(
@@ -827,7 +847,19 @@ async fn policy_authorizations_are_recorded_consumed_and_expire() {
         .await
         .unwrap_err();
     assert!(["policy_authorization_mismatch", "not_found"].contains(&reason(&e).as_str()), "{e:?}");
+    if reason(&e) == "policy_authorization_mismatch" {
+        let refused = h.events("agent.approval.refused").await;
+        let p = &refused.last().unwrap()["payload"];
+        assert_eq!(
+            (p["reason"].as_str(), p["approval_status"].as_str()),
+            (Some("no_matching_approval"), Some("consumed")),
+            "{p}"
+        );
+    }
     assert_eq!(h.events("agent.github.policy_authorization.consumed").await.len(), 1);
+    let consumed = &h.events("agent.github.policy_authorization.consumed").await[0]["payload"];
+    let rec_auth = recorded.iter().find(|e| e["payload"]["authorization_id"] == auth_id).unwrap();
+    assert_eq!(consumed["payload_sha256"], rec_auth["payload"]["payload_sha256"], "{consumed}");
     let all =
         h.ok(&lead(), "policy_authorization_list", json!({ "task_id": t, "include_inactive": true })).await;
     let states: Vec<&str> =
@@ -1225,6 +1257,21 @@ async fn a_failed_merge_keeps_the_policy_authorization() {
     // force is never covered by an authorization.
     let e = h.call(&lead(), "git_merge_task", merge(json!({ "force": true }))).await.unwrap_err();
     assert_eq!(reason(&e), "policy_authorization_force", "{e:?}");
+    let last_refusal =
+        async |h: &H| h.events("agent.approval.refused").await.last().unwrap()["payload"].clone();
+    let p = last_refusal(&h).await;
+    assert_eq!((p["reason"].as_str(), p["detail"].as_str()), (Some("not_covered"), Some("force")), "{p}");
+    // An authorization that does not exist is refused and ledgered too.
+    let e = h
+        .call(&lead(), "git_merge_task", json!({ "task_id": t, "policy_authorization_id": 424242 }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "not_found", "{e:?}");
+    let p = last_refusal(&h).await;
+    assert_eq!(
+        (p["reason"].as_str(), p["authorization_id"].as_i64()),
+        (Some("no_matching_approval"), Some(424242))
+    );
     // The merge fails: the authorization is restored, not burnt.
     let e = h.call(&lead(), "git_merge_task", merge(json!({}))).await.unwrap_err();
     assert!(e.to_string().contains("git merge"), "{e:?}");
@@ -1244,6 +1291,8 @@ async fn a_failed_merge_keeps_the_policy_authorization() {
         .await
         .unwrap_err();
     assert_eq!(reason(&e), "policy_authorization_mismatch", "{e:?}");
+    let p = last_refusal(&h).await;
+    assert_eq!((p["reason"].as_str(), p["detail"].as_str()), (Some("not_covered"), Some("in_flight")), "{p}");
     let in_flight = h
         .ok(&human(), "policy_authorization_record", auth(json!({ "allow_in_flight": true })))
         .await["authorization"]["id"]

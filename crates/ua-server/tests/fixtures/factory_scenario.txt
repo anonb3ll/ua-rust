@@ -27,11 +27,11 @@
 2 review.uncertain-outcome-visible pass
 
 3 release.expired-approval-refused pass
-3 release.expired-refusal-audited fail
+3 release.expired-refusal-audited pass
 3 release.changed-revision-refused pass
-3 release.changed-revision-refusal-audited fail
+3 release.changed-revision-refusal-audited pass
 3 release.changed-target-refused pass
-3 release.changed-target-refusal-audited fail
+3 release.changed-target-refusal-audited pass
 3 release.verified-human-approves-exact-action pass
 3 release.approved-attempt-produces-artifact pass
 3 release.one-time-approval-binds-revision fail

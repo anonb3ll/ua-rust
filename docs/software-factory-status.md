@@ -66,7 +66,7 @@ written by hand from it once and may lag behind it.
 
 ## Current scorecard
 
-55 checks: 31 pass, 8 fail, 16 not-built.
+55 checks: 34 pass, 5 fail, 16 not-built.
 
 ### 1. Plan and delegate
 
@@ -100,18 +100,22 @@ written by hand from it once and may lag behind it.
 | Check | Status | Reason |
 | --- | --- | --- |
 | `release.expired-approval-refused` | pass | |
-| `release.expired-refusal-audited` | fail | The refused merge leaves no ledger event, only a `tool_calls` row with outcome `denied`. |
+| `release.expired-refusal-audited` | pass | |
 | `release.changed-revision-refused` | pass | |
-| `release.changed-revision-refusal-audited` | fail | As above. |
+| `release.changed-revision-refusal-audited` | pass | |
 | `release.changed-target-refused` | pass | |
-| `release.changed-target-refusal-audited` | fail | As above. |
+| `release.changed-target-refusal-audited` | pass | |
 | `release.verified-human-approves-exact-action` | pass | |
 | `release.approved-attempt-produces-artifact` | pass | |
 | `release.one-time-approval-binds-revision` | fail | A one-time approval of `git_merge_task` binds only `{task_id}`; a commit added to the branch after the approval is merged under it. |
 
 The passing approval path is the policy authorization
 (`policy_authorization_record` and `git_merge_task(policy_authorization_id)`),
-which binds the task, the bound repository and the exact head.
+which binds the task, the bound repository and the exact head. Each refused
+merge leaves an `agent.approval.refused` ledger event (reason `expired` or
+`binding_changed`, with the authorization, the task, the bound and presented
+payload hashes and the changed fields), kept although the refused call rolls
+back; see [policy](policy.md#approvals-in-the-audit-record).
 
 ### 4. Check isolation
 

@@ -430,6 +430,21 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
     Ok(Some(event))
 }
 
+/// [`append`] an event that must outlive the transaction it is appended in:
+/// a refusal recorded by the call it refuses, which then fails and rolls
+/// back. When the transaction commits, the event is committed with it, once.
+/// When it rolls back, [`crate::Db::write`] appends the event again in a
+/// separate transaction before returning the call's error. Use it only for
+/// events that state a fact independent of the rest of the transaction.
+pub fn append_surviving(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>> {
+    let copy = input.clone();
+    let out = append(tx, input)?;
+    if out.is_some() {
+        tx.surviving.push(copy);
+    }
+    Ok(out)
+}
+
 /// Filters for [`query`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EventQuery {
@@ -612,6 +627,59 @@ mod tests {
             None,
         );
         assert_eq!(h, include_str!("../tests/fixtures/py_hash.txt").trim());
+    }
+
+    fn channels(db: &Db) -> Vec<String> {
+        db.read(|c| query(c, &EventQuery::default())).unwrap().into_iter().map(|e| e.channel).collect()
+    }
+
+    #[test]
+    fn a_surviving_event_outlives_the_rolled_back_write() {
+        let db = Db::open_in_memory(&[SCHEMA]).unwrap();
+        let mut rx = db.subscribe();
+        let err = db
+            .write(|tx| -> UaResult<()> {
+                append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.effect", json!({})))?;
+                append_surviving(
+                    tx,
+                    EventInput::new(ua_core::DEFAULT_ORG, "test.refused", json!({ "n": 1 })),
+                )?;
+                Err(UaError::denied("refused", "the call is refused"))
+            })
+            .unwrap_err();
+        assert_eq!(err.reason_code(), Some("refused"), "the caller sees the original error: {err:?}");
+        // The rest of the transaction rolled back; the refusal did not.
+        assert_eq!(channels(&db), ["test.refused"]);
+        assert_eq!(rx.try_recv().unwrap().channel, "test.refused", "the replayed event is broadcast");
+        assert!(rx.try_recv().is_err(), "nothing rolled back is broadcast");
+        // The chain still verifies with the replayed event in it.
+        let report = db.read(verify).unwrap();
+        assert!(report.ok, "{report:?}");
+    }
+
+    #[test]
+    fn a_surviving_event_in_a_committed_write_is_recorded_once() {
+        let db = Db::open_in_memory(&[SCHEMA]).unwrap();
+        db.write(|tx| {
+            append_surviving(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.refused", json!({})))?;
+            append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.effect", json!({})))
+        })
+        .unwrap();
+        assert_eq!(channels(&db), ["test.refused", "test.effect"]);
+        // A deduplicated surviving event is not replayed either.
+        let key = "refusal:1";
+        db.write(|tx| {
+            append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.refused", json!({})).dedupe(key))
+        })
+        .unwrap();
+        let _ = db.write(|tx| -> UaResult<()> {
+            append_surviving(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "test.refused", json!({})).dedupe(key),
+            )?;
+            Err(UaError::denied("refused", "again"))
+        });
+        assert_eq!(channels(&db).len(), 3);
     }
 
     #[test]

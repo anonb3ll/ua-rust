@@ -190,6 +190,22 @@ from its commit history.
   `not-built`, compared against a checked-in scorecard
   (`tests/fixtures/factory_scenario.txt`) that only moves forward. Status
   page: `docs/software-factory-status.md`. Tests and docs only.
+- Refusals in the audit record (`docs/policy.md#approvals-in-the-audit-record`):
+  a gated call refused because of its approval state appends one
+  `agent.approval.refused` ledger event with a reason (`expired`,
+  `binding_changed`, `no_matching_approval`, `denied`, `not_covered`,
+  `not_eligible`). It names the tool, the approval or policy authorization,
+  the task, the SHA-256 of the canonical payload that was approved and of the
+  one presented, and the top-level fields that differ by name, never their
+  values. It covers the approval gate, `git_merge_task` under a policy
+  authorization, `dispatch_task`, `dispatch_resume` and the relay's send.
+  The event survives the refused call: `ua_store::ledger::append_surviving`
+  appends it in the call's transaction and, when that transaction rolls
+  back, `Db::write` appends it again in a separate small transaction before
+  returning the call's error. The `agent.approval.requested`, `resolved` and
+  `consumed` events and the policy authorization `recorded` and `consumed`
+  events gain `payload_sha256`; `resolved` gains `expires_at` on an approval.
+  Additive: no response or schema changes.
 
 ### Changed
 

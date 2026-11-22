@@ -400,12 +400,24 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         .await?
         .ok_or_else(|| UaError::not_found(format!("task {id}")))?;
 
-    if a.policy_authorization_id.is_some() && a.force {
-        return Err(UaError::denied(
-            "policy_authorization_force",
-            "force=true is refused under a policy authorization: it covers a clean merge only; ask for a one-time \
-             approval instead",
-        ));
+    if let Some(auth_id) = a.policy_authorization_id
+        && a.force
+    {
+        let who = ctx.caller.label.clone();
+        return Err(ctx
+            .hub
+            .db()
+            .write_async(move |tx| {
+                let row = authz::row(tx, auth_id)?;
+                let err = UaError::denied(
+                    "policy_authorization_force",
+                    "force=true is refused under a policy authorization: it covers a clean merge only; ask for a \
+                     one-time approval instead",
+                );
+                Err::<(), _>(authz::refuse_mode(tx, &who, auth_id, id, row.as_ref(), "force", err))
+            })
+            .await
+            .unwrap_err());
     }
     let status_ok =
         row.status == "done" || (a.allow_in_flight && ["doing", "blocked"].contains(&row.status.as_str()));
@@ -497,15 +509,16 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
             .write_async(move |tx| {
                 let auth = authz::covering(tx, &cfg, auth_id, id, repo.as_deref(), &h, &who)?;
                 if in_flight && status != "done" && !authz::allows_in_flight(&auth) {
-                    return Err(UaError::denied(
+                    let err = UaError::denied(
                         "policy_authorization_mismatch",
                         format!(
                             "policy authorization {auth_id} does not cover merging task {id} while it is {status}; \
                              record one with allow_in_flight=true"
                         ),
-                    ));
+                    );
+                    return Err(authz::refuse_mode(tx, &who, auth_id, id, Some(&auth), "in_flight", err));
                 }
-                if dry { Ok(None) } else { authz::consume(tx, auth_id, id, &h, &who).map(Some) }
+                if dry { Ok(None) } else { authz::consume(tx, &auth, auth_id, id, &h, &who).map(Some) }
             })
             .await?;
         spent = stamp.map(|s| (auth_id, s));
