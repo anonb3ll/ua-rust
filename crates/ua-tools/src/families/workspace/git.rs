@@ -463,9 +463,11 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         .db()
         .read_async(move |c| {
             Ok(c.query_row(
+                // Tasks are all in the default organization, so only its
+                // bindings join.
                 "SELECT t.title, t.status, t.branch, t.worktree_path, b.repo FROM tasks t \
-                 LEFT JOIN project_repo_bindings b ON b.project = t.project WHERE t.id = ?1",
-                [id],
+                 LEFT JOIN project_repo_bindings b ON b.org_id = ?2 AND b.project = t.project WHERE t.id = ?1",
+                rusqlite::params![id, crate::families::tasks::TASK_ORG],
                 |r| {
                     Ok(TaskRow {
                         title: r.get(0)?,

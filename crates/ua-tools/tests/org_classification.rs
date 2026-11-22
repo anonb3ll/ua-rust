@@ -152,9 +152,11 @@ const TENANT: &[&str] = &[
 /// Today that is every tenant table except `inbound_deliveries` (born with
 /// its `org_id`), `deliverables` and `deliverable_revisions` (born with their
 /// `org_id`), `code_symbols`, the two graph canvas tables,
-/// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`), and
+/// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`),
 /// the three skill registry tables (`skill_registry.v2.tenant_keys`,
-/// `organization.v1.tools.skills`):
+/// `organization.v1.tools.skills`), and `project_repo_bindings`
+/// (`governance.v2.project_bindings_tenant_keys`,
+/// `organization.v1.tools.project_bindings`):
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
@@ -194,7 +196,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "plan_steps",
     "plans",
     "policy_authorizations",
-    "project_repo_bindings",
     "relay_messages",
     "review_ready_notices",
     "routine_runs",

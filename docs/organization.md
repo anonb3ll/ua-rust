@@ -35,11 +35,11 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (61 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (60 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
-  `skill_assignments` and `skill_publish_staging` having left it; a new table
-  cannot join it), and the grant tables
+  `skill_assignments`, `skill_publish_staging` and `project_repo_bindings`
+  having left it; a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
@@ -119,7 +119,9 @@ here for memory columns, owners and defaults.
   event at a site marked `ORG-EVENT-DEFAULT` in the source must switch to the
   organization of the row it is about in the same change that lets a second
   organization have callers, or the default organization's ledger would
-  record another organization's activity. `code_symbols` has no index led by
+  record another organization's activity. A second **resolver work item,
+  `ORG-TASK-DEFAULT`**, covers every lookup that starts from a task (it names
+  `TASK_ORG`); see the governance family below. `code_symbols` has no index led by
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
   index led by `org_id`, in a new static part, when its family is converted.
@@ -149,6 +151,32 @@ here for memory columns, owners and defaults.
   is read or written. Operator actions still need `ua_org::authz`, which
   admits only the default organization until memberships exist. The importer
   writes legacy skill versions and assignments to `default`.
+- The governance family applies the standalone procedure
+  `governance.v2.project_bindings_tenant_keys` to rebuild
+  `project_repo_bindings` around `(org_id, project)` and migrate existing
+  bindings to `default`, followed by `organization.v1.tools.project_bindings`
+  to install the organization triggers. `project_repo_bind`,
+  `project_repo_unbind`, `project_repo_get` and `project_repo_list` scope to
+  the caller's organization, and a bind or unbind for an unknown organization
+  is refused before anything changes. Tasks carry no `org_id` yet, so every
+  task-driven lookup of a binding (CI checks, merges, policy authorizations,
+  merged-PR reconciliation, deliverables, GitHub polling and webhooks) reads
+  the default organization's bindings. The Python importer explicitly writes
+  legacy bindings to `default`. **Resolver work item (`ORG-TASK-DEFAULT`):**
+  each such lookup, and each authority check and deliverable lookup that
+  starts from a task, names the constant `TASK_ORG`
+  (`crates/ua-tools/src/families/tasks/mod.rs`) rather than `DEFAULT_ORG`.
+  When tasks gain `org_id`, every use of `TASK_ORG` must switch to the task's
+  own organization in that change, and the constant be removed, or a task of
+  a second organization would resolve the default organization's
+  repositories. `crates/ua-tools/tests/project_bindings_tenant.rs` holds
+  another organization's binding of the same project and checks that none
+  of these lookups reads it. The `project.repo.bound` and
+  `project.repo.unbound` events are `ORG-EVENT-DEFAULT` sites whose payloads
+  carry the project and repository names (and the previous binding) into
+  the default organization's ledger. They must move to the binding's
+  organization with the `ORG-EVENT-DEFAULT` switch, in the same change that
+  lets a second organization bind; the payload shape stays as it is.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -735,7 +763,7 @@ global key in the tree is classified:
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
-| `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`. |
+| `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`, rebuilt in the standalone procedure `governance.v2.project_bindings_tenant_keys`. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
@@ -1258,7 +1286,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
