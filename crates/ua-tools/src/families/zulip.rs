@@ -15,6 +15,14 @@
 //! additionally stays retired unless `zulip_retired` is `0`, `false`, `no` or
 //! `off`. There is no poll timer: a caller drives every send and fetch.
 //!
+//! `zulip_sends` is tenant data (`org_id`, `organization.v1.tools.zulip`):
+//! the duplicate check, the outcome record and `zulip_resolve_send` see only
+//! the caller's organization's sends, and another organization's send answers
+//! exactly as a missing one. The Zulip site, account and channels in the hub
+//! configuration are the default organization's, so a caller of any other
+//! organization is refused before anything is recorded: its text is never
+//! posted to the default organization's Zulip.
+//!
 //! Fetched messages are labelled untrusted. The fetch position is one row
 //! in `zulip_fetch_cursors` per agent, channel and topic, and only moves
 //! forward.
@@ -32,7 +40,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, Config, UaError, UaResult};
 use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
@@ -77,6 +85,15 @@ CREATE INDEX IF NOT EXISTS idx_zulip_sends_content ON zulip_sends(stream, topic,
 ",
 };
 
+/// `organization.v1.tools.zulip`: `zulip_sends.org_id` (existing rows
+/// backfilled to the default organization) and its generated
+/// `zulip_sends_org_exists` / `zulip_sends_org_immutable` triggers. The table
+/// has no key beyond its AUTOINCREMENT id, so no rebuild is needed; the
+/// duplicate check filters on `org_id`. `zulip_fetch_cursors` is a hub table.
+/// Applied after `zulip.v1` and `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.zulip", &["zulip_sends"]);
+
 const MAX_CONTENT_CHARS: usize = 4000;
 /// Zulip's own topic limit.
 const MAX_TOPIC_CHARS: usize = 60;
@@ -111,6 +128,28 @@ fn clip(s: &str) -> String {
 fn require_identity(caller: &Caller) -> UaResult<()> {
     if caller.kind == ActorKind::Anonymous {
         return Err(UaError::denied("identity_required", "Zulip tools require an authenticated identity"));
+    }
+    Ok(())
+}
+
+/// Refuse a caller whose organization `orgs` does not hold, before anything
+/// is written (organizations are never deleted, so the check cannot go stale).
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; nothing was recorded")));
+    }
+    Ok(())
+}
+
+/// The Zulip configuration is the default organization's destination: a
+/// caller of another organization never posts through it.
+fn require_destination(org: &str) -> UaResult<()> {
+    if org != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "zulip_not_configured",
+            "Zulip is configured for the hub's default organization only; nothing was sent or recorded",
+        ));
     }
     Ok(())
 }
@@ -634,9 +673,9 @@ fn begin_send(
     }
     let open: Option<i64> = tx
         .query_row(
-            "SELECT id FROM zulip_sends WHERE stream = ?1 AND topic = ?2 AND content_sha256 = ?3 \
-             AND status IN ('sending','uncertain') LIMIT 1",
-            params![p.stream, p.topic, p.sha],
+            "SELECT id FROM zulip_sends WHERE org_id = ?1 AND stream = ?2 AND topic = ?3 \
+             AND content_sha256 = ?4 AND status IN ('sending','uncertain') LIMIT 1",
+            params![caller.org_id, p.stream, p.topic, p.sha],
             |r| r.get(0),
         )
         .optional()?;
@@ -663,9 +702,21 @@ fn begin_send(
     };
     let now = ua_core::time::now();
     tx.execute(
-        "INSERT INTO zulip_sends (agent_label, channel, stream, topic, content_sha256, chars, bytes, approval_id, \
-         status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'sending', ?9, ?9)",
-        params![p.agent, p.channel, p.stream, p.topic, p.sha, p.chars as i64, p.bytes as i64, approval_id, now],
+        "INSERT INTO zulip_sends (org_id, agent_label, channel, stream, topic, content_sha256, chars, bytes, \
+         approval_id, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sending', ?10, ?10)",
+        params![
+            caller.org_id,
+            p.agent,
+            p.channel,
+            p.stream,
+            p.topic,
+            p.sha,
+            p.chars as i64,
+            p.bytes as i64,
+            approval_id,
+            now
+        ],
     )?;
     let send_id = tx.last_insert_rowid();
     ledger::append(
@@ -682,6 +733,9 @@ fn begin_send(
 
 async fn zulip_send_message(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &org)).await?;
+    require_destination(&ctx.caller.org_id)?;
     let cfg = ctx.hub.cfg();
     let agent = write_identity(&ctx.caller, Some(&clean_label(&a.agent_label)?))?;
     let (logical, stream) = channel(cfg, &a.channel)?;
@@ -732,8 +786,8 @@ async fn zulip_send_message(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             tx.execute(
                 "UPDATE zulip_sends SET status = ?2, message_id = ?3, http_status = ?4, error = ?5, updated_at = ?6 \
-                 WHERE id = ?1",
-                params![send_id, status, message_id, http_status, err, ua_core::time::now()],
+                 WHERE id = ?1 AND org_id = ?7",
+                params![send_id, status, message_id, http_status, err, ua_core::time::now(), caller.org_id],
             )?;
             ledger::append(
                 tx,
@@ -813,10 +867,12 @@ async fn zulip_resolve_send(ctx: ToolCtx, a: ResolveArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &caller.org_id)?;
+            // Another organization's send answers exactly as a missing one.
             let row: Option<(String, String, String)> = tx
                 .query_row(
-                    "SELECT status, updated_at, content_sha256 FROM zulip_sends WHERE id = ?1",
-                    params![a.send_id],
+                    "SELECT status, updated_at, content_sha256 FROM zulip_sends WHERE org_id = ?1 AND id = ?2",
+                    params![caller.org_id, a.send_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
@@ -843,9 +899,11 @@ async fn zulip_resolve_send(ctx: ToolCtx, a: ResolveArgs) -> UaResult<Value> {
             }
             let reason = a.reason.as_deref().map(clip);
             tx.execute(
-                "UPDATE zulip_sends SET status = ?2, error = COALESCE(?3, error), updated_at = ?4 WHERE id = ?1",
-                params![a.send_id, status, reason, ua_core::time::now()],
+                "UPDATE zulip_sends SET status = ?2, error = COALESCE(?3, error), updated_at = ?4 \
+                 WHERE id = ?1 AND org_id = ?5",
+                params![a.send_id, status, reason, ua_core::time::now(), caller.org_id],
             )?;
+            // ORG-EVENT-DEFAULT: use the send's organization once org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG,
