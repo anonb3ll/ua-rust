@@ -23,18 +23,20 @@
 //! PDF text is not extracted: no small pure-Rust parser handles hostile PDFs
 //! reliably in-process, so PDFs come back as base64 with a note saying so.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use base64::Engine;
 use reqwest::Url;
 use reqwest::header::CONTENT_TYPE;
+use rusqlite::{Connection, OptionalExtension};
 use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
 use ua_ingress::{Outbound, OutboundError, Policy, Request, policy};
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
 use super::code::media;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
@@ -62,6 +64,204 @@ CREATE TABLE IF NOT EXISTS web_search_cache (
 CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched ON web_search_cache(fetched_at);
 ",
 };
+
+/// `web.v2.tenant_keys`: rebuild `web_search_cache` so its primary key is
+/// `(org_id, provider, query, max_results)` with `org_id TEXT NOT NULL DEFAULT 'default'`.
+///
+/// Runs standalone outside the shared migration transaction so
+/// `PRAGMA foreign_keys = OFF` takes effect before the rebuild transaction and
+/// `PRAGMA foreign_keys = ON` is restored afterwards (`docs/organization.md`,
+/// "Global keys and table rebuilds"). Safe to re-run after a crash before
+/// recording.
+pub const TENANT_KEYS: Procedure = Procedure {
+    name: "web.v2.tenant_keys",
+    version: 1,
+    standalone: true,
+    run: rebuild_tenant_keys,
+    args: &["web_search_cache"],
+};
+
+/// `organization.v1.tools.web`: installs `web_search_cache_org_exists` and
+/// `web_search_cache_org_immutable` after `web.v2.tenant_keys` and
+/// `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.web", &["web_search_cache"]);
+
+fn rebuild_tenant_keys(conn: &Connection, _args: &'static [&'static str]) -> anyhow::Result<String> {
+    anyhow::ensure!(conn.is_autocommit(), "web.v2.tenant_keys must run outside a transaction");
+    let mut log = Vec::new();
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    log.push("PRAGMA foreign_keys = OFF;".to_string());
+
+    let res = (|| -> anyhow::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        log.push("BEGIN IMMEDIATE;".to_string());
+        rebuild_web_search_cache_body(conn, &mut log)?;
+        conn.execute_batch("COMMIT;")?;
+        log.push("COMMIT;".to_string());
+        Ok(())
+    })();
+
+    if res.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let fk_res = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    res?;
+    fk_res?;
+    log.push("PRAGMA foreign_keys = ON;".to_string());
+    Ok(log.join("\n"))
+}
+
+fn rebuild_web_search_cache_body(conn: &Connection, log: &mut Vec<String>) -> anyhow::Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'web_search_cache'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    anyhow::ensure!(exists, "web_search_cache does not exist; apply web.v1 first");
+
+    let indexes: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'web_search_cache' AND sql IS NOT NULL \
+             ORDER BY name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let table_triggers: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = 'web_search_cache' AND sql IS NOT NULL \
+             ORDER BY name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let triggers_before: BTreeSet<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let views: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY rowid",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let views_before: BTreeSet<String> = views.iter().map(|(name, _)| name.clone()).collect();
+
+    let has_org_id: bool = conn
+        .query_row("SELECT 1 FROM pragma_table_info('web_search_cache') WHERE name = 'org_id'", [], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    let org_expr = if has_org_id { "COALESCE(org_id, 'default')" } else { "'default'" };
+
+    let create_new = "CREATE TABLE web_search_cache_new (\n    \
+        org_id TEXT NOT NULL DEFAULT 'default',\n    \
+        provider TEXT NOT NULL,\n    \
+        query TEXT NOT NULL,\n    \
+        max_results INTEGER NOT NULL,\n    \
+        results_json TEXT NOT NULL,\n    \
+        fetched_at TEXT NOT NULL,\n    \
+        PRIMARY KEY (org_id, provider, query, max_results)\n\
+    );";
+    let copy_rows = format!(
+        "INSERT INTO web_search_cache_new \
+         (org_id, provider, query, max_results, results_json, fetched_at) \
+         SELECT {org_expr}, provider, query, max_results, results_json, fetched_at \
+         FROM web_search_cache;"
+    );
+
+    for stmt in [create_new, copy_rows.as_str()] {
+        conn.execute_batch(stmt)?;
+        log.push(stmt.to_string());
+    }
+
+    // Drop views before dropping and renaming the table: SQLite's
+    // `ALTER TABLE ... RENAME` validates every view in `sqlite_master` and
+    // fails if a view references the just-dropped table.
+    for (name, _) in &views {
+        let escaped = name.replace('"', "\"\"");
+        let stmt = format!("DROP VIEW \"{escaped}\";");
+        conn.execute_batch(&stmt)?;
+        log.push(stmt);
+    }
+
+    for stmt in
+        ["DROP TABLE web_search_cache;", "ALTER TABLE web_search_cache_new RENAME TO web_search_cache;"]
+    {
+        conn.execute_batch(stmt)?;
+        log.push(stmt.to_string());
+    }
+
+    for (_, sql) in &indexes {
+        let stmt = format!("{};", sql.trim_end_matches(';'));
+        conn.execute_batch(&stmt)?;
+        log.push(stmt);
+    }
+    let org_idx = "CREATE INDEX IF NOT EXISTS idx_web_search_cache_org_fetched \
+                   ON web_search_cache(org_id, fetched_at);";
+    conn.execute_batch(org_idx)?;
+    log.push(org_idx.to_string());
+
+    for (_, sql) in &table_triggers {
+        let stmt = format!("{};", sql.trim_end_matches(';'));
+        conn.execute_batch(&stmt)?;
+        log.push(stmt);
+    }
+
+    for (_, sql) in &views {
+        let stmt = format!("{};", sql.trim_end_matches(';'));
+        conn.execute_batch(&stmt)?;
+        log.push(stmt);
+    }
+
+    let fk_violations: Vec<(String, Option<i64>, String, i64)> = conn
+        .prepare("PRAGMA foreign_key_check(web_search_cache)")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    anyhow::ensure!(
+        fk_violations.is_empty(),
+        "PRAGMA foreign_key_check(web_search_cache) reported {} violation(s): {:?}",
+        fk_violations.len(),
+        fk_violations
+    );
+
+    let indexes_after: BTreeSet<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'web_search_cache' AND sql IS NOT NULL \
+             ORDER BY name",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for (name, _) in &indexes {
+        anyhow::ensure!(indexes_after.contains(name), "index {name} missing after web_search_cache rebuild");
+    }
+
+    let triggers_after: BTreeSet<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    anyhow::ensure!(
+        triggers_after == triggers_before,
+        "trigger set changed across web_search_cache rebuild (before: {triggers_before:?}, after: {triggers_after:?})"
+    );
+
+    let views_after: BTreeSet<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    anyhow::ensure!(
+        views_after == views_before,
+        "view set changed across web_search_cache rebuild (before: {views_before:?}, after: {views_after:?})"
+    );
+
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // SSRF guard
@@ -645,13 +845,14 @@ async fn cache_get(
         return Ok(None);
     }
     let cutoff = cache_cutoff(ttl);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |conn| {
             let row = conn.query_row(
                 "SELECT results_json, fetched_at FROM web_search_cache \
-                 WHERE provider = ?1 AND query = ?2 AND max_results = ?3 AND fetched_at >= ?4",
-                rusqlite::params![provider, query, max as i64, cutoff],
+                 WHERE org_id = ?1 AND provider = ?2 AND query = ?3 AND max_results = ?4 AND fetched_at >= ?5",
+                rusqlite::params![org, provider, query, max as i64, cutoff],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             );
             match row {
@@ -675,18 +876,22 @@ async fn cache_put(ctx: &ToolCtx, provider: &'static str, query: String, max: us
     }
     let Ok(results) = serde_json::to_string(hits) else { return };
     let cutoff = cache_cutoff(ttl);
+    let org = ctx.caller.org_id.clone();
     let res = ctx
         .hub
         .db()
         .write_async(move |tx| {
             tx.execute(
-                "INSERT INTO web_search_cache (provider, query, max_results, results_json, fetched_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (provider, query, max_results) DO UPDATE SET \
+                "INSERT INTO web_search_cache (org_id, provider, query, max_results, results_json, fetched_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (org_id, provider, query, max_results) DO UPDATE SET \
                  results_json = excluded.results_json, fetched_at = excluded.fetched_at",
-                rusqlite::params![provider, query, max as i64, results, ua_core::time::now()],
+                rusqlite::params![org, provider, query, max as i64, results, ua_core::time::now()],
             )?;
-            tx.execute("DELETE FROM web_search_cache WHERE fetched_at < ?1", [cutoff])?;
+            tx.execute(
+                "DELETE FROM web_search_cache WHERE org_id = ?1 AND fetched_at < ?2",
+                rusqlite::params![org, cutoff],
+            )?;
             Ok(())
         })
         .await;

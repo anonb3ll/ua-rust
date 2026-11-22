@@ -57,6 +57,7 @@ slack.v2
 wake.v1
 wake.v2
 web.v1
+web.v2.tenant_keys
 workflows.v1
 zulip.v1
 config_revisions.v1
@@ -66,3 +67,4 @@ github.inbound.v1.copy
 slack.inbound.v1.copy
 import.v1
 organization.v1.tools.code
+organization.v1.tools.web

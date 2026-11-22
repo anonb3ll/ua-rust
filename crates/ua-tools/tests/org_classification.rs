@@ -147,7 +147,8 @@ const TENANT: &[&str] = &[
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
 /// Today that is every tenant table except `inbound_deliveries` (born with
-/// its `org_id`) and `code_symbols` (`organization.v1.tools.code`):
+/// its `org_id`), `code_symbols` (`organization.v1.tools.code`), and
+/// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`):
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
@@ -212,7 +213,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "task_workflow",
     "tasks",
     "tool_calls",
-    "web_search_cache",
     "work_proposal_items",
     "work_proposals",
     "workflow_checkpoints",

@@ -200,6 +200,11 @@ from its commit history.
   only the default organization sees no change in any tool result or event.
   As with every new part, a database that has applied it is refused by an
   earlier build (the unknown-part fence).
+- Web search cache rows (`web_search_cache`) have organization-scoped keys
+  and triggers (`web.v2.tenant_keys`, `organization.v1.tools.web`). Existing
+  cached entries migrate to `default`. Organizations cache identical queries
+  independently, and one organization's TTL eviction does not remove another
+  organization's cached entries.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

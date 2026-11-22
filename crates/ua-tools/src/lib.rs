@@ -56,6 +56,9 @@ pub fn schema_parts() -> Vec<Part> {
     parts.extend(families::schema_parts().into_iter().map(Part::from));
     // The organization column and triggers of the code family's table.
     parts.push(families::code::TENANT_PART.into());
+    // The organization key rebuild and triggers of the web search cache table.
+    parts.push(families::web::TENANT_KEYS.into());
+    parts.push(families::web::TENANT_PART.into());
     parts.push(config_revisions::SCHEMA.into());
     // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
     // family's delivery rows into it. Both need `organization.v1.store` and
