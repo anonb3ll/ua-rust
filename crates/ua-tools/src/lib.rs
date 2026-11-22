@@ -62,6 +62,9 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::github::INBOUND_COPY.into());
     // Then the Slack family's replay keys and delivery ids.
     parts.push(families::slack::INBOUND_COPY.into());
+    // Deliverables and their revisions (`ua-deliverables`), born
+    // tenant-scoped: they need `organization.v1.store`.
+    parts.extend(families::deliverables::schema_parts());
     parts
 }
 

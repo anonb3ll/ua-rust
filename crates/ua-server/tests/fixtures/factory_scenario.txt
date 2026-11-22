@@ -12,7 +12,7 @@
 1 delegate.task-claimed-with-review-requirement pass
 1 delegate.handoff-tied-to-revision pass
 1 delegate.session-handoff-sealed pass
-1 delegate.deliverable-revision-object not-built
+1 delegate.deliverable-revision-object pass
 
 2 review.second-harness-opens-same-task pass
 2 review.packet-carries-handoff-at-revision pass

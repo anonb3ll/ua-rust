@@ -41,7 +41,8 @@ pub(crate) use queue::{
     parked_block, queue_fold, queue_health, queue_park, queue_stale, queue_sweep, queue_unpark,
 };
 pub(crate) use workflow::{
-    STAGES, packet_section, task_check_record, task_check_verify, task_workflow_get, task_workflow_set,
+    STAGES, capsule_head, packet_section, require_writer, review_ready, task_check_record, task_check_verify,
+    task_repo, task_workflow_get, task_workflow_set, write_capsule,
 };
 
 /// The workflow record, task checks and session handoff notes. Column names

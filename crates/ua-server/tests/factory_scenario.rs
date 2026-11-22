@@ -741,11 +741,71 @@ async fn plan_and_delegate(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
             ))
         })(),
     );
-    card.not_built(
+
+    // The change is a deliverable of the task, and its commit a recorded
+    // revision in the project's bound repository.
+    s.must_act(&human(), "project_repo_bind", json!({ "project": "default", "repo": REPO })).await;
+    let recorded = async {
+        let made = s
+            .ok(
+                &builder(),
+                "deliverable_create",
+                json!({ "task_id": cx.task, "title": "changelog generator" }),
+            )
+            .await?;
+        let id = made["deliverable"]["id"].clone();
+        let rev = s
+            .ok(
+                &builder(),
+                "deliverable_revise",
+                json!({ "deliverable_id": id, "commit": cx.head, "summary": "first version" }),
+            )
+            .await?;
+        let wf = s.act_ok(&builder(), "task_workflow_get", json!({ "task_id": cx.task })).await?;
+        Ok::<_, String>((made, rev, wf))
+    }
+    .await;
+    card.check(
         1,
         "delegate.deliverable-revision-object",
-        "no deliverable record exists: the revision is a commit SHA string repeated on the workflow record, the \
-         checks and the handoff, with nothing tying them into one reviewable deliverable",
+        (|| {
+            let (made, rev, wf) = recorded?;
+            ensure(made["created"] == true && made["deliverable"]["task_id"] == cx.task, format!("{made}"))?;
+            ensure(made["deliverable"]["repo"] == REPO, format!("the deliverable lost the binding: {made}"))?;
+            let d = made["deliverable"]["id"].as_i64().ok_or("no deliverable id")?;
+            let r = &rev["revision"];
+            ensure(rev["recorded"] == true && r["rev_no"] == 1, format!("{rev}"))?;
+            ensure(r["commit"] == cx.head.as_str() && r["producer"] == "builder-1", format!("{rev}"))?;
+            let rid = r["id"].as_i64().ok_or("no revision id")?;
+            let row = s
+                .text(&format!(
+                    "SELECT identity || ' ' || repo || ' ' || org_id FROM deliverable_revisions \
+                     WHERE id = {rid} AND deliverable_id = {d} AND rev_no = 1"
+                ))
+                .ok_or("no deliverable_revisions row for the revision")?;
+            ensure(row == format!("{} {REPO} default", cx.head), format!("the stored revision is {row}"))?;
+            let ev = s
+                .ledger()
+                .into_iter()
+                .find(|e| e.channel == "agent.deliverable.revised" && e.payload["revision_id"] == rid)
+                .ok_or("no agent.deliverable.revised event for the revision")?;
+            ensure(
+                ev.payload["identity"] == cx.head.as_str()
+                    && ev.payload["deliverable_id"] == d
+                    && ev.payload["task_id"] == cx.task
+                    && ev.originator.as_deref() == Some("builder-1"),
+                format!("{ev:?}"),
+            )?;
+            ensure(wf["head_sha"] == cx.head.as_str(), format!("the workflow head is not the revision: {wf}"))?;
+            ensure(rev["latest_is_workflow_head"] == true, format!("{rev}"))?;
+            Ok(format!(
+                "deliverable_create attaches deliverable {d} in {REPO} to task {}; deliverable_revise records {} as \
+                 its revision 1 (row {rid}, ledger event {}), and the task's workflow head is that commit",
+                cx.task,
+                &cx.head[..12],
+                ev.seq
+            ))
+        })(),
     );
 }
 

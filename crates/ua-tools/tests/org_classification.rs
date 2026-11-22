@@ -127,6 +127,9 @@ const TENANT: &[&str] = &[
     "code_symbols",
     // inbound deliveries (`ua-ingress`): org_id and the triggers from birth
     "inbound_deliveries",
+    // deliverables (`ua-deliverables`): org_id and the triggers from birth
+    "deliverables",
+    "deliverable_revisions",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
