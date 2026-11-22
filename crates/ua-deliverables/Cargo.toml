@@ -1,0 +1,24 @@
+[package]
+name = "ua-deliverables"
+description = "Deliverables for ua-rust: what a task produces, and its immutable, ordered revisions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+# Depends on ua-core and ua-store only, never on the tool registry. Only
+# ua-tools depends on this crate: it registers the deliverable tools, and
+# every deliverable operation runs through them (tests/dependencies.rs).
+[dependencies]
+ua-core = { workspace = true, features = ["rusqlite"] }
+ua-store.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+hex.workspace = true

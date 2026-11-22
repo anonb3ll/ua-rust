@@ -106,6 +106,26 @@ pub fn human(caller: &Caller) -> bool {
     caller.kind == ActorKind::Human
 }
 
+/// The organization half of every authority check: refuse a caller acting
+/// on a row of `target_org` unless both are the same organization. Until
+/// organizations other than the default exist, both must be [`DEFAULT_ORG`].
+/// [`Authz::holds`] and [`Authz::require`] apply it first; a site whose
+/// other rule is not an [`Authority`] (a task's claimant writing its record)
+/// calls it directly.
+pub fn require_same_org(caller: &Caller, target_org: &str) -> UaResult<()> {
+    if target_org != DEFAULT_ORG || caller.org_id != DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_mismatch",
+            format!(
+                "only the {DEFAULT_ORG:?} organization exists; refusing a check for organization \
+                 {target_org:?} by a caller in {:?}",
+                caller.org_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Authority decisions over one hub configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Authz<'a> {
@@ -144,17 +164,7 @@ impl<'a> Authz<'a> {
     }
 
     fn org_ok(&self, caller: &Caller, target_org: &str) -> UaResult<()> {
-        if target_org != DEFAULT_ORG || caller.org_id != DEFAULT_ORG {
-            return Err(UaError::denied(
-                "org_mismatch",
-                format!(
-                    "only the {DEFAULT_ORG:?} organization exists; refusing a check for organization \
-                     {target_org:?} by a caller in {:?}",
-                    caller.org_id
-                ),
-            ));
-        }
-        Ok(())
+        require_same_org(caller, target_org)
     }
 
     fn holds_one(&self, caller: &Caller, a: &Authority) -> bool {

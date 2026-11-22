@@ -5156,6 +5156,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-deliverables"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.1",
+ "ua-core",
+ "ua-store",
+]
+
+[[package]]
 name = "ua-import"
 version = "0.1.0"
 dependencies = [
@@ -5324,6 +5336,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ua-core",
+ "ua-deliverables",
  "ua-ingress",
  "ua-memory",
  "ua-org",

@@ -67,6 +67,48 @@ fn sse_ids(text: &str) -> Vec<i64> {
 }
 
 #[tokio::test]
+async fn streams_share_mailbox_visibility_for_replayed_and_live_messages() {
+    for path in ["/api/events/stream", "/ui/activity/stream"] {
+        let hub = TestHub::new(stream_config());
+        let sender = Caller {
+            label: "builder-1".into(),
+            kind: ActorKind::Agent,
+            profile: Profile::Developer,
+            enforce_profile: true,
+            session_key: None,
+            transport: Transport::Mcp,
+            org_id: ua_core::DEFAULT_ORG.into(),
+        };
+        let send = async |recipient: &str| {
+            hub.state
+                .registry
+                .call(
+                    &hub.state.hub,
+                    &sender,
+                    "message_send",
+                    json!({ "act": "inform", "to_agent": recipient, "body": "Build update" }),
+                )
+                .await
+                .unwrap()["seq"]
+                .as_i64()
+                .unwrap()
+        };
+
+        send("builder-2").await;
+        let replayed = send("agent-a").await;
+        let mut req = get(path, None, Some(AGENT_A));
+        req.headers_mut().insert("last-event-id", "0".parse().unwrap());
+        let resp = hub.send(req).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+
+        send("builder-2").await;
+        let live = send("agent-a").await;
+        let text = read_sse(resp, |t| t.contains(&format!("id: {live}\n"))).await;
+        assert_eq!(sse_ids(&text), vec![replayed, live], "{path}: {text}");
+    }
+}
+
+#[tokio::test]
 async fn an_agent_without_event_log_query_cannot_open_either_stream() {
     let hub = TestHub::new(stream_config());
     for path in ["/api/events/stream", "/ui/activity/stream"] {

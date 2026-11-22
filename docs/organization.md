@@ -25,7 +25,9 @@ here for memory columns, owners and defaults.
   (`organization.v1.<crate>.<family>`, or `organization.v1.<crate>` for a
   crate that is one family) rather than the owner alone, so the part stays a
   constant. There is one part per table family, because a generated part's checksum covers its table list, so a released part can never take another family's tables. Its first user is `organization.v1.ingress`, for
-  `inbound_deliveries`, a table that carries `org_id` from its first part.
+  `inbound_deliveries`, a table that carries `org_id` from its first part;
+  `organization.v1.deliverables` does the same for `deliverables` and
+  `deliverable_revisions`.
 - `ua_core::DEFAULT_ORG`.
 - The importer exclusion: `org_id` is never mapped by column name.
 - The classification test (`crates/ua-tools/tests/org_classification.rs`,
@@ -1228,7 +1230,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
