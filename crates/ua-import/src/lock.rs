@@ -13,12 +13,15 @@
 //! (`docs/ingress.md`, Limits). Other commands never take it, so `ua mcp`,
 //! `ua call`, backups and the rest run beside a serve as before.
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-/// The lock file for a database path: `<db>.hub.lock`.
+/// The hub lock file for a database: `<db>.hub.lock` next to the database
+/// file, for a path already resolved by [`canonical_db_path`].
 pub fn lock_path(db_path: &Path) -> PathBuf {
     let mut name = db_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".hub.lock");
@@ -45,35 +48,27 @@ impl HubLock {
     }
 
     fn take(db_path: &Path, what: &str, exclusive: bool) -> anyhow::Result<HubLock> {
-        let path = lock_path(db_path);
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("opening lock file {}", path.display()))?;
-        if !try_lock(&file, exclusive, &path)? {
+        // Every spelling of one database meets on one lock file.
+        let db = canonical_db_path(db_path)?;
+        let path = lock_path(&db);
+        let file = open_lock_file(&path)?;
+        let unsupported = "an import or restore is NOT refused while a hub process runs, on this platform";
+        if !try_lock(&file, exclusive, &path, unsupported)? {
             if exclusive {
                 bail!(
                     "the database {} is in use by a running hub process (ua serve, ua mcp, ua call, ...) \
                      or another import: {what} refused. Stop them first, then retry",
-                    db_path.display()
+                    db.display()
                 );
             }
-            bail!(
-                "the database {} is being imported into: {what} refused until it finishes",
-                db_path.display()
-            );
+            bail!("the database {} is being imported into: {what} refused until it finishes", db.display());
         }
         Ok(HubLock { _file: file })
     }
 }
 
 /// The serve lock file for a database: `<canonical db>.serve.lock`, next to
-/// the database file itself (symbolic links resolved).
+/// the database file itself (see [`canonical_db_path`]).
 pub fn serve_lock_path(db_path: &Path) -> anyhow::Result<PathBuf> {
     let db = canonical_db_path(db_path)?;
     let mut name = db.file_name().map(|n| n.to_os_string()).unwrap_or_default();
@@ -81,24 +76,88 @@ pub fn serve_lock_path(db_path: &Path) -> anyhow::Result<PathBuf> {
     Ok(db.with_file_name(name))
 }
 
-/// What identifies "the same database": the database file's canonical path.
-/// When the file does not exist yet, its directory (created if missing) is
-/// canonicalized and the file name joined, so a first `ua serve` and a second
-/// one started before the database is created still meet on one lock.
+/// How many symbolic links one path may pass through before it is refused
+/// (the usual system limit).
+const MAX_LINKS: usize = 40;
+
+/// What identifies "the same database": the absolute path of the file SQLite
+/// will open, with every symbolic link followed and `.` and `..` resolved,
+/// including links whose target does not exist yet (a database not created
+/// yet behind a link) and directories not created yet. Every spelling of one
+/// database file therefore yields one path, before and after the file is
+/// created. Hard links are not resolved: two hard links to one file are two
+/// paths (SQLite's WAL and lock files are per name, so a database must never
+/// be used through two hard links anyway). Creates nothing.
 pub fn canonical_db_path(db_path: &Path) -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::fs::canonicalize(db_path) {
-        return Ok(p);
-    }
-    let name = db_path
-        .file_name()
-        .with_context(|| format!("database path {} has no file name", db_path.display()))?;
-    let dir = match db_path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        Some(d) => d.to_path_buf(),
-        None => PathBuf::from("."),
+    let start = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir().context("reading the current directory")?.join(db_path)
     };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let dir = std::fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
-    Ok(dir.join(name))
+    let mut todo: VecDeque<OsString> = VecDeque::new();
+    let mut resolved = PathBuf::new();
+    push_components(&start, &mut resolved, &mut todo);
+    let mut links = 0;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_LINKS {
+                    bail!("database path {} passes through too many symbolic links", db_path.display());
+                }
+                let target = std::fs::read_link(&candidate)
+                    .with_context(|| format!("reading the link {}", candidate.display()))?;
+                // The link's target, then what was left after the link.
+                let rest: Vec<OsString> = todo.drain(..).collect();
+                if target.is_absolute() {
+                    resolved = PathBuf::new();
+                }
+                push_components(&target, &mut resolved, &mut todo);
+                todo.extend(rest);
+            }
+            Ok(_) => resolved = candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => resolved = candidate,
+            Err(e) => return Err(e).with_context(|| format!("resolving {}", candidate.display())),
+        }
+    }
+    if resolved.file_name().is_none() {
+        bail!("database path {} has no file name", db_path.display());
+    }
+    Ok(resolved)
+}
+
+/// Queue `path`'s components: a root or prefix goes into `resolved` at once,
+/// `.` is dropped, names and `..` are queued.
+fn push_components(path: &Path, resolved: &mut PathBuf, todo: &mut VecDeque<OsString>) {
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => resolved.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => todo.push_back(OsString::from("..")),
+            Component::Normal(n) => todo.push_back(n.to_os_string()),
+        }
+    }
+}
+
+/// Open (creating, owner-only on Unix) a lock file, creating its directory.
+fn open_lock_file(path: &Path) -> anyhow::Result<File> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Another account that could open the file could hold the lock.
+        opts.mode(0o600);
+    }
+    opts.open(path).with_context(|| format!("opening lock file {}", path.display()))
 }
 
 /// The one-serving-process lock. `ua serve` takes it exclusively for the life
@@ -115,13 +174,9 @@ impl ServeLock {
     pub fn acquire(db_path: &Path) -> anyhow::Result<ServeLock> {
         let db = canonical_db_path(db_path)?;
         let path = serve_lock_path(&db)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("opening lock file {}", path.display()))?;
-        if !try_lock(&file, true, &path)? {
+        let file = open_lock_file(&path)?;
+        let unsupported = "a second `ua serve` on the same database is NOT refused on this platform";
+        if !try_lock(&file, true, &path, unsupported)? {
             bail!(
                 "another `ua serve` holds the database {}: a second `ua serve` on the same database is refused \
                  (two would each take the other's in-flight inbound deliveries for stale ones). Stop the running \
@@ -134,7 +189,7 @@ impl ServeLock {
 }
 
 #[cfg(unix)]
-fn try_lock(file: &File, exclusive: bool, _path: &Path) -> anyhow::Result<bool> {
+fn try_lock(file: &File, exclusive: bool, _path: &Path, _unsupported: &str) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd;
     let mode = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
     // SAFETY: `flock` on a descriptor owned by `file`, which outlives the call.
@@ -151,12 +206,11 @@ fn try_lock(file: &File, exclusive: bool, _path: &Path) -> anyhow::Result<bool> 
 }
 
 #[cfg(not(unix))]
-fn try_lock(_file: &File, exclusive: bool, path: &Path) -> anyhow::Result<bool> {
+fn try_lock(_file: &File, exclusive: bool, path: &Path, unsupported: &str) -> anyhow::Result<bool> {
     // No advisory lock on this platform yet. Say so instead of pretending.
     if exclusive {
         eprintln!(
-            "warning: database locking is not supported on this platform ({} is not locked); make sure no other \
-             process that this lock guards against is running",
+            "warning: database locking is not supported on this platform ({} is not locked): {unsupported}",
             path.display()
         );
     }
@@ -222,21 +276,93 @@ mod tests {
         assert!(HubLock::acquire(&db, "restore").is_err());
     }
 
+    /// A relative spelling of `abs`, from the current directory.
+    fn relative_to_cwd(abs: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(abs.strip_prefix("/").unwrap())
+    }
+
     #[test]
-    fn the_same_database_by_another_path_shares_the_serve_lock() {
+    fn every_spelling_of_one_database_gives_one_lock_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("ua.db");
+        symlink(&real_dir, root.join("dirlink")).unwrap();
+        // A link to the database file, which does not exist yet (dangling),
+        // and one with a relative target.
+        symlink(&real, root.join("dangling.db")).unwrap();
+        symlink("real/ua.db", root.join("relative.db")).unwrap();
+        // A chain of links.
+        symlink(root.join("dangling.db"), root.join("chain.db")).unwrap();
+        let spellings = |root: &Path| -> Vec<PathBuf> {
+            vec![
+                real.clone(),
+                root.join("dirlink/ua.db"),
+                root.join("dangling.db"),
+                root.join("relative.db"),
+                root.join("chain.db"),
+                root.join("real/../real/./ua.db"),
+                root.join("dirlink/../real/ua.db"),
+                relative_to_cwd(&real),
+            ]
+        };
+        let want_serve = real_dir.join("ua.db.serve.lock");
+        let want_hub = real_dir.join("ua.db.hub.lock");
+        // Before the database exists, then after.
+        for created in [false, true] {
+            if created {
+                std::fs::write(&real, b"").unwrap();
+            }
+            for p in spellings(&root) {
+                assert_eq!(canonical_db_path(&p).unwrap(), real, "{} (created={created})", p.display());
+                assert_eq!(serve_lock_path(&p).unwrap(), want_serve, "{}", p.display());
+                assert_eq!(lock_path(&canonical_db_path(&p).unwrap()), want_hub, "{}", p.display());
+            }
+        }
+        // A database whose directory does not exist yet: nothing is created.
+        let later = root.join("dirlink/not-yet/../not-yet/ua.db");
+        assert_eq!(canonical_db_path(&later).unwrap(), real_dir.join("not-yet/ua.db"));
+        assert!(!real_dir.join("not-yet").exists());
+        // A link loop is refused, not followed forever.
+        symlink(root.join("loop-b"), root.join("loop-a")).unwrap();
+        symlink(root.join("loop-a"), root.join("loop-b")).unwrap();
+        assert!(canonical_db_path(&root.join("loop-a")).is_err());
+    }
+
+    #[test]
+    fn the_same_database_by_another_path_shares_both_locks() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir_all(&real).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        // Not created yet, reached through a directory link and a `..` hop.
-        let _first = ServeLock::acquire(&real.join("ua.db")).unwrap();
-        assert!(ServeLock::acquire(&link.join("ua.db")).is_err());
-        assert!(ServeLock::acquire(&real.join("..").join("real").join("ua.db")).is_err());
-        // A database file that is itself a link to the real one.
+        std::os::unix::fs::symlink(real.join("ua.db"), dir.path().join("dangling.db")).unwrap();
+        // The first serve reaches it through a dangling link; SQLite would
+        // create the file at the target, so every later serve sees the target.
+        let _first = ServeLock::acquire(&dir.path().join("dangling.db")).unwrap();
         std::fs::write(real.join("ua.db"), b"").unwrap();
-        std::os::unix::fs::symlink(real.join("ua.db"), dir.path().join("alias.db")).unwrap();
-        assert!(ServeLock::acquire(&dir.path().join("alias.db")).is_err());
+        assert!(ServeLock::acquire(&real.join("ua.db")).is_err());
+        assert!(ServeLock::acquire(&dir.path().join("dangling.db")).is_err());
+        // A serve holds the hub lock shared; a restore by another spelling refuses.
+        let _serving = HubLock::acquire_shared(&dir.path().join("dangling.db"), "serve").unwrap();
+        assert!(HubLock::acquire(&real.join("ua.db"), "restore").is_err());
+    }
+
+    #[test]
+    fn lock_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let _hub = HubLock::acquire_shared(&db, "serve").unwrap();
+        let _serve = ServeLock::acquire(&db).unwrap();
+        for p in [lock_path(&db), serve_lock_path(&db).unwrap()] {
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
+        }
     }
 
     #[test]
