@@ -448,10 +448,13 @@ async fn user_name_is_never_identity() {
 async fn a_repeated_trigger_id_runs_once() {
     let h = TestHub::new(slack_config());
     let body = command_body(DEV, "/task", "write the report", "1.2.a");
-    let first = h.send(signed(slack_api_commands(), FORM, &body, now())).await;
+    // One clock reading for both: a second ticking between two readings would
+    // make the retry the very same signed bytes, a byte replay, not a retry.
+    let t = now();
+    let first = h.send(signed(slack_api_commands(), FORM, &body, t)).await;
     assert!(json_body(first).await["text"].as_str().unwrap().starts_with("Accepted /task"));
     // A new signature (other timestamp) over the same trigger id.
-    let retry = h.send(signed(slack_api_commands(), FORM, &body, now() - 1)).await;
+    let retry = h.send(signed(slack_api_commands(), FORM, &body, t - 1)).await;
     assert_eq!(retry.status(), 200);
     assert_eq!(json_body(retry).await["text"], "Already received.");
     settle(&h).await;
@@ -466,10 +469,11 @@ async fn a_repeated_trigger_id_runs_once() {
 async fn a_retried_event_id_runs_once() {
     let h = TestHub::new(slack_config());
     let body = event_body(DEV, "Ev0RETRY1", "app_mention", "<@U0BOT> /task write the report");
-    let first = h.send(signed(slack_api_events(), "application/json", &body, now())).await;
+    let t = now();
+    let first = h.send(signed(slack_api_events(), "application/json", &body, t)).await;
     assert_eq!(first.status(), 200);
     // Slack's retry: same event_id, new timestamp and signature.
-    let mut retry = signed(slack_api_events(), "application/json", &body, now() - 2);
+    let mut retry = signed(slack_api_events(), "application/json", &body, t - 2);
     retry.headers_mut().insert("x-slack-retry-num", "1".parse().unwrap());
     assert_eq!(h.send(retry).await.status(), 200);
     settle(&h).await;
