@@ -275,10 +275,16 @@ Error: another `ua serve` holds the database /path/to/ua.db: a second `ua serve`
 absolute, with every symbolic link followed (a chain, a relative target, and
 a link whose target does not exist yet, so a database not created yet behind
 a link meets the same lock as the created one) and `.` and `..` resolved.
-Every spelling of one database file gives one lock file. Hard links are not
-resolved: two hard links to one file are two databases to the lock. Do not
-reach a database through two hard links at all; SQLite's `-wal` and `-shm`
-files are per name, so that is unsafe without any `ua` involved.
+The longest part of that path that exists is then given its on-disk
+spelling, so on a file system that ignores letter case (the macOS default)
+an existing file or directory yields one spelling however it is typed.
+Every spelling of one database file gives one lock file. Two limits: on a
+file system that ignores case, two spellings that differ only in case of a
+database (or directory) that does not exist yet can get two locks until it
+exists; and hard links are not resolved, so two hard links to one file are
+two databases to the lock. Do not reach a database through two hard links at
+all; SQLite's `-wal` and `-shm` files are per name, so that is unsafe
+without any `ua` involved.
 
 The shared hub lock (`<db>.hub.lock`) uses the same resolution, so a
 `ua restore` or `ua import` that reaches the database by another spelling
@@ -289,8 +295,10 @@ process from before the change and one from after it use different
 hub-lock files during the transition, so stop every old process before
 running an import or restore with the new build.
 
-Both lock files are created owner-only (`0600`), so another local account
-cannot hold them. The operating system releases a lock when the process
+Both lock files are owner-only (`0600`), so another local account cannot
+hold them: a new one is created so, and an existing one with a wider mode is
+tightened when a lock is taken (best effort: a file another account owns
+keeps its mode, and the lock is still taken). The operating system releases a lock when the process
 exits, a crash or `SIGKILL` included, so there is nothing to clean up: the
 file stays and is harmless. Only `ua serve` takes the serve lock. `ua mcp`,
 `ua call`, `ua tools`, `ua token`, `ua backup` and `ua doctor` run beside a

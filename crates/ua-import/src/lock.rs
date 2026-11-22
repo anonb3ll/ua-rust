@@ -85,9 +85,13 @@ const MAX_LINKS: usize = 40;
 /// including links whose target does not exist yet (a database not created
 /// yet behind a link) and directories not created yet. Every spelling of one
 /// database file therefore yields one path, before and after the file is
-/// created. Hard links are not resolved: two hard links to one file are two
-/// paths (SQLite's WAL and lock files are per name, so a database must never
-/// be used through two hard links anyway). Creates nothing.
+/// created. The longest existing prefix takes its on-disk spelling through
+/// [`std::fs::canonicalize`], so on a file system that ignores letter case an
+/// existing file or directory always yields one spelling; components that do
+/// not exist yet are kept as written. Hard links are not resolved: two hard
+/// links to one file are two paths (SQLite's WAL and lock files are per name,
+/// so a database must never be used through two hard links anyway). Creates
+/// nothing.
 pub fn canonical_db_path(db_path: &Path) -> anyhow::Result<PathBuf> {
     let start = if db_path.is_absolute() {
         db_path.to_path_buf()
@@ -128,7 +132,32 @@ pub fn canonical_db_path(db_path: &Path) -> anyhow::Result<PathBuf> {
     if resolved.file_name().is_none() {
         bail!("database path {} has no file name", db_path.display());
     }
-    Ok(resolved)
+    on_disk_spelling(&resolved)
+}
+
+/// The on-disk spelling of a resolved path: its longest existing prefix
+/// through [`std::fs::canonicalize`] (which, on a file system that ignores
+/// letter case, returns the case stored on disk), then the components that do
+/// not exist yet, unchanged.
+fn on_disk_spelling(resolved: &Path) -> anyhow::Result<PathBuf> {
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut prefix = resolved;
+    loop {
+        if std::fs::symlink_metadata(prefix).is_ok() {
+            let mut out =
+                std::fs::canonicalize(prefix).with_context(|| format!("resolving {}", prefix.display()))?;
+            out.extend(rest.iter().rev());
+            return Ok(out);
+        }
+        match (prefix.parent(), prefix.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                prefix = parent;
+            }
+            // Nothing exists, not even the root: keep the resolution as is.
+            _ => return Ok(resolved.to_path_buf()),
+        }
+    }
 }
 
 /// Queue `path`'s components: a root or prefix goes into `resolved` at once,
@@ -157,7 +186,20 @@ fn open_lock_file(path: &Path) -> anyhow::Result<File> {
         // Another account that could open the file could hold the lock.
         opts.mode(0o600);
     }
-    opts.open(path).with_context(|| format!("opening lock file {}", path.display()))
+    let file = opts.open(path).with_context(|| format!("opening lock file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // `mode` applies only to a file this call creates: tighten an existing
+        // wider one too. Best effort: a file another account owns cannot be
+        // changed, and that must not fail the lock.
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(file)
 }
 
 /// The one-serving-process lock. `ua serve` takes it exclusively for the life
@@ -351,6 +393,61 @@ mod tests {
         // A serve holds the hub lock shared; a restore by another spelling refuses.
         let _serving = HubLock::acquire_shared(&dir.path().join("dangling.db"), "serve").unwrap();
         assert!(HubLock::acquire(&real.join("ua.db"), "restore").is_err());
+    }
+
+    #[test]
+    fn an_existing_prefix_takes_its_on_disk_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, root.join("dirlink")).unwrap();
+        // An existing directory reached through a link, plus names that do not exist yet.
+        assert_eq!(
+            on_disk_spelling(&root.join("dirlink/later/ua.db")).unwrap(),
+            real_dir.join("later/ua.db")
+        );
+        assert_eq!(canonical_db_path(&root.join("dirlink/ua.db")).unwrap(), real_dir.join("ua.db"));
+        // An existing file reached by two spellings: one path.
+        std::fs::write(real_dir.join("ua.db"), b"").unwrap();
+        let a = canonical_db_path(&root.join("dirlink/ua.db")).unwrap();
+        let b = canonical_db_path(&root.join("real/./x/../ua.db")).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, real_dir.join("ua.db"));
+    }
+
+    #[test]
+    fn spellings_that_differ_in_case_meet_on_a_case_insensitive_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("probe"), b"").unwrap();
+        if std::fs::metadata(root.join("PROBE")).is_err() {
+            eprintln!("skipped: the temporary directory {} is case-sensitive", root.display());
+            return;
+        }
+        std::fs::create_dir_all(root.join("Hub")).unwrap();
+        std::fs::write(root.join("Hub/ua.db"), b"").unwrap();
+        let want = root.join("Hub/ua.db");
+        for p in [root.join("hub/UA.db"), root.join("HUB/ua.DB"), root.join("Hub/ua.db")] {
+            assert_eq!(canonical_db_path(&p).unwrap(), want, "{}", p.display());
+            assert_eq!(serve_lock_path(&p).unwrap(), root.join("Hub/ua.db.serve.lock"));
+        }
+    }
+
+    #[test]
+    fn an_existing_wider_lock_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        for p in [lock_path(&db), serve_lock_path(&db).unwrap()] {
+            std::fs::write(&p, b"").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _hub = HubLock::acquire_shared(&db, "serve").unwrap();
+        let _serve = ServeLock::acquire(&db).unwrap();
+        for p in [lock_path(&db), serve_lock_path(&db).unwrap()] {
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
+        }
     }
 
     #[test]
