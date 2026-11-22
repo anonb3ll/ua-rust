@@ -111,16 +111,26 @@ construction:
 - **Pinned to one origin.** A pinned client refuses every request whose
   scheme, host or port differs from the origin it was built for, before
   anything is sent: another port, another scheme, another name for the same
-  address, or an IP literal that is not the origin. Each consumer pins its
-  client to the configured URL (`github_api_url`, `notify_webhook_url`,
-  `obsidian_api_url`). Requests to the origin are still checked against the
-  policy, so a configured origin outside it fails on first use.
+  address, or an IP literal that is not the origin. Requests to the origin
+  are still checked against the policy, so a configured origin outside it
+  fails on first use.
+
+What this guarantees is one origin per client. That the origin is the
+operator's own configured value (`github_api_url`, `notify_webhook_url`,
+`obsidian_api_url`) and never one a caller supplies is not enforced by the
+crate or the tests: it remains a review duty in the three consumer files
+(`ua-tools/src/families/github/client.rs`,
+`ua-tools/src/families/notify.rs`,
+`ua-tools/src/families/vault/obsidian.rs`).
 
 The ratchet test is a second line of defence
 (`relaxed_policies_stay_with_their_one_consumer`): outside `ua-ingress`,
-no file names `OperatorConfigured` or the certificate flag, each relaxed
-policy's constant is named by its one consumer file, and only those three
-files build a pinned client.
+no file names `OperatorConfigured` or the certificate flag, and each
+relaxed policy's constant is named only by its one consumer file. Since a
+pinned client needs one of those constants, that check is what keeps
+relaxed clients in the three files. The test also refuses the text
+`Outbound::pinned(` elsewhere, as a convenience only: an alias or other
+spacing would get past it.
 
 A limit that predates this policy: the client cannot tell the plugin from
 any other local process. Whatever answers on the configured loopback port,
@@ -306,7 +316,8 @@ redelivers stale rows processes the next copy anyway.
   it opens the database or binds a port (`docs/operations.md`, section 5).
   What remains: the lock is advisory and taken by the `ua` command, so a
   program that embeds `ua-server` and calls `serve_http` without taking
-  `ua_import::ServeLock` is not covered; two hard links to one database
+  `ua_store::ServeLock` is not covered (its plain opens still refuse to
+  migrate underneath another serve, which is the default); two hard links to one database
   file are two databases to the lock (never use a database through two
   hard links; SQLite's WAL files are per name); on a platform without
   `flock` (not Unix) nothing is locked; and two hosts that share one
@@ -330,15 +341,21 @@ redelivers stale rows processes the next copy anyway.
   build also predates the unknown-part fence (`docs/operations.md`, "Older
   builds and a newer database"), so it opens the database and ignores the
   parts it does not know. The fence protects only from this change on: a
-  build that has it
-  refuses a database that records parts added after it, and `ua serve`
-  refuses such a database even under the recovery override, so a later
-  change to inbound storage is covered. **What remains:** a build from
+  build that has it refuses a database that records parts added after it,
+  and `ua serve` refuses such a database even under the recovery override,
+  so a later change to inbound storage is covered. **What remains:** a build from
   before this change (every build before the inbound table included; no
   version has been released) is refused by nothing. Never run a build older
   than this change against a database a newer build has opened, and do not
   downgrade past the inbound table while either endpoint takes traffic;
-  restore a backup taken before the upgrade instead.
+  restore a backup taken before the upgrade instead. Running processes are
+  not re-checked by the fence, but an *older* build's command opened beside
+  a newer serve is refused by the fence when that build has it, and a
+  *newer* build's command that would migrate the database underneath an
+  older running `ua serve` is refused because that serve holds the serve
+  lock (`docs/operations.md`, "Processes already running"). A serve that
+  started before a migration made on a platform without `flock` is not
+  covered.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from

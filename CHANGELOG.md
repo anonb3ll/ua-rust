@@ -301,6 +301,17 @@ from its commit history.
   change against a database a newer build has opened; restore a
   pre-upgrade backup instead (`docs/operations.md`, "Older builds and a
   newer database").
+- A command that would migrate the database (apply a schema part it does
+  not record yet) refuses while another process holds the serve lock: a
+  newer build no longer migrates underneath an older running `ua serve`.
+  `ua serve` migrates at startup under its own lock; an open with nothing
+  to apply is unaffected; the recovery override does not lift it
+  (`docs/operations.md`, "Processes already running"). The guard is part
+  of the store's open (`Db::open`, `Hub::open`, `Hub::open_with`), so a
+  program that embeds the hub gets it by default; the only way to skip it
+  is the held serve lock of that database (`Fence::serving`,
+  `Hub::open_serving`). The lock code moved from `ua-import` to
+  `ua_store::lock`; `ua_import` re-exports the same names.
 - `ua doctor`: the `schema` check fails, where it warned, when the database
   records parts this build does not know, and leads with that explanation
   before any object findings. A plain `ua doctor` (without `--strict`) now

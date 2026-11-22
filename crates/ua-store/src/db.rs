@@ -21,6 +21,7 @@ use tokio::sync::broadcast;
 use ua_core::{UaError, UaResult};
 
 use crate::ledger::Event;
+use crate::lock::{self, ServeLock};
 use crate::schema::{self, Part};
 
 /// Pooled read-only connections of a file database.
@@ -59,6 +60,13 @@ struct Inner {
 /// (optional parts, and any part whose Cargo feature is compiled out of this
 /// build). A recorded part outside both refuses the open, before any part is
 /// applied, unless [`Fence::allow_newer`] is set.
+///
+/// Every open of a database file also runs the migration guard: when the open
+/// would apply at least one part the database does not record yet (a real
+/// migration, not a no-op open), it refuses while another process holds the
+/// database's serve lock (a running `ua serve`,
+/// [`crate::lock::refuse_if_served`]). The only way to skip it is
+/// [`Fence::serving`]: the held [`ServeLock`] of that same database.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Fence<'a> {
     pub also_known: &'a [&'a str],
@@ -66,6 +74,12 @@ pub struct Fence<'a> {
     /// fence). For recovery only; [`Db::ignored_newer_parts`] names them so the
     /// caller can log it.
     pub allow_newer: bool,
+    /// Proof that the caller is the process serving this database: its held
+    /// [`ServeLock`]. With it the migration guard does not probe (the caller
+    /// would only see its own lock). A lock held for another database is no
+    /// proof, and the guard runs as usual. [`Fence::allow_newer`] never lifts
+    /// the guard.
+    pub serving: Option<&'a ServeLock>,
 }
 
 /// The idle pooled readers, the count of overflow readers open now, and the
@@ -150,15 +164,24 @@ fn check_fence<P: Into<Part> + Copy>(
     conn: &Connection,
     parts: &[P],
     fence: Fence<'_>,
-    db: &str,
+    db: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let mut known: Vec<&str> = parts.iter().map(|p| (*p).into().name).collect();
+    let names: Vec<&str> = parts.iter().map(|p| (*p).into().name).collect();
+    let mut known = names.clone();
     known.extend_from_slice(fence.also_known);
     let unknown = schema::unknown_parts(conn, &known)?;
-    if unknown.is_empty() || fence.allow_newer {
-        return Ok(unknown);
+    if !unknown.is_empty() && !fence.allow_newer {
+        return Err(schema::NewerSchema { db: db.display().to_string(), unknown }.into());
     }
-    Err(schema::NewerSchema { db: db.to_string(), unknown }.into())
+    let pending = schema::unrecorded_parts(conn, &names)?;
+    if !pending.is_empty() {
+        let serving_this =
+            fence.serving.is_some_and(|l| lock::canonical_db_path(db).is_ok_and(|p| p == l.database()));
+        if !serving_this {
+            lock::refuse_if_served(db, &pending)?;
+        }
+    }
+    Ok(unknown)
 }
 
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
@@ -190,9 +213,8 @@ impl Db {
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
         let mut ignored = Vec::new();
-        let name = path.display().to_string();
         schema::apply_checked(&mut writer, parts, &mut |c| {
-            ignored = check_fence(c, parts, fence, &name)?;
+            ignored = check_fence(c, parts, fence, path)?;
             Ok(())
         })?;
         crate::ledger::check_hash_form(&writer)?;
@@ -508,10 +530,45 @@ mod tests {
         let path = dir.path().join("hub.db");
         drop(Db::open(&path, &[PART, NEWER]).unwrap());
         let db =
-            Db::open_with(&path, &[PART], Fence { also_known: &["newer.v1"], allow_newer: false }).unwrap();
+            Db::open_with(&path, &[PART], Fence { also_known: &["newer.v1"], ..Fence::default() }).unwrap();
         assert!(db.ignored_newer_parts().is_empty());
         // And a new file has nothing recorded yet.
         Db::open(&dir.path().join("fresh.db"), &[PART]).unwrap();
+    }
+
+    /// `flock` locks belong to the open file, so a `ServeLock` taken here
+    /// stands for another process holding it.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_open_refuses_to_migrate_while_another_holder_has_the_serve_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        // No serve: a new database migrates.
+        drop(Db::open(&path, &[PART]).unwrap());
+        let serve = ServeLock::acquire(&path).unwrap();
+        // A no-op open beside the serve works.
+        drop(Db::open(&path, &[PART]).unwrap());
+        // A migration is refused before it applies anything, override or not.
+        for fence in [Fence::default(), Fence { allow_newer: true, ..Fence::default() }] {
+            let err = Db::open_with(&path, &[PART, LATER], fence).err().expect("refused").to_string();
+            assert!(err.contains("a running `ua serve` holds the database"), "{err}");
+            assert!(err.contains("[later.v1]"), "{err}");
+        }
+        assert_eq!(part_names(&Db::open(&path, &[PART]).unwrap()), ["pool_test.v1"]);
+        // A lock held for another database is no proof.
+        let other = ServeLock::acquire(&dir.path().join("other.db")).unwrap();
+        let wrong = Fence { serving: Some(&other), ..Fence::default() };
+        assert!(Db::open_with(&path, &[PART, LATER], wrong).is_err());
+        // The serving process, with its own lock as proof, migrates.
+        let mine = Fence { serving: Some(&serve), ..Fence::default() };
+        let db = Db::open_with(&path, &[PART, LATER], mine).unwrap();
+        assert_eq!(part_names(&db), ["later.v1", "pool_test.v1"]);
+        drop((db, serve));
+        // With the serve gone, a plain open migrates again.
+        assert_eq!(
+            part_names(&Db::open(&path, &[PART, LATER, NEWER]).unwrap()),
+            ["later.v1", "newer.v1", "pool_test.v1"]
+        );
     }
 
     #[test]

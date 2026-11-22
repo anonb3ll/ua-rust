@@ -193,11 +193,8 @@ transaction of the migration, before the tracking table is created or any
 part is applied: no other process can record a part between the check and
 the apply, and a refused open applies nothing. (The connection setup before
 it sets `journal_mode = WAL`, which converts a database file not yet in WAL
-mode; every database `ua` creates already is.) A process that is already
-running is not re-checked: an older-build `ua mcp` session started before
-the upgrade keeps writing until it exits, so stop every hub process before
-upgrading. The refusal names the unknown parts, says a newer build wrote
-the database and what to do:
+mode; every database `ua` creates already is.) The refusal names the
+unknown parts, says a newer build wrote the database and what to do:
 
 ```text
 Error: the database /path/to/ua.db was written by a newer build: it records schema parts this build does not know ([future.v9]). This build refuses to open it for serving or writing, ...
@@ -244,6 +241,53 @@ refuses it until the override is set: each step asks for its own consent.
 The ledger's `hash_v` rollback fence (`docs/organization.md`) is separate
 and not lifted by the override.
 
+**Processes already running.** The fence checks a database when a
+process opens it, and a running process is not re-checked. Two cases are
+covered anyway:
+
+- An *older* build's command started beside a newer `ua serve` (or after a
+  newer build migrated) opens the database after the migration, so the
+  fence refuses it if that build has the fence.
+- A *newer* build's command beside an *older* running `ua serve`: before an
+  open that would apply at least one part the database does not record yet
+  (a real migration; an open with nothing to apply is unaffected, so
+  everyday use beside a serve of the same build keeps working), every
+  open of the database file except the serving process's own probes the
+  serve lock and refuses if another process holds it, before applying
+  anything:
+
+  ```text
+  Error: a running `ua serve` holds the database /path/to/ua.db: this command would migrate it (apply the schema parts [...]) underneath that serve, which may be from a build that does not know them. Stop the running `ua serve`, or upgrade it to this build, first; then retry
+  ```
+
+  The recovery override does not lift this. `ua serve` migrates at startup
+  under its own lock, as before. The probe is a non-blocking shared lock on
+  `<db>.serve.lock`, taken inside the migration transaction and released at
+  once. A `ua serve` that starts in the same instant as the probe waits and
+  retries its lock for a quarter of a second, so the probe does not make it
+  fail. What remains: a serve that starts just after the probe is not seen by
+  it; that serve opens the database after the migration's first transaction
+  has committed (and, should a migration ever include a step that commits on
+  its own, possibly between steps), so the fence decides whether it runs.
+  The guard is part of the store's open (`ua_store::Db::open`, and so
+  `Hub::open` and `Hub::open_with`), so a program that embeds the hub gets
+  it by default. The only way to skip it is to show the held serve lock of
+  that same database (`ua_store::Fence::serving`, or `Hub::open_serving`),
+  which only the process that took that lock can do; `ua serve` does
+  exactly that. An embedding program that serves inbound traffic must take
+  `ua_store::ServeLock` itself before it opens the hub, and open it with
+  `Hub::open_serving`. After the `ua` binary is replaced in place under a running
+  older serve, commands that serve starts (and anything else that runs the
+  new `ua`) are refused a migration until the serve is restarted on the new
+  build: that is the guard working.
+
+Not covered: a running process of an older build that is not `ua serve`
+(an older `ua mcp` session, for example) keeps writing after a newer
+build migrates; a running `ua serve` from a build before this guard is
+still detected (it holds the serve lock), but one from before the serve
+lock is not; and on a platform without `flock` (not Unix) no running serve
+can be detected. Stop every hub process before upgrading.
+
 **What the fence cannot stop.** It works only in builds that contain it,
 and it refuses only parts added after it. Every build from before this
 change opens an upgraded database and ignores the parts it does not know.
@@ -278,10 +322,11 @@ a link meets the same lock as the created one) and `.` and `..` resolved.
 The longest part of that path that exists is then given its on-disk
 spelling, so on a file system that ignores letter case (the macOS default)
 an existing file or directory yields one spelling however it is typed.
-Every spelling of one database file gives one lock file. Two limits: on a
-file system that ignores case, two spellings that differ only in case of a
-database (or directory) that does not exist yet can get two locks until it
-exists; and hard links are not resolved, so two hard links to one file are
+Every spelling of one database file gives one lock file. Parts of the path
+that do not exist yet keep the case they were typed in, but that is no gap:
+the lock files live in the database's own directory, so on a file system
+that ignores case two lock names that differ only in case are one file.
+One limit: hard links are not resolved, so two hard links to one file are
 two databases to the lock. Do not reach a database through two hard links at
 all; SQLite's `-wal` and `-shm` files are per name, so that is unsafe
 without any `ua` involved.
@@ -298,7 +343,9 @@ running an import or restore with the new build.
 Both lock files are owner-only (`0600`), so another local account cannot
 hold them: a new one is created so, and an existing one with a wider mode is
 tightened when a lock is taken (best effort: a file another account owns
-keeps its mode, and the lock is still taken). The operating system releases a lock when the process
+keeps its mode, and the lock is still taken). A lock file is opened without
+following a symbolic link: one planted in its place refuses the lock
+instead of having its target's mode changed. The operating system releases a lock when the process
 exits, a crash or `SIGKILL` included, so there is nothing to clean up: the
 file stays and is harmless. Only `ua serve` takes the serve lock. `ua mcp`,
 `ua call`, `ua tools`, `ua token`, `ua backup` and `ua doctor` run beside a
@@ -312,7 +359,9 @@ data volume.
 On a platform without `flock` (not Unix) nothing is locked: a second
 `ua serve` is NOT refused there, and `ua` prints a warning saying so. The
 lock is taken by the `ua` command. A program that embeds `ua-server` and
-calls `serve_http` itself must take `ua_import::ServeLock` first.
+calls `serve_http` itself must take `ua_store::ServeLock` first (also
+reachable as `ua_import::ServeLock`) and open the hub with
+`Hub::open_serving`; its other opens get the migration guard by default.
 
 ### Shutdown
 

@@ -26,9 +26,19 @@ pub const ALLOW_NEWER_SCHEMA_ENV: &str = "UA_ALLOW_NEWER_SCHEMA";
 /// Open a hub database with the unknown-part fence: refuse a database that
 /// records a part this build does not know ([`crate::known_schema_part_names`]),
 /// unless `allow_newer`, which opens it and logs a warning naming the parts.
-pub fn open_db(path: &std::path::Path, parts: &[ua_store::Part], allow_newer: bool) -> anyhow::Result<Db> {
+///
+/// It also runs the migration guard ([`ua_store::Fence`]): an open that would
+/// apply a part the database does not record yet is refused while another
+/// process holds the database's serve lock. `serving` is the only way to skip
+/// that: the caller's own held [`ua_store::ServeLock`] for this database.
+pub fn open_db(
+    path: &std::path::Path,
+    parts: &[ua_store::Part],
+    allow_newer: bool,
+    serving: Option<&ua_store::ServeLock>,
+) -> anyhow::Result<Db> {
     let known = crate::known_schema_part_names();
-    let db = Db::open_with(path, parts, ua_store::Fence { also_known: &known, allow_newer })?;
+    let db = Db::open_with(path, parts, ua_store::Fence { also_known: &known, allow_newer, serving })?;
     let ignored = db.ignored_newer_parts();
     if !ignored.is_empty() {
         tracing::warn!(
@@ -52,15 +62,31 @@ pub fn open_db(path: &std::path::Path, parts: &[ua_store::Part], allow_newer: bo
 
 impl Hub {
     /// Open the hub database described by `cfg`, applying every schema part.
-    /// A database written by a newer build is refused ([`open_db`]).
+    /// A database written by a newer build is refused ([`open_db`]), and so is
+    /// a migration (an open that would apply a part the database does not
+    /// record yet) while another process holds the database's serve lock: a
+    /// running `ua serve`. Every caller but the serving process uses this (or
+    /// [`Hub::open_with`]); an open with nothing to apply is never refused by
+    /// the guard.
     pub fn open(cfg: Config) -> anyhow::Result<Self> {
         Self::open_with(cfg, false)
     }
 
     /// [`Hub::open`], opening a database written by a newer build anyway when
-    /// `allow_newer` (recovery only; logged).
+    /// `allow_newer` (recovery only; logged). The migration guard still runs.
     pub fn open_with(cfg: Config, allow_newer: bool) -> anyhow::Result<Self> {
-        let db = open_db(&cfg.db_path(), &crate::schema_parts(), allow_newer)?;
+        let db = open_db(&cfg.db_path(), &crate::schema_parts(), allow_newer, None)?;
+        Ok(Self::new(cfg, db))
+    }
+
+    /// The open for the process that serves the database (`ua serve`, or a
+    /// program that embeds the server): `serving` is its held serve lock for
+    /// this database, taken before the open, and is the only way to migrate
+    /// without the migration guard's probe (which would see that same lock).
+    /// A lock held for another database is no proof; the guard then runs as
+    /// in [`Hub::open`]. A database written by a newer build is always refused.
+    pub fn open_serving(cfg: Config, serving: &ua_store::ServeLock) -> anyhow::Result<Self> {
+        let db = open_db(&cfg.db_path(), &crate::schema_parts(), false, Some(serving))?;
         Ok(Self::new(cfg, db))
     }
 

@@ -49,7 +49,8 @@ jobs:
       - run: cargo test --workspace --doc
 
   # The hub also runs on macOS, where orphan recovery and the stale-worktree
-  # sweep read processes through proc_pidinfo instead of /proc.
+  # sweep read processes through proc_pidinfo instead of /proc, and where the
+  # file system ignores letter case.
   dispatch-macos:
     runs-on: macos-latest
     steps:
@@ -58,3 +59,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p ua-tools --test dispatch
       - run: cargo test -p ua-tools --lib governance::procscan
+      # The database locks (flock, path resolution, and the case-insensitive
+      # file system macOS uses by default, which Linux CI never sees) and the
+      # schema fence from the command line.
+      - run: cargo test -p ua-store --lib lock -- --nocapture
+      - run: cargo test -p ua-cli --test serve_lock --test schema_fence

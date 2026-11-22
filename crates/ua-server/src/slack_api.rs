@@ -19,7 +19,7 @@
 //!    app's bot (`authorizations[].is_bot`), and events an app wrote or that
 //!    were edited (`bot_id`, `subtype`, `app_id`, `bot_profile`, `edited`)
 //!    are acknowledged and ignored, with no state.
-//! 4. One write transaction ([`slack::admit`]) records the signature (a
+//! 4. One write transaction ([`slack::admit_claimed`]) records the signature (a
 //!    replay is a 401), maps (`team_id`, `user_id`) to a hub identity through
 //!    `slack_identities`, dedupes on the trigger id or event id, and ledgers
 //!    the outcome. A request with no mapped identity adds no ledger row (any
@@ -29,7 +29,8 @@
 //! 5. Slack gets its answer (well inside its 3 seconds); the command then
 //!    runs on a tracked task through [`ua_tools::Registry::call`] as the
 //!    mapped identity, the same governed path as every other caller, and its
-//!    outcome is ledgered ([`slack::record_executed`]). A slash command's
+//!    outcome is ledgered ([`slack::record_executed_under`], with the claim
+//!    the admission took). A slash command's
 //!    result is posted to its `response_url` when that is
 //!    `https://hooks.slack.com/...` ([`slack::response_url`]).
 //!
@@ -168,7 +169,7 @@ pub(crate) enum Admitted {
 }
 
 /// Step 4, then the answer, for both transports: one admission transaction
-/// ([`slack::admit_keyed`]), then the command on a tracked task as the mapped
+/// ([`slack::admit_claimed`]), then the command on a tracked task as the mapped
 /// human. The answer is a fixed sentence (never the body or anything from the
 /// hub but the mapped identity).
 pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request) -> Admitted {
