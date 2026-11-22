@@ -65,5 +65,6 @@ organization.v1.ingress
 github.inbound.v1.copy
 slack.inbound.v1.copy
 import.v1
+organization.v1.tools.code
 deliverables.v1
 organization.v1.deliverables

@@ -24,6 +24,56 @@ async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) 
     reg.call(hub, who, tool, args).await.unwrap_or_else(|e| panic!("{tool} failed: {e}"))
 }
 
+#[tokio::test]
+async fn ledger_paginates_the_callers_visible_message_rows() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let session =
+        call(&reg, &hub, &recipient, "session_start", json!({ "kind": "interactive" })).await["session_id"]
+            .clone();
+    let first = call(&reg, &hub, &observer, "task_add", json!({ "title": "First task" })).await;
+    for (to_session, body) in [(Value::Null, "Label message"), (session, "Session message")] {
+        call(
+            &reg,
+            &hub,
+            &sender,
+            "message_send",
+            json!({ "act": "inform", "to_agent": recipient.label, "to_session": to_session, "body": body }),
+        )
+        .await;
+    }
+    let last = call(&reg, &hub, &observer, "task_add", json!({ "title": "Second task" })).await;
+
+    for (who, expected) in [
+        (sender, json!(["Label message", "Session message"])),
+        (recipient, json!(["Label message"])),
+        (observer.clone(), json!([])),
+        (
+            Caller { kind: ActorKind::Human, profile: Profile::Operator, ..agent("operator") },
+            json!(["Label message", "Session message"]),
+        ),
+        (Caller::local("local", Transport::Stdio), json!(["Label message", "Session message"])),
+    ] {
+        let rows =
+            call(&reg, &hub, &who, "event_log_query", json!({ "channel_prefix": "agent.message." })).await;
+        let bodies: Vec<_> =
+            rows["events"].as_array().unwrap().iter().map(|row| &row["payload"]["body"]).collect();
+        assert_eq!(json!(bodies), expected, "{}", who.label);
+    }
+
+    let channels = json!(["agent.task.created", "agent.message.inform"]);
+    let forward = |after| json!({ "channels": channels, "limit": 1, "after_seq": after });
+    let first_page = call(&reg, &hub, &observer, "event_log_query", forward(json!(0))).await;
+    assert_eq!(first_page["events"][0]["payload"]["task_id"], first["id"]);
+    let second_page =
+        call(&reg, &hub, &observer, "event_log_query", forward(first_page["next_after_seq"].clone())).await;
+    assert_eq!(second_page["events"][0]["payload"]["task_id"], last["id"]);
+    let recent =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 2 })).await;
+    assert_eq!(recent["events"], json!([first_page["events"][0], second_page["events"][0]]));
+}
+
 fn exec(hub: &Hub, sql: &str) {
     let sql = sql.to_string();
     hub.db()

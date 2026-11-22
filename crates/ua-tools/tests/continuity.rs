@@ -1108,6 +1108,8 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     for who in [researcher(), other(), unverified()] {
         let e = h.act_err(&who, "session_handoff_recover", params.clone()).await;
         assert_eq!(e.code(), "not_found", "{} {e:?}", who.label);
+        let packet = h.ok(&who, "session_packet", params.clone()).await;
+        assert_eq!(packet["handoff_note"], Value::Null, "{}", who.label);
     }
     // The same answer as for a session that does not exist.
     let e = h.act_err(&other(), "session_handoff_recover", json!({ "session_id": "no-such" })).await;
@@ -1116,6 +1118,8 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     for who in [builder(), human(), lifecycle_op()] {
         let r = h.act_ok(&who, "session_handoff_recover", params.clone()).await;
         assert_eq!(r["note"]["id"], id, "{}", who.label);
+        let packet = h.ok(&who, "session_packet", params.clone()).await;
+        assert_eq!(packet["handoff_note"], r["note"], "{}", who.label);
     }
     // The receiver of an assigned note may read it.
     h.sql(&format!(
@@ -1123,6 +1127,8 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     ));
     let r = h.act_ok(&other(), "session_handoff_recover", params.clone()).await;
     assert_eq!(r["note"]["id"], id);
+    let packet = h.ok(&other(), "session_packet", params.clone()).await;
+    assert_eq!(packet["handoff_note"], r["note"]);
     assert_eq!(h.act_err(&outsider(), "session_handoff_recover", params).await.code(), "not_found");
 }
 
