@@ -230,6 +230,41 @@ impl ServeLock {
     }
 }
 
+/// Refuse when another process holds the serve lock of `db_path`: a running
+/// `ua serve`. Called by a command that is not the serving process before it
+/// applies schema parts the database does not record yet (`pending`), so a
+/// newer build never migrates the database underneath an older running serve.
+///
+/// The probe is a non-blocking shared `flock` on the serve lock file, released
+/// at once; a missing lock file means no serve ever ran there. While it is
+/// held (microseconds), a `ua serve` starting at that instant is refused as if
+/// another serve held the database, and a serve that starts just after it is
+/// not seen; that one opens the database after the migration (the migration
+/// transaction is still open), so the fence, not this guard, decides whether
+/// it may run. Not the serving process itself: `flock` locks belong to the
+/// open file, so a process probing a lock it holds would see itself.
+pub fn refuse_if_served(db_path: &Path, pending: &[String]) -> anyhow::Result<()> {
+    let db = canonical_db_path(db_path)?;
+    let path = serve_lock_path(&db)?;
+    let file = match OpenOptions::new().read(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("opening lock file {}", path.display())),
+    };
+    let unsupported = "a running `ua serve` cannot be detected before a migration on this platform";
+    if try_lock(&file, false, &path, unsupported)? {
+        // Released when `file` drops, here.
+        return Ok(());
+    }
+    bail!(
+        "a running `ua serve` holds the database {}: this command would migrate it (apply the schema parts [{}]) \
+         underneath that serve, which may be from a build that does not know them. Stop the running `ua serve`, \
+         or upgrade it to this build, first; then retry",
+        db.display(),
+        pending.join(", ")
+    )
+}
+
 #[cfg(unix)]
 fn try_lock(file: &File, exclusive: bool, _path: &Path, _unsupported: &str) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd;
@@ -448,6 +483,24 @@ mod tests {
         for p in [lock_path(&db), serve_lock_path(&db).unwrap()] {
             assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "{}", p.display());
         }
+    }
+
+    #[test]
+    fn a_migration_is_refused_while_a_serve_holds_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let pending = vec!["new.v1".to_string()];
+        // No serve ever ran: no lock file, nothing to refuse.
+        refuse_if_served(&db, &pending).unwrap();
+        assert!(!serve_lock_path(&db).unwrap().exists(), "the probe creates nothing");
+        let serve = ServeLock::acquire(&db).unwrap();
+        let err = refuse_if_served(&db, &pending).unwrap_err().to_string();
+        assert!(err.contains("a running `ua serve` holds the database"), "{err}");
+        assert!(err.contains("[new.v1]") && err.contains("Stop the running `ua serve`"), "{err}");
+        drop(serve);
+        refuse_if_served(&db, &pending).unwrap();
+        // The probe released at once: a serve can start right after it.
+        ServeLock::acquire(&db).unwrap();
     }
 
     #[test]

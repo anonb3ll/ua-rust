@@ -37,7 +37,7 @@
 mod lock;
 mod map;
 
-pub use lock::{HubLock, ServeLock, canonical_db_path, lock_path, serve_lock_path};
+pub use lock::{HubLock, ServeLock, canonical_db_path, lock_path, refuse_if_served, serve_lock_path};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

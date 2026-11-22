@@ -338,7 +338,14 @@ redelivers stale rows processes the next copy anyway.
   version has been released) is refused by nothing. Never run a build older
   than this change against a database a newer build has opened, and do not
   downgrade past the inbound table while either endpoint takes traffic;
-  restore a backup taken before the upgrade instead.
+  restore a backup taken before the upgrade instead. Running processes are
+  not re-checked by the fence, but an *older* build's command opened beside
+  a newer serve is refused by the fence when that build has it, and a
+  *newer* build's command that would migrate the database underneath an
+  older running `ua serve` is refused because that serve holds the serve
+  lock (`docs/operations.md`, "Processes already running"). A serve that
+  started before a migration made on a platform without `flock` is not
+  covered.
 
 The table is a tenant table: `org_id NOT NULL` from its first part
 (`ingress.inbound.v1`) and the generated triggers from

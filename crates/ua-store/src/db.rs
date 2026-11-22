@@ -66,7 +66,16 @@ pub struct Fence<'a> {
     /// fence). For recovery only; [`Db::ignored_newer_parts`] names them so the
     /// caller can log it.
     pub allow_newer: bool,
+    /// Called, inside the same transaction and before anything is applied,
+    /// when this open would apply at least one part the database does not
+    /// record yet (a real migration, not a no-op open), with the database path
+    /// and those part names. An error refuses the open. [`Fence::allow_newer`]
+    /// does not lift it.
+    pub before_migrating: Option<MigrationGuard>,
 }
+
+/// See [`Fence::before_migrating`].
+pub type MigrationGuard = fn(&Path, &[String]) -> anyhow::Result<()>;
 
 /// The idle pooled readers, the count of overflow readers open now, and the
 /// pooled readers lost (closed and not yet reopened).
@@ -150,15 +159,22 @@ fn check_fence<P: Into<Part> + Copy>(
     conn: &Connection,
     parts: &[P],
     fence: Fence<'_>,
-    db: &str,
+    db: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let mut known: Vec<&str> = parts.iter().map(|p| (*p).into().name).collect();
+    let names: Vec<&str> = parts.iter().map(|p| (*p).into().name).collect();
+    let mut known = names.clone();
     known.extend_from_slice(fence.also_known);
     let unknown = schema::unknown_parts(conn, &known)?;
-    if unknown.is_empty() || fence.allow_newer {
-        return Ok(unknown);
+    if !unknown.is_empty() && !fence.allow_newer {
+        return Err(schema::NewerSchema { db: db.display().to_string(), unknown }.into());
     }
-    Err(schema::NewerSchema { db: db.to_string(), unknown }.into())
+    if let Some(guard) = fence.before_migrating {
+        let pending = schema::unrecorded_parts(conn, &names)?;
+        if !pending.is_empty() {
+            guard(db, &pending)?;
+        }
+    }
+    Ok(unknown)
 }
 
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
@@ -190,9 +206,8 @@ impl Db {
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
         let mut ignored = Vec::new();
-        let name = path.display().to_string();
         schema::apply_checked(&mut writer, parts, &mut |c| {
-            ignored = check_fence(c, parts, fence, &name)?;
+            ignored = check_fence(c, parts, fence, path)?;
             Ok(())
         })?;
         crate::ledger::check_hash_form(&writer)?;
@@ -508,10 +523,35 @@ mod tests {
         let path = dir.path().join("hub.db");
         drop(Db::open(&path, &[PART, NEWER]).unwrap());
         let db =
-            Db::open_with(&path, &[PART], Fence { also_known: &["newer.v1"], allow_newer: false }).unwrap();
+            Db::open_with(&path, &[PART], Fence { also_known: &["newer.v1"], ..Fence::default() }).unwrap();
         assert!(db.ignored_newer_parts().is_empty());
         // And a new file has nothing recorded yet.
         Db::open(&dir.path().join("fresh.db"), &[PART]).unwrap();
+    }
+
+    fn refuse_migration(_: &Path, pending: &[String]) -> anyhow::Result<()> {
+        anyhow::bail!("refused: would apply [{}]", pending.join(", "))
+    }
+
+    #[test]
+    fn the_migration_guard_runs_only_when_an_open_would_apply_a_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        let guarded = Fence { before_migrating: Some(refuse_migration), ..Fence::default() };
+        // A new database is a migration.
+        let err = Db::open_with(&path, &[PART], guarded).err().expect("refused").to_string();
+        assert!(err.contains("would apply [pool_test.v1]"), "{err}");
+        drop(Db::open(&path, &[PART]).unwrap());
+        // A no-op open does not call it.
+        drop(Db::open_with(&path, &[PART], guarded).unwrap());
+        // One new part: refused before it is applied, the override notwithstanding.
+        let err = Db::open_with(&path, &[PART, LATER], Fence { allow_newer: true, ..guarded })
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("would apply [later.v1]"), "{err}");
+        let db = Db::open(&path, &[PART]).unwrap();
+        assert_eq!(part_names(&db), ["pool_test.v1"]);
     }
 
     #[test]

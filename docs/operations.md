@@ -193,11 +193,8 @@ transaction of the migration, before the tracking table is created or any
 part is applied: no other process can record a part between the check and
 the apply, and a refused open applies nothing. (The connection setup before
 it sets `journal_mode = WAL`, which converts a database file not yet in WAL
-mode; every database `ua` creates already is.) A process that is already
-running is not re-checked: an older-build `ua mcp` session started before
-the upgrade keeps writing until it exits, so stop every hub process before
-upgrading. The refusal names the unknown parts, says a newer build wrote
-the database and what to do:
+mode; every database `ua` creates already is.) The refusal names the
+unknown parts, says a newer build wrote the database and what to do:
 
 ```text
 Error: the database /path/to/ua.db was written by a newer build: it records schema parts this build does not know ([future.v9]). This build refuses to open it for serving or writing, ...
@@ -243,6 +240,40 @@ with `--allow-newer` brings such a database in, and the fence then still
 refuses it until the override is set: each step asks for its own consent.
 The ledger's `hash_v` rollback fence (`docs/organization.md`) is separate
 and not lifted by the override.
+
+**Processes already running.** The fence checks a database when a
+process opens it, and a running process is not re-checked. Two cases are
+covered anyway:
+
+- An *older* build's command started beside a newer `ua serve` (or after a
+  newer build migrated) opens the database after the migration, so the
+  fence refuses it if that build has the fence.
+- A *newer* build's command beside an *older* running `ua serve`: before an
+  open that would apply at least one part the database does not record yet
+  (a real migration; an open with nothing to apply is unaffected, so
+  everyday use beside a serve of the same build keeps working), every
+  command except `ua serve` itself probes the serve lock and refuses if
+  another process holds it, before applying anything:
+
+  ```text
+  Error: a running `ua serve` holds the database /path/to/ua.db: this command would migrate it (apply the schema parts [...]) underneath that serve, which may be from a build that does not know them. Stop the running `ua serve`, or upgrade it to this build, first; then retry
+  ```
+
+  The recovery override does not lift this. `ua serve` migrates at startup
+  under its own lock, as before. The probe is a non-blocking shared lock on
+  `<db>.serve.lock`, taken inside the migration transaction and released at
+  once. What remains: a `ua serve` that starts in the same instant as the
+  probe can be refused as if another serve held the database (start it
+  again), and one that starts just after the probe is not seen by it; that
+  serve opens the database only after the migration commits, so the fence
+  decides whether it runs.
+
+Not covered: a running process of an older build that is not `ua serve`
+(an older `ua mcp` session, for example) keeps writing after a newer
+build migrates; a running `ua serve` from a build before this guard is
+still detected (it holds the serve lock), but one from before the serve
+lock is not; and on a platform without `flock` (not Unix) no running serve
+can be detected. Stop every hub process before upgrading.
 
 **What the fence cannot stop.** It works only in builds that contain it,
 and it refuses only parts added after it. Every build from before this

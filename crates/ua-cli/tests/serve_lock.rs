@@ -162,3 +162,59 @@ fn two_databases_do_not_block_each_other() {
         child.wait().unwrap();
     }
 }
+
+/// Make the database look one part older than this build: `code.v1`'s SQL
+/// is idempotent, so re-applying it is a real (if small) migration.
+fn forget_a_part(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(conn.execute("DELETE FROM schema_parts WHERE name = 'code.v1'", []).unwrap(), 1);
+}
+
+fn records_code_part(db: &Path) -> bool {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row("SELECT count(*) FROM schema_parts WHERE name = 'code.v1'", [], |r| r.get::<_, i64>(0))
+        .unwrap()
+        == 1
+}
+
+#[test]
+fn a_migration_beside_a_running_serve_is_refused_and_serve_migrates_itself() {
+    let home = tempfile::tempdir().unwrap();
+    let db = std::fs::canonicalize(home.path()).unwrap().join("ua.db");
+    let mut serve = spawn_serve(home.path());
+
+    // A no-op open beside the serve (same build, nothing to apply) works.
+    let tools = ua(home.path()).args(["tools", "--names"]).output().unwrap();
+    assert!(tools.status.success(), "{}", String::from_utf8_lossy(&tools.stderr));
+
+    // The serve is now "older": this build would apply a part under it.
+    forget_a_part(&db);
+    for override_on in [false, true] {
+        let mut cmd = ua(home.path());
+        if override_on {
+            cmd.arg("--allow-newer-schema");
+        }
+        let out = cmd.args(["call", "task_list", "{}"]).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("a running `ua serve` holds the database"), "{err}");
+        assert!(err.contains(&db.display().to_string()) && err.contains("[code.v1]"), "{err}");
+        assert!(err.contains("Stop the running `ua serve`"), "{err}");
+    }
+    assert!(!records_code_part(&db), "nothing was applied");
+
+    // With no serve running the same migration goes ahead.
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+    let call = ua(home.path()).args(["call", "task_list", "{}"]).output().unwrap();
+    assert!(call.status.success(), "{}", String::from_utf8_lossy(&call.stderr));
+    assert!(records_code_part(&db));
+
+    // `ua serve` migrates at startup under its own lock.
+    forget_a_part(&db);
+    let mut serve = spawn_serve(home.path());
+    assert!(records_code_part(&db));
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+}
