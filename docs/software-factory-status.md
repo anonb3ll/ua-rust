@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 35 pass, 7 fail, 20 not-built.
+62 checks: 36 pass, 7 fail, 19 not-built.
 
 ### 1. Plan and delegate
 
@@ -109,7 +109,13 @@ from it and may lag behind it.
 | `delegate.task-claimed-with-review-requirement` | pass | Recorded, not enforced: the implementer records the expected review; nothing gates on it (see `release.requires-review-at-head`). |
 | `delegate.handoff-tied-to-revision` | pass | |
 | `delegate.session-handoff-sealed` | pass | |
-| `delegate.deliverable-revision-object` | not-built | No deliverable record: the revision is a commit SHA repeated on the workflow record, the checks and the handoff. |
+| `delegate.deliverable-revision-object` | pass | |
+
+The first harness records its change as revision 1 of the task's commit
+deliverable (`deliverable_create`, `deliverable_revise`, see
+[deliverables](deliverables.md)); the check reads the revision row, its
+`agent.deliverable.revised` ledger event and the task's workflow head. The
+handoff and the checks still name the commit itself, not the revision.
 
 ### 2. Resume and review
 

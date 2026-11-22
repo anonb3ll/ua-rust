@@ -205,6 +205,22 @@ from its commit history.
   table that carries its organization key does not name `org_id`, in any
   crate's non-test source or any trigger body. It cannot see a table name
   built at run time, nor check what an `INSERT … SELECT` supplies.
+- Crate `ua-deliverables` and the tools `deliverable_create`,
+  `deliverable_revise`, `deliverable_get` and `deliverable_list`
+  (`docs/deliverables.md`): a task's deliverable and its immutable, ordered
+  revisions. For the `commit` kind a revision is the full 40-hex commit SHA
+  in the task's project's bound repository; recording one also sets the
+  task's workflow head through the workflow record's own write, so checks
+  are graded there. The writers are the workflow record's writers (the
+  `reviewer` profile does not see the write tools). Tables `deliverables`
+  and `deliverable_revisions` carry `org_id` and the organization triggers
+  from their first parts (`deliverables.v1`, `organization.v1.deliverables`);
+  triggers keep revisions immutable and in order. Events
+  `agent.deliverable.created` and `agent.deliverable.revised` carry ids and
+  the revision identity, no content. The scenario check
+  `delegate.deliverable-revision-object` passes. `/api/work-products*` still
+  answers 501. `ua_org::authz::require_same_org` exposes the organization
+  check every authority check applies.
 - Refusals in the audit record (`docs/policy.md#approvals-in-the-audit-record`):
   a gated call refused because of its approval state appends one
   `agent.approval.refused` ledger event with a reason (`expired`,

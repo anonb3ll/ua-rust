@@ -3,8 +3,8 @@
 //!
 //! A stream is opened with one governed `event_log_query` call as the
 //! caller, so the profile, policy and decision row apply exactly as they do
-//! to the tool. Every row it then sends, live or backfilled, passes the same
-//! [`EventScope`] the tool applies.
+//! to the tool. Live and backfilled rows share the tool's channel filters
+//! and mailbox visibility.
 //!
 //! The caller stays authorized only while it would still be let in: every
 //! [`RECHECK_EVERY`], and soon after a token-revoked, logout,
@@ -54,7 +54,7 @@ use tokio::time::{Interval, MissedTickBehavior};
 use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, UaResult};
 use ua_store::ledger::Event;
-use ua_tools::families::events::EventScope;
+use ua_tools::families::events::{EventReader, EventScope};
 use ua_tools::policy::{self, Policy, RuleKind, Verdict};
 
 use crate::AppState;
@@ -204,7 +204,7 @@ impl StreamAuth {
                 None => return Err("credential_invalid"),
             },
         };
-        if id.label != self.label {
+        if id.label != self.label || id.kind != self.kind {
             return Err("identity_changed");
         }
         let caller = caller_for(state, &id, self.session_key.clone(), self.transport);
@@ -291,6 +291,7 @@ fn without_throttles(policy: &Policy) -> Cow<'_, Policy> {
 struct Cursor {
     state: AppState,
     scope: EventScope,
+    reader: EventReader,
     auth: Arc<StreamAuth>,
     /// The stream was admitted through an approval.
     admitted_gated: bool,
@@ -323,11 +324,13 @@ impl Cursor {
         admitted_gated: bool,
         rx: broadcast::Receiver<Event>,
         start: i64,
+        caller: &Caller,
     ) -> Self {
         let mut recheck =
             tokio::time::interval_at(tokio::time::Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
         recheck.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
+            reader: EventReader::new(state.hub.cfg(), caller),
             state,
             scope,
             auth: Arc::new(auth),
@@ -403,8 +406,8 @@ impl Cursor {
         let mut pos = after;
         let mut read = 0usize;
         loop {
-            let (scope, page) = (self.scope.clone(), self.page);
-            let rows = self.state.hub.db().read_async(move |c| scope.read_after(c, pos, page)).await;
+            let (scope, reader, page) = (self.scope.clone(), self.reader.clone(), self.page);
+            let rows = self.state.hub.db().read_async(move |c| scope.read_after(c, &reader, pos, page)).await;
             match rows {
                 Ok(rows) => {
                     let n = rows.len();
@@ -464,6 +467,14 @@ impl Cursor {
         }
     }
 
+    async fn can_see(&self, event: &Event) -> UaResult<bool> {
+        if !EventReader::needs_visibility_check(event) {
+            return Ok(true);
+        }
+        let (reader, seq) = (self.reader.clone(), event.seq);
+        self.state.hub.db().read_async(move |c| reader.includes(c, seq)).await
+    }
+
     async fn next(mut self) -> Option<(StreamItem, Self)> {
         loop {
             if let Some(item) = self.queue.pop_front() {
@@ -484,6 +495,15 @@ impl Cursor {
                     Ok(ev) => {
                         if AUTH_CHANNELS.contains(&ev.channel.as_str()) {
                             self.schedule_recheck();
+                        }
+                        match self.can_see(&ev).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "event stream visibility check failed");
+                                self.revoke("visibility_check_failed");
+                                continue;
+                            }
                         }
                         self.close_gap(ev.seq);
                         if self.accept(ev.seq) && self.scope.matches(&ev) {
@@ -560,7 +580,7 @@ pub async fn open(
         .read_async(|c| Ok(c.query_row("SELECT COALESCE(MAX(seq), 0) FROM event_log", [], |r| r.get(0))?))
         .await?;
     let start = resume_after.map_or(end, |n| n.min(end));
-    let mut cursor = Cursor::new(state.clone(), scope, auth, admitted_gated, rx, start);
+    let mut cursor = Cursor::new(state.clone(), scope, auth, admitted_gated, rx, start, caller);
     if resume_after.is_some() && start < end {
         cursor.backfill(start).await;
     }
@@ -608,7 +628,16 @@ mod tests {
 
     fn cursor(state: &AppState, start: i64) -> Cursor {
         let scope = EventScope { channels: None, channel_prefix: Some("test.keep".into()) };
-        let mut c = Cursor::new(state.clone(), scope, local_auth(), false, state.hub.db().subscribe(), start);
+        let caller = Caller::local("local", Transport::Http);
+        let mut c = Cursor::new(
+            state.clone(),
+            scope,
+            local_auth(),
+            false,
+            state.hub.db().subscribe(),
+            start,
+            &caller,
+        );
         c.page = 10;
         c.cap = 30;
         c
@@ -657,7 +686,8 @@ mod tests {
             ..local_auth()
         };
         let scope = EventScope::default();
-        let c = Cursor::new(state.clone(), scope, auth, false, state.hub.db().subscribe(), 0);
+        let caller = Caller::local("local", Transport::Http);
+        let c = Cursor::new(state.clone(), scope, auth, false, state.hub.db().subscribe(), 0, &caller);
         append(&state, "agent.token.revoked");
         append(&state, "test.keep");
         let (item, c) = tokio::time::timeout(Duration::from_secs(5), c.next())

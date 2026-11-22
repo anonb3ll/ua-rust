@@ -323,7 +323,7 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
                    AND (?2 OR i.sender = ?3 OR (i.recipient = ?3 AND \
                        (i.target_session IS NULL OR i.target_session = ?4))) \
                  ORDER BY i.event_seq DESC LIMIT 1",
-                params![t, may_read_all_mail(ctx), who, own_session],
+                params![t, may_read_all_mail(ctx.hub.cfg(), &ctx.caller), who, own_session],
                 |r| {
                     let payload: Option<String> = r.get(3)?;
                     let payload: Value =

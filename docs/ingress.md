@@ -471,6 +471,10 @@ every workspace crate except `ua-ingress` and counts, per crate:
   record: a table whose name contains `deliver`, `seen`, `replay`,
   `dedup`, `webhook` or `envelope`, or which has a column named
   `delivery_id`, `envelope_id`, `event_id`, `trigger_id` or `request_sha`.
+  The word `deliverable` (a task's work product, `ua-deliverables`) is
+  removed from a name before the marks are looked for, so `deliverables`
+  and `deliverable_revisions` match no mark, while a name that also holds
+  a real mark (`deliverable_deliveries`) still does.
   Checked against every table in the tree, the rule matches the four
   delivery tables and nothing else (`idempotency_keys` and
   `dispatch_receipts` match no mark). A table that records deliveries
