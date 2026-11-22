@@ -70,9 +70,9 @@ const BASELINE: &[(&str, &str, usize)] = &[
     // bind or host checks in `observability.rs` (2) and `vault/obsidian.rs`
     // (1).
     ("ua-tools", "inline_address_check", 11),
-    // `github::client`, `mcp::gateway`, `notify`, `vault::obsidian`
-    // (`web::http_client` is gone: its consumers use `Outbound`).
-    ("ua-tools", "client_builder", 4),
+    // `mcp::gateway`, `notify`, `vault::obsidian` (`web::http_client` and
+    // `github::client` are gone: their consumers use `Outbound`).
+    ("ua-tools", "client_builder", 3),
     // `github_deliveries`, `github_delivery_bodies` (github/mod.rs) and
     // `slack_seen_signatures`, `slack_seen_deliveries` (slack.rs).
     ("ua-tools", "delivery_table", 4),
@@ -487,5 +487,35 @@ fn drift_is_reported_both_ways() {
         assert!(
             found.iter().any(|l| l == &format!("{k} {c}: 0, below the baseline {n}; lower BASELINE to 0"))
         );
+    }
+}
+
+/// Policies that relax a default for one consumer, with the only file
+/// outside `ua-ingress` that may name each (by constant or by name).
+/// `github.enterprise` admits private networks for the operator's
+/// `github_api_url`; never for a URL a caller supplies.
+const EXCEPTION_POLICIES: &[(&str, &str, &str)] =
+    &[("GITHUB_ENTERPRISE", "\"github.enterprise\"", "ua-tools/src/families/github/client.rs")];
+
+/// Relaxations that only `ua-ingress` itself may write.
+const RELAXATIONS: &[&str] = &["OperatorConfigured"];
+
+#[test]
+fn relaxed_policies_stay_with_their_one_consumer() {
+    let files = sources();
+    for (path, src) in &files {
+        if crate_of(path) == "ua-ingress" {
+            continue;
+        }
+        let code = without_tests(src);
+        let shown = path.to_string_lossy();
+        for r in RELAXATIONS {
+            assert!(!code.contains(r), "{shown} names {r}: only ua_ingress::policy may use it");
+        }
+        for (constant, name, home) in EXCEPTION_POLICIES {
+            let names_it = find_all(&code, constant).any(|at| !continues_ident(&code, at + constant.len()))
+                || without_tests_raw(src).contains(name);
+            assert!(!names_it || shown.ends_with(home), "{shown} names {constant}; only {home} may");
+        }
     }
 }

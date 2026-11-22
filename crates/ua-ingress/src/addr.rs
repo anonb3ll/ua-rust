@@ -89,6 +89,23 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+/// A private-network address: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`,
+/// `192.168.0.0/16`), the shared address space `100.64.0.0/10` (where
+/// carrier-grade NAT and mesh VPNs number hosts), IPv6 unique local
+/// `fc00::/7`, and the IPv4-mapped form of the IPv4 ranges. Loopback,
+/// link-local (cloud metadata), multicast, documentation and reserved
+/// addresses are not private networks.
+pub fn is_private_network(ip: IpAddr) -> bool {
+    let v4 = |v4: Ipv4Addr| {
+        let o = v4.octets();
+        v4.is_private() || (o[0] == 100 && (o[1] & 0xC0) == 64)
+    };
+    match ip {
+        IpAddr::V4(a) => v4(a),
+        IpAddr::V6(a) => (a.segments()[0] & 0xfe00) == 0xfc00 || a.to_ipv4_mapped().is_some_and(v4),
+    }
+}
+
 /// The IPv4 destination an IPv6 address stands for (mapped, compatible,
 /// translated, NAT64 and 6to4 forms).
 pub fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -209,6 +226,44 @@ mod tests {
 
     fn reason(s: &str) -> Option<&'static str> {
         non_public_reason(s.parse().unwrap_or_else(|_| panic!("{s} is not an address")))
+    }
+
+    #[test]
+    fn private_networks() {
+        for yes in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "fc00::1",
+            "fd12:3456::1",
+            "::ffff:10.1.2.3",
+            "::ffff:100.100.1.1",
+        ] {
+            assert!(is_private_network(yes.parse().unwrap()), "{yes}");
+        }
+        for no in [
+            "127.0.0.1",
+            "::1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.18.0.1",
+            "172.32.0.1",
+            "100.128.0.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "64:ff9b::a00:1",
+            "2002:a00:1::",
+            "::10.0.0.1",
+        ] {
+            assert!(!is_private_network(no.parse().unwrap()), "{no}");
+        }
     }
 
     #[test]

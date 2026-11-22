@@ -72,10 +72,13 @@ and has no effect.
 **One host, no redirects.** Every request goes to `github_api_url`, which
 must be `https` without credentials, query or fragment (plain `http` only to
 loopback under the test hook). A 3xx other than 304 is an error and is never
-followed, so the token cannot be forwarded anywhere. For the public API the
-connection goes through the same guarded resolver as `web_fetch`, so a DNS
-answer pointing at a private address is refused; a GHES host is the
-operator's choice and may be private.
+followed, so the token cannot be forwarded anywhere. Requests go through
+`ua_ingress::Outbound` ([ingress](ingress.md#consumers)) with no proxy. The
+public API uses the `github.rest` policy: `api.github.com` only, public
+addresses only, checked when the connection is made and again on its peer.
+Any other base uses `github.enterprise`: a GHES host is the operator's
+choice and may be on a private network or this host, but link-local (cloud
+metadata), multicast, documentation and reserved addresses are refused.
 
 **Bounded.** 20 seconds per request, 8 MiB per response, JSON only. When
 GitHub says the rate limit is spent (`x-ratelimit-remaining: 0`, or a

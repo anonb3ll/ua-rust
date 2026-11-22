@@ -349,6 +349,24 @@ from its commit history.
     the default port (before, only the hard-coded base URL kept it there);
   - Zulip and the relay: nothing beyond the first item. None of these
     follows redirects, before or now.
+- The GitHub REST client (CI check verification, polling, merged pull
+  requests) now goes through `ua_ingress::Outbound`: `github.rest` for
+  `api.github.com`, `github.enterprise` for a GHES root in `github_api_url`
+  (`docs/ingress.md`). Its client is still built once per API base. The
+  host, https, the loopback test hook, no proxy, no redirects (a 3xx is an
+  error), the 8 MiB cap, 20 seconds and its errors are as before. The new
+  address class `OperatorConfigured` (public, loopback and private networks:
+  RFC 1918, `100.64.0.0/10`, `fc00::/7`) serves the GHES case and follows no
+  redirect. Stricter:
+  - a GHES host was not address-checked at all; now a name or address in
+    link-local (cloud metadata), unspecified, multicast, broadcast and
+    reserved, documentation, benchmarking or IETF protocol ranges is
+    refused, at connect time and on the connection's peer. Private and
+    loopback addresses are still reached;
+  - the public API's connection peer is checked again after the response
+    arrives;
+  - a network failure's detail is `ua_ingress`'s message rather than the
+    HTTP library's error chain (it never quotes the URL).
 
 ### Security
 

@@ -41,13 +41,25 @@ pub enum Addresses {
     /// [`addr::Class::Public`] and loopback, nothing else. For a destination
     /// that is deliberately local, and for tests.
     PublicOrLoopback,
+    /// A destination the operator configured (a config value, never a URL a
+    /// caller supplies): [`addr::Class::Public`], loopback and private
+    /// networks ([`addr::is_private_network`]: RFC 1918, `100.64.0.0/10`,
+    /// `fc00::/7`). An operator may run the GitHub Enterprise API or a
+    /// webhook receiver on a private network or on this host. Still refused:
+    /// unspecified, link-local (cloud metadata), multicast, broadcast and
+    /// reserved, documentation, benchmarking and IETF protocol assignments.
+    /// A policy with this class follows no redirect ([`Policy::validate`]):
+    /// a redirect target is chosen by the server, not by the operator.
+    OperatorConfigured,
 }
 
 impl Addresses {
     /// The address class this rule is built on.
     pub fn class(self) -> addr::Class {
         match self {
-            Addresses::Public | Addresses::PublicOrLoopback => addr::Class::Public,
+            Addresses::Public | Addresses::PublicOrLoopback | Addresses::OperatorConfigured => {
+                addr::Class::Public
+            }
             Addresses::GlobalUnicastOnly => addr::Class::GlobalUnicastOnly,
         }
     }
@@ -57,6 +69,12 @@ impl Addresses {
         match addr::reason_in(ip, self.class()) {
             None => Ok(()),
             Some(_) if self == Addresses::PublicOrLoopback && addr::is_loopback(ip) => Ok(()),
+            Some(_)
+                if self == Addresses::OperatorConfigured
+                    && (addr::is_loopback(ip) || addr::is_private_network(ip)) =>
+            {
+                Ok(())
+            }
             Some(reason) => Err(reason),
         }
     }
@@ -165,9 +183,45 @@ pub const ZULIP_API: Policy = Policy {
 /// [`ZULIP_API`] with a 256 KiB body.
 pub const RELAY_GITHUB: Policy = Policy { name: "relay.github", max_body_bytes: 256 * 1024, ..ZULIP_API };
 
+/// The GitHub REST API at `api.github.com` (`github_api_url` left at its
+/// default): https, that one host, public addresses, no redirects, an 8 MiB
+/// body (refused past it), 10 seconds to connect and 20 for the call, body
+/// included.
+pub const GITHUB_REST: Policy = Policy {
+    name: "github.rest",
+    schemes: Schemes::HttpsOnly,
+    hosts: Hosts::Exactly(&["api.github.com"]),
+    default_port_only: false,
+    addresses: Addresses::Public,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    max_body_bytes: 8 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(20),
+    total_timeout: Duration::from_secs(20),
+};
+
+/// A GitHub Enterprise Server API root set in `github_api_url`: as
+/// [`GITHUB_REST`] for any host, with [`Addresses::OperatorConfigured`],
+/// since the operator's server may be on a private network.
+pub const GITHUB_ENTERPRISE: Policy = Policy {
+    name: "github.enterprise",
+    hosts: Hosts::Any,
+    addresses: Addresses::OperatorConfigured,
+    ..GITHUB_REST
+};
+
 /// Every named policy.
-pub const POLICIES: &[&Policy] =
-    &[&SLACK_RESPONSE_URL, &SLACK_WEB_API, &WEB_PAGE, &WEB_SEARCH, &ZULIP_API, &RELAY_GITHUB];
+pub const POLICIES: &[&Policy] = &[
+    &SLACK_RESPONSE_URL,
+    &SLACK_WEB_API,
+    &WEB_PAGE,
+    &WEB_SEARCH,
+    &ZULIP_API,
+    &RELAY_GITHUB,
+    &GITHUB_REST,
+    &GITHUB_ENTERPRISE,
+];
 
 /// The policy called `name`. An unknown name is refused.
 pub fn lookup(name: &str) -> Result<&'static Policy, OutboundError> {
@@ -182,15 +236,20 @@ const MAX_REDIRECTS_CEILING: u8 = 10;
 impl Policy {
     /// The policy under a loopback test hook (`fetch_allow_loopback`, the
     /// Slack test API base): loopback admitted besides public addresses,
-    /// plain http allowed, any host and port. Everything else is unchanged.
-    /// Only test configuration reaches this; TOML and the environment
-    /// cannot set those hooks.
+    /// plain http allowed, any host and port. A class that already admits
+    /// loopback ([`Addresses::OperatorConfigured`]) is kept as it is.
+    /// Everything else is unchanged. Only test configuration reaches this;
+    /// TOML and the environment cannot set those hooks.
     pub const fn loopback_test_hook(self) -> Policy {
+        let addresses = match self.addresses {
+            Addresses::OperatorConfigured => Addresses::OperatorConfigured,
+            _ => Addresses::PublicOrLoopback,
+        };
         Policy {
             schemes: Schemes::HttpOrHttps,
             hosts: Hosts::Any,
             default_port_only: false,
-            addresses: Addresses::PublicOrLoopback,
+            addresses,
             ..self
         }
     }
@@ -211,6 +270,9 @@ impl Policy {
         }
         if self.max_redirects > MAX_REDIRECTS_CEILING {
             return bad("at most 10 redirects");
+        }
+        if self.addresses == Addresses::OperatorConfigured && self.max_redirects > 0 {
+            return bad("an operator-configured destination follows no redirect");
         }
         if let Hosts::Exactly(names) = self.hosts
             && (names.is_empty() || names.iter().any(|n| n.is_empty()))
@@ -297,6 +359,7 @@ mod tests {
             Policy { max_redirects: 11, ..base },
             Policy { hosts: Hosts::Exactly(&[]), ..base },
             Policy { hosts: Hosts::Exactly(&[""]), ..base },
+            Policy { max_redirects: 1, ..GITHUB_ENTERPRISE },
         ] {
             assert!(matches!(bad.validate(), Err(OutboundError::InvalidPolicy { .. })), "{bad:?}");
         }
@@ -344,5 +407,47 @@ mod tests {
         assert!(lo.check_url(&url("http://127.0.0.1/")).is_ok());
         assert!(lo.check_url(&url("http://[::1]/")).is_ok());
         assert!(lo.check_url(&url("http://10.0.0.1/")).is_err(), "loopback admits loopback only");
+    }
+
+    #[test]
+    fn the_operator_class_admits_private_networks_and_nothing_else_extra() {
+        let op = Addresses::OperatorConfigured;
+        for yes in
+            ["8.8.8.8", "127.0.0.1", "::1", "10.1.2.3", "172.16.5.4", "192.168.1.10", "100.64.0.7", "fd00::7"]
+        {
+            assert!(op.check(yes.parse().unwrap()).is_ok(), "{yes}");
+        }
+        for (no, why) in [
+            ("169.254.169.254", "link-local (includes cloud metadata)"),
+            ("fe80::1", "link-local"),
+            ("0.0.0.0", "unspecified"),
+            ("224.0.0.1", "multicast"),
+            ("255.255.255.255", "reserved"),
+            ("192.0.2.1", "documentation"),
+        ] {
+            assert_eq!(op.check(no.parse().unwrap()), Err(why), "{no}");
+        }
+        // The class is only used by policies for operator-set destinations.
+        let users: Vec<&str> = POLICIES
+            .iter()
+            .filter(|p| p.addresses == Addresses::OperatorConfigured)
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(users, ["github.enterprise"]);
+    }
+
+    #[test]
+    fn the_github_policies() {
+        assert!(GITHUB_REST.check_url(&url("https://api.github.com/repos/a/b")).is_ok());
+        assert!(GITHUB_REST.check_url(&url("https://ghe.example.com/api/v3")).is_err());
+        assert!(GITHUB_REST.check_url(&url("http://api.github.com/")).is_err());
+        assert!(GITHUB_ENTERPRISE.check_url(&url("https://ghe.example.com/api/v3")).is_ok());
+        assert!(GITHUB_ENTERPRISE.check_url(&url("https://10.20.30.40/api/v3")).is_ok());
+        assert!(GITHUB_ENTERPRISE.check_url(&url("https://169.254.169.254/")).is_err());
+        assert!(GITHUB_ENTERPRISE.check_url(&url("http://ghe.example.com/")).is_err());
+        // The test hook keeps the operator class (it already admits loopback).
+        let hooked = GITHUB_ENTERPRISE.loopback_test_hook();
+        assert_eq!(hooked.addresses, Addresses::OperatorConfigured);
+        assert!(hooked.check_url(&url("http://127.0.0.1:9/")).is_ok());
     }
 }

@@ -17,7 +17,7 @@ same range tables:
 
 | Class | Functions | Used by |
 |---|---|---|
-| `Class::Public` | `non_public_reason`, `is_public` | `ua_tools::families::web::non_public_reason` (a re-export): the web tools, Zulip, the relay's GitHub client, GitHub REST, Slack replies and Socket Mode; outbound policies with `Addresses::Public` or `PublicOrLoopback` |
+| `Class::Public` | `non_public_reason`, `is_public` | `ua_tools::families::web::non_public_reason` (a re-export): the web tools, Zulip, the relay's GitHub client, GitHub REST, Slack replies and Socket Mode; outbound policies with `Addresses::Public`, `PublicOrLoopback` or `OperatorConfigured` |
 | `Class::GlobalUnicastOnly` | `non_global_unicast_reason`, `is_global_unicast` | `ua_server::oauth::cimd::is_public_ip` (a re-export); outbound policies with `Addresses::GlobalUnicastOnly` |
 
 Refused in both classes:
@@ -52,12 +52,25 @@ refused.
 `ua_ingress::Outbound` is built from a `Policy`, one per destination class.
 A policy fixes the schemes, the hosts (an exact list, or any), whether a
 URL may name a port, the address class a connection may reach (`Public`,
-`GlobalUnicastOnly`, or `PublicOrLoopback`), how many redirects are followed, the response body
+`GlobalUnicastOnly`, `PublicOrLoopback`, or `OperatorConfigured`), how many redirects are followed, the response body
 cap, and three timeouts (connect, one request with its body, the whole
 call). Named policies are constants in `ua_ingress::policy`;
 `Outbound::named` and `policy::lookup` refuse any other name, and a policy
-with an empty host list, a zero or unbounded cap or timeout, or more than
-ten redirects builds no client.
+with an empty host list, a zero or unbounded cap or timeout, more than
+ten redirects, or an operator-configured class that follows redirects
+builds no client.
+
+`Addresses::OperatorConfigured` is for a destination the operator set in
+configuration, never for a URL a caller supplies: the public class plus
+loopback and private networks (`addr::is_private_network`: RFC 1918, the
+shared address space `100.64.0.0/10` that carrier-grade NAT and mesh VPNs
+use, unique local `fc00::/7`, and the IPv4-mapped form of the IPv4 ranges).
+It still refuses unspecified, link-local (cloud metadata), multicast,
+broadcast and reserved, documentation, benchmarking and IETF protocol
+addresses. A policy with this class follows no redirect, since a redirect
+target is the server's choice, not the operator's. Only `ua_ingress::policy`
+names the class, and each policy that uses it is named by one consumer
+file only (`tests/ingress_guard.rs`, `relaxed_policies_stay_with_their_one_consumer`).
 
 Each property is enforced in the crate and has a test there:
 
@@ -325,7 +338,7 @@ category is caught, and that the lookalikes above are not. Baselines:
 | `ua-server` | `direct_dial` | 3 | `slack_socket.rs::connect`: `TcpStream::connect`, the rustls `TlsConnector`, the WebSocket client handshake |
 | `ua-server` | `inline_address_check` | 5 | loopback checks in `oauth/register.rs` (3) and `login.rs` (2) |
 | `ua-cli` | `inline_address_check` | 1 | `ops/doctor.rs`, the bind address |
-| `ua-tools` | `client_builder` | 4 | `github/client`, `mcp/gateway`, `notify`, `vault/obsidian` (`web::http_client` was removed when its consumers moved onto `Outbound`) |
+| `ua-tools` | `client_builder` | 3 | `mcp/gateway`, `notify`, `vault/obsidian` (`web::http_client` and the GitHub REST client were removed when their consumers moved onto `Outbound`) |
 | `ua-tools` | `address_classifier` | 4 | `mcp/scope.rs` `classify`, `classify_v4`; `relay/gates.rs` `v4_kind`, `v6_kind` |
 | `ua-tools` | `inline_address_check` | 11 | loopback URL hosts in `slack.rs`, `zulip.rs`, `github/client.rs`, `harness_config/policy.rs` (2 each); `observability.rs` (2); `vault/obsidian.rs` (1) |
 | `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies` (still created, no longer read or written; dropped one release later), `slack_seen_signatures`, `slack_seen_deliveries`. `inbound_deliveries` is in `ua-ingress` and not counted |
@@ -343,18 +356,21 @@ calls `ua_ingress::addr`, so it no longer counts.
 | `web_search` (DuckDuckGo, Brave, Tavily) | `web.search`: as `web.page`, but a redirect from https to http is refused |
 | Zulip (`zulip_send_message`, `zulip_fetch_messages`) | `zulip.api`: https to the configured site, public addresses, no redirects, 4 MiB cap (each call reads less), 20 s |
 | The relay's GitHub comments (`relay/github.rs`) | `relay.github`: https to `relay_github_api_url`, public addresses, no redirects, 256 KiB cap (cut), 20 s |
+| GitHub REST (`github/client.rs`: CI checks, polling, merged pull requests), public API | `github.rest`: https to `api.github.com`, public addresses, no redirects, 8 MiB cap (refused past it), 10 s to connect, 20 s for the call; one client per API base, reused |
+| GitHub REST against a GHES root in `github_api_url` | `github.enterprise`: as `github.rest` for any host, with `OperatorConfigured` addresses |
 
 The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
 neither settable from TOML or the environment) apply
 `Policy::loopback_test_hook`: loopback admitted besides public addresses,
-plain http, any host and port; everything else unchanged.
+plain http, any host and port; everything else unchanged. A policy whose
+class already admits loopback (`OperatorConfigured`) keeps its class.
 
 ## Planned slices
 
-1. Move the remaining HTTP client consumers onto policies (GitHub REST,
-   the MCP gateway, notify webhooks, the Obsidian client, the client ID
-   metadata fetch; the web, Zulip, relay and Slack Web API consumers have
-   moved).
+1. Move the remaining HTTP client consumers onto policies (the MCP
+   gateway, notify webhooks, the Obsidian client, the client ID metadata
+   fetch; the web, Zulip, relay, Slack Web API and GitHub REST consumers
+   have moved).
 2. One inbound-delivery table, with a cut-over for GitHub deliveries
    (done: [Inbound deliveries](#inbound-deliveries)).
 3. Slack's signed HTTP routes and Socket Mode onto it.
