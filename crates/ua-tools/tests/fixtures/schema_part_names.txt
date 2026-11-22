@@ -81,3 +81,5 @@ notify.v2.org_indexes
 organization.v1.tools.zulip
 harness_config.v3.tenant_keys
 organization.v1.tools.harness_config
+organization.v1.tools.plans
+plans.v2.org_scope

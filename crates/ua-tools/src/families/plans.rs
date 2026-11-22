@@ -14,6 +14,16 @@
 //!
 //! Every action is reachable through `plan_manage(action, params)`; the
 //! legacy `plan_*` tools are thin aliases onto the same functions.
+//!
+//! The three tables are tenant data (`org_id`, `organization.v1.tools.plans`,
+//! `plans.v2.org_scope`). Every read and write is scoped to the caller's
+//! organization: another organization's plan answers exactly as a missing
+//! one, and a write for an organization `orgs` does not hold is refused
+//! before anything changes. No key needed a rebuild: a plan id is a
+//! hub-generated random id (the hub-global primary key), and a step's
+//! `(plan_id, step_idx)` and a checkpoint's `(plan_id, seq)` are keyed by
+//! that id. A step or checkpoint always belongs to its plan's organization
+//! (the `*_org_parent` triggers). Plans do not link to tasks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
@@ -27,7 +37,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -78,6 +88,40 @@ CREATE TABLE IF NOT EXISTS plan_checkpoints (
     UNIQUE (plan_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_checkpoints_plan ON plan_checkpoints(plan_id);
+",
+};
+
+/// `organization.v1.tools.plans`: `org_id` on `plans`, `plan_steps` and
+/// `plan_checkpoints` (existing rows backfilled to the default organization)
+/// and their generated `*_org_exists` / `*_org_immutable` triggers. No key
+/// needs a rebuild (see the module docs). Applied after `plans.v1` and
+/// `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.plans", &["plans", "plan_steps", "plan_checkpoints"]);
+
+/// `plans.v2.org_scope`: the index the per-organization plan list uses, and
+/// triggers that keep a step or checkpoint in its plan's organization (the
+/// `plan_id` foreign key alone would accept a parent in another
+/// organization). A missing plan is still the foreign key's error. Applied
+/// after `organization.v1.tools.plans`.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "plans.v2.org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_plans_org_status ON plans(org_id, status, created_at);
+
+CREATE TRIGGER IF NOT EXISTS plan_steps_org_parent BEFORE INSERT ON plan_steps
+WHEN EXISTS (SELECT 1 FROM plans WHERE id = NEW.plan_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'plan belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS plan_steps_org_parent_update BEFORE UPDATE OF plan_id ON plan_steps
+WHEN EXISTS (SELECT 1 FROM plans WHERE id = NEW.plan_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'plan belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS plan_checkpoints_org_parent BEFORE INSERT ON plan_checkpoints
+WHEN EXISTS (SELECT 1 FROM plans WHERE id = NEW.plan_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'plan belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS plan_checkpoints_org_parent_update BEFORE UPDATE OF plan_id ON plan_checkpoints
+WHEN EXISTS (SELECT 1 FROM plans WHERE id = NEW.plan_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'plan belongs to another organization'); END;
 ",
 };
 
@@ -164,6 +208,28 @@ fn new_plan_id() -> String {
     hex::encode(h.finalize())[..12].to_string()
 }
 
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// The `org_exists` triggers fire only on insert, so a write with nothing to
+/// insert (an update, a delete) would otherwise pass.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no plan was changed"),
+        ));
+    }
+    Ok(())
+}
+
+/// Free text (a goal, a scope, a close reason) for a plan event's payload.
+/// Plan events are still written to the default organization's ledger
+/// (`ORG-EVENT-DEFAULT`), so another organization's text is left out (`null`)
+/// rather than recorded there; the payload keeps its shape.
+fn ledger_text(org: &str, text: &str) -> Value {
+    if org == ua_core::DEFAULT_ORG { json!(text) } else { Value::Null }
+}
+
 // ---------------------------------------------------------------------------
 // Reading plans and steps.
 
@@ -217,15 +283,18 @@ fn step_from_row(r: &Row<'_>) -> rusqlite::Result<Step> {
     })
 }
 
-fn get_plan(c: &Connection, plan_id: &str) -> UaResult<Value> {
-    c.query_row("SELECT * FROM plans WHERE id = ?1", [plan_id], plan_from_row)
+/// The plan `plan_id` of `org`. Another organization's plan answers exactly
+/// as a missing one.
+fn get_plan(c: &Connection, org: &str, plan_id: &str) -> UaResult<Value> {
+    c.query_row("SELECT * FROM plans WHERE org_id = ?1 AND id = ?2", params![org, plan_id], plan_from_row)
         .optional()?
         .ok_or_else(|| UaError::not_found(format!("no plan with id {plan_id:?}")))
 }
 
-fn load_steps(c: &Connection, plan_id: &str) -> UaResult<Vec<Step>> {
-    let mut stmt = c.prepare("SELECT * FROM plan_steps WHERE plan_id = ?1 ORDER BY step_idx")?;
-    let rows = stmt.query_map([plan_id], step_from_row)?;
+fn load_steps(c: &Connection, org: &str, plan_id: &str) -> UaResult<Vec<Step>> {
+    let mut stmt =
+        c.prepare("SELECT * FROM plan_steps WHERE org_id = ?1 AND plan_id = ?2 ORDER BY step_idx")?;
+    let rows = stmt.query_map(params![org, plan_id], step_from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -250,10 +319,10 @@ fn checkpoint_from_row(r: &Row<'_>) -> rusqlite::Result<Value> {
     Ok(Value::Object(m))
 }
 
-fn checkpoint_at(c: &Connection, plan_id: &str, seq: i64) -> UaResult<Option<Value>> {
+fn checkpoint_at(c: &Connection, org: &str, plan_id: &str, seq: i64) -> UaResult<Option<Value>> {
     Ok(c.query_row(
-        "SELECT * FROM plan_checkpoints WHERE plan_id = ?1 AND seq = ?2",
-        params![plan_id, seq],
+        "SELECT * FROM plan_checkpoints WHERE org_id = ?1 AND plan_id = ?2 AND seq = ?3",
+        params![org, plan_id, seq],
         checkpoint_from_row,
     )
     .optional()?)
@@ -285,21 +354,28 @@ fn check_step_id(plan_id: &str, idx: i64, steps: &[Step], expected: Option<i64>)
 // Writing.
 
 /// Every plan write advances `revision` and `updated_at`.
-fn touch(tx: &WriteTx<'_>, plan_id: &str, ts: &str) -> UaResult<()> {
+fn touch(tx: &WriteTx<'_>, org: &str, plan_id: &str, ts: &str) -> UaResult<()> {
     tx.execute(
-        "UPDATE plans SET updated_at = ?2, revision = revision + 1 WHERE id = ?1",
-        params![plan_id, ts],
+        "UPDATE plans SET updated_at = ?3, revision = revision + 1 WHERE org_id = ?1 AND id = ?2",
+        params![org, plan_id, ts],
     )?;
     Ok(())
 }
 
 /// Flip a non-escalated active plan to done once every step is done.
-fn maybe_autocomplete(tx: &mut WriteTx<'_>, caller: &Caller, plan_id: &str, ts: &str) -> UaResult<()> {
-    let steps = load_steps(tx, plan_id)?;
+fn maybe_autocomplete(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    org: &str,
+    plan_id: &str,
+    ts: &str,
+) -> UaResult<()> {
+    let steps = load_steps(tx, org, plan_id)?;
     if !steps.is_empty() && steps.iter().all(|s| s.status == "done") {
         let n = tx.execute(
-            "UPDATE plans SET status = 'done', updated_at = ?2 WHERE id = ?1 AND status = 'active' AND escalated = 0",
-            params![plan_id, ts],
+            "UPDATE plans SET status = 'done', updated_at = ?3 WHERE org_id = ?1 AND id = ?2 \
+             AND status = 'active' AND escalated = 0",
+            params![org, plan_id, ts],
         )?;
         if n > 0 {
             emit(tx, caller, "agent.plan.completed", json!({ "plan_id": plan_id }))?;
@@ -310,24 +386,26 @@ fn maybe_autocomplete(tx: &mut WriteTx<'_>, caller: &Caller, plan_id: &str, ts: 
 
 fn insert_checkpoint(
     tx: &WriteTx<'_>,
+    org: &str,
     plan_id: &str,
     mut context: Map<String, Value>,
     note: Option<&str>,
     ts: &str,
 ) -> UaResult<i64> {
     let seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM plan_checkpoints WHERE plan_id = ?1",
-        [plan_id],
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM plan_checkpoints WHERE org_id = ?1 AND plan_id = ?2",
+        params![org, plan_id],
         |r| r.get(0),
     )?;
-    let state: Vec<Value> = load_steps(tx, plan_id)?
+    let state: Vec<Value> = load_steps(tx, org, plan_id)?
         .iter()
         .map(|s| json!({ "step_idx": s.idx, "status": s.status, "description": s.json["description"] }))
         .collect();
     context.insert("step_state".into(), Value::Array(state));
     tx.execute(
-        "INSERT INTO plan_checkpoints (plan_id, seq, context, note, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![plan_id, seq, Value::Object(context).to_string(), note, ts],
+        "INSERT INTO plan_checkpoints (org_id, plan_id, seq, context, note, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![org, plan_id, seq, Value::Object(context).to_string(), note, ts],
     )?;
     Ok(seq)
 }
@@ -638,32 +716,50 @@ fn create(ctx: &ToolCtx, a: CreateArgs) -> UaResult<Value> {
     let scope =
         a.scope.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "default".into());
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
         let mut plan_id = new_plan_id();
+        // The one unscoped read: the id is the hub-global primary key, so a
+        // fresh id must be free in every organization. The id is generated
+        // here, so the check tells the caller nothing.
         while tx.query_row("SELECT 1 FROM plans WHERE id = ?1", [&plan_id], |_| Ok(())).optional()?.is_some()
         {
             plan_id = new_plan_id();
         }
         tx.execute(
-            "INSERT INTO plans (id, goal, scope, status, author, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
-            params![plan_id, goal, scope, author, ts],
+            "INSERT INTO plans (org_id, id, goal, scope, status, author, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6)",
+            params![org, plan_id, goal, scope, author, ts],
         )?;
         for (idx, s) in specs.iter().enumerate() {
             tx.execute(
-                "INSERT INTO plan_steps (plan_id, step_idx, description, owner, depends_on, status, retries, \
-                 created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', 0, ?6, ?6)",
-                params![plan_id, idx as i64, s.description, s.owner, json!(s.depends_on).to_string(), ts],
+                "INSERT INTO plan_steps (org_id, plan_id, step_idx, description, owner, depends_on, status, \
+                 retries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', 0, ?7, ?7)",
+                params![
+                    org,
+                    plan_id,
+                    idx as i64,
+                    s.description,
+                    s.owner,
+                    json!(s.depends_on).to_string(),
+                    ts
+                ],
             )?;
         }
         emit(
             tx,
             &caller,
             "agent.plan.created",
-            json!({ "plan_id": plan_id, "goal": goal, "scope": scope, "step_count": specs.len() }),
+            json!({
+                "plan_id": plan_id,
+                "goal": ledger_text(&org, &goal),
+                "scope": ledger_text(&org, &scope),
+                "step_count": specs.len(),
+            }),
         )?;
-        let steps = load_steps(tx, &plan_id)?;
+        let steps = load_steps(tx, &org, &plan_id)?;
         Ok(json!({ "plan_id": plan_id, "steps": steps_json(&steps) }))
     })
 }
@@ -675,50 +771,63 @@ fn update(ctx: &ToolCtx, a: UpdateArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {STEP_STATUSES:?}")));
     }
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        get_plan(tx, &a.plan_id)?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        get_plan(tx, &org, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?.clone();
         if let Some(st) = a.status.as_deref() {
             let done_at = (st == "done").then(|| ts.clone());
             tx.execute(
-                "UPDATE plan_steps SET status = ?2, done_at = ?3 WHERE id = ?1",
-                params![step.id, st, done_at],
+                "UPDATE plan_steps SET status = ?3, done_at = ?4 WHERE org_id = ?1 AND id = ?2",
+                params![org, step.id, st, done_at],
             )?;
         }
         if let Some(note) = a.note.as_deref() {
-            tx.execute("UPDATE plan_steps SET note = ?2 WHERE id = ?1", params![step.id, note])?;
+            tx.execute(
+                "UPDATE plan_steps SET note = ?3 WHERE org_id = ?1 AND id = ?2",
+                params![org, step.id, note],
+            )?;
         }
         if let Some(owner) = a.owner.as_deref() {
-            tx.execute("UPDATE plan_steps SET owner = ?2 WHERE id = ?1", params![step.id, owner])?;
+            tx.execute(
+                "UPDATE plan_steps SET owner = ?3 WHERE org_id = ?1 AND id = ?2",
+                params![org, step.id, owner],
+            )?;
         }
-        tx.execute("UPDATE plan_steps SET updated_at = ?2 WHERE id = ?1", params![step.id, ts])?;
-        touch(tx, &a.plan_id, &ts)?;
+        tx.execute(
+            "UPDATE plan_steps SET updated_at = ?3 WHERE org_id = ?1 AND id = ?2",
+            params![org, step.id, ts],
+        )?;
+        touch(tx, &org, &a.plan_id, &ts)?;
         emit(
             tx,
             &caller,
             "agent.plan.step_updated",
             json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "status": a.status, "owner": a.owner }),
         )?;
-        maybe_autocomplete(tx, &caller, &a.plan_id, &ts)?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        maybe_autocomplete(tx, &caller, &org, &a.plan_id, &ts)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         Ok(json!({
             "step": step_at(&steps, &a.plan_id, a.step_idx)?.json,
-            "plan": get_plan(tx, &a.plan_id)?,
+            "plan": get_plan(tx, &org, &a.plan_id)?,
             "next_step_idx": next_actionable(&steps),
         }))
     })
 }
 
 fn get(ctx: &ToolCtx, a: PlanIdArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
-        let plan = get_plan(c, &a.plan_id)?;
-        let steps = load_steps(c, &a.plan_id)?;
-        let mut stmt = c.prepare("SELECT * FROM plan_checkpoints WHERE plan_id = ?1 ORDER BY seq")?;
+        let plan = get_plan(c, &org, &a.plan_id)?;
+        let steps = load_steps(c, &org, &a.plan_id)?;
+        let mut stmt =
+            c.prepare("SELECT * FROM plan_checkpoints WHERE org_id = ?1 AND plan_id = ?2 ORDER BY seq")?;
         let checkpoints: Vec<Value> =
-            stmt.query_map([&a.plan_id], checkpoint_from_row)?.collect::<Result<_, _>>()?;
+            stmt.query_map(params![org, a.plan_id], checkpoint_from_row)?.collect::<Result<_, _>>()?;
         Ok(json!({
             "plan": plan,
             "steps": steps_json(&steps),
@@ -734,45 +843,49 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {PLAN_STATUSES:?} or \"all\"")));
     }
     let limit = a.limit.unwrap_or(50).clamp(1, 200);
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(
-            "SELECT * FROM plans WHERE (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR scope = ?2) \
-             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+            "SELECT * FROM plans WHERE org_id = ?1 AND (?2 = 'all' OR status = ?2) \
+             AND (?3 IS NULL OR scope = ?3) ORDER BY created_at DESC, rowid DESC LIMIT ?4",
         )?;
         let plans: Vec<Value> =
-            stmt.query_map(params![status, a.scope, limit], plan_from_row)?.collect::<Result<_, _>>()?;
+            stmt.query_map(params![org, status, a.scope, limit], plan_from_row)?.collect::<Result<_, _>>()?;
         Ok(json!({ "plans": plans }))
     })
 }
 
 fn checkpoint(ctx: &ToolCtx, a: CheckpointArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        get_plan(tx, &a.plan_id)?;
+        get_plan(tx, &org, &a.plan_id)?;
         let mut context = Map::new();
         context.insert("memory_ids".into(), json!(a.memory_ids.unwrap_or_default()));
         context.insert("file_paths".into(), json!(a.file_paths.unwrap_or_default()));
         context.insert("outputs".into(), Value::Object(a.outputs.unwrap_or_default()));
-        let seq = insert_checkpoint(tx, &a.plan_id, context, a.note.as_deref(), &ts)?;
-        touch(tx, &a.plan_id, &ts)?;
+        let seq = insert_checkpoint(tx, &org, &a.plan_id, context, a.note.as_deref(), &ts)?;
+        touch(tx, &org, &a.plan_id, &ts)?;
         emit(tx, &caller, "agent.plan.checkpointed", json!({ "plan_id": a.plan_id, "seq": seq }))?;
-        Ok(json!({ "plan_id": a.plan_id, "seq": seq, "checkpoint": checkpoint_at(tx, &a.plan_id, seq)? }))
+        Ok(json!({ "plan_id": a.plan_id, "seq": seq, "checkpoint": checkpoint_at(tx, &org, &a.plan_id, seq)? }))
     })
 }
 
 fn resume(ctx: &ToolCtx, a: ResumeArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
-        let plan = get_plan(c, &a.plan_id)?;
-        let steps = load_steps(c, &a.plan_id)?;
+        let plan = get_plan(c, &org, &a.plan_id)?;
+        let steps = load_steps(c, &org, &a.plan_id)?;
         let checkpoint = match a.from_checkpoint {
-            Some(seq) => Some(checkpoint_at(c, &a.plan_id, seq)?.ok_or_else(|| {
+            Some(seq) => Some(checkpoint_at(c, &org, &a.plan_id, seq)?.ok_or_else(|| {
                 UaError::not_found(format!("plan {:?} has no checkpoint seq {seq}", a.plan_id))
             })?),
             None => c
                 .query_row(
-                    "SELECT * FROM plan_checkpoints WHERE plan_id = ?1 ORDER BY seq DESC LIMIT 1",
-                    [&a.plan_id],
+                    "SELECT * FROM plan_checkpoints WHERE org_id = ?1 AND plan_id = ?2 ORDER BY seq DESC LIMIT 1",
+                    params![org, a.plan_id],
                     checkpoint_from_row,
                 )
                 .optional()?,
@@ -792,10 +905,12 @@ fn step_retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
         return Err(UaError::invalid("reason must not be empty"));
     }
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        get_plan(tx, &a.plan_id)?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        get_plan(tx, &org, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?;
         let retries = step.json["retries"].as_i64().unwrap_or(0) + 1;
@@ -807,15 +922,15 @@ fn step_retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
         );
         let status = if escalated { "blocked" } else { "failed" };
         tx.execute(
-            "UPDATE plan_steps SET retries = ?2, status = ?3, note = ?4, updated_at = ?5 WHERE id = ?1",
-            params![step.id, retries, status, note, ts],
+            "UPDATE plan_steps SET retries = ?3, status = ?4, note = ?5, updated_at = ?6 WHERE org_id = ?1 AND id = ?2",
+            params![org, step.id, retries, status, note, ts],
         )?;
-        touch(tx, &a.plan_id, &ts)?;
+        touch(tx, &org, &a.plan_id, &ts)?;
         if escalated {
             let esc = format!("step {} exhausted {retries}/{MAX_RETRIES} retries; last reason: {reason}", a.step_idx);
             tx.execute(
-                "UPDATE plans SET status = 'blocked', escalated = 1, escalation_note = ?2 WHERE id = ?1",
-                params![a.plan_id, esc],
+                "UPDATE plans SET status = 'blocked', escalated = 1, escalation_note = ?3 WHERE org_id = ?1 AND id = ?2",
+                params![org, a.plan_id, esc],
             )?;
         }
         emit(
@@ -824,14 +939,14 @@ fn step_retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
             "agent.plan.step_retried",
             json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "retries": retries, "escalated": escalated }),
         )?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         Ok(json!({
             "step": step_at(&steps, &a.plan_id, a.step_idx)?.json,
             "retries": retries,
             "escalated": escalated,
             "max_retries": MAX_RETRIES,
             "escalation_channel": ESCALATION_CHANNEL,
-            "plan": get_plan(tx, &a.plan_id)?,
+            "plan": get_plan(tx, &org, &a.plan_id)?,
         }))
     })
 }
@@ -842,14 +957,16 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         return Err(UaError::invalid("agent label must not be empty"));
     }
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        let plan = get_plan(tx, &a.plan_id)?;
+        let plan = get_plan(tx, &org, &a.plan_id)?;
         let plan_status = plan["status"].as_str().unwrap_or("");
         if TERMINAL_PLAN_STATUSES.contains(&plan_status) {
             return Err(UaError::conflict(format!("plan {:?} is {plan_status}; its steps cannot be claimed", a.plan_id)));
         }
-        let steps = load_steps(tx, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?;
         let waiting: Vec<i64> = step
@@ -868,9 +985,9 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         // agent claims no plan step either.
         crate::families::governance::check_claim(tx, Some(&agent), None, false)?;
         let n = tx.execute(
-            "UPDATE plan_steps SET owner = ?2, status = 'doing', updated_at = ?3 \
-             WHERE id = ?1 AND status IN ('open','failed') AND (owner IS NULL OR owner = ?2)",
-            params![step.id, agent, ts],
+            "UPDATE plan_steps SET owner = ?3, status = 'doing', updated_at = ?4 \
+             WHERE org_id = ?1 AND id = ?2 AND status IN ('open','failed') AND (owner IS NULL OR owner = ?3)",
+            params![org, step.id, agent, ts],
         )?;
         if n == 0 {
             return Err(UaError::conflict(format!(
@@ -882,17 +999,17 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 step.owner.as_deref().unwrap_or("(unowned)")
             )));
         }
-        touch(tx, &a.plan_id, &ts)?;
+        touch(tx, &org, &a.plan_id, &ts)?;
         emit(
             tx,
             &caller,
             "agent.plan.step_claimed",
             json!({ "plan_id": a.plan_id, "step_idx": a.step_idx, "agent": agent }),
         )?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         Ok(json!({
             "step": step_at(&steps, &a.plan_id, a.step_idx)?.json,
-            "plan": get_plan(tx, &a.plan_id)?,
+            "plan": get_plan(tx, &org, &a.plan_id)?,
             "claimed": true,
         }))
     })
@@ -907,10 +1024,12 @@ fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
         None => None,
     };
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        get_plan(tx, &a.plan_id)?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        get_plan(tx, &org, &a.plan_id)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?.clone();
         let outputs = a.outputs.clone().unwrap_or_default();
@@ -919,14 +1038,15 @@ fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
         context.insert("file_paths".into(), json!([]));
         context.insert("outputs".into(), Value::Object(outputs.clone()));
         let default_note = format!("Automatic checkpoint on step {} handoff", a.step_idx);
-        insert_checkpoint(tx, &a.plan_id, context, Some(a.note.as_deref().unwrap_or(&default_note)), &ts)?;
+        let note = a.note.as_deref().unwrap_or(&default_note);
+        insert_checkpoint(tx, &org, &a.plan_id, context, Some(note), &ts)?;
         tx.execute(
-            "UPDATE plan_steps SET status = 'done', done_at = ?2, outputs = ?3, updated_at = ?2, \
-             note = COALESCE(?4, note) WHERE id = ?1",
-            params![step.id, ts, Value::Object(outputs).to_string(), a.note],
+            "UPDATE plan_steps SET status = 'done', done_at = ?3, outputs = ?4, updated_at = ?3, \
+             note = COALESCE(?5, note) WHERE org_id = ?1 AND id = ?2",
+            params![org, step.id, ts, Value::Object(outputs).to_string(), a.note],
         )?;
-        touch(tx, &a.plan_id, &ts)?;
-        let steps = load_steps(tx, &a.plan_id)?;
+        touch(tx, &org, &a.plan_id, &ts)?;
+        let steps = load_steps(tx, &org, &a.plan_id)?;
         let next_idx = next_actionable(&steps);
         let next_step = next_idx.and_then(|i| steps.iter().find(|s| s.idx == i));
         let finisher = agent.clone().or(step.owner.clone());
@@ -944,11 +1064,11 @@ fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
         )?;
         let next_json = next_step.map(|s| s.json.clone());
         let step_json = step_at(&steps, &a.plan_id, a.step_idx)?.json.clone();
-        maybe_autocomplete(tx, &caller, &a.plan_id, &ts)?;
+        maybe_autocomplete(tx, &caller, &org, &a.plan_id, &ts)?;
         Ok(json!({
             "step": step_json,
             "next_step": next_json,
-            "plan": get_plan(tx, &a.plan_id)?,
+            "plan": get_plan(tx, &org, &a.plan_id)?,
             "notified": false,
         }))
     })
@@ -960,9 +1080,11 @@ fn close(ctx: &ToolCtx, a: CloseArgs) -> UaResult<Value> {
         return Err(UaError::invalid("reason must be a non-empty string"));
     }
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        require_org(tx, &org)?;
         let ts = ua_core::time::now();
-        let plan = get_plan(tx, &a.plan_id)?;
+        let plan = get_plan(tx, &org, &a.plan_id)?;
         let status = plan["status"].as_str().unwrap_or("");
         if TERMINAL_PLAN_STATUSES.contains(&status) {
             return Err(UaError::conflict(format!("plan {:?} is already {status}", a.plan_id)));
@@ -974,18 +1096,35 @@ fn close(ctx: &ToolCtx, a: CloseArgs) -> UaResult<Value> {
         context.insert("memory_ids".into(), json!([]));
         context.insert("file_paths".into(), json!([]));
         context.insert("outputs".into(), Value::Object(outputs));
-        let seq = insert_checkpoint(tx, &a.plan_id, context, Some(&format!("closed as abandoned: {reason}")), &ts)?;
-        tx.execute("UPDATE plans SET status = 'abandoned' WHERE id = ?1", [&a.plan_id])?;
-        touch(tx, &a.plan_id, &ts)?;
-        emit(tx, &caller, "agent.plan.closed", json!({ "plan_id": a.plan_id, "reason": reason, "seq": seq }))?;
-        Ok(json!({ "plan": get_plan(tx, &a.plan_id)?, "seq": seq, "checkpoint": checkpoint_at(tx, &a.plan_id, seq)? }))
+        let note = format!("closed as abandoned: {reason}");
+        let seq = insert_checkpoint(tx, &org, &a.plan_id, context, Some(&note), &ts)?;
+        tx.execute(
+            "UPDATE plans SET status = 'abandoned' WHERE org_id = ?1 AND id = ?2",
+            params![org, a.plan_id],
+        )?;
+        touch(tx, &org, &a.plan_id, &ts)?;
+        emit(
+            tx,
+            &caller,
+            "agent.plan.closed",
+            json!({ "plan_id": a.plan_id, "reason": ledger_text(&org, &reason), "seq": seq }),
+        )?;
+        Ok(json!({
+            "plan": get_plan(tx, &org, &a.plan_id)?,
+            "seq": seq,
+            "checkpoint": checkpoint_at(tx, &org, &a.plan_id, seq)?,
+        }))
     })
 }
 
 fn delete(ctx: &ToolCtx, a: PlanIdArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let n = tx.execute("DELETE FROM plans WHERE id = ?1", [&a.plan_id])?;
+        require_org(tx, &org)?;
+        // The steps and checkpoints go with the plan (ON DELETE CASCADE);
+        // they are always in the plan's organization.
+        let n = tx.execute("DELETE FROM plans WHERE org_id = ?1 AND id = ?2", params![org, a.plan_id])?;
         if n > 0 {
             emit(tx, &caller, "agent.plan.deleted", json!({ "plan_id": a.plan_id }))?;
         }
@@ -1002,11 +1141,13 @@ fn delete(ctx: &ToolCtx, a: PlanIdArgs) -> UaResult<Value> {
 
 fn open_structure_edit(
     tx: &WriteTx<'_>,
+    org: &str,
     plan_id: &str,
     expected_revision: Option<i64>,
     steps_change: bool,
 ) -> UaResult<(Value, Vec<Step>)> {
-    let plan = get_plan(tx, plan_id)?;
+    require_org(tx, org)?;
+    let plan = get_plan(tx, org, plan_id)?;
     let revision = plan["revision"].as_i64().unwrap_or(0);
     if let Some(expected) = expected_revision
         && expected != revision
@@ -1020,7 +1161,7 @@ fn open_structure_edit(
     if steps_change && TERMINAL_PLAN_STATUSES.contains(&status) {
         return Err(UaError::invalid(format!("plan {plan_id:?} is {status}; its steps cannot change")));
     }
-    let steps = load_steps(tx, plan_id)?;
+    let steps = load_steps(tx, org, plan_id)?;
     Ok((plan, steps))
 }
 
@@ -1037,7 +1178,13 @@ fn refuse_untouchable(step: &Step, verb: &str) -> UaResult<()> {
 /// Move each kept step to `new_index[old]` and remap every `depends_on`.
 /// Rows are parked at negative indexes first so `UNIQUE(plan_id, step_idx)`
 /// holds throughout.
-fn apply_layout(tx: &WriteTx<'_>, steps: &[Step], new_index: &BTreeMap<i64, i64>, ts: &str) -> UaResult<()> {
+fn apply_layout(
+    tx: &WriteTx<'_>,
+    org: &str,
+    steps: &[Step],
+    new_index: &BTreeMap<i64, i64>,
+    ts: &str,
+) -> UaResult<()> {
     let kept: Vec<&Step> = steps.iter().filter(|s| new_index.contains_key(&s.idx)).collect();
     for s in &kept {
         if new_index[&s.idx] != s.idx {
@@ -1045,7 +1192,10 @@ fn apply_layout(tx: &WriteTx<'_>, steps: &[Step], new_index: &BTreeMap<i64, i64>
         }
     }
     for s in &kept {
-        tx.execute("UPDATE plan_steps SET step_idx = ?2 WHERE id = ?1", params![s.id, -1 - s.id])?;
+        tx.execute(
+            "UPDATE plan_steps SET step_idx = ?3 WHERE org_id = ?1 AND id = ?2",
+            params![org, s.id, -1 - s.id],
+        )?;
     }
     for s in &kept {
         let deps: Vec<i64> = s
@@ -1057,31 +1207,39 @@ fn apply_layout(tx: &WriteTx<'_>, steps: &[Step], new_index: &BTreeMap<i64, i64>
             .collect();
         let moved = new_index[&s.idx] != s.idx || deps != s.depends_on;
         tx.execute(
-            "UPDATE plan_steps SET step_idx = ?2, depends_on = ?3, updated_at = ?4 WHERE id = ?1",
-            params![s.id, new_index[&s.idx], json!(deps).to_string(), if moved { ts } else { &s.updated_at }],
+            "UPDATE plan_steps SET step_idx = ?3, depends_on = ?4, updated_at = ?5 WHERE org_id = ?1 AND id = ?2",
+            params![
+                org,
+                s.id,
+                new_index[&s.idx],
+                json!(deps).to_string(),
+                if moved { ts } else { &s.updated_at }
+            ],
         )?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn structure_result(
     tx: &mut WriteTx<'_>,
     caller: &Caller,
+    org: &str,
     plan_id: &str,
     ts: &str,
     channel: &str,
     detail: Value,
     step_idx: Option<i64>,
 ) -> UaResult<Map<String, Value>> {
-    touch(tx, plan_id, ts)?;
+    touch(tx, org, plan_id, ts)?;
     let mut payload = json!({ "plan_id": plan_id });
     if let (Some(p), Value::Object(d)) = (payload.as_object_mut(), detail) {
         p.extend(d);
     }
     emit(tx, caller, channel, payload)?;
-    let steps = load_steps(tx, plan_id)?;
+    let steps = load_steps(tx, org, plan_id)?;
     let mut out = Map::new();
-    out.insert("plan".into(), get_plan(tx, plan_id)?);
+    out.insert("plan".into(), get_plan(tx, org, plan_id)?);
     out.insert("steps".into(), steps_json(&steps));
     out.insert("next_step_idx".into(), json!(next_actionable(&steps)));
     if let Some(i) = step_idx {
@@ -1101,8 +1259,9 @@ fn clean_description(d: &str) -> UaResult<String> {
 fn step_add(ctx: &ToolCtx, a: StepAddArgs) -> UaResult<Value> {
     let text = clean_description(&a.description)?;
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let (_plan, steps) = open_structure_edit(tx, &a.plan_id, a.expected_revision, true)?;
+        let (_plan, steps) = open_structure_edit(tx, &org, &a.plan_id, a.expected_revision, true)?;
         let ts = ua_core::time::now();
         let n = steps.len() as i64;
         let pos = a.position.unwrap_or(n);
@@ -1117,16 +1276,17 @@ fn step_add(ctx: &ToolCtx, a: StepAddArgs) -> UaResult<Value> {
         }
         let new_index: BTreeMap<i64, i64> =
             steps.iter().map(|s| (s.idx, s.idx + i64::from(s.idx >= pos))).collect();
-        apply_layout(tx, &steps, &new_index, &ts)?;
+        apply_layout(tx, &org, &steps, &new_index, &ts)?;
         let new_deps: BTreeSet<i64> = deps.iter().map(|d| new_index[d]).collect();
         tx.execute(
-            "INSERT INTO plan_steps (plan_id, step_idx, description, owner, depends_on, status, retries, \
-             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', 0, ?6, ?6)",
-            params![a.plan_id, pos, text, a.owner, json!(new_deps).to_string(), ts],
+            "INSERT INTO plan_steps (org_id, plan_id, step_idx, description, owner, depends_on, status, \
+             retries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', 0, ?7, ?7)",
+            params![org, a.plan_id, pos, text, a.owner, json!(new_deps).to_string(), ts],
         )?;
         let out = structure_result(
             tx,
             &caller,
+            &org,
             &a.plan_id,
             &ts,
             "agent.plan.step_added",
@@ -1140,19 +1300,21 @@ fn step_add(ctx: &ToolCtx, a: StepAddArgs) -> UaResult<Value> {
 fn step_edit(ctx: &ToolCtx, a: StepEditArgs) -> UaResult<Value> {
     let text = clean_description(&a.description)?;
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let (_plan, steps) = open_structure_edit(tx, &a.plan_id, a.expected_revision, true)?;
+        let (_plan, steps) = open_structure_edit(tx, &org, &a.plan_id, a.expected_revision, true)?;
         let ts = ua_core::time::now();
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?;
         refuse_untouchable(step, "edited")?;
         tx.execute(
-            "UPDATE plan_steps SET description = ?2, updated_at = ?3 WHERE id = ?1",
-            params![step.id, text, ts],
+            "UPDATE plan_steps SET description = ?3, updated_at = ?4 WHERE org_id = ?1 AND id = ?2",
+            params![org, step.id, text, ts],
         )?;
         let out = structure_result(
             tx,
             &caller,
+            &org,
             &a.plan_id,
             &ts,
             "agent.plan.step_edited",
@@ -1165,8 +1327,9 @@ fn step_edit(ctx: &ToolCtx, a: StepEditArgs) -> UaResult<Value> {
 
 fn step_remove(ctx: &ToolCtx, a: StepRemoveArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let (_plan, steps) = open_structure_edit(tx, &a.plan_id, a.expected_revision, true)?;
+        let (_plan, steps) = open_structure_edit(tx, &org, &a.plan_id, a.expected_revision, true)?;
         let ts = ua_core::time::now();
         check_step_id(&a.plan_id, a.step_idx, &steps, a.expected_step_id)?;
         let step = step_at(&steps, &a.plan_id, a.step_idx)?.clone();
@@ -1197,11 +1360,12 @@ fn step_remove(ctx: &ToolCtx, a: StepRemoveArgs) -> UaResult<Value> {
                 refuse_untouchable(s, "renumbered")?;
             }
         }
-        tx.execute("DELETE FROM plan_steps WHERE id = ?1", [step.id])?;
-        apply_layout(tx, &rest, &new_index, &ts)?;
+        tx.execute("DELETE FROM plan_steps WHERE org_id = ?1 AND id = ?2", params![org, step.id])?;
+        apply_layout(tx, &org, &rest, &new_index, &ts)?;
         let mut out = structure_result(
             tx,
             &caller,
+            &org,
             &a.plan_id,
             &ts,
             "agent.plan.step_removed",
@@ -1215,8 +1379,9 @@ fn step_remove(ctx: &ToolCtx, a: StepRemoveArgs) -> UaResult<Value> {
 
 fn step_reorder(ctx: &ToolCtx, a: StepReorderArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let (_plan, steps) = open_structure_edit(tx, &a.plan_id, a.expected_revision, true)?;
+        let (_plan, steps) = open_structure_edit(tx, &org, &a.plan_id, a.expected_revision, true)?;
         let ts = ua_core::time::now();
         let n = steps.len() as i64;
         let mut sorted = a.order.clone();
@@ -1239,10 +1404,11 @@ fn step_reorder(ctx: &ToolCtx, a: StepReorderArgs) -> UaResult<Value> {
                 }
             }
         }
-        apply_layout(tx, &steps, &new_index, &ts)?;
+        apply_layout(tx, &org, &steps, &new_index, &ts)?;
         let out = structure_result(
             tx,
             &caller,
+            &org,
             &a.plan_id,
             &ts,
             "agent.plan.steps_reordered",
@@ -1282,15 +1448,19 @@ fn edit(ctx: &ToolCtx, a: EditArgs) -> UaResult<Value> {
         None => None,
     };
     let caller = ctx.caller.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().write(|tx| {
-        let (plan, _steps) = open_structure_edit(tx, &a.plan_id, a.expected_revision, false)?;
+        let (plan, _steps) = open_structure_edit(tx, &org, &a.plan_id, a.expected_revision, false)?;
         let ts = ua_core::time::now();
         let (cur_title, cur_desc) = split_goal(plan["goal"].as_str().unwrap_or(""));
         let new_title = title.clone().unwrap_or(cur_title);
         let new_desc = description.clone().unwrap_or(cur_desc);
         let goal = if new_desc.is_empty() { new_title } else { format!("{new_title}\n\n{new_desc}") };
-        tx.execute("UPDATE plans SET goal = ?2 WHERE id = ?1", params![a.plan_id, goal])?;
-        let out = structure_result(tx, &caller, &a.plan_id, &ts, "agent.plan.edited", json!({}), None)?;
+        tx.execute(
+            "UPDATE plans SET goal = ?3 WHERE org_id = ?1 AND id = ?2",
+            params![org, a.plan_id, goal],
+        )?;
+        let out = structure_result(tx, &caller, &org, &a.plan_id, &ts, "agent.plan.edited", json!({}), None)?;
         Ok(Value::Object(out))
     })
 }

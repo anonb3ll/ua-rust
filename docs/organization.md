@@ -35,13 +35,14 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (53 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (50 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
   `notify_outbox`, `pending_notifications`, `zulip_sends`,
   `harness_config_bundles`, `harness_config_proposals`,
-  `harness_config_drift` and `harness_config_report_window` having left it;
+  `harness_config_drift`, `harness_config_report_window`, `plans`,
+  `plan_steps` and `plan_checkpoints` having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -230,6 +231,29 @@ here for memory columns, owners and defaults.
   no `org_id` yet; it must take the node's organization when nodes gain one.
   The `agent.harness_config` events are `ORG-EVENT-DEFAULT` sites. The
   importer writes legacy bundles to `default`.
+- The plans tables: `organization.v1.tools.plans` gives `plans`,
+  `plan_steps` and `plan_checkpoints` their `org_id` and triggers, and
+  `plans.v2.org_scope` adds an index led by `org_id` for the plan list and
+  the `*_org_parent` triggers that keep a step or checkpoint in its plan's
+  organization (the `plan_id` foreign key alone would accept a parent in
+  another organization). No rebuild: a plan id is a hub-generated random
+  id (the hub-global primary key, never chosen by a caller), and the step
+  key `(plan_id, step_idx)` and checkpoint key `(plan_id, seq)` hang off it,
+  so two organizations cannot collide on any of them. The one unscoped
+  statement is the fresh-id check in `create`, which must span every
+  organization because the key does. Every `plan_manage` action and legacy
+  `plan_*` tool, and the `plan` kind of `platform_object_get`, reads and
+  writes only the caller's organization's rows; another organization's plan
+  answers exactly as a missing one, and a write for an organization `orgs`
+  does not hold is refused (`unknown_organization`) before anything
+  changes. Plans do not link to tasks, so no `TASK_ORG` rule applies, and
+  no plan action has an approval gate of its own. The `agent.plan.*`
+  events are `ORG-EVENT-DEFAULT` sites: for a plan outside the default
+  organization their free text (`goal` and `scope` on `created`, `reason`
+  on `closed`) is `null`, so it never reaches the default organization's
+  ledger; the payload keeps its shape. The importer writes legacy plans,
+  steps and checkpoints to `default`. `crates/ua-tools/tests/plans_tenant.rs`
+  holds the upgrade and the isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -819,6 +843,7 @@ global key in the tree is classified:
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`, rebuilt in the standalone procedure `governance.v2.project_bindings_tenant_keys`. |
 | `notify_outbox`, `pending_notifications`, `zulip_sends` | No key | AUTOINCREMENT ids only, so no rebuild (`organization.v1.tools.notify`, `organization.v1.tools.zulip`). The digest category count and the Zulip duplicate check (`stream, topic, content_sha256`) are query keys and filter on `org_id`. |
+| `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
@@ -1342,7 +1367,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
