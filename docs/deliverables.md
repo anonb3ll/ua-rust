@@ -96,10 +96,14 @@ Later slices add:
 - **Handoff binding.** A sealed handoff note names the revision it hands
   over (by default the latest), and the session packet shows it, flagged
   when a newer revision exists.
-- **Release through approval.** A verified human approves one restricted
-  action for one revision; the hub refuses it unless every expected check
-  is verified at that revision and the reviewer is not the producer, and
-  the first release effect is a tag in the hub's own repository.
+- **Release through approval.** `git_merge_task` now enforces the
+  review-at-head gate when `"review"` is in the task's `expected_checks`: it
+  requires a passing, uncontradicted `review` check at the exact commit being
+  merged (`review_required`) and refuses a self-review when a commit
+  deliverable revision for that commit names the reviewer as its `producer`
+  (`self_review_refused`), without consuming the policy authorization. Later
+  slices will require every expected check to be verified at that revision
+  and add a release tag effect in the hub's own repository.
 - **Isolation and read surfaces.** A platform object kind and an evidence
   report section for deliverables, checked across organizations.
 - **File deliverables.** A document or file whose revision identity is a

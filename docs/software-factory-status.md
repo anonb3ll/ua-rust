@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 36 pass, 7 fail, 19 not-built.
+62 checks: 37 pass, 7 fail, 18 not-built.
 
 ### 1. Plan and delegate
 
@@ -106,7 +106,7 @@ from it and may lag behind it.
 | --- | --- | --- |
 | `delegate.task-delegated-to-first-harness` | pass | |
 | `delegate.team-accepts-task` | not-built | Teams do not exist: a task is delegated to and claimed by one agent. |
-| `delegate.task-claimed-with-review-requirement` | pass | Recorded, not enforced: the implementer records the expected review; nothing gates on it (see `release.requires-review-at-head`). |
+| `delegate.task-claimed-with-review-requirement` | pass | The implementer records the expected review; `git_merge_task` enforces a passing review at the exact head (see `release.requires-review-at-head`). |
 | `delegate.handoff-tied-to-revision` | pass | |
 | `delegate.session-handoff-sealed` | pass | |
 | `delegate.deliverable-revision-object` | pass | |
@@ -147,7 +147,7 @@ handoff and the checks still name the commit itself, not the revision.
 | `release.verified-human-approves-exact-action` | pass | Through the policy authorization path; the one-time approval path is scored separately below. |
 | `release.approved-attempt-produces-artifact` | pass | |
 | `release.one-time-approval-binds-revision` | pass | The one-time approval binds the head, target branch and bound repository; with the branch moved after the approval the merge is refused (`approval_binding_changed`) and an `agent.approval.refused` event by the refused caller names the approval, reason `binding_changed`, changed field `head`. |
-| `release.requires-review-at-head` | not-built | Nothing gates a merge on the recorded review: with the expected review unknown at the head, a merge under a valid authorization for that head runs. |
+| `release.requires-review-at-head` | pass | When `"review"` is in `expected_checks`, `git_merge_task` refuses (`review_required`) unless a passing, uncontradicted `review` check is recorded at the exact head being merged (and refuses `self_review_refused` when recorded by the commit deliverable revision's producer), leaving the policy authorization unconsumed. |
 
 The passing approval path is the policy authorization
 (`policy_authorization_record` and `git_merge_task(policy_authorization_id)`),

@@ -268,6 +268,27 @@ pub fn revision_count(conn: &Connection, org_id: &str, deliverable_id: i64) -> U
     )?)
 }
 
+/// The commit deliverable revision of `task_id` matching `identity` (full
+/// 40-hex commit SHA, case-insensitive), if one was recorded in `org_id`.
+pub fn commit_revision_for_task(
+    conn: &Connection,
+    org_id: &str,
+    task_id: i64,
+    identity: &str,
+) -> UaResult<Option<Revision>> {
+    let identity = identity.trim().to_ascii_lowercase();
+    Ok(conn
+        .query_row(
+            "SELECT r.id, r.deliverable_id, r.rev_no, r.identity, r.repo, r.summary, r.producer, r.recorded_at \
+             FROM deliverable_revisions r \
+             JOIN deliverables d ON d.id = r.deliverable_id AND d.org_id = r.org_id \
+             WHERE d.org_id = ?1 AND d.task_id = ?2 AND d.kind = 'commit' AND r.identity = ?3",
+            params![org_id, task_id, identity],
+            revision_row,
+        )
+        .optional()?)
+}
+
 // --- writes ------------------------------------------------------------------------
 
 /// A deliverable to create. The caller has resolved the task, the caller's

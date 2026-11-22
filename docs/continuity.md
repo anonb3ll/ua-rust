@@ -66,7 +66,10 @@ listed in `summary.verified_run_only`), since a green run can contain a
 skipped job.
 
 A lookup that contradicts the claim leaves the grade `attested` and lists the
-check in `summary.contradicted`. Nothing here gates a claim or a merge.
+check in `summary.contradicted`. When `"review"` is listed in `expected_checks`,
+`git_merge_task` requires a passing, uncontradicted `review` check at the exact
+head being merged (and refuses a self-review by the commit deliverable
+revision's producer); other checks remain advisory.
 
 The caller does not choose what the hub looks up:
 

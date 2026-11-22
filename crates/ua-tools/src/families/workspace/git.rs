@@ -19,6 +19,7 @@ use ua_core::safety::resolve_in_root;
 use ua_core::{UaError, UaResult};
 
 use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
+use crate::families::continuity;
 use crate::families::github::authz;
 
 use super::{RunOutput, Sandbox, git_env, record, run_program, sandbox};
@@ -407,15 +408,18 @@ fn merge_approval_payload(
     })
 }
 
-/// Take a one-time approval for exactly `payload`. A live pass for the same
-/// task bound to other values (the branch moved, the project was rebound)
-/// does not cover it: the call is refused (`approval_binding_changed`), the
-/// refusal is ledgered, and a new request for the current values is parked.
-async fn one_time_approval(ctx: &ToolCtx, task_id: i64, payload: Value) -> UaResult<()> {
-    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+/// Take a one-time approval for exactly `payload`. First enforces any required
+/// review at `head` so an unreviewed commit does not park or spend a pass. A
+/// live pass for the same task bound to other values (the branch moved, the
+/// project was rebound) does not cover it: the call is refused
+/// (`approval_binding_changed`), the refusal is ledgered, and a new request
+/// for the current values is parked.
+async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Value) -> UaResult<()> {
+    let (hub, caller, head) = (ctx.hub.clone(), ctx.caller.clone(), head.to_string());
     ctx.hub
         .db()
         .write_async(move |tx| {
+            continuity::require_review_at_head(tx, task_id, &head)?;
             let cfg = hub.cfg();
             match approvals::gate(tx, cfg, &caller, MERGE_TOOL, &payload)? {
                 GateOutcome::Pass { .. } => Ok(Ok(())),
@@ -577,7 +581,7 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
     // approved, or a project rebound to another repository, no longer matches.
     if a.policy_authorization_id.is_none() {
         let payload = merge_approval_payload(&a, &branch, &head, target, row.repo.as_deref());
-        one_time_approval(&ctx, id, payload).await?;
+        one_time_approval(&ctx, id, &head, payload).await?;
     }
     // A policy authorization stands in for the one-time approval. It is
     // reserved (consumed, fenced on the head) right before the merge and put
@@ -602,6 +606,7 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
                     );
                     return Err(authz::refuse_mode(tx, &who, auth_id, id, Some(&auth), "in_flight", err));
                 }
+                continuity::require_review_at_head(tx, id, &h)?;
                 if dry { Ok(None) } else { authz::consume(tx, &auth, auth_id, id, &h, &who).map(Some) }
             })
             .await?;
@@ -735,12 +740,16 @@ pub fn register(r: &mut Registry) {
         tool(
             "git_merge_task",
             "Merge a task's recorded branch into main of the workspace repository after checking the task \
-             status and a clean worktree, then remove the worktree and delete the branch (expected-SHA). \
-             dry_run=true only reports. Always needs a one-time human approval, bound to the head, branch, target \
-             branch and bound repository resolved at the call (a later commit or a rebound project needs a new \
-             one: approval_binding_changed), or policy_authorization_id: a human's policy authorization for exactly this task, its project's bound repository and the head being \
-             merged (spent only by a successful merge; force is refused on that path). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / \
-             branch_retained when the source was kept.",
+             status, a clean worktree, and (when `review` is in the task's `expected_checks`) a passing, \
+             uncontradicted `review` check at the exact head being merged (refusing a self-review by the commit \
+             deliverable revision's producer; not bypassed by `force`), then remove the worktree and delete the \
+             branch (expected-SHA). dry_run=true checks every gate and reports without merging. Always needs a \
+             one-time human approval, bound to the head, branch, target branch and bound repository resolved at \
+             the call (a later commit or a rebound project needs a new one: approval_binding_changed), or \
+             policy_authorization_id: a human's policy authorization for exactly this task, its project's bound \
+             repository and the head being merged (spent only by a successful merge; force is refused on that \
+             path). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / branch_retained when \
+             the source was kept.",
             git_merge_task,
         )
         .family("workspace")

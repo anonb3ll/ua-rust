@@ -746,9 +746,9 @@ async fn plan_and_delegate(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
             let review = check_of(&w, "review").ok_or("no review entry in the workflow view")?;
             ensure(review["grade"] == "unknown", format!("an unrecorded review must read unknown: {review}"))?;
             Ok(format!(
-                "recorded, not enforced: task_claim holds the task for builder-1 on {}; the implementer's \
-                 task_workflow_set records head {} with expected checks review and tests, and the review reads \
-                 unknown until recorded (nothing gates on it; see release.requires-review-at-head)",
+                "task_claim holds the task for builder-1 on {}; task_workflow_set records head {} with expected \
+                 checks review and tests, and the review reads unknown until recorded (enforced at merge; see \
+                 release.requires-review-at-head)",
                 cx.branch,
                 &cx.head[..12]
             ))
