@@ -458,6 +458,18 @@ pub struct EventQuery {
 
 /// Read events in commit order.
 pub fn query(conn: &Connection, q: &EventQuery) -> UaResult<Vec<Event>> {
+    query_filtered(conn, q, "1=1", &[])
+}
+
+/// Read events with an additional SQL predicate applied before pagination.
+/// The predicate is a code-defined expression over the event log. Bind its
+/// values with anonymous placeholders in the order given by the slice.
+pub fn query_filtered(
+    conn: &Connection,
+    q: &EventQuery,
+    predicate: &'static str,
+    values: &[&dyn rusqlite::ToSql],
+) -> UaResult<Vec<Event>> {
     let mut sql = format!("SELECT {COLUMNS} FROM event_log WHERE 1=1");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(chs) = q.channels.as_ref().filter(|c| !c.is_empty()) {
@@ -485,6 +497,9 @@ pub fn query(conn: &Connection, q: &EventQuery) -> UaResult<Vec<Event>> {
         args.push(Box::new(o.clone()));
     }
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    sql.push_str(" AND (");
+    sql.push_str(predicate);
+    sql.push(')');
     // With a cursor, page forward: the oldest `limit` rows after it, so a
     // poller never skips rows. Without one, the newest `limit` rows. Both are
     // returned oldest first.
@@ -494,7 +509,8 @@ pub fn query(conn: &Connection, q: &EventQuery) -> UaResult<Vec<Event>> {
         format!("SELECT * FROM ({sql} ORDER BY seq DESC LIMIT {limit}) ORDER BY seq ASC")
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), from_row)?;
+    let bindings = args.iter().map(|b| b.as_ref()).chain(values.iter().copied());
+    let rows = stmt.query_map(rusqlite::params_from_iter(bindings), from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
