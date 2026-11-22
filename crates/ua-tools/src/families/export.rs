@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::events::{EventReader, VISIBLE_MESSAGE};
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::harness_config::render::py_dumps;
 use super::injection::mark_untrusted;
@@ -875,7 +875,7 @@ fn write_manifest(
             }
             let columns = MANIFEST_EVENT_COLUMNS.join(", ");
             let sql = format!(
-                "SELECT {columns}, ({VISIBLE_MESSAGE}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
+                "SELECT {columns}, ({VISIBLE_EVENT}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
             );
             let bindings = reader.bindings().into_iter().chain([&since as &dyn ToSql]);
             let mut stmt = tx.prepare(&sql)?;

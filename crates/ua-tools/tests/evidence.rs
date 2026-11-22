@@ -24,6 +24,24 @@ async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) 
     reg.call(hub, who, tool, args).await.unwrap_or_else(|e| panic!("{tool} failed: {e}"))
 }
 
+async fn manage(reg: &Registry, hub: &Hub, who: &Caller, action: &str, params: Value) -> Value {
+    call(reg, hub, who, "coordination_manage", json!({ "action": action, "params": params })).await
+}
+
+async fn handoff_channels(reg: &Registry, hub: &Hub, who: &Caller) -> Vec<String> {
+    let channels = json!(["agent.lifecycle.handoff", "agent.conversation.handoff"]);
+    let rows = call(reg, hub, who, "event_log_query", json!({ "channels": channels })).await;
+    let mut chs: Vec<String> = rows["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["channel"].as_str().unwrap().to_string())
+        .collect();
+    chs.sort();
+    chs.dedup();
+    chs
+}
+
 #[tokio::test]
 async fn ledger_paginates_the_callers_visible_message_rows() {
     let hub = hub();
@@ -72,6 +90,55 @@ async fn ledger_paginates_the_callers_visible_message_rows() {
     let recent =
         call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 2 })).await;
     assert_eq!(recent["events"], json!([first_page["events"][0], second_page["events"][0]]));
+}
+
+#[tokio::test]
+async fn ledger_hides_handoff_note_and_conversation_handoff_events_from_outsiders() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (owner, participant, outsider) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let operator = Caller { kind: ActorKind::Human, profile: Profile::Operator, ..agent("operator") };
+    let task =
+        call(&reg, &hub, &owner, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+
+    // A sealed handoff note ledgered as `agent.lifecycle.handoff`.
+    let sid = call(&reg, &hub, &owner, "session_start", json!({ "kind": "interactive", "task_id": task }))
+        .await["session_id"]
+        .clone();
+    let note = manage(
+        &reg,
+        &hub,
+        &owner,
+        "session_handoff_propose",
+        json!({ "session_id": sid, "done": ["a"], "next_steps": ["b"] }),
+    )
+    .await;
+    manage(&reg, &hub, &owner, "session_handoff_seal", json!({ "note_id": note["id"] })).await;
+
+    // A conversation the outsider is not in, handed off to the task.
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "message_send",
+        json!({ "act": "request", "to_agent": participant.label, "body": "the plan",
+                "conversation_id": "conv-1", "task_id": task }),
+    )
+    .await;
+    manage(
+        &reg,
+        &hub,
+        &owner,
+        "conversation_handoff",
+        json!({ "conversation_id": "conv-1", "task_id": task }),
+    )
+    .await;
+
+    let want = ["agent.conversation.handoff", "agent.lifecycle.handoff"].map(String::from);
+    assert_eq!(handoff_channels(&reg, &hub, &outsider).await, Vec::<String>::new());
+    assert_eq!(handoff_channels(&reg, &hub, &participant).await, want[..1]);
+    assert_eq!(handoff_channels(&reg, &hub, &owner).await, want);
+    assert_eq!(handoff_channels(&reg, &hub, &operator).await, want);
 }
 
 fn exec(hub: &Hub, sql: &str) {

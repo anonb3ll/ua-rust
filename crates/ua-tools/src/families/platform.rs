@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
-use super::events::{EventReader, VISIBLE_MESSAGE};
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::injection;
 use super::memory::mark_untrusted;
@@ -642,7 +642,7 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             let reader = EventReader::new(hub.cfg(), caller);
             let sql = format!(
                 "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
-                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_MESSAGE})"
+                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_EVENT})"
             );
             let bindings = std::iter::once(&id as &dyn ToSql).chain(reader.bindings());
             let row = c.query_row(&sql, params_from_iter(bindings), row_map).optional()?;

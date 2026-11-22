@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -36,6 +36,7 @@ use ua_store::{EventInput, ledger};
 
 use super::agents::verified;
 use super::audit::rules::redact_secrets;
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::injection::{injection_regex, mark_untrusted};
 use super::messaging::may_read_all_mail;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
@@ -280,8 +281,10 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
     // A packet may describe another agent's session. Only the caller's own
     // session can admit handoffs addressed to that session.
     let own_session = session.as_ref().filter(|s| s["agent"].as_str() == who).and(sid_str.as_deref());
-    let recent_events = event_rows(conn, sid_str.as_deref(), task_id, None, EVENT_LIMIT);
-    let lifecycle = event_rows(conn, sid_str.as_deref(), task_id, Some("agent.lifecycle."), LIFECYCLE_LIMIT);
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    let recent_events = event_rows(conn, &reader, sid_str.as_deref(), task_id, None, EVENT_LIMIT);
+    let lifecycle =
+        event_rows(conn, &reader, sid_str.as_deref(), task_id, Some("agent.lifecycle."), LIFECYCLE_LIMIT);
 
     let memory = task
         .as_ref()
@@ -412,9 +415,11 @@ fn query_rows<P: rusqlite::Params>(
     stmt.query_map(p, f).map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
 }
 
-/// Recent ledger events for a session or task, newest first, without payloads.
+/// Recent ledger events for a session or task, newest first, without
+/// payloads; private-record rows are limited to the caller's visibility.
 fn event_rows(
     conn: &Connection,
+    reader: &EventReader,
     session_id: Option<&str>,
     task_id: Option<i64>,
     channel_prefix: Option<&str>,
@@ -424,22 +429,27 @@ fn event_rows(
         return Vec::new();
     }
     let prefix = channel_prefix.unwrap_or("");
-    query_rows(
-        conn,
+    let sql = format!(
         "SELECT seq, ulid, channel, originator, created_at, json_extract(payload, '$.kind'), \
          json_extract(payload, '$.tool') FROM event_log \
          WHERE (episode_id = ?1 OR json_extract(payload, '$.session_id') = ?1 \
                 OR json_extract(payload, '$.task_id') = ?2) \
-         AND substr(channel, 1, length(?3)) = ?3 ORDER BY seq DESC LIMIT ?4",
-        params![session_id.unwrap_or(""), task_id.unwrap_or(-1), prefix, limit as i64],
-        |r| {
-            Ok(json!({
-                "seq": r.get::<_, i64>(0)?, "ulid": r.get::<_, String>(1)?, "channel": r.get::<_, String>(2)?,
-                "originator": r.get::<_, Option<String>>(3)?, "created_at": r.get::<_, String>(4)?,
-                "kind": r.get::<_, Option<String>>(5)?, "tool": r.get::<_, Option<String>>(6)?,
-            }))
-        },
-    )
+         AND substr(channel, 1, length(?3)) = ?3 AND ({VISIBLE_EVENT}) ORDER BY seq DESC LIMIT ?"
+    );
+    let session = session_id.unwrap_or("");
+    let task = task_id.unwrap_or(-1);
+    let limit = limit as i64;
+    let bindings = [&session as &dyn rusqlite::ToSql, &task, &prefix]
+        .into_iter()
+        .chain(reader.bindings())
+        .chain([&limit as &dyn rusqlite::ToSql]);
+    query_rows(conn, &sql, params_from_iter(bindings), |r| {
+        Ok(json!({
+            "seq": r.get::<_, i64>(0)?, "ulid": r.get::<_, String>(1)?, "channel": r.get::<_, String>(2)?,
+            "originator": r.get::<_, Option<String>>(3)?, "created_at": r.get::<_, String>(4)?,
+            "kind": r.get::<_, Option<String>>(5)?, "tool": r.get::<_, Option<String>>(6)?,
+        }))
+    })
 }
 
 /// Keep the packet under [`PACKET_BYTE_LIMIT`] by trimming list sections from

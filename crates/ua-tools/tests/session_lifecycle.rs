@@ -175,6 +175,62 @@ async fn packet_selects_the_latest_handoff_visible_to_the_caller() {
 }
 
 #[tokio::test]
+async fn packet_recent_events_hide_messages_the_caller_cannot_read() {
+    let e = Env::new();
+    let (sender, recipient, other) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task = e.ok(&sender, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+    e.ok(
+        &sender,
+        "message_send",
+        json!({ "act": "request", "to_agent": recipient.label, "task_id": task, "body": "please review" }),
+    )
+    .await;
+    e.ok(
+        &sender,
+        "message_send",
+        json!({ "act": "handoff", "to_agent": recipient.label, "task_id": task, "body": "Ready for review",
+                "handoff": { "done": ["prepare"], "next_action": "Review the summary" } }),
+    )
+    .await;
+    let session = e.start(&recipient, json!({ "task_id": task })).await;
+    let note = e
+        .ok(
+            &recipient,
+            "coordination_manage",
+            json!({ "action": "session_handoff_propose",
+                    "params": { "session_id": session, "done": ["a"], "next_steps": ["b"] } }),
+        )
+        .await;
+    e.ok(
+        &recipient,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note["id"] } }),
+    )
+    .await;
+
+    let leaks_private = |p: &Value| {
+        ["recent_events", "lifecycle"].iter().any(|key| {
+            p[key].as_array().unwrap().iter().any(|ev| {
+                let ch = ev["channel"].as_str().unwrap_or("");
+                ch.starts_with("agent.message.") || ch == "agent.lifecycle.handoff"
+            })
+        })
+    };
+    let has_channel = |p: &Value, key: &str, channel: &str| {
+        p[key].as_array().unwrap().iter().any(|ev| ev["channel"] == channel)
+    };
+
+    let outsider = e.ok(&other, "session_packet", json!({ "task_id": task })).await;
+    assert!(!leaks_private(&outsider), "{outsider}");
+
+    let to_recipient = e.ok(&recipient, "session_packet", json!({ "task_id": task })).await;
+    assert!(has_channel(&to_recipient, "recent_events", "agent.message.request"), "{to_recipient}");
+    assert!(has_channel(&to_recipient, "lifecycle", "agent.lifecycle.handoff"), "{to_recipient}");
+    let to_sender = e.ok(&sender, "session_packet", json!({ "task_id": task })).await;
+    assert!(has_channel(&to_sender, "recent_events", "agent.message.request"), "{to_sender}");
+}
+
+#[tokio::test]
 async fn an_oversized_packet_is_trimmed_to_the_cap() {
     let e = Env::new();
     let b = agent("builder-1");
