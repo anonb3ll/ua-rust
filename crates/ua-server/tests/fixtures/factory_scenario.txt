@@ -59,7 +59,7 @@
 4 isolation.same-org-retrieval-and-explanations fail
 
 5 verify.trace-artifact-to-task pass
-5 verify.trace-artifact-to-handoff pass
+5 verify.trace-artifact-to-handoff fail
 5 verify.trace-artifact-to-approval pass
 5 verify.trace-artifact-to-policy not-built
 5 verify.policy-reference-recorded pass
@@ -72,6 +72,6 @@
 5 verify.authenticity-against-trusted-key not-built
 5 verify.asserted-evidence-labelled pass
 5 verify.unavailable-and-unhashed-evidence-reported not-built
-5 verify.private-content-kept-out fail
+5 verify.private-content-kept-out pass
 5 verify.unauthorized-caller-refused-export pass
 5 verify.auditor-authorization not-built

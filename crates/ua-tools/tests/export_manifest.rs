@@ -53,6 +53,59 @@ fn manifest_of(exported: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn manifest_listings_redact_messages_outside_the_exporters_mailbox() {
+    let e = env();
+    let reg = builtin_registry();
+    let sender = agent();
+    let recipient = caller("builder-2", Profile::Coordinator);
+    let observer = caller("builder-3", Profile::Coordinator);
+    let sent = reg
+        .call(
+            &e.hub,
+            &sender,
+            "message_send",
+            json!({
+                "act": "handoff", "to_agent": recipient.label, "body": "Draft ready",
+                "handoff": { "done": ["Drafted the report"], "next_action": "Review section two" }
+            }),
+        )
+        .await
+        .unwrap();
+    let args = json!({ "events_since_ulid": "00000000000000000000000000" });
+    let find = |manifest: &Value| {
+        manifest["event_log"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["ulid"] == sent["event_ulid"])
+            .unwrap()
+            .clone()
+    };
+    let allowed = reg.call(&e.hub, &recipient, "export_migration_manifest", args.clone()).await.unwrap();
+    let message = find(&allowed["manifest"]);
+    let payload: Value = serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["body"], "Draft ready");
+    assert_eq!(payload["handoff"]["next_action"], "Review section two");
+
+    let blocked = reg.call(&e.hub, &observer, "export_migration_manifest", args.clone()).await.unwrap();
+    let redacted =
+        json!({ "ulid": sent["event_ulid"], "entry_hash": message["entry_hash"], "redacted": true });
+    assert_eq!(find(&blocked["manifest"]), redacted);
+    assert_eq!(allowed["fingerprint"], blocked["fingerprint"]);
+    assert_eq!(
+        allowed["manifest"]["event_log"]["rolling_hash"],
+        blocked["manifest"]["event_log"]["rolling_hash"],
+    );
+
+    let mut file_args = args;
+    file_args["write_to_vault"] = json!(true);
+    let file = reg.call(&e.hub, &observer, "export_migration_manifest", file_args).await.unwrap();
+    let bytes = std::fs::read(e.workspace.join(file["path"].as_str().unwrap())).unwrap();
+    let manifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(find(&manifest), redacted);
+}
+
+#[tokio::test]
 async fn export_is_deterministic_and_compare_is_read_only() {
     let e = env();
     let reg = builtin_registry();

@@ -184,7 +184,7 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | Check | Status | Reason |
 | --- | --- | --- |
 | `verify.trace-artifact-to-task` | pass | |
-| `verify.trace-artifact-to-handoff` | pass | |
+| `verify.trace-artifact-to-handoff` | fail | The release handoff is addressed to the reviewer. The auditor receives its ID and stored hash. Tracing the handoff to the reviewed revision requires authorized access. |
 | `verify.trace-artifact-to-approval` | pass | |
 | `verify.trace-artifact-to-policy` | not-built | The approval carries a caller-supplied policy reference (free text); no policy record exists to resolve it against. |
 | `verify.policy-reference-recorded` | pass | A label, not a resolvable policy. |
@@ -197,7 +197,7 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `verify.authenticity-against-trusted-key` | not-built | Exports carry no signature or signed checkpoint. |
 | `verify.asserted-evidence-labelled` | pass | |
 | `verify.unavailable-and-unhashed-evidence-reported` | not-built | No bundle verifier reports unavailable evidence or unhashed legacy rows. |
-| `verify.private-content-kept-out` | fail | Scored: content kept out of an export unless the exporter may read it. The only bundle is a full migration manifest, not a scoped audit export; it carries message and handoff payloads the exporting auditor may not read. |
+| `verify.private-content-kept-out` | pass | The migration manifest gives the auditor IDs and stored hashes for message rows outside its mailbox. |
 | `verify.unauthorized-caller-refused-export` | pass | Refused by the developer profile; the gate is the coordinator profile, not an auditor grant. |
 | `verify.auditor-authorization` | not-built | No auditor role or grant exists: any coordinator-profile agent may export the whole hub. |
 

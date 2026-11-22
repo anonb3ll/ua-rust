@@ -11,7 +11,8 @@
 //! new file under `exports/` in the caller's workspace (capped at 32 MB). The
 //! file name carries a UTC timestamp and a counter, and is created exclusively
 //! so concurrent exports never overwrite each other. Writes are recorded on
-//! `agent.export.written`. No redaction: review an export before sharing it.
+//! `agent.export.written`. The manifest applies mailbox visibility to message
+//! event rows, which carry only their id and stored hash when restricted.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -23,7 +24,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -31,6 +32,7 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use super::events::{EventReader, VISIBLE_MESSAGE};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::harness_config::render::py_dumps;
 use super::injection::mark_untrusted;
@@ -843,6 +845,7 @@ fn write_manifest(
     c: &Connection,
     source_host: &str,
     since_ulid: Option<&str>,
+    reader: &EventReader,
     caps: ManifestCaps,
     out: &mut dyn std::io::Write,
 ) -> UaResult<ManifestStats> {
@@ -867,11 +870,30 @@ fn write_manifest(
         em.hashing = false;
         em.key(false, "rows")?;
         em.array(|item, em| {
-            for_each_row(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid", Some(since), |row| {
-                let mut row = Value::Object(row);
-                label_event_row(&mut row);
-                item(em, &row)
-            })
+            if !has_table(&tx, "event_log")? {
+                return Ok(());
+            }
+            let columns = MANIFEST_EVENT_COLUMNS.join(", ");
+            let sql = format!(
+                "SELECT {columns}, ({VISIBLE_MESSAGE}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
+            );
+            let bindings = reader.bindings().into_iter().chain([&since as &dyn ToSql]);
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(bindings))?;
+            while let Some(row) = rows.next()? {
+                let visible: bool = row.get("_visible")?;
+                let mut row = row_map(row)?;
+                let listed = if visible {
+                    row.remove("_visible");
+                    let mut listed = Value::Object(row);
+                    label_event_row(&mut listed);
+                    listed
+                } else {
+                    json!({ "ulid": row["ulid"], "entry_hash": row["entry_hash"], "redacted": true })
+                };
+                item(em, &listed)?;
+            }
+            Ok(())
         })?;
         em.key(false, "since_ulid")?;
         em.put(&py_dumps(&json!(since), None))?;
@@ -976,14 +998,21 @@ fn parse_cursor(raw: Option<&str>) -> UaResult<Option<String>> {
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
     let source_host = source_host_label(ctx.hub.cfg());
     let since = parse_cursor(a.events_since_ulid.as_deref())?;
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
     if !a.write_to_vault.unwrap_or(false) {
         let (stats, text) = ctx
             .hub
             .db()
             .read_async(move |c| {
                 let mut buf: Vec<u8> = Vec::new();
-                let stats =
-                    write_manifest(c, &source_host, since.as_deref(), ManifestCaps::INLINE, &mut buf)?;
+                let stats = write_manifest(
+                    c,
+                    &source_host,
+                    since.as_deref(),
+                    &reader,
+                    ManifestCaps::INLINE,
+                    &mut buf,
+                )?;
                 Ok((stats, buf))
             })
             .await?;
@@ -1007,14 +1036,15 @@ async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Va
                 .map_err(|e| UaError::internal(format!("cannot create {EXPORT_DIR}/: {e}")))?;
             let (file, path) = open_exclusive(&dir, &format!("migration-manifest-{stamp}"), "json")?;
             let mut out = std::io::BufWriter::new(file);
-            let written = write_manifest(c, &source_host, since.as_deref(), ManifestCaps::FILE, &mut out)
-                .and_then(|stats| {
-                    out.write_all(b"\n")
-                        .and_then(|_| out.flush())
-                        .and_then(|_| out.get_ref().sync_all())
-                        .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
-                    Ok(stats)
-                });
+            let written =
+                write_manifest(c, &source_host, since.as_deref(), &reader, ManifestCaps::FILE, &mut out)
+                    .and_then(|stats| {
+                        out.write_all(b"\n")
+                            .and_then(|_| out.flush())
+                            .and_then(|_| out.get_ref().sync_all())
+                            .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
+                        Ok(stats)
+                    });
             match written {
                 Ok(mut stats) => {
                     stats.bytes += 1;
@@ -1673,7 +1703,9 @@ pub fn register(r: &mut Registry) {
              and chain_error report where and why the chain broke (omitted on healthy logs). The summary has \
              no anchor: compare against an earlier \
              manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
-             client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
+             client evidence (sdk. channels) carrying a trust label. Restricted message rows contain \
+             only their ULID, stored entry hash, and a redacted flag. Row comparisons compare the \
+             listed views. The listing and cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \
              rewrite or delete anything. The manifest is streamed and refused as soon as it would pass a cap: \
@@ -1710,11 +1742,21 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ua_core::{Caller, Config, identity::Transport};
 
     /// Minimal manifest DB using the real ledger and ledger_meta schemas.
     fn db() -> Connection {
         let mut c = Connection::open_in_memory().unwrap();
-        ua_store::schema::apply(&mut c, &[ledger::SCHEMA, ledger::META_SCHEMA]).unwrap();
+        ua_store::schema::apply::<ua_store::schema::Part>(
+            &mut c,
+            &[
+                ledger::SCHEMA.into(),
+                ledger::META_SCHEMA.into(),
+                ua_store::org::STORE_PART.into(),
+                super::super::messaging::SCHEMA.into(),
+            ],
+        )
+        .unwrap();
         c.execute_batch(
             "INSERT INTO schema_parts (name, checksum, applied_at)
              VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
@@ -1747,6 +1789,10 @@ mod tests {
         ManifestCaps { bytes, kind: "test", memory_rows }
     }
 
+    fn reader() -> EventReader {
+        EventReader::new(&Config::default(), &Caller::local("local", Transport::Stdio))
+    }
+
     #[test]
     fn the_memory_cap_is_named_when_exceeded() {
         let c = db();
@@ -1754,11 +1800,12 @@ mod tests {
             c.execute("INSERT INTO memory VALUES (?1, 't', 'c')", [id]).unwrap();
         }
         let mut out = Vec::new();
-        let err = write_manifest(&c, "local", None, caps(1 << 20, 2), &mut out).unwrap_err().to_string();
+        let err =
+            write_manifest(&c, "local", None, &reader(), caps(1 << 20, 2), &mut out).unwrap_err().to_string();
         assert!(err.contains("memory cap of 2 rows"), "{err}");
         // Index notes do not count: three real notes fit a cap of three.
         let mut out = Vec::new();
-        let stats = write_manifest(&c, "local", None, caps(1 << 20, 3), &mut out).unwrap();
+        let stats = write_manifest(&c, "local", None, &reader(), caps(1 << 20, 3), &mut out).unwrap();
         assert_eq!(stats.memory, 3);
     }
 
@@ -1770,7 +1817,8 @@ mod tests {
             c.execute("INSERT INTO tasks (title) VALUES (?1)", [&title]).unwrap();
         }
         let mut out = Vec::new();
-        let err = write_manifest(&c, "local", None, caps(10_000, 10), &mut out).unwrap_err().to_string();
+        let err =
+            write_manifest(&c, "local", None, &reader(), caps(10_000, 10), &mut out).unwrap_err().to_string();
         assert!(err.contains("over the 10000 byte test cap"), "{err}");
         // Nothing past the cap was produced: about 2 MB of tasks were never serialised.
         assert!(out.len() <= 10_000, "{}", out.len());
@@ -1802,7 +1850,7 @@ mod tests {
         c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '1')", [ledger::LEGACY_PREFIX_KEY])
             .unwrap();
         let mut out = Vec::new();
-        let stats = write_manifest(&c, "hub-a", Some("01A"), caps(1 << 20, 10), &mut out).unwrap();
+        let stats = write_manifest(&c, "hub-a", Some("01A"), &reader(), caps(1 << 20, 10), &mut out).unwrap();
         assert_eq!(stats.bytes, out.len());
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         let m = parsed.as_object().unwrap();
@@ -1831,7 +1879,7 @@ mod tests {
 
         // The cursor listing is outside the fingerprint.
         let mut plain = Vec::new();
-        let without = write_manifest(&c, "hub-a", None, caps(1 << 20, 10), &mut plain).unwrap();
+        let without = write_manifest(&c, "hub-a", None, &reader(), caps(1 << 20, 10), &mut plain).unwrap();
         assert_eq!(without.fingerprint, stats.fingerprint);
     }
 
