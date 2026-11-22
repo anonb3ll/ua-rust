@@ -20,7 +20,7 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::broadcast;
 use ua_core::{UaError, UaResult};
 
-use crate::ledger::Event;
+use crate::ledger::{Event, EventInput};
 use crate::lock::{self, ServeLock};
 use crate::schema::{self, Part};
 
@@ -272,20 +272,21 @@ impl Db {
     /// Run `f` in a `BEGIN IMMEDIATE` transaction on the writer. Commits when
     /// `f` returns `Ok`, rolls back otherwise. Ledger events appended inside
     /// are broadcast to subscribers only after the commit succeeds.
+    ///
+    /// Events appended with [`crate::ledger::append_surviving`] (a refusal
+    /// recorded by the call it refuses) outlive a rollback: when `f` fails,
+    /// or the commit does, they are appended again in a separate small
+    /// transaction on the same writer, still under the writer lock, and the
+    /// original error is returned.
     pub fn write<T>(&self, f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>) -> UaResult<T> {
         let (out, pending) = {
             let mut conn = self.inner.writer.lock().map_err(|_| UaError::internal("writer lock poisoned"))?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut wtx = WriteTx { tx, pending: Vec::new() };
-            let out = f(&mut wtx)?;
-            let WriteTx { tx, pending } = wtx;
-            tx.commit()?;
-            (out, pending)
+            run_write(&mut conn, f)
         };
         for ev in pending {
             let _ = self.inner.events.send(ev);
         }
-        Ok(out)
+        out
     }
 
     /// Run `f` on a read connection. Blocking: from async code use
@@ -393,6 +394,10 @@ impl Db {
 pub struct WriteTx<'c> {
     tx: Transaction<'c>,
     pub(crate) pending: Vec<Event>,
+    /// Copies of the events appended with
+    /// [`crate::ledger::append_surviving`], recorded again if this
+    /// transaction rolls back.
+    pub(crate) surviving: Vec<EventInput>,
 }
 
 /// Run `f` inside a `BEGIN IMMEDIATE` transaction on an already-opened writer
@@ -402,11 +407,58 @@ pub(crate) fn write_on_connection<T>(
     conn: &mut Connection,
     f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
 ) -> UaResult<T> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut wtx = WriteTx { tx, pending: Vec::new() };
-    let out = f(&mut wtx)?;
-    wtx.tx.commit()?;
-    Ok(out)
+    run_write(conn, f).0
+}
+
+/// One write transaction on `conn`: the result of `f` (or of the commit)
+/// and the events to broadcast. When the transaction does not commit, the
+/// surviving events are recorded in a transaction of their own.
+fn run_write<T>(
+    conn: &mut Connection,
+    f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
+) -> (UaResult<T>, Vec<Event>) {
+    let (failure, surviving) = {
+        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => return (Err(e.into()), Vec::new()),
+        };
+        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        let out = f(&mut wtx);
+        let WriteTx { tx, pending, surviving } = wtx;
+        match out {
+            Ok(v) => match tx.commit() {
+                Ok(()) => return (Ok(v), pending),
+                Err(e) => (UaError::from(e), surviving),
+            },
+            // Dropping the transaction rolls it back.
+            Err(e) => (e, surviving),
+        }
+    };
+    if surviving.is_empty() {
+        return (Err(failure), Vec::new());
+    }
+    (Err(failure), record_surviving(conn, surviving))
+}
+
+/// Append `events` in a transaction of their own, after the transaction
+/// that first appended them rolled back. A failure here is logged, never
+/// returned: the caller reports the original error.
+fn record_surviving(conn: &mut Connection, events: Vec<EventInput>) -> Vec<Event> {
+    let n = events.len();
+    let recorded = (|| -> UaResult<Vec<Event>> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        for ev in events {
+            crate::ledger::append(&mut wtx, ev)?;
+        }
+        let WriteTx { tx, pending, .. } = wtx;
+        tx.commit()?;
+        Ok(pending)
+    })();
+    recorded.unwrap_or_else(|e| {
+        tracing::error!(error = %e, events = n, "could not record the events a rolled-back write kept");
+        Vec::new()
+    })
 }
 
 impl<'c> Deref for WriteTx<'c> {

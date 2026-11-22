@@ -14,7 +14,7 @@
 1 delegate.task-claimed-with-review-requirement pass
 1 delegate.handoff-tied-to-revision pass
 1 delegate.session-handoff-sealed pass
-1 delegate.deliverable-revision-object not-built
+1 delegate.deliverable-revision-object pass
 
 2 review.second-harness-opens-same-task pass
 2 review.packet-carries-handoff-at-revision pass
@@ -30,14 +30,14 @@
 2 review.uncertain-outcome-visible pass
 
 3 release.expired-approval-refused pass
-3 release.expired-refusal-audited fail
+3 release.expired-refusal-audited pass
 3 release.changed-revision-refused pass
-3 release.changed-revision-refusal-audited fail
+3 release.changed-revision-refusal-audited pass
 3 release.changed-target-refused pass
-3 release.changed-target-refusal-audited fail
+3 release.changed-target-refusal-audited pass
 3 release.verified-human-approves-exact-action pass
 3 release.approved-attempt-produces-artifact pass
-3 release.one-time-approval-binds-revision fail
+3 release.one-time-approval-binds-revision pass
 3 release.requires-review-at-head not-built
 
 4 isolation.other-org-direct-reads not-built

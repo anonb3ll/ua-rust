@@ -107,11 +107,11 @@ pub struct Config {
     /// diff time out). It cannot be set from TOML or the environment.
     #[serde(skip)]
     pub harness_config_diff_timeout_ms: Option<u64>,
-    /// Planning canvas boards one agent may create (`graph_canvas_write`).
+    /// Planning canvas boards one agent may create per organization (`graph_canvas_write`).
     /// Creating a new board past it is refused (`canvas_limit`); updating a
     /// board is never capped.
     pub graph_canvas_max_boards_per_agent: u32,
-    /// Planning canvas boards the hub holds in all. Creating a new board past
+    /// Planning canvas boards an organization may hold. Creating a new board past
     /// it is refused (`canvas_limit`).
     pub graph_canvas_max_boards: u32,
     /// Prior scenes kept per board for `graph_canvas_history` and

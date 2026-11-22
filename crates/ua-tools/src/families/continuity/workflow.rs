@@ -287,7 +287,7 @@ fn parse_ref(r: Option<CheckRef>) -> UaResult<Option<ParsedRef>> {
 /// caller: an unverified caller that names a human's label as its `actor` is
 /// not an operator (it still writes a task whose claimant or next owner it
 /// names, as every unverified write does).
-fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
+pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
     let allowed = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
@@ -308,7 +308,7 @@ fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) 
 }
 
 /// The repository the task's project is bound to.
-fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
+pub(crate) fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
     match str_field(task, "project") {
         Some(project) => governance::bound_repo(conn, project),
         None => Ok(None),
@@ -633,61 +633,87 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
     let out = ctx
         .hub
         .db()
-        .write_async(move |tx| {
-            let task = require_task(tx, id)?;
-            require_writer(&ctx2, &task, &who, id)?;
-            let revision: Option<i64> = tx
-                .query_row("SELECT revision FROM task_workflow WHERE task_id = ?1", [id], |r| r.get(0))
-                .optional()?;
-            let current = revision.unwrap_or(0);
-            if let Some(exp) = expected_revision
-                && exp != current
-            {
-                return Err(UaError::conflict(format!(
-                    "task {id}'s workflow record is at revision {current}, not {exp}; read it again"
-                )));
-            }
-            let now = now_micros();
-            if revision.is_none() {
-                tx.execute(
-                    "INSERT INTO task_workflow (task_id, revision, updated_by, updated_at) VALUES (?1, 0, ?2, ?3)",
-                    params![id, who, now],
-                )?;
-            }
-            let names: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
-            let mut values: Vec<Sql> = fields.into_iter().map(|(_, v)| v).collect();
-            let assignments: Vec<String> = names.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 1)).collect();
-            values.push(Sql::Text(who.clone()));
-            values.push(Sql::Text(now));
-            values.push(Sql::Integer(id));
-            let n = values.len();
-            tx.execute(
-                &format!(
-                    "UPDATE task_workflow SET {}, revision = revision + 1, updated_by = ?{}, updated_at = ?{} \
-                     WHERE task_id = ?{n}",
-                    assignments.join(", "),
-                    n - 2,
-                    n - 1
-                ),
-                params_from_iter(values.iter()),
-            )?;
-            let stage = names.contains(&"stage").then(|| {
-                tx.query_row("SELECT stage FROM task_workflow WHERE task_id = ?1", [id], |r| r.get::<_, String>(0))
-                    .ok()
-            });
-            let mut sorted = names.clone();
-            sorted.sort_unstable();
-            emit(
-                tx,
-                CHANNEL,
-                json!({ "kind": "capsule", "task_id": id, "stage": stage.flatten(), "fields": sorted, "revision": current + 1 }),
-                &who,
-            )?;
-            view(tx, id, None)
-        })
+        .write_async(move |tx| write_capsule(tx, &ctx2, id, &who, fields, expected_revision))
         .await?;
     review_ready(&ctx.hub, id).await;
     Ok(out)
+}
+
+/// Write validated capsule `fields` of task `id` as `who` inside `tx`: the
+/// writer rule, the `expected_revision` guard, one `revision` bump and one
+/// `agent.task.workflow` capsule event. Returns the workflow view.
+///
+/// `task_workflow_set` writes through it, and so does recording a
+/// deliverable revision (which sets `head_sha`), so the capsule's head stays
+/// the one place that says which commit the task is at. Call
+/// [`review_ready`] after the transaction commits.
+pub(crate) fn write_capsule(
+    tx: &mut ua_store::WriteTx<'_>,
+    ctx: &ToolCtx,
+    id: i64,
+    who: &str,
+    fields: Vec<(&'static str, Sql)>,
+    expected_revision: Option<i64>,
+) -> UaResult<Value> {
+    let task = require_task(tx, id)?;
+    require_writer(ctx, &task, who, id)?;
+    let revision: Option<i64> = tx
+        .query_row("SELECT revision FROM task_workflow WHERE task_id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    let current = revision.unwrap_or(0);
+    if let Some(exp) = expected_revision
+        && exp != current
+    {
+        return Err(UaError::conflict(format!(
+            "task {id}'s workflow record is at revision {current}, not {exp}; read it again"
+        )));
+    }
+    let now = now_micros();
+    if revision.is_none() {
+        tx.execute(
+            "INSERT INTO task_workflow (task_id, revision, updated_by, updated_at) VALUES (?1, 0, ?2, ?3)",
+            params![id, who, now],
+        )?;
+    }
+    let names: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
+    let mut values: Vec<Sql> = fields.into_iter().map(|(_, v)| v).collect();
+    let assignments: Vec<String> =
+        names.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 1)).collect();
+    values.push(Sql::Text(who.to_string()));
+    values.push(Sql::Text(now));
+    values.push(Sql::Integer(id));
+    let n = values.len();
+    tx.execute(
+        &format!(
+            "UPDATE task_workflow SET {}, revision = revision + 1, updated_by = ?{}, updated_at = ?{} \
+             WHERE task_id = ?{n}",
+            assignments.join(", "),
+            n - 2,
+            n - 1
+        ),
+        params_from_iter(values.iter()),
+    )?;
+    let stage = names.contains(&"stage").then(|| {
+        tx.query_row("SELECT stage FROM task_workflow WHERE task_id = ?1", [id], |r| r.get::<_, String>(0))
+            .ok()
+    });
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    emit(
+        tx,
+        CHANNEL,
+        json!({ "kind": "capsule", "task_id": id, "stage": stage.flatten(), "fields": sorted, "revision": current + 1 }),
+        who,
+    )?;
+    view(tx, id, None)
+}
+
+/// The head the task's capsule names, if any.
+pub(crate) fn capsule_head(conn: &Connection, task_id: i64) -> UaResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .optional()?
+        .flatten())
 }
 
 /// `coordination_manage(action="task_check_record")`.

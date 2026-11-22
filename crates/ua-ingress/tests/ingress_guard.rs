@@ -88,6 +88,12 @@ const CATEGORIES: &[&str] =
 /// `dispatch_receipts` are not inbound deliveries and match no mark).
 const DELIVERY_NAME_MARKS: &[&str] = &["deliver", "seen", "replay", "dedup", "webhook", "envelope"];
 
+/// Words that contain a mark but name something else, removed from a table
+/// name before the marks are looked for: a deliverable is what a task
+/// produces (`ua-deliverables`), not an inbound delivery. A name that also
+/// holds a real mark (`deliverable_deliveries`) is still caught.
+const NOT_DELIVERY_WORDS: &[&str] = &["deliverable"];
+
 /// Column names that mark an inbound delivery record, whatever the table is
 /// called.
 const DELIVERY_COLUMNS: &[&str] = &["delivery_id", "envelope_id", "event_id", "trigger_id", "request_sha"];
@@ -250,7 +256,10 @@ fn count_tables(raw: &str) -> Vec<usize> {
             rest = r.trim_start();
         }
         let rest = rest.trim_start_matches(['"', '`', '[']);
-        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let mut name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        for word in NOT_DELIVERY_WORDS {
+            name = name.replace(word, "_");
+        }
         if DELIVERY_NAME_MARKS.iter().any(|w| name.contains(w))
             || columns(rest).iter().any(|c| DELIVERY_COLUMNS.contains(&c.as_str()))
         {
@@ -403,6 +412,9 @@ fn each_category_is_caught() {
             "delivery_table",
         ),
         ("const S: &str = \"CREATE TABLE things (kind TEXT, delivery_id TEXT)\";", "delivery_table"),
+        // A deliverable's word does not hide a real mark next to it.
+        ("const S: &str = \"CREATE TABLE deliverable_deliveries (id TEXT)\";", "delivery_table"),
+        ("const S: &str = \"CREATE TABLE deliverables_seen (id TEXT)\";", "delivery_table"),
     ];
     for (src, cat) in cases {
         let got = count(src);
@@ -447,6 +459,12 @@ fn each_category_is_caught() {
             .is_empty()
     );
     assert!(count("const S: &str = \"CREATE TABLE managed_secrets (name TEXT, nonce BLOB)\";").is_empty());
+    // A deliverable is a task's work product, not an inbound delivery.
+    assert!(count("const S: &str = \"CREATE TABLE IF NOT EXISTS deliverables (id INTEGER)\";").is_empty());
+    assert!(
+        count("const S: &str = \"CREATE TABLE deliverable_revisions (id INTEGER, identity TEXT)\";")
+            .is_empty()
+    );
     assert!(
         count(
             "const S: &str = \"CREATE TABLE event_log (id INTEGER, kind TEXT, CHECK (kind <> 'event_id'))\";"

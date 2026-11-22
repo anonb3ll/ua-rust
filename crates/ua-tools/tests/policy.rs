@@ -454,11 +454,10 @@ async fn prod_actions_refuse_revoked_unscoped_and_anonymous_callers() {
         c.agent_scopes.insert("lead-2".into(), "merge|deploy".into());
     });
     assert_eq!(env.denied(&lead, "git_merge_task", merge_args()).await, "scope_denied");
+    // lead-2 passes the identity checks and reaches the handler, which
+    // resolves the task before it asks for an approval (task 999 is unknown).
     let lead2 = agent("lead-2", Profile::Coordinator);
-    assert_eq!(
-        env.call(&lead2, "git_merge_task", merge_args()).await.unwrap_err().code(),
-        "approval_required"
-    );
+    assert_eq!(env.call(&lead2, "git_merge_task", merge_args()).await.unwrap_err().code(), "not_found");
 
     let env = setup_with(None, |_| {});
     let anon = Caller {
@@ -469,10 +468,7 @@ async fn prod_actions_refuse_revoked_unscoped_and_anonymous_callers() {
     };
     assert_eq!(env.denied(&anon, "git_merge_task", merge_args()).await, "anonymous_prod_action");
     let local = Caller { transport: Transport::Stdio, ..anon };
-    assert_eq!(
-        env.call(&local, "git_merge_task", merge_args()).await.unwrap_err().code(),
-        "approval_required"
-    );
+    assert_eq!(env.call(&local, "git_merge_task", merge_args()).await.unwrap_err().code(), "not_found");
 }
 
 #[tokio::test]
@@ -485,8 +481,12 @@ async fn a_revoked_agent_cannot_spend_an_earlier_pass() {
 
     let id = {
         let hub = Hub::open(cfg.clone()).unwrap();
-        let err = reg.call(&hub, &lead, "git_merge_task", merge_args()).await.unwrap_err();
-        let UaError::ApprovalRequired { approval_id, .. } = err else { panic!("{err}") };
+        // The merge binds values its handler resolves; park its request
+        // through the gate directly, as the handler would.
+        let (c, l) = (hub.cfg().clone(), lead.clone());
+        let parked =
+            hub.db().write(move |tx| ua_tools::approvals::gate(tx, &c, &l, "git_merge_task", &merge_args()));
+        let ua_tools::approvals::GateOutcome::Pending { approval_id } = parked.unwrap() else { panic!() };
         reg.call(&hub, &human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" }))
             .await
             .unwrap();

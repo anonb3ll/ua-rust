@@ -549,11 +549,20 @@ impl Scenario {
     /// (`authorization_id` or `approval_id`) and carries a non-empty reason
     /// (`reason` or `reason_code`). A row that names another approval, or no
     /// reason, does not count.
-    fn refusal_audited(&self, mark: i64, caller: &str, approval: i64, what: &str) -> Verified {
+    /// `approval` names the decision the refused call presented, in its own
+    /// id space: [`Grant::Authorization`] for a policy authorization
+    /// (`authorization_id` on the event), [`Grant::Approval`] for a one-time
+    /// approval (`approval_id`). The two are separate tables, so an id of one
+    /// never counts for the other.
+    fn refusal_audited(&self, mark: i64, caller: &str, approval: Grant, what: &str) -> Verified {
         let rows = self.ledger_after(mark);
+        let (key, approval) = match approval {
+            Grant::Authorization(id) => ("authorization_id", id),
+            Grant::Approval(id) => ("approval_id", id),
+        };
         let audited = rows.iter().find(|e| {
             let p = &e.payload;
-            let names = p["authorization_id"] == approval || p["approval_id"] == approval;
+            let names = p[key] == approval;
             let why = ["reason", "reason_code"]
                 .iter()
                 .any(|k| p[*k].as_str().is_some_and(|s| !s.trim().is_empty()));
@@ -573,6 +582,15 @@ impl Scenario {
             )),
         }
     }
+}
+
+/// Which decision a refused call presented, by id space.
+#[derive(Debug, Clone, Copy)]
+enum Grant {
+    /// A policy authorization (`policy_authorizations`).
+    Authorization(i64),
+    /// A one-time approval (`approvals`).
+    Approval(i64),
 }
 
 /// The scenario's state as the steps hand it on.
@@ -818,11 +836,71 @@ async fn plan_and_delegate(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
             ))
         })(),
     );
-    card.not_built(
+
+    // The change is a deliverable of the task, and its commit a recorded
+    // revision in the project's bound repository.
+    s.must_act(&human(), "project_repo_bind", json!({ "project": "default", "repo": REPO })).await;
+    let recorded = async {
+        let made = s
+            .ok(
+                &builder(),
+                "deliverable_create",
+                json!({ "task_id": cx.task, "title": "changelog generator" }),
+            )
+            .await?;
+        let id = made["deliverable"]["id"].clone();
+        let rev = s
+            .ok(
+                &builder(),
+                "deliverable_revise",
+                json!({ "deliverable_id": id, "commit": cx.head, "summary": "first version" }),
+            )
+            .await?;
+        let wf = s.act_ok(&builder(), "task_workflow_get", json!({ "task_id": cx.task })).await?;
+        Ok::<_, String>((made, rev, wf))
+    }
+    .await;
+    card.check(
         1,
         "delegate.deliverable-revision-object",
-        "no deliverable record exists: the revision is a commit SHA string repeated on the workflow record, the \
-         checks and the handoff, with nothing tying them into one reviewable deliverable",
+        (|| {
+            let (made, rev, wf) = recorded?;
+            ensure(made["created"] == true && made["deliverable"]["task_id"] == cx.task, format!("{made}"))?;
+            ensure(made["deliverable"]["repo"] == REPO, format!("the deliverable lost the binding: {made}"))?;
+            let d = made["deliverable"]["id"].as_i64().ok_or("no deliverable id")?;
+            let r = &rev["revision"];
+            ensure(rev["recorded"] == true && r["rev_no"] == 1, format!("{rev}"))?;
+            ensure(r["commit"] == cx.head.as_str() && r["producer"] == "builder-1", format!("{rev}"))?;
+            let rid = r["id"].as_i64().ok_or("no revision id")?;
+            let row = s
+                .text(&format!(
+                    "SELECT identity || ' ' || repo || ' ' || org_id FROM deliverable_revisions \
+                     WHERE id = {rid} AND deliverable_id = {d} AND rev_no = 1"
+                ))
+                .ok_or("no deliverable_revisions row for the revision")?;
+            ensure(row == format!("{} {REPO} default", cx.head), format!("the stored revision is {row}"))?;
+            let ev = s
+                .ledger()
+                .into_iter()
+                .find(|e| e.channel == "agent.deliverable.revised" && e.payload["revision_id"] == rid)
+                .ok_or("no agent.deliverable.revised event for the revision")?;
+            ensure(
+                ev.payload["identity"] == cx.head.as_str()
+                    && ev.payload["deliverable_id"] == d
+                    && ev.payload["task_id"] == cx.task
+                    && ev.originator.as_deref() == Some("builder-1"),
+                format!("{ev:?}"),
+            )?;
+            ensure(wf["head_sha"] == cx.head.as_str(), format!("the workflow head is not the revision: {wf}"))?;
+            ensure(rev["latest_is_workflow_head"] == true, format!("{rev}"))?;
+            Ok(format!(
+                "deliverable_create attaches deliverable {d} in {REPO} to task {}; deliverable_revise records {} as \
+                 its revision 1 (row {rid}, ledger event {}), and the task's workflow head is that commit",
+                cx.task,
+                &cx.head[..12],
+                ev.seq
+            ))
+        })(),
     );
 }
 
@@ -1171,7 +1249,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.expired-refusal-audited",
-        s.refusal_audited(mark, "lead-1", expiring_id, "merge under an expired approval"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(expiring_id),
+            "merge under an expired approval",
+        ),
     );
 
     // A changed revision is refused.
@@ -1205,7 +1288,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.changed-revision-refusal-audited",
-        s.refusal_audited(mark, "lead-1", cx.authorization, "merge of a changed revision"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(cx.authorization),
+            "merge of a changed revision",
+        ),
     );
 
     // A changed target is refused.
@@ -1231,7 +1319,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.changed-target-refusal-audited",
-        s.refusal_audited(mark, "lead-1", cx.authorization, "merge into a changed target"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(cx.authorization),
+            "merge into a changed target",
+        ),
     );
 
     // The approved attempt merges exactly the reviewed head.
@@ -1330,7 +1423,26 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
         3,
         "release.one-time-approval-binds-revision",
         match &late {
-            Err(e) => Ok(format!("a branch moved after the approval is refused: {}", reason(e))),
+            Err(e) => (|| {
+                ensure(reason(e) == "approval_binding_changed", format!("refused for another reason: {e:?}"))?;
+                ensure(
+                    payload.contains(&approved_head) && !payload.contains(&unreviewed),
+                    format!("the approval does not bind the approved head: {payload}"),
+                )?;
+                let audited = s.refusal_audited(
+                    mark,
+                    "lead-1",
+                    Grant::Approval(approval_id),
+                    "merge of a branch moved after the approval",
+                )?;
+                Ok(format!(
+                    "the approval binds head {} (payload {payload}); with the branch moved to {} the merge is \
+                     refused: {}; {audited}",
+                    &approved_head[..12],
+                    &unreviewed[..12],
+                    reason(e)
+                ))
+            })(),
             Ok(_) => {
                 let merged = s
                     .ledger_after(mark)

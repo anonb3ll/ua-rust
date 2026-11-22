@@ -200,6 +200,11 @@ from its commit history.
   only the default organization sees no change in any tool result or event.
   As with every new part, a database that has applied it is refused by an
   earlier build (the unknown-part fence).
+- Graph canvas boards and revisions have organization-scoped keys and
+  triggers. Existing boards and history migrate to `default`. Organizations
+  can use the same board names independently, with separate board quotas and
+  revision retention. Canvas tool results and event payloads retain their
+  existing shapes.
 - Web search cache rows (`web_search_cache`) have organization-scoped keys
   and triggers (`web.v2.tenant_keys`, `organization.v1.tools.web`). Existing
   cached entries migrate to `default`. Organizations cache identical queries
@@ -210,6 +215,38 @@ from its commit history.
   table that carries its organization key does not name `org_id`, in any
   crate's non-test source or any trigger body. It cannot see a table name
   built at run time, nor check what an `INSERT … SELECT` supplies.
+- Crate `ua-deliverables` and the tools `deliverable_create`,
+  `deliverable_revise`, `deliverable_get` and `deliverable_list`
+  (`docs/deliverables.md`): a task's deliverable and its immutable, ordered
+  revisions. For the `commit` kind a revision is the full 40-hex commit SHA
+  in the task's project's bound repository; recording one also sets the
+  task's workflow head through the workflow record's own write, so checks
+  are graded there. The writers are the workflow record's writers (the
+  `reviewer` profile does not see the write tools). Tables `deliverables`
+  and `deliverable_revisions` carry `org_id` and the organization triggers
+  from their first parts (`deliverables.v1`, `organization.v1.deliverables`);
+  triggers keep revisions immutable and in order. Events
+  `agent.deliverable.created` and `agent.deliverable.revised` carry ids and
+  the revision identity, no content. The scenario check
+  `delegate.deliverable-revision-object` passes. `/api/work-products*` still
+  answers 501. `ua_org::authz::require_same_org` exposes the organization
+  check every authority check applies.
+- Refusals in the audit record (`docs/policy.md#approvals-in-the-audit-record`):
+  a gated call refused because of its approval state appends one
+  `agent.approval.refused` ledger event with a reason (`expired`,
+  `binding_changed`, `no_matching_approval`, `denied`, `not_covered`,
+  `not_eligible`). It names the tool, the approval or policy authorization,
+  the task, the SHA-256 of the canonical payload that was approved and of the
+  one presented, and the top-level fields that differ by name, never their
+  values. It covers the approval gate, `git_merge_task` under a policy
+  authorization, `dispatch_task`, `dispatch_resume` and the relay's send.
+  The event survives the refused call: `ua_store::ledger::append_surviving`
+  appends it in the call's transaction and, when that transaction rolls
+  back, `Db::write` appends it again in a separate small transaction before
+  returning the call's error. The `agent.approval.requested`, `resolved` and
+  `consumed` events and the policy authorization `recorded` and `consumed`
+  events gain `payload_sha256`; `resolved` gains `expires_at` on an approval.
+  Additive: no response or schema changes.
 
 ### Fixed
 
@@ -305,6 +342,22 @@ from its commit history.
   `proc_pidinfo`.
 
 ### Behaviour changes
+
+- A one-time approval of `git_merge_task` no longer covers a later commit.
+  The approval now binds the head (full SHA), branch, target branch and the
+  task project's bound repository resolved when the merge is called, plus a
+  summary naming the commit and the target for the approver. A merge whose
+  branch moved after the approval, or whose project was rebound to another
+  repository, is refused with `approval_binding_changed` (ledgered as an
+  `agent.approval.refused` event, reason `binding_changed`) and a new
+  request for the current values is parked; before, it ran under the old
+  approval. Passes approved before this change bound only the arguments and
+  no longer match: they need a new approval. Because the handler now
+  resolves the payload, `git_merge_task` can no longer be requested ahead
+  through `POST /api/approvals/request` (`409`), and a merge bound to fail
+  (an unknown task, an unfinished task, a dirty worktree) is refused with
+  that error before an approval is parked, instead of parking first. The
+  policy authorization path is unchanged.
 
 - An unknown schema part refuses to open the database. Opening the store
   compares the parts recorded in `schema_parts` with every part name the

@@ -527,6 +527,9 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     if append_event_seq {
         insert_cols.push("event_seq".into());
     }
+    if map.kind == Kind::GraphCanvas {
+        insert_cols.push("org_id".into());
+    }
     if map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_ulid") {
         bail!("source message_index has no event_ulid column; cannot link messages to the ledger");
     }
@@ -819,9 +822,11 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
         let rows = stmt.query_map([map.target], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     })?;
-    // A key made only of copied columns, or the `rowid` mapped to a column.
+    // A key whose values come from copied columns, the default org, or the source rowid.
     let mut keys: Vec<Vec<String>> = Vec::new();
-    if !pk.is_empty() && pk.iter().all(|c| plan.cols.contains(c)) {
+    if !pk.is_empty()
+        && pk.iter().all(|c| plan.cols.contains(c) || (map.kind == Kind::GraphCanvas && c == "org_id"))
+    {
         keys.push(pk);
     }
     if let Some(r) = map.rowid_to {
@@ -868,6 +873,9 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                 } else {
                     key.iter()
                         .map(|k| {
+                            if map.kind == Kind::GraphCanvas && k == "org_id" {
+                                return SqlValue::Text(ua_core::DEFAULT_ORG.into());
+                            }
                             let raw = col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null);
                             if map.kind == Kind::ProjectRepoBindings
                                 && k == "project"
@@ -1045,6 +1053,9 @@ fn copy_table(
                     }
                     if plan.append_event_seq {
                         vals.push(SqlValue::Null);
+                    }
+                    if map.kind == Kind::GraphCanvas {
+                        vals.push(SqlValue::Text(ua_core::DEFAULT_ORG.into()));
                     }
                     if let (Some(si), Some(ui)) = (seq_idx, ulid_idx)
                         && map.kind == Kind::MessageIndex

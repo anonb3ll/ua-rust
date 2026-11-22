@@ -56,6 +56,8 @@ pub fn schema_parts() -> Vec<Part> {
     parts.extend(families::schema_parts().into_iter().map(Part::from));
     // The organization column and triggers of the code family's table.
     parts.push(families::code::TENANT_PART.into());
+    parts.push(families::graph::TENANT_KEYS.into());
+    parts.push(families::graph::TENANT_PART.into());
     // The organization key rebuild and triggers of the web search cache table.
     parts.push(families::web::TENANT_KEYS.into());
     parts.push(families::web::TENANT_PART.into());
@@ -67,6 +69,9 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::github::INBOUND_COPY.into());
     // Then the Slack family's replay keys and delivery ids.
     parts.push(families::slack::INBOUND_COPY.into());
+    // Deliverables and their revisions (`ua-deliverables`), born
+    // tenant-scoped: they need `organization.v1.store`.
+    parts.extend(families::deliverables::schema_parts());
     parts
 }
 

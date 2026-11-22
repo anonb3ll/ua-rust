@@ -227,7 +227,12 @@ pub static OBJECT_TYPES: &[ObjectType] = &[
         id_pattern: Some(INT_ID),
         lifecycle: &["pending", "approved", "denied", "consumed", "revoked", "expired"],
         terminal_states: &["denied", "consumed", "revoked", "expired"],
-        event_kinds: &["agent.approval.requested", "agent.approval.resolved", "agent.approval.consumed"],
+        event_kinds: &[
+            "agent.approval.requested",
+            "agent.approval.resolved",
+            "agent.approval.consumed",
+            "agent.approval.refused",
+        ],
         envelope: "approval",
         required: &["id", "tool", "status"],
         writers: &[("resolve", "approval_resolve")],

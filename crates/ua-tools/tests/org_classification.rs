@@ -143,11 +143,15 @@ const TENANT: &[&str] = &[
     "code_symbols",
     // inbound deliveries (`ua-ingress`): org_id and the triggers from birth
     "inbound_deliveries",
+    // deliverables (`ua-deliverables`): org_id and the triggers from birth
+    "deliverables",
+    "deliverable_revisions",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
 /// Today that is every tenant table except `inbound_deliveries` (born with
-/// its `org_id`), `code_symbols` (`organization.v1.tools.code`), and
+/// its `org_id`), `deliverables` and `deliverable_revisions` (born with their
+/// `org_id`), `code_symbols`, the two graph canvas tables, and
 /// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`):
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
@@ -164,8 +168,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "goals",
-    "graph_canvas_revisions",
-    "graph_canvas_scenes",
     "harness_config_bundles",
     "harness_config_drift",
     "harness_config_proposals",
