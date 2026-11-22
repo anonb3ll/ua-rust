@@ -1,5 +1,10 @@
 # Contributing
 
+The [software factory direction](docs/software-factory.md) describes what
+ua-rust is building toward and the evidence that will show it works across
+harnesses. Use it to judge a proposal's value alongside its compatibility
+requirements.
+
 ## Layout
 
 | Crate | Rule |
