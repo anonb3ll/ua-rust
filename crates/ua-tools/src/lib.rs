@@ -61,6 +61,9 @@ pub fn schema_parts() -> Vec<Part> {
     // The organization key rebuild and triggers of the web search cache table.
     parts.push(families::web::TENANT_KEYS.into());
     parts.push(families::web::TENANT_PART.into());
+    // The organization key rebuild and triggers of the skill registry tables.
+    parts.push(families::skill_registry::TENANT_KEYS.into());
+    parts.push(families::skill_registry::TENANT_PART.into());
     // The organization key rebuild and triggers of the project repository bindings table.
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_KEYS.into());
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_PART.into());

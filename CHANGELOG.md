@@ -210,6 +210,21 @@ from its commit history.
   cached entries migrate to `default`. Organizations cache identical queries
   independently, and one organization's TTL eviction does not remove another
   organization's cached entries.
+- Skill registry versions, assignments and staged publishes
+  (`skill_versions`, `skill_assignments`, `skill_publish_staging`) are
+  organization-scoped. The standalone rebuild `skill_registry.v2.tenant_keys`
+  makes the keys `UNIQUE(org_id, name, version)` and
+  `UNIQUE(org_id, skill_name, target_type, target)`, keeping ids, the
+  AUTOINCREMENT sequence, indexes, the version immutability triggers and
+  views, and adds indexes led by `org_id`; `organization.v1.tools.skills`
+  adds `org_id` to the staging table and installs the organization triggers
+  on all three. Existing rows migrate to `default`. Every `skill_registry`
+  action and the skills a node's harness bundle carries use the caller's
+  organization: another organization's skill, version or staged publish
+  answers as a missing one, and a write for an organization `orgs` does not
+  hold is refused (`invalid_argument`) before anything is read or written.
+  The importer writes legacy skill versions and assignments to `default`.
+  Results and events in the default organization are unchanged.
 - Project repository bindings (`project_repo_bindings`) have
   organization-scoped keys and triggers
   (`governance.v2.project_bindings_tenant_keys`, a standalone rebuild, then

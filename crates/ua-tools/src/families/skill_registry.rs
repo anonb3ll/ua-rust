@@ -31,6 +31,16 @@
 //! outputs never carry the hub's filesystem paths. Events: `skill.published`,
 //! `skill.assigned` and `skill.unassigned`, in the same transaction.
 //!
+//! Organizations: every version, assignment and staged publish belongs to
+//! one organization (`org_id`, `skill_registry.v2.tenant_keys` and
+//! `organization.v1.tools.skills`). Every read and write is scoped to the
+//! caller's organization: another organization's skill, version, assignment
+//! or staging id answers exactly as a missing one, two organizations may
+//! publish and assign the same name and version independently, and the
+//! skills a node is served are its caller's organization's. A write by a
+//! caller whose organization `orgs` does not hold is refused before anything
+//! is read or written.
+//!
 //! Not ported: multi-file skill packages (a publish source with supporting
 //! files is refused), the catalog and team installs, and git skill sources.
 //! Versions imported from the Python hub keep their package manifest; their
@@ -45,7 +55,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use ua_core::{Profile, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, ledger};
 
 use super::agents::verified;
 use super::harness_config::render::{content_hash, py_dumps};
@@ -104,6 +114,245 @@ CREATE TRIGGER IF NOT EXISTS skill_versions_immutable_delete BEFORE DELETE ON sk
 BEGIN SELECT RAISE(ABORT, 'skill versions and provenance are immutable'); END;
 ",
 };
+
+/// `skill_registry.v2.tenant_keys`: rebuild `skill_versions` around
+/// `UNIQUE(org_id, name, version)` and `skill_assignments` around
+/// `UNIQUE(org_id, skill_name, target_type, target)`, each with
+/// `org_id TEXT NOT NULL DEFAULT 'default'`. Both keep their AUTOINCREMENT ids
+/// (and the sequence), their indexes and triggers (the `skill_versions`
+/// immutability triggers included), and gain an index led by `org_id`.
+/// `skill_publish_staging` is keyed by a hub-global random id, so it needs no
+/// rebuild: `organization.v1.tools.skills` adds its `org_id`.
+///
+/// Runs standalone outside the shared migration transaction so
+/// `PRAGMA foreign_keys = OFF` takes effect before the rebuild transaction and
+/// `PRAGMA foreign_keys = ON` is restored afterwards (`docs/organization.md`,
+/// "Global keys and table rebuilds"). Safe to re-run after a crash before
+/// recording: an existing `org_id` is kept (`COALESCE(org_id, 'default')`).
+pub const TENANT_KEYS: Procedure = Procedure {
+    name: "skill_registry.v2.tenant_keys",
+    version: 1,
+    standalone: true,
+    run: rebuild_tenant_keys,
+    args: &["skill_versions", "skill_assignments"],
+};
+
+/// `organization.v1.tools.skills`: installs the `*_org_exists` and
+/// `*_org_immutable` triggers of the three skill tables (and `org_id` on
+/// `skill_publish_staging`) after `skill_registry.v2.tenant_keys` and
+/// `organization.v1.store`.
+pub const TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.skills",
+    &["skill_versions", "skill_assignments", "skill_publish_staging"],
+);
+
+/// One table the rebuild re-creates.
+struct Rebuild {
+    table: &'static str,
+    /// The new table's body (after `CREATE TABLE <table>_new`).
+    body: &'static str,
+    /// Every column but `org_id`, copied by name.
+    cols: &'static str,
+    /// The index led by `org_id`.
+    org_index: &'static str,
+}
+
+const REBUILDS: [Rebuild; 2] = [
+    Rebuild {
+        table: "skill_versions",
+        body: "(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    source TEXT NOT NULL,
+    content TEXT NOT NULL,
+    published_by TEXT,
+    published_at TEXT NOT NULL,
+    package_manifest TEXT,
+    package_payload TEXT,
+    UNIQUE(org_id, name, version)
+)",
+        cols: "id, name, version, content_hash, source, content, published_by, published_at, \
+               package_manifest, package_payload",
+        org_index: "CREATE INDEX IF NOT EXISTS idx_skill_versions_org_name ON skill_versions(org_id, name);",
+    },
+    Rebuild {
+        table: "skill_assignments",
+        body: "(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id TEXT NOT NULL DEFAULT 'default',
+    skill_name TEXT NOT NULL,
+    target_type TEXT NOT NULL CHECK(target_type IN ('agent','profile')),
+    target TEXT NOT NULL,
+    pinned_version INTEGER,
+    assigned_by TEXT,
+    assigned_at TEXT NOT NULL,
+    UNIQUE(org_id, skill_name, target_type, target)
+)",
+        cols: "id, skill_name, target_type, target, pinned_version, assigned_by, assigned_at",
+        org_index: "CREATE INDEX IF NOT EXISTS idx_skill_assignments_org_target \
+                    ON skill_assignments(org_id, target_type, target);",
+    },
+];
+
+fn rebuild_tenant_keys(conn: &Connection, _args: &'static [&'static str]) -> anyhow::Result<String> {
+    anyhow::ensure!(conn.is_autocommit(), "skill_registry.v2.tenant_keys must run outside a transaction");
+    let mut log = Vec::new();
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    log.push("PRAGMA foreign_keys = OFF;".to_string());
+
+    let res = (|| -> anyhow::Result<()> {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        log.push("BEGIN IMMEDIATE;".to_string());
+        rebuild_body(conn, &mut log)?;
+        conn.execute_batch("COMMIT;")?;
+        log.push("COMMIT;".to_string());
+        Ok(())
+    })();
+
+    if res.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let fk_res = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    res?;
+    fk_res?;
+    log.push("PRAGMA foreign_keys = ON;".to_string());
+    Ok(log.join("\n"))
+}
+
+fn names(conn: &Connection, sql: &str, table: Option<&str>) -> anyhow::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = match table {
+        Some(t) => stmt.query_map([t], |r| r.get(0))?.collect::<Result<_, _>>()?,
+        None => stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?,
+    };
+    Ok(rows)
+}
+
+fn named_sql(conn: &Connection, kind: &str, table: &str) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = ?1 AND tbl_name = ?2 AND sql IS NOT NULL ORDER BY name",
+        )?
+        .query_map([kind, table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?)
+}
+
+fn step(conn: &Connection, log: &mut Vec<String>, stmt: &str) -> anyhow::Result<()> {
+    let stmt = format!("{};", stmt.trim().trim_end_matches(';'));
+    conn.execute_batch(&stmt)?;
+    log.push(stmt);
+    Ok(())
+}
+
+fn rebuild_body(conn: &Connection, log: &mut Vec<String>) -> anyhow::Result<()> {
+    const ALL_TRIGGERS: &str = "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name";
+    const ALL_VIEWS: &str = "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name";
+    let triggers_before = names(conn, ALL_TRIGGERS, None)?;
+    // Views are dropped before the tables are swapped (SQLite's
+    // `ALTER TABLE ... RENAME` validates every view and fails on one that
+    // names a dropped table) and re-created, in their original order, after.
+    let views: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY rowid",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let views_before = names(conn, ALL_VIEWS, None)?;
+    for (name, _) in &views {
+        step(conn, log, &format!("DROP VIEW \"{}\"", name.replace('"', "\"\"")))?;
+    }
+
+    for rb in &REBUILDS {
+        let t = rb.table;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [t], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        anyhow::ensure!(exists, "{t} does not exist; apply skill_registry.v1 first");
+        let indexes = named_sql(conn, "index", t)?;
+        let triggers = named_sql(conn, "trigger", t)?;
+        let seq: Option<i64> = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = ?1", [t], |r| r.get(0))
+            .optional()?;
+        let has_org_id: bool = conn
+            .query_row("SELECT 1 FROM pragma_table_info(?1) WHERE name = 'org_id'", [t], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        let org_expr = if has_org_id { "COALESCE(org_id, 'default')" } else { "'default'" };
+
+        step(conn, log, &format!("CREATE TABLE {t}_new {}", rb.body))?;
+        step(
+            conn,
+            log,
+            &format!(
+                "INSERT INTO {t}_new (org_id, {cols}) SELECT {org_expr}, {cols} FROM {t}",
+                cols = rb.cols
+            ),
+        )?;
+        step(conn, log, &format!("DROP TABLE {t}"))?;
+        step(conn, log, &format!("ALTER TABLE {t}_new RENAME TO {t}"))?;
+        // Keep the AUTOINCREMENT high-water mark, so an id freed by a delete
+        // is never handed out again.
+        if let Some(seq) = seq {
+            step(conn, log, &format!("DELETE FROM sqlite_sequence WHERE name IN ('{t}', '{t}_new')"))?;
+            step(
+                conn,
+                log,
+                &format!(
+                    "INSERT INTO sqlite_sequence (name, seq) \
+                     SELECT '{t}', MAX({seq}, COALESCE((SELECT MAX(id) FROM {t}), 0))"
+                ),
+            )?;
+        }
+        for (_, sql) in &indexes {
+            step(conn, log, sql)?;
+        }
+        step(conn, log, rb.org_index)?;
+        for (_, sql) in &triggers {
+            step(conn, log, sql)?;
+        }
+        let after = names(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+            Some(t),
+        )?;
+        for (name, _) in &indexes {
+            anyhow::ensure!(after.contains(name), "index {name} missing after the {t} rebuild");
+        }
+    }
+
+    for (_, sql) in &views {
+        step(conn, log, sql)?;
+    }
+
+    for rb in &REBUILDS {
+        let t = rb.table;
+        let fk_violations: Vec<(String, Option<i64>, String, i64)> = conn
+            .prepare(&format!("PRAGMA foreign_key_check({t})"))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        anyhow::ensure!(
+            fk_violations.is_empty(),
+            "PRAGMA foreign_key_check({t}) reported {} violation(s): {fk_violations:?}",
+            fk_violations.len(),
+        );
+    }
+    let triggers_after = names(conn, ALL_TRIGGERS, None)?;
+    anyhow::ensure!(
+        triggers_after == triggers_before,
+        "trigger set changed across the skill table rebuild (before: {triggers_before:?}, after: {triggers_after:?})"
+    );
+    let views_after = names(conn, ALL_VIEWS, None)?;
+    anyhow::ensure!(
+        views_after == views_before,
+        "view set changed across the skill table rebuild (before: {views_before:?}, after: {views_after:?})"
+    );
+    Ok(())
+}
 
 const NAME_MAX: usize = 64;
 /// Skills one resolution returns.
@@ -219,21 +468,26 @@ fn verify(row: &Value) -> UaResult<()> {
     }
 }
 
-fn load_version(c: &Connection, name: &str, version: Option<i64>) -> UaResult<Option<Value>> {
+/// A version of `name` in `org` (the latest when `version` is `None`),
+/// verified. Another organization's version reads as missing.
+fn load_version(c: &Connection, org: &str, name: &str, version: Option<i64>) -> UaResult<Option<Value>> {
     let row = match version {
         Some(v) => c
             .query_row(
-                &format!("SELECT {FULL_COLS} FROM skill_versions WHERE name = ?1 AND version = ?2"),
-                params![name, v],
+                &format!(
+                    "SELECT {FULL_COLS} FROM skill_versions WHERE org_id = ?1 AND name = ?2 AND version = ?3"
+                ),
+                params![org, name, v],
                 version_row,
             )
             .optional()?,
         None => c
             .query_row(
                 &format!(
-                    "SELECT {FULL_COLS} FROM skill_versions WHERE name = ?1 ORDER BY version DESC LIMIT 1"
+                    "SELECT {FULL_COLS} FROM skill_versions WHERE org_id = ?1 AND name = ?2 \
+                     ORDER BY version DESC LIMIT 1"
                 ),
-                [name],
+                params![org, name],
                 version_row,
             )
             .optional()?,
@@ -271,11 +525,16 @@ pub(crate) struct Resolved {
     pub via: &'static str,
 }
 
-/// The skills assigned to `agent` directly or through `profile`: direct
+/// The skills assigned to `agent` in `org` directly or through `profile`: direct
 /// assignments first (each source sorted by name), a direct one winning over
 /// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. A pinned
 /// version that is missing, or a version that fails verification, is skipped.
-pub(crate) fn resolve(c: &Connection, agent: &str, profile: Option<&str>) -> UaResult<Vec<Resolved>> {
+pub(crate) fn resolve(
+    c: &Connection,
+    org: &str,
+    agent: &str,
+    profile: Option<&str>,
+) -> UaResult<Vec<Resolved>> {
     let agent = agent.trim();
     if agent.is_empty() {
         return Ok(Vec::new());
@@ -284,11 +543,11 @@ pub(crate) fn resolve(c: &Connection, agent: &str, profile: Option<&str>) -> UaR
         let mut out: Vec<(String, Option<i64>)> = Vec::new();
         for t in targets {
             let mut stmt = c.prepare(
-                "SELECT skill_name, pinned_version FROM skill_assignments WHERE target_type = ?1 AND target = ?2 \
-                 ORDER BY skill_name",
+                "SELECT skill_name, pinned_version FROM skill_assignments \
+                 WHERE org_id = ?1 AND target_type = ?2 AND target = ?3 ORDER BY skill_name",
             )?;
             out.extend(
-                stmt.query_map(params![target_type, t], |r| Ok((r.get(0)?, r.get(1)?)))?
+                stmt.query_map(params![org, target_type, t], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -311,7 +570,7 @@ pub(crate) fn resolve(c: &Connection, agent: &str, profile: Option<&str>) -> UaR
     }
     let mut out = Vec::new();
     for (name, pin, via) in picked.into_iter().take(MAX_RESOLVED_SKILLS) {
-        let Ok(Some(row)) = load_version(c, &name, pin) else { continue };
+        let Ok(Some(row)) = load_version(c, org, &name, pin) else { continue };
         out.push(Resolved {
             version: row["version"].as_i64().unwrap_or_default(),
             hash: row["content_hash"].as_str().unwrap_or_default().to_string(),
@@ -416,14 +675,27 @@ fn author(ctx: &ToolCtx) -> UaResult<String> {
     })
 }
 
-/// An operator (a human or a lifecycle operator): what changes the skills
-/// every node of an agent or profile is served.
+/// An operator (a human or a lifecycle operator) of the caller's
+/// organization: what changes the skills every node of an agent or profile
+/// is served. An organization `orgs` does not hold is refused first, before
+/// anything is read or written (organizations are never deleted, so the
+/// check cannot go stale).
 fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+    let org = ctx.caller.org_id.as_str();
+    let known = ctx
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?))?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!(
+            "unknown organization {org:?}; the skill registry was not changed"
+        )));
+    }
     let who = author(ctx)?;
     if !Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        org,
     ) {
         return Err(UaError::denied(
             "operator_required",
@@ -571,11 +843,11 @@ struct Staged {
     published_version: Option<i64>,
 }
 
-fn load_staged(c: &Connection, id: &str) -> UaResult<Option<Staged>> {
+fn load_staged(c: &Connection, org: &str, id: &str) -> UaResult<Option<Staged>> {
     Ok(c.query_row(
         "SELECT id, name, content, content_hash, source, findings_json, requested_by, published_version \
-         FROM skill_publish_staging WHERE id = ?1",
-        [id],
+         FROM skill_publish_staging WHERE org_id = ?1 AND id = ?2",
+        params![org, id],
         |r| {
             let findings: String = r.get(5)?;
             Ok(Staged {
@@ -606,13 +878,13 @@ fn staged_payload(s: &Staged) -> Value {
     })
 }
 
-fn existing_version(c: &Connection, name: &str, hash: &str) -> UaResult<Option<Value>> {
+fn existing_version(c: &Connection, org: &str, name: &str, hash: &str) -> UaResult<Option<Value>> {
     Ok(c.query_row(
         &format!(
-            "SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND content_hash = ?2 \
+            "SELECT {LIST_COLS} FROM skill_versions WHERE org_id = ?1 AND name = ?2 AND content_hash = ?3 \
              ORDER BY version DESC LIMIT 1"
         ),
-        params![name, hash],
+        params![org, name, hash],
         version_row,
     )
     .optional()?)
@@ -650,15 +922,16 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
     let caller = ctx.caller.clone();
     let cfg = ctx.hub.cfg().clone();
     let who = who.to_string();
+    let org = ctx.caller.org_id.as_str();
     ctx.hub.db().write(|tx| {
-        if let Some(skill) = existing_version(tx, &name, &hash)? {
+        if let Some(skill) = existing_version(tx, org, &name, &hash)? {
             return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
         }
         let reuse: Option<String> = tx
             .query_row(
-                "SELECT id FROM skill_publish_staging WHERE name = ?1 AND content_hash = ?2 AND requested_by = ?3 \
-                 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
-                params![name, hash, who],
+                "SELECT id FROM skill_publish_staging WHERE org_id = ?1 AND name = ?2 AND content_hash = ?3 \
+                 AND requested_by = ?4 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![org, name, hash, who],
                 |r| r.get(0),
             )
             .optional()?;
@@ -667,14 +940,24 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
             None => {
                 let id = format!("sk-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
                 tx.execute(
-                    "INSERT INTO skill_publish_staging (id, name, content, content_hash, source, findings_json, \
-                     requested_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![id, name, text, hash, rel_md, json!(findings).to_string(), who, ua_core::time::now()],
+                    "INSERT INTO skill_publish_staging (org_id, id, name, content, content_hash, source, \
+                     findings_json, requested_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        org,
+                        id,
+                        name,
+                        text,
+                        hash,
+                        rel_md,
+                        json!(findings).to_string(),
+                        who,
+                        ua_core::time::now()
+                    ],
                 )?;
                 id
             }
         };
-        let staged = load_staged(tx, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
+        let staged = load_staged(tx, org, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
         let state = approvals::request(tx, &cfg, &caller, GATE, &staged_payload(&staged))?;
         Ok(json!({
             "ok": false,
@@ -691,15 +974,17 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
 
 /// `publish {staging_id}`: version the staged copy behind its approval.
 fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
+    let org = ctx.caller.org_id.as_str();
     ctx.hub
         .db()
         .write(|tx| {
+            // Another organization's staged copy answers exactly as a missing one.
             let missing = || UaError::not_found(format!("no staged publish {id:?} of yours"));
-            let staged = load_staged(tx, id.trim())?.ok_or_else(missing)?;
+            let staged = load_staged(tx, org, id.trim())?.ok_or_else(missing)?;
             if staged.requested_by != who {
                 return Err(missing());
             }
-            if let Some(skill) = existing_version(tx, &staged.name, &staged.content_hash)? {
+            if let Some(skill) = existing_version(tx, org, &staged.name, &staged.content_hash)? {
                 return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill })));
             }
             if staged.published_version.is_some() {
@@ -709,20 +994,22 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
                 return Ok(Err(approval));
             }
             let next: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(version), 0) + 1 FROM skill_versions WHERE name = ?1",
-                [&staged.name],
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM skill_versions WHERE org_id = ?1 AND name = ?2",
+                params![org, staged.name],
                 |r| r.get(0),
             )?;
             let now = ua_core::time::now();
             tx.execute(
-                "INSERT INTO skill_versions (name, version, content_hash, source, content, published_by, \
-                 published_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![staged.name, next, staged.content_hash, staged.source, staged.content, who, now],
+                "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                 published_by, published_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![org, staged.name, next, staged.content_hash, staged.source, staged.content, who, now],
             )?;
             tx.execute(
-                "UPDATE skill_publish_staging SET published_version = ?2 WHERE id = ?1",
-                params![staged.id, next],
+                "UPDATE skill_publish_staging SET published_version = ?3 WHERE org_id = ?1 AND id = ?2",
+                params![org, staged.id, next],
             )?;
+            // ORG-EVENT-DEFAULT: use the skill's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(
@@ -740,8 +1027,10 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
                 .by(who.to_string()),
             )?;
             let skill = tx.query_row(
-                &format!("SELECT {LIST_COLS} FROM skill_versions WHERE name = ?1 AND version = ?2"),
-                params![staged.name, next],
+                &format!(
+                    "SELECT {LIST_COLS} FROM skill_versions WHERE org_id = ?1 AND name = ?2 AND version = ?3"
+                ),
+                params![org, staged.name, next],
                 version_row,
             )?;
             Ok(Ok(json!({ "ok": true, "idempotent": false, "skill": skill })))
@@ -763,11 +1052,13 @@ fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
 
 fn list(ctx: &ToolCtx, p: ListParams) -> UaResult<Value> {
     let name = p.name.filter(|n| !n.trim().is_empty());
+    let org = ctx.caller.org_id.as_str();
     ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(&format!(
-            "SELECT {LIST_COLS} FROM skill_versions WHERE (?1 IS NULL OR name = ?1) ORDER BY name, version DESC"
+            "SELECT {LIST_COLS} FROM skill_versions WHERE org_id = ?1 AND (?2 IS NULL OR name = ?2) \
+             ORDER BY name, version DESC"
         ))?;
-        let skills = stmt.query_map([name], version_row)?.collect::<Result<Vec<_>, _>>()?;
+        let skills = stmt.query_map(params![org, name], version_row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "skills": skills }))
     })
 }
@@ -776,7 +1067,7 @@ fn get(ctx: &ToolCtx, p: GetParams) -> UaResult<Value> {
     let version = positive(p.version)?;
     ctx.hub
         .db()
-        .read(|c| load_version(c, &p.name, version))?
+        .read(|c| load_version(c, &ctx.caller.org_id, &p.name, version))?
         .ok_or_else(|| UaError::not_found(format!("unknown skill: {:?}", p.name)))
 }
 
@@ -792,21 +1083,24 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         target = profile_target(&target)?;
     }
     let pin = positive(p.version)?;
+    let org = ctx.caller.org_id.as_str();
     ctx.hub.db().write(|tx| {
         // The approved version is always the pin: a later version reaches
         // nobody until it is assigned (and approved) itself.
         let found: Option<(i64, String)> = match pin {
             Some(v) => tx
                 .query_row(
-                    "SELECT version, content_hash FROM skill_versions WHERE name = ?1 AND version = ?2",
-                    params![name, v],
+                    "SELECT version, content_hash FROM skill_versions \
+                     WHERE org_id = ?1 AND name = ?2 AND version = ?3",
+                    params![org, name, v],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?,
             None => tx
                 .query_row(
-                    "SELECT version, content_hash FROM skill_versions WHERE name = ?1 ORDER BY version DESC LIMIT 1",
-                    [&name],
+                    "SELECT version, content_hash FROM skill_versions WHERE org_id = ?1 AND name = ?2 \
+                     ORDER BY version DESC LIMIT 1",
+                    params![org, name],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?,
@@ -832,12 +1126,15 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         }
         let now = ua_core::time::now();
         tx.execute(
-            "INSERT INTO skill_assignments (skill_name, target_type, target, pinned_version, assigned_by, assigned_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(skill_name, target_type, target) DO UPDATE SET \
+            "INSERT INTO skill_assignments (org_id, skill_name, target_type, target, pinned_version, assigned_by, \
+             assigned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(org_id, skill_name, target_type, target) DO UPDATE SET \
              pinned_version = excluded.pinned_version, assigned_by = excluded.assigned_by, \
              assigned_at = excluded.assigned_at",
-            params![name, ttype, target, pin, who, now],
+            params![org, name, ttype, target, pin, who, now],
         )?;
+        // ORG-EVENT-DEFAULT: use the assignment's organization once callers
+        // can resolve to other organizations and org_guard allows it.
         ledger::append(
             tx,
             EventInput::new(ua_core::DEFAULT_ORG,
@@ -848,9 +1145,10 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         )?;
         let row = tx.query_row(
             &format!(
-                "SELECT {ASSIGN_COLS} FROM skill_assignments WHERE skill_name = ?1 AND target_type = ?2 AND target = ?3"
+                "SELECT {ASSIGN_COLS} FROM skill_assignments \
+                 WHERE org_id = ?1 AND skill_name = ?2 AND target_type = ?3 AND target = ?4"
             ),
-            params![name, ttype, target],
+            params![org, name, ttype, target],
             assignment_row,
         )?;
         Ok(Ok(json!({ "assignment": row })))
@@ -869,45 +1167,52 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     // Unassigning is idempotent and also clears a profile's rows stored
     // under its legacy name.
     let targets = if ttype == "profile" { profile_keys(&target) } else { vec![target.clone()] };
+    let org = ctx.caller.org_id.as_str();
     ctx.hub
         .db()
         .write(|tx| {
-        let mut present = 0;
-        for t in &targets {
-            present += tx.query_row(
-                "SELECT COUNT(*) FROM skill_assignments WHERE skill_name = ?1 AND target_type = ?2 AND target = ?3",
-                params![name, ttype, t],
-                |r| r.get::<_, i64>(0),
-            )?;
-        }
-        if present == 0 {
-            return Ok(Ok(json!({ "removed": false })));
-        }
-        // Removing a skill changes what every node of the target is served:
-        // a human approves it too.
-        let payload = json!({ "action": "unassign", "skill_name": name, "target_type": ttype, "target": target });
-        if let Some(id) = gate(tx, ctx, &payload)? {
-            return Ok(Err(id));
-        }
-        let mut removed = 0;
-        for t in &targets {
-            removed += tx.execute(
-                "DELETE FROM skill_assignments WHERE skill_name = ?1 AND target_type = ?2 AND target = ?3",
-                params![name, ttype, t],
-            )?;
-        }
-        if removed > 0 {
-            ledger::append(
-                tx,
-                EventInput::new(ua_core::DEFAULT_ORG,
-                    "skill.unassigned",
-                    json!({ "name": name, "target_type": ttype, "target": target }),
-                )
-                .by(who.clone()),
-            )?;
-        }
-        Ok(Ok(json!({ "removed": removed > 0 })))
-    })
+            let mut present = 0;
+            for t in &targets {
+                present += tx.query_row(
+                    "SELECT COUNT(*) FROM skill_assignments \
+                     WHERE org_id = ?1 AND skill_name = ?2 AND target_type = ?3 AND target = ?4",
+                    params![org, name, ttype, t],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            }
+            if present == 0 {
+                return Ok(Ok(json!({ "removed": false })));
+            }
+            // Removing a skill changes what every node of the target is served:
+            // a human approves it too.
+            let payload =
+                json!({ "action": "unassign", "skill_name": name, "target_type": ttype, "target": target });
+            if let Some(id) = gate(tx, ctx, &payload)? {
+                return Ok(Err(id));
+            }
+            let mut removed = 0;
+            for t in &targets {
+                removed += tx.execute(
+                    "DELETE FROM skill_assignments \
+                     WHERE org_id = ?1 AND skill_name = ?2 AND target_type = ?3 AND target = ?4",
+                    params![org, name, ttype, t],
+                )?;
+            }
+            if removed > 0 {
+                // ORG-EVENT-DEFAULT: use the assignment's organization once callers
+                // can resolve to other organizations and org_guard allows it.
+                ledger::append(
+                    tx,
+                    EventInput::new(
+                        ua_core::DEFAULT_ORG,
+                        "skill.unassigned",
+                        json!({ "name": name, "target_type": ttype, "target": target }),
+                    )
+                    .by(who.clone()),
+                )?;
+            }
+            Ok(Ok(json!({ "removed": removed > 0 })))
+        })
         .and_then(pending)
 }
 
@@ -918,7 +1223,7 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
         && !Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
-            ua_core::DEFAULT_ORG,
+            &ctx.caller.org_id,
         )
     {
         return Err(UaError::denied(
@@ -931,7 +1236,7 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
         None if label.is_empty() => None,
         None => Some(crate::sessions::default_profile(&ctx.hub, &label).as_str().to_string()),
     };
-    let skills = ctx.hub.db().read(|c| resolve(c, &label, profile.as_deref()))?;
+    let skills = ctx.hub.db().read(|c| resolve(c, &ctx.caller.org_id, &label, profile.as_deref()))?;
     let skills: Vec<Value> = skills
         .into_iter()
         .map(|s| {
@@ -990,14 +1295,15 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     };
     // The registry side: every skill's latest version, and with an agent the
     // versions it resolves to (pins honoured).
+    let org = ctx.caller.org_id.as_str();
     let (all_latest, resolved) = ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(
             "SELECT sv.name, sv.version, sv.content_hash, sv.package_manifest, sv.content FROM skill_versions sv \
-             JOIN (SELECT name, MAX(version) AS version FROM skill_versions GROUP BY name) latest \
-             ON sv.name = latest.name AND sv.version = latest.version",
+             JOIN (SELECT name, MAX(version) AS version FROM skill_versions WHERE org_id = ?1 GROUP BY name) latest \
+             ON sv.name = latest.name AND sv.version = latest.version WHERE sv.org_id = ?1",
         )?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map([org], |r| {
                 let name: String = r.get(0)?;
                 let version: i64 = r.get(1)?;
                 let hash: String = r.get(2)?;
@@ -1007,7 +1313,7 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let resolved = match &label {
-            Some(l) => Some(resolve(c, l, profile.as_deref())?),
+            Some(l) => Some(resolve(c, org, l, profile.as_deref())?),
             None => None,
         };
         Ok((rows, resolved))
