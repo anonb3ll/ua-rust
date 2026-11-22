@@ -35,9 +35,10 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (64 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (61 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
-  `graph_canvas_revisions` and `web_search_cache` having left it; a new table
+  `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
+  `skill_assignments` and `skill_publish_staging` having left it; a new table
   cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -133,6 +134,21 @@ here for memory columns, owners and defaults.
   and migrate existing rows to `default`, followed by
   `organization.v1.tools.web` to install the organization triggers. Search
   cache reads, writes and TTL evictions scope to the caller's organization.
+- The skill registry applies the standalone procedure
+  `skill_registry.v2.tenant_keys` to rebuild `skill_versions` around
+  `UNIQUE(org_id, name, version)` and `skill_assignments` around
+  `UNIQUE(org_id, skill_name, target_type, target)` in one transaction,
+  keeping ids and the AUTOINCREMENT sequence, indexes, the version
+  immutability triggers and views, and adding indexes led by `org_id`.
+  `skill_publish_staging` is keyed by a hub-global random id and needs no
+  rebuild. `organization.v1.tools.skills` then adds its `org_id` and installs
+  the organization triggers on all three. Every `skill_registry` action
+  (publish, staging, list, get, assign, unassign, resolve, drift) and the
+  registry skills in a node's harness bundle use the caller's organization;
+  a write for an organization `orgs` does not hold is refused before anything
+  is read or written. Operator actions still need `ua_org::authz`, which
+  admits only the default organization until memberships exist. The importer
+  writes legacy skill versions and assignments to `default`.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -711,8 +727,8 @@ global key in the tree is classified:
 | `nodes.node` | Hub namespace | Node names are registered hub-wide; a node serves one organization. |
 | `provider_accounts.label`, `mcp_servers.name`, `dispatch_meta.key` | Hub table | Hub-scoped configuration and hub salts, managed by hub owners. |
 | `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`. |
-| `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`. |
-| `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`. |
+| `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`, rebuilt in the standalone procedure `skill_registry.v2.tenant_keys`. |
+| `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`, rebuilt in `skill_registry.v2.tenant_keys` together with `skill_versions`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`. |
 | `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
@@ -730,6 +746,12 @@ The graph canvas rebuild uses a transactional static part. No existing
 foreign keys, triggers or views depend on the two original tables. The
 rebuild adds the composite revision reference with foreign keys enabled,
 so legacy revisions without a board fail the upgrade atomically.
+
+The skill registry rebuild is a standalone procedure, like the web cache's:
+`skill_versions` carries immutability triggers that the rebuild must
+re-create, and a view may name either table. It checks that the trigger and
+view sets are unchanged, and keeps each table's AUTOINCREMENT high-water mark
+so an id freed by a delete is never handed out again.
 
 The planned `organization.v1-rebuild` for the remaining tables runs alone, outside the usual transaction, at
 start-up before the hub serves, using SQLite's documented table-rebuild
@@ -1243,7 +1265,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
-| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
+| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
