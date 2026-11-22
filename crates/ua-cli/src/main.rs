@@ -425,10 +425,14 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     }
 
     let explicit_config = cli.config.clone();
+    // Read before any `.env` file is loaded (`load_config`): the override comes
+    // only from the command line or the real process environment.
+    let allow_newer_var = std::env::var_os(ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV);
     let allow_newer_flag = cli.allow_newer_schema;
+    let allow_newer = || allow_newer_schema(allow_newer_flag, allow_newer_var.clone());
     match cli.cmd {
         Cmd::Init(args) => {
-            ops::init::run(args, explicit_config.as_deref())?;
+            ops::init::run(args, explicit_config.as_deref(), allow_newer()?)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
@@ -456,7 +460,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                         let db = ua_tools::hub::open_db(
                             &cfg.db_path(),
                             &ua_import::schema_parts(),
-                            allow_newer_schema(allow_newer_flag)?,
+                            allow_newer()?,
                         )?;
                         let opts = ua_import::Options { drop_org_scope, ..Default::default() };
                         ua_import::import(&db, &from, &opts)?
@@ -482,7 +486,13 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                         held.serve = Some(ua_import::ServeLock::acquire(&cfg.db_path())?);
                     }
                     // Refuses a database a newer build wrote, unless overridden (docs/operations.md).
-                    let hub = Hub::open_with(cfg.clone(), allow_newer_schema(allow_newer_flag)?)?;
+                    // `ua serve` refuses it even then: serving it reopens the replay window.
+                    let override_on = allow_newer()?;
+                    let hub = if let Cmd::Serve = cmd {
+                        open_for_serve(&cfg, override_on)?
+                    } else {
+                        Hub::open_with(cfg.clone(), override_on)?
+                    };
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());
 
@@ -669,23 +679,55 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
 }
 
 /// Whether to open a database written by a newer build anyway: the
-/// `--allow-newer-schema` flag, or `UA_ALLOW_NEWER_SCHEMA` set to `1`. Any value
-/// other than an explicit yes or no is refused rather than guessed at.
-fn allow_newer_schema(flag: bool) -> anyhow::Result<bool> {
+/// `--allow-newer-schema` flag, or `UA_ALLOW_NEWER_SCHEMA` (`value`, read from
+/// the process environment before any `.env` file was loaded) set to `1`. Any
+/// value other than an explicit yes or no is refused rather than guessed at.
+fn allow_newer_schema(flag: bool, value: Option<std::ffi::OsString>) -> anyhow::Result<bool> {
     if flag {
         return Ok(true);
     }
     let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
-    match std::env::var(var) {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" => Ok(true),
-            "" | "0" | "false" | "no" => Ok(false),
-            _ => anyhow::bail!(
-                "{var} must be 1 (open a database written by a newer build anyway) or 0, not {v:?}"
+    let Some(v) = value else { return Ok(false) };
+    let Some(v) = v.to_str() else { anyhow::bail!("{var} must be 1 or 0") };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "" | "0" | "false" | "no" => Ok(false),
+        _ => {
+            anyhow::bail!("{var} must be 1 (open a database written by a newer build anyway) or 0, not {v:?}")
+        }
+    }
+}
+
+/// Open the hub for `ua serve`. The override never lets a serve start on a
+/// database written by a newer build: it would take GitHub and Slack
+/// deliveries while reading only the delivery tables this build knows, which
+/// reopens the replay window the fence closes. The fenced open runs first, so
+/// a refused serve has written nothing.
+fn open_for_serve(cfg: &ua_core::Config, override_on: bool) -> anyhow::Result<Hub> {
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    match Hub::open_with(cfg.clone(), false) {
+        Ok(hub) => {
+            if override_on {
+                tracing::warn!(
+                    "--allow-newer-schema / {var} has no effect on ua serve (and this database needs none); unset it"
+                );
+            }
+            Ok(hub)
+        }
+        Err(e) if override_on => match e.downcast_ref::<ua_store::NewerSchema>() {
+            Some(newer) => anyhow::bail!(
+                "ua serve refuses the database {} even with --allow-newer-schema / {var}: it was written by a newer \
+                 build and records schema parts this build does not know ([{}]). Serving it would take GitHub and \
+                 Slack deliveries while reading only the delivery tables this build knows, so copies of deliveries \
+                 the newer build already handled would be accepted again. The override is for recovery through the \
+                 commands that do not serve (ua call, ua tools, ua mcp, ua backup, ua doctor). Run the newer build, \
+                 or restore a backup taken before the upgrade",
+                newer.db,
+                newer.unknown.join(", ")
             ),
+            None => Err(e),
         },
-        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{var} must be 1 or 0"),
+        Err(e) => Err(e),
     }
 }
 

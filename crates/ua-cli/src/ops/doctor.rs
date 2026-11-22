@@ -267,54 +267,26 @@ fn check_schema(db_path: &Path) -> CheckResult {
         }
     };
     match ua_store::backup::check_schema_compatibility(&conn, &expected, &ua_tools::optional_schema_parts()) {
-        Ok(c) if c.has_tampering_or_unowned_objects() => {
-            let mut parts = vec![format!(
-                "drifted=[{}], missing_objects=[{}], modified_objects=[{}], \
-                 unexpected_tables=[{}], unexpected_indexes=[{}], unexpected_triggers=[{}]",
-                c.drifted.join(", "),
-                c.missing_objects.join(", "),
-                c.modified_objects.join(", "),
-                c.unexpected_tables.join(", "),
-                c.unexpected_indexes.join(", "),
-                c.unexpected_triggers.join(", "),
-            )];
-            if let Some(ref err) = c.reference_error {
-                parts.push(format!("reference_error=[{err}]"));
-            }
-            if !c.conflicting_objects.is_empty() {
-                parts.push(format!("conflicting_objects=[{}]", c.conflicting_objects.join(", ")));
-            }
-            if !c.unexpected_indexes_on_known_tables.is_empty() {
-                parts.push(format!(
-                    "unexpected_indexes_on_known_tables=[{}]",
-                    c.unexpected_indexes_on_known_tables.join(", ")
-                ));
-            }
-            if !c.reserved_name_objects.is_empty() {
-                parts.push(format!("reserved_name_objects=[{}]", c.reserved_name_objects.join(", ")));
-            }
-            if !c.unexpected_foreign_keys_to_known_tables.is_empty() {
-                parts.push(format!(
-                    "unexpected_foreign_keys_to_known_tables=[{}]",
-                    c.unexpected_foreign_keys_to_known_tables.join(", ")
-                ));
-            }
-            check("schema", Status::Fail, parts.join(", "))
-        }
-        // The unknown-part fence: serving and writing commands refuse this
-        // database (docs/operations.md, "Older builds and a newer database").
-        Ok(c) if !c.extra.is_empty() => check(
-            "schema",
-            Status::Fail,
-            format!(
+        // The unknown-part fence first: serving and writing commands refuse this
+        // database (docs/operations.md, "Older builds and a newer database"). A
+        // newer part may well add objects on known tables, so the object
+        // findings follow this explanation instead of replacing it.
+        Ok(c) if !c.extra.is_empty() => {
+            let mut detail = format!(
                 "written by a newer build: extra=[{}] are schema parts this build does not know, so ua serve, \
-                 ua mcp, ua call and the other writing commands refuse this database (override: \
-                 --allow-newer-schema or UA_ALLOW_NEWER_SCHEMA=1, recovery only); run the newer build, or \
+                 ua mcp, ua call and the other writing commands refuse this database (override for recovery, \
+                 never for ua serve: --allow-newer-schema or UA_ALLOW_NEWER_SCHEMA=1); run the newer build, or \
                  restore a backup taken before the upgrade; missing=[{}]",
                 c.extra.join(", "),
                 c.missing.join(", ")
-            ),
-        ),
+            );
+            if c.has_tampering_or_unowned_objects() {
+                detail.push_str("; objects this build does not expect (the newer parts may explain them): ");
+                detail.push_str(&object_findings(&c));
+            }
+            check("schema", Status::Fail, detail)
+        }
+        Ok(c) if c.has_tampering_or_unowned_objects() => check("schema", Status::Fail, object_findings(&c)),
         Ok(c) if !c.missing.is_empty() => check(
             "schema",
             Status::Warn,
@@ -323,6 +295,42 @@ fn check_schema(db_path: &Path) -> CheckResult {
         Ok(_) => check("schema", Status::Pass, format!("all {} expected schema parts match", expected.len())),
         Err(e) => check("schema", Status::Fail, format!("schema check failed: {e}")),
     }
+}
+
+/// The object-level findings of a schema check, one `name=[...]` per kind.
+fn object_findings(c: &ua_store::backup::SchemaCompatibility) -> String {
+    let mut parts = vec![format!(
+        "drifted=[{}], missing_objects=[{}], modified_objects=[{}], \
+         unexpected_tables=[{}], unexpected_indexes=[{}], unexpected_triggers=[{}]",
+        c.drifted.join(", "),
+        c.missing_objects.join(", "),
+        c.modified_objects.join(", "),
+        c.unexpected_tables.join(", "),
+        c.unexpected_indexes.join(", "),
+        c.unexpected_triggers.join(", "),
+    )];
+    if let Some(ref err) = c.reference_error {
+        parts.push(format!("reference_error=[{err}]"));
+    }
+    if !c.conflicting_objects.is_empty() {
+        parts.push(format!("conflicting_objects=[{}]", c.conflicting_objects.join(", ")));
+    }
+    if !c.unexpected_indexes_on_known_tables.is_empty() {
+        parts.push(format!(
+            "unexpected_indexes_on_known_tables=[{}]",
+            c.unexpected_indexes_on_known_tables.join(", ")
+        ));
+    }
+    if !c.reserved_name_objects.is_empty() {
+        parts.push(format!("reserved_name_objects=[{}]", c.reserved_name_objects.join(", ")));
+    }
+    if !c.unexpected_foreign_keys_to_known_tables.is_empty() {
+        parts.push(format!(
+            "unexpected_foreign_keys_to_known_tables=[{}]",
+            c.unexpected_foreign_keys_to_known_tables.join(", ")
+        ));
+    }
+    parts.join(", ")
 }
 
 fn check_restore_staging(db_path: &Path) -> CheckResult {

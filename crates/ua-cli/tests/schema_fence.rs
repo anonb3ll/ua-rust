@@ -46,6 +46,13 @@ fn upgraded_home(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (home, before)
 }
 
+/// The parts the database records, in order.
+fn recorded_parts(home: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+    let mut stmt = conn.prepare("SELECT name FROM schema_parts ORDER BY rowid").unwrap();
+    stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+}
+
 fn assert_refused(out: &Output, what: &str) {
     let err = text(&out.stderr);
     assert!(!out.status.success(), "{what} must refuse: {err}");
@@ -60,9 +67,9 @@ fn a_database_from_a_newer_build_is_refused_for_serving_and_writing() {
     let root = tempfile::tempdir().unwrap();
     let (home, _) = upgraded_home(root.path());
 
-    // Serving: refused before the port is bound.
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let serve = ua(&home).arg("serve").env("UA_BIND", format!("127.0.0.1:{port}")).output().unwrap();
+    let before = recorded_parts(&home);
+    // Serving: refused before a port is bound.
+    let serve = ua(&home).arg("serve").env("UA_BIND", "127.0.0.1:0").output().unwrap();
     assert_refused(&serve, "ua serve");
     assert!(!text(&serve.stderr).contains("hub listening"));
     // Writing (and every other command that opens the hub).
@@ -70,6 +77,17 @@ fn a_database_from_a_newer_build_is_refused_for_serving_and_writing() {
     assert_refused(&call, "ua call");
     assert_refused(&ua(&home).args(["token", "issue", "agent-1"]).output().unwrap(), "ua token issue");
     assert_refused(&ua(&home).args(["tools", "--names"]).output().unwrap(), "ua tools");
+    assert_refused(&ua(&home).args(["login-link", "operator"]).output().unwrap(), "ua login-link");
+    let source = root.path().join("no-such-source.db");
+    let import =
+        ua(&home).args(["import", "python-hub", "--from", source.to_str().unwrap()]).output().unwrap();
+    assert_refused(&import, "ua import");
+    let mcp = ua(&home).arg("mcp").stdin(std::process::Stdio::null()).output().unwrap();
+    if !text(&mcp.stderr).contains("without the mcp-server feature") {
+        assert_refused(&mcp, "ua mcp");
+    }
+    // A refused open applied nothing.
+    assert_eq!(recorded_parts(&home), before);
 
     // Diagnosis still runs, and says what is wrong.
     let doctor = ua(&home).args(["doctor", "--json"]).output().unwrap();
@@ -124,4 +142,69 @@ fn restoring_a_backup_from_before_the_upgrade_recovers() {
     let call = ua(&home).args(["call", "task_list", "{}"]).output().unwrap();
     assert!(call.status.success(), "{}", text(&call.stderr));
     assert!(!text(&call.stderr).contains("NEWER BUILD"));
+}
+
+#[test]
+fn ua_serve_refuses_it_even_with_the_override() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _) = upgraded_home(root.path());
+    let before = recorded_parts(&home);
+    for (var, flag) in [(Some("1"), false), (None, true)] {
+        let mut cmd = ua(&home);
+        if let Some(v) = var {
+            cmd.env("UA_ALLOW_NEWER_SCHEMA", v);
+        }
+        if flag {
+            cmd.arg("--allow-newer-schema");
+        }
+        let out = cmd.arg("serve").env("UA_BIND", "127.0.0.1:0").output().unwrap();
+        let err = text(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("ua serve refuses the database"), "{err}");
+        assert!(err.contains("even with --allow-newer-schema"), "{err}");
+        assert!(err.contains("[future.v9]"), "names the unknown part: {err}");
+        assert!(err.contains("accepted again"), "says why: {err}");
+        assert!(!err.contains("hub listening"), "{err}");
+    }
+    assert_eq!(recorded_parts(&home), before, "nothing applied");
+}
+
+#[test]
+fn a_dotenv_file_cannot_switch_the_override_on() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _) = upgraded_home(root.path());
+    // A `.env` in the working directory (as in a checked-out workspace).
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(".env"), "UA_ALLOW_NEWER_SCHEMA=1\n").unwrap();
+    let out = ua(&home).current_dir(&work).args(["call", "task_list", "{}"]).output().unwrap();
+    assert_refused(&out, "ua call with a .env override");
+    // The real environment still can.
+    let out = ua(&home)
+        .current_dir(&work)
+        .env("UA_ALLOW_NEWER_SCHEMA", "1")
+        .args(["call", "task_list", "{}"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn ua_init_honours_the_override() {
+    let root = tempfile::tempdir().unwrap();
+    let (home, _) = upgraded_home(root.path());
+    let init = |allow: bool| {
+        let mut cmd = ua(&home);
+        if allow {
+            cmd.arg("--allow-newer-schema");
+        }
+        cmd.args(["init", "--home", home.to_str().unwrap(), "--agent", "agent-2", "--force", "--json"])
+            .output()
+            .unwrap()
+    };
+    assert_refused(&init(false), "ua init");
+    let out = init(true);
+    let err = text(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("OPENING A DATABASE WRITTEN BY A NEWER BUILD"), "{err}");
 }

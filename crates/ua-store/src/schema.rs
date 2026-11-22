@@ -181,18 +181,34 @@ pub fn unknown_parts(conn: &Connection, known: &[&str]) -> anyhow::Result<Vec<St
 }
 
 /// The refusal when a database records parts this build does not know
-/// (`docs/operations.md`, "Older builds and a newer database").
-pub fn newer_build_refusal(db: &str, unknown: &[String]) -> String {
-    format!(
-        "the database {db} was written by a newer build: it records schema parts this build does not know \
-         ([{}]). This build refuses to open it for serving or writing, because it would ignore what those parts \
-         changed (for the inbound-delivery table: it would accept again deliveries the newer build already \
-         handled). Run the newer build (or a later one), or restore a backup taken before the upgrade with \
-         `ua restore`. `ua doctor` and `ua backup` still run. To open it anyway for recovery, set \
-         UA_ALLOW_NEWER_SCHEMA=1 or pass --allow-newer-schema (docs/operations.md)",
-        unknown.join(", ")
-    )
+/// (`docs/operations.md`, "Older builds and a newer database"). A caller can
+/// tell it from other open errors with `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerSchema {
+    /// The database, as the caller named it.
+    pub db: String,
+    /// The recorded parts this build does not know, sorted.
+    pub unknown: Vec<String>,
 }
+
+impl std::fmt::Display for NewerSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the database {} was written by a newer build: it records schema parts this build does not know \
+             ([{}]). This build refuses to open it for serving or writing, because it would ignore what those \
+             parts changed (for the inbound-delivery table: it would accept again deliveries the newer build \
+             already handled). Run the newer build (or a later one), or restore a backup taken before the upgrade \
+             with `ua restore`. `ua doctor` and `ua backup` still run. To open it anyway for recovery (not to \
+             serve: `ua serve` refuses it even then), set UA_ALLOW_NEWER_SCHEMA=1 or pass --allow-newer-schema \
+             (docs/operations.md)",
+            self.db,
+            self.unknown.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for NewerSchema {}
 
 /// Whether `part` still has to run: `false` when it is recorded with the same
 /// checksum, an error when it is recorded with a different one.
@@ -282,15 +298,32 @@ fn run_in(tx: &Transaction<'_>, part: &Part) -> anyhow::Result<()> {
 /// `BEGIN IMMEDIATE` transaction; a `standalone` procedure splits it (see the
 /// module documentation). Returns the names applied.
 pub fn apply<P: Into<Part> + Copy>(conn: &mut Connection, parts: &[P]) -> anyhow::Result<Vec<&'static str>> {
-    conn.execute_batch(TRACKING)?;
+    apply_checked(conn, parts, &mut |_| Ok(()))
+}
+
+/// [`apply`], running `check` first inside the first `BEGIN IMMEDIATE`
+/// transaction, the one that creates the tracking table and applies the
+/// first parts. No other connection can record a part between the check and
+/// the apply; when `check` fails, nothing is written.
+pub fn apply_checked<P: Into<Part> + Copy>(
+    conn: &mut Connection,
+    parts: &[P],
+    check: &mut dyn FnMut(&Connection) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<&'static str>> {
     let parts = self::parts(parts);
     let mut applied = Vec::new();
     let mut rest = parts.as_slice();
-    while !rest.is_empty() {
+    let mut first = true;
+    while first || !rest.is_empty() {
         let split = rest.iter().position(Part::is_standalone).unwrap_or(rest.len());
         let (shared, tail) = rest.split_at(split);
-        if !shared.is_empty() {
+        if first || !shared.is_empty() {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if first {
+                check(&tx)?;
+                tx.execute_batch(TRACKING)?;
+                first = false;
+            }
             for part in shared {
                 if pending(&tx, part)? {
                     run_in(&tx, part)?;
@@ -332,6 +365,27 @@ mod tests {
         assert!(unknown_parts(&conn, &["a.v1", "b.v1", "c.v1"]).unwrap().is_empty(), "known, not applied");
         assert_eq!(unknown_parts(&conn, &["a.v1"]).unwrap(), ["b.v1"]);
         assert_eq!(unknown_parts(&conn, &[]).unwrap(), ["a.v1", "b.v1"]);
+    }
+
+    #[test]
+    fn the_check_runs_inside_the_migration_transaction_and_a_refusal_writes_nothing() {
+        let (dir, mut conn) = file_db();
+        let path = dir.path().join("t.db");
+        let mut saw_lock = false;
+        let err = apply_checked(&mut conn, &[BEFORE], &mut |_| {
+            // Another connection cannot start a write while the check runs.
+            let other = Connection::open(&path)?;
+            other.busy_timeout(std::time::Duration::ZERO)?;
+            saw_lock = other.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_err();
+            anyhow::bail!("refused on purpose")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("refused on purpose"));
+        assert!(saw_lock, "the check ran under the write lock");
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "not even the tracking table was created");
     }
 
     #[test]

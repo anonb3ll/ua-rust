@@ -143,9 +143,9 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
     Ok(r)
 }
 
-/// The unknown-part fence, run before any part is applied: refuses (or, with
-/// `allow_newer`, returns) the recorded parts outside `parts` and
-/// `fence.also_known`.
+/// The unknown-part fence, run inside the first migration transaction before
+/// any part is applied: refuses (or, with `allow_newer`, returns) the recorded
+/// parts outside `parts` and `fence.also_known`.
 fn check_fence<P: Into<Part> + Copy>(
     conn: &Connection,
     parts: &[P],
@@ -158,7 +158,7 @@ fn check_fence<P: Into<Part> + Copy>(
     if unknown.is_empty() || fence.allow_newer {
         return Ok(unknown);
     }
-    anyhow::bail!("{}", schema::newer_build_refusal(db, &unknown))
+    Err(schema::NewerSchema { db: db.to_string(), unknown }.into())
 }
 
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
@@ -189,8 +189,12 @@ impl Db {
         }
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
-        let ignored = check_fence(&writer, parts, fence, &path.display().to_string())?;
-        schema::apply(&mut writer, parts)?;
+        let mut ignored = Vec::new();
+        let name = path.display().to_string();
+        schema::apply_checked(&mut writer, parts, &mut |c| {
+            ignored = check_fence(c, parts, fence, &name)?;
+            Ok(())
+        })?;
         crate::ledger::check_hash_form(&writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
