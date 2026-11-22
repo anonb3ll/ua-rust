@@ -309,10 +309,11 @@ a link meets the same lock as the created one) and `.` and `..` resolved.
 The longest part of that path that exists is then given its on-disk
 spelling, so on a file system that ignores letter case (the macOS default)
 an existing file or directory yields one spelling however it is typed.
-Every spelling of one database file gives one lock file. Two limits: on a
-file system that ignores case, two spellings that differ only in case of a
-database (or directory) that does not exist yet can get two locks until it
-exists; and hard links are not resolved, so two hard links to one file are
+Every spelling of one database file gives one lock file. Parts of the path
+that do not exist yet keep the case they were typed in, but that is no gap:
+the lock files live in the database's own directory, so on a file system
+that ignores case two lock names that differ only in case are one file.
+One limit: hard links are not resolved, so two hard links to one file are
 two databases to the lock. Do not reach a database through two hard links at
 all; SQLite's `-wal` and `-shm` files are per name, so that is unsafe
 without any `ua` involved.

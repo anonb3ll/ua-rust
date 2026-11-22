@@ -494,8 +494,11 @@ fn drift_is_reported_both_ways() {
 /// The relaxed policies (`ua_ingress::policy::RELAXED`) and the only file
 /// outside `ua-ingress` that may name each. By construction they cannot be
 /// looked up by name and build only clients pinned to one origin
-/// (`Outbound::pinned`); this scan is the second line of defence, so that
-/// the one origin is always the operator's configured one.
+/// (`Outbound::pinned`); this scan is the second line of defence, keeping
+/// each relaxed client in its one consumer file. Pinning guarantees one
+/// origin per client. That the origin is the operator's configured value,
+/// never one a caller supplies, is not proved here: it remains a review duty
+/// in these three files.
 /// `github.enterprise` and `notify.webhook` admit private networks for the
 /// operator's `github_api_url` and `notify_webhook_url`; never for a URL a
 /// caller supplies. `obsidian.local_rest` accepts any TLS certificate, on
@@ -526,8 +529,9 @@ fn relaxed_policies_stay_with_their_one_consumer() {
             let names_it = find_all(&code, constant).any(|at| !continues_ident(&code, at + constant.len()));
             assert!(!names_it || shown.ends_with(home), "{shown} names {constant}; only {home} may");
         }
-        // A pinned client is built only by the consumers of relaxed policies,
-        // each pinned to its configured origin.
+        // A convenience, not the guard: an alias or other spacing gets past
+        // this text match. The real guard is the constant check above, since
+        // `Outbound::pinned` accepts only one of those relaxed policies.
         if code.contains("Outbound::pinned(") {
             assert!(homes.iter().any(|h| shown.ends_with(h)), "{shown} builds a pinned client");
         }
