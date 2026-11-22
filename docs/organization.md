@@ -121,6 +121,12 @@ here for memory columns, owners and defaults.
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
   index led by `org_id`, in a new static part, when its family is converted.
+- The graph canvas family applies `graph_canvas.v2.tenant_keys` to rebuild
+  both keys around `org_id` and keep existing boards and history in `default`.
+  `organization.v1.tools.graph` installs the organization triggers. Canvas
+  reads, writes, restores, quotas and history retention use the caller's
+  organization. Each revision references a board in the same organization.
+  The Python importer explicitly writes legacy canvas boards to `default`.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -708,13 +714,18 @@ global key in the tree is classified:
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`. |
-| `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together. |
+| `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
 or board whose name A uses, the conflict error would tell B that A has it, and
 an idempotency replay could return A's stored result to B.
 
-`organization.v1-rebuild` runs alone, outside the usual transaction, at
+The graph canvas rebuild uses a transactional static part. No existing
+foreign keys, triggers or views depend on the two original tables. The
+rebuild adds the composite revision reference with foreign keys enabled,
+so legacy revisions without a board fail the upgrade atomically.
+
+The planned `organization.v1-rebuild` for the remaining tables runs alone, outside the usual transaction, at
 start-up before the hub serves, using SQLite's documented table-rebuild
 procedure:
 
@@ -1227,7 +1238,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
