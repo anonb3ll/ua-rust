@@ -330,7 +330,9 @@ running an import or restore with the new build.
 Both lock files are owner-only (`0600`), so another local account cannot
 hold them: a new one is created so, and an existing one with a wider mode is
 tightened when a lock is taken (best effort: a file another account owns
-keeps its mode, and the lock is still taken). The operating system releases a lock when the process
+keeps its mode, and the lock is still taken). A lock file is opened without
+following a symbolic link: one planted in its place refuses the lock
+instead of having its target's mode changed. The operating system releases a lock when the process
 exits, a crash or `SIGKILL` included, so there is nothing to clean up: the
 file stays and is harmless. Only `ua serve` takes the serve lock. `ua mcp`,
 `ua call`, `ua tools`, `ua token`, `ua backup` and `ua doctor` run beside a

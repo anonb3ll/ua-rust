@@ -185,6 +185,9 @@ fn open_lock_file(path: &Path) -> anyhow::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         // Another account that could open the file could hold the lock.
         opts.mode(0o600);
+        // A lock file is always one `ua` created: never follow a link planted
+        // in its place (the mode tightening below would act on its target).
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     let file = opts.open(path).with_context(|| format!("opening lock file {}", path.display()))?;
     #[cfg(unix)]
@@ -246,7 +249,14 @@ impl ServeLock {
 pub fn refuse_if_served(db_path: &Path, pending: &[String]) -> anyhow::Result<()> {
     let db = canonical_db_path(db_path)?;
     let path = serve_lock_path(&db)?;
-    let file = match OpenOptions::new().read(true).open(&path) {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match opts.open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("opening lock file {}", path.display())),
@@ -501,6 +511,22 @@ mod tests {
         refuse_if_served(&db, &pending).unwrap();
         // The probe released at once: a serve can start right after it.
         ServeLock::acquire(&db).unwrap();
+    }
+
+    #[test]
+    fn a_link_planted_as_a_lock_file_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, serve_lock_path(&db).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, lock_path(&db)).unwrap();
+        assert!(ServeLock::acquire(&db).is_err());
+        assert!(HubLock::acquire_shared(&db, "serve").is_err());
+        assert!(refuse_if_served(&db, &["new.v1".to_string()]).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]
