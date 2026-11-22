@@ -15,10 +15,12 @@
 //!
 //! Rules:
 //!
-//! - Both actions need a verified caller that can see the conversation: it
-//!   sent or received a message in it, or it may read every mailbox (a human,
-//!   or the coordinator profile). "Missing" and "not yours" read alike
-//!   (`not_found`).
+//! - Handing off needs a verified caller that can see the conversation: it
+//!   sent or received a message in it, or it is an operator, who may read
+//!   every mailbox. "Missing" and "not yours" read alike (`not_found`).
+//!   Listing handoffs follows the same rule, and is also open to a caller
+//!   with no verified identity (auth enforcement off), for whom mailboxes
+//!   and conversations are a message board to read.
 //! - Only an id-safe conversation id (1-200 letters, digits, `.`, `_`, `:`
 //!   or `-`) is written into notes, so an id cannot forge a note marker.
 //! - The task write is the registered `task_add` (create) or `task_update`
@@ -37,12 +39,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ua_core::{Profile, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use crate::families::agents::verified;
 use crate::families::governance;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.conversation.handoff";
 const MAX_TITLE: usize = 300;
@@ -84,10 +86,23 @@ fn is_id_safe(s: &str) -> bool {
 /// Whether the verified caller may read every mailbox (and so every
 /// conversation). An unverified caller never is.
 fn unrestricted(ctx: &ToolCtx) -> bool {
-    let cfg = ctx.hub.cfg();
-    verified(&ctx.caller).is_some_and(|label| {
-        ctx.caller.is_human() || cfg.is_human(label) || ctx.caller.profile == Profile::Coordinator
-    })
+    Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
+}
+
+/// Whose view a read is scoped to: `None` reads every conversation (an
+/// operator, or a caller with no verified identity, for whom mailboxes and
+/// conversations are a message board), else the verified caller's label.
+/// Reading only: a write still needs a verified caller.
+fn reader(ctx: &ToolCtx, verb: &str) -> UaResult<Option<String>> {
+    let board = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::LocalTrustReader, Authority::Operator],
+        ua_core::DEFAULT_ORG,
+    );
+    if board {
+        return Ok(None);
+    }
+    governance::verified_actor(&ctx.caller, verb).map(Some)
 }
 
 fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
@@ -209,12 +224,11 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
 /// is still there); `unaudited` holds tasks whose notes carry the line with
 /// no handoff event behind it. Same caller rule as `conversation_handoff`.
 pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaResult<Value> {
-    let actor = governance::verified_actor(&ctx.caller, "reading a conversation's handoffs")?;
+    let viewer = reader(&ctx, "reading a conversation's handoffs")?;
     let cid = a.conversation_id.trim().to_string();
     if !is_id_safe(&cid) {
         return Err(UaError::invalid("conversation_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
     }
-    let viewer = (!unrestricted(&ctx)).then_some(actor);
     ctx.hub
         .db()
         .read_async(move |c| {

@@ -55,6 +55,7 @@ impl H {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(dir.path().join("home"));
         cfg.human_identities = vec!["operator".into()];
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]);
         cfg.workspace = Some(dir.path().join("ws"));
         std::fs::create_dir_all(dir.path().join("ws")).unwrap();
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), dir }
@@ -499,6 +500,15 @@ async fn an_operator_claim_release_is_fenced() {
         )
         .await;
     assert_eq!(reason(&e), "not_lifecycle_operator");
+    // A routine running unattended under the human's label is an agent.
+    let e = h
+        .act_err(
+            &caller("operator", ActorKind::Agent),
+            "task_claim_release",
+            json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "x" }),
+        )
+        .await;
+    assert_eq!(reason(&e), "not_lifecycle_operator");
     let e = h
         .act_err(
             &human(),
@@ -543,6 +553,18 @@ async fn an_operator_claim_release_is_fenced() {
     assert!(out["task"]["notes"].as_str().unwrap().contains("[claim-released]"));
     assert!(out["released"]["event_ulid"].is_string());
     h.ok(&lead(), "task_claim", json!({ "id": t })).await;
+
+    // A listed agent releases under its own, separately named authority.
+    h.ok(&lead(), "task_update", json!({ "id": t, "release_claim": true })).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let out = h
+        .act_ok(
+            &caller("fleet-bot", ActorKind::Agent),
+            "task_claim_release",
+            json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "stale" }),
+        )
+        .await;
+    assert_eq!(out["released"]["authority"], "lifecycle_operator");
 
     // A finished task has no claim to transfer.
     let done = h.task("Finished", None).await;
@@ -663,6 +685,15 @@ async fn approved_proposal_items_become_tasks_whose_contract_is_rechecked_at_cla
     let e = h.err(&builder(), "task_update", json!({ "id": t2, "status": "doing" })).await;
     assert_eq!(reason(&e), "contract_mismatch");
 
+    // Filing in another identity's name is the human's alone. A routine
+    // running unattended under the human's label is an agent.
+    let named = json!({ "title": "For the lead", "proposer": "lead-1", "items": [{ "title": "One" }] });
+    let e = h.act_err(&caller("operator", ActorKind::Agent), "work_proposal_file", named.clone()).await;
+    assert_eq!(reason(&e), "identity_mismatch");
+    let p = h.act_ok(&human(), "work_proposal_file", named).await;
+    assert_eq!(p["proposal"]["proposer"], "lead-1");
+    h.act_ok(&lead(), "work_proposal_withdraw", json!({ "proposal_id": p["proposal"]["id"] })).await;
+
     // Withdraw: the proposer only, before any decision.
     let e = h.act_err(&lead(), "work_proposal_withdraw", json!({ "proposal_id": pid })).await;
     assert_eq!(e.code(), "conflict");
@@ -678,7 +709,11 @@ async fn approved_proposal_items_become_tasks_whose_contract_is_rechecked_at_cla
     assert_eq!(w["proposal"]["status"], "withdrawn");
 
     let list = h.act_ok(&lead(), "work_proposal_list", json!({ "proposer": "lead-1" })).await;
-    assert_eq!(list["proposals"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        list["proposals"].as_array().unwrap().len(),
+        4,
+        "three of its own and the human's in its name"
+    );
     assert_eq!(
         h.act_ok(&lead(), "work_proposal_get", json!({ "proposal_id": pid })).await["proposal"]["id"],
         pid
@@ -818,7 +853,15 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
     // An ordinary agent may not bind or unbind: the binding decides which
     // repository a task's CI checks are verified against.
     let e = h.act_err(&lead(), "project_repo_bind", bind.clone()).await;
-    assert_eq!(reason(&e), "not_lifecycle_operator");
+    assert_eq!(reason(&e), "operator_required");
+    // Nor may a lifecycle operator: bindings are human-only.
+    let fleet = caller("fleet-bot", ActorKind::Agent);
+    let e = h.act_err(&fleet, "project_repo_bind", bind.clone()).await;
+    assert_eq!(reason(&e), "operator_required");
+    // Nor an unattended routine running under the human's label.
+    let routine = caller("operator", ActorKind::Agent);
+    let e = h.act_err(&routine, "project_repo_bind", bind.clone()).await;
+    assert_eq!(reason(&e), "operator_required");
     // An unverified caller cannot borrow an operator's name.
     let spoof = json!({ "project": "web", "repo": "owner/web", "bound_by": "operator" });
     let e = h.act_err(&anon, "project_repo_bind", spoof).await;
@@ -831,7 +874,9 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
 
     h.act_ok(&human(), "project_repo_bind", bind).await;
     let e = h.act_err(&lead(), "project_repo_unbind", json!({ "project": "web" })).await;
-    assert_eq!(reason(&e), "not_lifecycle_operator");
+    assert_eq!(reason(&e), "operator_required");
+    let e = h.act_err(&fleet, "project_repo_unbind", json!({ "project": "web" })).await;
+    assert_eq!(reason(&e), "operator_required");
     let e =
         h.act_err(&anon, "project_repo_unbind", json!({ "project": "web", "unbound_by": "operator" })).await;
     assert_eq!(reason(&e), "identity_required");

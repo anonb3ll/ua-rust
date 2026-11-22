@@ -1108,6 +1108,8 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     for who in [researcher(), other(), unverified()] {
         let e = h.act_err(&who, "session_handoff_recover", params.clone()).await;
         assert_eq!(e.code(), "not_found", "{} {e:?}", who.label);
+        let packet = h.ok(&who, "session_packet", params.clone()).await;
+        assert_eq!(packet["handoff_note"], Value::Null, "{}", who.label);
     }
     // The same answer as for a session that does not exist.
     let e = h.act_err(&other(), "session_handoff_recover", json!({ "session_id": "no-such" })).await;
@@ -1116,6 +1118,8 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     for who in [builder(), human(), lifecycle_op()] {
         let r = h.act_ok(&who, "session_handoff_recover", params.clone()).await;
         assert_eq!(r["note"]["id"], id, "{}", who.label);
+        let packet = h.ok(&who, "session_packet", params.clone()).await;
+        assert_eq!(packet["handoff_note"], r["note"], "{}", who.label);
     }
     // The receiver of an assigned note may read it.
     h.sql(&format!(
@@ -1123,11 +1127,13 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
     ));
     let r = h.act_ok(&other(), "session_handoff_recover", params.clone()).await;
     assert_eq!(r["note"]["id"], id);
+    let packet = h.ok(&other(), "session_packet", params.clone()).await;
+    assert_eq!(packet["handoff_note"], r["note"]);
     assert_eq!(h.act_err(&outsider(), "session_handoff_recover", params).await.code(), "not_found");
 }
 
 #[tokio::test]
-async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_links() {
+async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_links() {
     let h = H::new();
     h.ok(
         &builder(),
@@ -1136,7 +1142,13 @@ async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_li
     )
     .await;
     let params = json!({ "conversation_id": "conv-9" });
-    let e = h.act_err(&unverified(), "conversation_handoffs", params.clone()).await;
+    // A caller with no verified identity (auth enforcement off) reads every
+    // conversation, like every mailbox. Handing off is a write: it cannot.
+    let board = h.act_ok(&unverified(), "conversation_handoffs", params.clone()).await;
+    assert_eq!(board["handoffs"], json!([]));
+    let e = h
+        .act_err(&unverified(), "conversation_handoff", json!({ "conversation_id": "conv-9", "title": "No" }))
+        .await;
     assert_eq!(reason(&e), "identity_required", "{e:?}");
 
     let real = h
@@ -1161,9 +1173,11 @@ async fn conversation_handoffs_need_a_verified_viewer_and_count_only_ledgered_li
     assert_eq!(ids("unaudited"), vec![forged]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-1");
     assert_eq!(listed["handoffs"][0]["note_reference"], true);
-    // The coordinator sees every conversation; an outsider sees none.
+    // A human sees every conversation; a coordinator-profile agent, like an
+    // outsider, sees none (a profile grants nothing).
+    h.act_ok(&human(), "conversation_handoffs", params.clone()).await;
     let coord = caller("coord-1", ActorKind::Agent, Profile::Coordinator);
-    h.act_ok(&coord, "conversation_handoffs", params.clone()).await;
+    assert_eq!(h.act_err(&coord, "conversation_handoffs", params.clone()).await.code(), "not_found");
     assert_eq!(h.act_err(&outsider(), "conversation_handoffs", params).await.code(), "not_found");
 }
 
@@ -1267,4 +1281,97 @@ async fn a_check_is_verified_only_against_the_bound_repo_a_full_head_and_its_job
         )
         .await;
     assert_eq!(e.code(), "invalid_argument");
+}
+
+/// Behaviour change: with auth off, an unverified caller that names a
+/// configured human (or lifecycle operator) as its `actor` used to get
+/// operator authority over any task's workflow record. It no longer does; it
+/// keeps writing a task whose claimant it names, and a verified human or
+/// lifecycle operator still writes any task's record.
+#[tokio::test]
+async fn an_unverified_caller_naming_a_human_is_not_a_workflow_operator() {
+    let h = H::new();
+    let t = h.task("Ship the parser", None).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let anon = Caller::local("anyone", Transport::Mcp);
+    for actor in ["operator", "lead-op"] {
+        let e = h
+            .act_err(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": actor }))
+            .await;
+        assert_eq!(reason(&e), "not_task_owner", "{actor}");
+        let e = h
+            .act_err(
+                &anon,
+                "task_check_record",
+                json!({ "task_id": t, "name": "tests", "outcome": "pass", "head_sha": FULL, "actor": actor }),
+            )
+            .await;
+        assert_eq!(reason(&e), "not_task_owner", "{actor}");
+    }
+    // Naming the claimant still works without verification (unchanged).
+    let v = h
+        .act_ok(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": "builder-1" }))
+        .await;
+    assert_eq!(v["updated_by"], "builder-1");
+    // A verified human and a verified lifecycle operator still may.
+    h.act_ok(&human(), "task_workflow_set", json!({ "task_id": t, "focus": "the lexer" })).await;
+    h.act_ok(&lifecycle_op(), "task_workflow_set", json!({ "task_id": t, "focus": "the parser" })).await;
+}
+
+/// The lifecycle-operator grant: an agent listed in `lifecycle_operators`
+/// keeps the fleet-maintenance operations (here: writing another task's
+/// workflow record, releasing another agent's claim) but never human-only ones
+/// (provider accounts, the hub view, reading other mailboxes). An unverified
+/// caller claiming that label holds neither.
+#[tokio::test]
+async fn a_lifecycle_operator_keeps_fleet_maintenance_but_not_human_only_operations() {
+    let h = H::new();
+    let t = h.task("Ship the parser", None).await;
+    h.ok(&builder(), "task_claim", json!({ "id": t })).await;
+    let anon = Caller::local("lead-op", Transport::Mcp);
+
+    // Fleet maintenance: the lifecycle operator may; a peer and an unverified
+    // caller claiming its label may not.
+    h.act_ok(&lifecycle_op(), "task_workflow_set", json!({ "task_id": t, "stage": "plan" })).await;
+    let e = h
+        .act_err(&anon, "task_workflow_set", json!({ "task_id": t, "stage": "plan", "actor": "lead-op" }))
+        .await;
+    assert_eq!(reason(&e), "not_task_owner");
+    let release = json!({ "task_id": t, "expected_claimant": "builder-1", "reason": "stale" });
+    assert_eq!(
+        reason(&h.act_err(&other(), "task_claim_release", release.clone()).await),
+        "not_lifecycle_operator"
+    );
+    assert_eq!(reason(&h.act_err(&anon, "task_claim_release", release.clone()).await), "identity_required");
+    h.act_ok(&lifecycle_op(), "task_claim_release", release).await;
+
+    // Human-only: provider accounts, the hub view, other agents' mailboxes.
+    let args = json!({ "provider": "anthropic", "label": "acct-1", "billing": "subscription" });
+    let e = h.call(&lifecycle_op(), "provider_account_register", args.clone()).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required");
+    let catalog = h.ok(&lifecycle_op(), "capability_catalog", json!({})).await;
+    assert!(catalog["boundaries"].is_null(), "{catalog}");
+    let catalog = h.ok(&human(), "capability_catalog", json!({})).await;
+    assert!(!catalog["boundaries"].is_null(), "{catalog}");
+    let e = h.call(&lifecycle_op(), "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
+    assert!(e.to_string().contains("outside your mailbox"), "{e}");
+}
+
+/// An unattended routine owned by a human runs as an agent under the owner's
+/// label, so that it carries no human authority: it is refused at the
+/// human-only sites (provider accounts, the hub view, reading other
+/// mailboxes), where the human is allowed.
+#[tokio::test]
+async fn an_unattended_routine_under_a_humans_label_holds_no_operator_authority() {
+    let h = H::new();
+    let routine = caller("operator", ActorKind::Agent, Profile::Coordinator);
+    let args = json!({ "provider": "anthropic", "label": "acct-r", "billing": "subscription" });
+    let e = h.call(&routine, "provider_account_register", args).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required");
+    let catalog = h.ok(&routine, "capability_catalog", json!({})).await;
+    assert!(catalog["boundaries"].is_null(), "{catalog}");
+    assert!(!h.ok(&human(), "capability_catalog", json!({})).await["boundaries"].is_null());
+    let e = h.call(&routine, "message_list", json!({ "to_agent": "builder-2" })).await.unwrap_err();
+    assert!(e.to_string().contains("outside your mailbox"), "{e}");
+    h.ok(&human(), "message_list", json!({ "to_agent": "builder-2" })).await;
 }

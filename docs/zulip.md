@@ -101,9 +101,11 @@ the same checks.
 
 ## Transport
 
-Requests use the web family's client: no redirects, no proxy, a 20-second
-timeout, and every address the site resolves to must be public, checked
-before the request and again at connect time. `zulip_site` must be https;
+Requests go through `ua_ingress::Outbound` under the `zulip.api` policy
+([ingress.md](ingress.md)): no redirects, no proxy, 20 seconds for the
+call, the key only in the `Authorization` header of a request to the site,
+and every address the site resolves to must be public, checked in the
+resolver the connection uses and again on the connection's peer. `zulip_site` must be https;
 plain http is accepted only for a loopback host under `fetch_allow_loopback`
 (tests use this). Replies are read up to 64 KiB (send, `users/me`) or 4 MiB
 (fetch); a longer reply is refused. Errors never include the key, the

@@ -1,12 +1,19 @@
 # Contributing
 
+The [software factory direction](docs/software-factory.md) describes what
+ua-rust is building toward and the evidence that will show it works across
+harnesses. Use it to judge a proposal's value alongside its compatibility
+requirements.
+
 ## Layout
 
 | Crate | Rule |
 |---|---|
 | `ua-core` | No I/O beyond reading config. Types, profiles, sandbox resolvers. |
+| `ua-ingress` | The address classifier and the guarded outbound HTTP client (`Outbound` with a named `Policy`). Depends only on `ua-core`; only `ua-tools` and `ua-server` depend on it. Call other systems through it: `tests/ingress_guard.rs` fails on a new `reqwest` client builder, address classifier or inbound delivery table outside it (see [docs/ingress.md](docs/ingress.md)). |
 | `ua-store` | SQLite access and the ledger. No tool logic. |
 | `ua-memory` | The memory domain: schema parts, note model, save, search, ranking, embeddings, lifecycle. Depends only on `ua-core` and `ua-store`, never on the `Registry`. Its tools are registered in `ua-tools` (`families/memory`), and adapters reach memory only through them; `ua-memory/tests/boundary.rs` fails if any other crate depends on it. |
+| `ua-deliverables` | The deliverable domain: schema parts, validation, reads and writes of deliverables and their revisions. Depends only on `ua-core` and `ua-store`, never on the `Registry`. Its tools are registered in `ua-tools` (`families/deliverables.rs`); `ua-deliverables/tests/dependencies.rs` fails if it gains another workspace dependency or any crate other than `ua-tools` depends on it. |
 | `ua-tools` | Tools. Every tool is registered in the `Registry` and runs only through `Registry::call`. |
 | `ua-server` | Adapters (MCP, HTTP, UI). Adapters build a `Caller` and call the registry; they never run tool code directly. |
 | `ua-cli` | The `ua` binary. |
@@ -130,4 +137,8 @@ This repository is public. No personal names, e-mail addresses, home
 directory paths, host names or real tokens in code, tests, docs or commits.
 Use placeholders such as `builder-1`, `operator`, `~/projects`,
 `example.com`. `scripts/vocab-check.sh` (run in CI) enforces this; list an
-intended exception in `scripts/vocab-allowlist.txt`.
+intended exception in `scripts/vocab-allowlist.txt`. An allowlist entry can be
+scoped to one pattern class — `vocab` for the legacy role names, `private` for
+addresses, home paths and tailnet names — and a scoped entry never silences
+the other class on the same line. `scripts/vocab-check-selftest.sh` (also run
+in CI) pins that behaviour.

@@ -49,9 +49,9 @@ use ua_store::{EventInput, SchemaPart, ledger};
 
 use super::agents::verified;
 use super::harness_config::render::{content_hash, py_dumps};
-use super::node_queue::is_operator;
 use crate::approvals::{self, GateOutcome};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
+use ua_org::authz::{Authority, Authz};
 
 /// The approval tool name `publish` and `assign` park under.
 pub const GATE: &str = "skill_registry";
@@ -420,7 +420,11 @@ fn author(ctx: &ToolCtx) -> UaResult<String> {
 /// every node of an agent or profile is served.
 fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
     let who = author(ctx)?;
-    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "operator_required",
             format!("{what} is an operator action (a human or a lifecycle operator)"),
@@ -910,7 +914,13 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
 fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
     let who = author(ctx)?;
     let label = p.agent_label.trim().to_string();
-    if label != who && !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if label != who
+        && !Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        )
+    {
         return Err(UaError::denied(
             "not_own_agent",
             "resolve shows the caller's own skills; an operator may resolve any agent's",

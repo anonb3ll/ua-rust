@@ -8,16 +8,16 @@
 //! - `project_repo_bindings`: shared `ua-tools` normalization, clearing invalid `default_branch` to NULL,
 //!   and dry-run/import refusals
 //! - `batch_size = 1` resume across the P0 tables
+//! - `#2742`: carry AUTOINCREMENT `sqlite_sequence` floors across import so deleted/skipped ids are never reused
 
 use std::path::PathBuf;
 
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ua_core::{ActorKind, Caller, Config, Profile, canonical, identity::Transport};
+use ua_core::{ActorKind, Caller, Config, Profile, UaError, canonical, identity::Transport};
 use ua_import::{MAX_REPORTED_TASK_RUN_IDS, Options, Report};
-use ua_store::Db;
-use ua_store::ledger;
+use ua_store::{Db, backup, ledger};
 use ua_tools::families::governance::normalize_repo as tools_normalize_repo;
 use ua_tools::{Hub, builtin_registry};
 
@@ -889,4 +889,181 @@ fn p0_tables_resume_across_small_batches_without_false_refusals() {
         assert_eq!(rep.total_copied, 3, "{tbl}");
         assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {tbl}")), 3, "{tbl}");
     }
+}
+
+fn seq_state(db: &Db, table: &str) -> (i64, Option<i64>) {
+    db.read(|c| {
+        Ok(c.query_row("SELECT COUNT(*), MAX(seq) FROM sqlite_sequence WHERE name = ?1", [table], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?)
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn imported_tasks_sequence_prevents_reusing_deleted_hold_root_id() {
+    let (f, c) = new_source();
+    c.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES
+           (10, 'Held member', 'open', '{T0}', '{T0}'),
+           (20, 'Deleted hold root', 'open', '{T0}', '{T0}');
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at)
+           VALUES (1, 20, 'pause', 'active', 'paused by operator', 'manual', 'operator', '{T0}');
+         INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) VALUES
+           (1, 20, 'open'),
+           (1, 10, 'open');
+         DELETE FROM tasks WHERE id = 20;"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(seq_state(&db, "tasks"), (1, Some(20)));
+    assert!(
+        db.read(|c| backup::check_autoincrement_sequences(c).map_err(|e| UaError::internal(format!("{e:#}"))))
+            .unwrap()
+            .is_empty()
+    );
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
+    let reg = builtin_registry();
+
+    // New task after cutover must advance past deleted hold root 20.
+    let created =
+        reg.call(&hub, &agent("agent-1"), "task_add", json!({ "title": "Post-cutover task" })).await.unwrap();
+    assert_eq!(created["id"], json!(21), "{created}");
+
+    // Holding the new task creates a distinct hold rather than hitting the orphan hold on 20.
+    let held_new = reg
+        .call(
+            &hub,
+            &human_coordinator(),
+            "coordination_manage",
+            json!({
+                "action": "task_hold",
+                "params": { "root_task_id": 21, "mode": "pause", "reason": "hold new task" }
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held_new["changed"], json!(true), "{held_new}");
+
+    // Both the newly held task and the original orphan-hold member remain unclaimable.
+    assert_eq!(
+        reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 21 })).await.unwrap_err().reason_code(),
+        Some("task_held")
+    );
+    assert_eq!(
+        reg.call(&hub, &agent("agent-1"), "task_claim", json!({ "id": 10 })).await.unwrap_err().reason_code(),
+        Some("task_held")
+    );
+    assert!(db.read(ledger::verify).unwrap().ok);
+}
+
+#[tokio::test]
+async fn imported_autoincrement_sequences_cover_empty_tables_other_tables_and_never_lower() {
+    // Case A: empty surviving `tasks` table + deleted max id in `task_holds`.
+    let (f, c) = new_source();
+    c.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at)
+           VALUES (25, 'Deleted max task', 'open', '{T0}', '{T0}');
+         DELETE FROM tasks WHERE id = 25;
+         INSERT INTO task_holds (id, root_task_id, mode, status, reason, release_policy, created_by, created_at) VALUES
+           (7, 25, 'pause', 'active', 'orphan hold', 'manual', 'operator', '{T0}'),
+           (8, 26, 'pause', 'active', 'deleted hold', 'manual', 'operator', '{T0}');
+         DELETE FROM task_holds WHERE id = 8;"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(seq_state(&db, "tasks"), (1, Some(25)));
+    assert_eq!(seq_state(&db, "task_holds"), (1, Some(8)));
+    assert!(
+        db.read(|c| backup::check_autoincrement_sequences(c).map_err(|e| UaError::internal(format!("{e:#}"))))
+            .unwrap()
+            .is_empty()
+    );
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
+    let reg = builtin_registry();
+    let created =
+        reg.call(&hub, &agent("agent-1"), "task_add", json!({ "title": "First new task" })).await.unwrap();
+    assert_eq!(created["id"], json!(26), "{created}");
+
+    let held = reg
+        .call(
+            &hub,
+            &human_coordinator(),
+            "coordination_manage",
+            json!({
+                "action": "task_hold",
+                "params": { "root_task_id": 26, "mode": "pause", "reason": "hold 26" }
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held["changed"], json!(true), "{held}");
+    assert_eq!(held["hold"]["id"], json!(9), "{held}");
+
+    // Case B: idempotent on re-import, and never lowers a higher target sequence.
+    let (f2, c2) = new_source();
+    c2.execute_batch(&format!(
+        "INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES
+           (10, 'Surviving', 'open', '{T0}', '{T0}'),
+           (20, 'Deleted', 'open', '{T0}', '{T0}');
+         DELETE FROM tasks WHERE id = 20;"
+    ))
+    .unwrap();
+    drop(c2);
+
+    let db2 = target();
+    ua_import::import(&db2, &f2.path, &opts()).unwrap();
+    assert_eq!(seq_state(&db2, "tasks"), (1, Some(20)));
+    ua_import::import(&db2, &f2.path, &opts()).unwrap();
+    assert_eq!(seq_state(&db2, "tasks"), (1, Some(20)));
+
+    db2.write(|tx| {
+        tx.execute("UPDATE sqlite_sequence SET seq = 30 WHERE name = 'tasks'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    ua_import::import(&db2, &f2.path, &opts()).unwrap();
+    assert_eq!(seq_state(&db2, "tasks"), (1, Some(30)));
+
+    // Case C: source without a `sqlite_sequence` table (no AUTOINCREMENT) imports cleanly.
+    let no_autoinc_schema = "
+    CREATE TABLE tasks (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE event_log (
+      ulid TEXT PRIMARY KEY,
+      channel TEXT NOT NULL,
+      payload TEXT NOT NULL DEFAULT '{}',
+      originator TEXT,
+      episode_id TEXT,
+      causal_parent_id TEXT,
+      created_at TEXT NOT NULL,
+      dedupe_key TEXT,
+      prev_hash TEXT,
+      entry_hash TEXT,
+      org_id TEXT
+    );";
+    let (f3, c3) = new_source_with_schema(no_autoinc_schema);
+    c3.execute(
+        "INSERT INTO tasks (id, title, created_at, updated_at) VALUES (5, 'Plain PK task', ?1, ?1)",
+        [T0],
+    )
+    .unwrap();
+    drop(c3);
+
+    let db3 = target();
+    let r3 = ua_import::import(&db3, &f3.path, &opts()).unwrap();
+    assert_eq!(table(&r3, "tasks").copied, 1);
+    assert_eq!(n(&db3, "SELECT COUNT(*) FROM tasks WHERE id = 5"), 1);
 }

@@ -22,8 +22,12 @@ here for memory columns, owners and defaults.
   rows are written with `hash_v = 2`, a row's `org_id` can be changed without
   `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
 - `ua_store::org::tenant_part`. It takes the full part name
-  (`organization.v1.<crate>`) rather than the owner alone, so the part stays a
-  constant. No table uses it yet.
+  (`organization.v1.<crate>.<family>`, or `organization.v1.<crate>` for a
+  crate that is one family) rather than the owner alone, so the part stays a
+  constant. There is one part per table family, because a generated part's checksum covers its table list, so a released part can never take another family's tables. Its first user is `organization.v1.ingress`, for
+  `inbound_deliveries`, a table that carries `org_id` from its first part;
+  `organization.v1.deliverables` does the same for `deliverables` and
+  `deliverable_revisions`.
 - `ua_core::DEFAULT_ORG`.
 - The importer exclusion: `org_id` is never mapped by column name.
 - The classification test (`crates/ua-tools/tests/org_classification.rs`,
@@ -31,13 +35,22 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (all 68 today,
-  frozen as a baseline that a new table cannot join), and the grant tables
+  may only shrink: the tenant tables still missing `org_id` (64 of the frozen
+  baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
+  `graph_canvas_revisions` and `web_search_cache` having left it; a new table
+  cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
 - A rollback fence: opening the store, and every append, refuses a ledger
-  whose newest row has a `hash_v` above the build's.
+  whose newest row has a `hash_v` above the build's. It sits beside the
+  unknown-part fence (`docs/operations.md`, "Older builds and a newer
+  database"), which refuses, before any part is applied, a database that
+  records a schema part the build does not know. The two are independent:
+  the unknown-part fence catches a newer schema, this one a newer ledger
+  form, and `--allow-newer-schema` lifts only the first (and never for
+  `ua serve`). A build is never allowed to append a row in an older hash
+  form after a newer one. Both stop only builds that contain them.
 
 - `Caller.org_id` (always `DEFAULT_ORG`; a serialized caller without it
   reads as the default) and `Caller::system_for(org_id)`, with
@@ -56,9 +69,78 @@ here for memory columns, owners and defaults.
   row shape, and refuses any organization other than the default rather than
   drop it. `org_id` is still not covered by the hash.
 
-Not yet: the tenant parts, the label and launch-key indexes, the
-`memory_versions_capture` trigger, `hash_v = 2`, and everything after
-`organization.v1`.
+- The `ua-org` crate, holding only `authz` for now. Departure from the
+  [Authority checks](#authority-checks) API: until users and memberships
+  exist (`organization.v2`), authority comes from the hub configuration, so
+  the checks run through an `Authz { cfg }` value with
+  `require(caller, need, target_org)` and `holds(...)`. `target_org` must be
+  `'default'` and the caller's organization; anything else is refused. The
+  authorities are **transitional**: each reproduces one rule the tree used,
+  and names the design authority that replaces it. Four of them use a
+  profile as authority, which this design forbids; they are marked, and kept
+  only to preserve behaviour. The operator, dispatch, hub-view and mailbox
+  predicates delegate to `authz`, and ua-memory's human check goes through
+  it. A guard test (`crates/ua-core/tests/authz_guard.rs`) holds per-crate
+  counts of the remaining ad-hoc checks (`is_human` definitions and calls,
+  `is_lifecycle_operator` calls, `fn is_operator…`, profile comparisons and
+  matches, profile-as-authority uses, `ActorKind` comparisons and matches,
+  and direct reads of `human_identities` / `lifecycle_operators`), which may
+  only go down. It scans `ua-core` too, skipping only the files that define
+  the primitives. One behaviour change:
+  an unverified caller naming a configured human as its actor is no longer a
+  workflow-record operator.
+
+- Authority comes from identity, never from a profile (two owner
+  decisions). `Operator` is a verified caller of kind human, so an
+  unattended routine (an agent under a human's label) is never one;
+  `LifecycleOperator` is a
+  separate fleet-maintenance grant for agents in `lifecycle_operators`,
+  never operator authority, named at each call site that admits it next to
+  `Operator`. The coordinator and operator profiles grant nothing; the
+  profile-as-authority count in the guard is 0. With auth enforcement off,
+  mailboxes and conversations are a message board: `LocalTrustReader` is a
+  read grant for a caller with no verified identity, and never satisfies
+  another authority ([auth.md](auth.md#with-auth-enforcement-off)).
+
+- The first tenant part for an existing table family,
+  `organization.v1.tools.code`, for the code family's `code_symbols`: `org_id`
+  added `NOT NULL DEFAULT 'default'` (existing rows backfilled), and the
+  generated triggers. The part is named for the owning crate **and family**
+  (`organization.v1.<crate>.<family>`) rather than one
+  `organization.v1.tools` for all of `ua-tools`, because the procedure
+  checksum covers its table list: a part for one family cannot later take
+  another family's tables, so each family gets its own part. Every query of
+  the symbol tools filters on the caller's `org_id`; indexing for an
+  organization `orgs` does not hold is refused before any row changes. The
+  `agent.code.indexed` event still names `DEFAULT_ORG`, which is the indexed
+  rows' organization for every caller until memberships exist; the
+  `org_guard` test admits no other value yet. **Resolver work item:** every
+  event at a site marked `ORG-EVENT-DEFAULT` in the source must switch to the
+  organization of the row it is about in the same change that lets a second
+  organization have callers, or the default organization's ledger would
+  record another organization's activity. `code_symbols` has no index led by
+  `org_id`; its queries use the existing `(workspace, …)` indexes, which is
+  enough while one organization holds the rows. A large tenant table gets an
+  index led by `org_id`, in a new static part, when its family is converted.
+- The graph canvas family applies `graph_canvas.v2.tenant_keys` to rebuild
+  both keys around `org_id` and keep existing boards and history in `default`.
+  `organization.v1.tools.graph` installs the organization triggers. Canvas
+  reads, writes, restores, quotas and history retention use the caller's
+  organization. Each revision references a board in the same organization.
+  The Python importer explicitly writes legacy canvas boards to `default`.
+- The web family applies the standalone procedure `web.v2.tenant_keys` to
+  rebuild `web_search_cache` around `(org_id, provider, query, max_results)`
+  and migrate existing rows to `default`, followed by
+  `organization.v1.tools.web` to install the organization triggers. Search
+  cache reads, writes and TTL evictions scope to the caller's organization.
+- The insert guard ([guard 2](#organizationv1)): a test fails when an
+  `INSERT` into a tenant table that carries its key does not name `org_id`,
+  in any crate's non-test source or any trigger body. See
+  [Converting a table family](#converting-a-table-family).
+
+Not yet: the tenant parts for the other families, the label and launch-key
+indexes, the `memory_versions_capture` trigger, `hash_v = 2`, and everything
+after `organization.v1`.
 
 ## Decision
 
@@ -450,13 +532,16 @@ its `tasks_team_same_org` / `approvals_team_same_org` triggers read `teams` and
 `team_members`. The memory parts (`docs/memory.md`) follow `organization.v1`;
 team visibility needs `organization.v3`.
 
-**Parts per owning crate.** Tenant tables are created by several crates
+**Parts per table family.** Tenant tables are created by several crates
 (`ua-tools`, `ua-memory`, `ua-import`, …), and a crate's own test database
 applies only that crate's parts, so one part that `ALTER`s every crate's tables
 would fail there with "no such table". Each step is therefore a set of parts,
 one per owner: `ua-store` owns `organization.v1.store` (`orgs`, the seed, the
-`event_log` columns), and each crate that owns tenant tables declares
-`organization.v1.<crate>` for its own tables. All of them are produced by one
+`event_log` columns), and each table family declares
+`organization.v1.<crate>.<family>` for its own tables (`organization.v1.<crate>`
+when the crate is one family, as `ua-ingress` is). The unit is the family,
+not the crate, because a generated part's checksum covers its table list, so a released part can never take another family's tables: families are converted one at a time, and
+a per-crate part released with the first family could not grow. All of them are produced by one
 helper, `ua_store::org::tenant_part(owner, tables)`, which emits the `ADD
 COLUMN`, the generated `org_exists` / `org_immutable` triggers and the
 backfills for exactly the listed tables, so the rules are written once.
@@ -604,6 +689,13 @@ failing. Three guards:
    also walks the SQL of **every trigger** in `sqlite_master` after all parts
    have applied, because trigger bodies insert too (the
    `memory_versions_capture` case above) and no Rust string shows them.
+   It is in the tree (the insert guard in
+   `crates/ua-tools/tests/org_classification.rs`) for every tenant table that
+   already carries its key; its table list is the classification's own. It
+   reads source text, so it cannot see SQL whose table name is built at run
+   time (`format!("INSERT INTO {table} …")`), and for `INSERT … SELECT` it
+   checks that the column list names `org_id` but not that the `SELECT`
+   supplies the right organization.
 3. Every lookup by id takes the caller's organization (`WHERE id = ? AND
    org_id = ?`) and returns the same `not_found` for another organization's row
    as for a missing one. This includes `approvals::get` in `resolve`.
@@ -626,15 +718,20 @@ global key in the tree is classified:
 | `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
-| `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`. |
+| `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`. |
-| `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together. |
+| `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
 or board whose name A uses, the conflict error would tell B that A has it, and
 an idempotency replay could return A's stored result to B.
 
-`organization.v1-rebuild` runs alone, outside the usual transaction, at
+The graph canvas rebuild uses a transactional static part. No existing
+foreign keys, triggers or views depend on the two original tables. The
+rebuild adds the composite revision reference with foreign keys enabled,
+so legacy revisions without a board fail the upgrade atomically.
+
+The planned `organization.v1-rebuild` for the remaining tables runs alone, outside the usual transaction, at
 start-up before the hub serves, using SQLite's documented table-rebuild
 procedure:
 
@@ -1139,7 +1236,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
@@ -1147,7 +1244,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets`, `graph_canvas_scenes`, `graph_canvas_revisions`, `idempotency_keys`, `tool_calls`, `web_search_cache`, `code_symbols` | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
@@ -1205,6 +1302,58 @@ organizations' rows.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.
+
+## Converting a table family
+
+Each tenant family gets its organization key in its own change. What every
+such change does:
+
+1. **Name the part for the family** (`organization.v1.<crate>.<family>`),
+   build it with `tenant_part`, register it after the family's own parts and
+   `organization.v1.store`, and add the name to
+   `crates/ua-tools/tests/fixtures/schema_part_names.txt`. Never edit or
+   extend a released part.
+2. **Rebuild first if a key lacks the organization.** A table whose
+   `UNIQUE` constraint or non-rowid primary key does not include `org_id`
+   needs its key rebuilt ([Global keys](#global-keys-and-table-rebuilds))
+   before it can leave the missing list. Otherwise an insert in one
+   organization collides with another organization's key, and the conflict
+   tells the caller that the key exists; `INSERT OR REPLACE` deletes the other
+   organization's row; and an upsert's `DO UPDATE` edits it without touching
+   `org_id`, so the immutability trigger never fires.
+3. **Foreign keys.** The existence trigger does not stop a row in one
+   organization from pointing at a parent in another. A child table needs a
+   composite `(org_id, parent_id)` reference or a same-organization trigger,
+   and every join filters `org_id` on both sides.
+4. **Every statement.** Every `INSERT` names `org_id` (the insert guard
+   enforces it); every `SELECT`, `UPDATE` and `DELETE` filters on it. The
+   value is the caller's organization or, for a system job, the organization
+   of the row it acts on; never a tool argument. A lookup by id answers
+   another organization's row exactly as it answers a missing one.
+5. **Find every other reader and writer.** Search the whole workspace for the
+   table name: the importer's mapping, export and backup, the HTTP and
+   compatibility routes, the UI, observability, other parts' triggers and
+   views. A `SELECT *` read by position, or an `INSERT … SELECT *`, breaks when
+   the column is added; a trigger or view that copies rows elsewhere must
+   carry `org_id`.
+6. **Refuse an unknown organization in code** before the first delete or
+   update. The existence trigger fires only on insert, so a write with
+   nothing to insert would otherwise pass.
+7. **Indexes.** A large table, or one queried per organization, gets an index
+   led by `org_id` in a new static part.
+8. **Events.** Name `DEFAULT_ORG` only while `org_guard` requires it, mark the
+   site `ORG-EVENT-DEFAULT`, and keep payloads free of content another
+   organization should not see.
+9. **Tests**, after `crates/ua-tools/tests/code_tenant.rs`: an upgrade from a
+   database without the part (rows backfilled, triggers present) and an
+   idempotent re-open; two organizations through every tool of the family,
+   with the same key in both where the table has one; an unknown organization
+   refused with nothing changed, including a write with nothing to insert;
+   default-organization results and events unchanged. Give the second
+   organization the profiles its test callers use.
+10. **Classification.** Remove the tables from `TENANT_MISSING_ORG_ID` only,
+    never from its frozen baseline, and update the status list above and the
+    [Scoping per subsystem](#scoping-per-subsystem) table.
 
 ## Where the code lives
 
@@ -1363,7 +1512,7 @@ Parity and isolation
    reference elsewhere does not stop it; the parts before a standalone part are
    committed and the parts after it apply.
 7a. **Schema parts.** Each crate's test database applies its own
-   `organization.v1.<crate>` part without the other crates' tables; a
+   `organization.v1.<crate>.<family>` parts without the other crates' tables; a
    procedure part whose `version` changes is refused as a changed part, while
    one that generated different SQL on a different database is not; a crate
    whose parts read organization tables (e.g. `memory.scope.v1` reads `users`)

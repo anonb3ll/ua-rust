@@ -45,8 +45,13 @@ slack-socket = []
 [dependencies]
 subtle.workspace = true
 ua-core = { workspace = true, features = ["rusqlite"] }
+# The address classifier and the guarded outbound client.
+ua-ingress.workspace = true
 ua-store.workspace = true
 ua-memory.workspace = true
+ua-org.workspace = true
+# Deliverables and their revisions; the tools are registered here.
+ua-deliverables.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true

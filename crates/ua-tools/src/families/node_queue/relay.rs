@@ -10,12 +10,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
 use super::{
-    CHANNEL, Item, check_item_id, clip, device_agent, evidence_ref, is_operator, load_item, now, owned_node,
-    record, run_gate, verified_caller,
+    CHANNEL, Item, check_item_id, clip, device_agent, evidence_ref, load_item, now, owned_node, record,
+    run_gate, verified_caller,
 };
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 const MAX_EVENTS: usize = 200;
 const MAX_EVENT_BYTES: usize = 32_768;
@@ -432,8 +433,9 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
         return Err(UaError::invalid("idempotency_key must be 8-128 of [A-Za-z0-9_.:-]"));
     }
     // Only a human writes without a gate; an agent's follow-up is new
-    // instructions to a running session and needs its own approval.
-    let operator = ctx.caller.is_human() || ctx.hub.cfg().is_human(&who);
+    // instructions to a running session and needs its own approval. A routine
+    // running unattended under a human's label is an agent here.
+    let operator = Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
     if !operator
         && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, FOLLOWUP_GATE)
     {
@@ -448,7 +450,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !operator {
-                if !(item.created_by == who || item.agent == who || is_operator(&hub, &caller, &who)) {
+                if !(item.created_by == who || item.agent == who || Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator, Authority::LifecycleOperator], ua_core::DEFAULT_ORG)) {
                     return Err(UaError::denied(
                         "not_item_owner",
                         format!("{who:?} did not request {id}; only its requester or an operator sends follow-ups"),

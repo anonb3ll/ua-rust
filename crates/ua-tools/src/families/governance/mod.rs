@@ -31,7 +31,7 @@ mod procscan;
 mod proposals;
 mod worktrees;
 
-use ua_core::{Caller, Config, UaError, UaResult};
+use ua_core::{Caller, UaError, UaResult};
 use ua_store::SchemaPart;
 
 pub(crate) use bindings::{
@@ -168,12 +168,6 @@ pub(crate) fn verified_actor(caller: &Caller, verb: &str) -> UaResult<String> {
     verified(caller).map(str::to_string).ok_or_else(|| {
         UaError::denied("identity_required", format!("{verb} requires an authenticated identity"))
     })
-}
-
-/// Whether the verified `who` holds operator authority over other agents'
-/// work: a human identity or a configured lifecycle operator.
-pub(crate) fn is_operator(cfg: &Config, caller: &Caller, who: &str) -> bool {
-    verified(caller).is_some() && (caller.is_human() || cfg.is_human(who) || cfg.is_lifecycle_operator(who))
 }
 
 pub(crate) fn now() -> String {

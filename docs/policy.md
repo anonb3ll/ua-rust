@@ -172,17 +172,112 @@ projection; without one, gating it is refused (`secret_args_unprojected`)
 rather than store the secret. The full status table is in
 [sdk.md](sdk.md#not-supported).
 
+## Approvals in the audit record
+
+A one-time approval binds one exact payload: the tool, the canonical form
+of the payload its gate builds (sorted keys, no whitespace, as
+`ua_core::canonical` writes it) and the requester. The payload is the
+call's arguments unless the tool's handler resolves more: `dispatch_task`
+binds the resolved harness, working directory and prompt hash, the relay
+binds the exact text and target, and `git_merge_task` binds the head,
+branch, target branch and bound repository it resolves at the call. A pass
+expires `approval_pass_ttl_hours` after it was approved.
+
+`git_merge_task` without `policy_authorization_id` checks the task, its
+worktree and the workspace repository first, then asks for a one-time
+approval of `{task_id, force, dry_run, allow_in_flight, branch, head,
+target, repo, summary}`, where `head` is the full commit SHA of the task's
+branch, `target` the branch merged into, `repo` the task project's bound
+`owner/name` (`null` when unbound) and `summary` one line naming the commit
+and the target for the approver ("Merge task 7 branch task-7 at commit
+0123456789ab into main of example/widgets"). A call whose head, target or
+repository differs from a live pass for the same task is refused with
+`approval_binding_changed`, naming the changed fields; the refusal is
+ledgered as `binding_changed`, the old pass stays unspent and a new
+request for the current values is parked. Because the payload is resolved
+by the handler, the merge cannot be requested ahead through
+`POST /api/approvals/request` (`409`), and a call bound to fail (an unknown
+task, a dirty worktree) is refused before a human is asked.
+
+Each approval event carries `payload_sha256`, the SHA-256 of that canonical
+payload, so the request, the decision, the use and any refusal can be tied
+to one payload without the ledger holding it:
+
+| Event | Carries |
+| --- | --- |
+| `agent.approval.requested` | `approval_id`, `tool`, `requested_by`, `payload_sha256`, `via` |
+| `agent.approval.resolved` | `approval_id`, `tool`, `decision`, `resolved_by`, `transport`, `payload_sha256`; `expires_at` when approved (the expiry under the TTL configured at that moment; a later TTL change applies to the pass from then on) |
+| `agent.approval.consumed` | `approval_id`, `tool`, `payload_sha256`, `via` |
+| `agent.approval.refused` | see below |
+
+The relay drops a message's text from its approval once decided; its hash
+is taken over the payload without the text fields, which still binds the
+text through `text_sha256`, so it is the same before and after the
+decision. A policy authorization's `recorded` and `consumed` events carry
+`payload_sha256` over what it binds: `{"head_sha", "repo", "task_id"}`
+(repository in lower case).
+
+A gated call refused because of its approval state appends one
+`agent.approval.refused` event. Its `reason` is one of:
+
+| `reason` | When |
+| --- | --- |
+| `expired` | The pass or policy authorization that covered the call has expired. A one-time pass is reported once, when the gate first finds it expired; the call parks a new request as before. |
+| `binding_changed` | An approval exists for this action but the call's arguments, revision or target differ from what it bound (`dispatch_task`, `dispatch_resume`, the relay's send, a policy authorization's task, repository or head). |
+| `no_matching_approval` | The call names an approval that does not exist or can no longer be used (`approval_status`: `consumed`, `revoked`), or a resume has no consumed `dispatch_task` approval. |
+| `denied` | A human denied exactly this call (or revoked the relay draft's approval). |
+| `not_covered` | A policy authorization binds the merge but not this mode of it (`detail`: `force`, `in_flight`). |
+| `not_eligible` | The caller may not spend the authorization, or its author is no longer a human identity (`detail`: `self_spend`, `authorizer_not_human`). |
+
+The event names what was refused without carrying it: `tool`,
+`requested_by`, and where they apply `approval_id` or `authorization_id`,
+`task_id`, `approved_payload_sha256`, `presented_payload_sha256`,
+`changed_fields` (the top-level field names that differ, never their
+values), `approval_status`, `expired_at`, `detail` and `via`. It never
+holds payload content. Its organization is the organization of the
+approval row, which is the default organization.
+
+A refusal is often decided inside the refused call's write transaction,
+which then fails and rolls back. The event is appended with
+`ledger::append_surviving`: when the transaction commits it is committed
+once with it, and when it rolls back the store appends it again in a
+separate small transaction on the same writer before the call returns its
+error. The error the caller sees is unchanged.
+
+A call that parks a new request because nothing was decided for it yet is
+not a refusal; its record is the `requested` event.
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client
 session. `profiles` in the hub config sets each identity's default
 (unlisted identities get `developer`, OAuth identities get `oauth_profile`);
+**A profile is a permission set, never authority.** It decides which tools a
+session sees. Who may act on another agent's work, read every mailbox or
+conversation, see the hub's boundaries, or move vault notes comes from
+identity (`ua_org::authz`): an operator is a verified caller of kind human
+(a `human_identities` label that authenticated as itself), and an agent
+explicitly listed in `lifecycle_operators` holds a separate fleet-maintenance
+grant (closing, parking and folding tasks, releasing claims and holds,
+worktree cleanup, handoff recovery, workflow records, wake handling, skill
+registry changes, harness config status, node-queue administration including
+node acceptance, and agent and node lifecycle), never operator authority.
+Secret and provider-account administration, project repo bindings, harness
+config publish, session credential revocation and node command adoption are
+for an operator. An unattended routine runs as an agent under its owner's
+label and so holds no operator authority; list its label in
+`lifecycle_operators` to give it fleet-maintenance rights. An unset
+`lifecycle_operators` defaults to `human_identities` for humans only. The
+Python hub let the coordinator and operator profiles carry authority; ua-rust
+does not. A coordinator agent that read every mailbox to route work cannot do
+so any more; organization roles (`docs/organization.md`) are what replace it.
+
 `profile_activate` moves a session to a profile no more privileged than that
 default, and a `profile_defaults` overlay (below) can only lower it.
 
 | Profile | Rank | Surface |
 |---|---|---|
-| `coordinator` | 8 | Every tool. Holds config authority: a profile overlay may not demote the last identity configured with it. Moves vault notes, reads every mailbox. |
+| `coordinator` | 8 | Every tool. A profile overlay may not demote the last identity configured with it (a lockout guard for config revisions). It grants no authority: moving vault notes and reading every mailbox need an operator (a verified human). |
 | `lead` | 7 | The developer surface plus `LEAD_EXTRA_TOOLS` (today all of those are already visible to developer), ranked above it. |
 | `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, migration manifests (`export_migration_manifest`, `compare_migration_manifests`, also through `export_data`), and profile switching (deny list: new tools are visible). |
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
@@ -407,9 +502,10 @@ decision), `work_proposal_get`, `work_proposal_list` and
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
 repository on an allowed forge host. The binding is the repository a task's
-CI checks are verified against, so bind and unbind are for a verified
-lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
-attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+CI checks are verified against and the repository merges and policy
+authorizations name, and it is not approval-gated, so bind and unbind are for
+an operator, a verified human (`operator_required` otherwise; a lifecycle
+operator does not qualify), and are attributed to that caller; `bound_by` / `unbound_by`, when given, must name
 it. Get and list are open.
 
 ### Maintenance tools

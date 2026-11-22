@@ -8,7 +8,7 @@ use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::{Db, EventInput, ledger};
 
 use super::note::{
-    self, DELETED_BY_HUMAN_TAG, DELETED_TAG, assert_privileged, is_human, json_list, json_text, verified,
+    self, DELETED_BY_HUMAN_TAG, DELETED_TAG, assert_privileged, json_list, json_text, verified,
 };
 
 /// Soft-delete note `id` as `caller`: its content becomes an attributed
@@ -20,7 +20,7 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
             "memory_delete requires a verified identity; an unverified or spoofed author is refused",
         ));
     };
-    let human = is_human(caller);
+    let human = ua_org::authz::human(caller);
     let label = caller.label.clone();
     db.write_async(move |tx| {
         let Some(n) = note::fetch(tx, &id)? else { return Ok(json!({ "deleted": false })) };
@@ -78,7 +78,7 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
     db.write_async(move |tx| {
         let n = note::require(tx, &id)?;
         let actor = verified(&caller).map(str::to_string);
-        let human = is_human(&caller);
+        let human = ua_org::authz::human(&caller);
         if n.is_deleted() {
             let Some(actor) = actor else {
                 return Err(UaError::denied(

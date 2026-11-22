@@ -238,14 +238,17 @@ impl Drop for TempConfigGuard {
     }
 }
 
-pub fn run(args: InitArgs, explicit_config: Option<&Path>) -> anyhow::Result<()> {
-    run_inner(args, explicit_config, None)
+/// `allow_newer_schema`: open a database written by a newer build anyway when
+/// minting the initial token (`--allow-newer-schema`), as the other commands do.
+pub fn run(args: InitArgs, explicit_config: Option<&Path>, allow_newer_schema: bool) -> anyhow::Result<()> {
+    run_inner(args, explicit_config, None, allow_newer_schema)
 }
 
 fn run_inner(
     args: InitArgs,
     explicit_config: Option<&Path>,
     before_config_write: Option<&dyn Fn() -> anyhow::Result<()>>,
+    allow_newer_schema: bool,
 ) -> anyhow::Result<()> {
     let operator = args.operator.trim().to_string();
     if operator.is_empty() {
@@ -311,7 +314,7 @@ fn run_inner(
     let issued_token = if let Some(agent_label) = agent.as_deref() {
         let db_path = cfg.db_path();
         let _lock = ua_import::HubLock::acquire_shared(&db_path, "init")?;
-        let hub = Hub::open(cfg.clone())?;
+        let hub = Hub::open_with(cfg.clone(), allow_newer_schema)?;
         let prev_max_id: i64 = hub
             .db()
             .read(|c| Ok(c.query_row("SELECT COALESCE(MAX(id), 0) FROM agent_tokens", [], |r| r.get(0))?))
@@ -482,6 +485,7 @@ mod tests {
             test_args(&home, Some("builder-1"), true, false),
             None,
             Some(&|| bail!("simulated config install failure")),
+            false,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -516,7 +520,7 @@ mod tests {
         drop(conn);
 
         // Retrying without `--force` must succeed because failed init left no stale files.
-        run_inner(test_args(&home, None, true, false), None, None).unwrap();
+        run_inner(test_args(&home, None, true, false), None, None, false).unwrap();
         assert!(home.join("policy.yaml").is_file());
         assert!(home.join("config.toml").is_file());
     }
@@ -533,6 +537,7 @@ mod tests {
             test_args(&home, Some("builder-1"), false, true),
             None,
             Some(&|| bail!("simulated force write failure")),
+            false,
         )
         .unwrap_err();
         let msg = format!("{err:#}");

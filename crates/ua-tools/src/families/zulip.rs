@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, Config, UaError, UaResult};
+use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use crate::approvals::{self, GateOutcome};
@@ -38,7 +39,7 @@ use crate::families::audit::rules::redact_secrets;
 use crate::families::injection;
 use crate::families::plans::write_identity;
 use crate::families::relay::gates::{self, Gates};
-use crate::families::web::{error_chain, http_client, vet_url};
+use crate::families::web::{hooked, outbound_error};
 use crate::registry::{Registry, ToolCtx, tool};
 
 /// The tool name send approvals are recorded under.
@@ -362,27 +363,42 @@ fn categories(findings: &[Value]) -> Value {
 
 // --- HTTP -----------------------------------------------------------------------------------
 
-/// Read at most `max` bytes; `None` when the body is longer.
-async fn read_capped(mut resp: reqwest::Response, max: usize) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                body.extend_from_slice(&chunk);
-                if body.len() > max {
-                    return None;
-                }
-            }
-            Ok(None) => return Some(body),
-            Err(_) => return None,
-        }
-    }
+/// Read at most `max` bytes; `None` when the body is longer (or the read
+/// fails).
+async fn read_capped(resp: Response, max: usize) -> Option<Vec<u8>> {
+    resp.bytes_within(max).await.ok()
 }
 
-async fn api_url(cfg: &Config, creds: &Creds, path: &str) -> UaResult<Url> {
-    let url = creds.site.join(path).map_err(|_| UaError::internal("could not build the Zulip URL"))?;
-    vet_url(&url, cfg.fetch_allow_loopback).await?;
-    Ok(url)
+fn api_url(creds: &Creds, path: &str) -> UaResult<Url> {
+    creds.site.join(path).map_err(|_| UaError::internal("could not build the Zulip URL"))
+}
+
+/// The client: the `zulip.api` policy (under the loopback test hook when
+/// `fetch_allow_loopback` is on).
+fn client(cfg: &Config) -> Result<Outbound, OutboundError> {
+    Outbound::new(hooked(cfg, policy::ZULIP_API))
+}
+
+/// `email:key` as an HTTP basic-auth header value.
+fn basic_auth(creds: &Creds) -> String {
+    use base64::Engine;
+    let pair = format!("{}:{}", creds.email, creds.key.expose_secret());
+    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))
+}
+
+/// A refusal before anything was sent (an address outside the class, a
+/// failed lookup, a URL outside the policy), as the hub error the old
+/// address check gave; `None` for every other failure, including a peer
+/// refused after the request went out.
+fn refusal(url: &Url, e: &OutboundError) -> Option<UaError> {
+    match e {
+        OutboundError::AddressRefused { .. }
+        | OutboundError::Lookup { .. }
+        | OutboundError::UrlRefused { .. } => {
+            Some(outbound_error(url.host_str().unwrap_or_default(), e.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// GET a JSON API path; `Err` is a generic, key-free reason.
@@ -393,15 +409,18 @@ async fn zulip_get(
     query: &[(&str, String)],
     max: usize,
 ) -> Result<Value, String> {
-    let url = api_url(cfg, creds, path).await.map_err(|e| clip(&e.to_string()))?;
-    let client = http_client(cfg).map_err(|_| HTTP_FAILED.to_string())?;
-    let resp = client
-        .get(url)
-        .basic_auth(&creds.email, Some(creds.key.expose_secret()))
-        .query(query)
-        .send()
-        .await
+    let mut url = api_url(creds, path).map_err(|e| clip(&e.to_string()))?;
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+    }
+    let client = client(cfg).map_err(|_| HTTP_FAILED.to_string())?;
+    let req = Request::get(url.clone())
+        .secret_header("Authorization", &basic_auth(creds))
         .map_err(|_| HTTP_FAILED.to_string())?;
+    let resp = client.send(req).await.map_err(|e| match refusal(&url, &e) {
+        Some(why) => clip(&why.to_string()),
+        None => HTTP_FAILED.to_string(),
+    })?;
     if !resp.status().is_success() {
         return Err(format!("{HTTP_FAILED} (HTTP {})", resp.status().as_u16()));
     }
@@ -436,11 +455,11 @@ enum Outcome {
 
 async fn post_message(cfg: &Config, creds: &Creds, stream: &str, topic: &str, content: &str) -> Outcome {
     let failed = |error: String| Outcome::Failed { http_status: None, error: clip(&error) };
-    let url = match api_url(cfg, creds, "api/v1/messages").await {
+    let url = match api_url(creds, "api/v1/messages") {
         Ok(u) => u,
         Err(e) => return failed(e.to_string()),
     };
-    let client = match http_client(cfg) {
+    let client = match client(cfg) {
         Ok(c) => c,
         Err(e) => return failed(e.to_string()),
     };
@@ -450,21 +469,25 @@ async fn post_message(cfg: &Config, creds: &Creds, stream: &str, topic: &str, co
         .append_pair("topic", topic)
         .append_pair("content", content)
         .finish();
-    let sent = client
-        .post(url)
-        .basic_auth(&creds.email, Some(creds.key.expose_secret()))
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(encoded)
-        .send()
-        .await;
-    let resp = match sent {
+    let req = Request::post(url.clone())
+        .secret_header("Authorization", &basic_auth(creds))
+        .and_then(|r| r.body("application/x-www-form-urlencoded", encoded.into_bytes()));
+    let req = match req {
+        Ok(r) => r,
+        Err(e) => return failed(e.to_string()),
+    };
+    let resp = match client.send(req).await {
         Ok(r) => r,
         Err(e) => {
-            let error = clip(&error_chain(&e));
-            return if e.is_connect() || e.is_builder() {
-                Outcome::Failed { http_status: None, error }
-            } else {
-                Outcome::Uncertain { http_status: None, error }
+            if let Some(why) = refusal(&url, &e) {
+                return failed(why.to_string());
+            }
+            return match e {
+                // Nothing left the hub: no connection, or no request built.
+                OutboundError::NotSent { why, .. } => {
+                    Outcome::Failed { http_status: None, error: clip(&why) }
+                }
+                other => Outcome::Uncertain { http_status: None, error: clip(&other.to_string()) },
             };
         }
     };

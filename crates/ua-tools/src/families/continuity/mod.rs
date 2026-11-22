@@ -29,12 +29,11 @@ pub(crate) mod merged;
 mod queue;
 mod workflow;
 
-use ua_core::{Caller, Config};
 use ua_store::SchemaPart;
 
 pub(crate) use conversation::{conversation_handoff, conversation_handoffs};
 pub(crate) use handoff::{
-    latest_committed_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
+    recover_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
     session_handoff_recover, session_handoff_seal, session_handoff_update,
 };
 pub(crate) use merged::queue_close_merged;
@@ -42,7 +41,8 @@ pub(crate) use queue::{
     parked_block, queue_fold, queue_health, queue_park, queue_stale, queue_sweep, queue_unpark,
 };
 pub(crate) use workflow::{
-    STAGES, packet_section, task_check_record, task_check_verify, task_workflow_get, task_workflow_set,
+    STAGES, capsule_head, packet_section, require_review_at_head, require_writer, review_ready,
+    task_check_record, task_check_verify, task_repo, task_workflow_get, task_workflow_set, write_capsule,
 };
 
 /// The workflow record, task checks and session handoff notes. Column names
@@ -196,12 +196,6 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 /// stored value, so two records inside one second must not share it.
 pub(crate) fn now_micros() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
-}
-
-/// Whether `who` holds operator authority: a human caller, a configured
-/// human identity or a lifecycle operator.
-pub(crate) fn is_operator_identity(cfg: &Config, caller: &Caller, who: &str) -> bool {
-    caller.is_human() || cfg.is_human(who) || cfg.is_lifecycle_operator(who)
 }
 
 /// Same label, ignoring ASCII case.

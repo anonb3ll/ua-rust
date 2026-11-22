@@ -84,6 +84,15 @@ describe("@unified-agent/protocol schemas", () => {
     assert.equal(PROTOCOL_SCHEMAS.Approval.parse(base).run_id, undefined);
   });
 
+  it("keeps approval resolved_transport when set, null, or absent (older hubs)", () => {
+    const base = fixtures.Approval as Record<string, unknown>;
+    const slack = PROTOCOL_SCHEMAS.Approval.parse({ ...base, resolved_transport: "slack" });
+    assert.equal(slack.resolved_transport, "slack");
+    assert.equal(PROTOCOL_SCHEMAS.Approval.parse({ ...base, resolved_transport: null }).resolved_transport, null);
+    assert.equal(PROTOCOL_SCHEMAS.Approval.parse(base).resolved_transport, undefined);
+    assert.equal(PROTOCOL_SCHEMAS.Approval.safeParse({ ...base, resolved_transport: 7 }).success, false);
+  });
+
   it("parses a valid Task and rejects an invalid status", () => {
     const task = Task.parse({
       id: 556,

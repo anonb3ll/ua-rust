@@ -25,8 +25,11 @@
 //!   row at an older head, shown as `stale_head`).
 //!
 //! A reference that contradicts the claim leaves the grade `attested` and is
-//! listed in `summary.contradicted`. Report mode: nothing here gates a claim
-//! or a merge.
+//! listed in `summary.contradicted`. When `"review"` is in `expected_checks`,
+//! `git_merge_task` requires a passing, uncontradicted `review` check at the
+//! exact commit being merged (and, when a commit deliverable revision matches
+//! that commit, refuses a self-review by its producer). Other checks are
+//! advisory.
 //!
 //! **What may be verified.** A caller cannot pick what the hub looks up:
 //!
@@ -56,11 +59,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
 
-use super::{bounded, is_operator_identity, now_micros, same_label};
+use super::{bounded, now_micros, same_label};
 use crate::ci::{CiRun, Verdict};
 use crate::families::governance;
 use crate::families::tasks::{acting_identity, emit, require_task, str_field};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub(crate) const STAGES: [&str; 8] =
     ["plan", "implement", "verify", "review", "merge", "deploy", "prove", "done"];
@@ -281,9 +285,17 @@ fn parse_ref(r: Option<CheckRef>) -> UaResult<Option<ParsedRef>> {
 
 // --- authority ----------------------------------------------------------------------
 
-fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
-    let allowed = is_operator_identity(ctx.hub.cfg(), &ctx.caller, who)
-        || same_label(str_field(task, "claimed_by"), who)
+/// The claimant, the next owner, or an operator may write a task's workflow
+/// record. Operator authority is governance's rule, which needs a verified
+/// caller: an unverified caller that names a human's label as its `actor` is
+/// not an operator (it still writes a task whose claimant or next owner it
+/// names, as every unverified write does).
+pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) -> UaResult<()> {
+    let allowed = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) || same_label(str_field(task, "claimed_by"), who)
         || same_label(str_field(task, "next_owner"), who);
     if allowed {
         Ok(())
@@ -299,7 +311,7 @@ fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str, id: i64) 
 }
 
 /// The repository the task's project is bound to.
-fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
+pub(crate) fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
     match str_field(task, "project") {
         Some(project) => governance::bound_repo(conn, project),
         None => Ok(None),
@@ -624,61 +636,168 @@ pub(crate) async fn task_workflow_set(ctx: ToolCtx, a: WorkflowSetArgs) -> UaRes
     let out = ctx
         .hub
         .db()
-        .write_async(move |tx| {
-            let task = require_task(tx, id)?;
-            require_writer(&ctx2, &task, &who, id)?;
-            let revision: Option<i64> = tx
-                .query_row("SELECT revision FROM task_workflow WHERE task_id = ?1", [id], |r| r.get(0))
-                .optional()?;
-            let current = revision.unwrap_or(0);
-            if let Some(exp) = expected_revision
-                && exp != current
-            {
-                return Err(UaError::conflict(format!(
-                    "task {id}'s workflow record is at revision {current}, not {exp}; read it again"
-                )));
-            }
-            let now = now_micros();
-            if revision.is_none() {
-                tx.execute(
-                    "INSERT INTO task_workflow (task_id, revision, updated_by, updated_at) VALUES (?1, 0, ?2, ?3)",
-                    params![id, who, now],
-                )?;
-            }
-            let names: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
-            let mut values: Vec<Sql> = fields.into_iter().map(|(_, v)| v).collect();
-            let assignments: Vec<String> = names.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 1)).collect();
-            values.push(Sql::Text(who.clone()));
-            values.push(Sql::Text(now));
-            values.push(Sql::Integer(id));
-            let n = values.len();
-            tx.execute(
-                &format!(
-                    "UPDATE task_workflow SET {}, revision = revision + 1, updated_by = ?{}, updated_at = ?{} \
-                     WHERE task_id = ?{n}",
-                    assignments.join(", "),
-                    n - 2,
-                    n - 1
-                ),
-                params_from_iter(values.iter()),
-            )?;
-            let stage = names.contains(&"stage").then(|| {
-                tx.query_row("SELECT stage FROM task_workflow WHERE task_id = ?1", [id], |r| r.get::<_, String>(0))
-                    .ok()
-            });
-            let mut sorted = names.clone();
-            sorted.sort_unstable();
-            emit(
-                tx,
-                CHANNEL,
-                json!({ "kind": "capsule", "task_id": id, "stage": stage.flatten(), "fields": sorted, "revision": current + 1 }),
-                &who,
-            )?;
-            view(tx, id, None)
-        })
+        .write_async(move |tx| write_capsule(tx, &ctx2, id, &who, fields, expected_revision))
         .await?;
     review_ready(&ctx.hub, id).await;
     Ok(out)
+}
+
+/// Write validated capsule `fields` of task `id` as `who` inside `tx`: the
+/// writer rule, the `expected_revision` guard, one `revision` bump and one
+/// `agent.task.workflow` capsule event. Returns the workflow view.
+///
+/// `task_workflow_set` writes through it, and so does recording a
+/// deliverable revision (which sets `head_sha`), so the capsule's head stays
+/// the one place that says which commit the task is at. Call
+/// [`review_ready`] after the transaction commits.
+pub(crate) fn write_capsule(
+    tx: &mut ua_store::WriteTx<'_>,
+    ctx: &ToolCtx,
+    id: i64,
+    who: &str,
+    fields: Vec<(&'static str, Sql)>,
+    expected_revision: Option<i64>,
+) -> UaResult<Value> {
+    let task = require_task(tx, id)?;
+    require_writer(ctx, &task, who, id)?;
+    let revision: Option<i64> = tx
+        .query_row("SELECT revision FROM task_workflow WHERE task_id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    let current = revision.unwrap_or(0);
+    if let Some(exp) = expected_revision
+        && exp != current
+    {
+        return Err(UaError::conflict(format!(
+            "task {id}'s workflow record is at revision {current}, not {exp}; read it again"
+        )));
+    }
+    let now = now_micros();
+    if revision.is_none() {
+        tx.execute(
+            "INSERT INTO task_workflow (task_id, revision, updated_by, updated_at) VALUES (?1, 0, ?2, ?3)",
+            params![id, who, now],
+        )?;
+    }
+    let names: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
+    let mut values: Vec<Sql> = fields.into_iter().map(|(_, v)| v).collect();
+    let assignments: Vec<String> =
+        names.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 1)).collect();
+    values.push(Sql::Text(who.to_string()));
+    values.push(Sql::Text(now));
+    values.push(Sql::Integer(id));
+    let n = values.len();
+    tx.execute(
+        &format!(
+            "UPDATE task_workflow SET {}, revision = revision + 1, updated_by = ?{}, updated_at = ?{} \
+             WHERE task_id = ?{n}",
+            assignments.join(", "),
+            n - 2,
+            n - 1
+        ),
+        params_from_iter(values.iter()),
+    )?;
+    let stage = names.contains(&"stage").then(|| {
+        tx.query_row("SELECT stage FROM task_workflow WHERE task_id = ?1", [id], |r| r.get::<_, String>(0))
+            .ok()
+    });
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    emit(
+        tx,
+        CHANNEL,
+        json!({ "kind": "capsule", "task_id": id, "stage": stage.flatten(), "fields": sorted, "revision": current + 1 }),
+        who,
+    )?;
+    view(tx, id, None)
+}
+
+/// The head the task's capsule names, if any.
+pub(crate) fn capsule_head(conn: &Connection, task_id: i64) -> UaResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .optional()?
+        .flatten())
+}
+
+/// Enforce the review-at-head gate before merging `head` of `task_id`.
+///
+/// Applies whenever the task's `expected_checks` includes `"review"`. Requires
+/// a passing (`outcome == "pass"`), uncontradicted (`verification.verdict !=
+/// "mismatch"`) `review` check (`grade` `attested` or `verified`) recorded at
+/// the exact 40-hex `head`. When the task has a commit deliverable revision
+/// matching `head`, refuses a self-review (`recorded_by == producer`).
+pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str) -> UaResult<()> {
+    let expected_raw: Option<String> = conn
+        .query_row("SELECT expected_json FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .optional()?;
+    let expected = json_list(expected_raw);
+    if !expected.iter().any(|n| n == "review") {
+        return Ok(());
+    }
+
+    let head = head.trim().to_ascii_lowercase();
+    let short = &head[..head.len().min(12)];
+    let row: Option<CheckRow> = conn
+        .query_row(
+            &format!(
+                "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = 'review' AND head_sha = ?2"
+            ),
+            params![task_id, head],
+            check_row,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        let stale: Option<String> = conn
+            .query_row(
+                "SELECT head_sha FROM task_checks WHERE task_id = ?1 AND name = 'review' \
+                 ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                [task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let detail = match stale {
+            Some(s) => format!(
+                "task {task_id} requires a passing review at head {short}; latest recorded review is for {}",
+                &s[..s.len().min(12)]
+            ),
+            None => {
+                format!("task {task_id} requires a passing review at head {short}; no review is recorded")
+            }
+        };
+        return Err(UaError::denied("review_required", detail));
+    };
+
+    if row.outcome != "pass" {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} did not pass (outcome: {:?})", row.outcome),
+        ));
+    }
+    if row.verification.as_ref().and_then(|v| v["verdict"].as_str()) == Some("mismatch") {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} was contradicted by verification"),
+        ));
+    }
+    if row.grade != ATTESTED && row.grade != VERIFIED {
+        return Err(UaError::denied(
+            "review_required",
+            format!("task {task_id}'s review at head {short} has unaccepted grade {:?}", row.grade),
+        ));
+    }
+    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, ua_core::DEFAULT_ORG, task_id, &head)?
+        && same_label(Some(&rev.producer), &row.recorded_by)
+    {
+        return Err(UaError::denied(
+            "self_review_refused",
+            format!(
+                "task {task_id}'s review at head {short} was recorded by its producer {:?}; an independent \
+                 reviewer is required",
+                row.recorded_by
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `coordination_manage(action="task_check_record")`.

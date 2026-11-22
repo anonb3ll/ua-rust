@@ -42,21 +42,57 @@ use ua_store::{Part, SchemaPart};
 
 /// Every schema part, in application order.
 pub fn schema_parts() -> Vec<Part> {
-    let mut parts: Vec<SchemaPart> =
-        vec![ua_store::ledger::SCHEMA, approvals::SCHEMA, sessions::SCHEMA, sessions::TOKENS_SCHEMA];
+    let mut parts: Vec<SchemaPart> = vec![
+        ua_store::ledger::SCHEMA,
+        approvals::SCHEMA,
+        approvals::SCHEMA_V2,
+        sessions::SCHEMA,
+        sessions::TOKENS_SCHEMA,
+    ];
     parts.push(ua_store::ledger::META_SCHEMA);
     let mut parts = ua_store::schema::parts(&parts);
     // `orgs`, the default organization and the ledger's organization columns.
     parts.push(ua_store::org::STORE_PART.into());
     parts.extend(families::schema_parts().into_iter().map(Part::from));
+    // The organization column and triggers of the code family's table.
+    parts.push(families::code::TENANT_PART.into());
+    parts.push(families::graph::TENANT_KEYS.into());
+    parts.push(families::graph::TENANT_PART.into());
+    // The organization key rebuild and triggers of the web search cache table.
+    parts.push(families::web::TENANT_KEYS.into());
+    parts.push(families::web::TENANT_PART.into());
     parts.push(config_revisions::SCHEMA.into());
+    // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
+    // family's delivery rows into it. Both need `organization.v1.store` and
+    // the GitHub parts above.
+    parts.extend(ua_ingress::inbound::schema_parts());
+    parts.push(families::github::INBOUND_COPY.into());
+    // Then the Slack family's replay keys and delivery ids.
+    parts.push(families::slack::INBOUND_COPY.into());
+    // Deliverables and their revisions (`ua-deliverables`), born
+    // tenant-scoped: they need `organization.v1.store`.
+    parts.extend(families::deliverables::schema_parts());
     parts
 }
 
 /// Optional schema parts recognized by this build (applied only by optional
 /// commands such as `ua import`, not on every `Hub::open`).
+///
+/// A part that only some builds of this version apply (one gated by a Cargo
+/// feature) must still be named by every build: when its feature is off, list
+/// it here. Otherwise a lean build takes a database a full build of the same
+/// version made for one from a newer build, and refuses it
+/// ([`known_schema_part_names`]).
 pub fn optional_schema_parts() -> Vec<Part> {
     vec![ua_store::schema::IMPORT_SCHEMA.into()]
+}
+
+/// Every part name this build knows: [`schema_parts`] and
+/// [`optional_schema_parts`]. A database that records any other part was
+/// written by a newer build, and opening it for serving or writing is refused
+/// (`docs/operations.md`, "Older builds and a newer database").
+pub fn known_schema_part_names() -> Vec<&'static str> {
+    schema_parts().iter().chain(optional_schema_parts().iter()).map(|p| p.name).collect()
 }
 
 /// The full registry of built-in tools.

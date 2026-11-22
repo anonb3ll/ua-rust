@@ -31,12 +31,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use ua_core::{Profile, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
 use super::{continuity, governance, node_queue, nodes, wake};
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "messaging.v1",
@@ -314,6 +315,10 @@ pub struct CoordinationArgs {
 
 // --- who is reading -------------------------------------------------------------
 
+pub(super) fn may_read_all_mail(cfg: &ua_core::Config, caller: &ua_core::Caller) -> bool {
+    Authz::new(cfg).holds(caller, &[Authority::LocalTrustReader, Authority::Operator], ua_core::DEFAULT_ORG)
+}
+
 /// The caller as the mailbox sees it.
 #[derive(Debug, Clone)]
 struct Viewer {
@@ -325,6 +330,12 @@ struct Viewer {
     /// The configured label of an unverified caller, used where a mailbox is
     /// required and none was named.
     local_label: String,
+    /// An unverified caller's own mailbox: the label it was configured with.
+    /// Another label's mailbox is a board it reads without changing that
+    /// mailbox's read state. `None` for a verified caller, and for an
+    /// unverified caller with only the shared local label: that one has no
+    /// mailbox of its own and acts as the mailbox it names.
+    own_local: Option<String>,
     /// Human identities: messages to or from them are exempt from loop guards.
     humans: Vec<String>,
 }
@@ -333,13 +344,16 @@ impl Viewer {
     fn of(ctx: &ToolCtx) -> Self {
         let identity = agents::verified(&ctx.caller).map(str::to_string);
         let cfg = ctx.hub.cfg();
-        let unrestricted = identity.is_none()
-            || ctx.caller.is_human()
-            || identity.as_deref().is_some_and(|l| cfg.is_human(l))
-            || ctx.caller.profile == Profile::Coordinator;
+        // Every mailbox: an operator (a verified human), or a caller without
+        // a verified label (auth enforcement off: a message board, read
+        // only). A profile grants nothing.
+        let unrestricted = may_read_all_mail(cfg, &ctx.caller);
+        let own_local = (identity.is_none() && ctx.caller.label != ua_core::identity::LOCAL_LABEL)
+            .then(|| ctx.caller.label.clone());
         Self {
             identity,
             unrestricted,
+            own_local,
             local_label: ctx.caller.label.clone(),
             humans: cfg.human_identities.clone(),
         }
@@ -836,6 +850,9 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         "delegation_id": a.delegation_id,
         "event_id": event_id,
         "expects_reply": a.expects_reply,
+        // Whether `from_agent` is an authenticated identity or only what an
+        // unverified caller said it was.
+        "sender_verified": v.identity.is_some(),
     });
     if let Some(h) = &typed {
         payload["handoff"] = h.clone();
@@ -892,6 +909,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         "reply_to": reply,
         "expects_reply": a.expects_reply,
         "availability": availability,
+        "sender_verified": v.identity.is_some(),
     });
     if let Some(live) = target_live {
         result["target_live"] = json!(live);
@@ -1051,6 +1069,9 @@ fn public_row(r: &Row<'_>) -> rusqlite::Result<Value> {
         "conversation_id": r.get::<_, String>("conversation_id")?,
         "reply_to": r.get::<_, Option<String>>("reply_to")?,
         "from_agent": r.get::<_, String>("sender")?,
+        // `false`: the sender was not authenticated, so `from_agent` is only
+        // a claim. `null`: sent before the hub recorded this.
+        "sender_verified": payload.get("sender_verified").cloned().unwrap_or(Value::Null),
         "to_agent": r.get::<_, String>("recipient")?,
         "hop": payload.get("hop").cloned().unwrap_or(Value::Null),
         "body": payload.get("body").cloned().unwrap_or(Value::Null),
@@ -1196,6 +1217,18 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     if own_inbox {
         recipient = mailbox.clone();
     }
+    // Auth enforcement off: another label's mailbox is a board. It is read,
+    // and its read state stays its owner's.
+    let board = match (&v.own_local, &mailbox) {
+        (Some(own), Some(m)) => own != m,
+        _ => false,
+    };
+    if board && sid.is_some() {
+        return Err(UaError::invalid(format!(
+            "session_id reads as one of your own sessions; the {:?} mailbox is not yours",
+            mailbox.as_deref().unwrap_or_default()
+        )));
+    }
     if let (Some(s), Some(owner)) = (&sid, &mailbox) {
         agents::own_session(conn, s, owner, false)?;
     }
@@ -1221,7 +1254,10 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     } else {
         let mut rows = query_rows(conn, &filters, q.limit.unwrap_or(50))?;
         let mut marked = 0;
-        if mark && let Some(owner) = &mailbox {
+        if mark
+            && !board
+            && let Some(owner) = &mailbox
+        {
             let own: Vec<String> = rows
                 .iter()
                 .filter(|r| r["to_agent"].as_str() == Some(owner) && r["read_at"].is_null())
@@ -1248,6 +1284,9 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         if mark {
             out["marked_read"] = json!(marked);
             out["mailbox"] = json!(mailbox);
+            if board {
+                out["read_state"] = json!("unchanged: this is not your mailbox, so nothing was marked read");
+            }
         }
         out
     };
@@ -1298,7 +1337,16 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
             }
             me.clone()
         }
-        None => validate_label(Some(named.as_deref().unwrap_or(&v.local_label)), "to_agent")?,
+        None => {
+            if let (Some(own), Some(n)) = (&v.own_local, &named)
+                && n != own
+            {
+                return Err(UaError::invalid(format!(
+                    "you can ack only your own mailbox ({own:?}); another label's mailbox is read-only for you"
+                )));
+            }
+            validate_label(Some(named.as_deref().unwrap_or(&v.local_label)), "to_agent")?
+        }
     };
     let sid = clean(a.session_id.as_deref());
     if let Some(s) = &sid {
@@ -1414,6 +1462,7 @@ pub(crate) fn send_system(
     let v = Viewer {
         identity: Some(from.to_string()),
         unrestricted: true,
+        own_local: None,
         local_label: from.to_string(),
         humans: Vec::new(),
     };

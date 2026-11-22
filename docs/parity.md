@@ -156,7 +156,7 @@ unless the last column says it is approved.
 | Billing and usage ledgers | Redesign | Scoped by organization; waits for the organization keys | Proposed |
 | Tenancy | In progress | The organization foundation is in; tables gain `org_id` slice by slice | Under way |
 | Cloud executors | Defer | Waits for the dispatch contract and budgets | Proposed |
-| Work products | Redesign | As generic deliverables reviewed through task stages, not a port of the Python work-product tools | Approved |
+| Work products | Redesign | As generic deliverables reviewed through task stages, not a port of the Python work-product tools; commit deliverables and revisions are in ([deliverables](deliverables.md)) | Approved |
 
 ## Overlaps to merge inside ua-rust
 

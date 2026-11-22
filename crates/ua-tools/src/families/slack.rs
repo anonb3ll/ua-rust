@@ -10,8 +10,9 @@
 //!
 //! The signature is HMAC-SHA256 over `v0:{timestamp}:{body}`, compared in
 //! constant time. Timestamps more than five minutes from the hub clock are
-//! rejected. A signature that already passed is remembered in
-//! `slack_seen_signatures` so the same signed bytes cannot be accepted twice.
+//! rejected. A signature that already passed is remembered in the
+//! inbound-delivery table (`ua_ingress::inbound`, kind `request_sha`) so the
+//! same signed bytes cannot be accepted twice.
 //! The signing secret comes from `UA_SLACK_SIGNING_SECRET` and is never logged
 //! or stored.
 //!
@@ -21,17 +22,20 @@
 use hmac::{Hmac, KeyInit, Mac};
 use icu_properties::CodePointMapData;
 use icu_properties::props::GeneralCategory;
-use rusqlite::params;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use ua_core::{Config, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_ingress::inbound;
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::registry::{Registry, ToolCtx, tool};
 
+/// The replay table before `ua_ingress::inbound`: unread and unwritten since
+/// [`INBOUND_COPY`] carried its rows across, kept until a later release
+/// drops it.
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "slack.v1",
     sql: "
@@ -47,7 +51,9 @@ CREATE INDEX IF NOT EXISTS slack_seen_signatures_seen_at ON slack_seen_signature
 /// (Slack re-sends an Events API callback it thinks timed out, with a new
 /// timestamp and so a new signature) runs once. `state` tracks a command
 /// from `accepted` to `finished`; one still `accepted` when the hub starts
-/// was lost and is ledgered as abandoned ([`sweep_abandoned`]).
+/// was lost and is ledgered as abandoned ([`sweep_abandoned`]). Unread and
+/// unwritten since [`INBOUND_COPY`] carried its rows into
+/// `ua_ingress::inbound`; kept until a later release drops it.
 pub const SCHEMA_V2: SchemaPart = SchemaPart {
     name: "slack.v2",
     sql: "
@@ -175,25 +181,85 @@ fn record_signature(tx: &mut WriteTx<'_>, timestamp: &str, body: &[u8], now: i64
     record_replay_key(tx, signed_request_sha(timestamp, body), now)
 }
 
-/// Insert one replay-table key (pruning first); `Err` with `replayed` when it
-/// was recorded before.
+/// Insert one replay key (pruning first); `Err` with `replayed` when it was
+/// recorded before.
 fn record_replay_key(tx: &mut WriteTx<'_>, sha: String, now: i64) -> UaResult<String> {
-    tx.execute(
-        "DELETE FROM slack_seen_signatures WHERE seen_at < ?1",
-        params![now.saturating_sub(SEEN_RETENTION_S)],
-    )?;
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO slack_seen_signatures (request_sha, seen_at) VALUES (?1, ?2)",
-        params![sha, now],
-    )?;
-    if inserted == 0 {
-        return Err(UaError::denied("replayed", "this signed Slack request was already accepted"));
+    prune(tx, now)?;
+    match inbound::record(tx, record_key(KIND_REQUEST, &sha), now, REPLAY_RULES, None)? {
+        inbound::Sight::Duplicate { .. } => {
+            Err(UaError::denied("replayed", "this signed Slack request was already accepted"))
+        }
+        _ => Ok(sha),
     }
-    Ok(sha)
 }
 
-/// The replay-table key of a Socket Mode envelope: SHA-256 of
-/// `socket-envelope:{envelope_id}`. It shares `slack_seen_signatures` with
+// --- the inbound-delivery table ----------------------------------------------------
+//
+// Both guards live in `ua_ingress::inbound` under source `slack`: the replay
+// key of the signed bytes or envelope (kind `request_sha`, kept
+// [`SEEN_RETENTION_S`]) and the event or trigger id (kinds `event` and
+// `trigger`, kept [`DELIVERY_RETENTION_S`]). Slack commands are not
+// idempotent, so a delivery taken on and never finished is refused, never
+// taken on again (`Stale::Duplicate`); the startup sweep reports it.
+
+const SOURCE: &str = "slack";
+const KIND_REQUEST: &str = "request_sha";
+const REPLAY_RULES: inbound::Rules =
+    inbound::Rules { ttl_s: SEEN_RETENTION_S, in_flight_s: 0, stale: inbound::Stale::Duplicate };
+const DELIVERY_RULES: inbound::Rules =
+    inbound::Rules { ttl_s: DELIVERY_RETENTION_S, in_flight_s: 0, stale: inbound::Stale::Duplicate };
+
+fn record_key<'a>(kind: &'a str, key: &'a str) -> inbound::Delivery<'a> {
+    inbound::Delivery { org_id: ua_core::DEFAULT_ORG, source: SOURCE, kind, key }
+}
+
+/// Expired rows go (never an `accepted` one); nothing is abandoned here.
+fn prune(tx: &WriteTx<'_>, now: i64) -> UaResult<()> {
+    let rules = inbound::SweepRules { max_per_kind: None, abandon_after_s: None };
+    inbound::sweep(tx, ua_core::DEFAULT_ORG, SOURCE, now, rules)?;
+    Ok(())
+}
+
+/// `slack.inbound.v1.copy`: carries the rows of `slack_seen_signatures` and
+/// `slack_seen_deliveries` into `inbound_deliveries` (source `slack`), so a
+/// replay or a duplicate of what was seen before the upgrade is still
+/// refused. Each row keeps its state (`seen`, `accepted`, `finished`,
+/// `abandoned`; replay keys are `seen`), its `seen_at` as the receipt time,
+/// its identity, and the retention it had. An `accepted` row stays
+/// `accepted`, with no claim, so the next startup sweep reports it as
+/// abandoned exactly as before; nothing is turned into `finished`. Rows
+/// already in the new table are left alone. The old tables stay in the
+/// schema, unread and unwritten, until a later release drops them.
+pub const INBOUND_COPY: Procedure = Procedure {
+    name: "slack.inbound.v1.copy",
+    version: 1,
+    standalone: false,
+    run: copy_deliveries,
+    args: &[],
+};
+
+fn copy_deliveries(conn: &rusqlite::Connection, _: &'static [&'static str]) -> anyhow::Result<String> {
+    let org = ua_core::DEFAULT_ORG.replace('\'', "''");
+    let sql = format!(
+        "INSERT INTO inbound_deliveries \
+         (org_id, source, kind, delivery_key, state, received_at, updated_at, expires_at, identity) \
+         SELECT '{org}', '{SOURCE}', '{KIND_REQUEST}', request_sha, 'seen', seen_at, seen_at, \
+                seen_at + {SEEN_RETENTION_S}, NULL \
+         FROM slack_seen_signatures WHERE length(request_sha) BETWEEN 1 AND 256 \
+         ON CONFLICT (org_id, source, kind, delivery_key) DO NOTHING;\n\
+         INSERT INTO inbound_deliveries \
+         (org_id, source, kind, delivery_key, state, received_at, updated_at, expires_at, identity) \
+         SELECT '{org}', '{SOURCE}', kind, delivery_id, state, seen_at, seen_at, \
+                seen_at + {DELIVERY_RETENTION_S}, identity \
+         FROM slack_seen_deliveries WHERE length(delivery_id) BETWEEN 1 AND 256 \
+         ON CONFLICT (org_id, source, kind, delivery_key) DO NOTHING;"
+    );
+    conn.execute_batch(&sql)?;
+    Ok(sql)
+}
+
+/// The replay key of a Socket Mode envelope: SHA-256 of
+/// `socket-envelope:{envelope_id}`. It shares the `request_sha` kind with
 /// signed HTTP requests; the prefix keeps the two key spaces apart (an HTTP
 /// key hashes `v0:{timestamp}:{body}`).
 pub fn envelope_sha(envelope_id: &str) -> String {
@@ -261,22 +327,25 @@ pub fn delivery_id_ok(id: &str) -> bool {
 }
 
 /// Record a delivery id at `now` (Unix seconds): `true` the first time,
-/// `false` for a repeat. Rows older than [`DELIVERY_RETENTION_S`] are pruned
-/// first.
+/// `false` for a repeat (in any state). Rows older than
+/// [`DELIVERY_RETENTION_S`] are pruned first, except `accepted` ones, which
+/// wait for the startup sweep however old.
 pub fn remember_delivery(tx: &mut WriteTx<'_>, kind: DeliveryKind, id: &str, now: i64) -> UaResult<bool> {
+    Ok(record_delivery(tx, kind, id, now)?.is_some())
+}
+
+/// [`remember_delivery`], with the claim the first sight was recorded under.
+fn record_delivery(
+    tx: &mut WriteTx<'_>,
+    kind: DeliveryKind,
+    id: &str,
+    now: i64,
+) -> UaResult<Option<inbound::Claim>> {
     if !delivery_id_ok(id) {
         return Err(UaError::invalid("malformed Slack delivery id"));
     }
-    // An `accepted` row waits for the startup sweep however old it is.
-    tx.execute(
-        "DELETE FROM slack_seen_deliveries WHERE seen_at < ?1 AND state != 'accepted'",
-        params![now.saturating_sub(DELIVERY_RETENTION_S)],
-    )?;
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO slack_seen_deliveries (kind, delivery_id, seen_at) VALUES (?1, ?2, ?3)",
-        params![kind.as_str(), id, now],
-    )?;
-    Ok(inserted == 1)
+    prune(tx, now)?;
+    Ok(inbound::record(tx, record_key(kind.as_str(), id), now, DELIVERY_RULES, None)?.claim().cloned())
 }
 
 /// One verified Slack request, as the route read it. Nothing here comes from
@@ -349,13 +418,27 @@ pub fn admit_keyed(
     now: i64,
     d: &Delivery,
 ) -> UaResult<Admission> {
+    Ok(admit_claimed(tx, cfg, key, now, d)?.0)
+}
+
+/// [`admit_keyed`], with the claim an [`Admission::Accepted`] delivery was
+/// taken on under (`None` for every other admission). Hand it to
+/// [`record_executed_under`], so the outcome settles only the row this
+/// admission created.
+pub fn admit_claimed(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    key: ReplayKey<'_>,
+    now: i64,
+    d: &Delivery,
+) -> UaResult<(Admission, Option<inbound::Claim>)> {
     let sha = match key {
         ReplayKey::Signed { timestamp, body } => record_signature(tx, timestamp, body, now)?,
         ReplayKey::Envelope { envelope_id } => record_replay_key(tx, envelope_sha(envelope_id), now)?,
     };
     let kind = d.kind.request();
     let Some(mapping) = cfg.slack_identity(&d.team_id, &d.user_id) else {
-        return Ok(Admission::Refused { reason: "unmapped_identity", identity: None });
+        return Ok((Admission::Refused { reason: "unmapped_identity", identity: None }, None));
     };
     let identity = mapping.identity.clone();
     match key {
@@ -387,9 +470,9 @@ pub fn admit_keyed(
             EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.refused", payload)
                 .by(identity.clone()),
         )?;
-        return Ok(Admission::Refused { reason, identity: Some(identity) });
+        return Ok((Admission::Refused { reason, identity: Some(identity) }, None));
     }
-    if !remember_delivery(tx, d.kind, &d.delivery_id, now)? {
+    let Some(claim) = record_delivery(tx, d.kind, &d.delivery_id, now)? else {
         ledger::append(
             tx,
             EventInput::new(
@@ -399,8 +482,8 @@ pub fn admit_keyed(
             )
             .by(identity.clone()),
         )?;
-        return Ok(Admission::Deduped { identity });
-    }
+        return Ok((Admission::Deduped { identity }, None));
+    };
     ledger::append(
         tx,
         EventInput::new(
@@ -410,11 +493,15 @@ pub fn admit_keyed(
         )
         .by(identity.clone()),
     )?;
-    tx.execute(
-        "UPDATE slack_seen_deliveries SET state = 'accepted', identity = ?3 WHERE kind = ?1 AND delivery_id = ?2",
-        params![d.kind.as_str(), d.delivery_id, identity],
-    )?;
-    Ok(Admission::Accepted { identity })
+    if !inbound::accept(tx, record_key(d.kind.as_str(), &d.delivery_id), &claim, now, Some(&identity))? {
+        // Not expected: the row was recorded under this claim in this same
+        // transaction. Logged, behaviour unchanged.
+        tracing::info!(
+            delivery_id = d.delivery_id.as_str(),
+            "a Slack delivery was not `seen` under its claim when accepted; admitted anyway"
+        );
+    }
+    Ok((Admission::Accepted { identity }, Some(claim)))
 }
 
 /// Refusal reason for `/approve` from a mapping without `can_approve`.
@@ -436,16 +523,12 @@ pub const APPROVE_NOT_ENABLED: &str = "approve_not_enabled";
 /// delivery id, and matching by caller and time would not be exact.)
 /// Returns how many were ledgered.
 pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
-    let rows: Vec<(String, String, i64, Option<String>)> = {
-        let mut stmt = tx.prepare(
-            "SELECT kind, delivery_id, seen_at, identity FROM slack_seen_deliveries WHERE state = 'accepted' \
-             ORDER BY seen_at, delivery_id",
-        )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?
-    };
-    for (kind, delivery_id, seen_at, identity) in &rows {
-        let request = if kind == "event" { "event" } else { "command" };
-        let who = identity.clone().unwrap_or_else(|| "system".into());
+    let mut rows = inbound::abandon_all_accepted(tx, ua_core::DEFAULT_ORG, SOURCE, now)?;
+    // In the order the earlier table reported them: by receipt, then id.
+    rows.sort_by(|a, b| (a.received_at, &a.key).cmp(&(b.received_at, &b.key)));
+    for a in &rows {
+        let request = if a.kind == "event" { "event" } else { "command" };
+        let who = a.identity.clone().unwrap_or_else(|| "system".into());
         ledger::append(
             tx,
             EventInput::new(
@@ -454,17 +537,13 @@ pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
                 json!({
                     "identity": who,
                     "kind": request,
-                    "delivery_id": delivery_id,
-                    "age_s": now.saturating_sub(*seen_at).max(0),
+                    "delivery_id": a.key,
+                    "age_s": now.saturating_sub(a.received_at).max(0),
                     "outcome": "unknown",
                     "detail": "admitted, no outcome recorded; check tool_calls",
                 }),
             )
             .by(who.clone()),
-        )?;
-        tx.execute(
-            "UPDATE slack_seen_deliveries SET state = 'abandoned' WHERE kind = ?1 AND delivery_id = ?2",
-            params![kind, delivery_id],
         )?;
     }
     Ok(rows.len())
@@ -476,6 +555,25 @@ pub fn sweep_abandoned(tx: &mut WriteTx<'_>, now: i64) -> UaResult<usize> {
 /// Marks the delivery `finished`, so the startup sweep leaves it alone.
 pub fn record_executed(
     tx: &mut WriteTx<'_>,
+    identity: &str,
+    d_kind: DeliveryKind,
+    delivery_id: &str,
+    command: &str,
+    tool: Option<&str>,
+    outcome: &UaResult<Value>,
+) -> UaResult<()> {
+    record_executed_under(tx, None, identity, d_kind, delivery_id, command, tool, outcome)
+}
+
+/// [`record_executed`], settling the delivery under `claim`, the one
+/// [`admit_claimed`] returned. A very late outcome then settles only the row
+/// its admission created, never a newer row for the same id (one recorded
+/// after the old row expired). With `None` the row's current claim is read
+/// back, as [`record_executed`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn record_executed_under(
+    tx: &mut WriteTx<'_>,
+    claim: Option<&inbound::Claim>,
     identity: &str,
     d_kind: DeliveryKind,
     delivery_id: &str,
@@ -504,10 +602,24 @@ pub fn record_executed(
         EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.executed", payload)
             .by(identity.to_string()),
     )?;
-    tx.execute(
-        "UPDATE slack_seen_deliveries SET state = 'finished' WHERE kind = ?1 AND delivery_id = ?2",
-        params![d_kind.as_str(), delivery_id],
-    )?;
+    // Slack never takes a delivery over, so without a claim from admission
+    // the row's current claim is the one this handler holds, unless the row
+    // expired and a newer delivery recorded it again.
+    let d = record_key(d_kind.as_str(), delivery_id);
+    let claim = match claim {
+        Some(c) => Some(c.clone()),
+        None => inbound::claim_of(tx, d)?,
+    };
+    if let Some(claim) = claim {
+        let now = ua_core::time::now_ms() / 1000;
+        if let inbound::Settle::NotMine { state } = inbound::finish(tx, d, &claim, now)? {
+            tracing::info!(
+                delivery_id,
+                state = state.map(inbound::State::as_str).unwrap_or("gone"),
+                "a Slack delivery was already settled; its outcome is ledgered anyway"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -826,10 +938,9 @@ pub fn reply_text(command: &str, identity: &str, outcome: &UaResult<Value>) -> S
 
 // --- response_url --------------------------------------------------------------
 
-/// The only host a reply is posted to.
+/// The only host a reply is posted to (the host of
+/// [`ua_ingress::policy::SLACK_RESPONSE_URL`]).
 pub const RESPONSE_URL_HOST: &str = "hooks.slack.com";
-/// How long one reply may take, connect included.
-const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Slack's `response_url`, if it is safe to post to: `https`, exactly the
 /// host [`RESPONSE_URL_HOST`] on the default port, no user info, no fragment,
@@ -849,27 +960,26 @@ pub fn response_url(raw: &str) -> Option<url::Url> {
     .then_some(u)
 }
 
-/// Post `text` as an ephemeral reply to a checked [`response_url`]. The
-/// client is the web tools' guarded client: no redirects, no proxy, every
-/// resolved address must be public (loopback refused here whatever
-/// `fetch_allow_loopback` says), bounded by [`REPLY_TIMEOUT`]. The response
-/// body is never read. Errors are reason classes: `timeout`, `transport`,
-/// `status`.
-pub async fn post_reply(cfg: &Config, url: &url::Url, text: &str) -> Result<(), &'static str> {
+/// Post `text` as an ephemeral reply to a checked [`response_url`], through
+/// `ua_ingress::Outbound` under the `slack.response_url` policy: https to
+/// [`RESPONSE_URL_HOST`] only, no redirects, no proxy, every address the
+/// connection may reach must be public (loopback is refused whatever
+/// `fetch_allow_loopback` says, so the config changes nothing), 10 seconds for
+/// the whole call. The response body is never read. Errors are reason
+/// classes: `response_url_refused`, `timeout`, `transport`, `status`.
+pub async fn post_reply(_cfg: &Config, url: &url::Url, text: &str) -> Result<(), &'static str> {
+    use ua_ingress::{Outbound, OutboundError, Request, policy};
     if response_url(url.as_str()).is_none() {
         return Err("response_url_refused");
     }
-    let mut guarded = cfg.clone();
-    guarded.fetch_allow_loopback = false;
-    let client = crate::families::web::http_client(&guarded).map_err(|_| "transport")?;
+    let client = Outbound::new(policy::SLACK_RESPONSE_URL).map_err(|_| "transport")?;
     let body = json!({ "response_type": "ephemeral", "replace_original": false, "text": text });
-    let resp = client
-        .post(url.clone())
-        .timeout(REPLY_TIMEOUT)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| if e.is_timeout() { "timeout" } else { "transport" })?;
+    let req = Request::post(url.clone()).json(&body).map_err(|_| "transport")?;
+    let resp = client.send(req).await.map_err(|e| match e {
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => "timeout",
+        OutboundError::UrlRefused { .. } => "response_url_refused",
+        _ => "transport",
+    })?;
     if resp.status().is_success() { Ok(()) } else { Err("status") }
 }
 
@@ -1013,8 +1123,9 @@ const PERMANENT_OPEN_ERRORS: [&str; 17] = [
     "deprecated_endpoint",
 ];
 
-/// The longest `apps.connections.open` response read.
-const OPEN_RESPONSE_MAX: usize = 16 * 1024;
+// The longest `apps.connections.open` response read is the `slack.web_api`
+// policy's cap.
+const _: () = assert!(ua_ingress::policy::SLACK_WEB_API.max_body_bytes == 16 * 1024);
 
 /// A socket URL from `apps.connections.open` this hub will connect to:
 /// `wss`, host `slack.com` or ending in `.slack.com`, the default port, no
@@ -1084,36 +1195,35 @@ pub fn record_envelope_outcome_unknown(
 /// Call `apps.connections.open` with the app token (in the `Authorization`
 /// header, never a parameter) and return the WebSocket URL to connect to.
 /// The request goes only to `https://slack.com/api` (or the test hook's
-/// base) through the guarded web client: no redirects, no proxy, public
-/// addresses only. The response is read up to 16 KiB. The token is never
+/// base, where loopback is admitted) through `ua_ingress::Outbound` under
+/// the `slack.web_api` policy: no redirects, no proxy, public addresses
+/// only, 15 seconds. The response is read up to 16 KiB. The token is never
 /// logged and never part of an error.
 pub async fn open_socket_url(cfg: &Config, token: &secrecy::SecretString) -> Result<url::Url, OpenError> {
     use secrecy::ExposeSecret;
+    use ua_ingress::{Outbound, OutboundError, Request, policy};
+    let transport = || OpenError::Transient("transport".into());
     let test = cfg.slack_socket_test_api.as_deref();
     let base = test.unwrap_or(SLACK_API).trim_end_matches('/');
-    let mut guarded = cfg.clone();
-    guarded.fetch_allow_loopback = test.is_some();
-    let client =
-        crate::families::web::http_client(&guarded).map_err(|_| OpenError::Transient("client".into()))?;
-    let resp = client
-        .post(format!("{base}/apps.connections.open"))
-        .bearer_auth(token.expose_secret())
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| {
-            OpenError::Transient(if e.is_timeout() { "timeout".into() } else { "transport".into() })
-        })?;
-    let status = resp.status();
-    let mut body = Vec::new();
-    let mut resp = resp;
-    while let Some(chunk) = resp.chunk().await.map_err(|_| OpenError::Transient("transport".into()))? {
-        if body.len() + chunk.len() > OPEN_RESPONSE_MAX {
-            return Err(OpenError::Transient("response_too_large".into()));
+    let rules =
+        if test.is_some() { policy::SLACK_WEB_API.loopback_test_hook() } else { policy::SLACK_WEB_API };
+    let client = Outbound::new(rules).map_err(|_| OpenError::Transient("client".into()))?;
+    let url = url::Url::parse(&format!("{base}/apps.connections.open")).map_err(|_| transport())?;
+    let req = Request::post(url)
+        .secret_header("Authorization", &format!("Bearer {}", token.expose_secret()))
+        .and_then(|r| r.header("Content-Type", "application/x-www-form-urlencoded"))
+        .map_err(|_| transport())?;
+    let resp = client.send(req).await.map_err(|e| match e {
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => {
+            OpenError::Transient("timeout".into())
         }
-        body.extend_from_slice(&chunk);
-    }
+        _ => transport(),
+    })?;
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| match e {
+        OutboundError::TooLarge { .. } => OpenError::Transient("response_too_large".into()),
+        _ => transport(),
+    })?;
     if !status.is_success() {
         return Err(OpenError::Transient(format!("http_{}", status.as_u16())));
     }

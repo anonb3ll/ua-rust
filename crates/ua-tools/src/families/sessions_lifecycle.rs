@@ -37,6 +37,7 @@ use ua_store::{EventInput, ledger};
 use super::agents::verified;
 use super::audit::rules::redact_secrets;
 use super::injection::{injection_regex, mark_untrusted};
+use super::messaging::may_read_all_mail;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 const OPEN_STATUSES: [&str; 3] = ["starting", "running", "waiting"];
@@ -166,7 +167,7 @@ fn related_memory(conn: &Connection, text: &str, limit: usize) -> Vec<Value> {
     rows.map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
 }
 
-fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>) -> UaResult<Value> {
+fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Value> {
     let sid = a.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if a.task_id.is_none() && sid.is_none() {
         return Err(UaError::invalid("pass task_id or session_id"));
@@ -275,6 +276,10 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
     };
 
     let sid_str = session.as_ref().and_then(|s| s["id"].as_str()).map(str::to_string);
+    let who = verified(&ctx.caller);
+    // A packet may describe another agent's session. Only the caller's own
+    // session can admit handoffs addressed to that session.
+    let own_session = session.as_ref().filter(|s| s["agent"].as_str() == who).and(sid_str.as_deref());
     let recent_events = event_rows(conn, sid_str.as_deref(), task_id, None, EVENT_LIMIT);
     let lifecycle = event_rows(conn, sid_str.as_deref(), task_id, Some("agent.lifecycle."), LIFECYCLE_LIMIT);
 
@@ -314,8 +319,11 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
             .query_row(
                 "SELECT i.message_id, i.sender, i.created_at, e.payload FROM message_index i \
                  LEFT JOIN event_log e ON e.ulid = i.event_ulid \
-                 WHERE i.task_id = ?1 AND i.act = 'handoff' ORDER BY i.event_seq DESC LIMIT 1",
-                [t],
+                 WHERE i.task_id = ?1 AND i.act = 'handoff' \
+                   AND (?2 OR i.sender = ?3 OR (i.recipient = ?3 AND \
+                       (i.target_session IS NULL OR i.target_session = ?4))) \
+                 ORDER BY i.event_seq DESC LIMIT 1",
+                params![t, may_read_all_mail(ctx.hub.cfg(), &ctx.caller), who, own_session],
                 |r| {
                     let payload: Option<String> = r.get(3)?;
                     let payload: Value =
@@ -336,10 +344,10 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
         None => Value::Null,
     };
 
-    // The session's own sealed handoff note and the task's workflow record.
-    // Both are advisory: a failed read leaves the section null.
+    // The note follows the recovery tool's visibility rules. An inaccessible
+    // or missing note leaves the section null.
     let handoff_note = match &sid_str {
-        Some(id) => super::continuity::latest_committed_note(conn, id).ok().flatten().unwrap_or(Value::Null),
+        Some(id) => super::continuity::recover_note(conn, id, ctx).ok().flatten().unwrap_or(Value::Null),
         None => Value::Null,
     };
     let workflow = super::continuity::packet_section(conn, task_id).unwrap_or(Value::Null);
@@ -353,6 +361,10 @@ fn build_packet(conn: &Connection, a: &PacketArgs, requested_by: Option<String>)
         })
     });
 
+    let requested_by = who
+        .map(str::to_string)
+        .or_else(|| a.agent.clone().filter(|x| !x.trim().is_empty()))
+        .unwrap_or_else(|| ctx.caller.label.clone());
     let packet = json!({
         "schema": PACKET_SCHEMA,
         "labels": {
@@ -474,11 +486,8 @@ fn bound_packet(mut packet: Value) -> Value {
 }
 
 async fn session_packet(ctx: ToolCtx, a: PacketArgs) -> UaResult<Value> {
-    let requested_by = verified(&ctx.caller)
-        .map(str::to_string)
-        .or_else(|| a.agent.clone().filter(|x| !x.trim().is_empty()))
-        .or_else(|| Some(ctx.caller.label.clone()));
-    ctx.hub.db().read_async(move |conn| build_packet(conn, &a, requested_by)).await
+    let hub = ctx.hub.clone();
+    hub.db().read_async(move |conn| build_packet(conn, &a, &ctx)).await
 }
 
 // --- propose_session_learnings ---------------------------------------------------------------
@@ -1205,7 +1214,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "session_packet",
-            "Build a bounded resume packet from existing state: the task, worktree, delegations, live approvals tied to the task, recent events, related memory, earlier session summaries, the prior handoff, the session's sealed handoff note, the task's workflow record (stage, capsule, check grades) and lifecycle observations. Never reads a transcript. Labelled historical context (authority: false): instructions and approval state stay authoritative elsewhere. Pass task_id or session_id (or both; they must agree). Capped at 16 KB. Returns {schema: \"ua.session_packet.v1\", labels, generated_at, requested_by, session_id, session, task, worktree, delegations, approvals, recent_events, memory, experience, prior_handoff, handoff_note, workflow, lifecycle, ...}.",
+            "Build a bounded resume packet from existing state: the task, worktree, delegations, live approvals tied to the task, recent events, related memory, earlier session summaries, the latest visible handoff, the session's sealed handoff note when visible to the caller, the task's workflow record (stage, capsule, check grades) and lifecycle observations. Never reads a transcript. Labelled historical context (authority: false): instructions and approval state stay authoritative elsewhere. Pass task_id or session_id (or both; they must agree). Capped at 16 KB. Returns {schema: \"ua.session_packet.v1\", labels, generated_at, requested_by, session_id, session, task, worktree, delegations, approvals, recent_events, memory, experience, prior_handoff, handoff_note, workflow, lifecycle, ...}.",
             session_packet,
         )
         .family("sessions")

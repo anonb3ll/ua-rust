@@ -24,6 +24,56 @@ async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) 
     reg.call(hub, who, tool, args).await.unwrap_or_else(|e| panic!("{tool} failed: {e}"))
 }
 
+#[tokio::test]
+async fn ledger_paginates_the_callers_visible_message_rows() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let session =
+        call(&reg, &hub, &recipient, "session_start", json!({ "kind": "interactive" })).await["session_id"]
+            .clone();
+    let first = call(&reg, &hub, &observer, "task_add", json!({ "title": "First task" })).await;
+    for (to_session, body) in [(Value::Null, "Label message"), (session, "Session message")] {
+        call(
+            &reg,
+            &hub,
+            &sender,
+            "message_send",
+            json!({ "act": "inform", "to_agent": recipient.label, "to_session": to_session, "body": body }),
+        )
+        .await;
+    }
+    let last = call(&reg, &hub, &observer, "task_add", json!({ "title": "Second task" })).await;
+
+    for (who, expected) in [
+        (sender, json!(["Label message", "Session message"])),
+        (recipient, json!(["Label message"])),
+        (observer.clone(), json!([])),
+        (
+            Caller { kind: ActorKind::Human, profile: Profile::Operator, ..agent("operator") },
+            json!(["Label message", "Session message"]),
+        ),
+        (Caller::local("local", Transport::Stdio), json!(["Label message", "Session message"])),
+    ] {
+        let rows =
+            call(&reg, &hub, &who, "event_log_query", json!({ "channel_prefix": "agent.message." })).await;
+        let bodies: Vec<_> =
+            rows["events"].as_array().unwrap().iter().map(|row| &row["payload"]["body"]).collect();
+        assert_eq!(json!(bodies), expected, "{}", who.label);
+    }
+
+    let channels = json!(["agent.task.created", "agent.message.inform"]);
+    let forward = |after| json!({ "channels": channels, "limit": 1, "after_seq": after });
+    let first_page = call(&reg, &hub, &observer, "event_log_query", forward(json!(0))).await;
+    assert_eq!(first_page["events"][0]["payload"]["task_id"], first["id"]);
+    let second_page =
+        call(&reg, &hub, &observer, "event_log_query", forward(first_page["next_after_seq"].clone())).await;
+    assert_eq!(second_page["events"][0]["payload"]["task_id"], last["id"]);
+    let recent =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 2 })).await;
+    assert_eq!(recent["events"], json!([first_page["events"][0], second_page["events"][0]]));
+}
+
 fn exec(hub: &Hub, sql: &str) {
     let sql = sql.to_string();
     hub.db()
@@ -32,6 +82,76 @@ fn exec(hub: &Hub, sql: &str) {
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_evidence_object_follows_the_message_row_visibility_rule() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let sent = call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": recipient.label, "body": "Build update" }),
+    )
+    .await;
+    let args = json!({ "kind": "evidence_event", "id": sent["event_ulid"] });
+
+    let hidden = reg.call(&hub, &observer, "platform_object_get", args.clone()).await.unwrap_err();
+    assert_eq!(hidden.code(), "not_found");
+    let absent = reg
+        .call(
+            &hub,
+            &observer,
+            "platform_object_get",
+            json!({ "kind": "evidence_event", "id": "00000000000000000000000000" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(absent.code(), hidden.code());
+
+    for viewer in [&sender, &recipient] {
+        let found = call(&reg, &hub, viewer, "platform_object_get", args.clone()).await;
+        assert_eq!(found["evidence_event"]["ulid"], sent["event_ulid"]);
+        assert_eq!(found["evidence_event"]["payload_parsed"]["body"], "Build update");
+    }
+}
+
+#[tokio::test]
+async fn evidence_uses_only_visible_messages_for_events_and_agent_attribution() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task =
+        call(&reg, &hub, &observer, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+    let sent = call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": recipient.label, "task_id": task, "body": "Ready for review" }),
+    )
+    .await;
+    let filters = json!({ "task_id": task, "agent": sender.label, "since": "2020-01-01" });
+
+    let outsider = call(&reg, &hub, &observer, "evidence_report", json!({ "task_id": task })).await;
+    let record = &outsider["records"][0];
+    assert_eq!(record["proof"]["events_count"], 1);
+    assert_eq!(record["participants"], json!([observer.label]));
+    assert_eq!(record["tool_calls"]["callers"], json!([observer.label]));
+    let filtered = call(&reg, &hub, &observer, "evidence_report", filters.clone()).await;
+    assert_eq!(filtered["total_records"], 0);
+
+    for viewer in [&sender, &recipient] {
+        let report = call(&reg, &hub, viewer, "evidence_report", filters.clone()).await;
+        let record = &report["records"][0];
+        assert_eq!(record["proof"]["events_count"], 2);
+        assert!(record["participants"].as_array().unwrap().contains(&json!(sender.label)));
+        assert_eq!(record["events"][1]["ulid"], sent["event_ulid"]);
+        assert_eq!(record["proof"]["event_hashes"][1]["ulid"], sent["event_ulid"]);
+    }
 }
 
 fn synthetic_calls(hub: &Hub, caller: &str, n: usize, failed: usize) {

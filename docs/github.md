@@ -72,10 +72,13 @@ and has no effect.
 **One host, no redirects.** Every request goes to `github_api_url`, which
 must be `https` without credentials, query or fragment (plain `http` only to
 loopback under the test hook). A 3xx other than 304 is an error and is never
-followed, so the token cannot be forwarded anywhere. For the public API the
-connection goes through the same guarded resolver as `web_fetch`, so a DNS
-answer pointing at a private address is refused; a GHES host is the
-operator's choice and may be private.
+followed, so the token cannot be forwarded anywhere. Requests go through
+`ua_ingress::Outbound` ([ingress](ingress.md#consumers)) with no proxy. The
+public API uses the `github.rest` policy: `api.github.com` only, public
+addresses only, checked when the connection is made and again on its peer.
+Any other base uses `github.enterprise`: a GHES host is the operator's
+choice and may be on a private network or this host, but link-local (cloud
+metadata), multicast, documentation and reserved addresses are refused.
 
 **Bounded.** 20 seconds per request, 8 MiB per response, JSON only. When
 GitHub says the rate limit is spent (`x-ratelimit-remaining: 0`, or a
@@ -100,14 +103,32 @@ lookup then reads `insufficient` and can be verified again later.
    body may have been processed before. Either repeat is 409 `replayed`. The
    delivery and event headers are outside the signature, so a signed body
    re-sent under a fresh delivery id is still a replay. Ids and body hashes
-   are kept 30 days, at most 20 000 of each.
+   are recorded in `inbound_deliveries` ([ingress.md](ingress.md#inbound-deliveries)),
+   kept 30 days, at most 20 000 of each.
 4. The body must be `application/json` (the API guard refuses a form body
    with 415) and at most 5 MiB.
 
-The delivery id, the body hash and an `agent.github.webhook.received` event
-are written in one transaction before any effect. If an effect fails with an
-internal error, the id and hash are forgotten so GitHub's redelivery is
-processed again; every effect is idempotent. The payload is trusted only after the signature check:
+The delivery id, the body hash (both `accepted` by this process) and an
+`agent.github.webhook.received` event are written in one transaction before
+any effect. After the effects both records are marked `finished`, and a later
+copy is a replay. If an effect fails with an internal error, the id and hash
+are released instead, so GitHub's redelivery is processed again. If the hub
+stops between recording a delivery and finishing it, or the delivery has been
+in flight for 15 minutes, a redelivery is processed again rather than
+refused, and its ledger event says `"redelivered": true`. Every effect is
+idempotent. Rows the old `github_deliveries` and `github_delivery_bodies`
+tables held when the hub was upgraded are copied in as `finished`; the two
+tables stay in the schema, unread and unwritten, until a later release drops
+them.
+
+Settling is by claim: a slow handler whose delivery a redelivery took over
+cannot finish or release the newer record. When the sweep abandons
+deliveries that were taken on and never finished, it ledgers one
+`agent.github.webhook.abandoned` event (counts and delivery ids, no body).
+Downgrading past this change reopens a replay window: an older binary reads
+only `github_deliveries` and `github_delivery_bodies`, which are no longer
+written, so it accepts a copy of anything handled since the upgrade (see
+[ingress.md](ingress.md#limits)). The payload is trusted only after the signature check:
 it carries the merge commit and head, so these effects need no API call.
 
 **Effects are governed calls under a narrow grant.** Closing a task is a

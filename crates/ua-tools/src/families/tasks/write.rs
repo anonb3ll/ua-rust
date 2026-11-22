@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Profile, UaError, UaResult};
+use ua_org::authz::{Authority, Authz};
 
 use super::*;
 use crate::families::governance;
@@ -434,7 +435,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             }
             let quarantined = int_field(&old, "untrusted").unwrap_or(0) != 0;
             let clearing_quarantine = a.untrusted == Some(false) && quarantined;
-            if clearing_quarantine && !(caller.is_human() || (is_verified(&caller) && cfg.is_human(&caller.label))) {
+            if clearing_quarantine && !Authz::new(&cfg).holds(&caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
                 return Err(UaError::denied(
                     "untrusted_clear_needs_human",
                     format!("clearing task {id}'s untrusted quarantine needs a verified human"),

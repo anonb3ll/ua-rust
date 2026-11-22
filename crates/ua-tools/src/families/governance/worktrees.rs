@@ -48,6 +48,7 @@ use ua_store::{EventInput, ledger};
 use super::procscan::{Live, live_process_paths};
 use crate::families::workspace::{RunOutput, git_env, run_program, sandbox};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
+use ua_org::authz::{Authority, Authz};
 
 const MAX_NEST_DEPTH: usize = 5;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -281,7 +282,11 @@ async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value
     let dry_run = a.dry_run.unwrap_or(true);
     if !dry_run {
         let who = super::verified_actor(&ctx.caller, "removing worktrees (dry_run=false)")?;
-        if !super::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+        if !Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        ) {
             return Err(UaError::denied(
                 "not_lifecycle_operator",
                 format!(

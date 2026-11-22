@@ -20,7 +20,8 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::broadcast;
 use ua_core::{UaError, UaResult};
 
-use crate::ledger::Event;
+use crate::ledger::{Event, EventInput};
+use crate::lock::{self, ServeLock};
 use crate::schema::{self, Part};
 
 /// Pooled read-only connections of a file database.
@@ -46,6 +47,39 @@ struct Inner {
     /// How long a read waits for a reader ([`READER_WAIT`]; tests shorten it).
     reader_wait: Duration,
     events: broadcast::Sender<Event>,
+    /// Recorded parts this build does not know, opened anyway because the
+    /// caller allowed it ([`Fence::allow_newer`]). Empty otherwise.
+    ignored_newer: Vec<String>,
+}
+
+/// What [`Db::open_with`] does about parts recorded in the database that this
+/// build does not know: parts a newer build applied.
+///
+/// "Known" is every part passed to the open plus [`Fence::also_known`]: the
+/// parts this build recognizes by name but does not apply on this open
+/// (optional parts, and any part whose Cargo feature is compiled out of this
+/// build). A recorded part outside both refuses the open, before any part is
+/// applied, unless [`Fence::allow_newer`] is set.
+///
+/// Every open of a database file also runs the migration guard: when the open
+/// would apply at least one part the database does not record yet (a real
+/// migration, not a no-op open), it refuses while another process holds the
+/// database's serve lock (a running `ua serve`,
+/// [`crate::lock::refuse_if_served`]). The only way to skip it is
+/// [`Fence::serving`]: the held [`ServeLock`] of that same database.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fence<'a> {
+    pub also_known: &'a [&'a str],
+    /// Open anyway, ignoring the unknown parts (the behaviour before the
+    /// fence). For recovery only; [`Db::ignored_newer_parts`] names them so the
+    /// caller can log it.
+    pub allow_newer: bool,
+    /// Proof that the caller is the process serving this database: its held
+    /// [`ServeLock`]. With it the migration guard does not probe (the caller
+    /// would only see its own lock). A lock held for another database is no
+    /// proof, and the guard runs as usual. [`Fence::allow_newer`] never lifts
+    /// the guard.
+    pub serving: Option<&'a ServeLock>,
 }
 
 /// The idle pooled readers, the count of overflow readers open now, and the
@@ -123,6 +157,33 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
     Ok(r)
 }
 
+/// The unknown-part fence, run inside the first migration transaction before
+/// any part is applied: refuses (or, with `allow_newer`, returns) the recorded
+/// parts outside `parts` and `fence.also_known`.
+fn check_fence<P: Into<Part> + Copy>(
+    conn: &Connection,
+    parts: &[P],
+    fence: Fence<'_>,
+    db: &Path,
+) -> anyhow::Result<Vec<String>> {
+    let names: Vec<&str> = parts.iter().map(|p| (*p).into().name).collect();
+    let mut known = names.clone();
+    known.extend_from_slice(fence.also_known);
+    let unknown = schema::unknown_parts(conn, &known)?;
+    if !unknown.is_empty() && !fence.allow_newer {
+        return Err(schema::NewerSchema { db: db.display().to_string(), unknown }.into());
+    }
+    let pending = schema::unrecorded_parts(conn, &names)?;
+    if !pending.is_empty() {
+        let serving_this =
+            fence.serving.is_some_and(|l| lock::canonical_db_path(db).is_ok_and(|p| p == l.database()));
+        if !serving_this {
+            lock::refuse_if_served(db, &pending)?;
+        }
+    }
+    Ok(unknown)
+}
+
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.execute_batch(
@@ -135,19 +196,33 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 
 impl Db {
     /// Open (creating if needed) the database at `path` and apply `parts`.
+    /// Refuses a database that records a part not in `parts` (see [`Fence`]).
     pub fn open<P: Into<Part> + Copy>(path: &Path, parts: &[P]) -> anyhow::Result<Self> {
+        Self::open_with(path, parts, Fence::default())
+    }
+
+    /// [`Db::open`] with an explicit [`Fence`].
+    pub fn open_with<P: Into<Part> + Copy>(
+        path: &Path,
+        parts: &[P],
+        fence: Fence<'_>,
+    ) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
-        schema::apply(&mut writer, parts)?;
+        let mut ignored = Vec::new();
+        schema::apply_checked(&mut writer, parts, &mut |c| {
+            ignored = check_fence(c, parts, fence, path)?;
+            Ok(())
+        })?;
         crate::ledger::check_hash_form(&writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
             readers.push(open_reader(path)?);
         }
-        Ok(Self::from_parts(Some(path.to_path_buf()), writer, readers))
+        Ok(Self::from_parts(Some(path.to_path_buf()), writer, readers, ignored))
     }
 
     /// An in-memory database (tests). Reads share the writer connection.
@@ -156,10 +231,21 @@ impl Db {
         writer.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::apply(&mut writer, parts)?;
         crate::ledger::check_hash_form(&writer)?;
-        Ok(Self::from_parts(None, writer, Vec::new()))
+        Ok(Self::from_parts(None, writer, Vec::new(), Vec::new()))
     }
 
-    fn from_parts(path: Option<PathBuf>, writer: Connection, readers: Vec<Connection>) -> Self {
+    /// The recorded parts this build does not know that the open ignored
+    /// because [`Fence::allow_newer`] was set. Empty for a fenced open.
+    pub fn ignored_newer_parts(&self) -> &[String] {
+        &self.inner.ignored_newer
+    }
+
+    fn from_parts(
+        path: Option<PathBuf>,
+        writer: Connection,
+        readers: Vec<Connection>,
+        ignored_newer: Vec<String>,
+    ) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Inner {
@@ -169,6 +255,7 @@ impl Db {
                 reader_free: Condvar::new(),
                 reader_wait: READER_WAIT,
                 events,
+                ignored_newer,
             }),
         }
     }
@@ -185,20 +272,21 @@ impl Db {
     /// Run `f` in a `BEGIN IMMEDIATE` transaction on the writer. Commits when
     /// `f` returns `Ok`, rolls back otherwise. Ledger events appended inside
     /// are broadcast to subscribers only after the commit succeeds.
+    ///
+    /// Events appended with [`crate::ledger::append_surviving`] (a refusal
+    /// recorded by the call it refuses) outlive a rollback: when `f` fails,
+    /// or the commit does, they are appended again in a separate small
+    /// transaction on the same writer, still under the writer lock, and the
+    /// original error is returned.
     pub fn write<T>(&self, f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>) -> UaResult<T> {
         let (out, pending) = {
             let mut conn = self.inner.writer.lock().map_err(|_| UaError::internal("writer lock poisoned"))?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut wtx = WriteTx { tx, pending: Vec::new() };
-            let out = f(&mut wtx)?;
-            let WriteTx { tx, pending } = wtx;
-            tx.commit()?;
-            (out, pending)
+            run_write(&mut conn, f)
         };
         for ev in pending {
             let _ = self.inner.events.send(ev);
         }
-        Ok(out)
+        out
     }
 
     /// Run `f` on a read connection. Blocking: from async code use
@@ -306,6 +394,10 @@ impl Db {
 pub struct WriteTx<'c> {
     tx: Transaction<'c>,
     pub(crate) pending: Vec<Event>,
+    /// Copies of the events appended with
+    /// [`crate::ledger::append_surviving`], recorded again if this
+    /// transaction rolls back.
+    pub(crate) surviving: Vec<EventInput>,
 }
 
 /// Run `f` inside a `BEGIN IMMEDIATE` transaction on an already-opened writer
@@ -315,11 +407,58 @@ pub(crate) fn write_on_connection<T>(
     conn: &mut Connection,
     f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
 ) -> UaResult<T> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut wtx = WriteTx { tx, pending: Vec::new() };
-    let out = f(&mut wtx)?;
-    wtx.tx.commit()?;
-    Ok(out)
+    run_write(conn, f).0
+}
+
+/// One write transaction on `conn`: the result of `f` (or of the commit)
+/// and the events to broadcast. When the transaction does not commit, the
+/// surviving events are recorded in a transaction of their own.
+fn run_write<T>(
+    conn: &mut Connection,
+    f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
+) -> (UaResult<T>, Vec<Event>) {
+    let (failure, surviving) = {
+        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => return (Err(e.into()), Vec::new()),
+        };
+        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        let out = f(&mut wtx);
+        let WriteTx { tx, pending, surviving } = wtx;
+        match out {
+            Ok(v) => match tx.commit() {
+                Ok(()) => return (Ok(v), pending),
+                Err(e) => (UaError::from(e), surviving),
+            },
+            // Dropping the transaction rolls it back.
+            Err(e) => (e, surviving),
+        }
+    };
+    if surviving.is_empty() {
+        return (Err(failure), Vec::new());
+    }
+    (Err(failure), record_surviving(conn, surviving))
+}
+
+/// Append `events` in a transaction of their own, after the transaction
+/// that first appended them rolled back. A failure here is logged, never
+/// returned: the caller reports the original error.
+fn record_surviving(conn: &mut Connection, events: Vec<EventInput>) -> Vec<Event> {
+    let n = events.len();
+    let recorded = (|| -> UaResult<Vec<Event>> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        for ev in events {
+            crate::ledger::append(&mut wtx, ev)?;
+        }
+        let WriteTx { tx, pending, .. } = wtx;
+        tx.commit()?;
+        Ok(pending)
+    })();
+    recorded.unwrap_or_else(|e| {
+        tracing::error!(error = %e, events = n, "could not record the events a rolled-back write kept");
+        Vec::new()
+    })
 }
 
 impl<'c> Deref for WriteTx<'c> {
@@ -393,6 +532,95 @@ mod tests {
 
     fn overflow(db: &Db) -> usize {
         lock_pool(&db.inner).overflow
+    }
+
+    const NEWER: SchemaPart =
+        SchemaPart { name: "newer.v1", sql: "CREATE TABLE IF NOT EXISTS n (id INTEGER);" };
+    const LATER: SchemaPart =
+        SchemaPart { name: "later.v1", sql: "CREATE TABLE IF NOT EXISTS l (id INTEGER);" };
+
+    fn part_names(db: &Db) -> Vec<String> {
+        db.read(|c| {
+            let mut stmt = c.prepare("SELECT name FROM schema_parts ORDER BY name")?;
+            Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_database_with_a_part_this_build_does_not_know_is_refused_before_anything_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        drop(Db::open(&path, &[PART, NEWER]).unwrap());
+        // The older build: it knows PART, has a part of its own still pending
+        // (LATER), and does not know NEWER.
+        let err = Db::open(&path, &[PART, LATER]).err().expect("refused").to_string();
+        assert!(err.contains("written by a newer build"), "{err}");
+        assert!(err.contains("[newer.v1]"), "names the unknown part: {err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("UA_ALLOW_NEWER_SCHEMA=1"), "{err}");
+        // Refused before applying: LATER was not recorded.
+        let db = Db::open(&path, &[PART, NEWER]).unwrap();
+        assert_eq!(part_names(&db), ["newer.v1", "pool_test.v1"]);
+        assert!(db.ignored_newer_parts().is_empty());
+    }
+
+    #[test]
+    fn the_override_opens_and_names_what_it_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        drop(Db::open(&path, &[PART, NEWER]).unwrap());
+        let db = Db::open_with(&path, &[PART], Fence { allow_newer: true, ..Fence::default() }).unwrap();
+        assert_eq!(db.ignored_newer_parts(), ["newer.v1"]);
+    }
+
+    #[test]
+    fn a_part_known_by_name_but_not_applied_here_is_not_from_a_newer_build() {
+        // A lean build (a feature compiled out) or an optional part: the
+        // build knows the name and does not apply it on this open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        drop(Db::open(&path, &[PART, NEWER]).unwrap());
+        let db =
+            Db::open_with(&path, &[PART], Fence { also_known: &["newer.v1"], ..Fence::default() }).unwrap();
+        assert!(db.ignored_newer_parts().is_empty());
+        // And a new file has nothing recorded yet.
+        Db::open(&dir.path().join("fresh.db"), &[PART]).unwrap();
+    }
+
+    /// `flock` locks belong to the open file, so a `ServeLock` taken here
+    /// stands for another process holding it.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_open_refuses_to_migrate_while_another_holder_has_the_serve_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        // No serve: a new database migrates.
+        drop(Db::open(&path, &[PART]).unwrap());
+        let serve = ServeLock::acquire(&path).unwrap();
+        // A no-op open beside the serve works.
+        drop(Db::open(&path, &[PART]).unwrap());
+        // A migration is refused before it applies anything, override or not.
+        for fence in [Fence::default(), Fence { allow_newer: true, ..Fence::default() }] {
+            let err = Db::open_with(&path, &[PART, LATER], fence).err().expect("refused").to_string();
+            assert!(err.contains("a running `ua serve` holds the database"), "{err}");
+            assert!(err.contains("[later.v1]"), "{err}");
+        }
+        assert_eq!(part_names(&Db::open(&path, &[PART]).unwrap()), ["pool_test.v1"]);
+        // A lock held for another database is no proof.
+        let other = ServeLock::acquire(&dir.path().join("other.db")).unwrap();
+        let wrong = Fence { serving: Some(&other), ..Fence::default() };
+        assert!(Db::open_with(&path, &[PART, LATER], wrong).is_err());
+        // The serving process, with its own lock as proof, migrates.
+        let mine = Fence { serving: Some(&serve), ..Fence::default() };
+        let db = Db::open_with(&path, &[PART, LATER], mine).unwrap();
+        assert_eq!(part_names(&db), ["later.v1", "pool_test.v1"]);
+        drop((db, serve));
+        // With the serve gone, a plain open migrates again.
+        assert_eq!(
+            part_names(&Db::open(&path, &[PART, LATER, NEWER]).unwrap()),
+            ["later.v1", "newer.v1", "pool_test.v1"]
+        );
     }
 
     #[test]

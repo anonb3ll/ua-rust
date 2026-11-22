@@ -20,7 +20,7 @@ event in the same transaction.
 | `session_handoff_recover` | The session's owner, the note's receiver, lifecycle operator, human | The session's latest sealed note |
 | `session_handoff_ack` | The agent the note was handed to | Acknowledge it |
 | `conversation_handoff` | A participant (or a human) | Link or create a task that points at a conversation |
-| `conversation_handoffs` | A verified participant (or a human) | Where a conversation was handed off |
+| `conversation_handoffs` | A verified participant, a human, or any caller when auth enforcement is off | Where a conversation was handed off |
 | `queue_health` | Anyone (the research profile too) | Open, parked, stale and milestone counts |
 | `queue_stale` | Anyone | Stale tasks, oldest first |
 | `queue_sweep` | Anyone | Proposed parks and folds; writes nothing |
@@ -66,7 +66,10 @@ listed in `summary.verified_run_only`), since a green run can contain a
 skipped job.
 
 A lookup that contradicts the claim leaves the grade `attested` and lists the
-check in `summary.contradicted`. Nothing here gates a claim or a merge.
+check in `summary.contradicted`. When `"review"` is listed in `expected_checks`,
+`git_merge_task` requires a passing, uncontradicted `review` check at the exact
+head being merged (and refuses a self-review by the commit deliverable
+revision's producer); other checks remain advisory.
 
 The caller does not choose what the hub looks up:
 
@@ -154,14 +157,16 @@ draft --seal--> sealed --> assigned --> delivered
 `project`, `priority` to create) ties a mailbox conversation to a task. The
 task gets one notes line, `[conversation: <id>] handed off from the agent
 conversation`; no message is copied. The caller must have sent or received a
-message in the conversation (a human, or the coordinator profile, sees every
-conversation). The task write goes through the registry as `task_add` or
+message in the conversation (an operator, a verified human, sees every
+conversation; a profile grants nothing). The task write goes through the registry as `task_add` or
 `task_update`, so the caller's profile, the policy file and the approval gate
 apply as they do to a direct call. Creating is idempotent per conversation,
 title, project and priority.
 
 `conversation_handoffs` has the same caller rule (a verified caller that can
-see the conversation; anyone else reads `not_found`). The handoff ledger
+see the conversation; anyone else reads `not_found`), and is also open to a
+caller with no verified identity, for whom conversations are a message board
+([auth.md](auth.md#with-auth-enforcement-off)). The handoff ledger
 event is the audited record: `handoffs` lists the tasks an
 `agent.conversation.handoff` event links, with who handed off, when, and
 `note_reference` (whether the notes line is still there). A task whose

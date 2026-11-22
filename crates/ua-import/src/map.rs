@@ -42,6 +42,8 @@ pub(crate) enum Kind {
     /// Project repository bindings: validate `project` slug and `repo`, and
     /// normalize `default_branch` (clearing invalid values to NULL).
     ProjectRepoBindings,
+    /// Legacy canvas boards are imported into the default organization.
+    GraphCanvas,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +127,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     plain("skill_versions"),
     plain("skill_assignments"),
     plain("harness_config_bundles"),
-    plain("graph_canvas_scenes"),
+    TableMap { kind: Kind::GraphCanvas, ..plain("graph_canvas_scenes") },
     TableMap { kind: Kind::Ledger, ..plain("event_log") },
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },
     TableMap {

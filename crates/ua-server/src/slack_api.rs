@@ -19,7 +19,7 @@
 //!    app's bot (`authorizations[].is_bot`), and events an app wrote or that
 //!    were edited (`bot_id`, `subtype`, `app_id`, `bot_profile`, `edited`)
 //!    are acknowledged and ignored, with no state.
-//! 4. One write transaction ([`slack::admit`]) records the signature (a
+//! 4. One write transaction ([`slack::admit_claimed`]) records the signature (a
 //!    replay is a 401), maps (`team_id`, `user_id`) to a hub identity through
 //!    `slack_identities`, dedupes on the trigger id or event id, and ledgers
 //!    the outcome. A request with no mapped identity adds no ledger row (any
@@ -29,7 +29,8 @@
 //! 5. Slack gets its answer (well inside its 3 seconds); the command then
 //!    runs on a tracked task through [`ua_tools::Registry::call`] as the
 //!    mapped identity, the same governed path as every other caller, and its
-//!    outcome is ledgered ([`slack::record_executed`]). A slash command's
+//!    outcome is ledgered ([`slack::record_executed_under`], with the claim
+//!    the admission took). A slash command's
 //!    result is posted to its `response_url` when that is
 //!    `https://hooks.slack.com/...` ([`slack::response_url`]).
 //!
@@ -168,7 +169,7 @@ pub(crate) enum Admitted {
 }
 
 /// Step 4, then the answer, for both transports: one admission transaction
-/// ([`slack::admit_keyed`]), then the command on a tracked task as the mapped
+/// ([`slack::admit_claimed`]), then the command on a tracked task as the mapped
 /// human. The answer is a fixed sentence (never the body or anything from the
 /// hub but the mapped identity).
 pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request) -> Admitted {
@@ -180,14 +181,14 @@ pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request)
                 Replay::Signed { timestamp, body } => slack::ReplayKey::Signed { timestamp, body },
                 Replay::Envelope(id) => slack::ReplayKey::Envelope { envelope_id: id },
             };
-            slack::admit_keyed(tx, hub.cfg(), key, now_s(), &d)
+            slack::admit_claimed(tx, hub.cfg(), key, now_s(), &d)
         })
         .await;
     let ack = |text: &str| Admitted::Answer(text.to_string());
-    let identity = match admitted {
-        Ok(Admission::Accepted { identity }) => identity,
-        Ok(Admission::Deduped { .. }) => return ack("Already received."),
-        Ok(Admission::Refused { reason, identity }) => {
+    let (identity, claim) = match admitted {
+        Ok((Admission::Accepted { identity }, claim)) => (identity, claim),
+        Ok((Admission::Deduped { .. }, _)) => return ack("Already received."),
+        Ok((Admission::Refused { reason, identity }, _)) => {
             if identity.is_none() {
                 // Not ledgered (anyone in the workspace can send these); debug only.
                 // The ids are what an operator adds to `slack_identities`; they
@@ -234,7 +235,7 @@ pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request)
         (_, None) => (format!("Accepted /{command}. The result is recorded in the hub ledger."), None),
     };
     let task_state = state.clone();
-    state.calls.spawn(execute(task_state, identity, req.delivery, parsed, response_url));
+    state.calls.spawn(execute(task_state, identity, claim, req.delivery, parsed, response_url));
     ack(&text)
 }
 
@@ -263,6 +264,7 @@ async fn http_admit(state: AppState, headers: &HeaderMap, body: Bytes, req: Requ
 async fn execute(
     state: AppState,
     identity: String,
+    claim: Option<ua_ingress::inbound::Claim>,
     d: Delivery,
     parsed: Value,
     response_url: Option<url::Url>,
@@ -289,7 +291,9 @@ async fn execute(
     let recorded = state
         .hub
         .db()
-        .write_async(move |tx| slack::record_executed(tx, &who, kind, &dl, &cmd, tool, &outcome))
+        .write_async(move |tx| {
+            slack::record_executed_under(tx, claim.as_ref(), &who, kind, &dl, &cmd, tool, &outcome)
+        })
         .await;
     if let Err(e) = recorded {
         tracing::warn!(code = e.code(), "could not ledger a Slack command's outcome");

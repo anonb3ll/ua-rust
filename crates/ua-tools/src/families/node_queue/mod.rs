@@ -57,6 +57,7 @@ use super::{governance, nodes};
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub(crate) use acceptance::{
     node_acceptance_attest, node_acceptance_evaluate, node_acceptance_start, node_acceptance_status,
@@ -304,12 +305,6 @@ pub(crate) fn verified_caller(caller: &Caller, verb: &str) -> UaResult<String> {
     verified(caller).map(str::to_string).ok_or_else(|| {
         UaError::denied("identity_required", format!("{verb} requires an authenticated identity"))
     })
-}
-
-/// Whether `who` may act on any item: a human identity or a lifecycle
-/// operator.
-pub(crate) fn is_operator(hub: &Hub, caller: &Caller, who: &str) -> bool {
-    caller.is_human() || hub.cfg().is_human(who) || hub.cfg().is_lifecycle_operator(who)
 }
 
 // --- node rows ------------------------------------------------------------------
@@ -1159,7 +1154,13 @@ pub struct ItemArgs {
 /// Who may control an item: whoever queued it, the node's agent, the
 /// command's owner, or an operator.
 fn may_control(c: &Connection, hub: &Hub, caller: &Caller, who: &str, item: &Item) -> UaResult<bool> {
-    if is_operator(hub, caller, who) || item.created_by == who || item.agent == who {
+    if Authz::new(hub.cfg()).holds(
+        caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) || item.created_by == who
+        || item.agent == who
+    {
         return Ok(true);
     }
     let owner: Option<String> = c
@@ -1225,7 +1226,13 @@ pub(crate) async fn node_item_reconcile(ctx: ToolCtx, a: ReconcileArgs) -> UaRes
             let Some(item) = load_item(tx, &id)? else {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
-            if !(item.agent == who || is_operator(&hub, &caller, &who)) {
+            if !(item.agent == who
+                || Authz::new(hub.cfg()).holds(
+                    &caller,
+                    &[Authority::Operator, Authority::LifecycleOperator],
+                    ua_core::DEFAULT_ORG,
+                ))
+            {
                 return Err(UaError::denied(
                     "not_item_owner",
                     format!("only the node's agent {:?} or an operator reconciles {id}", item.agent),
@@ -1516,7 +1523,12 @@ pub struct ItemsArgs {
 
 async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
     let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.as_deref().is_some_and(|w| is_operator(&ctx.hub, &ctx.caller, w));
+    let maintainer = who.is_some()
+        && Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        );
     let limit = a.limit.unwrap_or(25).clamp(1, 200);
     if let Some(s) = &a.status
         && s != "open"
@@ -1531,7 +1543,7 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
             // An item is visible to an operator, its requester, the node's
             // agent and a command's owner.
             let visible = |item: &Item| -> UaResult<bool> {
-                if operator {
+                if maintainer {
                     return Ok(true);
                 }
                 let Some(w) = who.as_deref() else { return Ok(false) };
@@ -1560,7 +1572,7 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
             }
             let mut clauses = vec!["1 = 1".to_string()];
             let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-            if !operator {
+            if !maintainer {
                 let Some(w) = who.clone() else { return Ok(json!({ "items": [], "count": 0 })) };
                 binds.push(w.into());
                 let i = binds.len();

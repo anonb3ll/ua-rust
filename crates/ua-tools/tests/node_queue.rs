@@ -900,6 +900,43 @@ async fn an_unscoped_agent_gets_no_permission_or_follow_up() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
 }
 
+/// A routine that runs unattended under a human's label is an agent. Its
+/// follow-up gets no human shortcut: into a session it did not request it is
+/// refused, and into one requested under that label it waits for the same
+/// one-time approval as any agent's.
+#[tokio::test]
+async fn an_unattended_routine_gets_no_human_shortcut_on_follow_ups() {
+    let h = H::new();
+    h.register_default().await;
+    let routine = caller("operator", ActorKind::Agent);
+    let id = h.queue(json!({ "backend": "acp:claude" })).await;
+    h.claim().await;
+    let ask =
+        json!({ "item_id": id, "mode": "queue", "body": "also push", "idempotency_key": "routine-0001" });
+    let e = h.err(&routine, "node_followup", ask.clone()).await;
+    assert_eq!(reason(&e), "not_item_owner");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_followups"), json!(0));
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
+
+    // Requested under the human's label: allowed, behind the approval.
+    h.sql(&format!("UPDATE node_dispatch SET created_by = 'operator' WHERE id = '{id}'"));
+    let parked = h.err(&routine, "node_followup", ask.clone()).await;
+    let UaError::ApprovalRequired { tool, .. } = parked else { panic!("expected an approval: {parked:?}") };
+    assert_eq!(tool, "node_followup");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_followups"), json!(0));
+
+    // The human, as themselves, still needs none.
+    let f = h
+        .ok(
+            &human(),
+            "node_followup",
+            json!({ "item_id": id, "mode": "queue", "body": "also push", "idempotency_key": "human-0001" }),
+        )
+        .await;
+    assert_eq!(f["approval"], "not_required_operator");
+    assert_eq!(f["operator_authored"], true);
+}
+
 #[tokio::test]
 async fn a_launch_key_belongs_to_its_caller_and_request() {
     let h = H::new();
@@ -992,4 +1029,28 @@ async fn an_adopted_command_notifies_the_chosen_session() {
     h.ok(&device(), "node_receipt", json!({ "node": NODE, "item_id": id, "receipt": { "status": "failed", "attempt": 1, "exit_code": 2, "fence_token": token } }))
         .await;
     assert_eq!(h.scalar("SELECT target_session FROM message_index WHERE sender = 'hub-node'"), session);
+}
+
+/// Node command adoption is human-only: neither a lifecycle-operator agent
+/// nor an unattended routine under a human's label may adopt another agent's
+/// command; a human may.
+#[tokio::test]
+async fn command_adoption_is_for_a_verified_human_only() {
+    let h = H::with(|c| c.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]));
+    h.register_default().await;
+    let params = json!({ "node": NODE, "argv": ["make"], "cwd": "/srv/work" });
+    let parked = h.manage(&lead(), "node_command_start", params.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!() };
+    h.ok(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    let id = h.manage(&lead(), "node_command_start", params).await.unwrap()["item_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fleet = Caller { label: "fleet-bot".into(), ..lead() };
+    let routine = Caller { kind: ActorKind::Agent, ..human() };
+    for who in [fleet, routine] {
+        let e = h.manage(&who, "node_command_adopt", json!({ "item_id": id })).await.unwrap_err();
+        assert!(e.to_string().contains("may adopt"), "{}: {e}", who.label);
+    }
+    h.manage(&human(), "node_command_adopt", json!({ "item_id": id })).await.unwrap();
 }

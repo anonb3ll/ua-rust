@@ -12,6 +12,7 @@ pub mod continuity;
 pub mod core_schema;
 pub mod cycles;
 pub mod delegation;
+pub mod deliverables;
 pub mod dispatch;
 pub mod events;
 pub mod evidence;
@@ -100,6 +101,7 @@ pub fn register(r: &mut Registry) {
     code::register(r);
     cycles::register(r);
     delegation::register(r);
+    deliverables::register(r);
     dispatch::register(r);
     events::register(r);
     evidence::register(r);

@@ -304,10 +304,6 @@ pub(crate) fn verified(caller: &Caller) -> Option<&str> {
     }
 }
 
-pub(crate) fn is_human(caller: &Caller) -> bool {
-    caller.kind == ActorKind::Human
-}
-
 /// The author to stamp: the verified identity, or the claimed one when the
 /// caller has none. A claim that contradicts the verified identity is refused.
 pub(crate) fn write_author(caller: &Caller, claimed: Option<String>) -> UaResult<Option<String>> {
@@ -337,7 +333,7 @@ pub(crate) fn has_broadcast(tags: &[String]) -> bool {
 pub(crate) fn assert_privileged(caller: &Caller, tags: &[String], salience: Option<f64>) -> UaResult<()> {
     let broadcast = has_broadcast(tags);
     let high = salience.is_some_and(|s| s.is_finite() && s > HUMAN_SALIENCE_CEILING);
-    if (!broadcast && !high) || is_human(caller) {
+    if (!broadcast && !high) || ua_org::authz::human(caller) {
         return Ok(());
     }
     let mut reasons = Vec::new();

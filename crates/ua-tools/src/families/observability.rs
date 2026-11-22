@@ -969,7 +969,11 @@ fn bind_check(cfg: &Config) -> Value {
         }
         (false, false) => (
             MISCONFIGURED,
-            format!("listening beyond loopback on port {} without enforced auth", cfg.bind.port()),
+            format!(
+                "listening beyond loopback on port {} without enforced auth: anyone who can reach it can read \
+                 every mailbox and conversation",
+                cfg.bind.port()
+            ),
         ),
     };
     finding("http_bind", status, detail, "UA_BIND, UA_ENFORCE_AUTH")
@@ -1280,10 +1284,22 @@ fn schema_check(facts: &DbFacts) -> Value {
             format!("schema parts not applied: {}", compat.missing.join(", ")),
             gate,
         )
+    } else if !compat.extra.is_empty() {
+        // Only reachable with the override: a fenced open refuses this database.
+        finding(
+            "schema",
+            DEGRADED,
+            format!(
+                "all {} schema parts applied, and {} part(s) from a newer build ({}) that this build ignores; \
+                 it opened the database only because --allow-newer-schema or UA_ALLOW_NEWER_SCHEMA is set",
+                expected.len(),
+                compat.extra.len(),
+                compat.extra.join(", ")
+            ),
+            gate,
+        )
     } else {
-        let extra = compat.extra.len();
-        let note = if extra > 0 { format!("; {extra} part(s) from another build") } else { String::new() };
-        finding("schema", LIVE, format!("all {} schema parts applied{note}", expected.len()), gate)
+        finding("schema", LIVE, format!("all {} schema parts applied", expected.len()), gate)
     }
 }
 

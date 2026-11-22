@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use ua_core::{ActorKind, Caller, Profile, UaError, UaResult};
+use ua_core::{ActorKind, Caller, UaError, UaResult};
 
 use super::executor::{self, LaunchSpec};
 use super::{
@@ -14,7 +14,7 @@ use super::{
     finalize_cancellation, live_run_for_task, load_run, now, record_outcome, record_transition, refusal,
     run_object, states, transition,
 };
-use crate::approvals::{self, GateOutcome};
+use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
 use crate::families::{governance, node_queue, provider_accounts};
 use crate::hub::Hub;
@@ -223,12 +223,12 @@ fn verified(caller: &Caller, tool: &str) -> UaResult<()> {
     Ok(())
 }
 
-fn operator(caller: &Caller, tool: &str) -> UaResult<()> {
+fn operator(cfg: &ua_core::Config, caller: &Caller, tool: &str) -> UaResult<()> {
     verified(caller, tool)?;
-    if caller.profile != Profile::Operator {
+    if !super::is_operator(cfg, caller) {
         return Err(UaError::denied(
             "operator_authorization_required",
-            format!("{tool} requires the authenticated operator profile"),
+            format!("{tool} requires an operator (a verified human)"),
         ));
     }
     Ok(())
@@ -482,7 +482,7 @@ fn stale_pass(
     cfg: &ua_core::Config,
     requester: &str,
     payload: &Value,
-) -> UaResult<Option<(i64, Vec<String>)>> {
+) -> UaResult<Option<(i64, Vec<String>, String)>> {
     let ttl = jiff::SignedDuration::from_secs((cfg.approval_pass_ttl_hours.max(0.0) * 3600.0) as i64);
     let cutoff =
         ua_core::time::format_ts(jiff::Timestamp::now().checked_sub(ttl).unwrap_or(jiff::Timestamp::MIN));
@@ -501,7 +501,7 @@ fn stale_pass(
         let changed: Vec<String> =
             BOUND_KEYS.iter().filter(|k| old.get(**k) != payload.get(**k)).map(|k| k.to_string()).collect();
         if !changed.is_empty() {
-            return Ok(Some((id, changed)));
+            return Ok(Some((id, changed, approvals::payload_sha256("dispatch_task", &old))));
         }
     }
     Ok(None)
@@ -656,7 +656,7 @@ fn route_to_node(
 
 async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
     let agent = check_slug("agent", &a.agent)?;
-    check_agent_or_operator(&ctx.caller, "dispatch_task", &agent)?;
+    check_agent_or_operator(ctx.hub.cfg(), &ctx.caller, "dispatch_task", &agent)?;
     if let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, "dispatch_task") {
         return Err(refusal.error);
     }
@@ -802,6 +802,18 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 GateOutcome::Pass { approval_id } => approval_id,
                 GateOutcome::Pending { approval_id } => {
                     let stale = stale_pass(tx, hub.cfg(), &caller.label, &payload)?;
+                    let stale = match stale {
+                        Some((old, changed, approved_sha)) => {
+                            let r = Refusal::new("dispatch_task", RefusalReason::BindingChanged)
+                                .approval(old)
+                                .task(Some(tid))
+                                .hashes(Some(approved_sha), Some(approvals::payload_sha256("dispatch_task", &payload)))
+                                .changed(changed.clone());
+                            approvals::refused(tx, &caller.label, &r, None)?;
+                            Some((old, changed))
+                        }
+                        None => None,
+                    };
                     return Ok(Gated::Pending { approval_id, stale });
                 }
                 GateOutcome::Denied { approval_id, reason } => return Ok(Gated::Denied { approval_id, reason }),
@@ -978,7 +990,7 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     verified(&ctx.caller, "dispatch_cancel")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
-    check_agent_or_operator(&ctx.caller, "dispatch_cancel", &run.agent_label)?;
+    check_agent_or_operator(ctx.hub.cfg(), &ctx.caller, "dispatch_cancel", &run.agent_label)?;
     let reason =
         a.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or("client cancelled".into());
     cancel_run(&ctx.hub, ctx.caller.label.clone(), rid, reason).await
@@ -1071,7 +1083,7 @@ fn reconcilable_for_retry(run: &super::Run) -> bool {
 }
 
 async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
-    operator(&ctx.caller, "dispatch_retry_cancellation")?;
+    operator(ctx.hub.cfg(), &ctx.caller, "dispatch_retry_cancellation")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
     if !reconcilable_for_retry(&run) {
@@ -1097,7 +1109,7 @@ async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
 }
 
 async fn confirm_cancellation(ctx: ToolCtx, a: ConfirmArgs) -> UaResult<Value> {
-    operator(&ctx.caller, "dispatch_confirm_cancellation")?;
+    operator(ctx.hub.cfg(), &ctx.caller, "dispatch_confirm_cancellation")?;
     let rid = trimmed("run_id", &a.run_id)?;
     let run = require_run(&ctx, &rid).await?;
     if !matches!(run.state.as_str(), "cancelled" | "blocked")
@@ -1179,21 +1191,30 @@ const RESUME_BOUND_KEYS: [&str; 14] = [
 /// `dispatch_task` approval bound: the same harness, argv, env allowlist,
 /// limits, token passing, resolved workdir and prompt. Returns those fields
 /// for the resume's own approval payload.
+///
+/// A refusal is ledgered (`agent.approval.refused`, kept although the
+/// caller's transaction rolls back) with the `dispatch_task` approval it
+/// checked against.
 fn check_resume_binding(
-    tx: &rusqlite::Connection,
+    tx: &mut ua_store::WriteTx<'_>,
+    caller: &str,
     run: &super::Run,
     harness: Option<&(String, ua_core::config::HarnessConfig)>,
     workdir: Option<&Path>,
 ) -> UaResult<Map<String, Value>> {
-    let bound: Option<String> = tx
+    let bound: Option<(i64, String)> = tx
         .query_row(
-            "SELECT payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
+            "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
              AND status = 'consumed' ORDER BY id LIMIT 1",
             [&run.run_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(bound) = bound.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+    let Some((approval_id, bound)) =
+        bound.and_then(|(id, t)| serde_json::from_str::<Value>(&t).ok().map(|v| (id, v)))
+    else {
+        let r = Refusal::new("dispatch_resume", RefusalReason::NoMatchingApproval).task(Some(run.task_id));
+        approvals::refused(tx, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!("run {} has no dispatch_task approval to resume under", run.run_id),
@@ -1204,6 +1225,26 @@ fn check_resume_binding(
     let changed: Vec<&str> =
         RESUME_BOUND_KEYS.iter().copied().filter(|k| bound.get(*k) != current.get(*k)).collect();
     if !changed.is_empty() {
+        // The approved payload against the same payload with what would
+        // run now in place of the changed fields.
+        let mut presented = bound.clone();
+        if let Some(o) = presented.as_object_mut() {
+            for k in &changed {
+                match current.get(*k) {
+                    Some(v) => o.insert(k.to_string(), v.clone()),
+                    None => o.remove(*k),
+                };
+            }
+        }
+        let r = Refusal::new("dispatch_resume", RefusalReason::BindingChanged)
+            .approval(approval_id)
+            .task(Some(run.task_id))
+            .hashes(
+                Some(approvals::payload_sha256("dispatch_task", &bound)),
+                Some(approvals::payload_sha256("dispatch_task", &presented)),
+            )
+            .changed(changed.iter().map(|k| k.to_string()).collect());
+        approvals::refused(tx, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!(
@@ -1270,7 +1311,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Some(why) = resume_refusal(&run) {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            let binding = check_resume_binding(tx, &run, h2.as_ref(), w2.as_deref())?;
+            let binding = check_resume_binding(tx, &caller.label, &run, h2.as_ref(), w2.as_deref())?;
             // A resume runs what was approved: it is refused, never rerouted,
             // while the harness's provider account cannot take a run.
             if let Some((name, h)) = &h2 {

@@ -135,8 +135,15 @@ gated call parks an approval like any other.
 **`/approve`** needs `can_approve` on the mapping, then resolves as the
 mapped identity with `approval_resolve`'s own rule: the approver must be a
 verified human other than the requester, and the profile must allow
-`approval_resolve`. The approval row's `reason` is `approved from Slack`
-and the `approval_resolve` call is recorded with transport `slack`.
+`approval_resolve`. Approvals from Slack are therefore opt-in per
+identity, and each one is recorded as coming from Slack: the approval row's
+`resolved_transport` is `slack` (every decision records the adapter it came
+through, one of `stdio`, `http`, `mcp`, `cli`, `ui`, `internal` and `slack`;
+the row holds the latest decision, so a later revoke overwrites it, while
+each decision stays in the ledger), the `agent.approval.resolved`
+ledger event carries `transport: "slack"`, the Control Center inbox shows
+it in the "Via" column, and the `approval_resolve` call's `tool_calls` row
+has transport `slack`. The row's `reason` is `approved from Slack`.
 `approve` is accepted **only as a slash command**: sent as a
 message through the Events API, in any spelling (`!approve`, `/approve`,
 any case), it is refused (`approve_needs_slash_command`
@@ -176,15 +183,17 @@ touching the database.
 4. **Parse.** Form fields (a repeated field is malformed) or a JSON object.
    `url_verification` is answered here. Ignored events stop here.
 5. **Admission**, one write transaction (`slack::admit`):
-   - the signed base's hash goes into `slack_seen_signatures`; the same
-     signed bytes a second time are a 401 (`replayed`);
+   - the signed base's hash is recorded in `inbound_deliveries` (source
+     `slack`, kind `request_sha`; [ingress.md](ingress.md#inbound-deliveries));
+     the same signed bytes a second time are a 401 (`replayed`);
    - (`team_id`, `user_id`) is looked up in `slack_identities`; unmapped is
      refused **with no ledger row** (the signature
      is still remembered, so a replay is still refused), logged at debug
      level only: any workspace member, or anyone in a shared channel, can
      send signed requests in a loop, and the ledger is permanent;
-   - the `trigger_id` (commands) or envelope `event_id` (events) goes into
-     `slack_seen_deliveries`; a repeat is answered "Already received." and
+   - the `trigger_id` (commands) or envelope `event_id` (events) is recorded
+     there too (kinds `trigger` and `event`), and accepted under the mapped
+     identity; a repeat in any state is answered "Already received." and
      runs nothing. Slack retries an event it thinks timed out with a new
      timestamp, so a retry passes the signature check and stops here;
    - `/approve` from a mapping without `can_approve` is refused.
@@ -192,8 +201,8 @@ touching the database.
    sentence, an event an empty 200), well inside Slack's 3 seconds. The
    command then runs on a tracked background task, so a graceful shutdown
    waits for it.
-7. **Result.** The outcome is ledgered and the delivery's row in
-   `slack_seen_deliveries` moves from `accepted` to `finished`. A slash
+7. **Result.** The outcome is ledgered and the delivery's record moves
+   from `accepted` to `finished`. A slash
    command's result is posted to its `response_url` as an ephemeral message
    (see below).
 
@@ -219,10 +228,11 @@ sweep has seen it.
 
 A slash command's `response_url` is posted to only when it is
 `https://hooks.slack.com/...` on the default port with no user info: that
-exact host, nothing else. The client is the web tools' guarded client: no
-redirects, no proxy, every resolved address must be public (loopback is
-refused here even under `fetch_allow_loopback`), a 10-second timeout, and the
-response body is never read. Any other `response_url` is ignored and the
+exact host, nothing else. The client is `ua_ingress::Outbound` under the
+`slack.response_url` policy ([ingress.md](ingress.md)): https to that host
+only, no redirects, no proxy, every address the connection reaches must be
+public (loopback is refused here even under `fetch_allow_loopback`), a
+10-second limit on the whole call, and the response body is never read. Any other `response_url` is ignored and the
 acknowledgement says the result is in the hub ledger.
 
 The reply is one fixed sentence per command (ids, and for `status` the
@@ -255,9 +265,17 @@ and so on) and its `tool_calls` row, attributed to the mapped identity. No
 event carries the body, the command text, the signing secret, a signature or
 the `response_url`.
 
-`slack_seen_signatures` rows older than 600 seconds and
-`slack_seen_deliveries` rows older than a day (except `accepted` ones, see
+Replay keys older than 600 seconds and delivery ids older than a day
+(except `accepted` ones, see
 [Commands with no recorded outcome](#commands-with-no-recorded-outcome)) are pruned on each admission.
+They live in `inbound_deliveries` since `slack.inbound.v1.copy` carried
+the rows of the earlier `slack_seen_signatures` and `slack_seen_deliveries`
+across, every state kept; those two tables stay in the schema, unread and
+unwritten, until a later release drops them. Do not downgrade past this
+change while Slack takes traffic: an older binary reads only the old
+tables, so for about a day a Slack retry of a command the newer build
+already ran would run again ([ingress.md](ingress.md#inbound-deliveries),
+Limits).
 
 ## Threat model
 
@@ -343,9 +361,9 @@ id or trigger id across both, so one that arrives on each runs once.
 ### How it works
 
 1. The hub POSTs `https://slack.com/api/apps.connections.open` with the token
-   in the `Authorization` header, through the guarded web client (no
-   redirects, no proxy, public addresses only; the response is read up to
-   16 KiB). It answers a one-time `wss://` URL.
+   in the `Authorization` header, through `ua_ingress::Outbound` under the
+   `slack.web_api` policy (https to `slack.com` only, no redirects, no proxy,
+   public addresses only, 15 seconds; the response is read up to 16 KiB). It answers a one-time `wss://` URL.
 2. The URL must be `wss`, on `slack.com` or a subdomain, on the default port,
    with no user info; otherwise it is refused and the hub retries later. The
    first refusal of each reason is ledgered as `agent.slack.socket.url_refused`
@@ -418,12 +436,12 @@ handshake request at trace level, so `ua` caps `tungstenite` and
 
 There is no request signature in Socket Mode: the connection itself is
 authenticated by the app token over TLS. In place of the signed bytes, the
-envelope id goes into the same replay table (`slack_seen_signatures`, keyed
+envelope id goes into the same replay keys (kind `request_sha`, keyed
 by the SHA-256 of `socket-envelope:{envelope_id}`, so it never collides with
 an HTTP key, and pruned after the same 10 minutes). A redelivered envelope
 (Slack retries ones it saw no acknowledgement for) is acknowledged again and
 runs nothing. Past that, the event id and trigger id dedupe
-(`slack_seen_deliveries`, a day) still applies, across both transports. For
+(kinds `event` and `trigger`, a day) still applies, across both transports. For
 a mapped identity the admission ledgers `agent.slack.envelope_accepted`
 (the envelope hash) where the HTTP route ledgers
 `agent.slack.signature_accepted`; unmapped users add no ledger row, as on
@@ -479,7 +497,7 @@ in-process stand-in, not yet against a live workspace:
 - `verify_slack_signature(secret, timestamp, body, signature, now)`: the v0
   check above. Not an agent tool: an agent that could submit signed bodies
   could spend another request's replay slot or probe the verifier.
-- `remember_signed_request(tx, timestamp, body, now)`: the replay table.
+- `remember_signed_request(tx, timestamp, body, now)`: the replay key.
 - `admit(tx, cfg, timestamp, body, now, delivery)`: signature record,
   identity, the `can_approve` check, dedupe and the admission ledger event,
   in the caller's transaction.

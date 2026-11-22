@@ -5156,12 +5156,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-deliverables"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.1",
+ "ua-core",
+ "ua-store",
+]
+
+[[package]]
 name = "ua-import"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
- "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5171,6 +5182,21 @@ dependencies = [
  "ua-core",
  "ua-store",
  "ua-tools",
+]
+
+[[package]]
+name = "ua-ingress"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.13.5",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ua-core",
+ "ua-store",
+ "url",
 ]
 
 [[package]]
@@ -5186,8 +5212,16 @@ dependencies = [
  "tokio",
  "tracing",
  "ua-core",
+ "ua-org",
  "ua-store",
  "uuid",
+]
+
+[[package]]
+name = "ua-org"
+version = "0.1.0"
+dependencies = [
+ "ua-core",
 ]
 
 [[package]]
@@ -5226,6 +5260,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ua-core",
+ "ua-ingress",
  "ua-store",
  "ua-tools",
  "ulid",
@@ -5247,6 +5282,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "tracing",
  "ua-core",
  "ulid",
 ]
@@ -5301,7 +5337,10 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ua-core",
+ "ua-deliverables",
+ "ua-ingress",
  "ua-memory",
+ "ua-org",
  "ua-store",
  "ulid",
  "url",

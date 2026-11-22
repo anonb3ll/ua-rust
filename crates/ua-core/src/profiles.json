@@ -59,6 +59,8 @@
   "delegate_claim",
   "delegate_release",
   "delegation_manage",
+  "deliverable_create",
+  "deliverable_revise",
   "dispatch_confirm_cancellation",
   "dispatch_retry_cancellation",
   "export_data",

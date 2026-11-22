@@ -16,8 +16,17 @@
 //! `flush_digest` (or reaching `max_batch_size`) sends them as one digest.
 //! `notify` is denied to the developer and reviewer profiles by the profile
 //! lists, as in the original hub.
+//!
+//! Deliveries go through `ua_ingress::Outbound` under `notify.webhook`. The
+//! URL is the operator's, so it may name a private network or this host,
+//! over http or https; link-local (cloud metadata), multicast and reserved
+//! addresses are refused. No redirect is followed (the secret header would
+//! go with it) and no proxy is used. The secret header, and credentials in
+//! the URL (sent as basic auth), are bound to the URL's origin.
 
 use std::time::Duration;
+
+use base64::Engine;
 
 use rusqlite::{Connection, params};
 use schemars::JsonSchema;
@@ -25,6 +34,7 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
+use ua_ingress::{Outbound, OutboundError, Request, Url, policy};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use crate::families::plans::write_identity;
@@ -72,32 +82,70 @@ const ERROR_CHARS: usize = 300;
 
 /// The configured webhook, or `None` when notifications are not configured.
 struct Webhook {
-    url: reqwest::Url,
-    header: Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    /// The POST without its body: URL and secret headers.
+    request: Request,
     attempts: u32,
+}
+
+/// `%XX` escapes decoded, as the URL's user name and password are written.
+fn percent_decode(s: &str) -> Option<String> {
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(h), Some(l)) =
+                (b.get(i + 1).and_then(|c| hex(*c)), b.get(i + 2).and_then(|c| hex(*c)))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Credentials in the URL (`user:password@host`), taken out of it as a
+/// basic-auth header value. The HTTP client this replaced sent them so.
+fn take_basic_auth(url: &mut Url) -> UaResult<Option<String>> {
+    if url.username().is_empty() && url.password().is_none() {
+        return Ok(None);
+    }
+    let bad = || UaError::invalid("notify_webhook_url carries credentials that are not valid UTF-8");
+    let user = percent_decode(url.username()).ok_or_else(bad)?;
+    let pass = url.password().map(|p| percent_decode(p).ok_or_else(bad)).transpose()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let pair = format!("{user}:{}", pass.unwrap_or_default());
+    Ok(Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))))
 }
 
 fn webhook(cfg: &Config) -> UaResult<Option<Webhook>> {
     let Some(raw) = cfg.notify_webhook_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let url = reqwest::Url::parse(raw)
-        .map_err(|_| UaError::invalid("notify_webhook_url does not parse as a URL"))?;
+    let mut url =
+        Url::parse(raw).map_err(|_| UaError::invalid("notify_webhook_url does not parse as a URL"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UaError::invalid("notify_webhook_url must be http or https"));
     }
-    let header = match &cfg.notify_webhook_secret {
-        None => None,
-        Some(secret) => {
-            let name = reqwest::header::HeaderName::from_bytes(cfg.notify_webhook_header.trim().as_bytes())
-                .map_err(|_| UaError::invalid("notify_webhook_header is not a valid header name"))?;
-            let mut value = reqwest::header::HeaderValue::from_str(secret.expose_secret().trim())
-                .map_err(|_| UaError::invalid("notify_webhook_secret is not a valid header value"))?;
-            value.set_sensitive(true);
-            Some((name, value))
-        }
-    };
-    Ok(Some(Webhook { url, header, attempts: cfg.notify_max_attempts.clamp(1, MAX_ATTEMPTS_CAP) }))
+    let basic = take_basic_auth(&mut url)?;
+    let mut request = Request::post(url);
+    if let Some(value) = basic {
+        request = request.secret_header("authorization", &value).map_err(|_| {
+            UaError::invalid("notify_webhook_url carries credentials that are not a valid header")
+        })?;
+    }
+    if let Some(secret) = &cfg.notify_webhook_secret {
+        let name = reqwest::header::HeaderName::from_bytes(cfg.notify_webhook_header.trim().as_bytes())
+            .map_err(|_| UaError::invalid("notify_webhook_header is not a valid header name"))?;
+        let bad_value = || UaError::invalid("notify_webhook_secret is not a valid header value");
+        reqwest::header::HeaderValue::from_str(secret.expose_secret().trim()).map_err(|_| bad_value())?;
+        request =
+            request.secret_header(name.as_str(), secret.expose_secret().trim()).map_err(|_| bad_value())?;
+    }
+    Ok(Some(Webhook { request, attempts: cfg.notify_max_attempts.clamp(1, MAX_ATTEMPTS_CAP) }))
 }
 
 /// Outcome of the delivery attempts for one outbox row.
@@ -112,16 +160,30 @@ fn clip(s: &str) -> String {
     s.chars().take(ERROR_CHARS).collect()
 }
 
+/// The outbox error for a failed attempt, and whether to try again. Never
+/// quotes the URL, which may embed a credential.
+fn failure(e: &OutboundError) -> (String, bool) {
+    match e {
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => {
+            ("webhook timed out".into(), true)
+        }
+        OutboundError::NotSent { .. } | OutboundError::Lookup { .. } => {
+            ("webhook connection failed".into(), true)
+        }
+        // Refused by the policy: the same answer every time.
+        OutboundError::AddressRefused { reason, .. } | OutboundError::PeerRefused { reason, .. } => {
+            (format!("webhook address refused ({reason})"), false)
+        }
+        OutboundError::UrlRefused { why, .. } => (format!("webhook URL refused ({why})"), false),
+        OutboundError::Unverified => ("webhook peer address could not be checked".into(), false),
+        _ => ("webhook request failed".into(), true),
+    }
+}
+
 async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
-    // rustls is built without a default provider; install ring once.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = match reqwest::Client::builder()
-        .timeout(timeout)
-        // Never follow redirects: a custom secret header would be replayed to
-        // whatever host the redirect names.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // The policy never follows a redirect: the secret header would go with it.
+    // The client is pinned to the configured URL's origin.
+    let client = match Outbound::pinned(policy::NOTIFY_WEBHOOK, hook.request.url()) {
         Ok(c) => c,
         Err(e) => {
             return Delivery {
@@ -133,13 +195,18 @@ async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
         }
     };
     let mut last = Delivery { delivered: false, attempts: 0, http_status: None, error: None };
-    for attempt in 1..=hook.attempts {
-        let mut req = client.post(hook.url.clone()).json(body);
-        if let Some((name, value)) = &hook.header {
-            req = req.header(name.clone(), value.clone());
+    let req = match hook.request.clone().json(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Delivery { error: Some(clip(&format!("webhook request failed: {e}"))), ..last };
         }
+    };
+    for attempt in 1..=hook.attempts {
         last.attempts = attempt;
-        let retry = match req.send().await {
+        let sent = tokio::time::timeout(timeout, client.send(req.clone()))
+            .await
+            .unwrap_or(Err(OutboundError::Timeout));
+        let retry = match sent {
             Ok(resp) => {
                 let status = resp.status();
                 last.http_status = Some(status.as_u16());
@@ -152,16 +219,9 @@ async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
                 status.is_server_error() || status.as_u16() == 429
             }
             Err(e) => {
-                // Errors can echo the URL, which may embed a credential.
-                let kind = if e.is_timeout() {
-                    "timed out"
-                } else if e.is_connect() {
-                    "connection failed"
-                } else {
-                    "request failed"
-                };
-                last.error = Some(format!("webhook {kind}"));
-                true
+                let (error, retry) = failure(&e);
+                last.error = Some(clip(&error));
+                retry
             }
         };
         if !retry || attempt == hook.attempts {

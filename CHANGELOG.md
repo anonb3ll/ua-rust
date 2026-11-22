@@ -14,6 +14,57 @@ from its commit history.
 
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
+- Crate `ua-ingress` (`docs/ingress.md`): one address classifier
+  (`ua_ingress::addr`, with a public class and a stricter global-unicast-only
+  class) and one guarded outbound HTTP client (`Outbound`)
+  built from a named policy per destination class. The client ignores proxy
+  settings, follows redirects only when the policy allows (checking every
+  hop), caps every body read, checks addresses at connect time through its
+  resolver and again on the connection's peer address, sends a secret header
+  only to the origin it was built for, and bounds connect, request and total
+  time. An unknown policy is refused. Slack slash-command replies are its
+  first consumer (policy `slack.response_url`); their refusals and failure
+  reasons (`response_url_refused`, `timeout`, `transport`, `status`) are
+  unchanged. A ratchet test counts `reqwest` client builders, address
+  classifiers and inbound delivery tables outside the crate; the counts may
+  only go down.
+- `ua-ingress` hardening before any policy follows redirects: a hop to
+  another origin carries only `Accept` and `Accept-Language` (every other
+  header stays with its origin, whatever its name), a 307 or 308 that would
+  resend the body to another origin is refused, and a redirect from https to
+  http is refused unless a policy allows it (none does). The ratchet also
+  counts connections dialled by hand, inline address range checks, and
+  delivery tables recognised by name marks or columns instead of a fixed
+  list. No change for Slack replies, which follow no redirect.
+- Slack's replay keys (signed bytes, Socket Mode envelopes) and delivery
+  ids (`trigger_id`, `event_id`) moved onto `inbound_deliveries` (source
+  `slack`; kinds `request_sha`, `trigger`, `event`). Slack never takes a
+  stale delivery on again (`Stale::Duplicate`): a command admitted and
+  never finished is refused as a repeat and reported by the startup sweep
+  as before. Every HTTP response and Socket Mode acknowledgement, every
+  reply text and every ledger event is unchanged. `slack.inbound.v1.copy`
+  carries the old rows across with their states; `slack_seen_signatures`
+  and `slack_seen_deliveries` stay, unread and unwritten, until a later
+  release drops them. `ua_ingress::inbound` gains `abandon_all_accepted`
+  (the startup sweep) and `claim_of`, and an expired row is now kept
+  through its expiry second (as both families did before). Downgrading past
+  this change while Slack takes traffic lets a Slack retry of a command the
+  newer build already ran run again for about a day (`docs/ingress.md`,
+  Limits).
+- `ua-ingress::inbound`: one inbound-delivery table, `inbound_deliveries`
+  (parts `ingress.inbound.v1`, `organization.v1.ingress`; a tenant table
+  from birth), with `record`, `accept`, `finish`, `release` and `sweep` and
+  the states `seen`, `accepted`, `finished`, `abandoned`. The GitHub
+  webhook's delivery-id and body-hash checks moved onto it;
+  `github.inbound.v1.copy` carries the rows of `github_deliveries` and
+  `github_delivery_bodies` across, and those two tables stay, unread and
+  unwritten, until a later release drops them. `ua-ingress` now depends on
+  `ua-store`.
+- `ua-ingress`: once a redirect chain leaves the request's origin, the
+  caller's headers and secret headers are dropped for the rest of the
+  chain, including a hop back to the original origin (only `Accept` and
+  `Accept-Language` travel from then on), so an intermediate origin cannot
+  choose which path on the original origin receives them.
 - Hash-chained event ledger in SQLite, with verification that fails on an
   unhashed row inside the chain. An imported unhashed prefix must be exactly
   as long as the import recorded.
@@ -108,6 +159,10 @@ from its commit history.
 - Slack request signature check (v0 HMAC, five-minute window, replayed bodies
   refused) and `slack_parse_command` for the nine coordination commands. The
   Slack routes above build on both.
+- `ua-org`, a new crate holding `authz`: the operator, dispatch, hub-view
+  and mailbox authority checks go through it, with today's rules kept as
+  named transitional authorities, and a guard test holds the remaining
+  ad-hoc checks to counts that only go down.
 - Callers and ledger events name their organization: `Caller.org_id` and
   `Caller::system_for`, and `EventInput::new` takes the `org_id` first (no
   `Default`). Every caller and every event is in the default organization;
@@ -129,6 +184,78 @@ from its commit history.
   part that gives a crate's tables `org_id` and its guard triggers.
 - A test that classifies every table for organization scoping and fails on
   an unclassified one.
+- The software factory acceptance scenario as a scored test
+  (`crates/ua-server/tests/factory_scenario.rs`): each step of the scenario in
+  `docs/software-factory.md` is a set of named checks, each `pass`, `fail` or
+  `not-built`, compared against a checked-in scorecard
+  (`tests/fixtures/factory_scenario.txt`) that only moves forward. Status
+  page: `docs/software-factory-status.md`. Tests and docs only.
+- The first existing table family with an organization key: the code
+  family's `code_symbols` gets `org_id` (existing rows backfilled to
+  `default`) and its `org_exists` / `org_immutable` triggers in the schema
+  part `organization.v1.tools.code`. `fs_index_symbols`, `fs_list_symbols`,
+  `fs_search_symbols` and `fs_repo_map` read and write only the caller's
+  organization's symbols, and indexing for an organization `orgs` does not
+  hold is refused (`invalid_argument`) before anything changes. A hub with
+  only the default organization sees no change in any tool result or event.
+  As with every new part, a database that has applied it is refused by an
+  earlier build (the unknown-part fence).
+- Graph canvas boards and revisions have organization-scoped keys and
+  triggers. Existing boards and history migrate to `default`. Organizations
+  can use the same board names independently, with separate board quotas and
+  revision retention. Canvas tool results and event payloads retain their
+  existing shapes.
+- Web search cache rows (`web_search_cache`) have organization-scoped keys
+  and triggers (`web.v2.tenant_keys`, `organization.v1.tools.web`). Existing
+  cached entries migrate to `default`. Organizations cache identical queries
+  independently, and one organization's TTL eviction does not remove another
+  organization's cached entries.
+- An insert guard beside the classification test: it fails when an
+  `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
+  table that carries its organization key does not name `org_id`, in any
+  crate's non-test source or any trigger body. It cannot see a table name
+  built at run time, nor check what an `INSERT … SELECT` supplies.
+- Crate `ua-deliverables` and the tools `deliverable_create`,
+  `deliverable_revise`, `deliverable_get` and `deliverable_list`
+  (`docs/deliverables.md`): a task's deliverable and its immutable, ordered
+  revisions. For the `commit` kind a revision is the full 40-hex commit SHA
+  in the task's project's bound repository; recording one also sets the
+  task's workflow head through the workflow record's own write, so checks
+  are graded there. The writers are the workflow record's writers (the
+  `reviewer` profile does not see the write tools). Tables `deliverables`
+  and `deliverable_revisions` carry `org_id` and the organization triggers
+  from their first parts (`deliverables.v1`, `organization.v1.deliverables`);
+  triggers keep revisions immutable and in order. Events
+  `agent.deliverable.created` and `agent.deliverable.revised` carry ids and
+  the revision identity, no content. The scenario check
+  `delegate.deliverable-revision-object` passes. `/api/work-products*` still
+  answers 501. `ua_org::authz::require_same_org` exposes the organization
+  check every authority check applies.
+- Refusals in the audit record (`docs/policy.md#approvals-in-the-audit-record`):
+  a gated call refused because of its approval state appends one
+  `agent.approval.refused` ledger event with a reason (`expired`,
+  `binding_changed`, `no_matching_approval`, `denied`, `not_covered`,
+  `not_eligible`). It names the tool, the approval or policy authorization,
+  the task, the SHA-256 of the canonical payload that was approved and of the
+  one presented, and the top-level fields that differ by name, never their
+  values. It covers the approval gate, `git_merge_task` under a policy
+  authorization, `dispatch_task`, `dispatch_resume` and the relay's send.
+  The event survives the refused call: `ua_store::ledger::append_surviving`
+  appends it in the call's transaction and, when that transaction rolls
+  back, `Db::write` appends it again in a separate small transaction before
+  returning the call's error. The `agent.approval.requested`, `resolved` and
+  `consumed` events and the policy authorization `recorded` and `consumed`
+  events gain `payload_sha256`; `resolved` gains `expires_at` on an approval.
+  Additive: no response or schema changes.
+
+### Fixed
+
+- `scripts/vocab-check.sh`: an allowlist entry now silences only the pattern
+  class it was written for. A `vocab` entry (the legacy profile names) no
+  longer hides a private address, home path or tailnet name on the same line,
+  and a `private` entry no longer hides role vocabulary. Entries without the
+  class field keep their previous line-wide meaning.
+  `scripts/vocab-check-selftest.sh` pins both directions and runs in CI.
 
 ### Changed
 
@@ -136,6 +263,11 @@ from its commit history.
   where the target has the column (`event_log`, the harness config tables).
   Such rows are refused unless `--drop-org-scope` is given. Before this,
   `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: notification webhooks (`notify_webhook_url`) no longer use
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or the system proxy settings; they
+  connect directly. An operator whose hub reaches its webhook receiver only
+  through a proxy must make the receiver reachable directly (the Obsidian
+  client, which also honoured them, talks to loopback only).
 - Upgrade note: a backup taken after `organization.v1.store` applied cannot be
   restored by an earlier build, even with `--allow-newer`, because that build
   sees `event_log` as an altered table and refuses. Older backups restore into
@@ -209,8 +341,294 @@ from its commit history.
 - The stale-worktree scan works on macOS, where it reads processes with
   `proc_pidinfo`.
 
+### Behaviour changes
+
+- `git_merge_task` now enforces the review-at-head gate whenever `"review"` is
+  in the task's `expected_checks` (for both policy-authorization and one-time
+  approval merges, including `dry_run=true`, and not bypassed by `force=true`).
+  The merge requires a passing (`outcome: "pass"`), uncontradicted `review`
+  check (`attested` or `verified`) recorded at the exact 40-hex commit being
+  merged (`review_required`), and when a commit deliverable revision matches
+  that commit, refuses a self-review by its `producer` (`self_review_refused`).
+  Under a policy authorization, authorization coverage is validated first so
+  expired or mismatched authorizations still emit `agent.approval.refused`, and
+  the review gate runs before the authorization is consumed so an unreviewed
+  head does not burn it. The software-factory scenario check
+  `release.requires-review-at-head` now passes (Step 3 is 10/10).
+
+- A one-time approval of `git_merge_task` no longer covers a later commit.
+  The approval now binds the head (full SHA), branch, target branch and the
+  task project's bound repository resolved when the merge is called, plus a
+  summary naming the commit and the target for the approver. A merge whose
+  branch moved after the approval, or whose project was rebound to another
+  repository, is refused with `approval_binding_changed` (ledgered as an
+  `agent.approval.refused` event, reason `binding_changed`) and a new
+  request for the current values is parked; before, it ran under the old
+  approval. Passes approved before this change bound only the arguments and
+  no longer match: they need a new approval. Because the handler now
+  resolves the payload, `git_merge_task` can no longer be requested ahead
+  through `POST /api/approvals/request` (`409`), and a merge bound to fail
+  (an unknown task, an unfinished task, a dirty worktree) is refused with
+  that error before an approval is parked, instead of parking first. The
+  policy authorization path is unchanged.
+
+- An unknown schema part refuses to open the database. Opening the store
+  compares the parts recorded in `schema_parts` with every part name the
+  build knows (optional and feature-gated parts included, so a lean build
+  of the same version is not refused) and, inside the first migration
+  transaction before anything is applied, refuses a database a newer build
+  wrote, naming the unknown parts and saying to run the newer build or
+  restore a backup taken before the upgrade. `ua serve`, `ua mcp`,
+  `ua call`, `ua init` (when it mints a token), `ua import` and the other
+  commands that open the hub refuse; `ua doctor`, `ua backup` and
+  `ua restore` run. `--allow-newer-schema` or `UA_ALLOW_NEWER_SCHEMA=1` (the
+  real environment only; a `.env` file cannot set it) opens it anyway for
+  recovery, logged at every open, but `ua serve` refuses such a database
+  even then. `system_doctor` reports a hub under the override as degraded.
+  A checked-in list of every shipped part name is pinned by a test: part
+  names are never retired or renamed. The fence protects only from this
+  change on, against parts added later: every earlier build (every build
+  from before the inbound-delivery table included) still opens an upgraded
+  database and is refused by nothing, so never run a build older than this
+  change against a database a newer build has opened; restore a
+  pre-upgrade backup instead (`docs/operations.md`, "Older builds and a
+  newer database").
+- A command that would migrate the database (apply a schema part it does
+  not record yet) refuses while another process holds the serve lock: a
+  newer build no longer migrates underneath an older running `ua serve`.
+  `ua serve` migrates at startup under its own lock; an open with nothing
+  to apply is unaffected; the recovery override does not lift it
+  (`docs/operations.md`, "Processes already running"). The guard is part
+  of the store's open (`Db::open`, `Hub::open`, `Hub::open_with`), so a
+  program that embeds the hub gets it by default; the only way to skip it
+  is the held serve lock of that database (`Fence::serving`,
+  `Hub::open_serving`). The lock code moved from `ua-import` to
+  `ua_store::lock`; `ua_import` re-exports the same names.
+- `ua doctor`: the `schema` check fails, where it warned, when the database
+  records parts this build does not know, and leads with that explanation
+  before any object findings. A plain `ua doctor` (without `--strict`) now
+  exits non-zero on such a database.
+- A second `ua serve` on the same database is refused. `ua serve` holds a
+  serve-only lock (`<db>.serve.lock`, owner-only, next to the database)
+  exclusively for the life of the process, beside the shared hub lock; a
+  second one exits before it opens the database or binds a port, with an
+  error naming the database and saying another `ua serve` holds it. The OS
+  releases the lock when the process exits or crashes. "The same database"
+  is the file SQLite opens, with every symbolic link followed (dangling
+  ones included) and `.`/`..` resolved; hard links are not covered. On a
+  platform without `flock` nothing is locked and a warning says so.
+  `ua mcp`, `ua call`, backups and the other commands are unaffected;
+  `ua restore` and `ua import` still refuse while a serve runs
+  (`docs/operations.md`, section 5).
+- The shared hub lock (`<db>.hub.lock`) now uses the same path resolution
+  and is created owner-only, so an import or restore that reaches the
+  database by another spelling refuses beside a running hub. For a
+  database reached through a link or an unusual spelling, a process from
+  before this change and one from after it use different hub-lock files
+  during the transition: stop every old process before an import or
+  restore.
+
+- GitHub webhook: a delivery that the hub recorded but never finished
+  handling (it stopped in between, or the delivery has been in flight for
+  15 minutes) is processed when GitHub redelivers it, instead of being
+  refused as a replay and lost. Its `agent.github.webhook.received` event
+  carries `"redelivered": true`. Every other response is unchanged.
+  Settling a delivery record is by claim (one per taking-on): a slow
+  handler cannot finish or release a record a redelivery took over, and one
+  whose record the sweep abandoned still finishes it, so a later copy stays
+  a replay. When the sweep abandons deliveries it appends one
+  `agent.github.webhook.abandoned` event (counts and up to 50 delivery ids,
+  no body) under the organization it swept; a sweep covers one
+  organization. Downgrading past this change reopens a replay window for
+  deliveries handled since, because an older binary reads only the old
+  GitHub tables, and nothing refuses it: every such build predates the
+  unknown-part fence (`docs/ingress.md`, Limits).
+
+- Operator authority is a verified caller of kind human, nothing else.
+  Dispatch and governance agree on it: acting for another agent in dispatch,
+  and confirming or retrying a cancellation, need an operator, not the
+  `operator` profile. Agents listed in `lifecycle_operators` keep their
+  fleet-maintenance operations under a separate grant (closing, parking and
+  folding tasks, releasing claims and holds, worktree cleanup, handoff
+  recovery, workflow records, wake handling, skill registry changes, harness
+  config status, node-queue administration including node acceptance, agent
+  and node lifecycle), but are not operators: secret administration (and
+  the default MCP read rule), provider-account administration, project repo
+  bindings, harness config publish, session credential revocation, node
+  command adoption, the hub view, reading every mailbox or conversation, and
+  `vault_move` need a verified human.
+- An unattended routine no longer holds operator authority anywhere: it runs
+  as an agent under its owner's label, and an agent is never an operator.
+  To give a routine fleet-maintenance rights, list its label in
+  `lifecycle_operators`. When `lifecycle_operators` is unset it defaults to
+  `human_identities` for humans only; that fallback grants nothing to an
+  agent.
+- The same rule now holds at the last places that still read the caller's
+  label instead: a follow-up into a running node session from a routine
+  waits for the one-time approval like any agent's, and clearing a task's
+  untrusted quarantine or filing a work proposal in another identity's name
+  needs the human as themselves.
+- The `coordinator` and `operator` profiles grant no authority. The hub
+  view, reading every mailbox or conversation, and `vault_move` need an
+  operator. A coordinator agent that read every mailbox to route work cannot
+  any more; organization roles will replace that.
+- With auth enforcement off there is no verified identity to scope a read
+  by, so mailboxes and conversations are a message board
+  ([auth.md](docs/auth.md#with-auth-enforcement-off)). An unverified caller
+  reads every mailbox, as before, and now `conversation_handoffs` too
+  (handing a conversation off still needs a verified caller). Reading
+  another label's mailbox no longer changes its read state: for a caller
+  configured with its own label, `message_inbox` on another mailbox lists
+  without marking and says so (`read_state`), and `message_ack` and
+  `session_id` on it are refused. A caller with only the shared `local`
+  label has no mailbox of its own and still acts as the mailbox it names.
+  This read grant never counts as operator, lifecycle or human authority.
+- Messages carry `sender_verified`: `false` when the sender was not
+  authenticated, so `from_agent` is only what the caller said (`null` on
+  messages sent before this).
+
+- The web tools' and the OAuth client-metadata fetch's address checks are
+  now one classifier (`ua_ingress::addr`) with two named classes. Nothing is
+  allowed that was refused before. Newly refused:
+  - by the web-class callers (`web_fetch`, `web_search`, Zulip, the relay's
+    GitHub client, GitHub REST, Slack replies and the Socket Mode `wss`
+    host): the IPv4-compatible form `::a.b.c.d` of a public IPv4 address.
+    It is deprecated (RFC 4291), lies in `::/8`, which is not routed, and no
+    current transition mechanism produces it, so no reachable destination
+    uses it. NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) and 6to4 addresses are
+    still judged by the IPv4 address they carry, as before, so IPv6-only
+    networks behind DNS64 keep working;
+  - by the client-metadata fetch: translated IPv6 (`::ffff:0:a.b.c.d`) of a
+    non-public IPv4 address, `3fff::/20` (documentation), `2001::/23` beyond
+    Teredo (IETF protocol assignments), and every IPv6 address outside
+    `2000::/3` not refused before. It still refuses every NAT64, 6to4 and
+    IPv4-compatible address, as before.
+- `web_fetch`, `web_search`, the Zulip tools, the relay's GitHub comments
+  and Slack Socket Mode's `apps.connections.open` call now go through
+  `ua_ingress::Outbound` under named policies (`web.page`, `web.search`,
+  `zulip.api`, `relay.github`, `slack.web_api`; `docs/ingress.md`), and the
+  web family's shared client is gone. Schemes, hosts, redirect limits, body
+  caps, timeouts, proxy handling, outcomes and error messages are as
+  before, except where each is now stricter:
+  - every one: the address of the connection that carried a response is
+    checked again after it arrives (a peer outside the class fails the
+    call), and failure messages no longer quote the request URL;
+  - `web_fetch`: a URL with credentials (`user:password@host`) is refused
+    (they were sent as basic auth); a fetch that runs out of its 45-second
+    budget reads `fetch of <host> timed out` instead of `fetch timed out`;
+  - `web_search`: a redirect from https to http is refused (it was
+    followed); a 307 or 308 that would resend the DuckDuckGo form or the
+    Tavily request body to another origin is refused (it was resent);
+    the Brave and Tavily keys, and every header other than `Accept` and
+    `Accept-Language`, are not sent once a redirect chain changes origin,
+    where before they were dropped only when the host changed (a change of
+    scheme or port kept them); a credentialled endpoint URL is refused;
+  - Slack Socket Mode's `apps.connections.open` call is now pinned to its
+    one host: the `slack.web_api` policy accepts only `https://slack.com` on
+    the default port (before, only the hard-coded base URL kept it there);
+  - Zulip and the relay: nothing beyond the first item. None of these
+    follows redirects, before or now.
+- The GitHub REST client (CI check verification, polling, merged pull
+  requests) now goes through `ua_ingress::Outbound`: `github.rest` for
+  `api.github.com`, `github.enterprise` for a GHES root in `github_api_url`
+  (`docs/ingress.md`). Its client is still built once per API base. The
+  host, https, the loopback test hook, no proxy, no redirects (a 3xx is an
+  error), the 8 MiB cap, 20 seconds and its errors are as before. The new
+  address class `OperatorConfigured` (public, loopback and private networks:
+  RFC 1918, the RFC 6598 shared address space, `fc00::/7`) serves the GHES case and follows no
+  redirect. Stricter:
+  - a GHES host was not address-checked at all; now a name or address in
+    link-local (cloud metadata), unspecified, multicast, broadcast and
+    reserved, documentation, benchmarking or IETF protocol ranges is
+    refused, at connect time and on the connection's peer. Private and
+    loopback addresses are still reached;
+  - the public API's connection peer is checked again after the response
+    arrives;
+  - a network failure's detail is `ua_ingress`'s message rather than the
+    HTTP library's error chain (it never quotes the URL).
+- The Obsidian tools (`obsidian_status`, `obsidian_open`,
+  `obsidian_active_note`, `obsidian_search`, `obsidian_append`) now go
+  through `ua_ingress::Outbound` under `obsidian.local_rest`. The URL check
+  (`obsidian_url`), http or https, the bearer key, 20 seconds, the 412
+  conflict and the error prefix `Obsidian request failed:` are as before,
+  and TLS certificates are still not verified (the plugin's certificate is
+  self-signed): `Policy::accept_invalid_certs` exists for this one policy
+  and is refused on any policy that is not loopback-only (new class
+  `LoopbackOnly`) or that follows redirects. Stricter:
+  - every address a connection reaches must be loopback, checked when it is
+    made and again on its peer (before, only the configured URL's host was
+    checked, so `localhost` resolving elsewhere was followed);
+  - redirects are not followed (up to ten were, with the key dropped only
+    on a host change); a 3xx now reads `HTTP 3xx` as any other non-success;
+  - proxy environment variables are ignored (they were honoured, so the key
+    could travel through a proxy);
+  - a reply larger than 16 MiB is refused (there was no cap); from
+    `obsidian_append`, whose patch has already been applied, such a reply
+    reads as `response: null` instead;
+  - replies are decoded as UTF-8 (lossy) whatever charset they declare;
+  - requests carry the hub's `User-Agent` (there was none).
+- Notification webhooks (`notify`, `batch_notify`, `flush_digest`, hub
+  events such as `review_ready`) now go through `ua_ingress::Outbound`
+  under `notify.webhook`: http or https to `notify_webhook_url`, any host
+  and port, `OperatorConfigured` addresses (private networks and this host
+  are still reached), no redirects, each attempt bounded by its timeout as
+  before. The configured secret header (also over plain http, as before),
+  retries on network errors, 429 and 5xx, the outbox and its error texts
+  are unchanged. Credentials in the URL are still sent as basic auth, now
+  as a header bound to the URL's origin. Stricter:
+  - a URL whose host is or resolves to a link-local (cloud metadata),
+    unspecified, multicast, broadcast and reserved, documentation,
+    benchmarking or IETF protocol address is refused (nothing was checked),
+    with `webhook address refused (<reason>)` and no retry; the peer
+    address is checked again after the response;
+  - proxy environment variables are ignored (they were honoured, so the
+    secret header could travel through a proxy);
+  - requests carry the hub's `User-Agent` (`ua-rust/<version>`; there was
+    none).
+- Every outbound address rule now refuses the well-known cloud
+  instance-metadata addresses that are not link-local, with the reason
+  `cloud metadata`: `100.100.100.200` and `fd00:ec2::254`, `fd20:ce::254`,
+  and any IPv6 form that carries the IPv4 one (mapped, translated, NAT64,
+  6to4). `OperatorConfigured` (GHES, notify webhooks) admitted them inside
+  the shared address space and unique local space; the rest of both ranges
+  is still reachable. The public classes refused them already, under their
+  range's reason.
+- `Addresses::class()` is gone: it returned the public range table for
+  `LoopbackOnly` too, so a caller deciding by it would have admitted public
+  addresses. Every decision goes through `Addresses::check`.
+- GitHub REST: `github_api_url` spelled with a trailing dot or in another
+  case (`https://API.GitHub.com.`) is the public API, gets `github.rest`, and
+  is normalised to `api.github.com`; before, a trailing dot selected
+  `github.enterprise`. Any other host keeps the spelling the operator wrote,
+  trailing dot included.
+
 ### Security
 
+- `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
+  `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
+  name or from the public policy list, and build only clients pinned to one
+  origin (`Outbound::pinned`): a request to another scheme, host or port is
+  refused before anything is sent. `Outbound::new` refuses a relaxed policy,
+  and a hand-made one is refused even pinned. The GitHub REST, Obsidian and
+  notify clients pin to their configured URL; their behaviour is unchanged.
+- Slack: a command's outcome settles its delivery under the claim its own
+  admission took, so a very late outcome can no longer mark a newer
+  delivery with the same id (recorded after the old row expired) as
+  finished; it is still ledgered. Admission also logs, at info level, an
+  accept that changed no row.
+- An unverified caller (auth off) that names a configured human or lifecycle
+  operator as its `actor` no longer gets operator authority over other
+  agents' task workflow records and checks; it is refused, as every other
+  operator check already refused it.
+- An approval decision records the adapter it came through: the approval
+  row's new `resolved_transport` (schema part `approvals.v2`; `stdio`,
+  `http`, `mcp`, `cli`, `ui`, `internal` or `slack`; NULL, shown as unknown,
+  for older rows; the row holds the latest decision), the
+  `agent.approval.resolved` and `relay.cancelled` ledger events'
+  `transport`, the approval list
+  and detail outputs, and a "Via" column in the Control Center inbox. A
+  `/approve` from Slack is no longer indistinguishable from a click in the
+  Control Center. Who may approve is unchanged.
 - `/api` and `/ui` refuse an unknown host and a cross-site write.
 - Auth fails closed: with `enforce_auth` and no token, every route except
   `GET /healthz` is rejected.

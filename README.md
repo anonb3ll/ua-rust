@@ -43,8 +43,10 @@ a rule is written once and holds for every client.
 | Crate | Holds |
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
+| `ua-ingress` | The boundary to other systems: the address classifier and the guarded outbound HTTP client with named destination policies ([docs/ingress.md](docs/ingress.md)) |
 | `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
+| `ua-deliverables` | Deliverables: what a task produces, and its immutable, ordered revisions ([docs/deliverables.md](docs/deliverables.md)) |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
@@ -178,6 +180,7 @@ vulnerability.
 | Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from harness-declared signals (`quota_patterns` on stderr, Pi's JSON error events; `provider_quota_status`), `dispatch_task` refusals or same-provider, same-billing fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`), close-on-merge (`queue_close_merged`); the review queue (`task_list(stage="review")`) and a `review_ready` notification; delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
+| Deliverables | A task's deliverable (`deliverable_create`, kind `commit`: a commit in the project's bound repository) and its immutable, ordered revisions (`deliverable_revise`: the full commit SHA, which also becomes the task's workflow head), read with `deliverable_get` and `deliverable_list`; the task workflow record's writers, one ledger event per change | [deliverables](docs/deliverables.md) |
 | GitHub | Native REST client scoped to bound repositories (no redirects, bounded, rate-limit aware); CI runs and jobs verify task checks; signed webhook `POST /api/github/webhook` with replay protection (merges close tasks, completed runs re-verify checks); ETag polling fallback; `policy_authorization_record` / `policy_authorization_list`, accepted by `git_merge_task` in place of a one-time approval for one exact head | [github](docs/github.md) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board within `graph_canvas_history_max_bytes`; deleted elements are not parsed), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries, agent hosts and the program allowlist for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
@@ -203,10 +206,12 @@ failover, the SDK's queue-health and node-session routes
 provenance graph and evidence export (`/api/platform/*` paths other than the
 manifest and objects, and `/api/evidence/export`, answer 501), discovered
 native sessions (`/api/nodes/*` other than `/api/nodes/acceptance`, 501),
-billing and usage ledgers, and tenancy (`org_id`). Work products
-(`/api/work-products*`) are not ported as they were: they are being redesigned
-as generic deliverables reviewed through task stages
-([docs/parity.md](docs/parity.md)), and the routes answer 501 until then.
+billing and usage ledgers, and tenancy (`org_id`). The older hub's work
+products are replaced by [deliverables](docs/deliverables.md), generic
+deliverables reviewed through task stages rather than a port
+([docs/parity.md](docs/parity.md)): deliverables and revisions of the commit
+kind are in; handoff binding, release through approval and file deliverables
+are not yet. The work-product routes (`/api/work-products*`) still answer 501.
 
 ## License
 

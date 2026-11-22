@@ -44,12 +44,13 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, WriteTx, ledger};
 
-use super::{clean_reason, is_operator, now, verified_actor};
+use super::{clean_reason, now, verified_actor};
 use crate::families::agents::validate_label;
 use crate::families::dispatch;
 use crate::families::{node_queue, tokens};
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const CHANNEL: &str = "agent.lifecycle";
 const MAX_OWNER: usize = 120;
@@ -269,8 +270,8 @@ pub(crate) async fn agent_states(ctx: ToolCtx, _a: StatesArgs) -> UaResult<Value
 
 // --- the transition -------------------------------------------------------------
 
-fn authorize(who: &str, operator: bool, label: &str, verb: Verb, current: Option<&Row>) -> UaResult<()> {
-    if verb.operator_only() && !operator {
+fn authorize(who: &str, maintainer: bool, label: &str, verb: Verb, current: Option<&Row>) -> UaResult<()> {
+    if verb.operator_only() && !maintainer {
         return Err(UaError::denied(
             "not_lifecycle_operator",
             format!(
@@ -280,7 +281,7 @@ fn authorize(who: &str, operator: bool, label: &str, verb: Verb, current: Option
             ),
         ));
     }
-    if operator {
+    if maintainer {
         return Ok(());
     }
     if !who.eq_ignore_ascii_case(label) {
@@ -513,7 +514,11 @@ async fn change(
         Some(o) => Some(validate_label(Some(o), "owner")?),
     };
     let who = verified_actor(&ctx.caller, "changing an agent's lifecycle")?;
-    let operator = is_operator(ctx.hub.cfg(), &ctx.caller, &who);
+    let maintainer = Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    );
     let (l2, w2, r2) = (label.clone(), who.clone(), reason.clone());
     let out = ctx
         .hub
@@ -522,7 +527,7 @@ async fn change(
             let (label, who, reason) = (l2, w2, r2);
             let current = load(tx, &label)?;
             let state = current.as_ref().map_or("active", |r| r.state.as_str()).to_string();
-            authorize(&who, operator, &label, verb, current.as_ref())?;
+            authorize(&who, maintainer, &label, verb, current.as_ref())?;
             check_transition(&label, verb, &state)?;
             let target = verb.target();
             if state == target {
@@ -560,7 +565,7 @@ async fn change(
             // clears it.
             let imposed_by = if target == "active" {
                 None
-            } else if operator && !who.eq_ignore_ascii_case(&label) {
+            } else if maintainer && !who.eq_ignore_ascii_case(&label) {
                 Some(who.clone())
             } else {
                 current.as_ref().and_then(|r| r.imposed_by.clone())

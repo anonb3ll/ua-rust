@@ -30,6 +30,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
+use ua_org::authz::{Authority, Authz};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 pub use reaper::{reap_expired_leases, spawn_reaper, startup_sweep};
@@ -630,22 +631,26 @@ pub(crate) fn classify_termination(termination: &str) -> &'static str {
     }
 }
 
-/// Whether `caller` may act for another agent: a human, or the operator
-/// profile.
-pub(crate) fn is_operator(caller: &ua_core::Caller) -> bool {
-    caller.kind != ua_core::ActorKind::Anonymous
-        && (caller.is_human() || caller.profile == ua_core::Profile::Operator)
+/// Whether `caller` may act for another agent: an operator (a verified
+/// human), the same rule governance uses. A profile grants nothing.
+pub(crate) fn is_operator(cfg: &ua_core::Config, caller: &ua_core::Caller) -> bool {
+    Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 /// Check that a verified caller is `agent` itself or an operator.
-pub(crate) fn check_agent_or_operator(caller: &ua_core::Caller, tool: &str, agent: &str) -> UaResult<()> {
+pub(crate) fn check_agent_or_operator(
+    cfg: &ua_core::Config,
+    caller: &ua_core::Caller,
+    tool: &str,
+    agent: &str,
+) -> UaResult<()> {
     if caller.kind == ua_core::ActorKind::Anonymous {
         return Err(UaError::denied(
             "unauthenticated",
             format!("{tool} requires an authenticated hub identity; anonymous callers cannot bind a run"),
         ));
     }
-    if caller.label != agent && !is_operator(caller) {
+    if caller.label != agent && !is_operator(cfg, caller) {
         return Err(UaError::denied(
             "identity_mismatch",
             format!(

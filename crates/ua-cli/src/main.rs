@@ -38,6 +38,11 @@ struct Cli {
     /// Config file (default: $UA_CONFIG, then $UA_HOME/config.toml).
     #[arg(long, global = true, env = "UA_CONFIG")]
     config: Option<std::path::PathBuf>,
+    /// Open a database written by a newer build anyway, ignoring the schema
+    /// parts this build does not know (also `UA_ALLOW_NEWER_SCHEMA=1`). For
+    /// recovery only: logged at every open; see docs/operations.md.
+    #[arg(long, global = true)]
+    allow_newer_schema: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -200,7 +205,7 @@ fn local_caller_with(
     confirm: impl FnOnce(&str) -> bool,
 ) -> Caller {
     let explicit = label.is_some() && agent_env.is_none();
-    let mut c = Caller::local(label.unwrap_or_else(|| "local".into()), Transport::Cli);
+    let mut c = Caller::local(label.unwrap_or_else(|| ua_core::identity::LOCAL_LABEL.into()), Transport::Cli);
     if explicit && cfg.is_human(&c.label) && confirm(&c.label) {
         c.kind = ActorKind::Human;
     }
@@ -371,10 +376,19 @@ async fn serve_until_shutdown(
     served
 }
 
+/// The locks a command holds until the process is about to exit.
+#[derive(Default)]
+struct Held {
+    /// The shared hub lock (every command that opens the hub).
+    hub: Option<ua_import::HubLock>,
+    /// The one-serving-process lock (`ua serve` only).
+    serve: Option<ua_import::ServeLock>,
+}
+
 /// Build the runtime, run the command, then give the runtime
-/// [`RUNTIME_SHUTDOWN`] for what is still running. The shared hub lock is
-/// released only after that, so an import cannot start while this process's
-/// tasks may still write.
+/// [`RUNTIME_SHUTDOWN`] for what is still running. The locks are released
+/// only after that, so an import (or a second `ua serve`) cannot start while
+/// this process's tasks may still write.
 fn main() -> ExitCode {
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -383,10 +397,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut hub_lock = None;
-    let result = rt.block_on(run(&mut hub_lock));
+    let mut held = Held::default();
+    let result = rt.block_on(run(&mut held));
     rt.shutdown_timeout(RUNTIME_SHUTDOWN);
-    drop(hub_lock);
+    drop(held);
     match result {
         Ok(code) => code,
         Err(e) => {
@@ -401,7 +415,7 @@ fn main() -> ExitCode {
 const NO_MCP_SERVER: &str = "ua mcp: this ua was built without the mcp-server feature, so it serves no MCP. \
 Rebuild with default features (or `--features mcp-server`), or call tools with `ua call` or the JSON API.";
 
-async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCode> {
+async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
     {
@@ -411,9 +425,14 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
     }
 
     let explicit_config = cli.config.clone();
+    // Read before any `.env` file is loaded (`load_config`): the override comes
+    // only from the command line or the real process environment.
+    let allow_newer_var = std::env::var_os(ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV);
+    let allow_newer_flag = cli.allow_newer_schema;
+    let allow_newer = || allow_newer_schema(allow_newer_flag, allow_newer_var.clone());
     match cli.cmd {
         Cmd::Init(args) => {
-            ops::init::run(args, explicit_config.as_deref())?;
+            ops::init::run(args, explicit_config.as_deref(), allow_newer()?)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
@@ -438,7 +457,12 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
                     } else {
                         // Held until the import ends: no hub may run on this database.
                         let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
-                        let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
+                        let db = ua_tools::hub::open_db(
+                            &cfg.db_path(),
+                            &ua_import::schema_parts(),
+                            allow_newer()?,
+                            None,
+                        )?;
                         let opts = ua_import::Options { drop_org_scope, ..Default::default() };
                         ua_import::import(&db, &from, &opts)?
                     };
@@ -456,8 +480,22 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
                 cmd => {
                     // Every command that opens the hub holds a shared lock while it runs, so an
                     // import or restore (which takes it exclusively) refuses while any of them is live.
-                    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
-                    let hub = Hub::open(cfg.clone())?;
+                    held.hub = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
+                    // One `ua serve` per database (docs/ingress.md, Limits): taken before the
+                    // database is opened, a port is bound or any inbound state is touched.
+                    if let Cmd::Serve = cmd {
+                        held.serve = Some(ua_import::ServeLock::acquire(&cfg.db_path())?);
+                    }
+                    // Refuses a database a newer build wrote, unless overridden (docs/operations.md).
+                    // `ua serve` refuses it even then: serving it reopens the replay window.
+                    let override_on = allow_newer()?;
+                    let hub = match held.serve.as_ref() {
+                        // The serving process migrates under its own serve lock.
+                        Some(serving) => open_for_serve(&cfg, override_on, serving)?,
+                        // Every other command: the default open refuses to migrate
+                        // underneath a running `ua serve`.
+                        None => Hub::open_with(cfg.clone(), override_on)?,
+                    };
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());
 
@@ -640,6 +678,63 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<ExitCo
                 }
             }
         }
+    }
+}
+
+/// Whether to open a database written by a newer build anyway: the
+/// `--allow-newer-schema` flag, or `UA_ALLOW_NEWER_SCHEMA` (`value`, read from
+/// the process environment before any `.env` file was loaded) set to `1`. Any
+/// value other than an explicit yes or no is refused rather than guessed at.
+fn allow_newer_schema(flag: bool, value: Option<std::ffi::OsString>) -> anyhow::Result<bool> {
+    if flag {
+        return Ok(true);
+    }
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    let Some(v) = value else { return Ok(false) };
+    let Some(v) = v.to_str() else { anyhow::bail!("{var} must be 1 or 0") };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "" | "0" | "false" | "no" => Ok(false),
+        _ => {
+            anyhow::bail!("{var} must be 1 (open a database written by a newer build anyway) or 0, not {v:?}")
+        }
+    }
+}
+
+/// Open the hub for `ua serve`. The override never lets a serve start on a
+/// database written by a newer build: it would take GitHub and Slack
+/// deliveries while reading only the delivery tables this build knows, which
+/// reopens the replay window the fence closes. The fenced open runs first, so
+/// a refused serve has written nothing.
+fn open_for_serve(
+    cfg: &ua_core::Config,
+    override_on: bool,
+    serving: &ua_import::ServeLock,
+) -> anyhow::Result<Hub> {
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    match Hub::open_serving(cfg.clone(), serving) {
+        Ok(hub) => {
+            if override_on {
+                tracing::warn!(
+                    "--allow-newer-schema / {var} has no effect on ua serve (and this database needs none); unset it"
+                );
+            }
+            Ok(hub)
+        }
+        Err(e) if override_on => match e.downcast_ref::<ua_store::NewerSchema>() {
+            Some(newer) => anyhow::bail!(
+                "ua serve refuses the database {} even with --allow-newer-schema / {var}: it was written by a newer \
+                 build and records schema parts this build does not know ([{}]). Serving it would take GitHub and \
+                 Slack deliveries while reading only the delivery tables this build knows, so copies of deliveries \
+                 the newer build already handled would be accepted again. The override is for recovery through the \
+                 commands that do not serve (ua call, ua tools, ua mcp, ua backup, ua doctor). Run the newer build, \
+                 or restore a backup taken before the upgrade",
+                newer.db,
+                newer.unknown.join(", ")
+            ),
+            None => Err(e),
+        },
+        Err(e) => Err(e),
     }
 }
 

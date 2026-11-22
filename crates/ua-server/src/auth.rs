@@ -50,7 +50,7 @@ pub struct AuthIdentity {
 }
 
 /// Label used for unauthenticated local callers.
-pub const LOCAL_LABEL: &str = "local";
+pub use ua_core::identity::LOCAL_LABEL;
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ").map(str::trim)

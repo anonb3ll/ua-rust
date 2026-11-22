@@ -5,7 +5,8 @@
 //! - CI verification: [`crate::ci::GitHubCiVerifier`] looks a check's run up
 //!   through the client, so a check can earn `verified`.
 //! - [`webhook`]: `POST /api/github/webhook` ingestion. HMAC-SHA256
-//!   signature check, replay protection by delivery id, then effects:
+//!   signature check, replay protection by delivery id and body hash (on
+//!   `ua_ingress::inbound`), then effects:
 //!   re-verify recorded checks at a completed head, close tasks a merged PR
 //!   finishes ([`crate::families::continuity::merged`]).
 //! - [`poll`]: the same effects without a public endpoint, polling the bound
@@ -29,7 +30,7 @@ pub mod webhook;
 
 use serde_json::{Value, json};
 use ua_core::{Caller, UaResult};
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
 use crate::Hub;
 use crate::families::tasks::emit;
@@ -81,6 +82,46 @@ CREATE INDEX IF NOT EXISTS idx_policy_authorizations_task ON policy_authorizatio
 ",
 };
 
+/// `github.inbound.v1.copy`: carries the delivery ids and body hashes in
+/// `github_deliveries` and `github_delivery_bodies` into
+/// `inbound_deliveries` (source `github`, kinds `delivery_id` and
+/// `body_sha256`) as `finished`, keeping their receipt times and the
+/// 30-day retention, so a hub upgraded between two copies of one delivery
+/// still refuses the second. It must run after `ingress.inbound.v1` and
+/// `organization.v1.ingress`. Rows already in the new table are left
+/// alone, so it changes nothing when run again. The old tables stay in the
+/// schema, unread and unwritten, until a later release retires them.
+pub const INBOUND_COPY: Procedure = Procedure {
+    name: "github.inbound.v1.copy",
+    version: 1,
+    standalone: false,
+    run: copy_deliveries,
+    args: &[],
+};
+
+fn copy_deliveries(conn: &rusqlite::Connection, _: &'static [&'static str]) -> anyhow::Result<String> {
+    let org = ua_core::DEFAULT_ORG.replace('\'', "''");
+    let ttl = webhook::KEEP_DAYS * 86_400;
+    let copy = |table: &str, key: &str, kind: &str, detail: &str| {
+        format!(
+            "INSERT INTO inbound_deliveries \
+             (org_id, source, kind, delivery_key, state, received_at, updated_at, expires_at, detail) \
+             SELECT '{org}', 'github', '{kind}', k, 'finished', t, t, t + {ttl}, d FROM ( \
+               SELECT {key} AS k, {detail} AS d, \
+                      COALESCE(unixepoch(received_at), unixepoch('now')) AS t FROM {table}) \
+             WHERE length(k) BETWEEN 1 AND 256 \
+             ON CONFLICT (org_id, source, kind, delivery_key) DO NOTHING;"
+        )
+    };
+    let sql = [
+        copy("github_deliveries", "delivery_id", "delivery_id", "event"),
+        copy("github_delivery_bodies", "body_sha256", "body_sha256", "delivery_id"),
+    ]
+    .join("\n");
+    conn.execute_batch(&sql)?;
+    Ok(sql)
+}
+
 /// Replay protection by body hash, and the policy-authorization fields the
 /// merge path and `policy_authorization_revoke` need.
 pub const HARDENING_SCHEMA: SchemaPart = SchemaPart {
@@ -104,7 +145,9 @@ pub fn register(r: &mut Registry) {
 }
 
 /// The hub identity GitHub effects run as. Its reach is the grant
-/// [`grant_refusal`] enforces, not its profile.
+/// [`grant_refusal`] enforces. The `operator` profile here only selects the
+/// tool surface; a profile grants no authority, and as a system caller it
+/// holds neither `Operator` nor `LifecycleOperator`.
 pub fn github_caller() -> Caller {
     Caller { label: GITHUB_ACTOR.into(), profile: ua_core::Profile::Operator, ..Caller::system() }
 }
@@ -196,4 +239,26 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
     let payload = json!({ "repo": repo, "head_sha": head, "source": source, "checks": out });
     hub.db().write_async(move |tx| emit(tx, "agent.github.checks_reverified", payload, GITHUB_ACTOR)).await?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    /// The GitHub caller carries the operator profile for its tool surface,
+    /// but that profile grants nothing: it is not an operator for dispatch
+    /// (which an operator-profile caller used to be), nor for the hub view.
+    #[test]
+    fn the_github_caller_holds_no_operator_authority() {
+        let cfg = ua_core::Config { human_identities: vec!["operator".into()], ..ua_core::Config::default() };
+        let gh = github_caller();
+        assert_eq!(gh.profile, ua_core::Profile::Operator);
+        assert!(!crate::families::dispatch::is_operator(&cfg, &gh));
+        assert!(!crate::families::capability::is_operator(&gh, &cfg));
+        assert!(!ua_org::authz::Authz::new(&cfg).holds(
+            &gh,
+            &[ua_org::authz::Authority::Operator, ua_org::authz::Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        ));
+    }
 }

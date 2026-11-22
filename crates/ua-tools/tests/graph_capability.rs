@@ -161,8 +161,8 @@ async fn new_boards_are_capped_per_agent_and_per_hub_but_updates_are_not() {
     hub.db()
         .write(|tx| {
             tx.execute(
-                "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) \
-                 VALUES ('imported', '{}', 'py', '2026-01-01T00:00:00Z')",
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at) \
+                 VALUES ('default', 'imported', '{}', 'py', '2026-01-01T00:00:00Z')",
                 [],
             )?;
             Ok(())
@@ -324,9 +324,9 @@ async fn a_corrupt_stored_scene_reads_as_corrupt() {
     hub.db()
         .write(|tx| {
             tx.execute(
-                "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at) \
-                 VALUES ('bad', '{not json', 'py', '2026-01-01T00:00:00Z'), \
-                        ('list', '[1, 2]', 'py', '2026-01-01T00:00:00Z')",
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at) \
+                 VALUES ('default', 'bad', '{not json', 'py', '2026-01-01T00:00:00Z'), \
+                        ('default', 'list', '[1, 2]', 'py', '2026-01-01T00:00:00Z')",
                 [],
             )?;
             Ok(())
@@ -515,10 +515,17 @@ async fn the_hub_map_is_shown_to_operators_only() {
     assert!(!agents.is_empty());
     assert!(agents.iter().all(|a| a.get("host").is_none()), "{agents:?}");
 
+    // A lifecycle operator and a coordinator-profile agent are not operators:
+    // the hub map is for a verified human only.
+    for who in [
+        caller("ops-bot", ActorKind::Agent, Profile::Developer),
+        caller("boss", ActorKind::Agent, Profile::Coordinator),
+    ] {
+        let view = ok(&reg, &hub, &who, "capability_catalog", json!({})).await;
+        assert_eq!(view["boundaries"], Value::Null, "{}", who.label);
+    }
     let human = caller("operator", ActorKind::Human, Profile::Coordinator);
-    let ops_bot = caller("ops-bot", ActorKind::Agent, Profile::Developer);
-    let boss = caller("boss", ActorKind::Agent, Profile::Coordinator);
-    for who in [human, ops_bot, boss] {
+    for who in [human] {
         let full = ok(&reg, &hub, &who, "capability_catalog", json!({})).await;
         assert_eq!(full["redacted"], json!([]), "{}", who.label);
         assert!(

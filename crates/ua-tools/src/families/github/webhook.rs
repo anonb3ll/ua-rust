@@ -14,12 +14,25 @@
 //! 4. Neither `X-GitHub-Delivery` (a well-formed id) nor the SHA-256 of the
 //!    raw body may have been seen before (`replayed`). The delivery and event
 //!    headers are not covered by the signature, so a signed body re-sent
-//!    under a fresh delivery id is still a replay. Both are kept 30 days, at
-//!    most 20 000 of each, and stored in one transaction.
+//!    under a fresh delivery id is still a replay. Both are recorded in
+//!    `ua_ingress::inbound` (source `github`, kinds `delivery_id` and
+//!    `body_sha256`), kept 30 days, at most 20 000 of each, in one
+//!    transaction, and accepted under this process's claim.
 //!
 //! Then the event is ledgered (`agent.github.webhook.received`) in the same
-//! transaction that stores the delivery id and body hash, and handled only
-//! when its repository is bound to a project:
+//! transaction, and handled only when its repository is bound to a project.
+//! Afterwards both records are marked `finished`; when handling failed with
+//! an internal error they are released instead, so GitHub's redelivery is
+//! processed. A delivery that was accepted but never finished (the hub
+//! stopped while handling it, or it has been in flight for 15 minutes) is
+//! processed again when it is redelivered, not refused: every effect is
+//! idempotent. The ledger event of such a redelivery says
+//! `"redelivered": true`. Settling is by claim: records a redelivery took
+//! over meanwhile are left to it. When the sweep abandons deliveries taken
+//! on and never finished, one `agent.github.webhook.abandoned` event says
+//! how many and which delivery ids.
+//!
+//! Effects, for a bound repository:
 //!
 //! - `pull_request` closed with `merged: true`: close the tasks it finishes
 //!   (close-on-merge rules, `task_update` with the merge commit as evidence).
@@ -37,6 +50,7 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::UaError;
+use ua_ingress::inbound;
 use ua_store::{EventInput, ledger};
 
 use super::client::{BoundRepo, full_sha};
@@ -44,9 +58,18 @@ use super::{GITHUB_ACTOR, github_caller, reverify_head};
 use crate::Hub;
 use crate::families::continuity::merged::{MergedPr, close_merged};
 
-/// Delivery ids kept for replay protection.
-const KEEP_DAYS: i64 = 30;
+/// Delivery ids and body hashes are kept this many days for replay
+/// protection, at most [`KEEP_MAX`] of each.
+pub(crate) const KEEP_DAYS: i64 = 30;
 const KEEP_MAX: i64 = 20_000;
+/// A delivery accepted longer ago than this, or by a process that has
+/// stopped, is taken on again when GitHub redelivers it.
+const IN_FLIGHT_S: i64 = 15 * 60;
+const SOURCE: &str = "github";
+const KIND_ID: &str = "delivery_id";
+const KIND_BODY: &str = "body_sha256";
+const RULES: inbound::Rules =
+    inbound::Rules { ttl_s: KEEP_DAYS * 86_400, in_flight_s: IN_FLIGHT_S, stale: inbound::Stale::Redeliver };
 /// Marks a body-hash replay inside the dedupe transaction.
 const REPLAYED_BODY: &str = "replayed_body";
 
@@ -165,6 +188,10 @@ pub(crate) fn payload_time(event: &str, payload: &Value) -> Option<jiff::Timesta
     fields.iter().filter_map(|(obj, key)| ts(&payload[*obj][*key])).max()
 }
 
+fn record_key<'a>(kind: &'a str, key: &'a str) -> inbound::Delivery<'a> {
+    inbound::Delivery { org_id: ua_core::DEFAULT_ORG, source: SOURCE, kind, key }
+}
+
 fn well_formed(s: &str, max: usize, extra: &[char]) -> bool {
     (1..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
@@ -206,70 +233,121 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
     let bound = hub
         .db()
         .write_async(move |tx| {
-            let now = ua_core::time::now();
-            let cutoff = ua_core::time::format_ts(
-                jiff::Timestamp::now()
-                    .checked_sub(jiff::SignedDuration::from_hours(24 * KEEP_DAYS))
-                    .unwrap_or_else(|_| jiff::Timestamp::now()),
-            );
-            tx.execute("DELETE FROM github_deliveries WHERE received_at < ?1", [&cutoff])?;
-            tx.execute(
-                "DELETE FROM github_deliveries WHERE delivery_id IN (SELECT delivery_id FROM github_deliveries \
-                 ORDER BY received_at DESC LIMIT -1 OFFSET ?1)",
-                [KEEP_MAX - 1],
-            )?;
-            tx.execute("DELETE FROM github_delivery_bodies WHERE received_at < ?1", [&cutoff])?;
-            tx.execute(
-                "DELETE FROM github_delivery_bodies WHERE body_sha256 IN (SELECT body_sha256 FROM \
-                 github_delivery_bodies ORDER BY received_at DESC LIMIT -1 OFFSET ?1)",
-                [KEEP_MAX - 1],
-            )?;
-            let inserted = tx.execute(
-                "INSERT INTO github_deliveries (delivery_id, event, received_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (delivery_id) DO NOTHING",
-                rusqlite::params![dl, ev, now],
-            )?;
-            if inserted == 0 {
+            let now = ua_core::time::now_ms() / 1000;
+            let sweep =
+                inbound::SweepRules { max_per_kind: Some(KEEP_MAX - 1), abandon_after_s: Some(IN_FLIGHT_S) };
+            // One organization per sweep, so every row it abandons belongs to
+            // the organization the event below is written under.
+            let swept = inbound::sweep(tx, ua_core::DEFAULT_ORG, SOURCE, now, sweep)?;
+            debug_assert!(swept.abandoned.iter().all(|a| a.org_id == ua_core::DEFAULT_ORG));
+            if !swept.abandoned.is_empty() {
+                ledger::append(tx, abandoned_event(&swept.abandoned).by(GITHUB_ACTOR.to_string()))?;
+            }
+            let by_id = inbound::record(tx, record_key(KIND_ID, &dl), now, RULES, Some(&ev))?;
+            if let inbound::Sight::Duplicate { .. } = by_id {
                 return Ok(None);
             }
             // The same signed body under a new delivery id is a replay too.
             // Returning here rolls the delivery id back with the transaction.
-            let fresh_body = tx.execute(
-                "INSERT INTO github_delivery_bodies (body_sha256, delivery_id, received_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (body_sha256) DO NOTHING",
-                rusqlite::params![bh, dl, now],
-            )?;
-            if fresh_body == 0 {
+            let by_body = inbound::record(tx, record_key(KIND_BODY, &bh), now, RULES, Some(&dl))?;
+            if let inbound::Sight::Duplicate { .. } = by_body {
                 return Err(UaError::conflict_code(REPLAYED_BODY, "this payload was already processed"));
             }
+            let (Some(id_claim), Some(body_claim)) = (by_id.claim().cloned(), by_body.claim().cloned())
+            else {
+                return Err(UaError::internal("a recorded delivery came back without a claim"));
+            };
+            inbound::accept(tx, record_key(KIND_ID, &dl), &id_claim, now, None)?;
+            inbound::accept(tx, record_key(KIND_BODY, &bh), &body_claim, now, None)?;
             let bound = !rp.is_empty() && BoundRepo::check(tx, &rp).is_ok();
+            let mut payload =
+                json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound });
+            if matches!(by_id, inbound::Sight::Redelivered { .. })
+                || matches!(by_body, inbound::Sight::Redelivered { .. })
+            {
+                payload["redelivered"] = json!(true);
+            }
             ledger::append(
                 tx,
-                EventInput::new(ua_core::DEFAULT_ORG,
-                    "agent.github.webhook.received",
-                    json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound }),
-                )
-                .by(GITHUB_ACTOR.to_string()),
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.github.webhook.received", payload)
+                    .by(GITHUB_ACTOR.to_string()),
             )?;
-            Ok(Some(bound))
+            Ok(Some((bound, id_claim, body_claim)))
         })
         .await
-        .map_err(|e| if e.reason_code() == Some(REPLAYED_BODY) { WebhookError::Replayed } else { WebhookError::from(e) })?;
-    let Some(bound) = bound else { return Err(WebhookError::Replayed) };
+        .map_err(|e| {
+            if e.reason_code() == Some(REPLAYED_BODY) {
+                WebhookError::Replayed
+            } else {
+                WebhookError::from(e)
+            }
+        })?;
+    let Some((bound, id_claim, body_claim)) = bound else { return Err(WebhookError::Replayed) };
     let result = handle(hub, &event, &action, &repo, bound, &payload, &delivery).await;
-    if let Err(WebhookError::Internal(_)) = &result {
-        // Forget the id so GitHub's redelivery of this event is processed;
-        // every effect is idempotent.
-        let (dl, bh) = (delivery.clone(), body_hash);
-        let _ = hub
-            .db()
-            .write_async(move |tx| {
-                tx.execute("DELETE FROM github_delivery_bodies WHERE body_sha256 = ?1", [bh])?;
-                Ok(tx.execute("DELETE FROM github_deliveries WHERE delivery_id = ?1", [dl])?)
-            })
-            .await;
+    // An internal failure releases both records so GitHub's redelivery of
+    // this event is processed (every effect is idempotent); any other
+    // outcome finishes them, so a later copy is a replay. Only records still
+    // under this delivery's claims are settled: one a redelivery took over
+    // meanwhile belongs to that redelivery and is left alone.
+    let retry = matches!(result, Err(WebhookError::Internal(_)));
+    let (dl, bh) = (delivery.clone(), body_hash);
+    let settled = hub
+        .db()
+        .write_async(move |tx| {
+            let now = ua_core::time::now_ms() / 1000;
+            let mut not_mine = Vec::new();
+            for (kind, key, claim) in [(KIND_BODY, &bh, &body_claim), (KIND_ID, &dl, &id_claim)] {
+                let outcome = if retry {
+                    inbound::release(tx, record_key(kind, key), claim)?
+                } else {
+                    inbound::finish(tx, record_key(kind, key), claim, now)?
+                };
+                if let inbound::Settle::NotMine { state } = outcome {
+                    not_mine.push((kind, state.map(inbound::State::as_str).unwrap_or("gone")));
+                }
+            }
+            Ok(not_mine)
+        })
+        .await;
+    match settled {
+        Ok(not_mine) => {
+            for (kind, state) in not_mine {
+                tracing::info!(
+                    delivery_id = %delivery,
+                    kind,
+                    state,
+                    "a GitHub delivery record was taken over or settled by another handler; left as it is"
+                );
+            }
+        }
+        // The response stands. The records stay accepted, and a redelivery
+        // after the in-flight bound is processed again.
+        Err(e) => tracing::warn!(code = e.code(), "could not settle a GitHub delivery record"),
     }
     result
+}
+
+/// Most delivery ids one `agent.github.webhook.abandoned` event lists.
+const ABANDONED_IDS_MAX: usize = 50;
+
+/// `agent.github.webhook.abandoned`: deliveries the sweep found taken on and
+/// never finished (the hub stopped, or they passed the in-flight bound).
+/// Each may never have been handled. The count, the count per kind and up
+/// to [`ABANDONED_IDS_MAX`] delivery ids; never a body or a body hash.
+fn abandoned_event(rows: &[inbound::Abandoned]) -> EventInput {
+    let per_kind = |k: &str| rows.iter().filter(|a| a.kind == k).count();
+    let ids: Vec<&str> =
+        rows.iter().filter(|a| a.kind == KIND_ID).map(|a| a.key.as_str()).take(ABANDONED_IDS_MAX).collect();
+    EventInput::new(
+        ua_core::DEFAULT_ORG,
+        "agent.github.webhook.abandoned",
+        json!({
+            "count": rows.len(),
+            "kinds": { KIND_ID: per_kind(KIND_ID), KIND_BODY: per_kind(KIND_BODY) },
+            "delivery_ids": ids,
+            "delivery_ids_truncated": per_kind(KIND_ID) > ids.len(),
+        }),
+    )
 }
 
 async fn handle(

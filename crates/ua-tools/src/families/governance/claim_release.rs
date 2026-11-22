@@ -29,10 +29,11 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::{clean_reason, is_operator, now, verified_actor};
+use super::{clean_reason, now, verified_actor};
 use crate::families::dispatch::live_run_for_task;
 use crate::families::tasks::{is_terminal, next_revision, require_task, str_field, task_reply};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +63,11 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             "expected_claimant is required: name the agent whose claim you release",
         ));
     }
-    if !is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "not_lifecycle_operator",
             format!(
@@ -71,11 +76,12 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             ),
         ));
     }
-    let authority = if ctx.caller.is_human() || ctx.hub.cfg().is_human(&who) {
-        "human_operator"
-    } else {
-        "lifecycle_operator"
-    };
+    let authority =
+        if Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+            "human_operator"
+        } else {
+            "lifecycle_operator"
+        };
     let reason = clean_reason(a.reason.as_deref(), Some("release another agent's claim"))?;
     let expected_claimed_at = match a.expected_claimed_at.as_deref().map(str::trim) {
         Some("") => return Err(UaError::invalid("expected_claimed_at must be a non-empty claim generation")),

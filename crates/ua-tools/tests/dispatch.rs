@@ -100,6 +100,25 @@ impl H {
         serde_json::from_str(text.as_str().unwrap()).unwrap()
     }
 
+    /// The payloads of the `agent.approval.refused` events, oldest first.
+    fn refused(&self) -> Vec<Value> {
+        self.hub
+            .db()
+            .read(|c| {
+                ua_store::ledger::query(
+                    c,
+                    &ua_store::ledger::EventQuery {
+                        channels: Some(vec!["agent.approval.refused".into()]),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect()
+    }
+
     fn sql(&self, stmt: &str) {
         let stmt = stmt.to_string();
         self.hub
@@ -327,9 +346,14 @@ async fn illegal_transitions_are_refused() {
     assert!(e.to_string().contains("terminal_finished"), "{e}");
     assert_eq!(h.scalar(&format!("SELECT state FROM dispatch_runs WHERE run_id = '{rid2}'")), "finished");
 
-    // The operator-only tools refuse other profiles at the gateway.
+    // The operator-only tools refuse other profiles at the gateway...
     let e = h.err(&me, "dispatch_confirm_cancellation", json!({ "run_id": rid })).await;
     assert_eq!(reason(&e), "profile_denied");
+    // ...and the operator profile alone is not an operator: a human is.
+    for tool in ["dispatch_confirm_cancellation", "dispatch_retry_cancellation"] {
+        let e = h.err(&operator_agent("ops-1"), tool, json!({ "run_id": rid })).await;
+        assert_eq!(reason(&e), "operator_authorization_required", "{tool}");
+    }
     // An operator can close out a blocked run, never a finished one.
     let e = h.err(&human(), "dispatch_confirm_cancellation", json!({ "run_id": rid2 })).await;
     assert!(e.to_string().contains("not_reconcilable"), "{e}");
@@ -513,6 +537,18 @@ async fn the_approval_binds_the_resolved_workdir_argv_and_prompt() {
     assert_eq!(reason(&e), "approval_binding_changed", "{e}");
     assert!(e.to_string().contains("prompt_sha256"), "{e}");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM dispatch_runs"), json!(0), "nothing ran");
+    // The refusal is ledgered with the pass it no longer matches.
+    let refused = h.refused();
+    let r = refused.last().expect("a binding_changed refusal event");
+    assert_eq!(
+        (r["reason"].as_str(), r["approval_id"].as_i64()),
+        (Some("binding_changed"), Some(approval_id)),
+        "{r}"
+    );
+    assert_eq!((r["tool"].as_str(), r["task_id"].as_i64()), (Some("dispatch_task"), Some(tid)), "{r}");
+    assert_eq!(r["changed_fields"], json!(["prompt_sha256", "prompt_bytes", "prompt_text"]), "{r}");
+    assert_ne!(r["approved_payload_sha256"], r["presented_payload_sha256"], "{r}");
+    assert!(!r.to_string().contains("backups"), "no payload content: {r}");
     assert_eq!(
         h.scalar(&format!("SELECT status FROM approvals WHERE id = {approval_id}")),
         "approved",
@@ -651,11 +687,18 @@ async fn dispatch_task_checks_the_caller_against_the_agent() {
     assert_eq!(reason(&h.err(&lead(), "dispatch_task", args.clone()).await), "identity_mismatch");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals"), json!(0), "a refused caller requests nothing");
 
-    // The agent itself, an operator-profile agent and a human may.
-    for who in [agent("agent-1"), operator_agent("ops-1"), Caller { label: "lead-human".into(), ..human() }] {
+    // The agent itself and a human may; the operator profile grants nothing.
+    for who in [agent("agent-1"), Caller { label: "lead-human".into(), ..human() }] {
         let e = h.err(&who, "dispatch_task", args.clone()).await;
         assert_eq!(e.code(), "approval_required", "{}: {e}", who.label);
     }
+    assert_eq!(
+        reason(&h.err(&operator_agent("ops-1"), "dispatch_task", args.clone()).await),
+        "identity_mismatch"
+    );
+    // Nor an unattended routine running under the human's label.
+    let routine = Caller { kind: ActorKind::Agent, ..human() };
+    assert_eq!(reason(&h.err(&routine, "dispatch_task", args.clone()).await), "identity_mismatch");
 
     // A harness that passes the agent's token says so on the approval.
     let tid2 = h.task().await;
@@ -910,6 +953,15 @@ mod spawn {
         let e = h.err(&agent("agent-1"), "dispatch_resume", json!({ "run_id": rid })).await;
         assert_eq!(reason(&e), "approval_binding_changed", "{e}");
         assert!(e.to_string().contains("timeout_s, output_cap_bytes"), "{e}");
+        // Refused inside the resume's write, which rolls back; the event stays.
+        let refused = h.refused();
+        let r = refused.last().expect("a binding_changed refusal event");
+        assert_eq!(
+            (r["reason"].as_str(), r["tool"].as_str()),
+            (Some("binding_changed"), Some("dispatch_resume")),
+            "{r}"
+        );
+        assert_eq!(r["changed_fields"], json!(["timeout_s", "output_cap_bytes"]), "{r}");
     }
 
     #[tokio::test]
@@ -924,17 +976,19 @@ mod spawn {
         let e = h.err(&agent("agent-2"), "dispatch_cancel", json!({ "run_id": rid })).await;
         assert_eq!(reason(&e), "identity_mismatch", "a peer still cannot cancel it");
 
-        let c = h
-            .ok(&operator_agent("ops-1"), "dispatch_cancel", json!({ "run_id": rid, "reason": "runaway" }))
-            .await;
+        // The operator profile grants nothing: an operator-profile agent is a peer.
+        let e = h.err(&operator_agent("ops-1"), "dispatch_cancel", json!({ "run_id": rid })).await;
+        assert_eq!(reason(&e), "identity_mismatch");
+
+        let c = h.ok(&human(), "dispatch_cancel", json!({ "run_id": rid, "reason": "runaway" })).await;
         assert_eq!(c["ok"], true, "{c}");
         assert_eq!(c["termination"], "killed");
         assert_eq!(c["cessation"], "confirmed");
-        assert_eq!(c["cancelled_by"], "ops-1");
+        assert_eq!(c["cancelled_by"], "operator");
         let r = h.wait_for(&rid, |r| r["exit"]["signal"].is_i64()).await;
         assert_eq!(r["run_state"], "cancelled");
-        assert_eq!(r["cancelled_by"], "ops-1");
-        assert!(r["receipts"].as_array().unwrap().iter().any(|x| x["reported_by"] == "ops-1"));
+        assert_eq!(r["cancelled_by"], "operator");
+        assert!(r["receipts"].as_array().unwrap().iter().any(|x| x["reported_by"] == "operator"));
         assert!(!executor::pid_is_alive(Some(pid)));
 
         // A human can cancel too.

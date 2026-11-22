@@ -861,4 +861,84 @@ mod socket {
         executed(&r.hub, CAP + 1).await;
         r.ct.cancel();
     }
+
+    // --- a delivery never runs twice ----------------------------------------------
+
+    /// An `accepted` Slack delivery row as a stopped process left it.
+    async fn plant_accepted(h: &TestHub, kind: &'static str, key: &'static str, at: i64) {
+        h.state
+            .hub
+            .db()
+            .write_async(move |tx| {
+                tx.execute(
+                    "INSERT INTO inbound_deliveries (org_id, source, kind, delivery_key, state, received_at, \
+                     updated_at, expires_at, claim, identity) VALUES ('default', 'slack', ?1, ?2, 'accepted', \
+                     ?3, ?3, ?4, 'a-stopped-process:0', 'operator')",
+                    rusqlite::params![kind, key, at, at + 86_400],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_delivery_admitted_and_never_finished_never_runs_over_the_socket() {
+        let (r, mut c) = rig().await;
+        // One clock reading for every planted row.
+        let t = ua_core::time::now_ms() / 1000;
+        plant_accepted(&r.hub, "trigger", "7.9.swept", t - 60).await;
+        plant_accepted(&r.hub, "event", "Ev0SWEPT", t - 60).await;
+        assert_eq!(ua_server::slack_api::sweep_abandoned(&r.hub.state.hub).await.unwrap(), 2);
+        plant_accepted(&r.hub, "trigger", "7.9.stopped", t - 60).await;
+        plant_accepted(&r.hub, "event", "Ev0STOPPED", t - 60).await;
+
+        c.send(slash("env-s1", HUMAN, "/task", "again", "7.9.stopped"));
+        assert_eq!(c.recv().await["payload"]["text"], "Already received.");
+        c.send(slash("env-s2", HUMAN, "/task", "again", "7.9.swept"));
+        assert_eq!(c.recv().await["payload"]["text"], "Already received.");
+        c.send(event("env-s3", HUMAN, "Ev0STOPPED", "app_mention", "<@U0BOT> !task again"));
+        assert_eq!(c.recv().await, json!({ "envelope_id": "env-s3" }));
+        c.send(event("env-s4", HUMAN, "Ev0SWEPT", "app_mention", "<@U0BOT> !task again"));
+        assert_eq!(c.recv().await, json!({ "envelope_id": "env-s4" }));
+        // Wait until all four admissions are ledgered, then check none ran.
+        for _ in 0..250 {
+            if events(&r.hub, "agent.slack.request.deduped").await.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(events(&r.hub, "agent.slack.request.deduped").await.len(), 4);
+        assert!(events(&r.hub, "agent.slack.request.accepted").await.is_empty());
+        assert!(events(&r.hub, "agent.slack.request.executed").await.is_empty());
+        assert_eq!(tasks(&r.hub).await, 0, "nothing ran");
+        r.ct.cancel();
+    }
+
+    #[tokio::test]
+    async fn the_same_envelope_twice_at_once_runs_one_command() {
+        let (r, mut c) = rig().await;
+        let twin = slash("env-twin", HUMAN, "/task", "once", "7.9.twin");
+        // Sent back to back, before either is acknowledged.
+        c.send(twin.clone());
+        c.send(twin);
+        let mut acks = [c.recv().await, c.recv().await];
+        acks.sort_by_key(|a| a.get("payload").is_none());
+        assert!(acks[0]["payload"]["text"].as_str().unwrap().starts_with("Accepted"), "{acks:?}");
+        assert_eq!(acks[1], json!({ "envelope_id": "env-twin" }), "the copy is acknowledged, not run");
+        // Two envelopes carrying one trigger id, at once.
+        c.send(slash("env-p1", HUMAN, "/task", "pair", "7.9.pair"));
+        c.send(slash("env-p2", HUMAN, "/task", "pair", "7.9.pair"));
+        let texts: Vec<String> = [c.recv().await, c.recv().await]
+            .iter()
+            .map(|a| a["payload"]["text"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(texts.iter().filter(|t| t.starts_with("Accepted")).count(), 1, "{texts:?}");
+        assert_eq!(texts.iter().filter(|t| *t == "Already received.").count(), 1, "{texts:?}");
+        executed(&r.hub, 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(tasks(&r.hub).await, 2, "one command per delivery");
+        r.ct.cancel();
+    }
 }

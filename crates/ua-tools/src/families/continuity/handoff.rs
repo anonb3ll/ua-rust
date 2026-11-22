@@ -49,10 +49,10 @@ use ua_store::{EventInput, WriteTx, ledger};
 
 use crate::families::agents::verified;
 use crate::families::audit::rules::redact_secrets;
-use crate::families::governance;
 use crate::families::injection::mark_untrusted;
 use crate::families::tasks::{acting_identity, row_object};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.lifecycle.handoff";
 const COOLDOWN_SECS: i64 = 5 * 60;
@@ -237,8 +237,8 @@ fn check_limits(conn: &Connection, session_id: &str, now: jiff::Timestamp) -> Ua
 }
 
 /// The session's latest committed note (sealed, assigned or delivered), never
-/// a draft, marked untrusted. For `session_handoff_recover` and the packet.
-pub(crate) fn latest_committed_note(conn: &Connection, session_id: &str) -> UaResult<Option<Value>> {
+/// a draft, marked untrusted.
+fn latest_committed_note(conn: &Connection, session_id: &str) -> UaResult<Option<Value>> {
     let note = conn
         .query_row(
             "SELECT * FROM session_handoff_notes WHERE session_id = ?1 \
@@ -253,6 +253,32 @@ pub(crate) fn latest_committed_note(conn: &Connection, session_id: &str) -> UaRe
         mark_untrusted(&mut n, "handoff_note", author.as_deref());
         n
     }))
+}
+
+/// Apply the same note visibility to the recovery tool and the resume packet.
+pub(crate) fn recover_note(conn: &Connection, session_id: &str, ctx: &ToolCtx) -> UaResult<Option<Value>> {
+    let who = verified(&ctx.caller);
+    let maintainer = who.is_some()
+        && Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        );
+    let owner: Option<String> = conn
+        .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [session_id], |r| r.get(0))
+        .optional()?;
+    let note = latest_committed_note(conn, session_id)?;
+    let allowed = maintainer
+        || who.is_some_and(|who| {
+            owner.as_deref() == Some(who)
+                || note.as_ref().is_some_and(|n| {
+                    ["agent", "assigned_to", "delivered_to"].iter().any(|k| n[*k].as_str() == Some(who))
+                })
+        });
+    if !allowed {
+        return Err(UaError::not_found(format!("session {session_id} not found")));
+    }
+    Ok(note)
 }
 
 // --- actions ------------------------------------------------------------------------
@@ -451,25 +477,10 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
     }
-    let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.as_deref().is_some_and(|w| governance::is_operator(ctx.hub.cfg(), &ctx.caller, w));
-    ctx.hub
-        .db()
+    let hub = ctx.hub.clone();
+    hub.db()
         .read_async(move |c| {
-            let owner: Option<String> = c
-                .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [&sid], |r| r.get(0))
-                .optional()?;
-            let note = latest_committed_note(c, &sid)?;
-            let allowed = operator
-                || who.as_deref().is_some_and(|w| {
-                    owner.as_deref() == Some(w)
-                        || note.as_ref().is_some_and(|n| {
-                            ["agent", "assigned_to", "delivered_to"].iter().any(|k| n[*k].as_str() == Some(w))
-                        })
-                });
-            if !allowed {
-                return Err(UaError::not_found(format!("session {sid} not found")));
-            }
+            let note = recover_note(c, &sid, &ctx)?;
             Ok(json!({ "session_id": sid, "note": note }))
         })
         .await

@@ -34,10 +34,13 @@
 //! the last source `rowid` copied. Each batch and its progress row commit
 //! together, so a re-run continues after the last committed batch.
 
-mod lock;
 mod map;
 
-pub use lock::{HubLock, lock_path};
+/// The database locks, which live in `ua_store::lock` (opening the database
+/// needs the serve lock); re-exported so the names here keep working.
+pub use ua_store::lock::{
+    HubLock, ServeLock, canonical_db_path, lock_path, refuse_if_served, serve_lock_path,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -265,6 +268,7 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
     let mut cleared_runs = 0u64;
     let mut cleared_run_ids = Vec::new();
     let mut cleared_branches = 0u64;
+    let src_has_sqlite_sequence = has_sqlite_sequence(&src)?;
     for map in MAPS {
         let idx = report
             .tables
@@ -289,6 +293,9 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             cleared_branches += eff.binding_branches_cleared;
             if let Some(sr) = map.self_ref {
                 fix_self_ref(&src, db, map, sr)?;
+            }
+            if src_has_sqlite_sequence {
+                carry_sqlite_sequence(&src, db, map)?;
             }
         }
         copied_any |= rep.copied > 0;
@@ -519,6 +526,9 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     let append_event_seq = map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_seq");
     if append_event_seq {
         insert_cols.push("event_seq".into());
+    }
+    if map.kind == Kind::GraphCanvas {
+        insert_cols.push("org_id".into());
     }
     if map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_ulid") {
         bail!("source message_index has no event_ulid column; cannot link messages to the ledger");
@@ -812,9 +822,11 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
         let rows = stmt.query_map([map.target], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     })?;
-    // A key made only of copied columns, or the `rowid` mapped to a column.
+    // A key whose values come from copied columns, the default org, or the source rowid.
     let mut keys: Vec<Vec<String>> = Vec::new();
-    if !pk.is_empty() && pk.iter().all(|c| plan.cols.contains(c)) {
+    if !pk.is_empty()
+        && pk.iter().all(|c| plan.cols.contains(c) || (map.kind == Kind::GraphCanvas && c == "org_id"))
+    {
         keys.push(pk);
     }
     if let Some(r) = map.rowid_to {
@@ -861,6 +873,9 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                 } else {
                     key.iter()
                         .map(|k| {
+                            if map.kind == Kind::GraphCanvas && k == "org_id" {
+                                return SqlValue::Text(ua_core::DEFAULT_ORG.into());
+                            }
                             let raw = col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null);
                             if map.kind == Kind::ProjectRepoBindings
                                 && k == "project"
@@ -1039,6 +1054,9 @@ fn copy_table(
                     if plan.append_event_seq {
                         vals.push(SqlValue::Null);
                     }
+                    if map.kind == Kind::GraphCanvas {
+                        vals.push(SqlValue::Text(ua_core::DEFAULT_ORG.into()));
+                    }
                     if let (Some(si), Some(ui)) = (seq_idx, ulid_idx)
                         && map.kind == Kind::MessageIndex
                     {
@@ -1111,6 +1129,72 @@ fn fix_self_ref(src: &Connection, db: &Db, map: &TableMap, sr: Ref) -> anyhow::R
         Ok(())
     })
     .with_context(|| format!("restoring {}.{}", map.target, sr.col))
+}
+
+fn has_sqlite_sequence(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// Raise a non-ledger target AUTOINCREMENT table's `sqlite_sequence` counter
+/// to at least the source's counter so post-cutover inserts never reuse a
+/// deleted or skipped id (for example, a deleted task id still referenced by
+/// an active `task_holds.root_task_id`, or a skipped approval id).
+///
+/// Never touches `event_log`, never lowers an existing target sequence or
+/// `MAX(rowid)`, never creates duplicate `sqlite_sequence` rows, and skips
+/// target tables that do not use `AUTOINCREMENT`.
+fn carry_sqlite_sequence(src: &Connection, db: &Db, map: &TableMap) -> anyhow::Result<()> {
+    let source_seq: Option<i64> = src.query_row(
+        "SELECT MAX(seq) FROM sqlite_sequence WHERE name = ?1 AND typeof(seq) = 'integer'",
+        [map.source],
+        |r| r.get(0),
+    )?;
+    let Some(source_seq) = source_seq.filter(|&s| s > 0) else {
+        return Ok(());
+    };
+    db.write(|tx| {
+        let target_is_autoinc: bool = tx
+            .query_row(
+                "SELECT COALESCE(upper(sql), '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [map.target],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|sql| sql.contains("AUTOINCREMENT") && !sql.contains("WITHOUT ROWID"));
+        if !target_is_autoinc {
+            return Ok(());
+        }
+        let max_rowid: i64 =
+            tx.query_row(&format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", q(map.target)), [], |r| {
+                r.get(0)
+            })?;
+        let (existing_seq, row_count): (Option<i64>, i64) = tx.query_row(
+            "SELECT MAX(seq), COUNT(*) FROM sqlite_sequence WHERE name = ?1",
+            [map.target],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let floor = existing_seq.unwrap_or(0).max(max_rowid);
+        if source_seq > floor {
+            if row_count == 0 {
+                tx.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    params![map.target, source_seq],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = ?2",
+                    params![source_seq, map.target],
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .with_context(|| format!("carrying sqlite_sequence for {}", map.target))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
