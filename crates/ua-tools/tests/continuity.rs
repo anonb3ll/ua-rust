@@ -629,8 +629,11 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
     let task = h.ok(&other(), "task_list", json!({ "status": "all" })).await;
     let row = task["tasks"].as_array().unwrap().iter().find(|r| r["id"] == t).unwrap().clone();
     assert_eq!(row["priority"], "high");
-    assert!(row["notes"].as_str().unwrap().contains("[conversation: conv-1]"));
-    assert!(!row["notes"].as_str().unwrap().contains("secret plan"), "the transcript is never copied");
+    assert!(
+        !row["notes"].as_str().unwrap_or("").contains("[conversation:"),
+        "the conversation id never reaches the task"
+    );
+    assert!(!row["notes"].as_str().unwrap_or("").contains("secret plan"), "the transcript is never copied");
 
     // A repeat returns the same task.
     let again = h
@@ -642,8 +645,20 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
         .await;
     assert_eq!((again["task_id"].as_i64(), again["created"].as_bool()), (Some(t), Some(false)));
 
-    // Link an existing task, twice: one note line.
+    // Link an existing task, twice: the task's notes and updated_at never
+    // move, and the second link records no new event.
     let existing = h.task("Existing work", None).await;
+    let before: (Option<String>, String) = {
+        let id = existing;
+        h.hub
+            .db()
+            .read(move |c| {
+                Ok(c.query_row("SELECT notes, updated_at FROM tasks WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?)
+            })
+            .unwrap()
+    };
     for _ in 0..2 {
         let linked = h
             .act_ok(
@@ -653,22 +668,41 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
             )
             .await;
         assert_eq!(linked["created"], false);
+        assert!(linked.get("reference").is_none(), "{linked}");
     }
-    let notes: String = {
+    let after: (Option<String>, String) = {
         let id = existing;
         h.hub
             .db()
-            .read(move |c| Ok(c.query_row("SELECT notes FROM tasks WHERE id = ?1", [id], |r| r.get(0))?))
+            .read(move |c| {
+                Ok(c.query_row("SELECT notes, updated_at FROM tasks WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?)
+            })
             .unwrap()
     };
-    assert_eq!(notes.matches("[conversation: conv-1]").count(), 1);
+    assert_eq!(after, before, "linking touches neither notes nor updated_at");
 
     let listed = h.act_ok(&builder(), "conversation_handoffs", json!({ "conversation_id": "conv-1" })).await;
     let ids: Vec<i64> =
         listed["handoffs"].as_array().unwrap().iter().map(|r| r["task_id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![t, existing]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-2");
+    for row in listed["handoffs"].as_array().unwrap() {
+        assert_eq!(row["note_reference"], false, "{row}");
+    }
     assert_eq!(h.events("agent.conversation.handoff"), 2, "one event per participant and task");
+
+    // A profile without task_update cannot link. An allow-list profile is
+    // refused the consolidated action before the handler's own check.
+    let e = h
+        .act_err(
+            &researcher(),
+            "conversation_handoff",
+            json!({ "conversation_id": "conv-1", "task_id": existing }),
+        )
+        .await;
+    assert_eq!(reason(&e), "action_denied", "{e:?}");
 
     // Validation.
     for bad in [
@@ -1172,7 +1206,7 @@ async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_l
     assert_eq!(ids("handoffs"), vec![real]);
     assert_eq!(ids("unaudited"), vec![forged]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-1");
-    assert_eq!(listed["handoffs"][0]["note_reference"], true);
+    assert_eq!(listed["handoffs"][0]["note_reference"], false, "the audited link writes no notes line");
     // A human sees every conversation; a coordinator-profile agent, like an
     // outsider, sees none (a profile grants nothing).
     h.act_ok(&human(), "conversation_handoffs", params.clone()).await;
