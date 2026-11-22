@@ -57,8 +57,10 @@ pub enum Addresses {
 }
 
 impl Addresses {
-    /// The address class this rule is built on.
-    pub fn class(self) -> addr::Class {
+    /// The range tables `check` starts from. Private, so that no decision
+    /// can be made from the class alone: `LoopbackOnly` and the relaxed
+    /// classes differ from it, and only [`Addresses::check`] knows how.
+    fn base_class(self) -> addr::Class {
         match self {
             Addresses::Public
             | Addresses::PublicOrLoopback
@@ -70,6 +72,10 @@ impl Addresses {
 
     /// `Err` with the reason when a connection to `ip` is not allowed.
     pub fn check(self, ip: IpAddr) -> Result<(), &'static str> {
+        // Refused whatever the class, before any relaxation applies.
+        if addr::is_cloud_metadata(ip) {
+            return Err("cloud metadata");
+        }
         if self == Addresses::LoopbackOnly {
             return if addr::is_loopback(ip) {
                 Ok(())
@@ -77,7 +83,7 @@ impl Addresses {
                 Err(addr::non_public_reason(ip).unwrap_or("not loopback"))
             };
         }
-        match addr::reason_in(ip, self.class()) {
+        match addr::reason_in(ip, self.base_class()) {
             None => Ok(()),
             Some(_) if self == Addresses::PublicOrLoopback && addr::is_loopback(ip) => Ok(()),
             Some(_)
@@ -484,11 +490,39 @@ mod tests {
     #[test]
     fn the_operator_class_admits_private_networks_and_nothing_else_extra() {
         let op = Addresses::OperatorConfigured;
-        for yes in ["8.8.8.8", "127.0.0.1", "::1", "10.1.2.3", "172.16.5.4", "192.168.1.10", "fd00::7"] {
+        for yes in [
+            "8.8.8.8",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "10.1.2.3",
+            "::ffff:10.1.2.3",
+            "172.16.5.4",
+            "192.168.1.10",
+            "::ffff:192.168.1.10",
+            "100.100.100.201",
+            "fd00::7",
+            "fd00:ec2::253",
+            "fd20:ce::1",
+            "64:ff9b::808:808",
+        ] {
             assert!(op.check(yes.parse().unwrap()).is_ok(), "{yes}");
         }
         for (no, why) in [
+            ("100.100.100.200", "cloud metadata"),
+            ("::ffff:100.100.100.200", "cloud metadata"),
+            ("::ffff:0:100.100.100.200", "cloud metadata"),
+            ("64:ff9b::100.100.100.200", "cloud metadata"),
+            ("fd00:ec2::254", "cloud metadata"),
+            ("fd20:ce::254", "cloud metadata"),
             ("169.254.169.254", "link-local (includes cloud metadata)"),
+            ("::ffff:169.254.169.254", "link-local (includes cloud metadata)"),
+            ("64:ff9b::169.254.169.254", "link-local (includes cloud metadata)"),
+            // Only the mapped form of a private address is a private network.
+            ("::ffff:0:10.1.2.3", "private"),
+            ("64:ff9b::10.1.2.3", "private"),
+            ("2002:a01:203::", "private"),
+            ("::10.1.2.3", "private"),
             ("fe80::1", "link-local"),
             ("0.0.0.0", "unspecified"),
             ("224.0.0.1", "multicast"),
@@ -504,6 +538,32 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(users, ["github.enterprise", "notify.webhook"]);
+    }
+
+    #[test]
+    fn every_class_refuses_cloud_metadata_and_loopback_only_refuses_public() {
+        let all = [
+            Addresses::Public,
+            Addresses::GlobalUnicastOnly,
+            Addresses::PublicOrLoopback,
+            Addresses::OperatorConfigured,
+            Addresses::LoopbackOnly,
+        ];
+        for a in all {
+            for m in ["100.100.100.200", "::ffff:100.100.100.200", "fd00:ec2::254", "fd20:ce::254"] {
+                assert_eq!(a.check(m.parse().unwrap()), Err("cloud metadata"), "{a:?} {m}");
+            }
+        }
+        // LoopbackOnly is decided by `check` alone (there is no public class
+        // accessor to misuse): public addresses are refused.
+        for public in ["8.8.8.8", "2606:4700:4700::1111", "64:ff9b::808:808"] {
+            assert_eq!(
+                Addresses::LoopbackOnly.check(public.parse().unwrap()),
+                Err("not loopback"),
+                "{public}"
+            );
+        }
+        assert!(Addresses::LoopbackOnly.check("::1".parse().unwrap()).is_ok());
     }
 
     #[test]

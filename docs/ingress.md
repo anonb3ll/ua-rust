@@ -36,6 +36,14 @@ Refused in both classes:
   and no current transition mechanism produces it, so no reachable
   destination has such an address.
 
+`addr::is_cloud_metadata` names the well-known cloud instance-metadata
+addresses that are not link-local: `100.100.100.200` (in the shared address
+space), `fd00:ec2::254` and `fd20:ce::254` (in unique local space), and any
+IPv6 form that carries the IPv4 one. Both classes refuse them anyway; every
+outbound address rule (`Addresses::check`) refuses them first, with the
+reason `cloud metadata`, before any relaxation applies. The common
+`169.254.169.254` is link-local and refused as such.
+
 The classes differ only on NAT64 and 6to4 forms of a public IPv4 address:
 `Public` judges them by that address and admits them (on an IPv6-only
 network behind DNS64, every IPv4-only site resolves to a NAT64 address);
@@ -68,9 +76,13 @@ configuration, never for a URL a caller supplies: the public class plus
 loopback and private networks (`addr::is_private_network`: RFC 1918, the
 shared address space `100.64.0.0/10` that carrier-grade NAT and mesh VPNs
 use, unique local `fc00::/7`, and the IPv4-mapped form of the IPv4 ranges).
-It still refuses unspecified, link-local (cloud metadata), multicast,
-broadcast and reserved, documentation, benchmarking and IETF protocol
-addresses. A policy with this class follows no redirect, since a redirect
+It still refuses the cloud-metadata addresses above (including the ones
+inside the shared and unique local ranges it otherwise admits), unspecified,
+link-local, multicast, broadcast and reserved, documentation, benchmarking
+and IETF protocol addresses, and every IPv6 form of a private IPv4 address
+other than the mapped one. Only `Addresses::check` decides: the class's
+base range table is private to it, so no caller can judge an address by a
+looser class than the rule. A policy with this class follows no redirect, since a redirect
 target is the server's choice, not the operator's. Only `ua_ingress::policy`
 names the class, and each policy that uses it is named by one consumer
 file only (`tests/ingress_guard.rs`, `relaxed_policies_stay_with_their_one_consumer`).
@@ -82,6 +94,11 @@ certificate. `validate` refuses it unless the class is `LoopbackOnly` and no
 redirect is followed, the loopback test hook never widens a `LoopbackOnly`
 class, and the same ratchet test keeps the field's name out of every other
 crate.
+
+A limit that predates this policy: the client cannot tell the plugin from
+any other local process. Whatever answers on the configured loopback port,
+over plain http or with any certificate, receives the API key. Run the hub
+only where no untrusted local process can bind that port.
 
 Each property is enforced in the crate and has a test there:
 
@@ -435,7 +452,10 @@ The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
 neither settable from TOML or the environment) apply
 `Policy::loopback_test_hook`: loopback admitted besides public addresses,
 plain http, any host and port; everything else unchanged. A policy whose
-class already admits loopback (`OperatorConfigured`) keeps its class.
+class already admits loopback keeps its class: `OperatorConfigured` stays
+operator-configured, and `LoopbackOnly` (the Obsidian policy) stays
+loopback-only, so the hook never lets an unverified-certificate policy
+reach a public address.
 
 ## Planned slices
 

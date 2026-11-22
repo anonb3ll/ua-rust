@@ -191,6 +191,11 @@ from its commit history.
   where the target has the column (`event_log`, the harness config tables).
   Such rows are refused unless `--drop-org-scope` is given. Before this,
   `harness_config_bundles.org_id` was copied verbatim.
+- Upgrade note: notification webhooks (`notify_webhook_url`) no longer use
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or the system proxy settings; they
+  connect directly. An operator whose hub reaches its webhook receiver only
+  through a proxy must make the receiver reachable directly (the Obsidian
+  client, which also honoured them, talks to loopback only).
 - Upgrade note: a backup taken after `organization.v1.store` applied cannot be
   restored by an earlier build, even with `--allow-newer`, because that build
   sees `event_log` as an altered table and refuses. Older backups restore into
@@ -422,6 +427,21 @@ from its commit history.
     secret header could travel through a proxy);
   - requests carry the hub's `User-Agent` (`ua-rust/<version>`; there was
     none).
+- Every outbound address rule now refuses the well-known cloud
+  instance-metadata addresses that are not link-local, with the reason
+  `cloud metadata`: `100.100.100.200` and `fd00:ec2::254`, `fd20:ce::254`,
+  and any IPv6 form that carries the IPv4 one (mapped, translated, NAT64,
+  6to4). `OperatorConfigured` (GHES, notify webhooks) admitted them inside
+  the shared address space and unique local space; the rest of both ranges
+  is still reachable. The public classes refused them already, under their
+  range's reason.
+- `Addresses::class()` is gone: it returned the public range table for
+  `LoopbackOnly` too, so a caller deciding by it would have admitted public
+  addresses. Every decision goes through `Addresses::check`.
+- GitHub REST: `github_api_url` spelled with a trailing dot or in another
+  case (`https://API.GitHub.com.`) is the public API, gets `github.rest`, and
+  is normalised to `api.github.com`; before, a trailing dot selected
+  `github.enterprise`.
 
 ### Security
 
