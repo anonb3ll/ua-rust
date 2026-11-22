@@ -12,6 +12,12 @@
 //! judges a stale in-flight delivery by "a claim that is not this process's"
 //! (`docs/ingress.md`, Limits). Other commands never take it, so `ua mcp`,
 //! `ua call`, backups and the rest run beside a serve as before.
+//!
+//! The locks live in the store because opening the database depends on the
+//! serve lock: [`crate::Db::open`] refuses to migrate a database while another
+//! process holds it ([`refuse_if_served`]), unless the caller hands it the
+//! held [`ServeLock`] of that database as proof that it is the serving
+//! process ([`crate::Fence::serving`]). `ua_import` re-exports these names.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -208,9 +214,15 @@ fn open_lock_file(path: &Path) -> anyhow::Result<File> {
 /// The one-serving-process lock. `ua serve` takes it exclusively for the life
 /// of the process, before it opens the database; the OS releases it when the
 /// process exits or crashes.
+///
+/// A `ServeLock` can only be had from [`ServeLock::acquire`], so holding one
+/// proves this process is the one serving that database; [`crate::Fence::serving`]
+/// takes it as the only way to skip the migration guard.
 #[derive(Debug)]
 pub struct ServeLock {
     _file: File,
+    /// The database it locks, as [`canonical_db_path`] resolved it.
+    db: PathBuf,
 }
 
 /// How often, and how long apart, `ua serve` retries its lock before
@@ -246,14 +258,20 @@ impl ServeLock {
                 db.display()
             );
         }
-        Ok(ServeLock { _file: file })
+        Ok(ServeLock { _file: file, db })
+    }
+
+    /// The database this lock is held for ([`canonical_db_path`]).
+    pub fn database(&self) -> &Path {
+        &self.db
     }
 }
 
 /// Refuse when another process holds the serve lock of `db_path`: a running
-/// `ua serve`. Called by a command that is not the serving process before it
-/// applies schema parts the database does not record yet (`pending`), so a
-/// newer build never migrates the database underneath an older running serve.
+/// `ua serve`. [`crate::Db::open`] calls it before it applies schema parts the
+/// database does not record yet (`pending`), unless the caller proved it is
+/// the serving process, so a newer build never migrates the database
+/// underneath an older running serve.
 ///
 /// The probe is a non-blocking shared `flock` on the serve lock file, released
 /// at once; a missing lock file means no serve ever ran there. While it is

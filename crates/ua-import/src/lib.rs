@@ -34,10 +34,13 @@
 //! the last source `rowid` copied. Each batch and its progress row commit
 //! together, so a re-run continues after the last committed batch.
 
-mod lock;
 mod map;
 
-pub use lock::{HubLock, ServeLock, canonical_db_path, lock_path, refuse_if_served, serve_lock_path};
+/// The database locks, which live in `ua_store::lock` (opening the database
+/// needs the serve lock); re-exported so the names here keep working.
+pub use ua_store::lock::{
+    HubLock, ServeLock, canonical_db_path, lock_path, refuse_if_served, serve_lock_path,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
