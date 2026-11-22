@@ -196,7 +196,8 @@ fn insert_calls(hub: &Hub, tool: &str, caller: &str, durations: &[i64], errors: 
 async fn perf_summary_from_tool_calls() {
     let hub = mem_hub();
     let reg = builtin_registry();
-    let who = agent("observer-1", Profile::Developer);
+    // A local-trust reader is unrestricted: it sees every caller's rows.
+    let who = Caller::local("observer-1", Transport::Stdio);
     let durations: Vec<i64> = (1..=100).collect();
     insert_calls(&hub, "synthetic_alpha", "builder-1", &durations, 10, &ua_core::time::now());
     insert_calls(&hub, "synthetic_beta", "builder-2", &[5, 7, 9, 11], 0, &ua_core::time::now());
@@ -377,6 +378,42 @@ async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
     for k in restricted {
         assert!(own_b1[k].as_i64().unwrap_or(0) >= 1, "{k} missing for the party: {own_b1}");
     }
+}
+
+#[tokio::test]
+async fn performance_counts_only_the_readers_own_calls() {
+    let hub = mem_hub();
+    let reg = builtin_registry();
+    let (sender, outsider) = (agent("builder-1", Profile::Developer), agent("builder-3", Profile::Developer));
+    call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": "builder-2", "body": "private ping" }),
+    )
+    .await;
+
+    let perf = json!({ "action": "performance", "params": {} });
+
+    // The outsider sees only its own calls: builder-1's message_send is absent.
+    let out = call(&reg, &hub, &outsider, "observability_manage", perf.clone()).await;
+    assert_eq!(out["scope"], "own_calls");
+    assert!(out["by_tool"].get("message_send").is_none(), "{out}");
+    assert!(out["by_caller"].get("builder-1").is_none(), "{out}");
+
+    // The agent sees its own calls.
+    let own = call(&reg, &hub, &sender, "observability_manage", perf.clone()).await;
+    assert_eq!(own["scope"], "own_calls");
+    assert!(own["by_tool"]["message_send"]["calls"].as_i64().unwrap() >= 1, "{own}");
+    assert!(own["by_caller"].get("builder-2").is_none(), "{own}");
+
+    // A mail-unrestricted reader sees them all.
+    let board = Caller::local("local", Transport::Stdio);
+    let all = call(&reg, &hub, &board, "observability_manage", perf).await;
+    assert_eq!(all["scope"], "all");
+    assert!(all["by_tool"]["message_send"]["calls"].as_i64().unwrap() >= 1, "{all}");
+    assert!(all["by_caller"]["builder-1"]["calls"].as_i64().unwrap() >= 1, "{all}");
 }
 
 #[tokio::test]

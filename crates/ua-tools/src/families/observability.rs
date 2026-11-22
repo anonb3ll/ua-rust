@@ -257,9 +257,12 @@ fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>
             }
         }
     }
+    // The call totals carry the same rule as perf_summary: restricted
+    // readers count only their own calls.
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
-        [&week],
+        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
+         WHERE started_at >= ?1 AND page = 0 AND (?2 OR caller = ?3)",
+        rusqlite::params![week, reader.unrestricted(), reader.party()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let size = match db_file_sizes(db_path) {
@@ -277,7 +280,12 @@ fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>
             "min": stat(|v| v.iter().copied().fold(f64::INFINITY, f64::min)),
             "max": stat(|v| v.iter().copied().fold(0.0, f64::max)),
         },
-        "tool_calls_last_7_days": { "calls": calls, "errors": errors, "error_rate": rate(errors, calls) },
+        "tool_calls_last_7_days": {
+            "calls": calls,
+            "errors": errors,
+            "error_rate": rate(errors, calls),
+            "scope": if reader.unrestricted() { "all" } else { "own_calls" },
+        },
         "db_size_bytes": size,
     }))
 }
@@ -341,14 +349,17 @@ fn rss_bytes() -> Option<u64> {
     Some(pages * 4096)
 }
 
-fn perf_summary(c: &Connection, a: PerfArgs) -> UaResult<Value> {
+fn perf_summary(c: &Connection, reader: &EventReader, a: PerfArgs) -> UaResult<Value> {
     let hours = a.since_hours.filter(|h| h.is_finite() && *h > 0.0).unwrap_or(PERF_WINDOW_HOURS_DEFAULT);
     let cutoff = agents::ago((hours * 3600.0).min(1e12) as i64);
+    // Other callers' governed calls are private activity: a restricted
+    // reader's buckets count only its own calls, like evidence's
+    // tool_call_window.
     let mut stmt = c.prepare(
-        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-         ORDER BY id DESC",
+        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ? AND page = 0 \
+         AND (? OR caller = ?) ORDER BY id DESC",
     )?;
-    let rows = stmt.query_map([&cutoff], |r| {
+    let rows = stmt.query_map(rusqlite::params![cutoff, reader.unrestricted(), reader.party()], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
     })?;
     let mut by_tool: BTreeMap<String, Bucket> = BTreeMap::new();
@@ -370,6 +381,7 @@ fn perf_summary(c: &Connection, a: PerfArgs) -> UaResult<Value> {
         "window_hours": hours,
         "since": cutoff,
         "source": "tool_calls",
+        "scope": if reader.unrestricted() { "all" } else { "own_calls" },
         "by_tool": by_tool.into_iter().map(|(k, b)| (k, b.summary(true))).collect::<Map<_, _>>(),
         "by_caller": by_caller.into_iter().map(|(k, b)| (k, b.summary(false))).collect::<Map<_, _>>(),
         "total": total.summary(true),
@@ -398,7 +410,7 @@ fn mem_available_percent() -> Option<(f64, u64, u64)> {
     (total > 0).then(|| (avail as f64 * 100.0 / total as f64, avail, total))
 }
 
-fn check_anomalies(c: &Connection) -> UaResult<Value> {
+fn check_anomalies(c: &Connection, reader: &EventReader) -> UaResult<Value> {
     let mut out: Vec<Value> = Vec::new();
 
     // stale_doing_task
@@ -579,16 +591,18 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
         }
     }
 
-    // tool_error_rate (from tool_calls, last 24 h)
+    // tool_error_rate (from tool_calls, last 24 h): a restricted reader's
+    // rule counts only its own calls, same as perf_summary.
     {
         let cutoff = agents::ago(86_400);
         let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY tool HAVING COUNT(*) >= ?2 ORDER BY tool",
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ? AND page = 0 \
+             AND (? OR caller = ?) GROUP BY tool HAVING COUNT(*) >= ? ORDER BY tool",
         )?;
-        let rows = stmt.query_map(rusqlite::params![cutoff, TOOL_ERROR_MIN_CALLS], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![cutoff, reader.unrestricted(), reader.party(), TOOL_ERROR_MIN_CALLS],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        )?;
         for row in rows {
             let (tool, calls, errors) = row?;
             let r = rate(errors, calls);
@@ -839,11 +853,13 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
         }
         "anomalies" => {
             let _: NoArgs = parse_params("observability", act, p)?;
-            read(&ctx, check_anomalies).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| check_anomalies(c, &reader)).await
         }
         "performance" => {
             let args: PerfArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| perf_summary(c, args)).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| perf_summary(c, &reader, args)).await
         }
         "agents" => {
             let args: AgentListArgs = parse_params("observability", act, p)?;
@@ -1648,25 +1664,33 @@ pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::To
     hex::encode(h.finalize())
 }
 
-fn call_counts(c: &Connection) -> UaResult<Value> {
+fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
+    // Every bucket is fed by the same scoped rows as perf_summary: a
+    // restricted reader counts only its own calls.
+    let scope = "AND (? OR caller = ?)";
     let day = agents::ago(86_400);
-    let (total, last_call): (i64, Option<String>) =
-        c.query_row("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    let (total, last_call): (i64, Option<String>) = c.query_row(
+        &format!("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0 {scope}"),
+        rusqlite::params![reader.unrestricted(), reader.party()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
-        [&day],
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope}"
+        ),
+        rusqlite::params![day, reader.unrestricted(), reader.party()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let mut by_transport = Map::new();
     {
-        let mut stmt = c.prepare(
-            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY transport ORDER BY transport",
-        )?;
-        let rows = stmt
-            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope} GROUP BY transport ORDER BY transport"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![day, reader.unrestricted(), reader.party()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
         for row in rows {
             let (t, n, e) = row?;
             by_transport.insert(t, json!({ "calls": n, "errors": e }));
@@ -1674,12 +1698,13 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
     }
     let mut top = Vec::new();
     {
-        let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20",
-        )?;
-        let rows = stmt
-            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope} GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![day, reader.unrestricted(), reader.party()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
         for row in rows {
             let (t, n, e) = row?;
             top.push(json!({ "tool": t, "calls": n, "errors": e }));
@@ -1688,6 +1713,7 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
     Ok(json!({
         "total_calls": total,
         "last_call_at": last_call,
+        "scope": if reader.unrestricted() { "all" } else { "own_calls" },
         "last_24h": { "calls": calls, "errors": errors, "error_rate": rate(errors, calls) },
         "by_transport_24h": by_transport,
         "top_tools_24h": top,
@@ -1696,7 +1722,8 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
 
 async fn mcp_health_telemetry(ctx: ToolCtx, _a: NoArgs) -> UaResult<Value> {
     let reg = crate::builtin_registry_shared();
-    let calls = ctx.hub.db().read_async(call_counts).await?;
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    let calls = ctx.hub.db().read_async(move |c| call_counts(c, &reader)).await?;
     let callable = || reg.visible_to(&ctx.caller);
     let callable_count = callable().count();
     let schema = schema_fingerprint(callable());
@@ -1734,7 +1761,8 @@ pub fn register(r: &mut Registry) {
             "observability_manage",
             "Agent visibility, metrics, anomalies and performance in one tool. action: activity (ledger activity, \
              newest first), metrics (cluster snapshot), anomalies (deterministic health rules), performance \
-             (p50/p95 latency and error rates per tool and caller from tool_calls), agents (agent_list), \
+             (p50/p95 latency and error rates per tool and caller from tool_calls; a restricted reader's \
+             buckets count only its own calls), agents (agent_list), \
              context (agent_context), delegation_stats (params agent, window_days, since: per-agent delegation \
              counts sent and received, states, completion rate, and completion and first-claim latencies in \
              seconds, plus per-pair state counts). `params` holds the action's arguments. Read-only.",
@@ -1761,7 +1789,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "metrics_snapshot",
             "Cluster snapshot: per-agent ledger event counts by kind for the last 7 days, tasks by status, \
-             done-task cycle time in days, tool-call totals and the database size.",
+             done-task cycle time in days, tool-call totals (own calls only for a restricted reader) \
+             and the database size.",
             |ctx: ToolCtx, _a: NoArgs| async move {
                 let path = ctx.hub.db().path().map(Path::to_path_buf);
                 let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
@@ -1775,8 +1804,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "perf_summary",
             "Latency and error rates from tool_calls over the last since_hours (default 24): per tool (calls, \
-             errors, error_rate, avg/min/max/p50/p95 latency in ms, outcome codes), per caller, and in total.",
-            |ctx: ToolCtx, a: PerfArgs| async move { read(&ctx, move |c| perf_summary(c, a)).await },
+             errors, error_rate, avg/min/max/p50/p95 latency in ms, outcome codes), per caller, and in total. \
+             scope is all for a mail-unrestricted reader and own_calls otherwise.",
+            |ctx: ToolCtx, a: PerfArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| perf_summary(c, &reader, a)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1786,9 +1819,13 @@ pub fn register(r: &mut Registry) {
             "check_anomalies",
             "Run the deterministic anomaly rules (no LLM): stale_doing_task, review_wait, \
              task_reassignment_thrash, agent_never_completes, approval_queue_age, unverified_done, \
-             tool_error_rate, ledger_chain, host_low_memory. Returns {anomalies: [{rule, subject, detail, \
+             tool_error_rate (counting only the caller's own calls unless it may read every mailbox), \
+             ledger_chain, host_low_memory. Returns {anomalies: [{rule, subject, detail, \
              severity}]}; empty when healthy.",
-            |ctx: ToolCtx, _a: NoArgs| async move { read(&ctx, check_anomalies).await },
+            |ctx: ToolCtx, _a: NoArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| check_anomalies(c, &reader)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1814,7 +1851,8 @@ pub fn register(r: &mut Registry) {
             "mcp_health_telemetry",
             "Tool-surface health: schema_fingerprint (16 hex over the callable tools' names and argument keys; \
              re-list tools when it changes), registry and semantic (full input-schema) fingerprints, tool counts, \
-             and tool-call counts and error rates from tool_calls. No secrets.",
+             and tool-call counts and error rates from tool_calls (own calls only for a restricted \
+             reader). No secrets.",
             mcp_health_telemetry,
         )
         .family("observability")
