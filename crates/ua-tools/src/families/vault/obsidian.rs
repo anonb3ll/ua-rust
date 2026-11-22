@@ -139,7 +139,9 @@ impl Api {
         query: Option<&[(&str, &str)]>,
         body: Option<Value>,
     ) -> UaResult<Response> {
-        let client = Outbound::new(policy::OBSIDIAN_LOCAL)
+        // Pinned to the configured origin: the policy builds no other client.
+        let origin = Url::parse(&self.base).map_err(|_| self.fail("the request URL does not parse"))?;
+        let client = Outbound::pinned(policy::OBSIDIAN_LOCAL, &origin)
             .map_err(|e| UaError::internal(format!("cannot build the HTTP client: {e}")))?;
         let mut url = Url::parse(&format!("{}/{}", self.base, path.trim_start_matches('/')))
             .map_err(|_| self.fail("the request URL does not parse"))?;

@@ -182,7 +182,8 @@ fn failure(e: &OutboundError) -> (String, bool) {
 
 async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
     // The policy never follows a redirect: the secret header would go with it.
-    let client = match Outbound::new(policy::NOTIFY_WEBHOOK) {
+    // The client is pinned to the configured URL's origin.
+    let client = match Outbound::pinned(policy::NOTIFY_WEBHOOK, hook.request.url()) {
         Ok(c) => c,
         Err(e) => {
             return Delivery {

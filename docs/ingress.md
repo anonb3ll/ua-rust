@@ -65,7 +65,8 @@ URL may name a port, the address class a connection may reach (`Public`,
 are verified, the response body
 cap, and three timeouts (connect, one request with its body, the whole
 call). Named policies are constants in `ua_ingress::policy`;
-`Outbound::named` and `policy::lookup` refuse any other name, and a policy
+`Outbound::named` and `policy::lookup` refuse any other name (and the
+names of the relaxed policies below), and a policy
 with an empty host list, a zero or unbounded cap or timeout, more than
 ten redirects, an operator-configured class that follows redirects, or
 unverified certificates on anything but a loopback-only policy without
@@ -83,17 +84,43 @@ and IETF protocol addresses, and every IPv6 form of a private IPv4 address
 other than the mapped one. Only `Addresses::check` decides: the class's
 base range table is private to it, so no caller can judge an address by a
 looser class than the rule. A policy with this class follows no redirect, since a redirect
-target is the server's choice, not the operator's. Only `ua_ingress::policy`
-names the class, and each policy that uses it is named by one consumer
-file only (`tests/ingress_guard.rs`, `relaxed_policies_stay_with_their_one_consumer`).
+target is the server's choice, not the operator's.
 
 `Policy::accept_invalid_certs` turns certificate verification off (any
 certificate, any name). Only `obsidian.local_rest` sets it: the Obsidian
 Local REST API plugin serves https on this host with a self-signed
 certificate. `validate` refuses it unless the class is `LoopbackOnly` and no
 redirect is followed, the loopback test hook never widens a `LoopbackOnly`
-class, and the same ratchet test keeps the field's name out of every other
-crate.
+class.
+
+### Relaxed policies
+
+A policy is relaxed when it uses `OperatorConfigured` or sets
+`accept_invalid_certs` (`Policy::is_relaxed`). There are three:
+`github.enterprise`, `notify.webhook` and `obsidian.local_rest`. By
+construction:
+
+- **Not obtainable by name.** They are not in `policy::POLICIES` (the
+  public list, every entry of which is strict); `policy::lookup` and
+  `Outbound::named` refuse their names, however the name was built.
+- **No unpinned client.** `Outbound::new` refuses a relaxed policy. The
+  only constructor that accepts one is `Outbound::pinned(policy, origin)`,
+  and only for one of the three as `ua_ingress` defines them (or one of them
+  under the loopback test hook); a hand-made policy with a relaxed class or
+  the certificate flag is refused.
+- **Pinned to one origin.** A pinned client refuses every request whose
+  scheme, host or port differs from the origin it was built for, before
+  anything is sent: another port, another scheme, another name for the same
+  address, or an IP literal that is not the origin. Each consumer pins its
+  client to the configured URL (`github_api_url`, `notify_webhook_url`,
+  `obsidian_api_url`). Requests to the origin are still checked against the
+  policy, so a configured origin outside it fails on first use.
+
+The ratchet test is a second line of defence
+(`relaxed_policies_stay_with_their_one_consumer`): outside `ua-ingress`,
+no file names `OperatorConfigured` or the certificate flag, each relaxed
+policy's constant is named by its one consumer file, and only those three
+files build a pinned client.
 
 A limit that predates this policy: the client cannot tell the plugin from
 any other local process. Whatever answers on the configured loopback port,

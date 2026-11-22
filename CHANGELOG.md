@@ -446,6 +446,13 @@ from its commit history.
 
 ### Security
 
+- `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
+  `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
+  name or from the public policy list, and build only clients pinned to one
+  origin (`Outbound::pinned`): a request to another scheme, host or port is
+  refused before anything is sent. `Outbound::new` refuses a relaxed policy,
+  and a hand-made one is refused even pinned. The GitHub REST, Obsidian and
+  notify clients pin to their configured URL; their behaviour is unchanged.
 - An unverified caller (auth off) that names a configured human or lifecycle
   operator as its `actor` no longer gets operator authority over other
   agents' task workflow records and checks; it is refused, as every other

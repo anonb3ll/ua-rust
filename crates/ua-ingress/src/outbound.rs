@@ -398,12 +398,30 @@ pub struct Outbound {
     client: reqwest::Client,
     /// `reqwest::Response::remote_addr`, except in tests.
     peer_of: PeerOf,
+    /// The one origin a pinned client may send to ([`Outbound::pinned`]).
+    pin: Option<url::Origin>,
 }
 
 impl Outbound {
-    /// A client for `policy`. An invalid policy is refused.
+    /// A client for `policy`. An invalid policy, or a relaxed one
+    /// ([`Policy::is_relaxed`]: use [`Outbound::pinned`]), is refused.
     pub fn new(policy: Policy) -> Result<Self, OutboundError> {
+        policy.validate_unpinned()?;
         Self::build(policy, system_lookup(), policy.addresses, reqwest::Response::remote_addr)
+    }
+
+    /// A client for `policy` that sends only to the origin (scheme, host,
+    /// port) of `origin`, the destination the operator configured. Every
+    /// request to another origin is refused before anything is sent. A
+    /// relaxed policy builds a client only this way, and only when it is one
+    /// of the relaxed policies this crate defines (or one of them under the
+    /// loopback test hook). Requests to the origin are checked against the
+    /// policy like any other, so an origin outside it fails on first use.
+    pub fn pinned(policy: Policy, origin: &Url) -> Result<Self, OutboundError> {
+        policy.validate_pinned()?;
+        let mut out = Self::build(policy, system_lookup(), policy.addresses, reqwest::Response::remote_addr)?;
+        out.pin = Some(origin.origin());
+        Ok(out)
     }
 
     /// A client for the named policy ([`policy::POLICIES`]). An unknown
@@ -414,7 +432,21 @@ impl Outbound {
 
     #[cfg(test)]
     pub(crate) fn with_lookup(policy: Policy, lookup: Lookup) -> Result<Self, OutboundError> {
+        policy.validate_unpinned()?;
         Self::build(policy, lookup, policy.addresses, reqwest::Response::remote_addr)
+    }
+
+    /// [`Outbound::pinned`] with a test lookup.
+    #[cfg(test)]
+    pub(crate) fn pinned_with_lookup(
+        policy: Policy,
+        origin: &Url,
+        lookup: Lookup,
+    ) -> Result<Self, OutboundError> {
+        policy.validate_pinned()?;
+        let mut out = Self::build(policy, lookup, policy.addresses, reqwest::Response::remote_addr)?;
+        out.pin = Some(origin.origin());
+        Ok(out)
     }
 
     /// Test seam for the peer-address re-check: the resolver applies
@@ -453,7 +485,7 @@ impl Outbound {
             .map_err(|e| {
                 OutboundError::Transport(format!("cannot build the HTTP client: {}", error_chain(&e)))
             })?;
-        Ok(Self { policy, client, peer_of })
+        Ok(Self { policy, client, peer_of, pin: None })
     }
 
     pub fn policy(&self) -> &Policy {
@@ -484,6 +516,14 @@ impl Outbound {
         let mut left_home = false;
         for hop in 0..=max {
             self.policy.check_url(&req.url)?;
+            if let Some(pin) = &self.pin
+                && req.url.origin() != *pin
+            {
+                return Err(OutboundError::UrlRefused {
+                    policy: self.policy.name,
+                    why: "not the origin this client is pinned to",
+                });
+            }
             let origin = req.url.origin();
             left_home |= origin != home;
             let headers = if !left_home {

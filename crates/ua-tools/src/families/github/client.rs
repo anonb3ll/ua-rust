@@ -167,7 +167,8 @@ fn shared_client(base: &Url, allow_loopback: bool) -> Result<(Arc<Outbound>, boo
     if let Some(c) = map.get(&key) {
         return Ok((c.clone(), false));
     }
-    let http = Outbound::new(policy_for(base, allow_loopback))
+    // Pinned to the base's origin: `github.enterprise` builds no other client.
+    let http = Outbound::pinned(policy_for(base, allow_loopback), base)
         .map(Arc::new)
         .map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
     if map.len() >= 16 {

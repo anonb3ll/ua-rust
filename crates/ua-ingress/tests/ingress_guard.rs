@@ -491,16 +491,19 @@ fn drift_is_reported_both_ways() {
     }
 }
 
-/// Policies that relax a default for one consumer, with the only file
-/// outside `ua-ingress` that may name each (by constant or by name).
+/// The relaxed policies (`ua_ingress::policy::RELAXED`) and the only file
+/// outside `ua-ingress` that may name each. By construction they cannot be
+/// looked up by name and build only clients pinned to one origin
+/// (`Outbound::pinned`); this scan is the second line of defence, so that
+/// the one origin is always the operator's configured one.
 /// `github.enterprise` and `notify.webhook` admit private networks for the
 /// operator's `github_api_url` and `notify_webhook_url`; never for a URL a
-/// caller supplies.
-/// `obsidian.local_rest` accepts any TLS certificate, on loopback only.
-const EXCEPTION_POLICIES: &[(&str, &str, &str)] = &[
-    ("GITHUB_ENTERPRISE", "\"github.enterprise\"", "ua-tools/src/families/github/client.rs"),
-    ("OBSIDIAN_LOCAL", "\"obsidian.local_rest\"", "ua-tools/src/families/vault/obsidian.rs"),
-    ("NOTIFY_WEBHOOK", "\"notify.webhook\"", "ua-tools/src/families/notify.rs"),
+/// caller supplies. `obsidian.local_rest` accepts any TLS certificate, on
+/// loopback only.
+const EXCEPTION_POLICIES: &[(&str, &str)] = &[
+    ("GITHUB_ENTERPRISE", "ua-tools/src/families/github/client.rs"),
+    ("OBSIDIAN_LOCAL", "ua-tools/src/families/vault/obsidian.rs"),
+    ("NOTIFY_WEBHOOK", "ua-tools/src/families/notify.rs"),
 ];
 
 /// Relaxations that only `ua-ingress` itself may write.
@@ -509,6 +512,7 @@ const RELAXATIONS: &[&str] = &["OperatorConfigured", "accept_invalid_certs"];
 #[test]
 fn relaxed_policies_stay_with_their_one_consumer() {
     let files = sources();
+    let homes: Vec<&str> = EXCEPTION_POLICIES.iter().map(|(_, home)| *home).collect();
     for (path, src) in &files {
         if crate_of(path) == "ua-ingress" {
             continue;
@@ -518,10 +522,14 @@ fn relaxed_policies_stay_with_their_one_consumer() {
         for r in RELAXATIONS {
             assert!(!code.contains(r), "{shown} names {r}: only ua_ingress::policy may use it");
         }
-        for (constant, name, home) in EXCEPTION_POLICIES {
-            let names_it = find_all(&code, constant).any(|at| !continues_ident(&code, at + constant.len()))
-                || without_tests_raw(src).contains(name);
+        for (constant, home) in EXCEPTION_POLICIES {
+            let names_it = find_all(&code, constant).any(|at| !continues_ident(&code, at + constant.len()));
             assert!(!names_it || shown.ends_with(home), "{shown} names {constant}; only {home} may");
+        }
+        // A pinned client is built only by the consumers of relaxed policies,
+        // each pinned to its configured origin.
+        if code.contains("Outbound::pinned(") {
+            assert!(homes.iter().any(|h| shown.ends_with(h)), "{shown} builds a pinned client");
         }
     }
 }
