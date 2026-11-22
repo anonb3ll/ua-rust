@@ -1,29 +1,34 @@
 # Intended matches for scripts/vocab-check.sh: a path glob, then optionally
-# whitespace and an extended regex the matching line must also match.
+# whitespace and an extended regex the matching line must also match. A path
+# alone allows every match in that file. The optional trailing field scopes the
+# entry to one pattern class ("vocab" for the role names, "private" for
+# addresses, home paths and tailnet names): an entry scoped to one class never
+# silences a finding of the other class, even on the same line. The regex may be
+# omitted ("<path glob> <class>") to allow that class anywhere in the file.
 
 # Legacy profile names, accepted as aliases for compatibility with the Python
 # hub, and the tests and docs that pin that compatibility.
-crates/ua-core/src/profiles.rs           (alias = |\("[a-z-]+", Profile::)
-crates/ua-core/src/config.rs             oauth_profile = \\"cloud-assistant\\".*chief-of-staff
-crates/ua-tools/tests/config_revisions.rs  chief-of-staff|"steward"|contains\("steward"\)
-crates/ua-tools/tests/gateway.rs         "profile": "steward"
-crates/ua-tools/tests/policy.rs          Python hub|steward|chief-of-staff
-docs/policy.md                           ^\| `[a-z-]+` \| `[a-z-]+` \|$
+crates/ua-core/src/profiles.rs           (alias = |\("[a-z-]+", Profile::) vocab
+crates/ua-core/src/config.rs             oauth_profile = \\"cloud-assistant\\".*chief-of-staff vocab
+crates/ua-tools/tests/config_revisions.rs  chief-of-staff|"steward"|contains\("steward"\) vocab
+crates/ua-tools/tests/gateway.rs         "profile": "steward" vocab
+crates/ua-tools/tests/policy.rs          Python hub|steward|chief-of-staff vocab
+docs/policy.md                           ^\| `[a-z-]+` \| `[a-z-]+` \|$ vocab
 
 # Shared address space (100.64.0.0/10) in the SSRF guards and their tests.
-crates/ua-server/src/oauth/cimd.rs       100\.64\.0\.0/10|"100\.100\.100\.100"
-crates/ua-tools/src/families/web.rs      "100\.64\.0\.1"
-crates/ua-tools/tests/web.rs             "http://100\.64\.0\.1/"
-crates/ua-tools/src/families/mcp/scope.rs  100\.64\.0\.0/10|"100\.64\.0\.1"
-docs/mcp.md                              `100\.64\.0\.0/10`
-crates/ua-ingress/src/addr.rs           100\.64\.0\.0/10|"100\.64\.0\.1"|"100\.127\.255\.255"
-docs/ingress.md                          `100\.64\.0\.0/10`
+crates/ua-server/src/oauth/cimd.rs       100\.64\.0\.0/10|"100\.100\.100\.100" private
+crates/ua-tools/src/families/web.rs      "100\.64\.0\.1" private
+crates/ua-tools/tests/web.rs             "http://100\.64\.0\.1/" private
+crates/ua-tools/src/families/mcp/scope.rs  100\.64\.0\.0/10|"100\.64\.0\.1" private
+docs/mcp.md                              `100\.64\.0\.0/10` private
+crates/ua-ingress/src/addr.rs           100\.64\.0\.0/10|"100\.64\.0\.1"|"100\.127\.255\.255" private
+docs/ingress.md                          `100\.64\.0\.0/10` private
 
 # The well-known cloud instance-metadata address in the shared address space,
 # refused by every outbound address rule, its neighbour in the tests, and the
 # docs that name it.
-crates/ua-ingress/src/addr.rs           "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]"
-crates/ua-ingress/src/policy.rs         "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]"
-docs/ingress.md                          `100\.100\.100\.200`
-CHANGELOG.md                             `100\.100\.100\.200`
-crates/ua-ingress/src/policy.rs         "::100\.100\.100\.200"
+crates/ua-ingress/src/addr.rs           "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]" private
+crates/ua-ingress/src/policy.rs         "(::ffff:|::ffff:0:|64:ff9b::)?100\.100\.100\.20[01]" private
+docs/ingress.md                          `100\.100\.100\.200` private
+CHANGELOG.md                             `100\.100\.100\.200` private
+crates/ua-ingress/src/policy.rs         "::100\.100\.100\.200" private
