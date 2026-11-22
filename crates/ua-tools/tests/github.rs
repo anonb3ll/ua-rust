@@ -1560,7 +1560,7 @@ fn an_older_build_refuses_a_database_with_the_inbound_parts() {
     let old: Vec<Part> =
         ua_tools::schema_parts().into_iter().filter(|p| !new_parts.contains(&p.name)).collect();
     let old_optional: Vec<&str> = ua_tools::optional_schema_parts().iter().map(|p| p.name).collect();
-    let older = Fence { also_known: &old_optional, allow_newer: false };
+    let older = Fence { also_known: &old_optional, ..Fence::default() };
     let err = ua_store::Db::open_with(&cfg.db_path(), &old, older).err().expect("refused").to_string();
     assert!(err.contains("written by a newer build"), "{err}");
     for name in new_parts {

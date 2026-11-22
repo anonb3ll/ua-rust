@@ -292,6 +292,12 @@ from its commit history.
   change against a database a newer build has opened; restore a
   pre-upgrade backup instead (`docs/operations.md`, "Older builds and a
   newer database").
+- A command that would migrate the database (apply a schema part it does
+  not record yet) refuses while another process holds the serve lock: a
+  newer build no longer migrates underneath an older running `ua serve`.
+  `ua serve` migrates at startup under its own lock; an open with nothing
+  to apply is unaffected; the recovery override does not lift it
+  (`docs/operations.md`, "Processes already running").
 - `ua doctor`: the `schema` check fails, where it warned, when the database
   records parts this build does not know, and leads with that explanation
   before any object findings. A plain `ua doctor` (without `--strict`) now

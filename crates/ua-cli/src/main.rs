@@ -461,6 +461,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                             &cfg.db_path(),
                             &ua_import::schema_parts(),
                             allow_newer()?,
+                            Some(ua_import::refuse_if_served),
                         )?;
                         let opts = ua_import::Options { drop_org_scope, ..Default::default() };
                         ua_import::import(&db, &from, &opts)?
@@ -491,7 +492,8 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                     let hub = if let Cmd::Serve = cmd {
                         open_for_serve(&cfg, override_on)?
                     } else {
-                        Hub::open_with(cfg.clone(), override_on)?
+                        // Not the serving process: refuse to migrate under a running `ua serve`.
+                        Hub::open_guarded(cfg.clone(), override_on, Some(ua_import::refuse_if_served))?
                     };
                     let registry = Arc::new(builtin_registry());
                     let state = AppState::new(hub.clone(), registry.clone());

@@ -180,6 +180,30 @@ pub fn unknown_parts(conn: &Connection, known: &[&str]) -> anyhow::Result<Vec<St
     Ok(names.into_iter().filter(|n| !known.contains(&n.as_str())).collect())
 }
 
+/// The names in `names` that `schema_parts` does not record yet, in order:
+/// what an open would apply. A database without the tracking table records
+/// none.
+pub fn unrecorded_parts(conn: &Connection, names: &[&str]) -> anyhow::Result<Vec<String>> {
+    let has: bool = conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_parts'", [], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    let mut out = Vec::new();
+    for n in names {
+        let recorded = has
+            && conn
+                .query_row("SELECT 1 FROM schema_parts WHERE name = ?1", [n], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+        if !recorded {
+            out.push(n.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// The refusal when a database records parts this build does not know
 /// (`docs/operations.md`, "Older builds and a newer database"). A caller can
 /// tell it from other open errors with `downcast_ref`.
