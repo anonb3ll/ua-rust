@@ -149,6 +149,64 @@ async fn send_list_and_reply_thread() {
 }
 
 #[tokio::test]
+async fn send_cannot_join_an_existing_conversation() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let (a, b, c) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    send(
+        &reg,
+        &hub,
+        &a,
+        json!({"act": "request", "to_agent": "builder-2", "body": "private thread",
+               "conversation_id": "conv-private"}),
+    )
+    .await;
+
+    // An outsider cannot join it by naming its id: same answer as a missing one.
+    let err = reg
+        .call(
+            &hub,
+            &c,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "let me in",
+                   "conversation_id": "conv-private"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "not_found");
+    assert!(err.to_string().contains("conversation not found"), "{err}");
+
+    // A mail-unrestricted reader and a party can.
+    let board = Caller::local("local", Transport::Stdio);
+    let joined = send(
+        &reg,
+        &hub,
+        &board,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "reviewing",
+               "conversation_id": "conv-private"}),
+    )
+    .await;
+    assert_eq!(joined["conversation_id"], "conv-private");
+    let reply = send(
+        &reg,
+        &hub,
+        &b,
+        json!({"act": "inform", "to_agent": "builder-1", "body": "on it", "conversation_id": "conv-private"}),
+    )
+    .await;
+    assert_eq!(reply["conversation_id"], "conv-private");
+
+    // A brand-new conversation id is still allowed for anyone.
+    let fresh = send(
+        &reg,
+        &hub,
+        &c,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "new thread", "conversation_id": "conv-new"}),
+    )
+    .await;
+    assert_eq!(fresh["conversation_id"], "conv-new");
+}
+
+#[tokio::test]
 async fn send_validation() {
     let (hub, reg) = (hub(), builtin_registry());
     let a = agent("builder-1");
