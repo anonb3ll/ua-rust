@@ -204,7 +204,8 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            BoundRepo::check(tx, &repo)?;
+            // Tasks are all in the default organization, so its bindings decide.
+            BoundRepo::check(tx, ua_core::DEFAULT_ORG, &repo)?;
             let task = require_task(tx, id)?;
             if is_terminal(str_field(&task, "status").unwrap_or("open")) {
                 return Err(UaError::conflict(format!(
@@ -212,7 +213,7 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
                 )));
             }
             let project = str_field(&task, "project").unwrap_or("default");
-            match bound_repo(tx, project)? {
+            match bound_repo(tx, ua_core::DEFAULT_ORG, project)? {
                 Some(b) if b.eq_ignore_ascii_case(&repo) => {}
                 other => {
                     return Err(UaError::denied(

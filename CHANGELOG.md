@@ -210,6 +210,20 @@ from its commit history.
   cached entries migrate to `default`. Organizations cache identical queries
   independently, and one organization's TTL eviction does not remove another
   organization's cached entries.
+- Project repository bindings (`project_repo_bindings`) have
+  organization-scoped keys and triggers
+  (`governance.v2.project_bindings_tenant_keys`, a standalone rebuild, then
+  `organization.v1.tools.project_bindings`). Existing bindings migrate to
+  `default`. `project_repo_bind`, `project_repo_unbind`, `project_repo_get`
+  and `project_repo_list` read and write only the caller's organization's
+  bindings, so two organizations may bind the same project slug to different
+  repositories; a bind or unbind for an organization `orgs` does not hold is
+  refused (`unknown_organization`) before anything changes. Task-driven
+  lookups (CI check verification, merges, policy authorizations, merged-PR
+  reconciliation, deliverables, GitHub polling and webhooks) use the default
+  organization's bindings, since tasks are not yet organization-scoped. The
+  importer writes imported bindings to `default`. Tool results and event
+  payloads keep their shapes.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

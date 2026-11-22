@@ -310,10 +310,11 @@ pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str
     }
 }
 
-/// The repository the task's project is bound to.
+/// The repository the task's project is bound to. Tasks carry no `org_id`
+/// yet and are all in the default organization, so its binding decides.
 pub(crate) fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
     match str_field(task, "project") {
-        Some(project) => governance::bound_repo(conn, project),
+        Some(project) => governance::bound_repo(conn, ua_core::DEFAULT_ORG, project),
         None => Ok(None),
     }
 }

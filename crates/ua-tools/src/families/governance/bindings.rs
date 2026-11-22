@@ -10,6 +10,13 @@
 //! against (`task_check_record`), so bind and unbind are for a verified
 //! lifecycle operator or human, attributed to that caller; get and list are
 //! open to every caller.
+//!
+//! Bindings are keyed by `(org_id, project)` (`governance.v2.project_bindings_tenant_keys`).
+//! Every tool reads and writes only the caller's organization's bindings, so
+//! two organizations may bind the same project slug to different
+//! repositories. Tasks carry no `org_id` yet and are all in the default
+//! organization, so the task-driven readers ([`bound_repo`]) look up the
+//! default organization's bindings.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -105,15 +112,26 @@ pub fn normalize_repo(raw: &str) -> UaResult<String> {
     Ok(format!("{}/{}", segments[0].to_ascii_lowercase(), segments[1].to_ascii_lowercase()))
 }
 
-/// The normalized `owner/name` a project stream is bound to, if any.
-pub(crate) fn bound_repo(c: &Connection, project: &str) -> UaResult<Option<String>> {
-    Ok(c.query_row("SELECT repo FROM project_repo_bindings WHERE project = ?1", [project], |r| r.get(0))
-        .optional()?)
+/// The normalized `owner/name` a project stream of organization `org` is
+/// bound to, if any.
+pub(crate) fn bound_repo(c: &Connection, org: &str, project: &str) -> UaResult<Option<String>> {
+    Ok(c.query_row(
+        "SELECT repo FROM project_repo_bindings WHERE org_id = ?1 AND project = ?2",
+        [org, project],
+        |r| r.get(0),
+    )
+    .optional()?)
 }
 
-fn binding(c: &Connection, project: &str) -> UaResult<Option<Value>> {
+/// One binding of organization `org`, without its `org_id` (the caller's own).
+fn binding(c: &Connection, org: &str, project: &str) -> UaResult<Option<Value>> {
     let row = c
-        .query_row("SELECT * FROM project_repo_bindings WHERE project = ?1", [project], row_object)
+        .query_row(
+            "SELECT project, repo, default_branch, bound_by, bound_at FROM project_repo_bindings \
+             WHERE org_id = ?1 AND project = ?2",
+            [org, project],
+            row_object,
+        )
         .optional()?;
     Ok(row.map(|mut m| {
         m.insert("source".into(), json!("db"));
@@ -163,13 +181,27 @@ pub struct ListArgs {}
 fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult<String> {
     let who = verified_actor(&ctx.caller, doing)?;
     acting_identity(&ctx.caller, named)?;
-    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], &ctx.caller.org_id) {
         return Err(UaError::denied(
             "operator_required",
             format!("{doing} is for an operator (a verified human); {who:?} is not one"),
         ));
     }
     Ok(who)
+}
+
+/// Refuse an organization `orgs` does not hold. Runs first in every write
+/// transaction: the `org_exists` trigger only sees inserts, so an unbind
+/// would otherwise pass.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no binding was changed"),
+        ));
+    }
+    Ok(())
 }
 
 /// Trim and validate an optional repository default branch name.
@@ -190,17 +222,22 @@ pub fn check_default_branch(raw: Option<&str>) -> UaResult<Option<String>> {
 pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
     let repo = normalize_repo(&a.repo)?;
-    let who = binding_operator(&ctx, a.bound_by.as_deref(), "binding a project repository")?;
-    let branch = check_default_branch(a.default_branch.as_deref())?;
+    let org = ctx.caller.org_id.clone();
+    let ctx2 = ctx.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
+            let who = binding_operator(&ctx2, a.bound_by.as_deref(), "binding a project repository")?;
+            let branch = check_default_branch(a.default_branch.as_deref())?;
             tx.execute(
-                "INSERT INTO project_repo_bindings (project, repo, default_branch, bound_by, bound_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(project) DO UPDATE SET repo = excluded.repo, \
+                "INSERT INTO project_repo_bindings (org_id, project, repo, default_branch, bound_by, bound_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (org_id, project) DO UPDATE SET repo = excluded.repo, \
                  default_branch = excluded.default_branch, bound_by = excluded.bound_by, bound_at = excluded.bound_at",
-                params![project, repo, branch, who, now()],
+                params![org, project, repo, branch, who, now()],
             )?;
+            // ORG-EVENT-DEFAULT: use the binding's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG,
@@ -209,7 +246,7 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
                 )
                 .by(who.clone()),
             )?;
-            Ok(json!({ "binding": binding(tx, &project)? }))
+            Ok(json!({ "binding": binding(tx, &org, &project)? }))
         })
         .await
 }
@@ -217,12 +254,20 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
 /// `coordination_manage(action="project_repo_unbind")`.
 pub(crate) async fn project_repo_unbind(ctx: ToolCtx, a: UnbindArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
-    let who = binding_operator(&ctx, a.unbound_by.as_deref(), "unbinding a project repository")?;
+    let org = ctx.caller.org_id.clone();
+    let ctx2 = ctx.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let previous = binding(tx, &project)?;
-            tx.execute("DELETE FROM project_repo_bindings WHERE project = ?1", [&project])?;
+            require_org(tx, &org)?;
+            let who = binding_operator(&ctx2, a.unbound_by.as_deref(), "unbinding a project repository")?;
+            let previous = binding(tx, &org, &project)?;
+            tx.execute(
+                "DELETE FROM project_repo_bindings WHERE org_id = ?1 AND project = ?2",
+                [&org, &project],
+            )?;
+            // ORG-EVENT-DEFAULT: use the binding's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(
@@ -240,27 +285,32 @@ pub(crate) async fn project_repo_unbind(ctx: ToolCtx, a: UnbindArgs) -> UaResult
 /// `coordination_manage(action="project_repo_get")`.
 pub(crate) async fn project_repo_get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
-        .read_async(move |c| Ok(json!({ "project": project, "binding": binding(c, &project)? })))
+        .read_async(move |c| Ok(json!({ "project": project, "binding": binding(c, &org, &project)? })))
         .await
 }
 
 /// `coordination_manage(action="project_repo_list")`: every project stream in
-/// use by a task or a binding, each with its binding or `null`.
+/// use by a task or a binding of the caller's organization, each with its
+/// binding or `null`. Tasks are all in the default organization, so only its
+/// callers see the task streams.
 pub(crate) async fn project_repo_list(ctx: ToolCtx, _a: ListArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let projects: Vec<String> = c
                 .prepare(
-                    "SELECT project FROM tasks UNION SELECT project FROM project_repo_bindings ORDER BY 1",
+                    "SELECT project FROM tasks WHERE ?1 = ?2 \
+                     UNION SELECT project FROM project_repo_bindings WHERE org_id = ?1 ORDER BY 1",
                 )?
-                .query_map([], |r| r.get(0))?
+                .query_map([org.as_str(), ua_core::DEFAULT_ORG], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             let rows = projects
                 .iter()
-                .map(|p| Ok(json!({ "project": p, "binding": binding(c, p)? })))
+                .map(|p| Ok(json!({ "project": p, "binding": binding(c, &org, p)? })))
                 .collect::<UaResult<Vec<_>>>()?;
             Ok(json!({ "projects": rows }))
         })
