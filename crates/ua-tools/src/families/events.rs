@@ -4,11 +4,11 @@
 //! the event streams. The ledger tool also applies mailbox visibility to
 //! message rows before selecting its page.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use ua_core::UaResult;
+use ua_core::{Caller, Config, DEFAULT_ORG, UaResult};
 use ua_store::ledger::{self, Event, EventQuery};
 
 use super::agents::verified;
@@ -28,6 +28,43 @@ const VISIBLE_MESSAGE: &str = "channel NOT GLOB 'agent.message.*' OR (
           AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
     ))
 )";
+
+/// Mailbox visibility for a ledger reader. A stream keeps the reader it
+/// authenticated with and rechecks that identity while the stream is open.
+#[derive(Clone)]
+pub struct EventReader {
+    unrestricted: bool,
+    party: Option<String>,
+}
+
+impl EventReader {
+    pub fn new(cfg: &Config, caller: &Caller) -> Self {
+        Self {
+            unrestricted: may_read_all_mail(cfg, caller),
+            party: verified(caller).filter(|_| caller.org_id == DEFAULT_ORG).map(str::to_owned),
+        }
+    }
+
+    fn bindings(&self) -> [&dyn ToSql; 4] {
+        [&DEFAULT_ORG, &self.unrestricted, &self.party, &self.party]
+    }
+
+    pub fn query(&self, conn: &Connection, query: &EventQuery) -> UaResult<Vec<Event>> {
+        ledger::query_filtered(conn, query, VISIBLE_MESSAGE, &self.bindings())
+    }
+
+    /// Message events need the persisted mailbox index to authorize a live row.
+    pub fn needs_visibility_check(event: &Event) -> bool {
+        event.channel.starts_with("agent.message.")
+    }
+
+    pub fn includes(&self, conn: &Connection, seq: i64) -> UaResult<bool> {
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM event_log WHERE seq = ? AND ({VISIBLE_MESSAGE}))");
+        let bindings = std::iter::once(&seq as &dyn ToSql).chain(self.bindings());
+        let mut stmt = conn.prepare_cached(&sql)?;
+        Ok(stmt.query_row(params_from_iter(bindings), |row| row.get(0))?)
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -81,8 +118,14 @@ impl EventScope {
 
     /// Scoped rows after `after_seq`, at most `limit`: the oldest ones after
     /// the cursor, so repeated calls page forward (see [`ledger::query`]).
-    pub fn read_after(&self, conn: &Connection, after_seq: i64, limit: usize) -> UaResult<Vec<Event>> {
-        ledger::query(conn, &self.query(Some(after_seq), None, Some(limit.clamp(1, MAX_LIMIT))))
+    pub fn read_after(
+        &self,
+        conn: &Connection,
+        reader: &EventReader,
+        after_seq: i64,
+        limit: usize,
+    ) -> UaResult<Vec<Event>> {
+        reader.query(conn, &self.query(Some(after_seq), None, Some(limit.clamp(1, MAX_LIMIT))))
     }
 
     /// `event_log_query` arguments for this scope, for a governed admission
@@ -121,22 +164,8 @@ pub fn register(r: &mut Registry) {
             |ctx: ToolCtx, a: QueryArgs| async move {
                 let scope = EventScope { channels: a.channels, channel_prefix: a.channel_prefix };
                 let q = scope.query(a.after_seq, a.since, a.limit);
-                let unrestricted = may_read_all_mail(&ctx);
-                let party = verified(&ctx.caller)
-                    .filter(|_| ctx.caller.org_id == ua_core::DEFAULT_ORG)
-                    .map(str::to_owned);
-                let events = ctx
-                    .hub
-                    .db()
-                    .read_async(move |c| {
-                        ledger::query_filtered(
-                            c,
-                            &q,
-                            VISIBLE_MESSAGE,
-                            &[&ua_core::DEFAULT_ORG, &unrestricted, &party, &party],
-                        )
-                    })
-                    .await?;
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                let events = ctx.hub.db().read_async(move |c| reader.query(c, &q)).await?;
                 let next = events.last().map(|e| e.seq);
                 let count = events.len();
                 let events: Vec<Value> = events.into_iter().map(labelled).collect::<UaResult<_>>()?;

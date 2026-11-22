@@ -315,12 +315,8 @@ pub struct CoordinationArgs {
 
 // --- who is reading -------------------------------------------------------------
 
-pub(super) fn may_read_all_mail(ctx: &ToolCtx) -> bool {
-    Authz::new(ctx.hub.cfg()).holds(
-        &ctx.caller,
-        &[Authority::LocalTrustReader, Authority::Operator],
-        ua_core::DEFAULT_ORG,
-    )
+pub(super) fn may_read_all_mail(cfg: &ua_core::Config, caller: &ua_core::Caller) -> bool {
+    Authz::new(cfg).holds(caller, &[Authority::LocalTrustReader, Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 /// The caller as the mailbox sees it.
@@ -351,7 +347,7 @@ impl Viewer {
         // Every mailbox: an operator (a verified human), or a caller without
         // a verified label (auth enforcement off: a message board, read
         // only). A profile grants nothing.
-        let unrestricted = may_read_all_mail(ctx);
+        let unrestricted = may_read_all_mail(cfg, &ctx.caller);
         let own_local = (identity.is_none() && ctx.caller.label != ua_core::identity::LOCAL_LABEL)
             .then(|| ctx.caller.label.clone());
         Self {
