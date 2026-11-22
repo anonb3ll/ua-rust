@@ -546,7 +546,7 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'old-box' AND retired_by = 'operator'"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
     assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
-    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = 'default'"), 1);
 
     // Self references: a forward parent is restored, a dangling one is NULL.
     assert_eq!(n(&db, "SELECT parent_id FROM tasks WHERE id = 2"), 4);
@@ -766,6 +766,43 @@ fn an_id_collision_refuses_before_any_write() {
     let msg = format!("{err:#}");
     assert!(msg.contains("tasks already holds a row") && msg.contains("nothing was written"), "{msg}");
     assert_eq!(counts(&db), before, "agents (copied before tasks) must not be written");
+}
+
+#[test]
+fn canvas_import_checks_for_collisions_in_the_default_organization() {
+    let f = fixture();
+    for org in [ua_core::DEFAULT_ORG, "other"] {
+        let db = target();
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at)
+                 VALUES ('other', 'other', 'Other', ?1)",
+                [T0],
+            )?;
+            tx.execute(
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at)
+                 VALUES (?1, 'default', '{}', 'builder-1', ?2)",
+                [org, T0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let before = counts(&db);
+        let result = ua_import::import(&db, &f.path, &opts());
+        if org == ua_core::DEFAULT_ORG {
+            let err = result.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("graph_canvas_scenes already holds a row")
+                    && msg.contains("nothing was written"),
+                "{msg}"
+            );
+            assert_eq!(counts(&db), before);
+        } else {
+            assert_eq!(table(&result.unwrap(), "graph_canvas_scenes").copied, 1);
+            assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE board_id = 'default'"), 2);
+        }
+    }
 }
 
 #[test]
