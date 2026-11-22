@@ -418,13 +418,27 @@ pub fn admit_keyed(
     now: i64,
     d: &Delivery,
 ) -> UaResult<Admission> {
+    Ok(admit_claimed(tx, cfg, key, now, d)?.0)
+}
+
+/// [`admit_keyed`], with the claim an [`Admission::Accepted`] delivery was
+/// taken on under (`None` for every other admission). Hand it to
+/// [`record_executed_under`], so the outcome settles only the row this
+/// admission created.
+pub fn admit_claimed(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    key: ReplayKey<'_>,
+    now: i64,
+    d: &Delivery,
+) -> UaResult<(Admission, Option<inbound::Claim>)> {
     let sha = match key {
         ReplayKey::Signed { timestamp, body } => record_signature(tx, timestamp, body, now)?,
         ReplayKey::Envelope { envelope_id } => record_replay_key(tx, envelope_sha(envelope_id), now)?,
     };
     let kind = d.kind.request();
     let Some(mapping) = cfg.slack_identity(&d.team_id, &d.user_id) else {
-        return Ok(Admission::Refused { reason: "unmapped_identity", identity: None });
+        return Ok((Admission::Refused { reason: "unmapped_identity", identity: None }, None));
     };
     let identity = mapping.identity.clone();
     match key {
@@ -456,7 +470,7 @@ pub fn admit_keyed(
             EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.refused", payload)
                 .by(identity.clone()),
         )?;
-        return Ok(Admission::Refused { reason, identity: Some(identity) });
+        return Ok((Admission::Refused { reason, identity: Some(identity) }, None));
     }
     let Some(claim) = record_delivery(tx, d.kind, &d.delivery_id, now)? else {
         ledger::append(
@@ -468,7 +482,7 @@ pub fn admit_keyed(
             )
             .by(identity.clone()),
         )?;
-        return Ok(Admission::Deduped { identity });
+        return Ok((Admission::Deduped { identity }, None));
     };
     ledger::append(
         tx,
@@ -487,7 +501,7 @@ pub fn admit_keyed(
             "a Slack delivery was not `seen` under its claim when accepted; admitted anyway"
         );
     }
-    Ok(Admission::Accepted { identity })
+    Ok((Admission::Accepted { identity }, Some(claim)))
 }
 
 /// Refusal reason for `/approve` from a mapping without `can_approve`.
@@ -548,6 +562,25 @@ pub fn record_executed(
     tool: Option<&str>,
     outcome: &UaResult<Value>,
 ) -> UaResult<()> {
+    record_executed_under(tx, None, identity, d_kind, delivery_id, command, tool, outcome)
+}
+
+/// [`record_executed`], settling the delivery under `claim`, the one
+/// [`admit_claimed`] returned. A very late outcome then settles only the row
+/// its admission created, never a newer row for the same id (one recorded
+/// after the old row expired). With `None` the row's current claim is read
+/// back, as [`record_executed`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn record_executed_under(
+    tx: &mut WriteTx<'_>,
+    claim: Option<&inbound::Claim>,
+    identity: &str,
+    d_kind: DeliveryKind,
+    delivery_id: &str,
+    command: &str,
+    tool: Option<&str>,
+    outcome: &UaResult<Value>,
+) -> UaResult<()> {
     let mut payload = json!({
         "kind": d_kind.request(),
         "delivery_id": delivery_id,
@@ -569,10 +602,15 @@ pub fn record_executed(
         EventInput::new(ua_core::DEFAULT_ORG, "agent.slack.request.executed", payload)
             .by(identity.to_string()),
     )?;
-    // Slack never takes a delivery over, so the row still carries the claim
-    // it was accepted under: the one this handler holds.
+    // Slack never takes a delivery over, so without a claim from admission
+    // the row's current claim is the one this handler holds, unless the row
+    // expired and a newer delivery recorded it again.
     let d = record_key(d_kind.as_str(), delivery_id);
-    if let Some(claim) = inbound::claim_of(tx, d)? {
+    let claim = match claim {
+        Some(c) => Some(c.clone()),
+        None => inbound::claim_of(tx, d)?,
+    };
+    if let Some(claim) = claim {
         let now = ua_core::time::now_ms() / 1000;
         if let inbound::Settle::NotMine { state } = inbound::finish(tx, d, &claim, now)? {
             tracing::info!(

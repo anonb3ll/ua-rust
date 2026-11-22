@@ -180,14 +180,14 @@ pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request)
                 Replay::Signed { timestamp, body } => slack::ReplayKey::Signed { timestamp, body },
                 Replay::Envelope(id) => slack::ReplayKey::Envelope { envelope_id: id },
             };
-            slack::admit_keyed(tx, hub.cfg(), key, now_s(), &d)
+            slack::admit_claimed(tx, hub.cfg(), key, now_s(), &d)
         })
         .await;
     let ack = |text: &str| Admitted::Answer(text.to_string());
-    let identity = match admitted {
-        Ok(Admission::Accepted { identity }) => identity,
-        Ok(Admission::Deduped { .. }) => return ack("Already received."),
-        Ok(Admission::Refused { reason, identity }) => {
+    let (identity, claim) = match admitted {
+        Ok((Admission::Accepted { identity }, claim)) => (identity, claim),
+        Ok((Admission::Deduped { .. }, _)) => return ack("Already received."),
+        Ok((Admission::Refused { reason, identity }, _)) => {
             if identity.is_none() {
                 // Not ledgered (anyone in the workspace can send these); debug only.
                 // The ids are what an operator adds to `slack_identities`; they
@@ -234,7 +234,7 @@ pub(crate) async fn admit_and_run(state: AppState, replay: Replay, req: Request)
         (_, None) => (format!("Accepted /{command}. The result is recorded in the hub ledger."), None),
     };
     let task_state = state.clone();
-    state.calls.spawn(execute(task_state, identity, req.delivery, parsed, response_url));
+    state.calls.spawn(execute(task_state, identity, claim, req.delivery, parsed, response_url));
     ack(&text)
 }
 
@@ -263,6 +263,7 @@ async fn http_admit(state: AppState, headers: &HeaderMap, body: Bytes, req: Requ
 async fn execute(
     state: AppState,
     identity: String,
+    claim: Option<ua_ingress::inbound::Claim>,
     d: Delivery,
     parsed: Value,
     response_url: Option<url::Url>,
@@ -289,7 +290,9 @@ async fn execute(
     let recorded = state
         .hub
         .db()
-        .write_async(move |tx| slack::record_executed(tx, &who, kind, &dl, &cmd, tool, &outcome))
+        .write_async(move |tx| {
+            slack::record_executed_under(tx, claim.as_ref(), &who, kind, &dl, &cmd, tool, &outcome)
+        })
         .await;
     if let Err(e) = recorded {
         tracing::warn!(code = e.code(), "could not ledger a Slack command's outcome");
