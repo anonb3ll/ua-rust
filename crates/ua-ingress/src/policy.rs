@@ -250,6 +250,27 @@ pub const OBSIDIAN_LOCAL: Policy = Policy {
     total_timeout: Duration::from_secs(20),
 };
 
+/// The operator's notification webhook (`notify_webhook_url`): http or
+/// https, any host and port, [`Addresses::OperatorConfigured`] (the
+/// receiver may be on a private network or this host), no redirects. The
+/// body is never read; 64 KiB is the cap if it were. 120 seconds for
+/// everything, the longest attempt the caller allows; the caller bounds
+/// each attempt more tightly.
+pub const NOTIFY_WEBHOOK: Policy = Policy {
+    name: "notify.webhook",
+    schemes: Schemes::HttpOrHttps,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::OperatorConfigured,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
+    max_body_bytes: 64 * 1024,
+    connect_timeout: Duration::from_secs(120),
+    request_timeout: Duration::from_secs(120),
+    total_timeout: Duration::from_secs(120),
+};
+
 /// Every named policy.
 pub const POLICIES: &[&Policy] = &[
     &SLACK_RESPONSE_URL,
@@ -261,6 +282,7 @@ pub const POLICIES: &[&Policy] = &[
     &GITHUB_REST,
     &GITHUB_ENTERPRISE,
     &OBSIDIAN_LOCAL,
+    &NOTIFY_WEBHOOK,
 ];
 
 /// The policy called `name`. An unknown name is refused.
@@ -482,7 +504,7 @@ mod tests {
             .filter(|p| p.addresses == Addresses::OperatorConfigured)
             .map(|p| p.name)
             .collect();
-        assert_eq!(users, ["github.enterprise"]);
+        assert_eq!(users, ["github.enterprise", "notify.webhook"]);
     }
 
     #[test]

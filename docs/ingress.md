@@ -351,7 +351,7 @@ category is caught, and that the lookalikes above are not. Baselines:
 | `ua-server` | `direct_dial` | 3 | `slack_socket.rs::connect`: `TcpStream::connect`, the rustls `TlsConnector`, the WebSocket client handshake |
 | `ua-server` | `inline_address_check` | 5 | loopback checks in `oauth/register.rs` (3) and `login.rs` (2) |
 | `ua-cli` | `inline_address_check` | 1 | `ops/doctor.rs`, the bind address |
-| `ua-tools` | `client_builder` | 2 | `mcp/gateway`, `notify` (`web::http_client`, the GitHub REST client and the Obsidian client were removed when their consumers moved onto `Outbound`) |
+| `ua-tools` | `client_builder` | 1 | `mcp/gateway` (`web::http_client`, the GitHub REST client, the Obsidian client and the notify client were removed when their consumers moved onto `Outbound`) |
 | `ua-tools` | `address_classifier` | 4 | `mcp/scope.rs` `classify`, `classify_v4`; `relay/gates.rs` `v4_kind`, `v6_kind` |
 | `ua-tools` | `inline_address_check` | 11 | loopback URL hosts in `slack.rs`, `zulip.rs`, `github/client.rs`, `harness_config/policy.rs` (2 each); `observability.rs` (2); `vault/obsidian.rs` (1) |
 | `ua-tools` | `delivery_table` | 4 | `github_deliveries`, `github_delivery_bodies` (still created, no longer read or written; dropped one release later), `slack_seen_signatures`, `slack_seen_deliveries`. `inbound_deliveries` is in `ua-ingress` and not counted |
@@ -372,6 +372,7 @@ calls `ua_ingress::addr`, so it no longer counts.
 | GitHub REST (`github/client.rs`: CI checks, polling, merged pull requests), public API | `github.rest`: https to `api.github.com`, public addresses, no redirects, 8 MiB cap (refused past it), 10 s to connect, 20 s for the call; one client per API base, reused |
 | GitHub REST against a GHES root in `github_api_url` | `github.enterprise`: as `github.rest` for any host, with `OperatorConfigured` addresses |
 | The Obsidian Local REST API (`vault/obsidian.rs`: `obsidian_status`, `_open`, `_active_note`, `_search`, `_append`) | `obsidian.local_rest`: http or https to `obsidian_api_url` (which must name `localhost` or a loopback address), `LoopbackOnly` addresses, certificates not verified, no redirects, 16 MiB cap (refused past it), 20 s for everything |
+| Notification webhook (`notify.rs`: `notify`, `batch_notify`, `flush_digest`, hub events such as `review_ready`) | `notify.webhook`: http or https to `notify_webhook_url`, any host and port, `OperatorConfigured` addresses, no redirects, the body never read (64 KiB cap), 120 s, with each attempt bounded by the caller's timeout (1 to 120 s, default 60; 20 for hub events) |
 
 The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
 neither settable from TOML or the environment) apply
@@ -382,8 +383,8 @@ class already admits loopback (`OperatorConfigured`) keeps its class.
 ## Planned slices
 
 1. Move the remaining HTTP client consumers onto policies (the MCP
-   gateway, notify webhooks, the client ID metadata fetch; the web, Zulip,
-   relay, Slack Web API, GitHub REST and Obsidian consumers have moved).
+   gateway and the client ID metadata fetch; the web, Zulip, relay, Slack
+   Web API, GitHub REST, Obsidian and notify consumers have moved).
 2. One inbound-delivery table, with a cut-over for GitHub deliveries
    (done: [Inbound deliveries](#inbound-deliveries)).
 3. Slack's signed HTTP routes and Socket Mode onto it.

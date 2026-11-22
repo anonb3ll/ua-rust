@@ -386,7 +386,26 @@ from its commit history.
   - a reply larger than 16 MiB is refused (there was no cap); from
     `obsidian_append`, whose patch has already been applied, such a reply
     reads as `response: null` instead;
-  - replies are decoded as UTF-8 (lossy) whatever charset they declare.
+  - replies are decoded as UTF-8 (lossy) whatever charset they declare;
+  - requests carry the hub's `User-Agent` (there was none).
+- Notification webhooks (`notify`, `batch_notify`, `flush_digest`, hub
+  events such as `review_ready`) now go through `ua_ingress::Outbound`
+  under `notify.webhook`: http or https to `notify_webhook_url`, any host
+  and port, `OperatorConfigured` addresses (private networks and this host
+  are still reached), no redirects, each attempt bounded by its timeout as
+  before. The configured secret header (also over plain http, as before),
+  retries on network errors, 429 and 5xx, the outbox and its error texts
+  are unchanged. Credentials in the URL are still sent as basic auth, now
+  as a header bound to the URL's origin. Stricter:
+  - a URL whose host is or resolves to a link-local (cloud metadata),
+    unspecified, multicast, broadcast and reserved, documentation,
+    benchmarking or IETF protocol address is refused (nothing was checked),
+    with `webhook address refused (<reason>)` and no retry; the peer
+    address is checked again after the response;
+  - proxy environment variables are ignored (they were honoured, so the
+    secret header could travel through a proxy);
+  - requests carry the hub's `User-Agent` (`ua-rust/<version>`; there was
+    none).
 
 ### Security
 
