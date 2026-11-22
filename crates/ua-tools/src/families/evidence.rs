@@ -31,14 +31,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use crate::families::events::{EventReader, VISIBLE_MESSAGE};
 use crate::families::injection::mark_untrusted;
 use crate::families::observability::{normalize_since, normalize_until};
 use crate::families::plans::row_map;
@@ -199,11 +199,17 @@ fn proof(task: &Map<String, Value>, events: &[Value], chain_ok: bool) -> Value {
 }
 
 /// Rows of `sql` with one bound list of task ids, grouped by the first column.
-fn grouped(c: &Connection, sql: &str, ids: &[i64]) -> UaResult<BTreeMap<i64, Vec<Map<String, Value>>>> {
+fn grouped(
+    c: &Connection,
+    sql: &str,
+    ids: &[i64],
+    extra: &[&dyn ToSql],
+) -> UaResult<BTreeMap<i64, Vec<Map<String, Value>>>> {
     let marks = vec!["?"; ids.len()].join(",");
     let sql = sql.replace("{ids}", &marks);
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(ids.iter()), row_map)?;
+    let params = ids.iter().map(|id| id as &dyn ToSql).chain(extra.iter().copied());
+    let rows = stmt.query_map(params_from_iter(params), row_map)?;
     let mut out: BTreeMap<i64, Vec<Map<String, Value>>> = BTreeMap::new();
     for row in rows {
         let mut m = row?;
@@ -287,6 +293,7 @@ fn build_report(
     a: &ReportArgs,
     caller_label: &str,
     verified_caller: bool,
+    reader: &EventReader,
 ) -> UaResult<Value> {
     let since = a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?;
     let until = a.until.as_deref().map(|s| normalize_until("until", s)).transpose()?;
@@ -313,38 +320,40 @@ fn build_report(
     }
 
     let mut sql = String::new();
-    let mut args: Vec<SqlValue> = Vec::new();
-    if let Some(pid) = a.project_id {
+    let mut args: Vec<&dyn ToSql> = Vec::new();
+    let visibility = reader.bindings();
+    let claimed_by_marker = a.agent.as_ref().map(|agent| format!("claimed-by: {agent}"));
+    if let Some(pid) = &a.project_id {
         sql.push_str(
             "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks WHERE id = ? \
              UNION ALL SELECT t.id, s.depth + 1, s.path || '.' || printf('%020d', t.id) \
              FROM tasks t JOIN sub s ON t.parent_id = s.id) \
              SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id WHERE 1=1",
         );
-        args.push(SqlValue::Integer(pid));
+        args.push(pid);
     } else {
         sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE 1=1");
     }
     if a.item.is_some() {
         sql.push_str(" AND 0");
     }
-    if let Some(t) = a.task_id {
+    if let Some(t) = &a.task_id {
         sql.push_str(" AND tasks.id = ?");
-        args.push(SqlValue::Integer(t));
+        args.push(t);
     }
-    if let Some(p) = a.project.as_deref() {
+    if let Some(p) = &a.project {
         sql.push_str(" AND tasks.project = ?");
-        args.push(SqlValue::Text(p.to_string()));
+        args.push(p);
     }
-    if let Some(agent) = a.agent.as_deref() {
-        sql.push_str(
+    if let Some(agent) = &a.agent {
+        sql.push_str(&format!(
             " AND (tasks.claimed_by = ? OR instr(COALESCE(tasks.notes, ''), ?) > 0 OR EXISTS (\
-             SELECT 1 FROM event_log e WHERE e.originator = ? AND NOT (e.channel >= 'sdk.' AND e.channel < 'sdk/') \
-             AND json_valid(e.payload) AND CAST(json_extract(e.payload, '$.task_id') AS INTEGER) = tasks.id))",
-        );
-        args.push(SqlValue::Text(agent.to_string()));
-        args.push(SqlValue::Text(format!("claimed-by: {agent}")));
-        args.push(SqlValue::Text(agent.to_string()));
+             SELECT 1 FROM event_log WHERE originator = ? AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
+             AND json_valid(payload) AND CAST(json_extract(payload, '$.task_id') AS INTEGER) = tasks.id \
+             AND ({VISIBLE_MESSAGE})))",
+        ));
+        args.extend([agent as &dyn ToSql, &claimed_by_marker, agent]);
+        args.extend(visibility);
     }
     if since.is_some() || until.is_some() {
         let mut clauses = Vec::new();
@@ -352,27 +361,26 @@ fn build_report(
             let mut parts = vec![format!("tasks.{col} IS NOT NULL")];
             if let Some(s) = &since {
                 parts.push(format!("tasks.{col} >= ?"));
-                args.push(SqlValue::Text(s.clone()));
+                args.push(s);
             }
             if let Some(u) = &until {
                 parts.push(format!("tasks.{col} <= ?"));
-                args.push(SqlValue::Text(u.clone()));
+                args.push(u);
             }
             clauses.push(format!("({})", parts.join(" AND ")));
         }
         sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
     }
-    if let Some(pr) = a.pr.as_deref() {
+    if let Some(pr) = &a.pr {
         sql.push_str(" AND (instr(COALESCE(tasks.evidence_ref, ''), ?) > 0 OR instr(COALESCE(tasks.notes, ''), ?) > 0)");
-        args.push(SqlValue::Text(pr.to_string()));
-        args.push(SqlValue::Text(pr.to_string()));
+        args.extend([pr as &dyn ToSql, pr]);
     }
     sql.push_str(if a.project_id.is_some() { " ORDER BY sub.path" } else { " ORDER BY tasks.id DESC" });
     sql.push_str(&format!(" LIMIT {}", limit + 1));
 
     let mut tasks: Vec<Map<String, Value>> = {
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args.iter()), row_map)?;
+        let rows = stmt.query_map(params_from_iter(args), row_map)?;
         rows.collect::<Result<_, _>>()?
     };
     let truncated = tasks.len() as i64 > limit;
@@ -385,11 +393,15 @@ fn build_report(
         (
             grouped(
                 c,
-                "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
-                 originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
-                 AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
-                 AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({ids}) ORDER BY seq",
+                &format!(
+                    "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
+                     originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
+                     AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
+                     AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({{ids}}) \
+                     AND ({VISIBLE_MESSAGE}) ORDER BY seq"
+                ),
                 &ids,
+                &visibility,
             )?,
             grouped(
                 c,
@@ -402,6 +414,7 @@ fn build_report(
                      ORDER BY seq"
                 ),
                 &ids,
+                &[],
             )?,
             grouped(
                 c,
@@ -410,12 +423,14 @@ fn build_report(
                  FROM approvals WHERE json_valid(payload) AND CAST(COALESCE(json_extract(payload, '$.task_id'), \
                  json_extract(payload, '$.parent_task_id')) AS INTEGER) IN ({ids}) ORDER BY id",
                 &ids,
+                &[],
             )?,
             grouped(
                 c,
                 "SELECT task_id AS _task, id, from_agent, to_agent, status, created_at, completed_at \
                  FROM delegations WHERE task_id IN ({ids}) ORDER BY id",
                 &ids,
+                &[],
             )?,
         )
     };
@@ -572,7 +587,8 @@ fn build_report(
 async fn evidence_report(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
     let label = ctx.caller.label.clone();
     let verified = matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human);
-    ctx.hub.db().read_async(move |c| build_report(c, &a, &label, verified)).await
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    ctx.hub.db().read_async(move |c| build_report(c, &a, &label, verified, &reader)).await
 }
 
 // ---------------------------------------------------------------------------

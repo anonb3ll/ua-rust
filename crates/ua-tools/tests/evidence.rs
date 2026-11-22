@@ -84,6 +84,41 @@ fn exec(hub: &Hub, sql: &str) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn evidence_uses_only_visible_messages_for_events_and_agent_attribution() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, recipient, observer) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task =
+        call(&reg, &hub, &observer, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+    let sent = call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": recipient.label, "task_id": task, "body": "Ready for review" }),
+    )
+    .await;
+    let filters = json!({ "task_id": task, "agent": sender.label, "since": "2020-01-01" });
+
+    let outsider = call(&reg, &hub, &observer, "evidence_report", json!({ "task_id": task })).await;
+    let record = &outsider["records"][0];
+    assert_eq!(record["proof"]["events_count"], 1);
+    assert_eq!(record["participants"], json!([observer.label]));
+    assert_eq!(record["tool_calls"]["callers"], json!([observer.label]));
+    let filtered = call(&reg, &hub, &observer, "evidence_report", filters.clone()).await;
+    assert_eq!(filtered["total_records"], 0);
+
+    for viewer in [&sender, &recipient] {
+        let report = call(&reg, &hub, viewer, "evidence_report", filters.clone()).await;
+        let record = &report["records"][0];
+        assert_eq!(record["proof"]["events_count"], 2);
+        assert!(record["participants"].as_array().unwrap().contains(&json!(sender.label)));
+        assert_eq!(record["events"][1]["ulid"], sent["event_ulid"]);
+        assert_eq!(record["proof"]["event_hashes"][1]["ulid"], sent["event_ulid"]);
+    }
+}
+
 fn synthetic_calls(hub: &Hub, caller: &str, n: usize, failed: usize) {
     let caller = caller.to_string();
     hub.db()
