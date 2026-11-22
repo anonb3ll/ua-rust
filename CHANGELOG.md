@@ -242,6 +242,25 @@ from its commit history.
   proves another organization's binding of the same project is never read. The
   importer writes imported bindings to `default`. Tool results and event
   payloads keep their shapes.
+- The notification tables carry an organization key: `notify_outbox` and
+  `pending_notifications` (`organization.v1.tools.notify`, with indexes led
+  by `org_id` in `notify.v2.org_indexes`) and `zulip_sends`
+  (`organization.v1.tools.zulip`). No key rebuild: none has a key beyond its
+  AUTOINCREMENT id. Existing rows move to `default`. `notify`,
+  `batch_notify`, `flush_digest` and `notify_delivery_status` read and write
+  only the caller's organization's rows (the digest threshold counts that
+  organization's queue, and a digest never mixes organizations);
+  `review_ready` notices are recorded in their task's organization
+  (`TASK_ORG`). The hub's webhook and Zulip configuration are the default
+  organization's destinations: another organization's notifications stay in
+  its outbox as `not_configured`, and its `zulip_send_message` is refused
+  (`zulip_not_configured`) before anything is recorded. The Zulip duplicate
+  check and `zulip_resolve_send` see only the caller's organization's sends;
+  another organization's send answers as a missing one. An organization
+  `orgs` does not hold is refused before any write. The `observability`
+  webhook health check reads the default organization's last delivery.
+  `review_ready_notices` stays in the tasks family. Results and events in
+  the default organization are unchanged.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

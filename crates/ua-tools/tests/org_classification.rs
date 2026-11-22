@@ -156,7 +156,9 @@ const TENANT: &[&str] = &[
 /// the three skill registry tables (`skill_registry.v2.tenant_keys`,
 /// `organization.v1.tools.skills`), and `project_repo_bindings`
 /// (`governance.v2.project_bindings_tenant_keys`,
-/// `organization.v1.tools.project_bindings`):
+/// `organization.v1.tools.project_bindings`), `notify_outbox` and
+/// `pending_notifications` (`organization.v1.tools.notify`) and `zulip_sends`
+/// (`organization.v1.tools.zulip`):
 /// `harness_config_bundles` and `harness_config_proposals` carry a nullable
 /// `org_id` and no triggers.
 const TENANT_MISSING_ORG_ID: &[&str] = &[
@@ -190,8 +192,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "notify_outbox",
-    "pending_notifications",
     "plan_checkpoints",
     "plan_steps",
     "plans",
@@ -219,7 +219,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "work_proposals",
     "workflow_checkpoints",
     "workflow_runs",
-    "zulip_sends",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];
