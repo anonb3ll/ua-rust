@@ -172,11 +172,11 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `isolation.same-org-handoff-note` | pass | |
 | `isolation.same-org-conversation-handoffs` | pass | |
 | `isolation.same-org-own-inbox` | pass | Control check. |
-| `isolation.same-org-ledger-read` | pass | `event_log_query`: builder-3's view is identical before and after the hidden records exist; message, handoff-note and conversation-handoff rows outside its access are filtered. |
+| `isolation.same-org-ledger-read` | pass | `event_log_query` and observability: builder-3's view is identical before and after the hidden records exist; message, handoff-note and conversation-handoff rows outside its access are filtered. |
 | `isolation.same-org-stream` | pass | Event stream: builder-3's view is identical before and after the hidden records exist; the backfill applies the same filter as ledger reads. |
 | `isolation.same-org-handoffs-in-retrieval` | pass | `session_packet(task_id)`: builder-3's view is identical before and after the hidden records exist. |
-| `isolation.same-org-evidence` | fail | Scored: the same restriction applied to evidence reports. The hidden events no longer appear, but the record's `tool_calls` window still counts the governed calls the participants made while writing them (counts only, no payloads). |
-| `isolation.same-org-exports` | pass | Export: builder-3's view is identical before and after the hidden records exist. |
+| `isolation.same-org-evidence` | fail | Scored: the same restriction applied to evidence reports. The hidden events no longer appear, but the record's `tool_calls` window still counts the governed calls the participants made while writing them (counts only, no payloads). Chain metadata — the manifest's `{ulid, entry_hash, redacted}` placeholders, the chain head and `total_verified` — stays visible as the accepted integrity exception. |
+| `isolation.same-org-exports` | pass | Export: builder-3's view is identical before and after the hidden records exist. Chain metadata stays visible as the accepted integrity exception: the manifest's `{ulid, entry_hash, redacted}` placeholders for hidden rows, the chain head and `total_verified`. |
 | `isolation.same-org-retrieval-and-explanations` | pass | `memory_search` and ranked `task_list`: builder-3's view is identical before and after the hidden records exist. |
 
 ### 5. Verify independently
@@ -197,7 +197,7 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `verify.authenticity-against-trusted-key` | not-built | Exports carry no signature or signed checkpoint. |
 | `verify.asserted-evidence-labelled` | pass | |
 | `verify.unavailable-and-unhashed-evidence-reported` | not-built | No bundle verifier reports unavailable evidence or unhashed legacy rows. |
-| `verify.private-content-kept-out` | pass | The migration manifest gives the auditor IDs and stored hashes for message rows outside its mailbox. |
+| `verify.private-content-kept-out` | pass | The migration manifest gives the auditor only the ID and stored hash (a `redacted` placeholder) for rows outside its event visibility — messages, handoff notes and conversation-handoff links. |
 | `verify.unauthorized-caller-refused-export` | pass | Refused by the developer profile; the gate is the coordinator profile, not an auditor grant. |
 | `verify.auditor-authorization` | not-built | No auditor role or grant exists: any coordinator-profile agent may export the whole hub. |
 

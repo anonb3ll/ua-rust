@@ -1350,6 +1350,16 @@ reveal hub-wide volume; every row's own hash is checkable, but the export is not
 chain-continuous on its own, because the chain links through other
 organizations' rows.
 
+**Chain metadata is the accepted integrity exception to event visibility.**
+Rows a caller may not see — private mailbox messages, session-handoff notes
+and conversation-handoff links outside its reach — are hidden whole: their
+channel, parties, task and payload never leak. The chain itself still does:
+sequence numbers, `prev_hash`/`entry_hash` links, the chain head
+(`head_ulid`/`head_hash`), verified totals such as `total_verified`, and the
+migration manifest's `{ulid, entry_hash, redacted: true}` placeholder for each
+hidden row. That metadata proves the ledger is intact and reveals that some
+rows exist, never what they say or whose they are.
+
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.
 
