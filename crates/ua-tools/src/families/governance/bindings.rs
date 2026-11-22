@@ -190,9 +190,9 @@ fn binding_operator(ctx: &ToolCtx, named: Option<&str>, doing: &str) -> UaResult
     Ok(who)
 }
 
-/// Refuse an organization `orgs` does not hold. Runs first in every write
-/// transaction: the `org_exists` trigger only sees inserts, so an unbind
-/// would otherwise pass.
+/// Refuse an organization `orgs` does not hold. Runs before the write, and
+/// again first in every write transaction: the `org_exists` trigger only
+/// sees inserts, so an unbind would otherwise pass.
 fn require_org(c: &Connection, org: &str) -> UaResult<()> {
     let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
     if !known {
@@ -223,13 +223,16 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
     let project = check_slug("project", &a.project)?;
     let repo = normalize_repo(&a.repo)?;
     let org = ctx.caller.org_id.clone();
-    let ctx2 = ctx.clone();
+    // Refuse an unknown organization and a non-operator before taking the
+    // writer lock; the transaction checks the organization again.
+    let known = org.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &known)).await?;
+    let who = binding_operator(&ctx, a.bound_by.as_deref(), "binding a project repository")?;
+    let branch = check_default_branch(a.default_branch.as_deref())?;
     ctx.hub
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
-            let who = binding_operator(&ctx2, a.bound_by.as_deref(), "binding a project repository")?;
-            let branch = check_default_branch(a.default_branch.as_deref())?;
             tx.execute(
                 "INSERT INTO project_repo_bindings (org_id, project, repo, default_branch, bound_by, bound_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (org_id, project) DO UPDATE SET repo = excluded.repo, \
@@ -255,12 +258,15 @@ pub(crate) async fn project_repo_bind(ctx: ToolCtx, a: BindArgs) -> UaResult<Val
 pub(crate) async fn project_repo_unbind(ctx: ToolCtx, a: UnbindArgs) -> UaResult<Value> {
     let project = check_slug("project", &a.project)?;
     let org = ctx.caller.org_id.clone();
-    let ctx2 = ctx.clone();
+    // Refuse an unknown organization and a non-operator before taking the
+    // writer lock; the transaction checks the organization again.
+    let known = org.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &known)).await?;
+    let who = binding_operator(&ctx, a.unbound_by.as_deref(), "unbinding a project repository")?;
     ctx.hub
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
-            let who = binding_operator(&ctx2, a.unbound_by.as_deref(), "unbinding a project repository")?;
             let previous = binding(tx, &org, &project)?;
             tx.execute(
                 "DELETE FROM project_repo_bindings WHERE org_id = ?1 AND project = ?2",

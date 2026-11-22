@@ -1,8 +1,17 @@
 //! Organization keys, standalone table rebuild and tool isolation for
 //! `project_repo_bindings`.
 
+use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, identity::Transport};
+use ua_tools::families::github::poll_once;
 use ua_tools::{Hub, Registry, builtin_registry};
 
 const ORG_B: &str = "org-b";
@@ -548,4 +557,250 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(got["binding"], Value::Null);
     let list = h.ok(&agent(UNKNOWN), "project_repo_list", json!({})).await;
     assert_eq!(list["projects"], json!([]));
+}
+
+// --- task-driven lookups -------------------------------------------------------------
+//
+// Tasks carry no `org_id` yet, so every lookup of a binding that starts from
+// a task reads the default organization's bindings. Another organization's
+// binding of the same project slug must never stand in for a missing or a
+// different default binding: not in a CI check, a policy authorization, a
+// commit deliverable, a merge's approval payload, merged-PR reconciliation
+// or the GitHub poll.
+
+/// Every request path the mock GitHub saw.
+type Seen = Arc<Mutex<Vec<String>>>;
+
+/// A local GitHub REST mock: an empty open-PR list for any repository, 404
+/// for everything else. Nothing reaches the network.
+async fn start_github() -> (Seen, String) {
+    async fn serve(State(seen): State<Seen>, req: Request) -> Response {
+        let path = req.uri().path().to_string();
+        let found = path.starts_with("/repos/") && path.ends_with("/pulls");
+        seen.lock().unwrap().push(path);
+        if found {
+            axum::Json(json!([])).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, axum::Json(json!({ "message": "Not Found" }))).into_response()
+        }
+    }
+    let seen: Seen = Arc::default();
+    let app = Router::new().fallback(serve).with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (seen, format!("http://{addr}"))
+}
+
+fn have_git() -> bool {
+    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A workspace repository with branch `task-7` one commit ahead of main.
+fn workspace_with_branch(ws: &Path) {
+    git(ws, &["init", "-q", "-b", "main"]);
+    for (k, v) in [
+        ("user.name", "builder-1"),
+        ("user.email", "builder-1@example.com"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", "/dev/null"),
+    ] {
+        git(ws, &["config", k, v]);
+    }
+    std::fs::write(ws.join("README.md"), "readme\n").unwrap();
+    git(ws, &["add", "README.md"]);
+    git(ws, &["commit", "-q", "-m", "chore: initial commit"]);
+    git(ws, &["checkout", "-q", "-b", "task-7"]);
+    std::fs::write(ws.join("feature.txt"), "feature\n").unwrap();
+    git(ws, &["add", "feature.txt"]);
+    git(ws, &["commit", "-q", "-m", "feat: add feature"]);
+    git(ws, &["checkout", "-q", "main"]);
+}
+
+fn default_agent(label: &str, profile: Profile) -> Caller {
+    Caller { label: label.into(), session_key: Some(format!("{label}-s")), profile, ..agent(DEFAULT_ORG) }
+}
+
+const FULL: &str = "abcdef1234567abcdef1234567abcdef12345678";
+
+struct TaskH {
+    h: H,
+    seen: Seen,
+    _ws: tempfile::TempDir,
+}
+
+impl TaskH {
+    async fn new() -> Self {
+        let (seen, base) = start_github().await;
+        let ws_dir = tempfile::tempdir().unwrap();
+        let ws = ws_dir.path().canonicalize().unwrap();
+        workspace_with_branch(&ws);
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_home(dir.path().join("home"));
+        cfg.human_identities = vec!["operator".into()];
+        cfg.workspace = Some(ws);
+        cfg.fetch_allow_loopback = true;
+        cfg.github_api_url = base;
+        cfg.github_token_value = Some("test-token".to_string().into());
+        cfg.github_web_host = Some("github.com".into());
+        let hub = Hub::in_memory(cfg).unwrap();
+        add_org(&hub, ORG_B);
+        Self { h: H { hub, reg: builtin_registry(), _dir: dir }, seen, _ws: ws_dir }
+    }
+
+    async fn call(&self, who: &Caller, tool: &str, args: Value) -> Result<Value, UaError> {
+        self.h.reg.call(&self.h.hub, who, tool, args).await
+    }
+
+    /// Requests the mock saw for `repo`.
+    fn hits(&self, repo: &str) -> Vec<String> {
+        let prefix = format!("/repos/{repo}/");
+        self.seen.lock().unwrap().iter().filter(|p| p.starts_with(&prefix)).cloned().collect()
+    }
+
+    /// The `repo` a merge of `task` asks its one-time approval for.
+    async fn merge_approval_repo(&self, task: i64) -> Value {
+        let e = self
+            .call(
+                &default_agent("lead-2", Profile::Coordinator),
+                "git_merge_task",
+                json!({ "task_id": task }),
+            )
+            .await;
+        let Err(UaError::ApprovalRequired { approval_id, .. }) = e else {
+            panic!("git_merge_task should ask for an approval, got {e:?}");
+        };
+        let raw: String = self
+            .h
+            .hub
+            .db()
+            .read(move |c| {
+                Ok(c.query_row("SELECT payload FROM approvals WHERE id = ?1", [approval_id], |r| r.get(0))?)
+            })
+            .unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()["repo"].clone()
+    }
+}
+
+#[tokio::test]
+async fn task_driven_lookups_never_read_another_organizations_binding() {
+    if !have_git() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let t = TaskH::new().await;
+    let h = &t.h;
+    let op = human(DEFAULT_ORG);
+    let builder = default_agent("builder-1", Profile::Developer);
+    let lead = default_agent("lead-2", Profile::Coordinator);
+
+    // Org B binds `web`; a default-organization task works in `web`.
+    h.seed_org_b("web", "owner-b/repo");
+    let task = t.call(&builder, "task_add", json!({ "title": "web work", "project": "web" })).await.unwrap()
+        ["id"]
+        .as_i64()
+        .unwrap();
+    t.call(&builder, "task_claim", json!({ "id": task })).await.unwrap();
+    // A finished task in `web` with a branch to merge, linking a PR of org B's repository.
+    let done = t.call(&builder, "task_add", json!({ "title": "merge me", "project": "web" })).await.unwrap()
+        ["id"]
+        .as_i64()
+        .unwrap();
+    h.hub
+        .db()
+        .write(move |tx| {
+            Ok(tx.execute("UPDATE tasks SET status = 'done', branch = 'task-7' WHERE id = ?1", [done])?)
+        })
+        .unwrap();
+    h.hub
+        .db()
+        .write(move |tx| {
+            Ok(tx.execute("UPDATE tasks SET evidence_ref = 'owner-b/repo#5' WHERE id = ?1", [task])?)
+        })
+        .unwrap();
+    let record = |name: &str, repo: Option<&str>| {
+        let mut r = json!({ "kind": "ci_run", "ref": "41" });
+        if let Some(repo) = repo {
+            r["repo"] = json!(repo);
+        }
+        json!({ "task_id": task, "name": name, "outcome": "pass", "head_sha": FULL, "ref": r })
+    };
+    let check = |v: &Value, name: &str| -> Value {
+        v["checks"].as_array().unwrap().iter().find(|c| c["name"] == name).cloned().unwrap()
+    };
+    let authorize = |repo: &str| json!({ "repo": repo, "pr": 5, "head_sha": FULL, "task_id": task, "policy_ref": "release-policy-1" });
+
+    // 1. No default binding at all.
+    // A check names no repository: none is filled in from org B's binding.
+    let v = h.ok(&builder, "task_check_record", record("ci-none", None)).await;
+    assert_eq!(check(&v, "ci-none")["ref"]["repo"], Value::Null, "{v}");
+    // A check naming org B's repository stays attested: the task's project
+    // has no binding of its own, so nothing is verified and GitHub is not asked.
+    let v = h.ok(&builder, "task_check_record", record("ci-b", Some("owner-b/repo"))).await;
+    let c = check(&v, "ci-b");
+    assert_eq!(c["grade"], "attested", "{c}");
+    assert_eq!(c["verification"]["verdict"], "unverifiable", "{c}");
+    assert!(c["verification"]["detail"].as_str().unwrap().contains("has no bound repository"), "{c}");
+    // A policy authorization for org B's repository is refused.
+    let e = t.call(&op, "policy_authorization_record", authorize("owner-b/repo")).await.unwrap_err();
+    assert_eq!(reason(&e), "repo_not_bound", "{e:?}");
+    // A commit deliverable needs the task's own binding.
+    let e =
+        t.call(&builder, "deliverable_create", json!({ "task_id": task, "title": "x" })).await.unwrap_err();
+    assert_eq!(reason(&e), "repo_unbound", "{e:?}");
+    // The merge would go into the workspace repository, not org B's.
+    assert_eq!(t.merge_approval_repo(done).await, Value::Null);
+    // Neither the poll nor merged-PR reconciliation touches org B's repository.
+    let polled = poll_once(&h.hub).await.unwrap();
+    assert_eq!(polled["repos"], json!([]), "{polled}");
+    h.ok(&lead, "queue_close_merged", json!({})).await;
+
+    // 2. The default organization binds another project to org B's repository
+    //    name: the repository is now bound for it, but not to `web`.
+    h.ok(&op, "project_repo_bind", json!({ "project": "api", "repo": "owner-b/repo" })).await;
+    let e = t.call(&op, "policy_authorization_record", authorize("owner-b/repo")).await.unwrap_err();
+    assert_eq!(reason(&e), "repo_mismatch", "{e:?}");
+    let e =
+        t.call(&builder, "deliverable_create", json!({ "task_id": task, "title": "x" })).await.unwrap_err();
+    assert_eq!(reason(&e), "repo_unbound", "{e:?}");
+    assert_eq!(t.merge_approval_repo(done).await, Value::Null);
+    // The web task's PR link is in no default project bound to owner-b/repo,
+    // so reconciliation never looks the PR up.
+    h.ok(&lead, "queue_close_merged", json!({})).await;
+    assert!(!t.hits("owner-b/repo").iter().any(|p| p.contains("/pulls/5")), "{:?}", t.hits("owner-b/repo"));
+    h.ok(&op, "project_repo_unbind", json!({ "project": "api" })).await;
+
+    // 3. The default organization binds `web` to its own repository.
+    h.ok(&op, "project_repo_bind", json!({ "project": "web", "repo": "owner-a/repo" })).await;
+    let e = t.call(&op, "policy_authorization_record", authorize("owner-b/repo")).await.unwrap_err();
+    assert_eq!(reason(&e), "repo_not_bound", "{e:?}");
+    let e = h.err(&builder, "task_check_record", record("ci-b2", Some("owner-b/repo"))).await;
+    assert_eq!(reason(&e), "repo_mismatch", "{e:?}");
+    let v = h.ok(&builder, "task_check_record", record("ci-a", None)).await;
+    assert_eq!(check(&v, "ci-a")["ref"]["repo"], "owner-a/repo", "{v}");
+    let ok = t.call(&op, "policy_authorization_record", authorize("owner-a/repo")).await.unwrap();
+    assert_eq!(ok["authorization"]["valid"], true, "{ok}");
+    assert_eq!(t.merge_approval_repo(done).await, "owner-a/repo");
+    // BoundRepo::all, through the poll: the default organization's repository only.
+    let polled = poll_once(&h.hub).await.unwrap();
+    let repos: Vec<&str> =
+        polled["repos"].as_array().unwrap().iter().map(|r| r["repo"].as_str().unwrap()).collect();
+    assert_eq!(repos, ["owner-a/repo"], "{polled}");
+    assert!(
+        t.hits("owner-b/repo").is_empty(),
+        "org B's repository was never asked: {:?}",
+        t.hits("owner-b/repo")
+    );
+    assert!(!t.hits("owner-a/repo").is_empty());
 }

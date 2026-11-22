@@ -54,7 +54,7 @@ use ua_core::{Caller, UaError, UaResult};
 use super::queue::{Row, descendants, is_active, protection, task_rows};
 use crate::Hub;
 use crate::families::github::client::{BoundRepo, GitHub, full_sha};
-use crate::families::tasks::{emit, int_field, str_field};
+use crate::families::tasks::{TASK_ORG, emit, int_field, str_field};
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
 
@@ -178,7 +178,7 @@ fn candidates(conn: &rusqlite::Connection, repo: &str) -> UaResult<Vec<Row>> {
         conn,
         "SELECT t.* FROM tasks t JOIN project_repo_bindings b ON b.org_id = ?2 AND b.project = t.project \
          WHERE lower(b.repo) = ?1 AND t.status IN ('open','doing','waiting_review','blocked') ORDER BY t.id",
-        [repo, ua_core::DEFAULT_ORG],
+        [repo, TASK_ORG],
     )
 }
 
@@ -383,7 +383,7 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
         if !Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
-            ua_core::DEFAULT_ORG,
+            TASK_ORG,
         ) {
             return Err(UaError::denied(
                 "operator_required",
@@ -400,7 +400,7 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
         .db()
         .read_async(move |c| {
             let mut out: BTreeSet<(BoundRepo, u64)> = BTreeSet::new();
-            for repo in BoundRepo::all(c, ua_core::DEFAULT_ORG)? {
+            for repo in BoundRepo::all(c, TASK_ORG)? {
                 if only.as_deref().is_some_and(|o| o != repo.as_str()) {
                     continue;
                 }

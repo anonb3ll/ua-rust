@@ -45,7 +45,7 @@ use super::client::{BoundRepo, full_sha};
 use crate::approvals::{self, Refusal, RefusalReason};
 use crate::families::continuity::same_label;
 use crate::families::governance::{bound_repo, normalize_repo};
-use crate::families::tasks::{emit, is_terminal, require_task, row_object, str_field};
+use crate::families::tasks::{TASK_ORG, emit, is_terminal, require_task, row_object, str_field};
 use crate::registry::{Registry, ToolCtx, tool};
 
 const DEFAULT_HOURS: u32 = 24;
@@ -204,8 +204,8 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            // Tasks are all in the default organization, so its bindings decide.
-            BoundRepo::check(tx, ua_core::DEFAULT_ORG, &repo)?;
+            // The task's organization's bindings decide.
+            BoundRepo::check(tx, TASK_ORG, &repo)?;
             let task = require_task(tx, id)?;
             if is_terminal(str_field(&task, "status").unwrap_or("open")) {
                 return Err(UaError::conflict(format!(
@@ -213,7 +213,7 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
                 )));
             }
             let project = str_field(&task, "project").unwrap_or("default");
-            match bound_repo(tx, ua_core::DEFAULT_ORG, project)? {
+            match bound_repo(tx, TASK_ORG, project)? {
                 Some(b) if b.eq_ignore_ascii_case(&repo) => {}
                 other => {
                     return Err(UaError::denied(

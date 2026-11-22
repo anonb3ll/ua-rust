@@ -62,7 +62,7 @@ use ua_core::{UaError, UaResult};
 use super::{bounded, now_micros, same_label};
 use crate::ci::{CiRun, Verdict};
 use crate::families::governance;
-use crate::families::tasks::{acting_identity, emit, require_task, str_field};
+use crate::families::tasks::{TASK_ORG, acting_identity, emit, require_task, str_field};
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
 
@@ -294,7 +294,7 @@ pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str
     let allowed = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        TASK_ORG,
     ) || same_label(str_field(task, "claimed_by"), who)
         || same_label(str_field(task, "next_owner"), who);
     if allowed {
@@ -314,7 +314,7 @@ pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str
 /// yet and are all in the default organization, so its binding decides.
 pub(crate) fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
     match str_field(task, "project") {
-        Some(project) => governance::bound_repo(conn, ua_core::DEFAULT_ORG, project),
+        Some(project) => governance::bound_repo(conn, TASK_ORG, project),
         None => Ok(None),
     }
 }
@@ -786,7 +786,7 @@ pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str
             format!("task {task_id}'s review at head {short} has unaccepted grade {:?}", row.grade),
         ));
     }
-    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, ua_core::DEFAULT_ORG, task_id, &head)?
+    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, TASK_ORG, task_id, &head)?
         && same_label(Some(&rev.producer), &row.recorded_by)
     {
         return Err(UaError::denied(

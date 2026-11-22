@@ -259,7 +259,7 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             };
             inbound::accept(tx, record_key(KIND_ID, &dl), &id_claim, now, None)?;
             inbound::accept(tx, record_key(KIND_BODY, &bh), &body_claim, now, None)?;
-            let bound = !rp.is_empty() && BoundRepo::check(tx, ua_core::DEFAULT_ORG, &rp).is_ok();
+            let bound = !rp.is_empty() && BoundRepo::check(tx, crate::families::tasks::TASK_ORG, &rp).is_ok();
             let mut payload =
                 json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound });
             if matches!(by_id, inbound::Sight::Redelivered { .. })

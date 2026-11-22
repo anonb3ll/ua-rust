@@ -158,7 +158,8 @@ impl GitHubCiVerifier {
             Err(e) => return Err(CiOutcome::new(Verdict::Unverifiable, e.detail()).observed(seen)),
         };
         let repo = run.repo.clone();
-        let bound = self.db.read_async(move |c| BoundRepo::check(c, ua_core::DEFAULT_ORG, &repo)).await;
+        let bound =
+            self.db.read_async(move |c| BoundRepo::check(c, crate::families::tasks::TASK_ORG, &repo)).await;
         match bound {
             Ok(b) => Ok((client, b)),
             Err(e) => Err(CiOutcome::new(Verdict::Unverifiable, e.to_string()).observed(seen)),

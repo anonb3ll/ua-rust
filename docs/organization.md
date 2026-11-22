@@ -118,7 +118,9 @@ here for memory columns, owners and defaults.
   event at a site marked `ORG-EVENT-DEFAULT` in the source must switch to the
   organization of the row it is about in the same change that lets a second
   organization have callers, or the default organization's ledger would
-  record another organization's activity. `code_symbols` has no index led by
+  record another organization's activity. A second **resolver work item,
+  `ORG-TASK-DEFAULT`**, covers every lookup that starts from a task (it names
+  `TASK_ORG`); see the governance family below. `code_symbols` has no index led by
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
   index led by `org_id`, in a new static part, when its family is converted.
@@ -144,7 +146,21 @@ here for memory columns, owners and defaults.
   task-driven lookup of a binding (CI checks, merges, policy authorizations,
   merged-PR reconciliation, deliverables, GitHub polling and webhooks) reads
   the default organization's bindings. The Python importer explicitly writes
-  legacy bindings to `default`.
+  legacy bindings to `default`. **Resolver work item (`ORG-TASK-DEFAULT`):**
+  each such lookup, and each authority check and deliverable lookup that
+  starts from a task, names the constant `TASK_ORG`
+  (`crates/ua-tools/src/families/tasks/mod.rs`) rather than `DEFAULT_ORG`.
+  When tasks gain `org_id`, every use of `TASK_ORG` must switch to the task's
+  own organization in that change, and the constant be removed, or a task of
+  a second organization would resolve the default organization's
+  repositories. `crates/ua-tools/tests/project_bindings_tenant.rs` holds
+  another organization's binding of the same project and checks that none
+  of these lookups reads it. The `project.repo.bound` and
+  `project.repo.unbound` events are `ORG-EVENT-DEFAULT` sites whose payloads
+  carry the project and repository names (and the previous binding) into
+  the default organization's ledger. They must move to the binding's
+  organization with the `ORG-EVENT-DEFAULT` switch, in the same change that
+  lets a second organization bind; the payload shape stays as it is.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See

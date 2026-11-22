@@ -218,10 +218,13 @@ from its commit history.
   and `project_repo_list` read and write only the caller's organization's
   bindings, so two organizations may bind the same project slug to different
   repositories; a bind or unbind for an organization `orgs` does not hold is
-  refused (`unknown_organization`) before anything changes. Task-driven
-  lookups (CI check verification, merges, policy authorizations, merged-PR
-  reconciliation, deliverables, GitHub polling and webhooks) use the default
-  organization's bindings, since tasks are not yet organization-scoped. The
+  refused (`unknown_organization`) before anything changes, and both that
+  refusal and `operator_required` come before the writer lock is taken.
+  Task-driven lookups (CI check verification, merges, policy authorizations,
+  merged-PR reconciliation, deliverables, GitHub polling and webhooks) use
+  the default organization's bindings, since tasks are not yet
+  organization-scoped; each names the shared `TASK_ORG` constant, and a test
+  proves another organization's binding of the same project is never read. The
   importer writes imported bindings to `default`. Tool results and event
   payloads keep their shapes.
 - An insert guard beside the classification test: it fails when an

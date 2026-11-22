@@ -39,7 +39,7 @@ pub async fn poll_once(hub: &Hub) -> UaResult<Value> {
         Ok(None) => return Ok(json!({ "skipped": "no GitHub token configured" })),
         Err(e) => return Ok(json!({ "skipped": e.detail() })),
     };
-    let repos = hub.db().read_async(|c| BoundRepo::all(c, ua_core::DEFAULT_ORG)).await?;
+    let repos = hub.db().read_async(|c| BoundRepo::all(c, crate::families::tasks::TASK_ORG)).await?;
     let mut reports = Vec::new();
     for repo in repos {
         reports.push(poll_repo(hub, &gh, &repo).await?);
