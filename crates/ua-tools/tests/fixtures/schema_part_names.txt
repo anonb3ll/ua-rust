@@ -76,5 +76,8 @@ skill_registry.v2.tenant_keys
 organization.v1.tools.skills
 governance.v2.project_bindings_tenant_keys
 organization.v1.tools.project_bindings
+organization.v1.tools.notify
+notify.v2.org_indexes
+organization.v1.tools.zulip
 harness_config.v3.tenant_keys
 organization.v1.tools.harness_config

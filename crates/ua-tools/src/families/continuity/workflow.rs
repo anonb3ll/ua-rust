@@ -1122,8 +1122,15 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
         .await;
     match claimed {
         Ok(Some(message)) => {
-            if let Err(e) =
-                crate::families::notify::send_event(hub, "review_ready", REVIEW_READY_AGENT, &message).await
+            // ORG-TASK-DEFAULT: the notification is in its task's organization.
+            if let Err(e) = crate::families::notify::send_event(
+                hub,
+                TASK_ORG,
+                "review_ready",
+                REVIEW_READY_AGENT,
+                &message,
+            )
+            .await
             {
                 tracing::warn!(task_id, error = %e, "review_ready notification failed");
             }

@@ -67,6 +67,11 @@ pub fn schema_parts() -> Vec<Part> {
     // The organization key rebuild and triggers of the project repository bindings table.
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_KEYS.into());
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_PART.into());
+    // The organization column and triggers of the notification tables (no
+    // key rebuild: neither family has a key beyond an AUTOINCREMENT id).
+    parts.push(families::notify::TENANT_PART.into());
+    parts.push(families::notify::ORG_INDEXES.into());
+    parts.push(families::zulip::TENANT_PART.into());
     // The organization key rebuild and triggers of the harness config tables.
     parts.push(families::harness_config::TENANT_KEYS.into());
     parts.push(families::harness_config::TENANT_PART.into());
