@@ -235,6 +235,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                 ],
             ),
         ),
+        ("families/workspace/git.rs", (1, vec![("git_merge_task", json!({ "task_id": 1 }))])),
         ("families/workspace/shell.rs", (1, vec![("run_cmd", json!({}))])),
         ("families/zulip.rs", (1, vec![("zulip_send_message", json!({}))])),
     ])

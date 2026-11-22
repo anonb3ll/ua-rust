@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 use ua_core::safety::resolve_in_root;
 use ua_core::{UaError, UaResult};
 
+use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
 use crate::families::github::authz;
 
 use super::{RunOutput, Sandbox, git_env, record, run_program, sandbox};
@@ -374,6 +375,82 @@ async fn run_merge(top: &Path, target: &str, id: i64, title: &str, head: &str) -
     Ok(rev_parse(top, "HEAD").await?.unwrap_or_default())
 }
 
+const MERGE_TOOL: &str = "git_merge_task";
+
+/// What a one-time approval of a merge binds: the call's arguments and the
+/// head, branch, target branch and bound repository (`owner/name`, `null`
+/// when the task's project has none) resolved when the call is made, with a
+/// one-line `summary` naming the commit and the target for the approver.
+fn merge_approval_payload(
+    a: &MergeArgs,
+    branch: &str,
+    head: &str,
+    target: &str,
+    repo: Option<&str>,
+) -> Value {
+    let short: String = head.chars().take(12).collect();
+    let into = match repo {
+        Some(r) => format!("{target} of {r}"),
+        None => format!("{target} of the workspace repository (no repository bound)"),
+    };
+    let what = if a.dry_run { "Dry run of merging" } else { "Merge" };
+    json!({
+        "task_id": a.task_id,
+        "force": a.force,
+        "dry_run": a.dry_run,
+        "allow_in_flight": a.allow_in_flight,
+        "branch": branch,
+        "head": head,
+        "target": target,
+        "repo": repo,
+        "summary": format!("{what} task {} branch {branch} at commit {short} into {into}", a.task_id),
+    })
+}
+
+/// Take a one-time approval for exactly `payload`. A live pass for the same
+/// task bound to other values (the branch moved, the project was rebound)
+/// does not cover it: the call is refused (`approval_binding_changed`), the
+/// refusal is ledgered, and a new request for the current values is parked.
+async fn one_time_approval(ctx: &ToolCtx, task_id: i64, payload: Value) -> UaResult<()> {
+    let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            let cfg = hub.cfg();
+            match approvals::gate(tx, cfg, &caller, MERGE_TOOL, &payload)? {
+                GateOutcome::Pass { .. } => Ok(Ok(())),
+                GateOutcome::Denied { approval_id, reason } => Ok(Err(UaError::denied(
+                    "approval_denied",
+                    format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+                ))),
+                GateOutcome::Pending { approval_id } => {
+                    let stale = approvals::stale_pass(tx, cfg, &caller.label, MERGE_TOOL, &payload, &["task_id"])?;
+                    let Some(stale) = stale else {
+                        return Ok(Err(UaError::ApprovalRequired { tool: MERGE_TOOL.into(), approval_id }));
+                    };
+                    // The summary restates the bound fields; name those.
+                    let changed: Vec<String> = stale.changed.into_iter().filter(|f| f != "summary").collect();
+                    let r = Refusal::new(MERGE_TOOL, RefusalReason::BindingChanged)
+                        .approval(stale.approval_id)
+                        .task(Some(task_id))
+                        .hashes(Some(stale.approved_sha256), Some(approvals::payload_sha256(MERGE_TOOL, &payload)))
+                        .changed(changed.clone());
+                    approvals::refused(tx, &caller.label, &r, None)?;
+                    Ok(Err(UaError::denied(
+                        "approval_binding_changed",
+                        format!(
+                            "approval {} no longer matches this merge (changed: {}); approval {approval_id} was \
+                             requested for the current values",
+                            stale.approval_id,
+                            changed.join(", ")
+                        ),
+                    )))
+                }
+            }
+        })
+        .await?
+}
+
 async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
     let sb = sandbox(&ctx)?;
     let id = a.task_id;
@@ -494,8 +571,15 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         "worktree_clean": worktree_clean,
         "already_merged": already_merged,
     });
-    // A policy authorization stands in for the one-time approval (the
-    // registry skipped its gate because the argument is present). It is
+    // Without a policy authorization the merge needs a one-time approval
+    // bound to what it will do, resolved now: the head, the branch, the
+    // target branch and the bound repository. A commit added after the human
+    // approved, or a project rebound to another repository, no longer matches.
+    if a.policy_authorization_id.is_none() {
+        let payload = merge_approval_payload(&a, &branch, &head, target, row.repo.as_deref());
+        one_time_approval(&ctx, id, payload).await?;
+    }
+    // A policy authorization stands in for the one-time approval. It is
     // reserved (consumed, fenced on the head) right before the merge and put
     // back to active if the merge does not happen, so a failure does not burn it.
     let mut spent: Option<(i64, String)> = None;
@@ -652,14 +736,15 @@ pub fn register(r: &mut Registry) {
             "git_merge_task",
             "Merge a task's recorded branch into main of the workspace repository after checking the task \
              status and a clean worktree, then remove the worktree and delete the branch (expected-SHA). \
-             dry_run=true only reports. Always needs a one-time human approval, or policy_authorization_id: a \
-             human's policy authorization for exactly this task, its project's bound repository and the head being \
+             dry_run=true only reports. Always needs a one-time human approval, bound to the head, branch, target \
+             branch and bound repository resolved at the call (a later commit or a rebound project needs a new \
+             one: approval_binding_changed), or policy_authorization_id: a human's policy authorization for exactly this task, its project's bound repository and the head being \
              merged (spent only by a successful merge; force is refused on that path). Returns {success, commit_hash, task_id, branch} plus cleanup_skipped / \
              branch_retained when the source was kept.",
             git_merge_task,
         )
         .family("workspace")
         .always_gated()
-        .handler_gates_with("policy_authorization_id"),
+        .gates_in_handler(),
     );
 }

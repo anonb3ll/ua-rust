@@ -293,6 +293,22 @@ from its commit history.
 
 ### Behaviour changes
 
+- A one-time approval of `git_merge_task` no longer covers a later commit.
+  The approval now binds the head (full SHA), branch, target branch and the
+  task project's bound repository resolved when the merge is called, plus a
+  summary naming the commit and the target for the approver. A merge whose
+  branch moved after the approval, or whose project was rebound to another
+  repository, is refused with `approval_binding_changed` (ledgered as an
+  `agent.approval.refused` event, reason `binding_changed`) and a new
+  request for the current values is parked; before, it ran under the old
+  approval. Passes approved before this change bound only the arguments and
+  no longer match: they need a new approval. Because the handler now
+  resolves the payload, `git_merge_task` can no longer be requested ahead
+  through `POST /api/approvals/request` (`409`), and a merge bound to fail
+  (an unknown task, an unfinished task, a dirty worktree) is refused with
+  that error before an approval is parked, instead of parking first. The
+  policy authorization path is unchanged.
+
 - An unknown schema part refuses to open the database. Opening the store
   compares the parts recorded in `schema_parts` with every part name the
   build knows (optional and feature-gated parts included, so a lean build

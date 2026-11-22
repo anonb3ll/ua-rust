@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 34 pass, 8 fail, 20 not-built.
+62 checks: 35 pass, 7 fail, 20 not-built.
 
 ### 1. Plan and delegate
 
@@ -140,7 +140,7 @@ from it and may lag behind it.
 | `release.changed-target-refusal-audited` | pass | As above, reason `binding_changed`, changed field `repo`. |
 | `release.verified-human-approves-exact-action` | pass | Through the policy authorization path; the one-time approval path is scored separately below. |
 | `release.approved-attempt-produces-artifact` | pass | |
-| `release.one-time-approval-binds-revision` | fail | Scored: an approval bound to the revision. A one-time approval of `git_merge_task` records the task, not the head, so the merge it allows is not bound to the revision shown at approval. |
+| `release.one-time-approval-binds-revision` | pass | The one-time approval binds the head, target branch and bound repository; with the branch moved after the approval the merge is refused (`approval_binding_changed`) and an `agent.approval.refused` event by the refused caller names the approval, reason `binding_changed`, changed field `head`. |
 | `release.requires-review-at-head` | not-built | Nothing gates a merge on the recorded review: with the expected review unknown at the head, a merge under a valid authorization for that head runs. |
 
 The passing approval path is the policy authorization

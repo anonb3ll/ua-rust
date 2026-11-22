@@ -590,7 +590,6 @@ enum Grant {
     /// A policy authorization (`policy_authorizations`).
     Authorization(i64),
     /// A one-time approval (`approvals`).
-    #[allow(dead_code)]
     Approval(i64),
 }
 
@@ -1364,7 +1363,26 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
         3,
         "release.one-time-approval-binds-revision",
         match &late {
-            Err(e) => Ok(format!("a branch moved after the approval is refused: {}", reason(e))),
+            Err(e) => (|| {
+                ensure(reason(e) == "approval_binding_changed", format!("refused for another reason: {e:?}"))?;
+                ensure(
+                    payload.contains(&approved_head) && !payload.contains(&unreviewed),
+                    format!("the approval does not bind the approved head: {payload}"),
+                )?;
+                let audited = s.refusal_audited(
+                    mark,
+                    "lead-1",
+                    Grant::Approval(approval_id),
+                    "merge of a branch moved after the approval",
+                )?;
+                Ok(format!(
+                    "the approval binds head {} (payload {payload}); with the branch moved to {} the merge is \
+                     refused: {}; {audited}",
+                    &approved_head[..12],
+                    &unreviewed[..12],
+                    reason(e)
+                ))
+            })(),
             Ok(_) => {
                 let merged = s
                     .ledger_after(mark)

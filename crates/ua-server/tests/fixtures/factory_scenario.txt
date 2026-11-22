@@ -37,7 +37,7 @@
 3 release.changed-target-refusal-audited pass
 3 release.verified-human-approves-exact-action pass
 3 release.approved-attempt-produces-artifact pass
-3 release.one-time-approval-binds-revision fail
+3 release.one-time-approval-binds-revision pass
 3 release.requires-review-at-head not-built
 
 4 isolation.other-org-direct-reads not-built

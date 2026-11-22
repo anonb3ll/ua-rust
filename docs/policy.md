@@ -179,8 +179,25 @@ of the payload its gate builds (sorted keys, no whitespace, as
 `ua_core::canonical` writes it) and the requester. The payload is the
 call's arguments unless the tool's handler resolves more: `dispatch_task`
 binds the resolved harness, working directory and prompt hash, the relay
-binds the exact text and target. A pass expires `approval_pass_ttl_hours`
-after it was approved.
+binds the exact text and target, and `git_merge_task` binds the head,
+branch, target branch and bound repository it resolves at the call. A pass
+expires `approval_pass_ttl_hours` after it was approved.
+
+`git_merge_task` without `policy_authorization_id` checks the task, its
+worktree and the workspace repository first, then asks for a one-time
+approval of `{task_id, force, dry_run, allow_in_flight, branch, head,
+target, repo, summary}`, where `head` is the full commit SHA of the task's
+branch, `target` the branch merged into, `repo` the task project's bound
+`owner/name` (`null` when unbound) and `summary` one line naming the commit
+and the target for the approver ("Merge task 7 branch task-7 at commit
+0123456789ab into main of example/widgets"). A call whose head, target or
+repository differs from a live pass for the same task is refused with
+`approval_binding_changed`, naming the changed fields; the refusal is
+ledgered as `binding_changed`, the old pass stays unspent and a new
+request for the current values is parked. Because the payload is resolved
+by the handler, the merge cannot be requested ahead through
+`POST /api/approvals/request` (`409`), and a call bound to fail (an unknown
+task, a dirty worktree) is refused before a human is asked.
 
 Each approval event carries `payload_sha256`, the SHA-256 of that canonical
 payload, so the request, the decision, the use and any refusal can be tied
