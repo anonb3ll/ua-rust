@@ -735,6 +735,7 @@ async fn project_repo_bindings_normalize_clear_bad_branch_and_refuse_overlaps() 
     assert_eq!(table(&r, "project_repo_bindings").copied, 4);
     assert_eq!(r.binding_branches_cleared, 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM project_repo_bindings"), 4);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM project_repo_bindings WHERE org_id = 'default'"), 4);
 
     let hub = Hub::new(Config::for_home(std::env::temp_dir()), db.clone());
     let reg = builtin_registry();
@@ -825,6 +826,41 @@ async fn project_repo_bindings_normalize_clear_bad_branch_and_refuse_overlaps() 
     assert!(msg_hit.contains("already holds a row"), "{msg_hit}");
     assert_eq!(n(&db_hit, "SELECT COUNT(*) FROM tasks"), 0);
     assert_eq!(n(&db_hit, "SELECT COUNT(*) FROM project_repo_bindings"), 1);
+
+    // The same slug bound in another organization is no collision: imported
+    // bindings land in the default organization.
+    let db_other = target();
+    db_other
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('other', 'other', 'Other', ?1)",
+                [T0],
+            )?;
+            tx.execute(
+                "INSERT INTO project_repo_bindings (org_id, project, repo, bound_by, bound_at) \
+                 VALUES ('other', 'alpha-proj', 'owner/native', 'operator', ?1)",
+                [T0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let r_other = ua_import::import(&db_other, &f_hit.path, &opts()).unwrap();
+    assert_eq!(table(&r_other, "project_repo_bindings").copied, 1);
+    assert_eq!(
+        n(
+            &db_other,
+            "SELECT COUNT(*) FROM project_repo_bindings WHERE org_id = 'default' AND project = 'alpha-proj' \
+             AND repo = 'owner/repo'"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &db_other,
+            "SELECT COUNT(*) FROM project_repo_bindings WHERE org_id = 'other' AND repo = 'owner/native'"
+        ),
+        1
+    );
 }
 
 #[test]

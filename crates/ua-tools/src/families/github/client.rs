@@ -91,17 +91,21 @@ impl GhError {
 
 /// A repository some project is bound to, normalized `owner/name`. The only
 /// way to name a repository to [`GitHub`].
+///
+/// Bindings are per organization. The GitHub family's own data (deliveries,
+/// poll state, the tasks it links) is not organization-scoped yet, so its
+/// callers look up the default organization's bindings.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BoundRepo(String);
 
 impl BoundRepo {
-    /// `repo` if a project is bound to it.
-    pub(crate) fn check(conn: &Connection, repo: &str) -> UaResult<BoundRepo> {
+    /// `repo` if a project of organization `org` is bound to it.
+    pub(crate) fn check(conn: &Connection, org: &str, repo: &str) -> UaResult<BoundRepo> {
         let want = repo.trim().to_ascii_lowercase();
         let found: Option<String> = conn
             .query_row(
-                "SELECT repo FROM project_repo_bindings WHERE lower(repo) = ?1 LIMIT 1",
-                [&want],
+                "SELECT repo FROM project_repo_bindings WHERE org_id = ?1 AND lower(repo) = ?2 LIMIT 1",
+                [org, want.as_str()],
                 |r| r.get(0),
             )
             .ok();
@@ -114,10 +118,11 @@ impl BoundRepo {
         }
     }
 
-    /// Every bound repository, once each.
-    pub(crate) fn all(conn: &Connection) -> UaResult<Vec<BoundRepo>> {
-        let mut stmt = conn.prepare("SELECT DISTINCT lower(repo) FROM project_repo_bindings ORDER BY 1")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    /// Every repository organization `org` binds, once each.
+    pub(crate) fn all(conn: &Connection, org: &str) -> UaResult<Vec<BoundRepo>> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT lower(repo) FROM project_repo_bindings WHERE org_id = ?1 ORDER BY 1")?;
+        let rows = stmt.query_map([org], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(BoundRepo).collect())
     }
 

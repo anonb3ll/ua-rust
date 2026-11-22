@@ -215,13 +215,19 @@ fn active(c: &Connection) -> UaResult<Option<Active>> {
 }
 
 /// The bundle a node of `agent` is served: the active bundle plus the
-/// registry skills resolved for the agent (and its default profile), and a
+/// registry skills of `org` resolved for the agent (and its default profile), and a
 /// note per resolved skill saying whether it was included. A registry skill
 /// that fails the bundle policy (a description that cannot go into TOML,
 /// hidden text, permission front matter) is left out and the note says why.
-fn effective(c: &Connection, hub: &Hub, agent: &str, bundle: &Bundle) -> UaResult<(Bundle, Vec<Value>)> {
+fn effective(
+    c: &Connection,
+    hub: &Hub,
+    org: &str,
+    agent: &str,
+    bundle: &Bundle,
+) -> UaResult<(Bundle, Vec<Value>)> {
     let profile = crate::sessions::default_profile(hub, agent);
-    let resolved = skill_registry::resolve(c, agent, Some(profile.as_str()))?;
+    let resolved = skill_registry::resolve(c, org, agent, Some(profile.as_str()))?;
     let mut out = bundle.clone();
     let mut notes = Vec::new();
     for s in resolved {
@@ -538,10 +544,10 @@ fn no_bundle() -> Value {
     json!({ "bundle": null, "version": null, "rendered": {}, "apply_grants": [], "proposal_mode": true })
 }
 
-fn get_payload(c: &Connection, hub: &Hub, agent: &str, node: &str) -> UaResult<Value> {
+fn get_payload(c: &Connection, hub: &Hub, org: &str, agent: &str, node: &str) -> UaResult<Value> {
     let row = owned_node(c, node, agent)?;
     let Some(active) = active(c)? else { return Ok(no_bundle()) };
-    let (bundle, assigned) = effective(c, hub, agent, &active.bundle)?;
+    let (bundle, assigned) = effective(c, hub, org, agent, &active.bundle)?;
     let rendered = render_all(&bundle)?;
     let grants = apply_grants(c, hub, agent, &row.node, &active.version, &rendered)?;
     let mut full = Map::new();
@@ -593,7 +599,13 @@ struct ReportPlan {
 
 /// Validate a report and compute every approval payload (diffs included)
 /// on a read connection.
-fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> UaResult<ReportPlan> {
+fn plan_report(
+    c: &Connection,
+    hub: &Hub,
+    org: &str,
+    agent: &str,
+    a: &NodeConfigArgs,
+) -> UaResult<ReportPlan> {
     let node = owned_node(c, &a.node, agent)?.node;
     let Some(active) = active(c)? else {
         return Err(UaError::not_found("no active harness config bundle"));
@@ -614,7 +626,7 @@ fn plan_report(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> Ua
     if proposals.len() > MAX_PROPOSALS_PER_REPORT {
         return Err(UaError::invalid(format!("at most {MAX_PROPOSALS_PER_REPORT} proposals per report")));
     }
-    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
+    let (bundle, _) = effective(c, hub, org, agent, &active.bundle)?;
     let mut items = Vec::new();
     for raw in proposals {
         let Some(raw) = raw.as_object() else {
@@ -832,9 +844,9 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
 }
 
 /// The grants a node holds now, for a report's answer.
-fn grants_now(c: &Connection, hub: &Hub, agent: &str, node: &str) -> UaResult<Vec<Value>> {
+fn grants_now(c: &Connection, hub: &Hub, org: &str, agent: &str, node: &str) -> UaResult<Vec<Value>> {
     let Some(active) = active(c)? else { return Ok(Vec::new()) };
-    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
+    let (bundle, _) = effective(c, hub, org, agent, &active.bundle)?;
     apply_grants(c, hub, agent, node, &active.version, &render_all(&bundle)?)
 }
 
@@ -854,7 +866,13 @@ struct AppliedPlan {
     base: Option<String>,
 }
 
-fn plan_applied(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> UaResult<AppliedPlan> {
+fn plan_applied(
+    c: &Connection,
+    hub: &Hub,
+    org: &str,
+    agent: &str,
+    a: &NodeConfigArgs,
+) -> UaResult<AppliedPlan> {
     let surface = a.surface.as_deref().map(py_strip).unwrap_or_default().to_string();
     if !valid_surface(&surface) {
         return Err(UaError::invalid("surface is invalid"));
@@ -868,7 +886,7 @@ fn plan_applied(c: &Connection, hub: &Hub, agent: &str, a: &NodeConfigArgs) -> U
         return Err(UaError::not_found("no active harness config bundle"));
     };
     let version = active.version.clone();
-    let (bundle, _) = effective(c, hub, agent, &active.bundle)?;
+    let (bundle, _) = effective(c, hub, org, agent, &active.bundle)?;
     let desired = render_surface(&bundle, &surface)?;
     if content_hash(&desired) != hash {
         return Err(UaError::conflict_code(
@@ -993,21 +1011,24 @@ async fn node_config(ctx: ToolCtx, a: NodeConfigArgs) -> UaResult<Value> {
     let action = crate::routes::action_of("node_config", a.action.as_deref())?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let agent = caller.label.clone();
+    // The registry skills a node is served are its caller's organization's.
+    let org = caller.org_id.clone();
     let db = ctx.hub.db();
     match action {
-        "get" => db.read_async(move |c| get_payload(c, &hub, &agent, &a.node)).await,
+        "get" => db.read_async(move |c| get_payload(c, &hub, &org, &agent, &a.node)).await,
         "report" => {
-            let (h, ag) = (hub.clone(), agent.clone());
-            let plan = db.read_async(move |c| plan_report(c, &h, &ag, &a)).await?;
+            let (h, o, ag) = (hub.clone(), org.clone(), agent.clone());
+            let plan = db.read_async(move |c| plan_report(c, &h, &o, &ag, &a)).await?;
             let node = plan.node.clone();
             let h = hub.clone();
             let mut out = db.write_async(move |tx| commit_report(tx, &h, &caller, plan)).await?;
-            out["apply_grants"] = json!(db.read_async(move |c| grants_now(c, &hub, &agent, &node)).await?);
+            out["apply_grants"] =
+                json!(db.read_async(move |c| grants_now(c, &hub, &org, &agent, &node)).await?);
             Ok(out)
         }
         "applied" => {
-            let (h, ag) = (hub.clone(), agent.clone());
-            let plan = db.read_async(move |c| plan_applied(c, &h, &ag, &a)).await?;
+            let (h, o, ag) = (hub.clone(), org.clone(), agent.clone());
+            let plan = db.read_async(move |c| plan_applied(c, &h, &o, &ag, &a)).await?;
             match db.write_async(move |tx| commit_applied(tx, &hub, &caller, plan)).await? {
                 Ok(v) => Ok(v),
                 Err(NotApplied::Pending(approval_id)) => {

@@ -210,6 +210,38 @@ from its commit history.
   cached entries migrate to `default`. Organizations cache identical queries
   independently, and one organization's TTL eviction does not remove another
   organization's cached entries.
+- Skill registry versions, assignments and staged publishes
+  (`skill_versions`, `skill_assignments`, `skill_publish_staging`) are
+  organization-scoped. The standalone rebuild `skill_registry.v2.tenant_keys`
+  makes the keys `UNIQUE(org_id, name, version)` and
+  `UNIQUE(org_id, skill_name, target_type, target)`, keeping ids, the
+  AUTOINCREMENT sequence, indexes, the version immutability triggers and
+  views, and adds indexes led by `org_id`; `organization.v1.tools.skills`
+  adds `org_id` to the staging table and installs the organization triggers
+  on all three. Existing rows migrate to `default`. Every `skill_registry`
+  action and the skills a node's harness bundle carries use the caller's
+  organization: another organization's skill, version or staged publish
+  answers as a missing one, and a write for an organization `orgs` does not
+  hold is refused (`invalid_argument`) before anything is read or written.
+  The importer writes legacy skill versions and assignments to `default`.
+  Results and events in the default organization are unchanged.
+- Project repository bindings (`project_repo_bindings`) have
+  organization-scoped keys and triggers
+  (`governance.v2.project_bindings_tenant_keys`, a standalone rebuild, then
+  `organization.v1.tools.project_bindings`). Existing bindings migrate to
+  `default`. `project_repo_bind`, `project_repo_unbind`, `project_repo_get`
+  and `project_repo_list` read and write only the caller's organization's
+  bindings, so two organizations may bind the same project slug to different
+  repositories; a bind or unbind for an organization `orgs` does not hold is
+  refused (`unknown_organization`) before anything changes, and both that
+  refusal and `operator_required` come before the writer lock is taken.
+  Task-driven lookups (CI check verification, merges, policy authorizations,
+  merged-PR reconciliation, deliverables, GitHub polling and webhooks) use
+  the default organization's bindings, since tasks are not yet
+  organization-scoped; each names the shared `TASK_ORG` constant, and a test
+  proves another organization's binding of the same project is never read. The
+  importer writes imported bindings to `default`. Tool results and event
+  payloads keep their shapes.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

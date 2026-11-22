@@ -29,6 +29,7 @@ mod holds;
 mod lifecycle;
 mod procscan;
 mod proposals;
+mod tenant_keys;
 mod worktrees;
 
 use ua_core::{Caller, UaError, UaResult};
@@ -50,6 +51,7 @@ pub(crate) use proposals::{
     check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
     work_proposal_list, work_proposal_recover, work_proposal_withdraw,
 };
+pub use tenant_keys::{PROJECT_BINDINGS_TENANT_KEYS, PROJECT_BINDINGS_TENANT_PART};
 
 use super::agents::verified;
 use crate::registry::Registry;

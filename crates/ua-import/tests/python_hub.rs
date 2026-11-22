@@ -805,6 +805,69 @@ fn canvas_import_checks_for_collisions_in_the_default_organization() {
     }
 }
 
+/// Legacy skill versions and assignments land in the default organization,
+/// keeping their ids. A source `org_id` is never copied by name, even when the
+/// target holds an organization of that id, and another organization's row
+/// with the same name and version does not collide.
+#[test]
+fn skill_rows_import_into_the_default_organization() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute_batch(&format!(
+        "
+CREATE TABLE skill_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, version INTEGER NOT NULL,
+  content_hash TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, published_by TEXT,
+  published_at TEXT NOT NULL, package_manifest TEXT, package_payload TEXT, org_id TEXT, UNIQUE(name, version));
+CREATE TABLE skill_assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL,
+  target_type TEXT NOT NULL, target TEXT NOT NULL, pinned_version INTEGER, assigned_by TEXT,
+  assigned_at TEXT NOT NULL, UNIQUE(skill_name, target_type, target));
+INSERT INTO skill_versions (id, name, version, content_hash, source, content, published_at, org_id) VALUES
+  (7, 'review-diff', 1, 'h1', 'skills/review-diff/SKILL.md', 'body', '{T0}', 'org-a');
+INSERT INTO skill_assignments (id, skill_name, target_type, target, pinned_version, assigned_at) VALUES
+  (3, 'review-diff', 'agent', 'agent-1', 1, '{T0}');
+"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('org-a', 'org-a', 'Org A', ?1)",
+            [T0],
+        )?;
+        tx.execute(
+            "INSERT INTO skill_versions (id, org_id, name, version, content_hash, source, content, published_at)
+             VALUES (100, 'org-a', 'review-diff', 1, 'other', 's', 'theirs', ?1)",
+            [T0],
+        )?;
+        tx.execute(
+            "INSERT INTO skill_assignments (id, org_id, skill_name, target_type, target, pinned_version, assigned_at)
+             VALUES (100, 'org-a', 'review-diff', 'agent', 'agent-1', 1, ?1)",
+            [T0],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(r.org_scoped_rows.get("skill_versions"), Some(&1), "{:?}", r.org_scoped_rows);
+    assert_eq!(table(&r, "skill_versions").copied, 1);
+    assert_eq!(table(&r, "skill_assignments").copied, 1);
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM skill_versions WHERE id = 7 AND org_id = 'default' AND content = 'body'"
+        ),
+        1
+    );
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_assignments WHERE id = 3 AND org_id = 'default'"), 1);
+    // Organization A keeps exactly its own rows.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_versions WHERE org_id = 'org-a'"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_assignments WHERE org_id = 'org-a'"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_versions WHERE id = 100 AND content = 'theirs'"), 1);
+}
+
 #[test]
 fn org_scoped_rows_refuse_unless_the_scope_is_dropped() {
     let f = fixture();

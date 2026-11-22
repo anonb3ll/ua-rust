@@ -35,10 +35,11 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (64 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (60 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
-  `graph_canvas_revisions` and `web_search_cache` having left it; a new table
-  cannot join it), and the grant tables
+  `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
+  `skill_assignments`, `skill_publish_staging` and `project_repo_bindings`
+  having left it; a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
   so a table added to a released tenant part is refused, not skipped.
@@ -118,7 +119,9 @@ here for memory columns, owners and defaults.
   event at a site marked `ORG-EVENT-DEFAULT` in the source must switch to the
   organization of the row it is about in the same change that lets a second
   organization have callers, or the default organization's ledger would
-  record another organization's activity. `code_symbols` has no index led by
+  record another organization's activity. A second **resolver work item,
+  `ORG-TASK-DEFAULT`**, covers every lookup that starts from a task (it names
+  `TASK_ORG`); see the governance family below. `code_symbols` has no index led by
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
   index led by `org_id`, in a new static part, when its family is converted.
@@ -133,6 +136,47 @@ here for memory columns, owners and defaults.
   and migrate existing rows to `default`, followed by
   `organization.v1.tools.web` to install the organization triggers. Search
   cache reads, writes and TTL evictions scope to the caller's organization.
+- The skill registry applies the standalone procedure
+  `skill_registry.v2.tenant_keys` to rebuild `skill_versions` around
+  `UNIQUE(org_id, name, version)` and `skill_assignments` around
+  `UNIQUE(org_id, skill_name, target_type, target)` in one transaction,
+  keeping ids and the AUTOINCREMENT sequence, indexes, the version
+  immutability triggers and views, and adding indexes led by `org_id`.
+  `skill_publish_staging` is keyed by a hub-global random id and needs no
+  rebuild. `organization.v1.tools.skills` then adds its `org_id` and installs
+  the organization triggers on all three. Every `skill_registry` action
+  (publish, staging, list, get, assign, unassign, resolve, drift) and the
+  registry skills in a node's harness bundle use the caller's organization;
+  a write for an organization `orgs` does not hold is refused before anything
+  is read or written. Operator actions still need `ua_org::authz`, which
+  admits only the default organization until memberships exist. The importer
+  writes legacy skill versions and assignments to `default`.
+- The governance family applies the standalone procedure
+  `governance.v2.project_bindings_tenant_keys` to rebuild
+  `project_repo_bindings` around `(org_id, project)` and migrate existing
+  bindings to `default`, followed by `organization.v1.tools.project_bindings`
+  to install the organization triggers. `project_repo_bind`,
+  `project_repo_unbind`, `project_repo_get` and `project_repo_list` scope to
+  the caller's organization, and a bind or unbind for an unknown organization
+  is refused before anything changes. Tasks carry no `org_id` yet, so every
+  task-driven lookup of a binding (CI checks, merges, policy authorizations,
+  merged-PR reconciliation, deliverables, GitHub polling and webhooks) reads
+  the default organization's bindings. The Python importer explicitly writes
+  legacy bindings to `default`. **Resolver work item (`ORG-TASK-DEFAULT`):**
+  each such lookup, and each authority check and deliverable lookup that
+  starts from a task, names the constant `TASK_ORG`
+  (`crates/ua-tools/src/families/tasks/mod.rs`) rather than `DEFAULT_ORG`.
+  When tasks gain `org_id`, every use of `TASK_ORG` must switch to the task's
+  own organization in that change, and the constant be removed, or a task of
+  a second organization would resolve the default organization's
+  repositories. `crates/ua-tools/tests/project_bindings_tenant.rs` holds
+  another organization's binding of the same project and checks that none
+  of these lookups reads it. The `project.repo.bound` and
+  `project.repo.unbound` events are `ORG-EVENT-DEFAULT` sites whose payloads
+  carry the project and repository names (and the previous binding) into
+  the default organization's ledger. They must move to the binding's
+  organization with the `ORG-EVENT-DEFAULT` switch, in the same change that
+  lets a second organization bind; the payload shape stays as it is.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -711,15 +755,15 @@ global key in the tree is classified:
 | `nodes.node` | Hub namespace | Node names are registered hub-wide; a node serves one organization. |
 | `provider_accounts.label`, `mcp_servers.name`, `dispatch_meta.key` | Hub table | Hub-scoped configuration and hub salts, managed by hub owners. |
 | `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`. |
-| `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`. |
-| `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`. |
+| `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`, rebuilt in the standalone procedure `skill_registry.v2.tenant_keys`. |
+| `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`, rebuilt in `skill_registry.v2.tenant_keys` together with `skill_versions`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`. |
 | `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
-| `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`. |
+| `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`, rebuilt in the standalone procedure `governance.v2.project_bindings_tenant_keys`. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
@@ -730,6 +774,12 @@ The graph canvas rebuild uses a transactional static part. No existing
 foreign keys, triggers or views depend on the two original tables. The
 rebuild adds the composite revision reference with foreign keys enabled,
 so legacy revisions without a board fail the upgrade atomically.
+
+The skill registry rebuild is a standalone procedure, like the web cache's:
+`skill_versions` carries immutability triggers that the rebuild must
+re-create, and a view may name either table. It checks that the trigger and
+view sets are unchanged, and keeps each table's AUTOINCREMENT high-water mark
+so an id freed by a delete is never handed out again.
 
 The planned `organization.v1-rebuild` for the remaining tables runs alone, outside the usual transaction, at
 start-up before the hub serves, using SQLite's documented table-rebuild
@@ -1236,14 +1286,14 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings`, `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints`, `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox`, `pending_notifications`, `relay_messages`, `zulip_sends` | `org_id` |
-| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging`, `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
+| Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
