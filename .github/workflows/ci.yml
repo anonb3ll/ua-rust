@@ -22,6 +22,9 @@ jobs:
       - run: scripts/vocab-check.sh
         env:
           VOCAB_DENYLIST: ${{ secrets.VOCAB_DENYLIST }}
+      # The allowlist's class scoping is the guard that keeps a role-name
+      # exception from hiding a private address on the same line; pin it.
+      - run: scripts/vocab-check-selftest.sh
 
   check:
     runs-on: ubuntu-latest

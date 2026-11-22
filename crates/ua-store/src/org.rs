@@ -94,8 +94,11 @@ fn store(conn: &Connection, _: &'static [&'static str]) -> anyhow::Result<String
     Ok(format!("{}\n{seed};\n{}", ORGS_SQL.trim(), EVENT_LOG_SQL.trim()))
 }
 
-/// A tenant part for the tables one crate owns, conventionally named
-/// `organization.v1.<crate>`.
+/// A tenant part for the tables of one table family, named
+/// `organization.v1.<crate>.<family>` (`organization.v1.ingress` for a crate
+/// that is one family). One part per family, not per crate: the checksum
+/// covers the table list (below), so a released part can never take another
+/// family's tables, and each family is converted in its own part.
 ///
 /// For every listed table it adds `org_id TEXT NOT NULL DEFAULT 'default'`
 /// (or, where a nullable `org_id` already exists, fills its `NULL`s with

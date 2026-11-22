@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -199,25 +199,40 @@ fn degraded_detail(failures: &BTreeMap<&'static str, usize>, sample: &[String]) 
     })
 }
 
-/// Replace the stored symbols under `prefix` with `files`. Returns rows written.
-fn store(tx: &rusqlite::Transaction<'_>, ws: &str, prefix: &str, files: &[FileSymbols]) -> UaResult<usize> {
+/// Replace the stored symbols of organization `org` under `prefix` with
+/// `files`. Returns rows written. An organization `orgs` does not hold is
+/// refused before anything changes, even when there is nothing to insert
+/// (the `code_symbols_org_exists` trigger only sees inserts).
+fn store(
+    tx: &rusqlite::Transaction<'_>,
+    org: &str,
+    ws: &str,
+    prefix: &str,
+    files: &[FileSymbols],
+) -> UaResult<usize> {
+    let known = tx.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; nothing was indexed")));
+    }
     if prefix.is_empty() {
-        tx.execute("DELETE FROM code_symbols WHERE workspace = ?1", [ws])?;
+        tx.execute("DELETE FROM code_symbols WHERE org_id = ?1 AND workspace = ?2", [org, ws])?;
     } else {
         tx.execute(
-            "DELETE FROM code_symbols WHERE workspace = ?1 \
-             AND (file_path = ?2 OR substr(file_path, 1, length(?2) + 1) = ?2 || '/')",
-            [ws, prefix],
+            "DELETE FROM code_symbols WHERE org_id = ?1 AND workspace = ?2 \
+             AND (file_path = ?3 OR substr(file_path, 1, length(?3) + 1) = ?3 || '/')",
+            [org, ws, prefix],
         )?;
     }
     let mut stmt = tx.prepare(
-        "INSERT INTO code_symbols (workspace, file_path, language, symbol_name, symbol_type, symbol_kind, \
-         parent_name, signature, docstring, line_no) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO code_symbols (org_id, workspace, file_path, language, symbol_name, symbol_type, \
+         symbol_kind, parent_name, signature, docstring, line_no) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     let mut n = 0;
     for f in files {
         for s in &f.symbols {
             stmt.execute(rusqlite::params![
+                org,
                 ws,
                 f.rel,
                 f.language,
@@ -258,12 +273,18 @@ pub(super) async fn index(ctx: &ToolCtx, path: String) -> UaResult<Value> {
         "symbols_indexed": symbols_indexed,
     });
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
     let (ws2, prefix) = (ws.clone(), scan.prefix.clone());
     let files = scan.files;
     ctx.hub
         .db()
         .write_async(move |tx| {
-            store(tx, &ws2, &prefix, &files)?;
+            store(tx, &org, &ws2, &prefix, &files)?;
+            // ORG-EVENT-DEFAULT: the rows are the caller's organization's. The
+            // event names DEFAULT_ORG, which is that organization for every
+            // caller until memberships exist (the org_guard test holds every
+            // event there). It must name the rows' organization in the same
+            // change that lets a second organization have callers.
             ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.code.indexed", event).by(by))?;
             Ok(())
         })
@@ -308,16 +329,18 @@ fn row_json(r: &rusqlite::Row<'_>, with_file: bool) -> rusqlite::Result<Value> {
     Ok(v)
 }
 
-fn list_symbols(conn: &Connection, sb: &Sandbox, file_path: &str) -> UaResult<Value> {
+fn list_symbols(conn: &Connection, org: &str, sb: &Sandbox, file_path: &str) -> UaResult<Value> {
     let p = resolve_in_root(file_path, std::slice::from_ref(&sb.root), false)?;
     if !p.is_file() {
         return Err(UaError::not_found(format!("file {file_path:?} does not exist")));
     }
     let rel = rel_slash(&sb.root, &p);
-    let mut stmt = conn
-        .prepare("SELECT * FROM code_symbols WHERE workspace = ?1 AND file_path = ?2 ORDER BY line_no, id")?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM code_symbols WHERE org_id = ?1 AND workspace = ?2 AND file_path = ?3 \
+         ORDER BY line_no, id",
+    )?;
     let rows: Vec<Value> = stmt
-        .query_map([workspace_key(sb), rel.clone()], |r| row_json(r, false))?
+        .query_map([org.to_string(), workspace_key(sb), rel.clone()], |r| row_json(r, false))?
         .collect::<Result<_, _>>()?;
     if !rows.is_empty() {
         return Ok(json!({ "symbols": rows, "degraded": false, "source": "index" }));
@@ -367,17 +390,17 @@ fn like_escape(q: &str) -> String {
     s
 }
 
-fn search_symbols(conn: &Connection, ws: &str, query: &str, semantic: bool) -> UaResult<Value> {
+fn search_symbols(conn: &Connection, org: &str, ws: &str, query: &str, semantic: bool) -> UaResult<Value> {
     let q = query.trim();
     let mut stmt = conn.prepare(
-        "SELECT * FROM code_symbols WHERE workspace = ?1 AND symbol_name LIKE ?2 ESCAPE '\\' \
-         ORDER BY (lower(symbol_name) = lower(?3)) DESC, \
-                  (substr(lower(symbol_name), 1, length(?3)) = lower(?3)) DESC, \
+        "SELECT * FROM code_symbols WHERE org_id = ?1 AND workspace = ?2 AND symbol_name LIKE ?3 ESCAPE '\\' \
+         ORDER BY (lower(symbol_name) = lower(?4)) DESC, \
+                  (substr(lower(symbol_name), 1, length(?4)) = lower(?4)) DESC, \
                   length(symbol_name), symbol_name, file_path, line_no \
-         LIMIT ?4",
+         LIMIT ?5",
     )?;
     let results: Vec<Value> = stmt
-        .query_map(rusqlite::params![ws, like_escape(q), q, SEARCH_LIMIT], |r| row_json(r, true))?
+        .query_map(rusqlite::params![org, ws, like_escape(q), q, SEARCH_LIMIT], |r| row_json(r, true))?
         .collect::<Result<_, _>>()?;
     let mut out = json!({ "results": results, "degraded": false });
     if semantic {
@@ -403,13 +426,13 @@ struct MapSym {
     line_no: i64,
 }
 
-fn load_map_symbols(conn: &Connection, ws: &str) -> UaResult<Vec<MapSym>> {
+fn load_map_symbols(conn: &Connection, org: &str, ws: &str) -> UaResult<Vec<MapSym>> {
     let mut stmt = conn.prepare(
         "SELECT file_path, language, symbol_name, symbol_type, symbol_kind, parent_name, signature, docstring, \
-         line_no FROM code_symbols WHERE workspace = ?1 ORDER BY id",
+         line_no FROM code_symbols WHERE org_id = ?1 AND workspace = ?2 ORDER BY id",
     )?;
     let rows = stmt
-        .query_map([ws], |r| {
+        .query_map([org, ws], |r| {
             Ok(MapSym {
                 file: r.get(0)?,
                 language: r.get(1)?,
@@ -584,12 +607,12 @@ async fn repo_map(ctx: ToolCtx, a: RepoMapArgs) -> UaResult<Value> {
     let ws = workspace_key(&sb);
     let budget = a.token_budget.clamp(1, 100_000);
 
-    let ws2 = ws.clone();
-    let mut syms = ctx.hub.db().read_async(move |c| load_map_symbols(c, &ws2)).await?;
+    let (org, ws2) = (ctx.caller.org_id.clone(), ws.clone());
+    let mut syms = ctx.hub.db().read_async(move |c| load_map_symbols(c, &org, &ws2)).await?;
     if syms.is_empty() {
         index(&ctx, ".".into()).await?;
-        let ws2 = ws.clone();
-        syms = ctx.hub.db().read_async(move |c| load_map_symbols(c, &ws2)).await?;
+        let (org, ws2) = (ctx.caller.org_id.clone(), ws.clone());
+        syms = ctx.hub.db().read_async(move |c| load_map_symbols(c, &org, &ws2)).await?;
     }
     let path = a.path.clone();
     let map = blocking(move || Ok(render_map(&path, &prefix, syms, budget))).await?;
@@ -622,8 +645,8 @@ pub fn register(r: &mut Registry) {
              not indexed yet, by parsing it now. Returns {symbols: [{name, type, kind, parent, signature, \
              docstring, line_no}], degraded}.",
             |ctx: ToolCtx, a: ListArgs| async move {
-                let sb = sandbox(&ctx)?;
-                ctx.hub.db().read_async(move |c| list_symbols(c, &sb, &a.file_path)).await
+                let (sb, org) = (sandbox(&ctx)?, ctx.caller.org_id.clone());
+                ctx.hub.db().read_async(move |c| list_symbols(c, &org, &sb, &a.file_path)).await
             },
         )
         .family("code")
@@ -637,8 +660,8 @@ pub fn register(r: &mut Registry) {
              {results: [{file_path, language, name, type, kind, parent, signature, docstring, line_no}], \
              degraded, [semantic, note]}.",
             |ctx: ToolCtx, a: SearchArgs| async move {
-                let ws = workspace_key(&sandbox(&ctx)?);
-                ctx.hub.db().read_async(move |c| search_symbols(c, &ws, &a.query, a.semantic)).await
+                let (ws, org) = (workspace_key(&sandbox(&ctx)?), ctx.caller.org_id.clone());
+                ctx.hub.db().read_async(move |c| search_symbols(c, &org, &ws, &a.query, a.semantic)).await
             },
         )
         .family("code")
