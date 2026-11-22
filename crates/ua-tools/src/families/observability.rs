@@ -25,6 +25,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
+use crate::families::events::{EventReader, VISIBLE_EVENT};
 use crate::families::nodes;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -158,7 +159,7 @@ pub struct ActivityArgs {
     pub limit: Option<i64>,
 }
 
-fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
+fn agent_activity(c: &Connection, reader: &EventReader, a: ActivityArgs) -> UaResult<Value> {
     let mut sql =
         String::from("SELECT seq, originator, created_at, channel, payload FROM event_log WHERE 1=1");
     let mut args: Vec<String> = Vec::new();
@@ -177,10 +178,12 @@ fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
         args.push(prefix);
         args.push(format!("agent.{kind}"));
     }
+    sql.push_str(&format!(" AND ({VISIBLE_EVENT})"));
     let capped = a.limit.unwrap_or(200).clamp(1, ACTIVITY_LIMIT_CAP);
     sql.push_str(&format!(" ORDER BY created_at DESC, seq DESC LIMIT {}", capped + 1));
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
+    let args = args.iter().map(|s| s as &dyn rusqlite::ToSql).chain(reader.bindings());
+    let rows = stmt.query_map(params_from_iter(args), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -214,15 +217,17 @@ fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
-fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
+fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>) -> UaResult<Value> {
     let week = agents::ago(7 * 86_400);
     let mut events: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     {
-        let mut stmt = c.prepare(
+        let sql = format!(
             "SELECT COALESCE(originator, '(unattributed)'), channel, COUNT(*) FROM event_log \
-             WHERE created_at >= ?1 GROUP BY 1, 2",
-        )?;
-        let rows = stmt.query_map([&week], |r| {
+             WHERE created_at >= ?1 AND ({VISIBLE_EVENT}) GROUP BY 1, 2"
+        );
+        let mut stmt = c.prepare(&sql)?;
+        let args = std::iter::once(&week as &dyn rusqlite::ToSql).chain(reader.bindings());
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
         })?;
         for row in rows {
@@ -823,12 +828,14 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
     match act {
         "activity" => {
             let args: ActivityArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| agent_activity(c, args)).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| agent_activity(c, &reader, args)).await
         }
         "metrics" => {
             let _: NoArgs = parse_params("observability", act, p)?;
             let path = ctx.hub.db().path().map(Path::to_path_buf);
-            read(&ctx, move |c| metrics_snapshot(c, path.as_deref())).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| metrics_snapshot(c, &reader, path.as_deref())).await
         }
         "anomalies" => {
             let _: NoArgs = parse_params("observability", act, p)?;
@@ -1742,7 +1749,10 @@ pub fn register(r: &mut Registry) {
             "Ledger activity newest first, filtered by agent label, since (ISO-8601) and kind (the channel noun: \
              task, memory, plan...). limit defaults to 200, max 1000. Returns {events: [{id, agent, ts, kind, \
              ref_id, summary}], truncated}.",
-            |ctx: ToolCtx, a: ActivityArgs| async move { read(&ctx, move |c| agent_activity(c, a)).await },
+            |ctx: ToolCtx, a: ActivityArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| agent_activity(c, &reader, a)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1754,7 +1764,8 @@ pub fn register(r: &mut Registry) {
              done-task cycle time in days, tool-call totals and the database size.",
             |ctx: ToolCtx, _a: NoArgs| async move {
                 let path = ctx.hub.db().path().map(Path::to_path_buf);
-                read(&ctx, move |c| metrics_snapshot(c, path.as_deref())).await
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| metrics_snapshot(c, &reader, path.as_deref())).await
             },
         )
         .family("observability")
