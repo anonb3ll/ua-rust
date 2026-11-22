@@ -453,6 +453,11 @@ from its commit history.
   refused before anything is sent. `Outbound::new` refuses a relaxed policy,
   and a hand-made one is refused even pinned. The GitHub REST, Obsidian and
   notify clients pin to their configured URL; their behaviour is unchanged.
+- Slack: a command's outcome settles its delivery under the claim its own
+  admission took, so a very late outcome can no longer mark a newer
+  delivery with the same id (recorded after the old row expired) as
+  finished; it is still ledgered. Admission also logs, at info level, an
+  accept that changed no row.
 - An unverified caller (auth off) that names a configured human or lifecycle
   operator as its `actor` no longer gets operator authority over other
   agents' task workflow records and checks; it is refused, as every other
