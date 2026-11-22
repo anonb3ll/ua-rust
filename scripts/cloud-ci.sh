@@ -359,6 +359,20 @@ else
             exit 1
         fi
     done
+    # The vocab step runs THIS checkout's checker against the head's allowlist.
+    # An allowlist entry may declare a pattern class (a trailing `vocab` or
+    # `private`), which a checker that predates classes would read as part of
+    # the regex: every intended exception would fail with bogus matches. Refuse
+    # with the fix instead of submitting a run that cannot pass.
+    head_allowlist=$(git -C "$root" show "$sha:scripts/vocab-allowlist.txt" 2>/dev/null || true)
+    if [ -n "$head_allowlist" ] &&
+        grep -qE '[[:space:]](vocab|private)[[:space:]]*$' <<<"$head_allowlist" &&
+        ! grep -q 'insensitive_class' "$root/scripts/vocab-check.sh"; then
+        echo "$short declares allowlist pattern classes, but this checkout's" >&2
+        echo "scripts/vocab-check.sh predates them. Update the checkout (git pull)" >&2
+        echo "and re-run; nothing was submitted." >&2
+        exit 1
+    fi
     # The newest status id before submitting; anything later from another
     # build is a newer run. This also fails, before billing, for a commit
     # GitHub does not have.

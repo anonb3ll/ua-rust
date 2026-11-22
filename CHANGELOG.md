@@ -195,6 +195,15 @@ from its commit history.
   As with every new part, a database that has applied it is refused by an
   earlier build (the unknown-part fence).
 
+### Fixed
+
+- `scripts/vocab-check.sh`: an allowlist entry now silences only the pattern
+  class it was written for. A `vocab` entry (the legacy profile names) no
+  longer hides a private address, home path or tailnet name on the same line,
+  and a `private` entry no longer hides role vocabulary. Entries without the
+  class field keep their previous line-wide meaning.
+  `scripts/vocab-check-selftest.sh` pins both directions and runs in CI.
+
 ### Changed
 
 - `ua import python-hub` never copies a source `org_id` by column name, even
