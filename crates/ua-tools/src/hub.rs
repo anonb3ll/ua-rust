@@ -63,12 +63,19 @@ pub fn open_db(
 impl Hub {
     /// Open the hub database described by `cfg`, applying every schema part.
     /// A database written by a newer build is refused ([`open_db`]).
+    ///
+    /// This does **not** run the guard that refuses to migrate underneath a
+    /// running `ua serve`: that needs the serve lock, which lives with the
+    /// command line. A caller that may migrate a database another process
+    /// serves must use [`Hub::open_guarded`] with that guard, as every `ua`
+    /// command except `ua serve` does.
     pub fn open(cfg: Config) -> anyhow::Result<Self> {
         Self::open_with(cfg, false)
     }
 
     /// [`Hub::open`], opening a database written by a newer build anyway when
-    /// `allow_newer` (recovery only; logged).
+    /// `allow_newer` (recovery only; logged). Like [`Hub::open`], it does not
+    /// run the migration guard.
     pub fn open_with(cfg: Config, allow_newer: bool) -> anyhow::Result<Self> {
         Self::open_guarded(cfg, allow_newer, None)
     }

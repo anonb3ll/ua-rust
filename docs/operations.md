@@ -262,11 +262,18 @@ covered anyway:
   The recovery override does not lift this. `ua serve` migrates at startup
   under its own lock, as before. The probe is a non-blocking shared lock on
   `<db>.serve.lock`, taken inside the migration transaction and released at
-  once. What remains: a `ua serve` that starts in the same instant as the
-  probe can be refused as if another serve held the database (start it
-  again), and one that starts just after the probe is not seen by it; that
-  serve opens the database only after the migration commits, so the fence
-  decides whether it runs.
+  once. A `ua serve` that starts in the same instant as the probe waits and
+  retries its lock for a quarter of a second, so the probe does not make it
+  fail. What remains: a serve that starts just after the probe is not seen by
+  it; that serve opens the database after the migration's first transaction
+  has committed (and, should a migration ever include a step that commits on
+  its own, possibly between steps), so the fence decides whether it runs.
+  The guard is run by the `ua` commands; a program that embeds the hub and
+  opens it with the plain open functions does not get it and must pass the
+  guard itself. After the `ua` binary is replaced in place under a running
+  older serve, commands that serve starts (and anything else that runs the
+  new `ua`) are refused a migration until the serve is restarted on the new
+  build: that is the guard working.
 
 Not covered: a running process of an older build that is not `ua serve`
 (an older `ua mcp` session, for example) keeps writing after a newer

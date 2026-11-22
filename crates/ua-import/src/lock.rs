@@ -213,6 +213,11 @@ pub struct ServeLock {
     _file: File,
 }
 
+/// How often, and how long apart, `ua serve` retries its lock before
+/// concluding another serve holds it (a quarter of a second in all).
+const SERVE_LOCK_RETRIES: u32 = 5;
+const SERVE_LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl ServeLock {
     /// Take the serve lock, or fail naming the database and saying another
     /// `ua serve` holds it.
@@ -221,7 +226,19 @@ impl ServeLock {
         let path = serve_lock_path(&db)?;
         let file = open_lock_file(&path)?;
         let unsupported = "a second `ua serve` on the same database is NOT refused on this platform";
-        if !try_lock(&file, true, &path, unsupported)? {
+        // A command probing for a running serve ([`refuse_if_served`]) holds
+        // this lock shared for an instant; a real serve holds it for its whole
+        // life. A short wait tells the two apart, so a probe never makes a
+        // starting serve fail.
+        let mut held = try_lock(&file, true, &path, unsupported)?;
+        for _ in 0..SERVE_LOCK_RETRIES {
+            if held {
+                break;
+            }
+            std::thread::sleep(SERVE_LOCK_RETRY_WAIT);
+            held = try_lock(&file, true, &path, unsupported)?;
+        }
+        if !held {
             bail!(
                 "another `ua serve` holds the database {}: a second `ua serve` on the same database is refused \
                  (two would each take the other's in-flight inbound deliveries for stale ones). Stop the running \
@@ -240,8 +257,8 @@ impl ServeLock {
 ///
 /// The probe is a non-blocking shared `flock` on the serve lock file, released
 /// at once; a missing lock file means no serve ever ran there. While it is
-/// held (microseconds), a `ua serve` starting at that instant is refused as if
-/// another serve held the database, and a serve that starts just after it is
+/// held (microseconds), a `ua serve` starting at that instant waits and
+/// retries ([`ServeLock::acquire`]), and a serve that starts just after it is
 /// not seen; that one opens the database after the migration (the migration
 /// transaction is still open), so the fence, not this guard, decides whether
 /// it may run. Not the serving process itself: `flock` locks belong to the
@@ -511,6 +528,30 @@ mod tests {
         refuse_if_served(&db, &pending).unwrap();
         // The probe released at once: a serve can start right after it.
         ServeLock::acquire(&db).unwrap();
+    }
+
+    /// A probe holds the serve lock shared for an instant. A serve starting
+    /// at that instant waits for it instead of reporting another serve.
+    #[test]
+    fn a_serve_starting_during_a_probe_waits_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ua.db");
+        drop(ServeLock::acquire(&db).unwrap());
+        let path = serve_lock_path(&db).unwrap();
+        // Stand in for a probe that is slow to release: a shared lock held
+        // for less than the retry window.
+        let probe = OpenOptions::new().read(true).open(&path).unwrap();
+        assert!(try_lock(&probe, false, &path, "").unwrap());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(SERVE_LOCK_RETRY_WAIT * 2);
+            drop(probe);
+        });
+        let serve = ServeLock::acquire(&db).unwrap();
+        release.join().unwrap();
+        // A real serve holds the lock for its whole life: still refused.
+        let err = ServeLock::acquire(&db).unwrap_err().to_string();
+        assert!(err.contains("another `ua serve` holds the database"), "{err}");
+        drop(serve);
     }
 
     #[test]
