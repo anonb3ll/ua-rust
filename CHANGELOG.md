@@ -279,6 +279,29 @@ from its commit history.
   (`unknown_organization`) before anything changes. The importer writes
   legacy bundles to `default`. Event payloads and tool results keep their
   shapes.
+- Routines and workflow runs carry an organization key: `routines` and
+  `routine_runs` (`organization.v1.tools.routines`, with indexes led by
+  `org_id` and a same-organization rule between a receipt and its routine in
+  `routines.v2.org_indexes`), and `workflow_runs` and `workflow_checkpoints`
+  (`organization.v1.tools.workflows`, with indexes and a same-organization
+  rule between a checkpoint and its run in `workflows.v2.org_indexes`). No key
+  rebuild: their keys are AUTOINCREMENT ids, hub-generated run ids, and
+  unique pairs led by one of those. Existing rows move to `default`.
+  `routine_add`, `routine_list`, `routine_pause`, `routine_fire`,
+  `workflow_run`, the `langgraph_*` tools and the workflow rows of `run_list`
+  and `run_get` read and write only the caller's organization's rows; another
+  organization's routine or run answers as a missing one, and an organization
+  `orgs` does not hold is refused before any write. The scheduler and the
+  startup reconciliation fire each routine in its own organization, and a
+  routine's workflow run takes the routine's organization. Tasks carry no
+  organization yet (`TASK_ORG`), so a fire of a routine in another
+  organization creates no task and runs no workflow: it is recorded as
+  `skipped` with reason `org_tasks_unavailable`, and `routine_fire` now
+  returns a skipped fire's `reason`. LangGraph runs see only the task
+  organization's tasks. A gated workflow step's approval payload binds
+  `org_id`, so an approval parked before this change is not reused: resuming
+  such a run parks a new one. Results and events in the default organization
+  are otherwise unchanged.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

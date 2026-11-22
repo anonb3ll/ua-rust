@@ -507,14 +507,18 @@ pub(crate) struct RunRow {
     pub owner: String,
     pub owner_profile: String,
     pub status: String,
+    /// The run's organization: its starter's, or its routine's. Every later
+    /// read and write of the run and its checkpoints is scoped to it.
+    pub org_id: String,
 }
 
-pub(crate) fn load_run(conn: &Connection, run_id: &str) -> UaResult<Option<RunRow>> {
+/// A run of `org` by id; another organization's run answers as a missing one.
+pub(crate) fn load_run(conn: &Connection, org: &str, run_id: &str) -> UaResult<Option<RunRow>> {
     Ok(conn
         .query_row(
-            "SELECT run_id, kind, name, definition_digest, inputs, task_id, owner, owner_profile, status \
-             FROM workflow_runs WHERE run_id = ?1",
-            [run_id],
+            "SELECT run_id, kind, name, definition_digest, inputs, task_id, owner, owner_profile, status, org_id \
+             FROM workflow_runs WHERE run_id = ?1 AND org_id = ?2",
+            params![run_id, org],
             |r| {
                 let inputs: String = r.get(4)?;
                 Ok(RunRow {
@@ -527,16 +531,30 @@ pub(crate) fn load_run(conn: &Connection, run_id: &str) -> UaResult<Option<RunRo
                     owner: r.get(6)?,
                     owner_profile: r.get(7)?,
                     status: r.get(8)?,
+                    org_id: r.get(9)?,
                 })
             },
         )
         .optional()?)
 }
 
-/// Store a new run. Nothing executes until [`execute`].
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// Organizations are never deleted, so the check cannot go stale.
+pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; no workflow run was recorded")));
+    }
+    Ok(())
+}
+
+/// Store a new run in organization `org` (the caller's, or for a routine's
+/// fire the routine's). Nothing executes until [`execute`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_run(
     hub: &Hub,
     caller: &Caller,
+    org: &str,
     run_id: &str,
     kind: &str,
     def: &Definition,
@@ -544,16 +562,18 @@ pub(crate) async fn create_run(
     task_id: Option<i64>,
 ) -> UaResult<()> {
     let (caller, run_id, kind) = (caller.clone(), run_id.to_string(), kind.to_string());
+    let org = org.to_string();
     let (name, digest) = (def.name.clone(), def.digest());
     let definition = serde_json::to_string(def)?;
     let inputs_text = serde_json::to_string(inputs)?;
     hub.db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let now = ua_core::time::now();
             tx.execute(
-                "INSERT INTO workflow_runs (run_id, kind, name, definition_digest, definition, inputs, task_id, \
-                 owner, owner_profile, status, next_step, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', 0, ?10, ?10)",
+                "INSERT INTO workflow_runs (org_id, run_id, kind, name, definition_digest, definition, inputs, \
+                 task_id, owner, owner_profile, status, next_step, created_at, updated_at) \
+                 VALUES (?11, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', 0, ?10, ?10)",
                 params![
                     run_id,
                     kind,
@@ -564,9 +584,11 @@ pub(crate) async fn create_run(
                     task_id,
                     caller.label,
                     caller.profile.as_str(),
-                    now
+                    now,
+                    org
                 ],
             )?;
+            // ORG-EVENT-DEFAULT: use the run's organization once org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG,
@@ -638,12 +660,12 @@ struct Checkpoint {
 }
 
 /// The newest checkpoint of each step.
-fn latest_checkpoints(conn: &Connection, run_id: &str) -> UaResult<BTreeMap<String, Checkpoint>> {
+fn latest_checkpoints(conn: &Connection, org: &str, run_id: &str) -> UaResult<BTreeMap<String, Checkpoint>> {
     let mut stmt = conn.prepare(
         "SELECT step_name, tool, status, attempts, output, output_digest, error, approval_id \
-         FROM workflow_checkpoints WHERE run_id = ?1 ORDER BY seq",
+         FROM workflow_checkpoints WHERE run_id = ?1 AND org_id = ?2 ORDER BY seq",
     )?;
-    let rows = stmt.query_map([run_id], |r| {
+    let rows = stmt.query_map(params![run_id, org], |r| {
         let output: Option<String> = r.get(4)?;
         Ok(Checkpoint {
             step_name: r.get(0)?,
@@ -666,10 +688,11 @@ fn latest_checkpoints(conn: &Connection, run_id: &str) -> UaResult<BTreeMap<Stri
 
 fn step_reports(
     conn: &Connection,
+    org: &str,
     run_id: &str,
     def: &Definition,
 ) -> UaResult<(Vec<Value>, Map<String, Value>)> {
-    let latest = latest_checkpoints(conn, run_id)?;
+    let latest = latest_checkpoints(conn, org, run_id)?;
     let mut steps = Vec::new();
     let mut outputs = Map::new();
     for step in &def.steps {
@@ -712,13 +735,13 @@ enum Acquire {
 /// denied or waits on an approval.
 pub(crate) async fn execute(hub: &Hub, caller: &Caller, run: &RunRow, def: &Definition) -> UaResult<Report> {
     let token = new_run_id();
-    let (rid, tok) = (run.run_id.clone(), token.clone());
+    let (rid, tok, org) = (run.run_id.clone(), token.clone(), run.org_id.clone());
     let acquired = hub
         .db()
         .write_async(move |tx| {
             let (status, lease, expires): (String, Option<String>, Option<String>) = tx.query_row(
-                "SELECT status, lease_token, lease_expires_at FROM workflow_runs WHERE run_id = ?1",
-                [&rid],
+                "SELECT status, lease_token, lease_expires_at FROM workflow_runs WHERE run_id = ?1 AND org_id = ?2",
+                params![rid, org],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             if status == "done" {
@@ -731,8 +754,8 @@ pub(crate) async fn execute(hub: &Hub, caller: &Caller, run: &RunRow, def: &Defi
             }
             tx.execute(
                 "UPDATE workflow_runs SET lease_token = ?2, lease_expires_at = ?3, status = 'running', \
-                 error = NULL, updated_at = ?4 WHERE run_id = ?1",
-                params![rid, tok, lease_deadline(), now],
+                 error = NULL, updated_at = ?4 WHERE run_id = ?1 AND org_id = ?5",
+                params![rid, tok, lease_deadline(), now, org],
             )?;
             Ok(Acquire::Held)
         })
@@ -752,14 +775,15 @@ pub(crate) async fn execute(hub: &Hub, caller: &Caller, run: &RunRow, def: &Defi
         Err(e) => {
             // Best effort: release the lease so a retry is not blocked for the
             // lease period by an internal error.
-            let (rid, tok, msg) = (run.run_id.clone(), token.clone(), e.to_string());
+            let (rid, tok, msg, org) = (run.run_id.clone(), token.clone(), e.to_string(), run.org_id.clone());
             let _ = hub
                 .db()
                 .write_async(move |tx| {
                     tx.execute(
                         "UPDATE workflow_runs SET status = 'failed', error = ?3, lease_token = NULL, \
-                         lease_expires_at = NULL, updated_at = ?4 WHERE run_id = ?1 AND lease_token = ?2",
-                        params![rid, tok, msg, ua_core::time::now()],
+                         lease_expires_at = NULL, updated_at = ?4 WHERE run_id = ?1 AND lease_token = ?2 \
+                         AND org_id = ?5",
+                        params![rid, tok, msg, ua_core::time::now(), org],
                     )?;
                     Ok(())
                 })
@@ -777,8 +801,8 @@ async fn finished_report(
     error: Option<String>,
     duplicate: bool,
 ) -> UaResult<Report> {
-    let (rid, d) = (run.run_id.clone(), def.clone());
-    let (steps, outputs) = hub.db().read_async(move |c| step_reports(c, &rid, &d)).await?;
+    let (rid, d, org) = (run.run_id.clone(), def.clone(), run.org_id.clone());
+    let (steps, outputs) = hub.db().read_async(move |c| step_reports(c, &org, &rid, &d)).await?;
     Ok(Report {
         run_id: run.run_id.clone(),
         status: status.into(),
@@ -805,14 +829,17 @@ fn classify(err: &UaError) -> Option<Outcome> {
     }
 }
 
-async fn run_one(hub: &Hub, caller: &Caller, run_id: &str, step: &StepDef, scope: &Value) -> (Outcome, i64) {
+async fn run_one(hub: &Hub, caller: &Caller, run: &RunRow, step: &StepDef, scope: &Value) -> (Outcome, i64) {
     let args = match substitute(&step.args, scope) {
         Ok(a) => a,
         Err(e) => return (Outcome::Failed(e.to_string()), 0),
     };
     if let Some(gate) = &step.gate {
+        // The payload binds the run's organization, so a pass is never
+        // consumed across organizations.
         let payload = json!({
-            "run_id": run_id,
+            "org_id": run.org_id,
+            "run_id": run.run_id,
             "step": step.name,
             "tool": step.tool,
             "args_sha256": sha256_hex(&approvals::canonical_payload(&args)),
@@ -916,27 +943,27 @@ async fn checkpoint(
     let status = outcome.status();
     let next_step = if status == "done" { idx + 1 } else { idx } as i64;
     let (rid, tok, label) = (run.run_id.clone(), token.to_string(), caller.label.clone());
-    let (name, tool) = (step.name.clone(), step.tool.clone());
+    let (name, tool, org) = (step.name.clone(), step.tool.clone(), run.org_id.clone());
     hub.db()
         .write_async(move |tx: &mut WriteTx<'_>| {
             let now = ua_core::time::now();
             let n = tx.execute(
                 "UPDATE workflow_runs SET updated_at = ?3, lease_expires_at = ?4, next_step = ?5 \
-                 WHERE run_id = ?1 AND lease_token = ?2",
-                params![rid, tok, now, lease_deadline(), next_step],
+                 WHERE run_id = ?1 AND lease_token = ?2 AND org_id = ?6",
+                params![rid, tok, now, lease_deadline(), next_step, org],
             )?;
             if n == 0 {
                 return Ok(false);
             }
             let seq: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM workflow_checkpoints WHERE run_id = ?1",
-                [&rid],
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM workflow_checkpoints WHERE run_id = ?1 AND org_id = ?2",
+                params![rid, org],
                 |r| r.get(0),
             )?;
             tx.execute(
-                "INSERT INTO workflow_checkpoints (run_id, seq, step_index, step_name, tool, status, attempts, \
-                 output, output_digest, error, approval_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO workflow_checkpoints (org_id, run_id, seq, step_index, step_name, tool, status, \
+                 attempts, output, output_digest, error, approval_id, created_at) \
+                 VALUES (?13, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     rid,
                     seq,
@@ -949,9 +976,11 @@ async fn checkpoint(
                     digest,
                     error,
                     approval_id,
-                    now
+                    now,
+                    org
                 ],
             )?;
+            // ORG-EVENT-DEFAULT: use the run's organization once org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG,
@@ -980,8 +1009,8 @@ async fn run_steps(
     def: &Definition,
     token: &str,
 ) -> UaResult<Report> {
-    let (rid, d) = (run.run_id.clone(), def.clone());
-    let (_, done_outputs) = hub.db().read_async(move |c| step_reports(c, &rid, &d)).await?;
+    let (rid, d, org) = (run.run_id.clone(), def.clone(), run.org_id.clone());
+    let (_, done_outputs) = hub.db().read_async(move |c| step_reports(c, &org, &rid, &d)).await?;
     let mut steps_scope = Map::new();
     for (name, out) in &done_outputs {
         steps_scope.insert(name.clone(), as_scope_value(out));
@@ -998,7 +1027,7 @@ async fn run_steps(
         if done_outputs.contains_key(&step.name) {
             continue;
         }
-        let result = run_one(hub, caller, &run.run_id, step, &scope).await;
+        let result = run_one(hub, caller, run, step, &scope).await;
         if !checkpoint(hub, caller, run, token, idx, step, &result).await? {
             let mut report = finished_report(hub, run, def, "conflict", None, false).await?;
             report.code = Some("lease_lost".into());
@@ -1037,6 +1066,7 @@ async fn run_steps(
 
     let (rid, tok, label, st, err) =
         (run.run_id.clone(), token.to_string(), caller.label.clone(), final_status, error.clone());
+    let org = run.org_id.clone();
     let released = hub
         .db()
         .write_async(move |tx| {
@@ -1044,8 +1074,8 @@ async fn run_steps(
             let n = tx.execute(
                 "UPDATE workflow_runs SET status = ?3, error = ?4, lease_token = NULL, lease_expires_at = NULL, \
                  updated_at = ?5, completed_at = CASE WHEN ?3 = 'done' THEN ?5 ELSE completed_at END \
-                 WHERE run_id = ?1 AND lease_token = ?2",
-                params![rid, tok, st, err, now],
+                 WHERE run_id = ?1 AND lease_token = ?2 AND org_id = ?6",
+                params![rid, tok, st, err, now, org],
             )?;
             if n == 0 {
                 return Ok(false);

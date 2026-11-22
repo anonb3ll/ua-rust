@@ -24,6 +24,7 @@ use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 
 use super::engine::{self, Definition, Report, RunRow, StepDef};
+use crate::families::tasks::TASK_ORG;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -140,7 +141,14 @@ struct TaskState {
     lock_expires_at: Option<String>,
 }
 
-async fn task_state(hub: &Hub, task_id: i64) -> UaResult<Option<TaskState>> {
+/// A task as `org` sees it. ORG-TASK-DEFAULT: tasks carry no organization
+/// yet, so they are all the task organization's; any other organization sees
+/// none, and a run is never tied to a task of another organization. Take the
+/// task's own organization when tasks gain one.
+async fn task_state(hub: &Hub, org: &str, task_id: i64) -> UaResult<Option<TaskState>> {
+    if org != TASK_ORG {
+        return Ok(None);
+    }
     hub.db()
         .read_async(move |c| {
             Ok(c.query_row(
@@ -158,7 +166,7 @@ async fn start_authority(hub: &Hub, caller: &Caller, task_id: i64) -> UaResult<S
     if task_id <= 0 {
         return Err(UaError::invalid("task_id must be a positive integer"));
     }
-    let task = task_state(hub, task_id)
+    let task = task_state(hub, &caller.org_id, task_id)
         .await?
         .ok_or_else(|| UaError::invalid(format!("task #{task_id} not found")))?;
     if task.status != "doing" {
@@ -182,7 +190,7 @@ async fn start_authority(hub: &Hub, caller: &Caller, task_id: i64) -> UaResult<S
 /// Why a stored run's origin authority no longer holds, if it does not.
 async fn origin_lapse(hub: &Hub, run: &RunRow) -> UaResult<Option<String>> {
     let Some(task_id) = run.task_id else { return Ok(Some("run has no task".into())) };
-    let Some(task) = task_state(hub, task_id).await? else {
+    let Some(task) = task_state(hub, &run.org_id, task_id).await? else {
         return Ok(Some("origin task no longer exists".into()));
     };
     if task.status != "doing" {
@@ -287,8 +295,8 @@ async fn resume_checks(
     if !engine::is_ulid(run_id) {
         return Err(UaError::invalid("run_id must be a 26-character Crockford ULID"));
     }
-    let rid = run_id.to_string();
-    let run = hub.db().read_async(move |c| engine::load_run(c, &rid)).await?;
+    let (rid, org) = (run_id.to_string(), caller.org_id.clone());
+    let run = hub.db().read_async(move |c| engine::load_run(c, &org, &rid)).await?;
     let Some(run) = run else {
         return Ok(Err(refusal(
             run_id,
@@ -337,11 +345,12 @@ async fn start(
     task_id: i64,
 ) -> UaResult<(RunRow, Report)> {
     engine::check_inputs(def, &inputs)?;
-    engine::create_run(hub, caller, run_id, kind, def, &inputs, Some(task_id)).await?;
+    let org = caller.org_id.clone();
+    engine::create_run(hub, caller, &org, run_id, kind, def, &inputs, Some(task_id)).await?;
     let rid = run_id.to_string();
     let run = hub
         .db()
-        .read_async(move |c| engine::load_run(c, &rid))
+        .read_async(move |c| engine::load_run(c, &org, &rid))
         .await?
         .ok_or_else(|| UaError::internal("run vanished after insert"))?;
     let report = engine::execute(hub, caller, &run, def).await?;
@@ -583,16 +592,17 @@ fn twenty() -> i64 {
 
 async fn langgraph_checkpoints(ctx: ToolCtx, a: CheckpointsArgs) -> UaResult<Value> {
     let limit = a.limit.clamp(1, 200);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
                 "SELECT cp.id, cp.run_id, r.kind, r.name, r.task_id, cp.seq, cp.step_name, cp.tool, cp.status, \
                  cp.attempts, cp.output_digest, cp.error, cp.approval_id, cp.created_at \
-                 FROM workflow_checkpoints cp JOIN workflow_runs r ON r.run_id = cp.run_id \
-                 WHERE (?1 IS NULL OR cp.run_id = ?1) ORDER BY cp.id DESC LIMIT ?2",
+                 FROM workflow_checkpoints cp JOIN workflow_runs r ON r.run_id = cp.run_id AND r.org_id = cp.org_id \
+                 WHERE cp.org_id = ?3 AND (?1 IS NULL OR cp.run_id = ?1) ORDER BY cp.id DESC LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![a.run_id, limit], |r| {
+            let rows = stmt.query_map(params![a.run_id, limit, org], |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
                     "run_id": r.get::<_, String>(1)?,
