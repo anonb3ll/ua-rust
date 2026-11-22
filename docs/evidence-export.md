@@ -31,17 +31,21 @@ The verifier trusts exactly three things, and none of them is the hub:
 
 Three claims are separate, and the output must keep them separate:
 
-- **Integrity** — the bytes are what they were. Proven by recomputing hashes and
-  the ledger chain.
-- **Authorship** — the hub holding key `K` produced this checkpoint. Proven by
-  the signature.
+- **Integrity** — the bytes are what they were. Proven by recomputing each row's
+  hash and, depending on the class, the ledger chain or the organization's
+  running hash.
+- **Authorship** — the holder of key `K` attested this checkpoint. Proven by the
+  signature. The key is operator-held (`## Keys`), so this is not a claim that
+  the hub process signed anything.
 - **Completeness** — nothing was withheld from the stated range. Proven only
-  *relative to a pinned checkpoint*: a bundle shows every sequence number in
-  `[from, to]` exactly once and that the chain from `to` back to the pinned
-  point is continuous. It cannot prove the hub did not decide to end the range
-  early. A verifier that was given a pinned checkpoint from a later time can
-  detect a shortened range; one that was not, cannot. The output says which case
-  it is in.
+  *relative to a pinned checkpoint*, and the basis depends on the bundle class
+  (next section): for a `hub` bundle, every global `seq` in the window appears
+  exactly once and the chain from the end back to the pinned point is
+  continuous; for an `org` bundle, that organization's rows form a contiguous
+  `org_seq` `1..N` whose running hash and count are signed in the checkpoint.
+  Neither class can prove the hub did not end the range early; a verifier given
+  a later pinned checkpoint can detect a shortened range, one that was not,
+  cannot. The output says which case it is in.
 
 This is the point of signing checkpoints rather than only hashing rows: anyone
 with write access to the database can rewrite a row and recompute every
@@ -49,14 +53,45 @@ subsequent hash. A signature over a checkpoint is the only thing they cannot
 recompute without the key. A bundle without a trusted signature proves
 integrity, not authorship, and must say so.
 
+## Bundle classes and what each can prove
+
+`event_log` is one global chain and is never forked (`docs/organization.md`,
+The ledger). An organization's export cannot carry the global `seq` of its
+rows — the gaps would reveal hub-wide volume — and its rows are linked through
+other organizations' rows, so it is not chain-continuous on its own. One
+completeness rule therefore cannot serve both readers. A bundle declares its
+class in `manifest.json`:
+
+| Class | Rows | Sequence basis | Chain claim |
+| --- | --- | --- | --- |
+| `hub` | every row in the window | global `seq` | full: continuity back to the pinned checkpoint or genesis, no gaps, no duplicates |
+| `org` | one organization's rows | `org_seq` (`1..N`, assigned in global `seq` order at export) | each row's own hash, plus a per-organization running hash signed in the checkpoint; cross-organization linkage is reported as *not provable from this bundle* |
+
+For an `org` bundle the checkpoint signs `{class: "org", org_id, window,
+org_row_count, org_chain_hash, key_id, signed_at}`, where `org_chain_hash` is
+the fold `H(prev_org_chain_hash || entry_hash)` over that organization's rows in
+`org_seq` order, seeded from the pinned checkpoint's value (or an empty seed at
+genesis). The verifier recomputes each row's `entry_hash` under its `hash_v`,
+checks `org_seq` is `1..N` with no gap or duplicate, and refolds the running
+hash against the signed value and count.
+
+That proves the organization's own history was neither edited nor truncated
+after the signed point. It does not prove what happened in other organizations,
+and it cannot prove the hub did not end the window early — the same limit the
+`hub` class has, stated against a different basis. `ua evidence export --class
+hub` is operator-only; an organization exporting for itself always gets `org`.
+The verdict prints the class, so a reader cannot mistake the narrower claim for
+the wider one.
+
 ## Bundle layout
 
 ```text
 bundle/
-  manifest.json            # format version, range, counts, every file with sha256
+  manifest.json            # class, format version, window, counts, every hashed file with sha256
   manifest.sig             # Ed25519 signature over manifest.json's digest
-  ledger/events.jsonl      # canonical JSON, one event per line, ascending seq
-  ledger/checkpoint.json   # {seq, hash, key_id, signed_at, signature}
+  producer.json            # export time, host, tool version — reported, never hashed
+  ledger/events.jsonl      # canonical JSON, one event per line, ascending seq (hub) or org_seq (org)
+  ledger/checkpoint.json   # {class, seq|org_row_count, hash|org_chain_hash, key_id, signed_at, signature}
   approvals/<id>.json      # one receipt per approval in range
   evidence/rows.jsonl      # evidence records and their labels
   policy/revisions.json    # the policy revisions the receipts cite
@@ -66,14 +101,18 @@ bundle/
 
 Rules that make the bundle verifiable:
 
-- **Canonical JSON everywhere** (sorted keys, integers only, RFC 3339 UTC, no
-  floating point, no `null` vs absent ambiguity). The same encoder the ledger
-  uses for hashing.
-- **One ordering**: events by `seq`, receipts by approval id, artifacts by id.
-  No maps keyed by something the writer chooses.
+- **Canonical JSON for bundle files** (sorted keys, integers only, RFC 3339 UTC,
+  no floating point, no `null` vs absent ambiguity). This is the bundle encoder,
+  defined here; it is **not** the ledger's row-hash encoder. Ledger rows are
+  re-hashed with the encoder their `hash_v` names, because imported Python rows
+  were hashed over a form that accepts floats and must keep verifying.
+- **One ordering**: events by `seq` (class `hub`) or `org_seq` (class `org`),
+  receipts by approval id, artifacts by id. No maps keyed by something the
+  writer chooses.
 - **Export metadata is outside the hashed set.** Export time, host and tool
-  version live in `manifest.json` under `producer`, which the verifier reports
-  but never treats as evidence.
+  version live in `producer.json`, a separate file that is not listed in the
+  manifest and not covered by the bundle digest. The verifier reports it and
+  never treats it as evidence.
 - **No content by default.** Artifacts are referenced by hash and size.
   Including bytes is opt-in per export and changes the bundle class.
 
@@ -88,11 +127,17 @@ The ledger already versions its hash form (`docs/organization.md`, The ledger):
 
 On top of that:
 
-- `manifest.json` carries a `sha256` per file. The bundle digest is the hash of
-  the manifest with the `digest` field removed.
-- A receipt's digest is the hash of its canonical body with `signature` removed.
-- A checkpoint's signature covers `{org_id, seq, hash, key_id, signed_at}` in
-  canonical form.
+- `manifest.json` carries a `sha256` per hashed file. The bundle digest is the
+  hash of the manifest with the `digest` field removed; `producer.json` is not
+  in the manifest and therefore not covered.
+- A receipt's digest is the hash of its canonical body. Receipts carry no
+  signature of their own: their digests travel in the manifest, and the
+  manifest is what the checkpoint signature covers. Authorship of a receipt is
+  therefore "the holder of key `K` attested this checkpoint and the manifest it
+  signs", not a per-receipt signature.
+- A checkpoint's signature covers `{class, org_id, seq, hash, key_id,
+  signed_at}` for class `hub` and `{class, org_id, window, org_row_count,
+  org_chain_hash, key_id, signed_at}` for class `org`.
 
 ## The approval receipt
 
@@ -110,10 +155,13 @@ without replaying the whole hub.
 | `resolver` | Identity label, kind, and transport (`ui`, `http`, `mcp`, `cli`, `slack`) |
 | `decision`, `reason` | `approved` or `denied`, with the recorded reason |
 | `decided_at`, `expires_at` | Decision time and any one-time window |
-| `ledger` | `{seq, hash}` of the event that recorded the decision |
+| `ledger` | `{seq, hash}` (class `hub`) or `{org_seq, hash}` (class `org`) of the event that recorded the decision |
 | `run_id`, `attempt` | The execution the approval authorizes, if any |
 | `covers` | Artifact revisions (`id`, `sha256`) the approval is bound to |
-| `signature`, `key_id` | Hub signature over the receipt body |
+
+A receipt carries no signature of its own. Its digest is listed in the manifest,
+which the operator's checkpoint signature covers, so a receipt's authorship is
+the signer's attestation of the bundle, not a separate per-receipt key.
 
 Binding rules the verifier enforces:
 
@@ -136,15 +184,24 @@ unsupported version). A refusal is never downgraded to a warning.
 2. **Manifest digest and per-file digests.**
 3. **Checkpoint signature** against a trusted key id. An unknown key id is `2`,
    never a pass.
-4. **Chain continuity** from the checkpoint back to the pinned point or genesis,
-   recomputing each row's hash under its `hash_v`.
-5. **No gaps, no duplicates, no reordering** across `[from, to]`.
+4. **Row hashes and chain continuity.** Every row's `entry_hash` is recomputed
+   under its `hash_v`. For class `hub`, continuity is checked from the
+   checkpoint back to the pinned point or genesis. For class `org`, continuity
+   is the signed running hash (check 5).
+5. **Sequence basis.** Class `hub`: every global `seq` in the window appears
+   once, in order, with no gap or duplicate. Class `org`: `org_seq` is `1..N`
+   with no gap or duplicate, and the refolded `org_chain_hash` plus
+   `org_row_count` equal the signed checkpoint values. A mismatch is a refusal.
 6. **Downgrade refusal** — a `hash_v = 1` row after the first `hash_v = 2` row.
-7. **Receipts** — signature, `action_digest` matches the event payload, resolver
-   is a verified human, separation of duties holds, `covers` matches the
-   artifact index.
+7. **Receipts** — digest matches the manifest, `action_digest` matches the event
+   payload, resolver is a verified human, separation of duties holds, `covers`
+   matches the artifact index. Separation of duties is taken from the action's
+   approval rule as captured in `policy/revisions.json` (today that is
+   `config_revision_manage`'s "a human other than the requester",
+   `docs/policy.md` → Config revisions). Where the rule has no such clause the
+   claim is reported as `not-applicable`, never as a pass.
 8. **Cross-links** — every approval event has a receipt and every receipt has an
-   event; `ledger.seq`/`hash` in the receipt resolve.
+   event; `ledger.seq`/`ledger.org_seq` and `ledger.hash` in the receipt resolve.
 9. **Trace** — for each artifact: artifact → task → run/attempt → policy
    revision → approval. A missing link is a refusal, not a blank field.
 10. **Private content** — a bundle containing a record marked private, a secret
@@ -181,12 +238,13 @@ silent.
 
 The format is testable without a hub:
 
-- Fixtures in the repository: one good bundle, one with a flipped byte, one with
-  a dropped event, one with a reordered pair, one signed by an unknown key, one
+- Fixtures in the repository: one good bundle of each class, one with a flipped
+  byte, one with a dropped event, one with a reordered pair, one `org`-class
+  bundle missing a row inside its own range, one signed by an unknown key, one
   with a receipt bound to a different payload, one containing a private record.
 - Property tests: for any valid bundle, flipping one byte anywhere in a hashed
-  file refuses; dropping or duplicating a sequence refuses; re-signing the
-  checkpoint with a different key refuses.
+  file refuses; dropping or duplicating a sequence (global or `org_seq`)
+  refuses; re-signing the checkpoint with a different key refuses.
 - The producer's own `verify.json` is never trusted; the verifier recomputes.
 
 ## Slices and gates
@@ -218,3 +276,13 @@ shipping it would invite the wrong reading.
    checkpoint digest; signing is a separate operator step over that digest. A
    hub-held key would only protect against database editors, which the hash chain
    already covers, and it would let a compromised hub forge an export.
+4. **Two bundle classes, because tenancy and chain continuity conflict.** The
+   ledger stays one global chain, but an organization's export carries no global
+   `seq` and is not chain-continuous (`docs/organization.md`, The ledger). An
+   `org` bundle therefore proves integrity, authorship and completeness over
+   that organization's own `org_seq` range against a signed running hash and
+   count; cross-organization linkage is reported as not provable from the
+   bundle. A whole-hub `hub` bundle keeps global-`seq` chain continuity and is
+   operator-only. Receipts carry no signature of their own — the manifest
+   carries their digests and the checkpoint signature covers it. This replaces
+   the earlier single whole-hub assumption (review, 2026-11-22).
