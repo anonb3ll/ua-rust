@@ -549,11 +549,20 @@ impl Scenario {
     /// (`authorization_id` or `approval_id`) and carries a non-empty reason
     /// (`reason` or `reason_code`). A row that names another approval, or no
     /// reason, does not count.
-    fn refusal_audited(&self, mark: i64, caller: &str, approval: i64, what: &str) -> Verified {
+    /// `approval` names the decision the refused call presented, in its own
+    /// id space: [`Grant::Authorization`] for a policy authorization
+    /// (`authorization_id` on the event), [`Grant::Approval`] for a one-time
+    /// approval (`approval_id`). The two are separate tables, so an id of one
+    /// never counts for the other.
+    fn refusal_audited(&self, mark: i64, caller: &str, approval: Grant, what: &str) -> Verified {
         let rows = self.ledger_after(mark);
+        let (key, approval) = match approval {
+            Grant::Authorization(id) => ("authorization_id", id),
+            Grant::Approval(id) => ("approval_id", id),
+        };
         let audited = rows.iter().find(|e| {
             let p = &e.payload;
-            let names = p["authorization_id"] == approval || p["approval_id"] == approval;
+            let names = p[key] == approval;
             let why = ["reason", "reason_code"]
                 .iter()
                 .any(|k| p[*k].as_str().is_some_and(|s| !s.trim().is_empty()));
@@ -573,6 +582,15 @@ impl Scenario {
             )),
         }
     }
+}
+
+/// Which decision a refused call presented, by id space.
+#[derive(Debug, Clone, Copy)]
+enum Grant {
+    /// A policy authorization (`policy_authorizations`).
+    Authorization(i64),
+    /// A one-time approval (`approvals`).
+    Approval(i64),
 }
 
 /// The scenario's state as the steps hand it on.
@@ -1231,7 +1249,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.expired-refusal-audited",
-        s.refusal_audited(mark, "lead-1", expiring_id, "merge under an expired approval"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(expiring_id),
+            "merge under an expired approval",
+        ),
     );
 
     // A changed revision is refused.
@@ -1265,7 +1288,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.changed-revision-refusal-audited",
-        s.refusal_audited(mark, "lead-1", cx.authorization, "merge of a changed revision"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(cx.authorization),
+            "merge of a changed revision",
+        ),
     );
 
     // A changed target is refused.
@@ -1291,7 +1319,12 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
     card.check(
         3,
         "release.changed-target-refusal-audited",
-        s.refusal_audited(mark, "lead-1", cx.authorization, "merge into a changed target"),
+        s.refusal_audited(
+            mark,
+            "lead-1",
+            Grant::Authorization(cx.authorization),
+            "merge into a changed target",
+        ),
     );
 
     // The approved attempt merges exactly the reviewed head.
@@ -1390,7 +1423,26 @@ async fn approve_and_release(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
         3,
         "release.one-time-approval-binds-revision",
         match &late {
-            Err(e) => Ok(format!("a branch moved after the approval is refused: {}", reason(e))),
+            Err(e) => (|| {
+                ensure(reason(e) == "approval_binding_changed", format!("refused for another reason: {e:?}"))?;
+                ensure(
+                    payload.contains(&approved_head) && !payload.contains(&unreviewed),
+                    format!("the approval does not bind the approved head: {payload}"),
+                )?;
+                let audited = s.refusal_audited(
+                    mark,
+                    "lead-1",
+                    Grant::Approval(approval_id),
+                    "merge of a branch moved after the approval",
+                )?;
+                Ok(format!(
+                    "the approval binds head {} (payload {payload}); with the branch moved to {} the merge is \
+                     refused: {}; {audited}",
+                    &approved_head[..12],
+                    &unreviewed[..12],
+                    reason(e)
+                ))
+            })(),
             Ok(_) => {
                 let merged = s
                     .ledger_after(mark)

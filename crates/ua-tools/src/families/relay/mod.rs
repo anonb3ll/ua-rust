@@ -43,7 +43,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use self::gates::{Gates, Verdict};
 use self::github::{Outcome, Target};
-use crate::approvals::{self, GateOutcome};
+use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
 use crate::families::managed_secrets;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -221,7 +221,7 @@ const TEXT_FIELDS: [&str; 2] = ["text", "text_escaped"];
 
 /// `payload` with the text fields set to null: what an approval record keeps
 /// once it is decided.
-fn without_text(payload: &Value) -> Value {
+pub(crate) fn without_text(payload: &Value) -> Value {
     let mut p = payload.clone();
     if let Some(m) = p.as_object_mut() {
         for k in TEXT_FIELDS {
@@ -668,6 +668,31 @@ struct Ready {
     token: SecretString,
 }
 
+/// Ledger the refusal of a send that no longer matches its draft's
+/// approval: `presented` builds what the call presented from the approved
+/// payload.
+fn refuse_send(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    row: &Row,
+    reason: RefusalReason,
+    presented: impl Fn(&Value) -> Value,
+) -> UaResult<()> {
+    let mut r = Refusal::new(TOOL, reason);
+    if let Some(id) = row.approval_id {
+        let approved = approvals::get(tx, id)?.payload;
+        let shown = presented(&approved);
+        r = r
+            .approval(id)
+            .hashes(
+                Some(approvals::payload_sha256(TOOL, &approved)),
+                Some(approvals::payload_sha256(TOOL, &shown)),
+            )
+            .changed(approvals::changed_fields(&without_text(&approved), &shown));
+    }
+    approvals::refused(tx, &caller.label, &r, None)
+}
+
 fn first_difference(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -698,6 +723,14 @@ fn begin_send(
     }
     let stored = row.text.clone().unwrap_or_default();
     if p.text != stored {
+        let presented = |a: &Value| {
+            let mut v = without_text(a);
+            v["text_sha256"] = json!(sha256(&p.text));
+            v["chars"] = json!(p.text.chars().count());
+            v["bytes"] = json!(p.text.len());
+            v
+        };
+        refuse_send(tx, caller, &row, RefusalReason::BindingChanged, presented)?;
         return Err(UaError::denied(
             "text_mismatch",
             format!(
@@ -711,6 +744,13 @@ fn begin_send(
     if let Some(t) = p.target.as_deref()
         && github::parse_target(t).map(|t| t.canonical()).ok().as_deref() != Some(row.target.as_str())
     {
+        let presented = |a: &Value| {
+            let mut v = without_text(a);
+            v["target"] =
+                json!(github::parse_target(t).map(|t| t.canonical()).unwrap_or_else(|_| t.to_string()));
+            v
+        };
+        refuse_send(tx, caller, &row, RefusalReason::BindingChanged, presented)?;
         return Err(UaError::denied(
             "target_mismatch",
             format!("relay draft {} was approved for another target; nothing was sent", row.id),
@@ -750,6 +790,19 @@ fn begin_send(
         && without_text(&approval.payload) == without_text(&payload)
         && stored_text.is_none_or(|t| Some(t) == payload.get("text"));
     if !bound {
+        let mut changed =
+            approvals::changed_fields(&without_text(&approval.payload), &without_text(&payload));
+        if changed.is_empty() {
+            changed.push("text".into());
+        }
+        let r = Refusal::new(TOOL, RefusalReason::BindingChanged)
+            .approval(id)
+            .hashes(
+                Some(approvals::payload_sha256(TOOL, &approval.payload)),
+                Some(approvals::payload_sha256(TOOL, &payload)),
+            )
+            .changed(changed);
+        approvals::refused(tx, &caller.label, &r, None)?;
         return Err(UaError::denied(
             "approval_mismatch",
             format!(
@@ -773,7 +826,11 @@ fn begin_send(
                 EventInput::new(
                     ua_core::DEFAULT_ORG,
                     "agent.approval.consumed",
-                    json!({ "approval_id": id, "tool": TOOL }),
+                    json!({
+                        "approval_id": id,
+                        "tool": TOOL,
+                        "payload_sha256": approvals::payload_sha256(TOOL, &approval.payload),
+                    }),
                 )
                 .by(caller.label.clone()),
             )?;
@@ -785,6 +842,12 @@ fn begin_send(
                 "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
                 params![id, ua_core::time::now()],
             )?;
+            let sha = approvals::payload_sha256(TOOL, &approval.payload);
+            let r = Refusal::new(TOOL, RefusalReason::Expired)
+                .approval(id)
+                .hashes(Some(sha.clone()), Some(sha))
+                .expired_at(approvals::pass_expires_at(cfg, approval.resolved_at.as_deref()));
+            approvals::refused(tx, &caller.label, &r, Some(format!("{}:expired:{id}", approvals::REFUSED)))?;
             drop_approval_text(tx, id, &approval.payload)?;
             let GateOutcome::Pending { approval_id } = approvals::gate(tx, cfg, caller, TOOL, &payload)?
             else {
@@ -800,6 +863,12 @@ fn begin_send(
             return Ok(Err(UaError::ApprovalRequired { tool: TOOL.into(), approval_id }));
         }
         status @ ("denied" | "revoked") => {
+            let sha = approvals::payload_sha256(TOOL, &approval.payload);
+            let r = Refusal::new(TOOL, RefusalReason::Denied)
+                .approval(id)
+                .hashes(Some(sha.clone()), Some(sha))
+                .status(status);
+            approvals::refused(tx, &caller.label, &r, None)?;
             drop_approval_text(tx, id, &approval.payload)?;
             cancel_withdrawn(tx, caller, &row, id, status)?;
             return Ok(Err(UaError::denied(

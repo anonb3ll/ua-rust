@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 32 pass, 11 fail, 19 not-built.
+62 checks: 36 pass, 7 fail, 19 not-built.
 
 ### 1. Plan and delegate
 
@@ -139,19 +139,23 @@ handoff and the checks still name the commit itself, not the revision.
 | Check | Status | Reason |
 | --- | --- | --- |
 | `release.expired-approval-refused` | pass | Refused as expired. |
-| `release.expired-refusal-audited` | fail | Scored: an audited refusal. The refused merge appends no ledger row naming the authorization and a reason; only a `tool_calls` row with outcome `denied` remains. |
+| `release.expired-refusal-audited` | pass | An `agent.approval.refused` event by the refused caller names the authorization, reason `expired`. |
 | `release.changed-revision-refused` | pass | Refused, naming the authorized head and the new one. |
-| `release.changed-revision-refusal-audited` | fail | As above. |
+| `release.changed-revision-refusal-audited` | pass | As above, reason `binding_changed`, changed field `head_sha`. |
 | `release.changed-target-refused` | pass | Refused as another repository. |
-| `release.changed-target-refusal-audited` | fail | As above. |
+| `release.changed-target-refusal-audited` | pass | As above, reason `binding_changed`, changed field `repo`. |
 | `release.verified-human-approves-exact-action` | pass | Through the policy authorization path; the one-time approval path is scored separately below. |
 | `release.approved-attempt-produces-artifact` | pass | |
-| `release.one-time-approval-binds-revision` | fail | Scored: an approval bound to the revision. A one-time approval of `git_merge_task` records the task, not the head, so the merge it allows is not bound to the revision shown at approval. |
+| `release.one-time-approval-binds-revision` | pass | The one-time approval binds the head, target branch and bound repository; with the branch moved after the approval the merge is refused (`approval_binding_changed`) and an `agent.approval.refused` event by the refused caller names the approval, reason `binding_changed`, changed field `head`. |
 | `release.requires-review-at-head` | not-built | Nothing gates a merge on the recorded review: with the expected review unknown at the head, a merge under a valid authorization for that head runs. |
 
 The passing approval path is the policy authorization
 (`policy_authorization_record` and `git_merge_task(policy_authorization_id)`),
-which binds the task, the bound repository and the exact head.
+which binds the task, the bound repository and the exact head. Each refused
+merge leaves an `agent.approval.refused` ledger event (reason `expired` or
+`binding_changed`, with the authorization, the task, the bound and presented
+payload hashes and the changed fields), kept although the refused call rolls
+back; see [policy](policy.md#approvals-in-the-audit-record).
 
 ### 4. Check isolation
 

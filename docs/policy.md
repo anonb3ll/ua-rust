@@ -172,6 +172,81 @@ projection; without one, gating it is refused (`secret_args_unprojected`)
 rather than store the secret. The full status table is in
 [sdk.md](sdk.md#not-supported).
 
+## Approvals in the audit record
+
+A one-time approval binds one exact payload: the tool, the canonical form
+of the payload its gate builds (sorted keys, no whitespace, as
+`ua_core::canonical` writes it) and the requester. The payload is the
+call's arguments unless the tool's handler resolves more: `dispatch_task`
+binds the resolved harness, working directory and prompt hash, the relay
+binds the exact text and target, and `git_merge_task` binds the head,
+branch, target branch and bound repository it resolves at the call. A pass
+expires `approval_pass_ttl_hours` after it was approved.
+
+`git_merge_task` without `policy_authorization_id` checks the task, its
+worktree and the workspace repository first, then asks for a one-time
+approval of `{task_id, force, dry_run, allow_in_flight, branch, head,
+target, repo, summary}`, where `head` is the full commit SHA of the task's
+branch, `target` the branch merged into, `repo` the task project's bound
+`owner/name` (`null` when unbound) and `summary` one line naming the commit
+and the target for the approver ("Merge task 7 branch task-7 at commit
+0123456789ab into main of example/widgets"). A call whose head, target or
+repository differs from a live pass for the same task is refused with
+`approval_binding_changed`, naming the changed fields; the refusal is
+ledgered as `binding_changed`, the old pass stays unspent and a new
+request for the current values is parked. Because the payload is resolved
+by the handler, the merge cannot be requested ahead through
+`POST /api/approvals/request` (`409`), and a call bound to fail (an unknown
+task, a dirty worktree) is refused before a human is asked.
+
+Each approval event carries `payload_sha256`, the SHA-256 of that canonical
+payload, so the request, the decision, the use and any refusal can be tied
+to one payload without the ledger holding it:
+
+| Event | Carries |
+| --- | --- |
+| `agent.approval.requested` | `approval_id`, `tool`, `requested_by`, `payload_sha256`, `via` |
+| `agent.approval.resolved` | `approval_id`, `tool`, `decision`, `resolved_by`, `transport`, `payload_sha256`; `expires_at` when approved (the expiry under the TTL configured at that moment; a later TTL change applies to the pass from then on) |
+| `agent.approval.consumed` | `approval_id`, `tool`, `payload_sha256`, `via` |
+| `agent.approval.refused` | see below |
+
+The relay drops a message's text from its approval once decided; its hash
+is taken over the payload without the text fields, which still binds the
+text through `text_sha256`, so it is the same before and after the
+decision. A policy authorization's `recorded` and `consumed` events carry
+`payload_sha256` over what it binds: `{"head_sha", "repo", "task_id"}`
+(repository in lower case).
+
+A gated call refused because of its approval state appends one
+`agent.approval.refused` event. Its `reason` is one of:
+
+| `reason` | When |
+| --- | --- |
+| `expired` | The pass or policy authorization that covered the call has expired. A one-time pass is reported once, when the gate first finds it expired; the call parks a new request as before. |
+| `binding_changed` | An approval exists for this action but the call's arguments, revision or target differ from what it bound (`dispatch_task`, `dispatch_resume`, the relay's send, a policy authorization's task, repository or head). |
+| `no_matching_approval` | The call names an approval that does not exist or can no longer be used (`approval_status`: `consumed`, `revoked`), or a resume has no consumed `dispatch_task` approval. |
+| `denied` | A human denied exactly this call (or revoked the relay draft's approval). |
+| `not_covered` | A policy authorization binds the merge but not this mode of it (`detail`: `force`, `in_flight`). |
+| `not_eligible` | The caller may not spend the authorization, or its author is no longer a human identity (`detail`: `self_spend`, `authorizer_not_human`). |
+
+The event names what was refused without carrying it: `tool`,
+`requested_by`, and where they apply `approval_id` or `authorization_id`,
+`task_id`, `approved_payload_sha256`, `presented_payload_sha256`,
+`changed_fields` (the top-level field names that differ, never their
+values), `approval_status`, `expired_at`, `detail` and `via`. It never
+holds payload content. Its organization is the organization of the
+approval row, which is the default organization.
+
+A refusal is often decided inside the refused call's write transaction,
+which then fails and rolls back. The event is appended with
+`ledger::append_surviving`: when the transaction commits it is committed
+once with it, and when it rolls back the store appends it again in a
+separate small transaction on the same writer before the call returns its
+error. The error the caller sees is unchanged.
+
+A call that parks a new request because nothing was decided for it yet is
+not a refusal; its record is the `requested` event.
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client

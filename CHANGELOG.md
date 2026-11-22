@@ -221,6 +221,22 @@ from its commit history.
   `delegate.deliverable-revision-object` passes. `/api/work-products*` still
   answers 501. `ua_org::authz::require_same_org` exposes the organization
   check every authority check applies.
+- Refusals in the audit record (`docs/policy.md#approvals-in-the-audit-record`):
+  a gated call refused because of its approval state appends one
+  `agent.approval.refused` ledger event with a reason (`expired`,
+  `binding_changed`, `no_matching_approval`, `denied`, `not_covered`,
+  `not_eligible`). It names the tool, the approval or policy authorization,
+  the task, the SHA-256 of the canonical payload that was approved and of the
+  one presented, and the top-level fields that differ by name, never their
+  values. It covers the approval gate, `git_merge_task` under a policy
+  authorization, `dispatch_task`, `dispatch_resume` and the relay's send.
+  The event survives the refused call: `ua_store::ledger::append_surviving`
+  appends it in the call's transaction and, when that transaction rolls
+  back, `Db::write` appends it again in a separate small transaction before
+  returning the call's error. The `agent.approval.requested`, `resolved` and
+  `consumed` events and the policy authorization `recorded` and `consumed`
+  events gain `payload_sha256`; `resolved` gains `expires_at` on an approval.
+  Additive: no response or schema changes.
 
 ### Fixed
 
@@ -316,6 +332,22 @@ from its commit history.
   `proc_pidinfo`.
 
 ### Behaviour changes
+
+- A one-time approval of `git_merge_task` no longer covers a later commit.
+  The approval now binds the head (full SHA), branch, target branch and the
+  task project's bound repository resolved when the merge is called, plus a
+  summary naming the commit and the target for the approver. A merge whose
+  branch moved after the approval, or whose project was rebound to another
+  repository, is refused with `approval_binding_changed` (ledgered as an
+  `agent.approval.refused` event, reason `binding_changed`) and a new
+  request for the current values is parked; before, it ran under the old
+  approval. Passes approved before this change bound only the arguments and
+  no longer match: they need a new approval. Because the handler now
+  resolves the payload, `git_merge_task` can no longer be requested ahead
+  through `POST /api/approvals/request` (`409`), and a merge bound to fail
+  (an unknown task, an unfinished task, a dirty worktree) is refused with
+  that error before an approval is parked, instead of parking first. The
+  policy authorization path is unchanged.
 
 - An unknown schema part refuses to open the database. Opening the store
   compares the parts recorded in `schema_parts` with every part name the

@@ -26,7 +26,13 @@
 //!   merge fails, so a failed merge does not burn it; a dry run only reports
 //!   that it would cover the merge.
 //!
-//! Every write appends an `agent.github.policy_authorization.*` event.
+//! Every write appends an `agent.github.policy_authorization.*` event. The
+//! `recorded` and `consumed` events carry `payload_sha256`, the SHA-256 of
+//! the canonical form of what the authorization binds ([`binding`]: task,
+//! repository and head). A merge it refuses appends an
+//! `agent.approval.refused` event naming the authorization, the reason, the
+//! bound and the presented hashes and the fields that differ; the event is
+//! kept even though the refused call's transaction rolls back.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -36,6 +42,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::client::{BoundRepo, full_sha};
+use crate::approvals::{self, Refusal, RefusalReason};
 use crate::families::continuity::same_label;
 use crate::families::governance::{bound_repo, normalize_repo};
 use crate::families::tasks::{emit, is_terminal, require_task, row_object, str_field};
@@ -133,6 +140,48 @@ fn get(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
     Ok(conn.query_row("SELECT * FROM policy_authorizations WHERE id = ?1", [id], row_object).optional()?)
 }
 
+/// One authorization row, if it exists.
+pub(crate) fn row(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    get(conn, id)
+}
+
+/// The tool a policy authorization stands in for.
+const MERGE_TOOL: &str = "git_merge_task";
+
+/// What a policy authorization binds, in the form its events hash: the
+/// task, the repository (lower case; `null` when unbound) and the exact head.
+pub(crate) fn binding(task_id: i64, repo: Option<&str>, head: &str) -> Value {
+    json!({
+        "task_id": task_id,
+        "repo": repo.map(str::to_ascii_lowercase),
+        "head_sha": full_sha(head).unwrap_or_else(|| head.to_string()),
+    })
+}
+
+/// [`binding`] of a stored authorization row.
+fn row_binding(row: &Map<String, Value>) -> Value {
+    binding(
+        row.get("task_id").and_then(Value::as_i64).unwrap_or_default(),
+        str_field(row, "repo"),
+        str_field(row, "head_sha").unwrap_or_default(),
+    )
+}
+
+/// SHA-256 of the canonical form of a [`binding`].
+pub(crate) fn binding_sha256(b: &Value) -> String {
+    approvals::payload_sha256(MERGE_TOOL, b)
+}
+
+/// Ledger `r` as a refusal by `caller` and return the refusal error. When
+/// the refusal cannot be ledgered, that error is returned instead: the call
+/// is refused either way.
+fn refuse(tx: &mut WriteTx<'_>, caller: &str, r: Refusal, err: UaError) -> UaError {
+    match approvals::refused(tx, caller, &r, None) {
+        Ok(()) => err,
+        Err(e) => e,
+    }
+}
+
 /// `policy_authorization_record`.
 async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
     if !ctx.caller.is_human() {
@@ -193,12 +242,14 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
                 params![repo, pr.map(|p| p as i64), head, id, policy, who, claimant, now, expires, in_flight],
             )?;
             let auth_id = tx.last_insert_rowid();
+            let sha = binding_sha256(&binding(id, Some(&repo), &head));
             emit(
                 tx,
                 "agent.github.policy_authorization.recorded",
                 json!({
                     "authorization_id": auth_id, "repo": repo, "pr": pr, "head_sha": head, "task_id": id,
                     "policy_ref": policy, "expires_at": expires, "allow_in_flight": in_flight,
+                    "payload_sha256": sha,
                 }),
                 &who,
             )?;
@@ -276,9 +327,11 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
 }
 
 /// Check that authorization `auth_id` covers merging `head` of task
-/// `task_id` in `repo` for `caller`. Returns the row.
+/// `task_id` in `repo` for `caller`. Returns the row. A refusal is ledgered
+/// (`agent.approval.refused`, kept even when the caller's transaction then
+/// rolls back) before its error is returned.
 pub(crate) fn covering(
-    conn: &Connection,
+    tx: &mut WriteTx<'_>,
     cfg: &Config,
     auth_id: i64,
     task_id: i64,
@@ -286,48 +339,94 @@ pub(crate) fn covering(
     head: &str,
     caller: &str,
 ) -> UaResult<Map<String, Value>> {
-    let refuse = |why: String| UaError::denied("policy_authorization_mismatch", why);
-    let row =
-        get(conn, auth_id)?.ok_or_else(|| UaError::not_found(format!("policy authorization {auth_id}")))?;
-    if str_field(&row, "status") != Some("active") {
-        return Err(refuse(format!(
-            "policy authorization {auth_id} is {}",
-            str_field(&row, "status").unwrap_or("?")
-        )));
+    let mismatch = |why: String| UaError::denied("policy_authorization_mismatch", why);
+    let presented = binding(task_id, repo, head);
+    let presented_sha = binding_sha256(&presented);
+    let base = |reason| {
+        Refusal::new(MERGE_TOOL, reason)
+            .authorization(auth_id)
+            .task(Some(task_id))
+            .hashes(None, Some(presented_sha.clone()))
+    };
+    let Some(row) = get(tx, auth_id)? else {
+        let r = base(RefusalReason::NoMatchingApproval);
+        return Err(refuse(tx, caller, r, UaError::not_found(format!("policy authorization {auth_id}"))));
+    };
+    let approved = row_binding(&row);
+    let approved_sha = Some(binding_sha256(&approved));
+    let base = |reason| base(reason).hashes(approved_sha.clone(), Some(presented_sha.clone()));
+    let status = str_field(&row, "status").unwrap_or("?").to_string();
+    if status != "active" {
+        let r = base(RefusalReason::NoMatchingApproval).status(status.clone());
+        return Err(refuse(tx, caller, r, mismatch(format!("policy authorization {auth_id} is {status}"))));
     }
     if str_field(&row, "expires_at").is_none_or(expired) {
-        return Err(refuse(format!("policy authorization {auth_id} has expired")));
+        let r = base(RefusalReason::Expired).expired_at(str_field(&row, "expires_at").map(str::to_string));
+        return Err(refuse(tx, caller, r, mismatch(format!("policy authorization {auth_id} has expired"))));
     }
-    if row.get("task_id").and_then(Value::as_i64) != Some(task_id) {
-        return Err(refuse(format!("policy authorization {auth_id} is for another task")));
-    }
-    let Some(repo) = repo else {
-        return Err(refuse(format!("task {task_id}'s project is not bound to a repository")));
-    };
-    if !str_field(&row, "repo").is_some_and(|r| r.eq_ignore_ascii_case(repo)) {
-        return Err(refuse(format!("policy authorization {auth_id} is for another repository")));
-    }
-    if str_field(&row, "head_sha") != full_sha(head).as_deref() {
-        return Err(refuse(format!(
+    let changed = approvals::changed_fields(&approved, &presented);
+    let why = if row.get("task_id").and_then(Value::as_i64) != Some(task_id) {
+        Some(format!("policy authorization {auth_id} is for another task"))
+    } else if repo.is_none() {
+        Some(format!("task {task_id}'s project is not bound to a repository"))
+    } else if !str_field(&row, "repo").is_some_and(|r| repo.is_some_and(|b| r.eq_ignore_ascii_case(b))) {
+        Some(format!("policy authorization {auth_id} is for another repository"))
+    } else if str_field(&row, "head_sha") != full_sha(head).as_deref() {
+        Some(format!(
             "policy authorization {auth_id} covers head {}, not {head}: a new commit needs a new authorization",
             str_field(&row, "head_sha").unwrap_or_default()
-        )));
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        let r = base(RefusalReason::BindingChanged).changed(changed);
+        return Err(refuse(tx, caller, r, mismatch(why)));
     }
     if same_label(str_field(&row, "authorized_by"), caller) {
-        return Err(refuse("the authorizer may not spend its own authorization".into()));
+        let r = base(RefusalReason::NotEligible).detail("self_spend");
+        return Err(refuse(
+            tx,
+            caller,
+            r,
+            mismatch("the authorizer may not spend its own authorization".into()),
+        ));
     }
     // The authority is the human's: someone no longer configured as a human
     // identity cannot cover a merge any more.
-    let by = str_field(&row, "authorized_by").unwrap_or_default();
-    if !cfg.is_human(by) {
-        return Err(UaError::denied(
+    let by = str_field(&row, "authorized_by").unwrap_or_default().to_string();
+    if !cfg.is_human(&by) {
+        let r = base(RefusalReason::NotEligible).detail("authorizer_not_human");
+        let err = UaError::denied(
             "authorizer_not_human",
             format!(
                 "policy authorization {auth_id} was recorded by {by:?}, who is no longer a human identity"
             ),
-        ));
+        );
+        return Err(refuse(tx, caller, r, err));
     }
     Ok(row)
+}
+
+/// Ledger the refusal of a merge under authorization `auth_id` that the
+/// authorization binds but does not cover in this mode (`detail`: `force`,
+/// `in_flight`), and return `err`.
+pub(crate) fn refuse_mode(
+    tx: &mut WriteTx<'_>,
+    caller: &str,
+    auth_id: i64,
+    task_id: i64,
+    row: Option<&Map<String, Value>>,
+    detail: &'static str,
+    err: UaError,
+) -> UaError {
+    let sha = row.map(|r| binding_sha256(&row_binding(r)));
+    let r = Refusal::new(MERGE_TOOL, RefusalReason::NotCovered)
+        .authorization(auth_id)
+        .task(Some(task_id))
+        .hashes(sha, None)
+        .detail(detail);
+    refuse(tx, caller, r, err)
 }
 
 /// Whether authorization row `row` also covers an in-flight task.
@@ -339,6 +438,7 @@ pub(crate) fn allows_in_flight(row: &Map<String, Value>) -> bool {
 /// caller's write). Returns the `consumed_at` stamp [`restore`] fences on.
 pub(crate) fn consume(
     tx: &mut WriteTx<'_>,
+    auth: &Map<String, Value>,
     auth_id: i64,
     task_id: i64,
     head: &str,
@@ -356,7 +456,10 @@ pub(crate) fn consume(
     emit(
         tx,
         "agent.github.policy_authorization.consumed",
-        json!({ "authorization_id": auth_id, "task_id": task_id, "head_sha": head, "tool": "git_merge_task" }),
+        json!({
+            "authorization_id": auth_id, "task_id": task_id, "head_sha": head, "tool": MERGE_TOOL,
+            "payload_sha256": binding_sha256(&row_binding(auth)),
+        }),
         caller,
     )?;
     Ok(now)

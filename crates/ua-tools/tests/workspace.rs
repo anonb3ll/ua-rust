@@ -517,10 +517,49 @@ async fn git_merge_task_parks_for_approval_then_merges() {
     assert!(!env.ws.join("feature.txt").exists(), "a dry run merges nothing");
 
     let real = json!({ "task_id": task_id });
-    assert_eq!(env.call("git_merge_task", real.clone()).await.unwrap_err().code(), "approval_required");
+    let e = env.call("git_merge_task", real.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id: first, .. } = e else { panic!("{e}") };
+    // The approval binds the head, branch, target and repository resolved
+    // at the call, and its summary names the commit and the target.
+    let head = git(&env.ws, &["rev-parse", "task-7"]).trim().to_string();
+    let pending =
+        env.reg.call(&env.hub, &human(), "approval_pending", json!({ "tool": "git_merge_task" })).await;
+    let p = pending.unwrap()["pending"][0]["payload"].clone();
+    assert_eq!(
+        (p["head"].as_str(), p["branch"].as_str(), p["target"].as_str()),
+        (Some(&*head), Some("task-7"), Some("main")),
+        "{p}"
+    );
+    assert_eq!(p["repo"], Value::Null, "{p}");
+    let summary = p["summary"].as_str().unwrap();
+    assert!(summary.contains(&head[..12]) && summary.contains("into main"), "{summary}");
+    env.approve_pending("git_merge_task").await;
+
+    // A commit added after the approval is not covered by it.
+    std::fs::write(wt.join("later.txt"), "later\n").unwrap();
+    git(&wt, &["add", "later.txt"]);
+    git(&wt, &["commit", "-q", "-m", "feat: a later change"]);
+    let e = env.call("git_merge_task", real.clone()).await.unwrap_err();
+    assert_eq!(reason(&e), "approval_binding_changed", "{e}");
+    assert!(!env.ws.join("feature.txt").exists(), "nothing was merged");
+    let refused = env.events("agent.approval.refused").await;
+    let r = &refused.last().expect("the refusal is ledgered")["payload"];
+    assert_eq!(
+        (r["reason"].as_str(), r["approval_id"].as_i64()),
+        (Some("binding_changed"), Some(first)),
+        "{r}"
+    );
+    assert_eq!((r["tool"].as_str(), r["task_id"].as_i64()), (Some("git_merge_task"), Some(task_id)), "{r}");
+    assert_eq!(r["changed_fields"], json!(["head"]), "{r}");
+    assert!(!r.to_string().contains(&head), "no payload content: {r}");
+    let row = env.hub.db().read(move |c| ua_tools::approvals::get(c, first)).unwrap();
+    assert_eq!(row.status, "approved", "the stale pass is not spent");
+
+    // A human approves the new head: that merge runs.
     env.approve_pending("git_merge_task").await;
     let r = env.ok("git_merge_task", real).await;
     assert_eq!(r["success"], true);
+    assert!(env.ws.join("later.txt").exists(), "the approved head is merged");
     assert_eq!(r["branch"], "task-7");
     assert!(r.get("cleanup_skipped").is_none(), "{r}");
     assert!(env.ws.join("feature.txt").exists());
@@ -529,10 +568,9 @@ async fn git_merge_task_parks_for_approval_then_merges() {
     assert!(branches.is_empty(), "the merged branch is deleted");
     assert_eq!(env.events("agent.git.merged").await.len(), 1);
 
-    // Unknown task: parks first, then reports not found once approved.
+    // Unknown task: refused before a human is asked (the approval binds
+    // values only the handler resolves).
     let missing = json!({ "task_id": 9999 });
-    assert_eq!(env.call("git_merge_task", missing.clone()).await.unwrap_err().code(), "approval_required");
-    env.approve_pending("git_merge_task").await;
     assert_eq!(env.call("git_merge_task", missing).await.unwrap_err().code(), "not_found");
 }
 
