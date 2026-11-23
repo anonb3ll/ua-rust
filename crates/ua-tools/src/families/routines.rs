@@ -119,6 +119,22 @@ BEGIN SELECT RAISE(ABORT, 'a routine run must be in its routine''s organization'
 ",
 };
 
+/// `routines.v3.task_org`: a routine run's `task_id` points at a task in the
+/// run's own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "routines.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org BEFORE INSERT ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org_update BEFORE UPDATE OF task_id ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+",
+};
+
 const MAX_DUE_PER_TICK: usize = 100;
 const MAX_RECENT_RUNS: i64 = 100;
 pub const SKIP_OVERLAP: &str = "overlap";

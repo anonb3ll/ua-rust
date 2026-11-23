@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_deliverables::{Kind, NewDeliverable, NewRevision, REVISIONS_PER_READ};
-use ua_store::Part;
+use ua_store::{Part, SchemaPart};
 
 use crate::families::continuity::{capsule_head, require_writer, review_ready, task_repo, write_capsule};
 use crate::families::tasks::{TASK_ORG, acting_identity, require_task};
@@ -44,6 +44,21 @@ const FAMILY: &str = "deliverables";
 pub fn schema_parts() -> Vec<Part> {
     ua_deliverables::schema_parts()
 }
+
+/// `deliverables.v2.task_org`: a deliverable's `task_id` points at a task in
+/// the deliverable's own organization. It lives here, not in
+/// `ua-deliverables`, because that crate's store has no `tasks` table.
+/// `task_id` carries no foreign key, so a missing task passes as before, and
+/// `deliverables_fixed` already refuses any change of `task_id`. Applied
+/// after `organization.v1.tools.tasks` and `organization.v1.deliverables`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "deliverables.v2.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS deliverables_task_org BEFORE INSERT ON deliverables
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a deliverable must point at a task in its own organization'); END;
+",
+};
 
 // --- arguments ----------------------------------------------------------------------
 

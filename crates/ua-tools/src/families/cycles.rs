@@ -143,6 +143,22 @@ BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
 ",
 };
 
+/// `cycles.v3.task_org`: a cycle's `task_id` points at a task in the cycle's
+/// own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "cycles.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org BEFORE INSERT ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org_update BEFORE UPDATE OF task_id ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
+",
+};
+
 pub const STATES: [&str; 11] = [
     "plan",
     "delegated",

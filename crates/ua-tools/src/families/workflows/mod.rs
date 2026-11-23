@@ -130,6 +130,21 @@ BEGIN SELECT RAISE(ABORT, 'a workflow checkpoint must be in its run''s organizat
 ",
 };
 
+/// `workflows.v3.task_org`: a workflow run's `task_id` points at a task in
+/// the run's own organization. `task_id` carries no foreign key, so a missing
+/// task passes as before. Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "workflows.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS workflow_runs_task_org BEFORE INSERT ON workflow_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow run must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS workflow_runs_task_org_update BEFORE UPDATE OF task_id ON workflow_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow run must point at a task in its own organization'); END;
+",
+};
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListArgs {}

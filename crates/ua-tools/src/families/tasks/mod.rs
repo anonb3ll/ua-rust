@@ -20,7 +20,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::registry::Registry;
 
@@ -97,6 +97,69 @@ CREATE TABLE IF NOT EXISTS task_goal_links (
     linked_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_goal_links_goal ON task_goal_links(goal_id);
+",
+};
+
+/// `organization.v1.tools.tasks`: `org_id` on `tasks`, `task_dependencies`,
+/// `task_comments` and `task_comment_threads` (existing rows backfilled to the
+/// default organization) and their generated `*_org_exists` /
+/// `*_org_immutable` triggers. No key rebuild: a task id is a hub-global
+/// AUTOINCREMENT id (Decision 3: task identity never moves between
+/// organizations), and every child key is led by a task or comment id, so two
+/// organizations can never collide. `task_fts` is an external-content index
+/// over `tasks` and takes no column: every search filters through `tasks`.
+/// Applied after the tasks parts and `organization.v1.store`.
+pub const TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.tasks",
+    &["tasks", "task_dependencies", "task_comments", "task_comment_threads"],
+);
+
+/// `tasks.v2.org_scope`: indexes led by `org_id` for the hot task reads (the
+/// status and project queues, a claimant's tasks), and triggers that keep
+/// every task reference inside one organization: a task's `parent_id` and
+/// `folded_into`, both ends of a dependency, and a comment's task and parent
+/// comment (the foreign keys alone would accept a row in another
+/// organization). A missing target is still the foreign key's error. Applied
+/// after [`TENANT_PART`] and the continuity parking columns.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "tasks.v2.org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_tasks_org_status ON tasks(org_id, status, priority);
+CREATE INDEX IF NOT EXISTS idx_tasks_org_project ON tasks(org_id, project, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_org_claimed ON tasks(org_id, claimed_by);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_org_task ON task_dependencies(org_id, task_id);
+
+CREATE TRIGGER IF NOT EXISTS tasks_org_parent BEFORE INSERT ON tasks
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id IN (NEW.parent_id, NEW.folded_into) AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS tasks_org_parent_update BEFORE UPDATE OF parent_id, folded_into ON tasks
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id IN (NEW.parent_id, NEW.folded_into) AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_dependencies_org_parent BEFORE INSERT ON task_dependencies
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id IN (NEW.task_id, NEW.depends_on_task_id) AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_dependencies_org_parent_update
+BEFORE UPDATE OF task_id, depends_on_task_id ON task_dependencies
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id IN (NEW.task_id, NEW.depends_on_task_id) AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_comments_org_parent BEFORE INSERT ON task_comments
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM task_comments WHERE id = NEW.parent_comment_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or comment belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_comments_org_parent_update
+BEFORE UPDATE OF task_id, parent_comment_id ON task_comments
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM task_comments WHERE id = NEW.parent_comment_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or comment belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_comment_threads_org_parent BEFORE INSERT ON task_comment_threads
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_comment_threads_org_parent_update BEFORE UPDATE OF task_id ON task_comment_threads
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
 ",
 };
 

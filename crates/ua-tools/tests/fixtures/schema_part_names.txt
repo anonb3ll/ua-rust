@@ -91,3 +91,9 @@ organization.v1.tools.cycles
 cycles.v2.org_scope
 organization.v1.tools.approvals
 approvals.v3.org_indexes
+organization.v1.tools.tasks
+tasks.v2.org_scope
+routines.v3.task_org
+workflows.v3.task_org
+cycles.v3.task_org
+deliverables.v2.task_org
