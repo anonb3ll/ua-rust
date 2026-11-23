@@ -49,13 +49,17 @@ const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
 /// Parts registered after this family's, which need its `org_id` columns
 /// (the continuity, holds and delegation families').
-const LATER: [&str; 6] = [
+const LATER: [&str; 10] = [
     "organization.v1.tools.continuity",
     "continuity.v2.org_scope",
     "organization.v1.tools.holds",
     "governance.v3.holds_org_scope",
     "organization.v1.tools.delegation",
     "delegation.v2.org_scope",
+    "organization.v1.tools.goals",
+    "goals.v2.org_scope",
+    "organization.v1.tools.proposals",
+    "governance.v4.proposals_org_scope",
 ];
 
 fn old_parts() -> Vec<ua_store::Part> {
@@ -785,19 +789,22 @@ async fn state_sync_verify_counts_only_the_callers_tasks() {
     }
 }
 
-/// A proposal or contract marker on another organization's task fails
-/// closed with one generic mismatch: the default organization's work
-/// proposals are never looked up for it.
+/// A proposal or contract marker on another organization's task is checked
+/// against that organization's work proposals only, and fails closed when
+/// it names none of them (`goals_tenant.rs` holds the cross-organization
+/// cases).
 #[tokio::test]
-async fn an_organization_b_contract_marker_is_refused_without_a_lookup() {
+async fn an_organization_b_contract_marker_is_checked_in_organization_b() {
     let h = H::new();
     let b = agent(ORG_B);
-    for notes in ["[proposal: wp_0123456789ab#0]", "[contract: deadbeef]"] {
+    for (notes, says) in [
+        ("[proposal: wp_0123456789ab#0]", "unknown work proposal item"),
+        ("[contract: deadbeef]", "no [proposal: ...] marker"),
+    ] {
         let t = h.add(&b, json!({ "title": "B marked", "notes": notes })).await;
         let e = h.err(&b, "task_claim", json!({ "id": t })).await;
         assert_eq!(reason(&e), "contract_mismatch", "{e}");
-        assert!(e.to_string().contains("outside the default organization"), "{e}");
-        assert!(!e.to_string().contains("wp_"), "{e}");
+        assert!(e.to_string().contains(says), "{e}");
     }
     // An unmarked task claims as before.
     let t = h.add(&b, json!({ "title": "B plain" })).await;

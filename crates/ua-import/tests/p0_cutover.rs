@@ -286,6 +286,9 @@ fn p0_tables_and_harness_config_bundles_enforce_drop_org_scope() {
         })
         .unwrap();
     assert_eq!(landed, "default", "harness_config_bundles.org_id is dropped; the bundle lands in default");
+    // A work proposal is imported into the default organization: its source
+    // `org_id` is never copied.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM work_proposals WHERE org_id = 'default'"), 1);
 
     // An all-NULL org_id source imports cleanly without --drop-org-scope.
     let (f_null, c_null) = new_source();

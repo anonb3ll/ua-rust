@@ -451,6 +451,28 @@ from its commit history.
   agents, deadline, callback, reasons and results are `null` in them and
   the originator is `system`. The importer writes legacy delegations to
   `default`.
+- Goals and work proposals are organization-scoped:
+  `organization.v1.tools.goals` adds `org_id` and the organization triggers
+  to `goals` and `task_goal_links`, and `organization.v1.tools.proposals` to
+  `work_proposals` and `work_proposal_items`. Existing goals and proposals
+  move to `default`; `goals.v2.org_scope` moves each link to its task's
+  organization (and deletes a link whose goal is then in another
+  organization) and `governance.v4.proposals_org_scope` each item to its
+  proposal's. Both add indexes led by `org_id` and same-organization
+  triggers for a goal's parent, a link's task and goal, and an item's
+  proposal and spawned task. No key rebuild: a goal id is a hub-global
+  AUTOINCREMENT id and a proposal id is hub-generated. Every `goal_manage`
+  action, the goal-project check of a `task_update` project move,
+  `platform_object_get` (which read any organization's goal before) and
+  every work-proposal action read and write only the caller's
+  organization's rows; another organization's goal or proposal answers
+  exactly as a missing one, and a write for an organization `orgs` does not
+  hold is refused (`unknown_organization`) before anything changes.
+  `goal_manage` still refuses `params.org_id`. Replies carry no `org_id`.
+  Goal and work-proposal events stay in the default organization's ledger;
+  another organization's reasons and proposer are `null` in them and the
+  originator is `system`. The importer writes legacy goals, links,
+  proposals and items to `default` and never copies a source `org_id`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -610,11 +632,22 @@ from its commit history.
   (`org_tasks_unavailable`); its workflow is still recorded as `not_run`
   until a routine owner can act outside the default organization. Old
   receipts keep their recorded reason.
-- Work proposals, merged-PR reconciliation (`queue_close_merged`) and the
-  GitHub webhook, poller and CI lookups stay with the default organization:
-  another organization's caller is refused (`org_unsupported`) by the
-  proposal actions and `queue_close_merged`, and the hub's GitHub paths only
-  read and close default-organization tasks (`ORG-GITHUB-DEFAULT`).
+- Merged-PR reconciliation (`queue_close_merged`) and the GitHub webhook,
+  poller and CI lookups stay with the default organization: another
+  organization's caller is refused (`org_unsupported`) by
+  `queue_close_merged`, and the hub's GitHub paths only read and close
+  default-organization tasks (`ORG-GITHUB-DEFAULT`).
+- Work proposals are no longer refused to another organization's caller
+  (`org_unsupported`): it files, reads, lists, withdraws and recovers its own
+  organization's proposals. Deciding also needs the organization half of
+  authority (`ua_org::authz`), which admits only the default organization
+  until memberships exist, so another organization's human is refused
+  (`org_mismatch`) and nothing is written. An approved item's task is
+  created in the proposal's organization, and the contract check on a task
+  (claim, `doing`, dispatch, node work) reads only the task organization's
+  proposals and items: a marker naming another organization's proposal is
+  refused as an unknown item, instead of every marker on another
+  organization's task being refused outright.
 - Policy authorizations carry no organization yet; each is reached only
   through its task's organization, so another organization's authorization
   answers as a missing one. Delegation to another organization's agent is

@@ -135,6 +135,16 @@ pub fn schema_parts() -> Vec<Part> {
     // delegation's task is in its own organization.
     parts.push(families::delegation::TENANT_PART.into());
     parts.push(families::delegation::ORG_SCOPE.into());
+    // The organization column and triggers of the goal and work-proposal
+    // tables (no key rebuild: a goal id is an AUTOINCREMENT id, a proposal id
+    // is hub-generated, and the link and item keys are led by a task or
+    // proposal id), then each link moved to its task's organization and each
+    // item to its proposal's, the organization-led indexes and the
+    // same-organization triggers.
+    parts.push(families::tasks::GOALS_TENANT_PART.into());
+    parts.push(families::tasks::GOALS_ORG_SCOPE.into());
+    parts.push(families::governance::PROPOSALS_TENANT_PART.into());
+    parts.push(families::governance::PROPOSALS_ORG_SCOPE.into());
     parts
 }
 

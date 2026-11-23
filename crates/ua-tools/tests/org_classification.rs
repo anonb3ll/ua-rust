@@ -174,7 +174,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agents",
     "dispatch_receipts",
     "dispatch_runs",
-    "goals",
     "idempotency_keys",
     "managed_secrets",
     "memory",
@@ -196,10 +195,7 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "session_profiles",
     "session_wake",
     "session_wake_offers",
-    "task_goal_links",
     "tool_calls",
-    "work_proposal_items",
-    "work_proposals",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];
