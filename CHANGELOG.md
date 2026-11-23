@@ -320,6 +320,28 @@ from its commit history.
   `agent.plan.handoff`, and `reason` on `agent.plan.closed`. The importer writes legacy plans to
   `default`. Results and events in the default organization are unchanged,
   except that plan rows now carry `org_id`.
+- Autonomous cycles, their transitions and usage (`autonomous_cycles`,
+  `autonomous_cycle_transitions`, `autonomous_cycle_usage`) are
+  organization-scoped: `organization.v1.tools.cycles` adds `org_id` and the
+  organization triggers, and `cycles.v2.org_scope` adds an index led by
+  `org_id` and triggers that keep a transition or usage row in its cycle's
+  organization. No key rebuild: cycle ids are hub-generated, and the
+  transition and usage keys are led by them. Existing rows move to
+  `default`. Every `autonomous_cycle_manage` action, the legacy
+  `autonomous_cycle_*` tools and `autonomous_cycle_green_path_eligibility`
+  read and write only the caller's organization's rows; another
+  organization's cycle answers as a missing one, and an organization `orgs`
+  does not hold is refused (`unknown_organization`) before anything changes.
+  Tasks carry no organization yet (`TASK_ORG`): only the task organization
+  can bind a cycle to a task or a delegation, and to any other organization
+  a task or delegation id answers as a missing one. A gated transition's
+  approval payload binds `org_id`, so an approval parked before this change
+  is not reused: retrying the transition parks a new one. In
+  `agent.cycle.updated`, a cycle outside the default organization has a
+  `null` `stop_reason` and is attributed to the caller's own label. Results
+  and events in the default organization are unchanged, except that cycle
+  rows now carry `org_id`. `delegations` is not converted: it belongs to the
+  tasks family and converts with `tasks`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
