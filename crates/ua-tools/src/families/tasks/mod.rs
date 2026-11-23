@@ -163,6 +163,60 @@ BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
 ",
 };
 
+/// `organization.v1.tools.goals`: `org_id` on `goals` and `task_goal_links`
+/// (existing rows filled with the default organization) and their generated
+/// `*_org_exists` / `*_org_immutable` triggers. No key rebuild: a goal id is a
+/// hub-global AUTOINCREMENT id and a link's key is its hub-global task id.
+/// [`GOALS_ORG_SCOPE`] then moves each link to its task's organization.
+/// Applied after [`ORG_SCOPE`].
+pub const GOALS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.goals", &["goals", "task_goal_links"]);
+
+/// `goals.v2.org_scope`: every goal stays in the default organization (goals
+/// were the default organization's until now), and each link moves to its
+/// task's organization; a link that then names a goal in another
+/// organization is deleted, since a task may serve only its own
+/// organization's goal. Indexes led by `org_id` for the goal list and the
+/// links of a goal, and triggers that keep a goal's parent, and a link's task
+/// and goal, inside the row's organization (the foreign keys alone would
+/// accept another organization's row). The backfill drops the generated
+/// `task_goal_links_org_immutable` trigger for its one `UPDATE` and puts the
+/// same trigger back, in this part's transaction.
+pub const GOALS_ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "goals.v2.org_scope",
+    sql: concat!(
+        "
+DROP TRIGGER task_goal_links_org_immutable;
+UPDATE task_goal_links SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = task_goal_links.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_goal_links.task_id AND t.org_id IS NOT task_goal_links.org_id);
+",
+        crate::families::continuity::org_immutable!("task_goal_links"),
+        "
+DELETE FROM task_goal_links
+WHERE EXISTS (SELECT 1 FROM goals g WHERE g.id = task_goal_links.goal_id AND g.org_id IS NOT task_goal_links.org_id);
+
+CREATE INDEX IF NOT EXISTS idx_goals_org_project ON goals(org_id, project, id);
+CREATE INDEX IF NOT EXISTS idx_task_goal_links_org_goal ON task_goal_links(org_id, goal_id);
+
+CREATE TRIGGER IF NOT EXISTS goals_org_parent BEFORE INSERT ON goals
+WHEN EXISTS (SELECT 1 FROM goals WHERE id = NEW.parent_goal_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'goal belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS goals_org_parent_update BEFORE UPDATE OF parent_goal_id ON goals
+WHEN EXISTS (SELECT 1 FROM goals WHERE id = NEW.parent_goal_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'goal belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_goal_links_org_parent BEFORE INSERT ON task_goal_links
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM goals WHERE id = NEW.goal_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or goal belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_goal_links_org_parent_update BEFORE UPDATE OF task_id, goal_id ON task_goal_links
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM goals WHERE id = NEW.goal_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or goal belongs to another organization'); END;
+"
+    ),
+};
+
 pub fn schema_parts() -> Vec<SchemaPart> {
     vec![SEARCH_SCHEMA, COMMENTS_SCHEMA, GOALS_SCHEMA]
 }

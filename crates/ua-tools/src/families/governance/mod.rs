@@ -48,6 +48,7 @@ pub(crate) use lifecycle::{
     agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate, agent_unretire,
     stopped,
 };
+pub use proposals::{PROPOSALS_ORG_SCOPE, PROPOSALS_TENANT_PART};
 pub(crate) use proposals::{
     check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
     work_proposal_list, work_proposal_recover, work_proposal_withdraw,

@@ -520,8 +520,9 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             {
                 let goal_project: Option<String> = tx
                     .query_row(
-                        "SELECT g.project FROM task_goal_links l JOIN goals g ON g.id = l.goal_id WHERE l.task_id = ?1",
-                        [id],
+                        "SELECT g.project FROM task_goal_links l JOIN goals g ON g.id = l.goal_id AND g.org_id = l.org_id \
+                         WHERE l.org_id = ?2 AND l.task_id = ?1",
+                        params![id, org],
                         |r| r.get(0),
                     )
                     .optional()?;

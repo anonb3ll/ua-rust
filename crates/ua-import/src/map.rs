@@ -63,6 +63,12 @@ pub(crate) enum Kind {
     /// Legacy delegations are imported into the default organization, with
     /// their tasks (a source `org_id` is never copied).
     Delegations,
+    /// Legacy goals and task-goal links are imported into the default
+    /// organization, with their tasks (a source `org_id` is never copied).
+    Goals,
+    /// Legacy work proposals and their items are imported into the default
+    /// organization (a source `org_id` is never copied).
+    WorkProposals,
 }
 
 impl Kind {
@@ -83,6 +89,8 @@ impl Kind {
                 | Kind::Plans
                 | Kind::Approvals
                 | Kind::Delegations
+                | Kind::Goals
+                | Kind::WorkProposals
         )
     }
 }
@@ -135,9 +143,14 @@ pub(crate) const MAPS: &[TableMap] = &[
         kind: Kind::TaskChildren,
         ..plain("task_comments")
     },
-    TableMap { self_ref: Some(Ref { col: "parent_goal_id", table: "goals", key: "id" }), ..plain("goals") },
+    TableMap {
+        self_ref: Some(Ref { col: "parent_goal_id", table: "goals", key: "id" }),
+        kind: Kind::Goals,
+        ..plain("goals")
+    },
     TableMap {
         refs: &[TASK_REF, Ref { col: "goal_id", table: "goals", key: "id" }],
+        kind: Kind::Goals,
         ..plain("task_goal_links")
     },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_workflow") },
@@ -148,9 +161,10 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_steps") },
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_checkpoints") },
     TableMap { refs: &[TASK_REF], kind: Kind::Delegations, ..plain("delegations") },
-    plain("work_proposals"),
+    TableMap { kind: Kind::WorkProposals, ..plain("work_proposals") },
     TableMap {
         refs: &[Ref { col: "proposal_id", table: "work_proposals", key: "id" }],
+        kind: Kind::WorkProposals,
         ..plain("work_proposal_items")
     },
     // Neither schema has an FK from task_holds.root_task_id to tasks: hold

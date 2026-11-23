@@ -732,7 +732,10 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             mark_untrusted(&mut v);
             v
         }),
-        "goal" => one_row(c, "SELECT * FROM goals WHERE id = ?1", id)?.map(Value::Object),
+        // A goal of the reader's organization, without `org_id`.
+        "goal" => {
+            org_row(c, "SELECT * FROM goals WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?.map(Value::Object)
+        }
         "comment" => org_row(c, "SELECT * FROM task_comments WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
             .map(|mut m| {
             decode(&mut m, &["mentions", "refs"]);

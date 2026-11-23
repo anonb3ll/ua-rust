@@ -35,7 +35,7 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (32 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (28 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
@@ -47,7 +47,8 @@ here for memory columns, owners and defaults.
   `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `approvals`,
   `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`,
   `task_workflow`, `task_checks`, `review_ready_notices`, `task_holds`,
-  `task_hold_members` and `delegations` having left it;
+  `task_hold_members`, `delegations`, `goals`, `task_goal_links`,
+  `work_proposals` and `work_proposal_items` having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -452,12 +453,10 @@ here for memory columns, owners and defaults.
     not fall into the default organization, but the outcome of deleting
     another organization's task is kept. The default organization's holds
     and authorizations outlive their task, as before.
-  - Work proposals carry no organization yet, so their actions are refused
-    to another organization's caller (`org_unsupported`) and a proposal's
-    task is always a default-organization task. A proposal or contract
-    marker on another organization's task fails the contract check with one
-    generic mismatch, without reading the default organization's proposals. Goals are not converted;
-    a goal action looks the task it names up in the caller's organization.
+  - Work proposals and goals carry their own organization (the goal and
+    work-proposal tables, below): a proposal's task is created in the
+    proposal's organization, and the contract check reads only the task
+    organization's proposals and items.
   - Events stay in the default organization's ledger (`ORG-EVENT-DEFAULT`):
     for another organization's task its titles, notes, comment bodies,
     reasons, check names and caller-supplied labels are `null`, and the
@@ -558,6 +557,53 @@ here for memory columns, owners and defaults.
   importer writes legacy delegations to `default` and never copies a
   source `org_id`. `crates/ua-tools/tests/delegation_tenant.rs` holds the
   upgrade and the isolation tests.
+- The goal and work-proposal tables: `organization.v1.tools.goals` gives
+  `goals` and `task_goal_links` their `org_id` and triggers, and
+  `organization.v1.tools.proposals` gives `work_proposals` and
+  `work_proposal_items` theirs. Every existing goal and proposal stays in
+  `default` (they were the default organization's: proposals were refused
+  to other organizations, and goals had no organization to take).
+  `goals.v2.org_scope` moves each link to its task's organization and then
+  deletes a link whose goal is in another organization, since a task may
+  serve only its own organization's goal; `governance.v4.proposals_org_scope`
+  moves each item to its proposal's organization. Each drops the generated
+  `*_org_immutable` trigger for its one `UPDATE` and recreates it exactly,
+  in the part's transaction. They add indexes led by `org_id` for the goal
+  list, a goal's links, the proposal list and the contract check's lookup of
+  the item that spawned a task, and the `*_org_parent` triggers that keep a
+  goal's `parent_goal_id`, a link's task and goal, and an item's proposal
+  and `task_id` (which has no foreign key) inside the row's organization.
+  No rebuild: a goal id is a hub-global AUTOINCREMENT id, a proposal id the
+  hub-generated `wp_<uuid12>` (never chosen by a caller), and the link and
+  item keys are led by a task or proposal id. Every `goal_manage` action,
+  `task_update`'s check that a moved task's goal is in its new project,
+  `platform_object_get`, every work-proposal action and the contract check
+  that `task_claim`, `task_update` into `doing`, dispatch and node work run
+  read and write only one organization's rows: the caller's, or for the
+  contract check the task's. Another organization's goal or proposal
+  answers exactly as a missing one, a link to another organization's goal
+  is refused as a link to a missing goal, and a contract marker naming
+  another organization's proposal is refused as naming an unknown item. A
+  write for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes. Replies carry no
+  `org_id` (owner decision (d)), and `goal_manage` still refuses
+  `params.org_id`. Deciding a proposal is authority-gated in the caller's
+  organization (`authz` with `TransitionalHuman`), which admits only the
+  default organization until memberships exist: another organization's
+  proposals can be filed, read, listed, withdrawn and recovered, but its
+  human is refused (`org_mismatch`) before anything is read, so no
+  approval outside the default organization happens yet; when one does, its
+  task is created in the proposal's organization. Filing for another
+  identity is operator authority in the caller's organization, so it too is
+  default-only for now. The `agent.goal.*` and `agent.work_proposal.*`
+  events are `ORG-EVENT-DEFAULT` sites: for another organization the close
+  and reopen reason, the proposer and the withdrawal reason are `null` and
+  the originator is `system`; ids, indexes, statuses, the reporting mode
+  and contract digests remain (goal and item titles and notes never reach
+  an event). The importer writes legacy goals, links, proposals and items
+  to `default` and never copies a source `org_id`.
+  `crates/ua-tools/tests/goals_tenant.rs` holds the upgrade and the
+  isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -1675,7 +1721,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_workflow`, `task_checks`, `review_ready_notices` (`organization.v1.tools.continuity` and `continuity.v2.org_scope`: existing rows moved to their task's organization, every workflow, check and notice read and write, same-organization task triggers; re-verification default-only), `task_holds`, `task_hold_members` (`organization.v1.tools.holds` and `governance.v3.holds_org_scope`: a hold in its root task's organization, every hold read, write and claim check, same-organization root, task and hold triggers), `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_workflow`, `task_checks`, `review_ready_notices` (`organization.v1.tools.continuity` and `continuity.v2.org_scope`: existing rows moved to their task's organization, every workflow, check and notice read and write, same-organization task triggers; re-verification default-only), `task_holds`, `task_hold_members` (`organization.v1.tools.holds` and `governance.v3.holds_org_scope`: a hold in its root task's organization, every hold read, write and claim check, same-organization root, task and hold triggers), `goals`, `task_goal_links` (`organization.v1.tools.goals` and `goals.v2.org_scope`: a link in its task's organization, every goal and link read and write, same-organization parent, task and goal triggers), `work_proposals`, `work_proposal_items` (`organization.v1.tools.proposals` and `governance.v4.proposals_org_scope`: an item in its proposal's organization, every proposal read and write and the contract check in the task's organization, an approved item's task in the proposal's organization, deciding authority-gated and so default-only today), `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
