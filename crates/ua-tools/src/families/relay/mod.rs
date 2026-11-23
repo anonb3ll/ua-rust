@@ -837,7 +837,9 @@ fn begin_send(
                         "payload_sha256": approvals::payload_sha256(TOOL, &approval.payload),
                     }),
                 )
-                .by(caller.label.clone()),
+                // ORG-EVENT-DEFAULT: another organization's label is not the
+                // originator in the default ledger.
+                .by(approvals::ledger_originator(&approval.org_id, &caller.label)),
             )?;
             id
         }
@@ -1009,7 +1011,15 @@ async fn status(ctx: ToolCtx, p: StatusParams) -> UaResult<Value> {
             if !caller.is_human() && row.requested_by != caller.label {
                 return Err(UaError::not_found(format!("relay draft {}", row.id)));
             }
-            let approval = row.approval_id.map(|a| approvals::get(c, &caller.org_id, a)).transpose()?;
+            // `relay_messages` carries no organization yet, so a draft's
+            // approval may sit in another organization than the reader's.
+            // That approval answers as a missing one (`approvals::get`), so
+            // the status reports no approval rather than failing the call.
+            let approval = match row.approval_id.map(|a| approvals::get(c, &caller.org_id, a)) {
+                Some(Ok(a)) => Some(a),
+                Some(Err(UaError::NotFound(_))) | None => None,
+                Some(Err(e)) => return Err(e),
+            };
             let mut out = row.summary();
             out["findings"] = row.findings.get("findings").cloned().unwrap_or(json!([]));
             out["approval_status"] = json!(approval.as_ref().map(|a| a.status.clone()));
@@ -1071,6 +1081,11 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
             // approval stays in the ledger (`agent.approval.resolved`).
             let mut approval_status = None;
             if let Some(a) = row.approval_id {
+                // Unlike `status`, a missing approval (another
+                // organization's answers as one) fails the cancel: the draft
+                // must not be marked cancelled while a decision that can
+                // still be spent stays live where this caller cannot
+                // withdraw it. Fail closed.
                 let approval = approvals::get(tx, &caller.org_id, a)?;
                 let new = match approval.status.as_str() {
                     "pending" => Some("denied"),

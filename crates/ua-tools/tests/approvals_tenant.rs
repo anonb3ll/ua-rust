@@ -586,9 +586,18 @@ async fn organization_b_labels_never_reach_the_default_ledger() {
     assert!(refused.iter().all(|p| p["requested_by"].is_null()), "{refused:?}");
     assert_eq!(h.payloads("agent.approval.consumed").len(), 1);
     for needle in ["kestrel", "nightshift"] {
-        let leaked = h.count(&format!("SELECT COUNT(*) FROM event_log WHERE payload LIKE '%{needle}%'"));
+        let leaked = h.count(&format!(
+            "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%{needle}%' OR originator LIKE '%{needle}%'"
+        ));
         assert_eq!(leaked, 0, "{needle:?} reached the default organization's ledger");
     }
+    // Every one of organization B's approval events is attributed to the
+    // neutral originator, never to its requester or resolver.
+    let originators = h.count(&format!(
+        "SELECT COUNT(*) FROM event_log WHERE channel LIKE 'agent.approval.%' AND originator <> '{}'",
+        approvals::NEUTRAL_ORIGINATOR
+    ));
+    assert_eq!(originators, 0, "an organization B approval event names a label as its originator");
     // Organization B keeps its own text.
     let v = h.call(&b_agent, "approval_pending", json!({})).await.unwrap();
     assert_eq!(v["pending"][0]["requested_by"], B_AGENT, "{v}");
@@ -617,6 +626,72 @@ async fn the_anomaly_check_counts_only_the_readers_organization() {
     assert!(!rules(&d).contains(&"approval_queue_age".to_string()), "{d}");
     let o = h.call(&human(ORG_B), "check_anomalies", json!({})).await.unwrap();
     assert!(rules(&o).contains(&"approval_queue_age".to_string()), "{o}");
+}
+
+/// Seed a task and one approved approval about it in each organization:
+/// the default one resolved by `operator`, organization B's by `B_AGENT`.
+/// Returns the task id and the two approval ids (default, B).
+fn seed_task_approvals(h: &H) -> (i64, i64, i64) {
+    let fresh = now();
+    h.hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO tasks (title, created_at, updated_at) VALUES ('shared task', ?1, ?1)",
+                [&fresh],
+            )?;
+            let task = tx.last_insert_rowid();
+            let payload = approvals::canonical_payload(&json!({ "task_id": task }));
+            let mut ids = Vec::new();
+            for (org, resolver) in [(DEFAULT_ORG, "operator"), (ORG_B, B_AGENT)] {
+                tx.execute(
+                    "INSERT INTO approvals (org_id, tool, payload, requested_by, status, resolved_by, created_at, \
+                     updated_at, resolved_at) VALUES (?1, 'merge', ?2, ?3, 'approved', ?4, ?5, ?5, ?5)",
+                    rusqlite::params![org, payload, AGENT, resolver, fresh],
+                )?;
+                ids.push(tx.last_insert_rowid());
+            }
+            Ok((task, ids[0], ids[1]))
+        })
+        .unwrap()
+}
+
+/// The session packet's approvals for a task are the reader's
+/// organization's only, though both organizations' payloads name the task.
+#[tokio::test]
+async fn the_session_packet_shows_only_the_readers_approvals() {
+    let h = H::new();
+    let (task, a, _) = seed_task_approvals(&h);
+    let ids = |p: &Value| -> Vec<i64> {
+        p["approvals"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{p}"))
+            .iter()
+            .map(|x| x["id"].as_i64().unwrap())
+            .collect()
+    };
+    let p = h.call(&agent(DEFAULT_ORG), "session_packet", json!({ "task_id": task })).await.unwrap();
+    assert_eq!(ids(&p), [a], "{p}");
+    assert!(!p.to_string().contains(B_AGENT), "{p}");
+}
+
+/// The evidence report's approvals, and the human it attributes a task to
+/// (an approval's resolver), come from the reader's organization only.
+#[tokio::test]
+async fn the_evidence_report_shows_only_the_readers_approvals() {
+    let h = H::new();
+    let (task, a, _) = seed_task_approvals(&h);
+    let r = h.call(&agent(DEFAULT_ORG), "evidence_report", json!({ "task_id": task })).await.unwrap();
+    let record = &r["records"][0];
+    let ids: Vec<i64> = record["action"]["approvals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{r}"))
+        .iter()
+        .map(|x| x["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [a], "{r}");
+    assert_eq!(record["human"], "operator", "{r}");
+    assert!(!r.to_string().contains(B_AGENT), "{r}");
 }
 
 /// The stale-pass check (a live pass for the same subject bound to other

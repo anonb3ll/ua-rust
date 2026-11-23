@@ -236,7 +236,10 @@ The event names what was refused without carrying it: `tool`,
 values), `approval_status`, `expired_at`, `detail` and `via`. It never
 holds payload content. Every event is still written to the default
 organization's ledger (`ORG-EVENT-DEFAULT`); when the approval belongs to
-another organization, `requested_by` is `null` there.
+another organization, `requested_by` is `null` there and the event's
+`originator` is `system`, never the requester's label. The same holds for
+the `requested`, `resolved` and `consumed` events: another organization's
+requester or resolver label is in neither the payload nor the originator.
 
 ## The approval queue and organizations
 

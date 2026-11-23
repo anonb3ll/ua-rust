@@ -733,7 +733,26 @@ enum Acquire {
 
 /// Execute (or continue) a run as `caller` until it finishes, fails, is
 /// denied or waits on an approval.
+/// Refuse to run a step of a run in organization `run_org` as a caller of
+/// another organization. A gated step's approval payload binds the run's
+/// organization, but [`approvals::gate`] parks and matches in the caller's,
+/// so a mismatch would check one organization and park in another. This
+/// fails closed rather than rebuilding the caller in the run's organization:
+/// a caller is only ever built by the resolver, and `org_guard` forbids
+/// assigning another organization to one here.
+pub(crate) fn require_caller_in_run_org(caller: &Caller, run_org: &str) -> UaResult<()> {
+    if caller.org_id == run_org {
+        return Ok(());
+    }
+    Err(UaError::internal(format!(
+        "workflow run is in organization {run_org:?} but its caller is in {:?}; refusing to run it",
+        caller.org_id
+    )))
+}
+
 pub(crate) async fn execute(hub: &Hub, caller: &Caller, run: &RunRow, def: &Definition) -> UaResult<Report> {
+    // Before the lease: a refused run is left exactly as it was.
+    require_caller_in_run_org(caller, &run.org_id)?;
     let token = new_run_id();
     let (rid, tok, org) = (run.run_id.clone(), token.clone(), run.org_id.clone());
     let acquired = hub
@@ -835,6 +854,12 @@ async fn run_one(hub: &Hub, caller: &Caller, run: &RunRow, step: &StepDef, scope
         Err(e) => return (Outcome::Failed(e.to_string()), 0),
     };
     if let Some(gate) = &step.gate {
+        // `execute` refused a caller outside the run's organization; check
+        // again where it matters, so the approval below is parked in the
+        // organization its payload binds.
+        if let Err(e) = require_caller_in_run_org(caller, &run.org_id) {
+            return (Outcome::Failed(e.to_string()), 0);
+        }
         // The payload binds the run's organization, so a pass is never
         // consumed across organizations.
         let payload = json!({
@@ -1133,5 +1158,80 @@ mod tests {
         assert!(parse_definition("x", roles).unwrap_err().to_string().contains("role workflow"));
         let mismatch = "name: other\nsteps:\n  - name: a\n    tool: task_list\n";
         assert!(parse_definition("x", mismatch).is_err());
+    }
+
+    /// Review finding: a gated step bound the run's organization in its
+    /// approval payload but parked the approval in the caller's. A run whose
+    /// organization differs from its caller's is now refused before any
+    /// step runs, so no approval is parked in either queue.
+    #[tokio::test]
+    async fn a_run_outside_its_callers_organization_never_parks_an_approval() {
+        use ua_core::{ActorKind, Profile, identity::Transport};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("workflows")).unwrap();
+        std::fs::write(
+            dir.path().join("workflows").join("vet.yaml"),
+            "steps:\n  - name: vet\n    tool: run_cmd_check\n    args: { command: \"echo hi\" }\n",
+        )
+        .unwrap();
+        let hub = Hub::in_memory(Config::for_home(dir.path())).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                     ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let caller = Caller {
+            label: "builder-1".into(),
+            kind: ActorKind::Agent,
+            profile: Profile::Developer,
+            enforce_profile: true,
+            session_key: None,
+            transport: Transport::Internal,
+            org_id: ua_core::DEFAULT_ORG.into(),
+        };
+        let count =
+            |sql: &'static str| hub.db().read(move |c| Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))?));
+
+        // A gated run recorded in organization B, executed by a default
+        // organization caller: refused, and nothing parked or changed.
+        let def = Definition {
+            name: "gated".into(),
+            description: None,
+            inputs: vec![],
+            steps: vec![StepDef::local("hold", json!({})).gated("merge")],
+        };
+        let run_id = new_run_id();
+        create_run(&hub, &caller, "org-b", &run_id, "workflow", &def, &Map::new(), None).await.unwrap();
+        let rid = run_id.clone();
+        let run = hub.db().read(move |c| load_run(c, "org-b", &rid)).unwrap().unwrap();
+        let before = hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT status FROM workflow_runs", [], |r| r.get::<_, String>(0))?))
+            .unwrap();
+        let e = execute(&hub, &caller, &run, &def).await.unwrap_err();
+        assert!(e.to_string().contains("refusing to run it"), "{e}");
+        assert_eq!(count("SELECT COUNT(*) FROM approvals").unwrap(), 0);
+        let after = hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT status FROM workflow_runs", [], |r| r.get::<_, String>(0))?))
+            .unwrap();
+        assert_eq!(before, after);
+
+        // The step itself refuses too, should a future path skip `execute`.
+        let scope = json!({ "inputs": {}, "steps": {} });
+        let (outcome, _) = run_one(&hub, &caller, &run, &def.steps[0], &scope).await;
+        let Outcome::Failed(m) = outcome else { panic!("the step should fail") };
+        assert!(m.contains("refusing to run it"), "{m}");
+        assert_eq!(count("SELECT COUNT(*) FROM approvals").unwrap(), 0);
+
+        // Starting a run for organization B as a default caller records nothing.
+        let e = super::super::run_as(&hub, &caller, "org-b", "vet", Map::new()).await.unwrap_err();
+        assert!(e.to_string().contains("refusing to run it"), "{e}");
+        assert_eq!(count("SELECT COUNT(*) FROM workflow_runs").unwrap(), 1);
     }
 }

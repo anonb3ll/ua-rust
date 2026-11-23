@@ -107,6 +107,19 @@ fn ledger_label(org: &str, label: &str) -> Value {
     if org == ua_core::DEFAULT_ORG { json!(label) } else { Value::Null }
 }
 
+/// The `originator` of an approval event for organization `org`. The
+/// column sits beside the payload in the default organization's ledger
+/// (`ORG-EVENT-DEFAULT`), so the rule of [`ledger_label`] applies to it too:
+/// another organization's requester or resolver label is never recorded
+/// there, and the event is attributed to [`NEUTRAL_ORIGINATOR`] instead.
+pub(crate) fn ledger_originator(org: &str, label: &str) -> String {
+    if org == ua_core::DEFAULT_ORG { label.to_string() } else { NEUTRAL_ORIGINATOR.to_string() }
+}
+
+/// The originator recorded for another organization's approval events: the
+/// label the hub's own system events (Slack, agent registry) already use.
+pub const NEUTRAL_ORIGINATOR: &str = "system";
+
 /// The caller's transport as stored and ledgered (`"slack"`, `"ui"`, ...).
 pub(crate) fn transport_name(caller: &Caller) -> String {
     serde_json::to_value(caller.transport)
@@ -340,9 +353,10 @@ pub fn refused(
     dedupe: Option<String>,
 ) -> UaResult<()> {
     // ORG-EVENT-DEFAULT: use `org` once org_guard allows it. Until then
-    // another organization's requester label is `null` in the payload.
+    // another organization's requester label is `null` in the payload and
+    // absent from the originator.
     let mut input = EventInput::new(ua_core::DEFAULT_ORG, REFUSED, r.payload(org, requested_by))
-        .by(requested_by.to_string());
+        .by(ledger_originator(org, requested_by));
     if let Some(k) = dedupe {
         input = input.dedupe(k);
     }
@@ -509,10 +523,12 @@ pub fn gate_via(
         if let Some(v) = via {
             event["via"] = json!(v);
         }
-        // ORG-EVENT-DEFAULT: ids, the tool and a hash only.
+        // ORG-EVENT-DEFAULT: ids, the tool and a hash only; another
+        // organization's requester is not the originator either.
         ledger::append(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.consumed", event).by(caller.label.clone()),
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.consumed", event)
+                .by(ledger_originator(org, &caller.label)),
         )?;
         return Ok(GateOutcome::Pass { approval_id: id });
     }
@@ -577,10 +593,12 @@ fn park(
     if let Some(v) = via {
         event["via"] = json!(v);
     }
-    // ORG-EVENT-DEFAULT: another organization's requester label is `null`.
+    // ORG-EVENT-DEFAULT: another organization's requester label is `null`
+    // in the payload and absent from the originator.
     ledger::append(
         tx,
-        EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.requested", event).by(caller.label.clone()),
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.requested", event)
+            .by(ledger_originator(org, &caller.label)),
     )?;
     Ok(approval_id)
 }
@@ -940,10 +958,12 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             // The expiry under the TTL configured when the human approved.
             event["expires_at"] = json!(pass_expires_at(&cfg, Some(&now)));
         }
-        // ORG-EVENT-DEFAULT: another organization's resolver label is `null`.
+        // ORG-EVENT-DEFAULT: another organization's resolver label is `null`
+        // in the payload and absent from the originator.
         ledger::append(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.resolved", event).by(caller.label.clone()),
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.resolved", event)
+                .by(ledger_originator(&row.org_id, &caller.label)),
         )?;
         Ok(json!({ "ok": true, "approval": get(tx, &row.org_id, row.id)? }))
     })
