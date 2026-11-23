@@ -35,13 +35,14 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (50 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (46 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
   `notify_outbox`, `pending_notifications`, `zulip_sends`,
   `harness_config_bundles`, `harness_config_proposals`,
-  `harness_config_drift`, `harness_config_report_window`, `plans`,
+  `harness_config_drift`, `harness_config_report_window`, `routines`,
+  `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `plans`,
   `plan_steps` and `plan_checkpoints` having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
@@ -231,6 +232,36 @@ here for memory columns, owners and defaults.
   no `org_id` yet; it must take the node's organization when nodes gain one.
   The `agent.harness_config` events are `ORG-EVENT-DEFAULT` sites. The
   importer writes legacy bundles to `default`.
+- The routine and workflow-run tables: `organization.v1.tools.routines`
+  gives `routines` and `routine_runs` their `org_id` and triggers, and
+  `routines.v2.org_indexes` adds indexes led by `org_id` and the
+  `routine_runs_same_org` triggers (a receipt is in its routine's
+  organization); `organization.v1.tools.workflows` and
+  `workflows.v2.org_indexes` do the same for `workflow_runs` and
+  `workflow_checkpoints` (a checkpoint is in its run's organization). No
+  rebuild: `routines` is keyed by an AUTOINCREMENT id, a run by a ULID the
+  hub generates, and the unique pairs `(routine_id, fire_key)` and
+  `(run_id, seq)` are led by those hub-global ids. Every routine, workflow and
+  LangGraph tool, and the workflow rows of `run_list` and `run_get`, read and
+  write only the caller's organization's rows; another organization's
+  routine or run answers as a missing one, and an organization `orgs` does
+  not hold is refused before any write. The scheduler (`tick`) and the
+  startup reconciliation have no caller: each fire takes its routine's
+  organization, and a routine's workflow run is recorded in it. A routine's
+  workflow runs as its owner, and that caller can only be built in the
+  default organization until the resolver binds others (`org_guard`), so a
+  fire outside it never runs its workflow (reconciliation marks one `not_run`).
+  Tasks carry no organization (`ORG-TASK-DEFAULT`): a fire of a routine
+  outside the task organization creates no task and is recorded as `skipped`
+  (`org_tasks_unavailable`), and the LangGraph tools see the task
+  organization's tasks only. A gated step's approval payload binds `org_id`.
+  `routine_runs` and `workflow_runs` point at tasks (`task_id`), but neither
+  is keyed by a task id nor part of the task workflow, so they convert here,
+  not with `tasks`. The routine and workflow events are `ORG-EVENT-DEFAULT`
+  sites; another organization's client-chosen fire key reaches the ledger
+  only as a SHA-256 digest. The importer copies none of these tables.
+  `crates/ua-tools/tests/routines_tenant.rs` holds the upgrade and the
+  isolation tests.
 - The plans tables: `organization.v1.tools.plans` gives `plans`,
   `plan_steps` and `plan_checkpoints` their `org_id` and triggers, and
   `plans.v2.org_scope` adds an index led by `org_id` for the plan list and
@@ -846,6 +877,7 @@ global key in the tree is classified:
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
 | `project_repo_bindings.project` | **Rebuild** | Key becomes `(org_id, project)`, rebuilt in the standalone procedure `governance.v2.project_bindings_tenant_keys`. |
 | `notify_outbox`, `pending_notifications`, `zulip_sends` | No key | AUTOINCREMENT ids only, so no rebuild (`organization.v1.tools.notify`, `organization.v1.tools.zulip`). The digest category count and the Zulip duplicate check (`stream, topic, content_sha256`) are query keys and filter on `org_id`. |
+| `routine_runs UNIQUE(routine_id, fire_key)`, `workflow_runs.run_id`, `workflow_checkpoints UNIQUE(run_id, seq)` | Global, safe | Led by a hub-global id (a routine's AUTOINCREMENT id, a hub-generated ULID run id), never client text alone, so two organizations cannot collide; no rebuild (`organization.v1.tools.routines`, `organization.v1.tools.workflows`). The child tables carry a same-organization trigger against their parent. |
 | `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
@@ -1370,7 +1402,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines`, `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |

@@ -158,9 +158,12 @@ const TENANT: &[&str] = &[
 /// (`governance.v2.project_bindings_tenant_keys`,
 /// `organization.v1.tools.project_bindings`), `notify_outbox` and
 /// `pending_notifications` (`organization.v1.tools.notify`), `zulip_sends`
-/// (`organization.v1.tools.zulip`), and the four harness config tables
+/// (`organization.v1.tools.zulip`), the four harness config tables
 /// (`harness_config.v3.tenant_keys`, `organization.v1.tools.harness_config`),
-/// and the three plans tables (`organization.v1.tools.plans`).
+/// `routines` and `routine_runs` (`organization.v1.tools.routines`),
+/// `workflow_runs` and `workflow_checkpoints`
+/// (`organization.v1.tools.workflows`), and the three plans tables
+/// (`organization.v1.tools.plans`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -191,8 +194,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "policy_authorizations",
     "relay_messages",
     "review_ready_notices",
-    "routine_runs",
-    "routines",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",
@@ -210,8 +211,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "tool_calls",
     "work_proposal_items",
     "work_proposals",
-    "workflow_checkpoints",
-    "workflow_runs",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];

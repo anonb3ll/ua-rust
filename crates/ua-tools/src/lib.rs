@@ -75,6 +75,13 @@ pub fn schema_parts() -> Vec<Part> {
     // The organization key rebuild and triggers of the harness config tables.
     parts.push(families::harness_config::TENANT_KEYS.into());
     parts.push(families::harness_config::TENANT_PART.into());
+    // The organization column, triggers, indexes and same-organization rules
+    // of the routine and workflow-run tables (no key rebuild: their keys are
+    // AUTOINCREMENT ids and hub-generated run ids).
+    parts.push(families::routines::TENANT_PART.into());
+    parts.push(families::routines::ORG_SCHEMA.into());
+    parts.push(families::workflows::TENANT_PART.into());
+    parts.push(families::workflows::ORG_SCHEMA.into());
     // The organization column and triggers of the plans tables (no key
     // rebuild: a plan id is hub-generated, and the step and checkpoint keys
     // hang off it), then the organization-led index and same-organization
