@@ -242,8 +242,8 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         Some(t) => query_rows(
             conn,
             "SELECT id, from_agent, to_agent, status, task_spec, created_at FROM delegations \
-             WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
-            params![t, DELEGATION_LIMIT as i64],
+             WHERE org_id = ?3 AND task_id = ?1 ORDER BY id DESC LIMIT ?2",
+            params![t, DELEGATION_LIMIT as i64, ctx.caller.org_id],
             |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?, "from_agent": r.get::<_, String>(1)?,

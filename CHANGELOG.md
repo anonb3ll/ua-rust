@@ -431,6 +431,26 @@ from its commit history.
   Replies keep their shape. The importer writes legacy workflow records,
   checks, holds and members to `default`. Results and events in the default
   organization are unchanged.
+- Delegations are organization-scoped: `organization.v1.tools.delegation`
+  adds `org_id` and the organization triggers to `delegations`, and
+  `delegation.v2.org_scope` moves each existing delegation to its task's
+  organization, adds indexes led by `org_id` and the
+  `delegations_org_parent` triggers that keep a delegation's task in its own
+  organization. No key rebuild: a delegation id is a hub-global
+  AUTOINCREMENT id. A delegation and its task are created together in the
+  delegator's organization. Every delegation action and legacy tool, the
+  plans UI, the evidence report, `delegation_stats`, the session packet,
+  `platform_object_get` (which read any organization's delegation before),
+  a cycle's `delegation_id` and the task queue's live-work check read and
+  write only the caller's organization's delegations; another
+  organization's delegation answers exactly as a missing one, including a
+  claim or a fenced transition, and a write for an organization `orgs` does
+  not hold is refused (`unknown_organization`) before anything changes.
+  Replies carry no `org_id`. Delegation events stay in the default
+  organization's ledger; another organization's title, project, lane,
+  agents, deadline, callback, reasons and results are `null` in them and
+  the originator is `system`. The importer writes legacy delegations to
+  `default`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -595,10 +615,20 @@ from its commit history.
   another organization's caller is refused (`org_unsupported`) by the
   proposal actions and `queue_close_merged`, and the hub's GitHub paths only
   read and close default-organization tasks (`ORG-GITHUB-DEFAULT`).
-- Delegations and policy authorizations carry no organization yet; each is
-  reached only through its task's organization, so another organization's
-  delegation or authorization answers as a missing one.
-  Delegation to another organization's agent is still allowed.
+- Policy authorizations carry no organization yet; each is reached only
+  through its task's organization, so another organization's authorization
+  answers as a missing one. Delegation to another organization's agent is
+  still allowed; that agent can never claim it.
+- `observability_manage`'s `delegation_stats` counts only the caller's
+  organization's delegations (it counted every organization's).
+- A `delegate` idempotency key stores its delegating agent's label with
+  `%`, `:` and `/` percent-escaped, as `task_update` keys do, so two agents
+  never share a stored key. Only a label holding `:` changes its stored
+  form; a retry or `lookup` from such a label still finds a receipt stored
+  under the old unescaped form, but only when it is the caller's (its
+  request digest, or its delegation's `from_agent`, names the caller), so a
+  retry across the upgrade creates no second delegation and never replays
+  another agent's receipt.
 - `cleanup_stale_worktrees` judges a worktree only against the caller's
   organization's tasks and skips (`other_organization`) a worktree of
   another organization's task.

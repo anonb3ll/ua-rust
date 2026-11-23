@@ -446,8 +446,7 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
             if let Some(d) = delegation_id
                 && tx
                     .query_row(
-                        "SELECT 1 FROM delegations d JOIN tasks t ON t.id = d.task_id AND t.org_id = ?1 \
-                         WHERE d.id = ?2",
+                        "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2",
                         params![org, d],
                         |_| Ok(()),
                     )

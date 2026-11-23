@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
-use ua_store::{SchemaPart, WriteTx};
+use ua_store::{Procedure, SchemaPart, WriteTx};
 
-use super::plans::{emit, parse_params, row_map, write_identity};
+use super::plans::{emit, ledger_label, ledger_text, parse_params, row_map, write_identity};
 use crate::approvals;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -53,6 +53,46 @@ CREATE TABLE IF NOT EXISTS delegations (
 CREATE INDEX IF NOT EXISTS idx_delegations_task ON delegations(task_id);
 CREATE INDEX IF NOT EXISTS idx_delegations_to_agent ON delegations(to_agent, status);
 CREATE INDEX IF NOT EXISTS idx_delegations_status ON delegations(status, created_at);
+",
+};
+
+/// `organization.v1.tools.delegation`: `org_id` on `delegations` (existing
+/// rows take the default organization; [`ORG_SCOPE`] then moves each to its
+/// task's) and the generated `delegations_org_exists` /
+/// `delegations_org_immutable` triggers. No key rebuild: a delegation id is a
+/// hub-global AUTOINCREMENT id and no other key exists. Applied after the
+/// tasks parts (`tasks.v2.org_scope`).
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.delegation", &["delegations"]);
+
+/// `delegation.v2.org_scope`: each existing delegation moves to its task's
+/// organization (the generated immutability trigger is dropped for that one
+/// update and recreated exactly as [`TENANT_PART`] made it; a delegation whose
+/// task is gone stays the default organization's), then indexes led by
+/// `org_id` for the assignee queue, the status list and the stats window, and
+/// triggers that keep a delegation's `task_id` inside its own organization
+/// (the foreign key alone would accept another organization's task). A
+/// missing task is still the foreign key's error.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "delegation.v2.org_scope",
+    sql: "
+DROP TRIGGER IF EXISTS delegations_org_immutable;
+UPDATE delegations SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = delegations.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id AND t.org_id IS NOT delegations.org_id);
+CREATE TRIGGER delegations_org_immutable BEFORE UPDATE OF org_id ON delegations \
+WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id \
+BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;
+
+CREATE INDEX IF NOT EXISTS idx_delegations_org_to_agent ON delegations(org_id, to_agent, status);
+CREATE INDEX IF NOT EXISTS idx_delegations_org_status ON delegations(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_delegations_org_created ON delegations(org_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS delegations_org_parent BEFORE INSERT ON delegations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS delegations_org_parent_update BEFORE UPDATE OF task_id ON delegations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
 ",
 };
 
@@ -165,68 +205,66 @@ fn derive_title(task_spec: &str) -> String {
     if t.is_empty() { "untitled delegation".into() } else { t }
 }
 
-/// A delegation's organization, as a SQL condition with one bare `?` (the
-/// organization): its task's. `delegations` carries no `org_id` yet (a later
-/// change), and every delegation creates its task in the same transaction,
-/// so a delegation is reached only through its task's organization. One
-/// whose task was deleted stays the default organization's, as every
-/// delegation was before.
-const DELEGATION_ORG: &str =
-    "COALESCE((SELECT t.org_id FROM tasks t WHERE t.id = delegations.task_id), 'default') = ?";
+/// A delegation row as a reply: the row without its `org_id` (replies keep
+/// their shape, owner decision (d)).
+fn delegation_reply(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Map<String, Value>> {
+    let mut m = row_map(r)?;
+    m.remove("org_id");
+    Ok(m)
+}
 
-/// Delegation `id` of organization `org`; another organization's answers as
-/// a missing one.
+/// Delegation `id` of organization `org`; another organization's answers
+/// exactly as a missing one.
 fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
-    c.query_row(
-        &format!("SELECT * FROM delegations WHERE id = ? AND {DELEGATION_ORG}"),
-        params![id, org],
-        |r| row_map(r).map(Value::Object),
-    )
+    c.query_row("SELECT * FROM delegations WHERE org_id = ?1 AND id = ?2", params![org, id], |r| {
+        delegation_reply(r).map(Value::Object)
+    })
     .optional()?
     .ok_or_else(|| UaError::not_found(format!("no delegation with id {id}")))
 }
 
-/// The stored idempotency key of a delegation. `idempotency_keys` is still
-/// hub-wide, so another organization's key carries its organization and
-/// never replays the default organization's receipt; the default keeps its
-/// form.
+/// The stored idempotency key of a delegation: per delegating agent, with
+/// `%`, `:` and `/` in its label percent-escaped (as `task_update`'s keys are),
+/// so the label ends at the first `:` after the tool name and two agents
+/// never share a stored key. `idempotency_keys` is still hub-wide, so another
+/// organization's key is prefixed with its organization
+/// (`crate::families::tasks::idem_key`) and never replays the default
+/// organization's receipt, or a third's; the default keeps the
+/// `delegate:<label>:<key>` form. Only a label holding `:` is stored
+/// differently from before; [`legacy_receipt_key`] names its old form.
 fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
-    if org == ua_core::DEFAULT_ORG {
-        format!("delegate:{from_agent}:{key}")
-    } else {
-        format!("org:{org}/delegate:{from_agent}:{key}")
-    }
+    crate::families::tasks::idem_key(org, "delegate", &format!("{}:{key}", escape_label(from_agent)))
 }
 
-/// A delegation event about a delegation of organization `org`.
-/// ORG-EVENT-DEFAULT: another organization's labels, title, project, reason
-/// and result text are `null` in the default ledger, and the originator is
-/// the neutral `system`; ids, statuses and generations remain.
+fn escape_label(label: &str) -> String {
+    label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
+}
+
+/// The key a receipt was stored under before labels were escaped, when that
+/// differs from [`receipt_key`] (a label holding `:`). That form is ambiguous
+/// (`a:b` with key `k` and `a` with key `b:k` share it), so a receipt found
+/// there counts only once it is shown to be this agent's: by the request
+/// digest, which covers `from_agent`, or by its delegation's `from_agent`.
+fn legacy_receipt_key(org: &str, from_agent: &str, key: &str) -> Option<String> {
+    (escape_label(from_agent) != from_agent)
+        .then(|| crate::families::tasks::idem_key(org, "delegate", &format!("{from_agent}:{key}")))
+}
+
+/// A delegation event about a delegation of organization `org`, through the
+/// shared [`emit`]. ORG-EVENT-DEFAULT: callers pass another organization's
+/// free text and labels (title, project, lane, agents, reasons, results,
+/// deadline, callback) through [`ledger_text`] / [`ledger_label`], so only
+/// ids, statuses and generations reach the default ledger, and the
+/// originator is the neutral `system`, never the acting agent.
 fn org_emit(
     tx: &mut WriteTx<'_>,
     org: &str,
     caller: &ua_core::Caller,
     channel: &str,
-    mut payload: Value,
+    payload: Value,
 ) -> UaResult<()> {
     if org == ua_core::DEFAULT_ORG {
         return emit(tx, caller, channel, payload);
-    }
-    for key in [
-        "title",
-        "project",
-        "lane",
-        "from_agent",
-        "to_agent",
-        "agent",
-        "reason",
-        "result",
-        "callback",
-        "deadline",
-    ] {
-        if let Some(v) = payload.get_mut(key) {
-            *v = Value::Null;
-        }
     }
     let neutral = ua_core::Caller { label: "system".into(), ..ua_core::Caller::system() };
     emit(tx, &neutral, channel, payload)
@@ -257,6 +295,24 @@ fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Va
         }
         None => Ok(None),
     }
+}
+
+/// The committed result of this request, if any: its receipt under the
+/// current key (a different request there is a conflict), else under the old
+/// unescaped key when its digest is this request's. The digest covers
+/// `from_agent`, so the old key never replays another agent's receipt; any
+/// other receipt there reads as none, and the request runs fresh.
+fn find_receipt(c: &Connection, keys: &(String, Option<String>), digest: &str) -> UaResult<Option<Value>> {
+    if let Some(done) = replay(read_receipt(c, &keys.0)?, digest)? {
+        return Ok(Some(done));
+    }
+    if let Some(old) = &keys.1
+        && let Some((d, result)) = read_receipt(c, old)?
+        && d == digest
+    {
+        return Ok(Some(result));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,12 +547,15 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     });
     let digest = hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()));
     let org = ctx.caller.org_id.clone();
-    let rkey = idem.as_deref().map(|k| receipt_key(&org, &from_agent, k));
+    let rkeys = idem
+        .as_deref()
+        .map(|k| (receipt_key(&org, &from_agent, k), legacy_receipt_key(&org, &from_agent, k)));
+    let rkey = rkeys.as_ref().map(|k| k.0.clone());
 
     // A committed retry replays before any gate: no second approval, no effect.
-    if let Some(k) = rkey.clone() {
-        let existing = ctx.hub.db().read(|c| read_receipt(c, &k))?;
-        if let Some(done) = replay(existing, &digest)? {
+    if let Some(k) = rkeys.clone() {
+        let found = ctx.hub.db().read(|c| find_receipt(c, &k, &digest))?;
+        if let Some(done) = found {
             return Ok(done);
         }
     }
@@ -504,8 +563,8 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
-        if let Some(k) = rkey.as_deref()
-            && let Some(done) = replay(read_receipt(tx, k)?, &digest)?
+        if let Some(k) = rkeys.as_ref()
+            && let Some(done) = find_receipt(tx, k, &digest)?
         {
             return Ok(done);
         }
@@ -545,10 +604,11 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             ],
         )?;
         let task_id = tx.last_insert_rowid();
+        // The delegation and its task are both the caller's organization's.
         tx.execute(
-            "INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, deadline, callback, status, \
-             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
-            params![from_agent, to_agent, task_id, task_spec, deadline, callback, ts],
+            "INSERT INTO delegations (org_id, from_agent, to_agent, task_id, task_spec, deadline, callback, \
+             status, created_at, updated_at) VALUES (?8, ?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+            params![from_agent, to_agent, task_id, task_spec, deadline, callback, ts, org],
         )?;
         let delegation_id = tx.last_insert_rowid();
         org_emit(
@@ -556,7 +616,13 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             &org,
             &caller,
             "agent.task.created",
-            json!({ "task_id": task_id, "title": title, "project": project, "lane": to_agent, "via": "delegate" }),
+            json!({
+                "task_id": task_id,
+                "title": ledger_text(&org, &title),
+                "project": ledger_text(&org, &project),
+                "lane": ledger_text(&org, &to_agent),
+                "via": "delegate",
+            }),
         )?;
         org_emit(
             tx,
@@ -566,10 +632,10 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             json!({
                 "delegation_id": delegation_id,
                 "task_id": task_id,
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-                "deadline": deadline,
-                "callback": callback,
+                "from_agent": ledger_text(&org, &from_agent),
+                "to_agent": ledger_text(&org, &to_agent),
+                "deadline": ledger_label(&org, deadline.as_deref()),
+                "callback": ledger_text(&org, &callback),
             }),
         )?;
         let mut result = json!({ "delegation_id": delegation_id, "task_id": task_id, "memory_id": null });
@@ -589,8 +655,28 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let actor = validate_label(&write_identity(&ctx.caller, a.from_agent.as_deref())?, "from_agent")?;
     let key = validate_idempotency_key(&a.idempotency_key)?;
-    let rkey = receipt_key(&ctx.caller.org_id, &actor, &key);
-    let found = ctx.hub.db().read(|c| read_receipt(c, &rkey))?;
+    let org = ctx.caller.org_id.clone();
+    let rkey = receipt_key(&org, &actor, &key);
+    let old = legacy_receipt_key(&org, &actor, &key);
+    let found = ctx.hub.db().read(|c| {
+        if let Some(hit) = read_receipt(c, &rkey)? {
+            return Ok(Some(hit));
+        }
+        // A receipt under the old unescaped key counts only when its
+        // delegation is this agent's: that key is shared with another label.
+        let Some(old) = old else { return Ok(None) };
+        let Some((d, result)) = read_receipt(c, &old)? else { return Ok(None) };
+        let Some(id) = result["delegation_id"].as_i64() else { return Ok(None) };
+        let mine = c
+            .query_row(
+                "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2 AND from_agent = ?3",
+                params![org, id, actor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(mine.then_some((d, result)))
+    })?;
     Ok(match found {
         Some((_, result)) => json!({ "idempotency_key": key, "state": "committed", "result": result }),
         None => json!({ "idempotency_key": key, "state": "not_found" }),
@@ -614,15 +700,14 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
     let now = jiff::Timestamp::now();
     let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
-        // Only delegations whose task is the caller's organization's.
+        // Only the caller's organization's delegations.
         let mut stmt = c.prepare(
-            "SELECT * FROM delegations WHERE COALESCE((SELECT t.org_id FROM tasks t \
-             WHERE t.id = delegations.task_id), 'default') = ?5 \
+            "SELECT * FROM delegations WHERE org_id = ?5 \
              AND (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR to_agent = ?2) \
              AND (?3 IS NULL OR task_id = ?3) ORDER BY created_at DESC, id DESC LIMIT ?4",
         )?;
         let rows: Vec<_> = stmt
-            .query_map(params![status, a.to_agent, a.task_id, limit + 1, org], row_map)?
+            .query_map(params![status, a.to_agent, a.task_id, limit + 1, org], delegation_reply)?
             .collect::<Result<_, _>>()?;
         let truncated = rows.len() as i64 > limit;
         let out: Vec<Value> = rows
@@ -670,8 +755,10 @@ fn run_guard(
     if run.trim().is_empty() || run.len() > 256 {
         return Err(UaError::invalid("expected_run_id must be a nonempty bounded string"));
     }
-    let mut sql =
-        String::from(" AND to_agent = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id");
+    let mut sql = String::from(
+        " AND to_agent = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
+             AND t.org_id = delegations.org_id",
+    );
     let mut p = vec![SqlValue::Text(agent.into())];
     if let Some(t) = task_id {
         sql.push_str(" AND t.id = ?");
@@ -704,8 +791,9 @@ fn transition(
 ) -> UaResult<bool> {
     let caller = ctx.caller.clone();
     let org = caller.org_id.clone();
-    // Only a delegation of the caller's organization moves.
-    let sql = format!("{sql} AND {DELEGATION_ORG}");
+    // Only a delegation of the caller's organization moves; another
+    // organization's changes nothing and answers as a missing one would.
+    let sql = format!("{sql} AND org_id = ?");
     let mut params = params;
     params.push(SqlValue::Text(org.clone()));
     ctx.hub.db().write(move |tx: &mut WriteTx<'_>| {
@@ -736,12 +824,9 @@ fn claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         crate::families::tasks::require_org(tx, &org)?;
         let ts = ua_core::time::now();
         let n = tx.execute(
-            &format!(
-                "UPDATE delegations SET status = 'in_flight', attempts = attempts + 1, \
-                 claim_generation = claim_generation + 1, last_attempt_at = ?3, updated_at = ?3 \
-                 WHERE id = ?1 AND status = 'pending' AND to_agent = ?2 AND {}",
-                DELEGATION_ORG.replace('?', "?4")
-            ),
+            "UPDATE delegations SET status = 'in_flight', attempts = attempts + 1, \
+             claim_generation = claim_generation + 1, last_attempt_at = ?3, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'pending' AND to_agent = ?2 AND org_id = ?4",
             params![a.id, agent, ts, org],
         )?;
         // Read inside the same transaction so a later release and reclaim
@@ -756,7 +841,7 @@ fn claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 json!({
                     "delegation_id": a.id,
                     "task_id": row["task_id"],
-                    "agent": agent,
+                    "agent": ledger_text(&org, &agent),
                     "claim_generation": row["claim_generation"],
                 }),
             )?;
@@ -788,7 +873,14 @@ fn release(ctx: &ToolCtx, a: FencedArgs) -> UaResult<Value> {
         SqlValue::Integer(generation),
     ];
     p.extend(gp);
-    let changed = transition(ctx, a.id, sql, p, "agent.delegation.released", json!({ "agent": agent }))?;
+    let changed = transition(
+        ctx,
+        a.id,
+        sql,
+        p,
+        "agent.delegation.released",
+        json!({ "agent": ledger_text(&ctx.caller.org_id, &agent) }),
+    )?;
     Ok(transition_result("released", changed, a.expected_run_id.as_deref()))
 }
 
@@ -827,13 +919,14 @@ fn cancel(ctx: &ToolCtx, a: CancelArgs) -> UaResult<Value> {
         // cancelled or superseded, never after a newer attempt took over.
         sql.push_str(
             " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
-             AND (t.current_run_id IS NOT ? OR t.cancel_requested = 1))",
+             AND t.org_id = delegations.org_id AND (t.current_run_id IS NOT ? OR t.cancel_requested = 1))",
         );
         p.push(SqlValue::Text(run.into()));
     }
     if a.require_no_run {
         sql.push_str(
-            " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id AND t.current_run_id IS NULL)",
+            " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
+             AND t.org_id = delegations.org_id AND t.current_run_id IS NULL)",
         );
     }
     let changed = transition(
@@ -842,7 +935,10 @@ fn cancel(ctx: &ToolCtx, a: CancelArgs) -> UaResult<Value> {
         sql,
         p,
         "agent.delegation.cancelled",
-        json!({ "agent": agent, "reason": reason }),
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "reason": ledger_text(&ctx.caller.org_id, &reason),
+        }),
     )?;
     Ok(json!({ "cancelled": changed }))
 }
@@ -880,7 +976,17 @@ fn finish(
         g,
     ];
     p.extend(gp);
-    let changed = transition(ctx, a.id, sql, p, channel, json!({ "agent": agent, "result": text }))?;
+    let changed = transition(
+        ctx,
+        a.id,
+        sql,
+        p,
+        channel,
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "result": ledger_text(&ctx.caller.org_id, &text),
+        }),
+    )?;
     Ok(transition_result(key, changed, a.expected_run_id.as_deref()))
 }
 
@@ -938,7 +1044,10 @@ fn retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
         sql,
         p,
         "agent.delegation.retried",
-        json!({ "agent": agent, "reason": reason }),
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "reason": ledger_text(&ctx.caller.org_id, &reason),
+        }),
     )?;
     Ok(transition_result("retried", changed, a.expected_run_id.as_deref()))
 }

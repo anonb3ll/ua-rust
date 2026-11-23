@@ -101,3 +101,5 @@ organization.v1.tools.continuity
 continuity.v2.org_scope
 organization.v1.tools.holds
 governance.v3.holds_org_scope
+organization.v1.tools.delegation
+delegation.v2.org_scope

@@ -47,12 +47,15 @@ const B_MENTION: &str = "osprey-counsel";
 const B_CHECK: &str = "falcon-secret-check";
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
-/// Parts registered after this family's, which need its `org_id` columns.
-const LATER: [&str; 4] = [
+/// Parts registered after this family's, which need its `org_id` columns
+/// (the continuity, holds and delegation families').
+const LATER: [&str; 6] = [
     "organization.v1.tools.continuity",
     "continuity.v2.org_scope",
     "organization.v1.tools.holds",
     "governance.v3.holds_org_scope",
+    "organization.v1.tools.delegation",
+    "delegation.v2.org_scope",
 ];
 
 fn old_parts() -> Vec<ua_store::Part> {

@@ -446,9 +446,10 @@ fn build_report(
             grouped(
                 c,
                 "SELECT task_id AS _task, id, from_agent, to_agent, status, created_at, completed_at \
-                 FROM delegations WHERE task_id IN ({ids}) ORDER BY id",
+                 FROM delegations WHERE task_id IN ({ids}) AND org_id = ? ORDER BY id",
                 &ids,
-                &[],
+                // Only the reader's organization's delegations.
+                &[&org],
             )?,
         )
     };

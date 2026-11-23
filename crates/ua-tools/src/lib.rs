@@ -129,6 +129,12 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::continuity::ORG_SCOPE.into());
     parts.push(families::governance::HOLDS_TENANT_PART.into());
     parts.push(families::governance::HOLDS_ORG_SCOPE.into());
+    // The organization column and triggers of `delegations` (no key rebuild:
+    // its only key is an AUTOINCREMENT id), then each delegation moved to its
+    // task's organization, the organization-led indexes and the rule that a
+    // delegation's task is in its own organization.
+    parts.push(families::delegation::TENANT_PART.into());
+    parts.push(families::delegation::ORG_SCOPE.into());
     parts
 }
 

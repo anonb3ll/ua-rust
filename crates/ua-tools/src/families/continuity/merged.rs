@@ -235,7 +235,7 @@ fn assess(
         ));
         return Ok(Some(entry));
     }
-    let mut reasons = protection(conn, row, now)?;
+    let mut reasons = protection(conn, TASK_ORG, row, now)?;
     if let (Some(merged), Some(created)) = (
         pr.merged_at.as_deref().and_then(ua_core::time::parse_ts),
         str_field(row, "created_at").and_then(ua_core::time::parse_ts),
