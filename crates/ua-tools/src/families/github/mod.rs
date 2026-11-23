@@ -194,17 +194,22 @@ pub(crate) fn grant_refusal(caller: &Caller, tool: &str, args: &Value) -> Option
 
 /// Re-verify every check recorded with a CI reference in `repo` at `head`,
 /// through the governed `task_check_verify`. Returns one entry per check.
+///
+/// ORG-GITHUB-DEFAULT: a delivery runs as the hub, so only the default
+/// organization's tasks' checks are re-verified (`TASK_ORG`).
 pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &str) -> UaResult<Vec<Value>> {
     let (r, h) = (repo.to_ascii_lowercase(), head.to_ascii_lowercase());
     let rows: Vec<(i64, String)> = hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT task_id, name FROM task_checks WHERE lower(repo) = ?1 AND lower(head_sha) = ?2 \
-                 AND ref_kind = 'ci_run' ORDER BY id LIMIT ?3",
+                "SELECT k.task_id, k.name FROM task_checks k JOIN tasks t ON t.id = k.task_id AND t.org_id = ?4 \
+                 WHERE lower(k.repo) = ?1 AND lower(k.head_sha) = ?2 AND k.ref_kind = 'ci_run' ORDER BY k.id LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![r, h, REVERIFY_CAP], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map(rusqlite::params![r, h, REVERIFY_CAP, crate::families::tasks::TASK_ORG], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -237,7 +242,17 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
         out.push(entry);
     }
     let payload = json!({ "repo": repo, "head_sha": head, "source": source, "checks": out });
-    hub.db().write_async(move |tx| emit(tx, "agent.github.checks_reverified", payload, GITHUB_ACTOR)).await?;
+    hub.db()
+        .write_async(move |tx| {
+            emit(
+                tx,
+                crate::families::tasks::TASK_ORG,
+                "agent.github.checks_reverified",
+                payload,
+                GITHUB_ACTOR,
+            )
+        })
+        .await?;
     Ok(out)
 }
 

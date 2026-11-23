@@ -165,14 +165,71 @@ fn derive_title(task_spec: &str) -> String {
     if t.is_empty() { "untitled delegation".into() } else { t }
 }
 
-fn delegation_row(c: &Connection, id: i64) -> UaResult<Value> {
-    c.query_row("SELECT * FROM delegations WHERE id = ?1", [id], |r| row_map(r).map(Value::Object))
-        .optional()?
-        .ok_or_else(|| UaError::not_found(format!("no delegation with id {id}")))
+/// A delegation's organization, as a SQL condition with one bare `?` (the
+/// organization): its task's. `delegations` carries no `org_id` yet (a later
+/// change), and every delegation creates its task in the same transaction,
+/// so a delegation is reached only through its task's organization. One
+/// whose task was deleted stays the default organization's, as every
+/// delegation was before.
+const DELEGATION_ORG: &str =
+    "COALESCE((SELECT t.org_id FROM tasks t WHERE t.id = delegations.task_id), 'default') = ?";
+
+/// Delegation `id` of organization `org`; another organization's answers as
+/// a missing one.
+fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    c.query_row(
+        &format!("SELECT * FROM delegations WHERE id = ? AND {DELEGATION_ORG}"),
+        params![id, org],
+        |r| row_map(r).map(Value::Object),
+    )
+    .optional()?
+    .ok_or_else(|| UaError::not_found(format!("no delegation with id {id}")))
 }
 
-fn receipt_key(from_agent: &str, key: &str) -> String {
-    format!("delegate:{from_agent}:{key}")
+/// The stored idempotency key of a delegation. `idempotency_keys` is still
+/// hub-wide, so another organization's key carries its organization and
+/// never replays the default organization's receipt; the default keeps its
+/// form.
+fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
+    if org == ua_core::DEFAULT_ORG {
+        format!("delegate:{from_agent}:{key}")
+    } else {
+        format!("org:{org}/delegate:{from_agent}:{key}")
+    }
+}
+
+/// A delegation event about a delegation of organization `org`.
+/// ORG-EVENT-DEFAULT: another organization's labels, title, project, reason
+/// and result text are `null` in the default ledger, and the originator is
+/// the neutral `system`; ids, statuses and generations remain.
+fn org_emit(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    caller: &ua_core::Caller,
+    channel: &str,
+    mut payload: Value,
+) -> UaResult<()> {
+    if org == ua_core::DEFAULT_ORG {
+        return emit(tx, caller, channel, payload);
+    }
+    for key in [
+        "title",
+        "project",
+        "lane",
+        "from_agent",
+        "to_agent",
+        "agent",
+        "reason",
+        "result",
+        "callback",
+        "deadline",
+    ] {
+        if let Some(v) = payload.get_mut(key) {
+            *v = Value::Null;
+        }
+    }
+    let neutral = ua_core::Caller { label: "system".into(), ..ua_core::Caller::system() };
+    emit(tx, &neutral, channel, payload)
 }
 
 /// A stored receipt: (request digest, committed result).
@@ -433,7 +490,8 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         "project": project,
     });
     let digest = hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()));
-    let rkey = idem.as_deref().map(|k| receipt_key(&from_agent, k));
+    let org = ctx.caller.org_id.clone();
+    let rkey = idem.as_deref().map(|k| receipt_key(&org, &from_agent, k));
 
     // A committed retry replays before any gate: no second approval, no effect.
     if let Some(k) = rkey.clone() {
@@ -451,12 +509,15 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         {
             return Ok(done);
         }
+        crate::families::tasks::require_org(tx, &org)?;
         let ts = ua_core::time::now();
         let (parent_untrusted, parent_project) = match a.parent_task_id {
             Some(pid) => tx
-                .query_row("SELECT untrusted, project FROM tasks WHERE id = ?1", [pid], |r| {
-                    Ok((r.get::<_, i64>(0)? != 0, Some(r.get::<_, String>(1)?)))
-                })
+                .query_row(
+                    "SELECT untrusted, project FROM tasks WHERE org_id = ?1 AND id = ?2",
+                    params![org, pid],
+                    |r| Ok((r.get::<_, i64>(0)? != 0, Some(r.get::<_, String>(1)?))),
+                )
                 .optional()?
                 .ok_or_else(|| UaError::not_found(format!("no task with id {pid}")))?,
             None => (false, None),
@@ -470,8 +531,18 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         notes.push_str(&format!("\n\ntask-spec:\n{task_spec}"));
         tx.execute(
             "INSERT INTO tasks (title, notes, status, priority, parent_id, created_at, updated_at, untrusted, \
-             project, lane) VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
-            params![title, notes, priority, a.parent_task_id, ts, i64::from(parent_untrusted), project, to_agent],
+             project, lane, org_id) VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                title,
+                notes,
+                priority,
+                a.parent_task_id,
+                ts,
+                i64::from(parent_untrusted),
+                project,
+                to_agent,
+                org
+            ],
         )?;
         let task_id = tx.last_insert_rowid();
         tx.execute(
@@ -480,14 +551,16 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             params![from_agent, to_agent, task_id, task_spec, deadline, callback, ts],
         )?;
         let delegation_id = tx.last_insert_rowid();
-        emit(
+        org_emit(
             tx,
+            &org,
             &caller,
             "agent.task.created",
             json!({ "task_id": task_id, "title": title, "project": project, "lane": to_agent, "via": "delegate" }),
         )?;
-        emit(
+        org_emit(
             tx,
+            &org,
             &caller,
             "agent.delegation.created",
             json!({
@@ -516,7 +589,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let actor = validate_label(&write_identity(&ctx.caller, a.from_agent.as_deref())?, "from_agent")?;
     let key = validate_idempotency_key(&a.idempotency_key)?;
-    let rkey = receipt_key(&actor, &key);
+    let rkey = receipt_key(&ctx.caller.org_id, &actor, &key);
     let found = ctx.hub.db().read(|c| read_receipt(c, &rkey))?;
     Ok(match found {
         Some((_, result)) => json!({ "idempotency_key": key, "state": "committed", "result": result }),
@@ -539,13 +612,17 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
     }
     let limit = a.limit.unwrap_or(50).clamp(1, 200);
     let now = jiff::Timestamp::now();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
+        // Only delegations whose task is the caller's organization's.
         let mut stmt = c.prepare(
-            "SELECT * FROM delegations WHERE (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR to_agent = ?2) \
+            "SELECT * FROM delegations WHERE COALESCE((SELECT t.org_id FROM tasks t \
+             WHERE t.id = delegations.task_id), 'default') = ?5 \
+             AND (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR to_agent = ?2) \
              AND (?3 IS NULL OR task_id = ?3) ORDER BY created_at DESC, id DESC LIMIT ?4",
         )?;
         let rows: Vec<_> = stmt
-            .query_map(params![status, a.to_agent, a.task_id, limit + 1], row_map)?
+            .query_map(params![status, a.to_agent, a.task_id, limit + 1, org], row_map)?
             .collect::<Result<_, _>>()?;
         let truncated = rows.len() as i64 > limit;
         let out: Vec<Value> = rows
@@ -566,7 +643,7 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
 }
 
 fn get(ctx: &ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ctx.hub.db().read(|c| Ok(json!({ "delegation": delegation_row(c, a.id)? })))
+    ctx.hub.db().read(|c| Ok(json!({ "delegation": delegation_row(c, &ctx.caller.org_id, a.id)? })))
 }
 
 // ---------------------------------------------------------------------------
@@ -626,10 +703,16 @@ fn transition(
     detail: Value,
 ) -> UaResult<bool> {
     let caller = ctx.caller.clone();
+    let org = caller.org_id.clone();
+    // Only a delegation of the caller's organization moves.
+    let sql = format!("{sql} AND {DELEGATION_ORG}");
+    let mut params = params;
+    params.push(SqlValue::Text(org.clone()));
     ctx.hub.db().write(move |tx: &mut WriteTx<'_>| {
+        crate::families::tasks::require_org(tx, &org)?;
         let n = tx.execute(&sql, params_from_iter(params))?;
         if n > 0 {
-            let row = delegation_row(tx, id)?;
+            let row = delegation_row(tx, &org, id)?;
             let mut payload = json!({
                 "delegation_id": id,
                 "task_id": row["task_id"],
@@ -639,7 +722,7 @@ fn transition(
             if let (Some(p), Value::Object(d)) = (payload.as_object_mut(), detail) {
                 p.extend(d);
             }
-            emit(tx, &caller, channel, payload)?;
+            org_emit(tx, &org, &caller, channel, payload)?;
         }
         Ok(n > 0)
     })
@@ -648,20 +731,26 @@ fn transition(
 fn claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
     let agent = caller_label(ctx, a.agent.as_deref())?;
     let caller = ctx.caller.clone();
+    let org = caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        crate::families::tasks::require_org(tx, &org)?;
         let ts = ua_core::time::now();
         let n = tx.execute(
-            "UPDATE delegations SET status = 'in_flight', attempts = attempts + 1, \
-             claim_generation = claim_generation + 1, last_attempt_at = ?3, updated_at = ?3 \
-             WHERE id = ?1 AND status = 'pending' AND to_agent = ?2",
-            params![a.id, agent, ts],
+            &format!(
+                "UPDATE delegations SET status = 'in_flight', attempts = attempts + 1, \
+                 claim_generation = claim_generation + 1, last_attempt_at = ?3, updated_at = ?3 \
+                 WHERE id = ?1 AND status = 'pending' AND to_agent = ?2 AND {}",
+                DELEGATION_ORG.replace('?', "?4")
+            ),
+            params![a.id, agent, ts, org],
         )?;
         // Read inside the same transaction so a later release and reclaim
         // cannot swap a successor's generation into this response.
-        let row = delegation_row(tx, a.id)?;
+        let row = delegation_row(tx, &org, a.id)?;
         if n > 0 {
-            emit(
+            org_emit(
                 tx,
+                &org,
                 &caller,
                 "agent.delegation.claimed",
                 json!({

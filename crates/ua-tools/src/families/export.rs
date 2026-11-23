@@ -179,13 +179,15 @@ fn md_cell(v: &Value) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
+/// Organization `org`'s tasks.
 fn task_rows(
     c: &Connection,
+    org: &str,
     status: Option<&str>,
     project: Option<&str>,
 ) -> UaResult<Vec<Map<String, Value>>> {
-    let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", TASK_COLUMNS.join(", "));
-    let mut args: Vec<SqlValue> = Vec::new();
+    let mut sql = format!("SELECT {} FROM tasks WHERE org_id = ?", TASK_COLUMNS.join(", "));
+    let mut args: Vec<SqlValue> = vec![SqlValue::Text(org.into())];
     if let Some(s) = status {
         sql.push_str(" AND status = ?");
         args.push(SqlValue::Text(s.into()));
@@ -213,7 +215,9 @@ async fn export_tasks(ctx: ToolCtx, a: TasksArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {TASK_STATUSES:?} or all, got {s:?}")));
     }
     let project = a.project.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let rows = ctx.hub.db().read_async(move |c| task_rows(c, status.as_deref(), project.as_deref())).await?;
+    let org = ctx.caller.org_id.clone();
+    let rows =
+        ctx.hub.db().read_async(move |c| task_rows(c, &org, status.as_deref(), project.as_deref())).await?;
     let n = rows.len();
     let null = Value::Null;
     let cell = |r: &Map<String, Value>, k: &str| -> Value { r.get(k).unwrap_or(&null).clone() };
@@ -996,7 +1000,24 @@ fn parse_cursor(raw: Option<&str>) -> UaResult<Option<String>> {
         .map_err(|_| UaError::invalid(format!("events_since_ulid must be a ulid, got {raw:?}")))
 }
 
+/// The migration manifest is a hub-wide snapshot (every organization's
+/// tasks and notes, the whole event-log summary), so only the default
+/// organization, which operates the hub, may build or compare one. Another
+/// organization's caller is refused before anything is read.
+fn manifest_org_guard(ctx: &ToolCtx, what: &str) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "{what} covers the whole hub and is available to the default organization only; nothing was read"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "the migration manifest")?;
     let source_host = source_host_label(ctx.hub.cfg());
     let since = parse_cursor(a.events_since_ulid.as_deref())?;
     let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
@@ -1525,6 +1546,7 @@ fn missing_parents(side: &str, tasks: &BTreeMap<String, &Map<String, Value>>, co
 }
 
 async fn compare_migration_manifests(ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "comparing migration manifests")?;
     let left = side_manifest(&ctx, "left", a.left, a.left_path).await?;
     let right = side_manifest(&ctx, "right", a.right, a.right_path).await?;
     compare_manifests(&left, &right)
@@ -1763,7 +1785,7 @@ mod tests {
         c.execute_batch(
             "INSERT INTO schema_parts (name, checksum, applied_at)
              VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT);
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT, org_id TEXT NOT NULL DEFAULT 'default');
              CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
              -- The columns VISIBLE_EVENT joins on, minimal versions of the
              -- real tables.

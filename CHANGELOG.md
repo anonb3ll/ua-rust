@@ -364,6 +364,52 @@ from its commit history.
   organization's ledger with another organization's `requested_by` and
   `resolved_by` left out (`null`). The importer writes legacy approvals to
   `default`. Results and events in the default organization are unchanged.
+- The core task tables are organization-scoped:
+  `organization.v1.tools.tasks` adds `org_id` and the organization triggers
+  to `tasks`, `task_dependencies`, `task_comments` and
+  `task_comment_threads` (existing rows move to `default`), and
+  `tasks.v2.org_scope` adds indexes led by `org_id` and same-organization
+  triggers for a task's `parent_id` and `folded_into`, both ends of a
+  dependency, and a comment's task and parent comment. No key rebuild: task
+  ids stay hub-global AUTOINCREMENT ids. `routines.v3.task_org`,
+  `workflows.v3.task_org`, `cycles.v3.task_org` and `deliverables.v2.task_org`
+  keep a routine run's, workflow run's, cycle's and deliverable's `task_id`
+  inside its own organization. Every task, dependency, lineage and comment
+  tool, `project_build`, the queue and workflow-record actions, holds,
+  claims, dispatch, node work, the session packet, agents, capability,
+  policy claims, the evidence report, observability, export,
+  `platform_object_get` and the UI's task page read and write only the
+  caller's organization's tasks; another organization's task answers exactly
+  as a missing one, and a write for an organization `orgs` does not hold is
+  refused (`unknown_organization`) before anything changes. Ranked search
+  (`task_list query=`) filters the organization before the candidate cap.
+  Replies keep their shape: `org_id` is not added to a task or comment.
+  A task-driven lookup (its project's binding, deliverables, review-at-head,
+  `review_ready`) takes the task row's organization. Task events stay in the
+  default organization's ledger; another organization's titles, notes,
+  comment bodies, reasons and caller-supplied labels are `null` in them and
+  the originator is `system`. `task_add`, `task_update` and `delegate`
+  idempotency keys of another organization are stored with its organization
+  prefixed, so a key reused in another organization never replays. The
+  migration manifest (`export_migration_manifest`,
+  `compare_migration_manifests`, and both through `export_data`) is
+  hub-wide and refused to another organization's caller (`org_unsupported`).
+  Deleting another organization's task also deletes the holds rooted in its
+  subtree and the policy authorizations naming it, so none falls into the
+  default organization. `state_sync_verify` counts only the caller's
+  organization's tasks in `task_fts`'s check, a proposal or contract marker
+  on another organization's task fails the contract check without reading
+  the default organization's proposals, and a node follow-up checks the
+  task holder in the task's organization. The importer writes legacy tasks,
+  dependencies, comments and threads to `default`. Results and events in the
+  default organization are unchanged, except for two fixes that apply to
+  every organization: a `task_update` idempotency key is now the caller's
+  (`task_update:<escaped label>:<key>`), is checked only after the task is
+  found, and replays only for the same task (another task is refused
+  `idempotency_key_reused`); and `conversation_handoff` now creates its task
+  itself under `task_add`'s gate, with a key scoped to the organization and
+  actor stored under its own tool name, while `task_add` refuses client keys
+  starting with `conversation-handoff:`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -518,6 +564,23 @@ from its commit history.
   be consumed, so no migration expires it. **Upgrade note:** deny or revoke
   pending or approved `skill_registry` approvals at upgrade and retry the
   call, which parks a new approval in the new shape.
+- A routine outside the default organization now creates its task in its
+  own organization when it fires, instead of being recorded as `skipped`
+  (`org_tasks_unavailable`); its workflow is still recorded as `not_run`
+  until a routine owner can act outside the default organization. Old
+  receipts keep their recorded reason.
+- Work proposals, merged-PR reconciliation (`queue_close_merged`) and the
+  GitHub webhook, poller and CI lookups stay with the default organization:
+  another organization's caller is refused (`org_unsupported`) by the
+  proposal actions and `queue_close_merged`, and the hub's GitHub paths only
+  read and close default-organization tasks (`ORG-GITHUB-DEFAULT`).
+- Delegations, task holds and policy authorizations carry no organization
+  yet; each is reached only through its task's organization, so another
+  organization's delegation, hold or authorization answers as a missing one.
+  Delegation to another organization's agent is still allowed.
+- `cleanup_stale_worktrees` judges a worktree only against the caller's
+  organization's tasks and skips (`other_organization`) a worktree of
+  another organization's task.
 - `conversation_handoff` no longer writes the
   `[conversation: <id>] handed off from the agent conversation` line into the
   task's notes and no longer returns `reference`: the link is recorded only

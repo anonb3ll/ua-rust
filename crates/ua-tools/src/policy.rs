@@ -740,13 +740,14 @@ fn binding_matches(bind: &BTreeMap<String, String>, scope: &Scope, unclaimed_mat
     })
 }
 
-fn resolve_claims(conn: &Connection, label: &str) -> rusqlite::Result<Vec<Claim>> {
+/// The live claims of `label` in its organization `org`.
+fn resolve_claims(conn: &Connection, org: &str, label: &str) -> rusqlite::Result<Vec<Claim>> {
     let now = ua_core::time::now();
     let mut stmt = conn.prepare(
-        "SELECT id, project FROM tasks WHERE claimed_by = ?1 AND status = 'doing' \
+        "SELECT id, project FROM tasks WHERE org_id = ?3 AND claimed_by = ?1 AND status = 'doing' \
          AND (lock_expires_at IS NULL OR lock_expires_at > ?2)",
     )?;
-    let rows = stmt.query_map(params![label, now], |r| {
+    let rows = stmt.query_map(params![label, now, org], |r| {
         let id: i64 = r.get(0)?;
         let project: Option<String> = r.get(1)?;
         Ok(Claim {
@@ -880,7 +881,7 @@ fn evaluate_with(
     }
     let mut scope = Scope { agent: scope_agent(caller), claims: Vec::new() };
     if caller.kind != ActorKind::Anonymous && tool_matched.iter().any(|r| bind_needs_claims(&r.bind)) {
-        scope.claims = resolve_claims(conn, &caller.label).map_err(|e| unavailable("", e))?;
+        scope.claims = resolve_claims(conn, &caller.org_id, &caller.label).map_err(|e| unavailable("", e))?;
     }
     let who = principals(caller, &scope);
     // `role` rules are allow-lists and still fire for callers outside `roles`;

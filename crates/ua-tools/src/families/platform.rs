@@ -612,15 +612,27 @@ fn one_row(c: &Connection, sql: &str, id: &str) -> UaResult<Option<Map<String, V
     Ok(c.query_row(sql, [id], row_map).optional()?)
 }
 
-fn board(c: &Connection) -> UaResult<Value> {
+/// One row of organization `org` (`sql` binds the id then the
+/// organization), without its `org_id`.
+fn org_row(c: &Connection, sql: &str, id: &str, org: &str) -> UaResult<Option<Map<String, Value>>> {
+    Ok(c.query_row(sql, [id, org], row_map).optional()?.map(|mut m| {
+        m.remove("org_id");
+        m
+    }))
+}
+
+/// The reader's organization `org`'s open board.
+fn board(c: &Connection, org: &str) -> UaResult<Value> {
     let mut stmt = c.prepare(
         "SELECT id, title, status, priority, parent_id, project, domain, lane, claimed_by, claimed_at, \
          lock_expires_at, created_at, updated_at, due_at, evidence_ref FROM tasks \
-         WHERE status IN ('open','doing','waiting_review','blocked') AND archived_at IS NULL \
+         WHERE org_id = ?2 AND status IN ('open','doing','waiting_review','blocked') AND archived_at IS NULL \
          ORDER BY id LIMIT ?1",
     )?;
-    let mut tasks: Vec<Value> =
-        stmt.query_map([BOARD_CAP + 1], row_map)?.map(|r| r.map(Value::Object)).collect::<Result<_, _>>()?;
+    let mut tasks: Vec<Value> = stmt
+        .query_map(rusqlite::params![BOARD_CAP + 1, org], row_map)?
+        .map(|r| r.map(Value::Object))
+        .collect::<Result<_, _>>()?;
     let truncated = tasks.len() as i64 > BOARD_CAP;
     tasks.truncate(BOARD_CAP as usize);
     for t in &mut tasks {
@@ -634,7 +646,9 @@ fn board(c: &Connection) -> UaResult<Value> {
 /// The object itself (without the `uri`), or `None` when no row has the id.
 fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaResult<Option<Value>> {
     let obj = match kind {
-        "task" => one_row(c, "SELECT * FROM tasks WHERE id = ?1", id)?.map(Value::Object),
+        // A task or comment of the reader's organization, without `org_id`.
+        "task" => org_row(c, "SELECT * FROM tasks WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(Value::Object),
         "run" => runs::read_one(hub, caller, c, id)?,
         "approval" => {
             let Ok(n) = id.parse::<i64>() else { return Ok(None) };
@@ -717,7 +731,8 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             v
         }),
         "goal" => one_row(c, "SELECT * FROM goals WHERE id = ?1", id)?.map(Value::Object),
-        "comment" => one_row(c, "SELECT * FROM task_comments WHERE id = ?1", id)?.map(|mut m| {
+        "comment" => org_row(c, "SELECT * FROM task_comments WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(|mut m| {
             decode(&mut m, &["mentions", "refs"]);
             Value::Object(m)
         }),
@@ -741,7 +756,8 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
         if id.is_some() {
             return Err(UaError::invalid(format!("object kind {kind:?} is a collection and takes no id")));
         }
-        let mut v = hub.db().read_async(board).await?;
+        let org = caller.org_id.clone();
+        let mut v = hub.db().read_async(move |c| board(c, &org)).await?;
         v["uri"] = json!(t.uri);
         return Ok(v);
     }

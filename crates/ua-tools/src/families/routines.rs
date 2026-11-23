@@ -23,10 +23,11 @@
 //! organization, and the tools read and write only the caller's
 //! organization's rows: another organization's routine answers as a missing
 //! one. The scheduler has no caller: it fires every due routine with that
-//! routine's own organization. Tasks carry no organization yet
-//! (`ORG-TASK-DEFAULT`), so a fire of a routine outside the task
-//! organization creates no task and runs no workflow: it is recorded as
-//! `skipped` (`org_tasks_unavailable`) in its own organization.
+//! routine's own organization, and creates its task in that organization
+//! (`routines.v3.task_org` keeps a receipt's task in the receipt's
+//! organization). A routine's workflow still runs only in the default
+//! organization (its owner's caller cannot yet be built in another), so a
+//! fire elsewhere records its workflow as `not_run`.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -36,7 +37,7 @@ use ua_core::{ActorKind, Caller, UaError, UaResult, identity::Transport};
 use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::families::plans::{row_map, write_identity};
-use crate::families::tasks::{TASK_ORG, check_slug};
+use crate::families::tasks::check_slug;
 use crate::families::workflows;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
@@ -119,15 +120,32 @@ BEGIN SELECT RAISE(ABORT, 'a routine run must be in its routine''s organization'
 ",
 };
 
+/// `routines.v3.task_org`: a routine run's `task_id` points at a task in the
+/// run's own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "routines.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org BEFORE INSERT ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org_update BEFORE UPDATE OF task_id ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+",
+};
+
 const MAX_DUE_PER_TICK: usize = 100;
 const MAX_RECENT_RUNS: i64 = 100;
 pub const SKIP_OVERLAP: &str = "overlap";
 pub const SKIP_NO_SIGNAL: &str = "no_signal";
 pub const SKIP_SELF_ECHO: &str = "self_echo";
 pub const SKIP_CATCH_UP_NONE: &str = "catch_up_none";
-/// A fire of a routine outside the task organization: tasks carry no
-/// organization yet (`ORG-TASK-DEFAULT`), so its task would land in another
-/// organization. Nothing is created and no workflow runs.
+/// The skip reason older builds recorded for a fire of a routine outside the
+/// default organization, before tasks carried an organization. No fire is
+/// skipped for it any more (each creates its task in its routine's
+/// organization); the value stays so existing receipts still read.
 pub const SKIP_ORG_TASKS: &str = "org_tasks_unavailable";
 const RECENT_RUN_COLUMNS: &str = "id, fire_key, scheduled_for, status, reason, subject_key, task_id, created_at, \
      window_start, gate_matched, workflow_run_id, workflow_status";
@@ -204,7 +222,7 @@ struct Fire {
 /// The routine's oldest unfinished task.
 fn active_task(c: &Connection, org: &str, routine_id: i64) -> UaResult<Option<i64>> {
     Ok(c.query_row(
-        "SELECT t.id FROM routine_runs rr JOIN tasks t ON t.id = rr.task_id \
+        "SELECT t.id FROM routine_runs rr JOIN tasks t ON t.id = rr.task_id AND t.org_id = rr.org_id \
          WHERE rr.routine_id = ?1 AND rr.org_id = ?2 AND t.status NOT IN ('done','cancelled') \
          ORDER BY rr.id LIMIT 1",
         params![routine_id, org],
@@ -230,9 +248,8 @@ fn window_start(c: &Connection, routine: &Map<String, Value>) -> UaResult<String
 /// `(matched, echoes)`: activity in the gate's scope at or after `since`.
 /// Tasks any routine created, events about them, routine bookkeeping and the
 /// workflow runs routines started are echoes, never activity. Only the
-/// routine's organization counts: its receipts and its ledger rows. Tasks
-/// carry no organization yet; they are all the task organization's
-/// (`ORG-TASK-DEFAULT`), the only one whose routines create tasks.
+/// routine's organization counts: its tasks, its receipts and its ledger
+/// rows.
 fn scope_activity(c: &Connection, routine: &Map<String, Value>, since: &str) -> UaResult<(i64, i64)> {
     let project_scope = i64::from(routine["activity_gate_scope"] == "project");
     let project = routine["project"].as_str().unwrap_or_default();
@@ -243,7 +260,7 @@ fn scope_activity(c: &Connection, routine: &Map<String, Value>, since: &str) -> 
     let (tasks, task_echoes): (i64, i64) = c.query_row(
         &format!(
             "SELECT count(*), COALESCE(SUM(id IN ({own})), 0) FROM tasks \
-             WHERE (created_at >= ?1 OR updated_at >= ?1) AND (?2 = 0 OR project = ?3)"
+             WHERE org_id = ?4 AND (created_at >= ?1 OR updated_at >= ?1) AND (?2 = 0 OR project = ?3)"
         ),
         params![since, project_scope, project, org],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -255,7 +272,7 @@ fn scope_activity(c: &Connection, routine: &Map<String, Value>, since: &str) -> 
              SELECT count(*), COALESCE(SUM((dedupe_key IS NOT NULL AND (dedupe_key LIKE 'routine:%' \
              OR dedupe_key LIKE 'routine-run:%')) OR (task_id IS NOT NULL AND task_id IN ({own})) \
              OR (run_id IS NOT NULL AND run_id IN ({own_runs}))), 0) FROM ev \
-             WHERE (?2 = 0 OR task_id IN (SELECT id FROM tasks WHERE project = ?3))"
+             WHERE (?2 = 0 OR task_id IN (SELECT id FROM tasks WHERE org_id = ?4 AND project = ?3))"
         ),
         params![since, project_scope, project, org],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -289,15 +306,12 @@ fn create_fire(
         };
         return Ok(Fire { status, task_id, reason: None, created_new: false, run_row: None });
     }
-    // ORG-TASK-DEFAULT: tasks carry no organization, so a routine outside
-    // the task organization cannot create one without it landing in another
-    // organization. Take the routine's organization when tasks gain one.
-    let no_tasks = org != TASK_ORG;
-    let active = if no_tasks { None } else { active_task(tx, &org, id)? };
+    // The fire's task is created in the routine's own organization.
+    let active = active_task(tx, &org, id)?;
     let skip = active.is_some() && routine["concurrency"] == "skip";
     let mut subject_key = format!("routine:{id}");
     let (mut win, mut matched, mut echoes) = (None, None, 0);
-    if !no_tasks && !skip && routine["activity_gate"] == "require_activity" {
+    if !skip && routine["activity_gate"] == "require_activity" {
         let since = window_start(tx, routine)?;
         let (m, e) = scope_activity(tx, routine, &since)?;
         win = Some(since);
@@ -306,9 +320,7 @@ fn create_fire(
     }
     let now = ua_core::time::now();
     let at_text = ua_core::time::format_ts(at);
-    let (status, task_id, reason) = if no_tasks {
-        ("skipped", None, Some(SKIP_ORG_TASKS))
-    } else if skip {
+    let (status, task_id, reason) = if skip {
         subject_key = format!("task:{}", active.unwrap_or_default());
         ("skipped", None, Some(SKIP_OVERLAP))
     } else if matched == Some(0) {
@@ -324,8 +336,8 @@ fn create_fire(
         let marker = format!("[routine: {id}] [scheduled: {at_text}]");
         let notes = if notes.is_empty() { marker } else { format!("{notes}\n{marker}") };
         tx.execute(
-            "INSERT INTO tasks (title, notes, status, priority, created_at, updated_at, project, domain, lane) \
-             VALUES (?1, ?2, ?3, 'med', ?4, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks (title, notes, status, priority, created_at, updated_at, project, domain, lane, \
+             org_id) VALUES (?1, ?2, ?3, 'med', ?4, ?4, ?5, ?6, ?7, ?8)",
             params![
                 routine["title"].as_str().unwrap_or_default(),
                 notes,
@@ -334,16 +346,16 @@ fn create_fire(
                 routine["project"].as_str().unwrap_or("default"),
                 routine["domain"].as_str().unwrap_or("general"),
                 routine["lane"].as_str().unwrap_or("default"),
+                org,
             ],
         )?;
         let task_id = tx.last_insert_rowid();
-        ledger::append(
+        crate::families::tasks::emit(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG,
-                "agent.task.created",
-                json!({ "task_id": task_id, "routine_id": id, "status": if status == "queued" { "blocked" } else { "open" } }),
-            )
-            .by(by.to_string()),
+            &org,
+            "agent.task.created",
+            json!({ "task_id": task_id, "routine_id": id, "status": if status == "queued" { "blocked" } else { "open" } }),
+            by,
         )?;
         (status, Some(task_id), None)
     };
@@ -380,7 +392,7 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
     let rows: Vec<(i64, String, i64, i64)> = {
         let mut stmt = tx.prepare(
             "SELECT rr.id, rr.org_id, rr.routine_id, rr.task_id FROM routine_runs rr \
-             JOIN tasks t ON t.id = rr.task_id \
+             JOIN tasks t ON t.id = rr.task_id AND t.org_id = rr.org_id \
              WHERE rr.status = 'queued' AND t.status = 'blocked' ORDER BY rr.id",
         )?;
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?
@@ -389,7 +401,8 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
     for (row_id, org, routine_id, task_id) in rows {
         let earlier: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM routine_runs old JOIN tasks t ON t.id = old.task_id WHERE old.routine_id = ?1 \
+                "SELECT 1 FROM routine_runs old JOIN tasks t ON t.id = old.task_id AND t.org_id = old.org_id \
+                 WHERE old.routine_id = ?1 \
                  AND old.org_id = ?3 AND old.id < ?2 AND t.status NOT IN ('done','cancelled') LIMIT 1",
                 params![routine_id, row_id, org],
                 |r| r.get(0),
@@ -399,7 +412,10 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
             continue;
         }
         let now = ua_core::time::now();
-        tx.execute("UPDATE tasks SET status = 'open', updated_at = ?2 WHERE id = ?1", params![task_id, now])?;
+        tx.execute(
+            "UPDATE tasks SET status = 'open', updated_at = ?2 WHERE id = ?1 AND org_id = ?3",
+            params![task_id, now, org],
+        )?;
         tx.execute(
             "UPDATE routine_runs SET status = 'created' WHERE id = ?1 AND org_id = ?2",
             params![row_id, org],
@@ -501,9 +517,9 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
     if org != ua_core::DEFAULT_ORG {
         // The owner's caller can only be built in the default organization
         // until the resolver binds others (`org_guard`), and a workflow must
-        // never run one organization's routine under another's caller. No
-        // such fire exists (they are skipped, `SKIP_ORG_TASKS`); refuse one
-        // that does rather than run it.
+        // never run one organization's routine under another's caller. The
+        // fire's task exists in the routine's organization; its workflow is
+        // recorded as not run.
         let o = org.clone();
         let _ = hub
             .db()

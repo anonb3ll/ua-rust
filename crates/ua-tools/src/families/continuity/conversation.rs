@@ -28,14 +28,16 @@
 //!   policy file, the same refusal codes as a call would get) before it
 //!   checks the task exists, so a refused caller cannot probe task ids.
 //!   The `coordination_manage` call itself already passed the registry's
-//!   policy and approval gate. Creating calls the registered `task_add`
-//!   through the governed registry as the caller, so the caller's profile,
-//!   the policy file and the approval gate apply exactly as to a direct
-//!   call.
-//! - Creating is idempotent per conversation, title, project and priority
-//!   (a `task_add` idempotency key derived from them): a repeat returns the
-//!   same task. Relinking appends nothing new (the handoff event is
-//!   deduplicated).
+//!   policy and approval gate. Creating applies `task_add`'s gate the same
+//!   way (profile allow-list, policy file, and a tool the policy or
+//!   `approval_tools` sends for approval is refused, not created around
+//!   it), then inserts the task itself.
+//! - Creating is idempotent per organization, actor, conversation, title,
+//!   project and priority: a key derived from them is stored under the
+//!   handoff's own tool name (`conversation_handoff`), so a repeat returns
+//!   the same task and no `task_add` client key reaches it. `task_add`
+//!   refuses client keys starting with `conversation-handoff:`. Relinking
+//!   appends nothing new (the handoff event is deduplicated).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -127,16 +129,32 @@ fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool>
     Ok(found)
 }
 
-/// The idempotency key one create handoff uses.
-fn create_key(cid: &str, title: &str, project: Option<&str>, priority: &str) -> String {
-    let material = json!([cid, title, project.unwrap_or(""), priority]).to_string();
+/// The `idempotency_keys` tool a create handoff stores its key under: its
+/// own, never `task_add`, so a client `task_add` key can neither replay nor
+/// squat a handoff's.
+const HANDOFF_TOOL: &str = "conversation_handoff";
+
+/// The idempotency key one create handoff uses: a digest of the
+/// organization, the handing-off actor, the conversation, title, project
+/// and priority. Only the hub derives it, and it is stored under
+/// [`HANDOFF_TOOL`].
+fn create_key(
+    org: &str,
+    actor: &str,
+    cid: &str,
+    title: &str,
+    project: Option<&str>,
+    priority: &str,
+) -> String {
+    let material = json!([org, actor, cid, title, project.unwrap_or(""), priority]).to_string();
     let digest = hex::encode(Sha256::digest(material.as_bytes()));
-    format!("conversation-handoff:{}", &digest[..40])
+    format!("{HANDOFF_KEY_PREFIX}{}", &digest[..40])
 }
 
-fn registry() -> &'static crate::Registry {
-    crate::builtin_registry_shared()
-}
+/// The prefix of every handoff key. `task_add` refuses client keys that
+/// start with it, so the keys older hubs stored under `task_add` can be
+/// neither probed nor squatted.
+pub(crate) const HANDOFF_KEY_PREFIX: &str = "conversation-handoff:";
 
 /// `coordination_manage(action="conversation_handoff")`.
 pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResult<Value> {
@@ -174,11 +192,16 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                     .as_deref(),
             )
             .await?;
+            let org = ctx.caller.org_id.clone();
             let exists: bool = ctx
                 .hub
                 .db()
                 .read_async(move |c| {
-                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [id], |r| r.get(0))?)
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2)",
+                        params![org, id],
+                        |r| r.get(0),
+                    )?)
                 })
                 .await?;
             if !exists {
@@ -187,35 +210,55 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
             (id, false)
         }
         (None, Some(title)) => {
+            // The task_add gate (profile allow-list, policy file, approval
+            // tools) applies as for a direct call: a refused caller gets
+            // task_add's refusal and nothing is created.
+            crate::families::platform::check_read(
+                &ctx.hub,
+                &ctx.caller,
+                "conversation handoff",
+                "task_add",
+                "coordination_manage",
+                crate::routes::route("coordination_manage", &json!({ "action": "conversation_handoff" }))
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.recorded())
+                    .as_deref(),
+            )
+            .await?;
             let title: String = title.chars().take(MAX_TITLE).collect();
             let priority = a.priority.unwrap_or_else(|| "med".into());
-            let key = create_key(&cid, &title, a.project.as_deref(), &priority);
-            let k2 = key.clone();
-            let seen: bool = ctx
-                .hub
+            let project =
+                a.project.as_deref().map(|p| crate::families::tasks::check_slug("project", p)).transpose()?;
+            let org = ctx.caller.org_id.clone();
+            let key = create_key(&org, &actor, &cid, &title, project.as_deref(), &priority);
+            let by = ctx.caller.label.clone();
+            ctx.hub
                 .db()
-                .read_async(move |c| {
-                    Ok(c.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE tool = 'task_add' AND key = ?1)",
-                        [format!("task_add:{k2}")],
-                        |r| r.get(0),
-                    )?)
+                .write_async(move |tx| {
+                    use crate::families::tasks::{
+                        NewTask, idempotent_record, idempotent_replay, insert_task,
+                    };
+                    if let Some(prior) = idempotent_replay(tx, &org, HANDOFF_TOOL, &key)? {
+                        let id = prior["id"]
+                            .as_i64()
+                            .ok_or_else(|| UaError::internal("stored handoff reply carries no task id"))?;
+                        return Ok((id, false));
+                    }
+                    let mut task = NewTask::simple(title, String::new(), &priority);
+                    task.notes = None;
+                    task.project = project;
+                    let id = insert_task(tx, &org, task, &by)?;
+                    idempotent_record(tx, &org, HANDOFF_TOOL, &key, &json!({ "id": id }))?;
+                    Ok((id, true))
                 })
-                .await?;
-            let mut args = json!({ "title": title, "priority": priority, "idempotency_key": key });
-            if let Some(p) = a.project {
-                args["project"] = json!(p);
-            }
-            let reply = registry().call(&ctx.hub, &ctx.caller, "task_add", args).await?;
-            let id = reply["id"]
-                .as_i64()
-                .ok_or_else(|| UaError::internal("task_add returned no task id for the handoff"))?;
-            (id, !seen)
+                .await?
         }
         (None, None) => unreachable!("checked above"),
     };
 
     let (c2, a2) = (cid.clone(), actor.clone());
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -230,14 +273,19 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 return Ok(());
             }
             let key = if created { format!("{base}:created") } else { base };
+            // ORG-EVENT-DEFAULT: another organization's handoff names no
+            // agent in the default ledger and has a neutral originator.
+            let default = org == ua_core::DEFAULT_ORG;
+            let by = if default { a2.clone() } else { "system".to_string() };
             ledger::append(
                 tx,
                 EventInput::new(
                     ua_core::DEFAULT_ORG,
                     CHANNEL,
-                    json!({ "conversation_id": c2, "task_id": task_id, "created": created, "by": a2 }),
+                    json!({ "conversation_id": c2, "task_id": task_id, "created": created,
+                            "by": crate::families::tasks::ledger_text(&org, &a2) }),
                 )
-                .by(a2.clone())
+                .by(by)
                 .dedupe(key),
             )?;
             Ok(())
@@ -257,16 +305,18 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
     if !is_id_safe(&cid) {
         return Err(UaError::invalid("conversation_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
     }
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             if !visible(c, &cid, viewer.as_deref())? {
                 return Err(UaError::not_found("conversation not found"));
             }
-            let mut stmt =
-                c.prepare("SELECT id FROM tasks WHERE instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id")?;
+            let mut stmt = c.prepare(
+                "SELECT id FROM tasks WHERE org_id = ?2 AND instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id",
+            )?;
             let noted: BTreeSet<i64> =
-                stmt.query_map([reference(&cid)], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                stmt.query_map(params![reference(&cid), org], |r| r.get(0))?.collect::<Result<_, _>>()?;
             // The first event per task says who handed off and when.
             let mut audit: BTreeMap<i64, (Option<String>, String)> = BTreeMap::new();
             let mut stmt = c.prepare(
@@ -283,7 +333,12 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
                 }
             }
             let task = |id: i64| -> UaResult<Option<(String, String)>> {
-                Ok(c.query_row("SELECT title, status FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                Ok(c
+                    .query_row(
+                        "SELECT title, status FROM tasks WHERE org_id = ?1 AND id = ?2",
+                        params![org, id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .optional()?)
             };
             let mut handoffs = Vec::new();

@@ -110,6 +110,17 @@ pub fn schema_parts() -> Vec<Part> {
     // Deliverables and their revisions (`ua-deliverables`), born
     // tenant-scoped: they need `organization.v1.store`.
     parts.extend(families::deliverables::schema_parts());
+    // The organization column and triggers of the core task tables (no key
+    // rebuild: task ids stay hub-global AUTOINCREMENT ids and every child key
+    // is led by one), the organization-led indexes and same-organization
+    // reference triggers, then the rule, on each family already converted,
+    // that its `task_id` points inside its own organization.
+    parts.push(families::tasks::TENANT_PART.into());
+    parts.push(families::tasks::ORG_SCOPE.into());
+    parts.push(families::routines::TASK_ORG_SCHEMA.into());
+    parts.push(families::workflows::TASK_ORG_SCHEMA.into());
+    parts.push(families::cycles::TASK_ORG_SCHEMA.into());
+    parts.push(families::deliverables::TASK_ORG_SCHEMA.into());
     parts
 }
 

@@ -381,9 +381,17 @@ fn mint_tx(
     if hub.cfg().is_human(&subject) {
         return Err(refuse("human_subject", "a session credential is never minted for a human identity"));
     }
+    // A runner path: the item's task is read in the task row's own
+    // organization (the enqueuer's, `insert_item`).
     if let Some(task_id) = item.task_id {
-        let status: Option<String> =
-            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?;
+        let org = crate::families::tasks::task_org(tx, task_id)?.unwrap_or_default();
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         if status.as_deref().is_none_or(|s| matches!(s, "done" | "cancelled")) {
             return Err(conflict("task_closed", "the item's task is closed or missing"));
         }
@@ -574,8 +582,14 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     }
     // The bound task, read live: closed by any path, it ends access.
     if let Some(t) = task_id {
-        let status: Option<String> =
-            c.query_row("SELECT status FROM tasks WHERE id = ?1", [t], |r| r.get(0)).optional()?;
+        let org = crate::families::tasks::task_org(c, t)?.unwrap_or_default();
+        let status: Option<String> = c
+            .query_row(
+                "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, t],
+                |r| r.get(0),
+            )
+            .optional()?;
         match status.as_deref() {
             None => return Ok(Decision::Lapse("task_deleted", id)),
             Some("done" | "cancelled") => return Ok(Decision::Lapse("task_closed", id)),

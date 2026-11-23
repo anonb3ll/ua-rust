@@ -35,7 +35,7 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (42 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (38 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
@@ -44,7 +44,8 @@ here for memory columns, owners and defaults.
   `harness_config_drift`, `harness_config_report_window`, `routines`,
   `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `plans`,
   `plan_steps`, `plan_checkpoints`, `autonomous_cycles`,
-  `autonomous_cycle_transitions`, `autonomous_cycle_usage` and `approvals`
+  `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `approvals`,
+  `tasks`, `task_dependencies`, `task_comments` and `task_comment_threads`
   having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
@@ -126,9 +127,11 @@ here for memory columns, owners and defaults.
   event at a site marked `ORG-EVENT-DEFAULT` in the source must switch to the
   organization of the row it is about in the same change that lets a second
   organization have callers, or the default organization's ledger would
-  record another organization's activity. A second **resolver work item,
-  `ORG-TASK-DEFAULT`**, covers every lookup that starts from a task (it names
-  `TASK_ORG`); see the governance family below. `code_symbols` has no index led by
+  record another organization's activity. A second resolver work item,
+  `ORG-TASK-DEFAULT`, covered every lookup that starts from a task; it was
+  resolved when tasks gained `org_id` (the tasks family below), except for
+  the hub's GitHub and CI paths, which are marked `ORG-GITHUB-DEFAULT`.
+  `code_symbols` has no index led by
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
   index led by `org_id`, in a new static part, when its family is converted.
@@ -169,18 +172,17 @@ here for memory columns, owners and defaults.
   to install the organization triggers. `project_repo_bind`,
   `project_repo_unbind`, `project_repo_get` and `project_repo_list` scope to
   the caller's organization, and a bind or unbind for an unknown organization
-  is refused before anything changes. Tasks carry no `org_id` yet, so every
-  task-driven lookup of a binding (CI checks, merges, policy authorizations,
-  merged-PR reconciliation, deliverables, GitHub polling and webhooks) reads
-  the default organization's bindings. The Python importer explicitly writes
-  legacy bindings to `default`. **Resolver work item (`ORG-TASK-DEFAULT`):**
-  each such lookup, and each authority check and deliverable lookup that
-  starts from a task, names the constant `TASK_ORG`
-  (`crates/ua-tools/src/families/tasks/mod.rs`) rather than `DEFAULT_ORG`.
-  When tasks gain `org_id`, every use of `TASK_ORG` must switch to the task's
-  own organization in that change, and the constant be removed, or a task of
-  a second organization would resolve the default organization's
-  repositories. `crates/ua-tools/tests/project_bindings_tenant.rs` holds
+  is refused before anything changes. Every task-driven lookup of a binding
+  (CI checks, merges, policy authorizations, deliverables) reads the
+  binding of the task row's own organization (the tasks family below). The
+  hub's GitHub and CI paths without a caller (the webhook, the poller, the
+  CI run lookup, the head re-verification and merged-PR reconciliation) read
+  only the default organization's bindings and tasks: they are marked
+  `ORG-GITHUB-DEFAULT` and name the constant `TASK_ORG`
+  (`crates/ua-tools/src/families/tasks/mod.rs`), which is removed when the
+  GitHub family resolves each delivery to its task's organization. The
+  Python importer explicitly writes legacy bindings to `default`.
+  `crates/ua-tools/tests/project_bindings_tenant.rs` holds
   another organization's binding of the same project and checks that none
   of these lookups reads it. The `project.repo.bound` and
   `project.repo.unbound` events are `ORG-EVENT-DEFAULT` sites whose payloads
@@ -204,7 +206,7 @@ here for memory columns, owners and defaults.
   `zulip_send_message` is refused before anything is recorded, until
   organizations configure their own destinations. A hub-originated
   notification takes the organization of the row it is about, never a
-  caller's: `review_ready` uses its task's (`TASK_ORG`, `ORG-TASK-DEFAULT`).
+  caller's: `review_ready` uses its task row's.
   `review_ready_notices` stays with the tasks family: it belongs to the task
   workflow (continuity), is keyed by the hub-global task id, and is read in
   the same transaction as `task_workflow`, so it converts with `tasks`. The
@@ -257,10 +259,11 @@ here for memory columns, owners and defaults.
   workflow runs as its owner, and that caller can only be built in the
   default organization until the resolver binds others (`org_guard`), so a
   fire outside it never runs its workflow (reconciliation marks one `not_run`).
-  Tasks carry no organization (`ORG-TASK-DEFAULT`): a fire of a routine
-  outside the task organization creates no task and is recorded as `skipped`
-  (`org_tasks_unavailable`), and the LangGraph tools see the task
-  organization's tasks only. A gated step's approval payload binds `org_id`.
+  Each fire creates its task in its routine's organization (before tasks
+  carried an organization, a fire outside the default organization was
+  recorded as `skipped`, `org_tasks_unavailable`; old receipts keep that
+  reason), and the LangGraph tools see only the caller's organization's
+  tasks. A gated step's approval payload binds `org_id`.
   `routine_runs` and `workflow_runs` point at tasks (`task_id`), but neither
   is keyed by a task id nor part of the task workflow, so they convert here,
   not with `tasks`. The routine and workflow events are `ORG-EVENT-DEFAULT`
@@ -310,11 +313,10 @@ here for memory columns, owners and defaults.
   before anything changes, including before a gated transition reaches the
   approval queue. A gated transition's approval payload binds `org_id`.
   Nothing runs a cycle without a caller. A cycle may name a task and a
-  delegation, which carry no organization yet (`ORG-TASK-DEFAULT`): only a
-  cycle in the task organization can bind either, and to any other
-  organization a task or delegation id answers as a missing one, so its
-  cycles never read `tasks` (attempt-keyed usage is refused as `not_owner`,
-  and the green path finds no worktree). `autonomous_cycles.task_id` is
+  delegation, both read in the cycle's organization: to another
+  organization a task, or a delegation of another organization's task,
+  answers as a missing one (`cycles.v3.task_org` also keeps a cycle's task in
+  its own organization). `autonomous_cycles.task_id` is
   optional and the table is keyed by its own id, so it converts here, not
   with `tasks`. `agent.cycle.updated` is an `ORG-EVENT-DEFAULT` site: for a
   cycle outside the default organization its `stop_reason` (which carries
@@ -327,7 +329,9 @@ here for memory columns, owners and defaults.
   every delegation creates its task in the same transaction (the task's
   notes carry the whole spec, so scoping the delegation alone would hide
   nothing), the fenced transitions read the task row in the same statement,
-  and the task queue reads delegations by task id. It converts with `tasks`.
+  and the task queue reads delegations by task id. It converts in a later
+  change of the tasks family; until then it is reached through its task's
+  organization.
 - The approval queue: `organization.v1.tools.approvals` gives `approvals`
   its `org_id` and triggers, and `approvals.v3.org_indexes` adds indexes led
   by `org_id` for the gate's match and the per-organization queue. No
@@ -378,6 +382,100 @@ here for memory columns, owners and defaults.
   carry the caller's label whatever the caller's organization. The importer
   writes legacy approvals to `default`. `crates/ua-tools/tests/approvals_tenant.rs`
   holds the upgrade and the isolation tests.
+- The core task tables: `organization.v1.tools.tasks` gives `tasks`,
+  `task_dependencies`, `task_comments` and `task_comment_threads` their
+  `org_id` and triggers (existing rows move to `default`), and
+  `tasks.v2.org_scope` adds indexes led by `org_id` for the status, project
+  and claimant queues and the `*_org_parent` triggers that keep a task's
+  `parent_id` and `folded_into`, both ends of a dependency, and a comment's
+  task and parent comment inside one organization. No rebuild: a task id is
+  a hub-global AUTOINCREMENT id (Decision 3: task identity never moves
+  between organizations) and every child key is led by a task or comment id.
+  The converted families gain the same rule for their `task_id`:
+  `routines.v3.task_org`, `workflows.v3.task_org`, `cycles.v3.task_org` and
+  `deliverables.v2.task_org` (the last lives in `ua-tools`, because the
+  `ua-deliverables` store has no `tasks` table). The shared lookups
+  (`task_object`, `require_task`, `ancestors`, `subtree_ids`, `rollup`,
+  `decorate`, `check_nesting`) take the organization and filter on it, so
+  every task tool, the queue and workflow-record actions, claims and their
+  release, holds, dispatch, node work, the relay, the session packet,
+  agents, capability, policy claims, the evidence report, observability,
+  the task, memory and journal exports, `platform_object_get`,
+  `state_sync_verify`'s `task_fts` counts and the UI read and write only the
+  caller's organization's tasks (the follow-up relay checks a node item's
+  task holder in the task row's organization); a job with no caller (dispatch outcomes, node
+  runners, `review_ready`) uses the task row's organization. Another
+  organization's task, dependency, comment, hold, delegation or policy
+  authorization answers exactly as a missing one, and a write for an
+  organization `orgs` does not hold is refused (`unknown_organization`, "no
+  task was changed") before anything changes. Task and comment replies keep
+  their shape: `org_id` is not added (owner decision). `task_fts` stays an
+  external-content index with no column: ranked search scopes its
+  `eligible` subquery by `org_id` before the candidate cap.
+  - **Owner decisions (2026-11-23).** (a) `idempotency_keys` stays hub-wide
+    until its `(org_id, principal, key)` rebuild; meanwhile another
+    organization's `task_add`, `task_update` and `delegate` keys are stored
+    with its organization prefixed (`org:<org>/<tool>:<key>`), so a key
+    reused in another organization never replays, and the default
+    organization keeps its `<tool>:<key>` form. (b) The GitHub and CI paths
+    without a caller stay default-only under the marker
+    `ORG-GITHUB-DEFAULT` (`TASK_ORG`), and their task scans filter
+    `t.org_id = 'default'`, so a delivery for a repository two
+    organizations bind only touches default-organization tasks; another
+    organization's caller is refused `queue_close_merged`
+    (`org_unsupported`). (c) A delegation to another organization's agent
+    is still allowed, but it can never be claimed: the delegate looks the
+    task up in its own organization and finds none, so it fails closed.
+    Delegations (like holds and policy authorizations, which carry no
+    `org_id` yet) are reached only through their task's organization.
+    (d) Task replies carry no `org_id`.
+  - The migration manifest (`export_migration_manifest`,
+    `compare_migration_manifests`, and both through `export_data`) is a
+    hub-wide snapshot: every organization's tasks and notes and the whole
+    event-log summary. Only the default organization, which operates the
+    hub, may build or compare one; another organization's caller is
+    refused (`org_unsupported`) before anything is read.
+  - `task_update` idempotency keys are the caller's: stored as
+    `task_update:<label>:<key>` (organization-prefixed outside the
+    default), with `%`, `:` and `/` in the label percent-escaped so two
+    labels never share a stored key. The task is looked up first, and a
+    stored reply is replayed only for the same task; the same key on
+    another task is refused (`idempotency_key_reused`). Old
+    `task_update:<key>` rows are not read.
+  - A conversation handoff's task is created by the handoff itself, under
+    `task_add`'s gate, with a key derived from the organization, actor,
+    conversation, title, project and priority and stored under its own tool
+    name (`conversation_handoff`). `task_add` refuses client keys starting
+    with `conversation-handoff:`.
+  - Deleting another organization's task deletes, in the same transaction,
+    the holds rooted in its subtree (and their members) and the policy
+    authorizations naming a task in it: with no `org_id` and no foreign key
+    to `tasks`, they would otherwise fall into the default organization.
+    They are deleted, not blanked, because a blanked row would still be a
+    default-organization row it never created. The default organization's
+    holds and authorizations outlive their task, as before.
+  - Work proposals carry no organization yet, so their actions are refused
+    to another organization's caller (`org_unsupported`) and a proposal's
+    task is always a default-organization task. A proposal or contract
+    marker on another organization's task fails the contract check with one
+    generic mismatch, without reading the default organization's proposals. Goals are not converted;
+    a goal action looks the task it names up in the caller's organization.
+  - Events stay in the default organization's ledger (`ORG-EVENT-DEFAULT`):
+    for another organization's task its titles, notes, comment bodies,
+    reasons, check names and caller-supplied labels are `null`, and the
+    originator is `system`.
+  - **Accepted residuals.** Task ids are hub-global, so the gaps in the ids
+    one organization sees reveal how many tasks the hub holds overall.
+    bm25's term statistics (document frequencies, average length) come
+    from the whole `task_fts` index, so another organization's tasks can
+    shift a score's value, never which rows match or are returned. A
+    delegation whose task was deleted has no organization left and stays
+    the default organization's, as does a default-organization hold or
+    policy authorization.
+  - The importer writes legacy tasks, dependencies, comments and threads to
+    `default`. A routine fire in another organization now creates its task
+    there. `crates/ua-tools/tests/tasks_tenant.rs` holds the upgrade and the
+    isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -961,7 +1059,7 @@ global key in the tree is classified:
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`, rebuilt in the standalone procedure `harness_config.v3.tenant_keys`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`, rebuilt in `harness_config.v3.tenant_keys`; the key stays a hub-global random id. |
 | `harness_config_report_window.node` | **Rebuild** | Key becomes `(org_id, node)`, rebuilt in `harness_config.v3.tenant_keys`, so the rate-limit upsert never updates another organization's window (node names are hub-wide, but a node can be reassigned to another organization's agent). |
-| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
+| `idempotency_keys.key` | **Rebuild** | Until the rebuild, another organization's `task_add`, `task_update` and `delegate` keys are stored as `org:<org>/<tool>:<key>` (the default keeps `<tool>:<key>`), so no reuse replays across organizations. Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Re-index** | An index, not a table key: `organization.v1` drops it and creates a unique index on `(org_id, launch_key)`. No rebuild. |
 | `event_log.dedupe_key UNIQUE` | Global, safe | Every producer builds it from hub-global identifiers (ULIDs, approval, run and delivery ids), never from client-chosen text alone, so two organizations cannot collide on it. A test asserts each producer's key format; a future producer that takes client text must prefix `org_id`. |
 | `web_search_cache (provider, query, max_results)` | **Rebuild** | Key becomes `(org_id, provider, query, max_results)`, rebuilt in the standalone procedure `web.v2.tenant_keys`. |
@@ -970,6 +1068,7 @@ global key in the tree is classified:
 | `routine_runs UNIQUE(routine_id, fire_key)`, `workflow_runs.run_id`, `workflow_checkpoints UNIQUE(run_id, seq)` | Global, safe | Led by a hub-global id (a routine's AUTOINCREMENT id, a hub-generated ULID run id), never client text alone, so two organizations cannot collide; no rebuild (`organization.v1.tools.routines`, `organization.v1.tools.workflows`). The child tables carry a same-organization trigger against their parent. |
 | `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
 | `approvals.id`; the gate's `(tool, payload, requested_by)` match | No key | AUTOINCREMENT id only, so no rebuild (`organization.v1.tools.approvals`, `approvals.v3.org_indexes`). The gate's match is a query key and filters on `org_id`. |
+| `tasks.id`, `task_dependencies.id`, `task_comments.id`, `task_comment_threads.task_id` | Global, safe | AUTOINCREMENT ids (and a thread keyed by its task's), never client text, so no rebuild (`organization.v1.tools.tasks`, `tasks.v2.org_scope`); the `*_org_parent` triggers keep every reference in one organization. The client-chosen comment idempotency key is unique per `(task_id, author, key)`, led by the hub-global task id. Accepted residual: the id gaps one organization sees reveal the hub's total task volume. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `autonomous_cycles.id`, `autonomous_cycle_transitions (cycle_id, idempotency_key)`, `autonomous_cycle_usage (cycle_id, usage_run_id, usage_id)` | Global, safe | A cycle id is hub-generated (random, never caller-chosen), and the transition and usage keys are led by it, so the caller-chosen idempotency and usage keys cannot collide across organizations; no rebuild (`organization.v1.tools.cycles`, `cycles.v2.org_scope`). The `*_org_parent` triggers keep transitions and usage in their cycle's organization. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
@@ -1494,7 +1593,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (converts with `tasks`), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; only the task organization binds a task or delegation), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (converts with the tasks family; reached through its task's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |

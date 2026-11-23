@@ -32,8 +32,13 @@ const B_REASON: &str = "Project Falcon acquisition halted";
 const B_CAP: &str = "falcon_secret_tool";
 const B_AGENT: &str = "Kestrel night-shift runner";
 
+/// The parts before this family's conversion: without its parts, and
+/// without the later `*.task_org` parts, whose triggers read its `org_id`.
 fn old_parts() -> Vec<ua_store::Part> {
-    ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
+    ua_tools::schema_parts()
+        .into_iter()
+        .filter(|p| !PARTS.contains(&p.name) && !p.name.ends_with(".task_org"))
+        .collect()
 }
 
 fn add_org(hub: &Hub, id: &str) {
@@ -268,9 +273,16 @@ fn a_legacy_database_upgrades_into_the_default_organization() {
                     )?;
                     assert_eq!(notnull, 1, "{t}");
                 }
+                // `cycles.v3.task_org` (applied after the tasks conversion)
+                // keeps a cycle's task in its own organization.
                 assert_eq!(
                     names(c, "trigger", "autonomous_cycles"),
-                    ["autonomous_cycles_org_exists", "autonomous_cycles_org_immutable"]
+                    [
+                        "autonomous_cycles_org_exists",
+                        "autonomous_cycles_org_immutable",
+                        "autonomous_cycles_task_org",
+                        "autonomous_cycles_task_org_update",
+                    ]
                 );
                 for t in CHILDREN {
                     assert_eq!(
@@ -451,9 +463,9 @@ async fn cycles_are_isolated_in_both_directions() {
     }
 }
 
-/// Tasks carry no organization yet (`ORG-TASK-DEFAULT`): to another
-/// organization a task, and the delegation tied to one, answers as a missing
-/// one, both when a cycle is started and when the green path judges it.
+/// A task, and the delegation tied to one, is read in the cycle's
+/// organization: to another organization it answers as a missing one, both
+/// when a cycle is started and when the green path judges it.
 #[tokio::test]
 async fn another_organization_never_reaches_a_task() {
     let h = H::new();
@@ -517,7 +529,7 @@ async fn organization_b_writes_land_in_organization_b() {
         .await;
     assert_eq!(out["cycle"]["state"], "blocked", "{out}");
     assert!(out["reason"].as_str().unwrap().contains(B_CAP), "organization B keeps its own text: {out}");
-    // Attempt-keyed usage needs a task, which organization B cannot bind.
+    // Attempt-keyed usage needs a task the caller owns; this cycle has none.
     let e = h
         .manage(
             &b,
@@ -740,7 +752,8 @@ async fn another_organizations_rows_under_a_cycle_id_are_never_read() {
         .write(move |tx| {
             tx.execute_batch(
                 "DROP TRIGGER autonomous_cycle_transitions_org_parent;
-                 DROP TRIGGER autonomous_cycle_usage_org_parent;",
+                 DROP TRIGGER autonomous_cycle_usage_org_parent;
+                 DROP TRIGGER autonomous_cycles_task_org;",
             )?;
             tx.execute(
                 "INSERT INTO autonomous_cycle_transitions

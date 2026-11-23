@@ -39,6 +39,8 @@ pub async fn poll_once(hub: &Hub) -> UaResult<Value> {
         Ok(None) => return Ok(json!({ "skipped": "no GitHub token configured" })),
         Err(e) => return Ok(json!({ "skipped": e.detail() })),
     };
+    // ORG-GITHUB-DEFAULT: the poller runs as the hub, so it polls the default
+    // organization's bound repositories and closes only its tasks.
     let repos = hub.db().read_async(|c| BoundRepo::all(c, crate::families::tasks::TASK_ORG)).await?;
     let mut reports = Vec::new();
     for repo in repos {
@@ -139,7 +141,7 @@ async fn poll_repo(hub: &Hub, gh: &GitHub, repo: &BoundRepo) -> UaResult<Value> 
                 rusqlite::params![name, new_etag, open_json, now],
             )?;
             if changed {
-                emit(tx, "agent.github.polled", event, GITHUB_ACTOR)?;
+                emit(tx, crate::families::tasks::TASK_ORG, "agent.github.polled", event, GITHUB_ACTOR)?;
             }
             Ok(())
         })

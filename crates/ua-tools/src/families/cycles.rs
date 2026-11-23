@@ -23,12 +23,11 @@
 //! transition or usage row always belongs to its cycle's organization (the
 //! `*_org_parent` triggers). Nothing runs a cycle without a caller.
 //!
-//! A cycle may name a task and a delegation. Tasks carry no organization yet
-//! (`ORG-TASK-DEFAULT`), and a delegation is always in its task's
-//! organization, so only a cycle in the task organization (`TASK_ORG`) can
-//! bind either: to any other organization a task or delegation id answers as
-//! a missing one, and its cycles never read the tasks table (attempt-keyed
-//! usage and the green path need a task, so they are refused there).
+//! A cycle may name a task and a delegation. Both are read in the cycle's
+//! organization: another organization's task, or a delegation of another
+//! organization's task, answers as a missing one (`cycles.v3.task_org` also
+//! keeps a cycle's task in its own organization). Attempt-keyed usage and
+//! the green path read the cycle's task in the cycle's organization.
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -44,7 +43,6 @@ use ua_store::{Procedure, SchemaPart, WriteTx};
 
 use crate::approvals::{self, GateOutcome};
 use crate::families::plans::{emit, ledger_text, parse_params, row_map, write_identity};
-use crate::families::tasks::TASK_ORG;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -140,6 +138,22 @@ CREATE TRIGGER IF NOT EXISTS autonomous_cycle_usage_org_parent_update
 BEFORE UPDATE OF cycle_id ON autonomous_cycle_usage
 WHEN EXISTS (SELECT 1 FROM autonomous_cycles WHERE id = NEW.cycle_id AND org_id IS NOT NEW.org_id)
 BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
+",
+};
+
+/// `cycles.v3.task_org`: a cycle's `task_id` points at a task in the cycle's
+/// own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "cycles.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org BEFORE INSERT ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org_update BEFORE UPDATE OF task_id ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
 ",
 };
 
@@ -336,14 +350,6 @@ fn updated_event(
     emit(tx, &caller, "agent.cycle.updated", payload)
 }
 
-/// Whether `org` can see the tasks table. ORG-TASK-DEFAULT: tasks carry no
-/// organization yet, so they (and the delegations tied to them) are all the
-/// task organization's; any other organization sees none. Take the task's
-/// own organization when tasks gain one.
-fn sees_tasks(org: &str) -> bool {
-    org == TASK_ORG
-}
-
 // ---------------------------------------------------------------------------
 // start
 
@@ -427,20 +433,26 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
-            // A task, and the delegation tied to one, is visible only to the
-            // task organization (`sees_tasks`): to any other it is missing.
+            // A task, and the delegation tied to one, is read in the cycle's
+            // organization: another organization's answers as a missing one.
             if let Some(t) = task_id
-                && (!sees_tasks(&org)
-                    || tx.query_row("SELECT 1 FROM tasks WHERE id = ?1", [t], |_| Ok(())).optional()?.is_none())
+                && tx
+                    .query_row("SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, t], |_| Ok(()))
+                    .optional()?
+                    .is_none()
             {
                 return Err(UaError::not_found(format!("no task with id {t}")));
             }
             if let Some(d) = delegation_id
-                && (!sees_tasks(&org)
-                    || tx
-                        .query_row("SELECT 1 FROM delegations WHERE id = ?1", [d], |_| Ok(()))
-                        .optional()?
-                        .is_none())
+                && tx
+                    .query_row(
+                        "SELECT 1 FROM delegations d JOIN tasks t ON t.id = d.task_id AND t.org_id = ?1 \
+                         WHERE d.id = ?2",
+                        params![org, d],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_none()
             {
                 return Err(UaError::not_found(format!("no delegation with id {d}")));
             }
@@ -892,13 +904,15 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
                         "attempt-keyed usage requires an authenticated caller",
                     ));
                 }
-                // Only a cycle in the task organization has a task to own.
-                let task_id = cycle.get("task_id").and_then(Value::as_i64).filter(|_| sees_tasks(&org));
+                // The cycle's task, in the cycle's organization.
+                let task_id = cycle.get("task_id").and_then(Value::as_i64);
                 let task: Option<(Option<String>, Option<String>)> = match task_id {
                     Some(t) => tx
-                        .query_row("SELECT claimed_by, current_run_id FROM tasks WHERE id = ?1", [t], |r| {
-                            Ok((r.get(0)?, r.get(1)?))
-                        })
+                        .query_row(
+                            "SELECT claimed_by, current_run_id FROM tasks WHERE org_id = ?1 AND id = ?2",
+                            params![org, t],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
                         .optional()?,
                     None => None,
                 };
@@ -1116,8 +1130,8 @@ pub(crate) fn validation_env(
 /// touching no red-tier path, and the configured validation command passing
 /// with the HEAD unchanged afterwards. A PR head that cannot be checked
 /// offline (a URL rather than the head commit SHA) is never eligible.
-/// `org` is the organization judging: a task it cannot see (`sees_tasks`)
-/// answers as one without a worktree.
+/// `org` is the organization judging: another organization's task answers
+/// as one without a worktree.
 async fn eligibility(
     hub: &Hub,
     org: &str,
@@ -1153,16 +1167,15 @@ async fn eligibility(
     reasons.push("no stop_reason recorded".into());
 
     let Some(task_id) = task_id else { return no(reasons, "cycle has no task") };
-    let visible = sees_tasks(org);
+    let task_org = org.to_string();
     let wt: Option<(Option<String>, Option<String>)> = hub
         .db()
         .read_async(move |c| {
-            if !visible {
-                return Ok(None);
-            }
-            Ok(c.query_row("SELECT worktree_path, branch FROM tasks WHERE id = ?1", [task_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            Ok(c.query_row(
+                "SELECT worktree_path, branch FROM tasks WHERE org_id = ?1 AND id = ?2",
+                params![task_org, task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?)
         })
         .await

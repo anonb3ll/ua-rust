@@ -200,8 +200,8 @@ pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload
     // delegation families share this function; the `agent.plan.*` and
     // `agent.cycle.*` callers pass another organization's free text and
     // labels through `ledger_text` or `ledger_label`, so only ids, counts and
-    // statuses reach this ledger. Delegations are still all in the task
-    // organization (`ORG-TASK-DEFAULT`).
+    // statuses reach this ledger. The delegation family scrubs another
+    // organization's payloads before calling it (`delegation::org_emit`).
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
@@ -244,7 +244,7 @@ pub(crate) fn ledger_text(org: &str, text: &str) -> Value {
 /// An optional caller-supplied label (a step owner, a claiming or finishing
 /// agent) for a plan event's payload, under the same rule as `ledger_text`:
 /// another organization's label is `null` in the default ledger.
-fn ledger_label(org: &str, label: Option<&str>) -> Value {
+pub(crate) fn ledger_label(org: &str, label: Option<&str>) -> Value {
     match label {
         Some(l) => ledger_text(org, l),
         None => Value::Null,
@@ -1009,7 +1009,7 @@ fn step_claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         }
         // The one claim gate, agent part: a paused, terminated or retired
         // agent claims no plan step either.
-        crate::families::governance::check_claim(tx, Some(&agent), None, false)?;
+        crate::families::governance::check_claim(tx, &org, Some(&agent), None, false)?;
         let n = tx.execute(
             "UPDATE plan_steps SET owner = ?3, status = 'doing', updated_at = ?4 \
              WHERE org_id = ?1 AND id = ?2 AND status IN ('open','failed') AND (owner IS NULL OR owner = ?3)",

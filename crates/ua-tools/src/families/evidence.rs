@@ -312,8 +312,13 @@ fn build_report(
     let chain_ok = chain["verified"].as_bool().unwrap_or(false);
 
     if let Some(pid) = a.project_id {
-        let notes: Option<Option<String>> =
-            c.query_row("SELECT notes FROM tasks WHERE id = ?1", [pid], |r| r.get(0)).optional()?;
+        let notes: Option<Option<String>> = c
+            .query_row(
+                "SELECT notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, pid],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(notes) = notes else { return Err(UaError::not_found(format!("no task with id {pid}"))) };
         if !has_project_marker(notes.as_deref().unwrap_or("")) {
             return Err(UaError::invalid(format!("task {pid} does not carry [project-spec]")));
@@ -324,16 +329,21 @@ fn build_report(
     let mut args: Vec<&dyn ToSql> = Vec::new();
     let visibility = reader.bindings();
     let claimed_by_marker = a.agent.as_ref().map(|agent| format!("claimed-by: {agent}"));
+    // Only the reader's organization's tasks.
+    let org_s = org.to_string();
     if let Some(pid) = &a.project_id {
         sql.push_str(
-            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks WHERE id = ? \
+            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks \
+             WHERE id = ? AND org_id = ? \
              UNION ALL SELECT t.id, s.depth + 1, s.path || '.' || printf('%020d', t.id) \
-             FROM tasks t JOIN sub s ON t.parent_id = s.id) \
-             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id WHERE 1=1",
+             FROM tasks t JOIN sub s ON t.parent_id = s.id WHERE t.org_id = ?) \
+             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id \
+             WHERE tasks.org_id = ?",
         );
-        args.push(pid);
+        args.extend([pid as &dyn ToSql, &org_s, &org_s, &org_s]);
     } else {
-        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE 1=1");
+        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE tasks.org_id = ?");
+        args.push(&org_s);
     }
     if a.item.is_some() {
         sql.push_str(" AND 0");
@@ -381,7 +391,13 @@ fn build_report(
 
     let mut tasks: Vec<Map<String, Value>> = {
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), row_map)?;
+        // A task row keeps the shape it had before tasks carried `org_id`.
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            row_map(r).map(|mut m| {
+                m.remove("org_id");
+                m
+            })
+        })?;
         rows.collect::<Result<_, _>>()?
     };
     let truncated = tasks.len() as i64 > limit;
@@ -626,25 +642,75 @@ fn fts_indexes(c: &Connection) -> UaResult<Vec<FtsIndex>> {
     Ok(out)
 }
 
-fn fts_check(c: &Connection, ix: &FtsIndex) -> UaResult<Value> {
-    let count = |sql: String| -> UaResult<i64> { Ok(c.query_row(&sql, [], |r| r.get(0))?) };
+/// One index's sync state, as `org` sees it. When the mirrored table carries
+/// `org_id` (`tasks`), the counts cover only `org`'s rows, so another
+/// organization's caller learns nothing about the hub's other rows. An index
+/// row whose table row is gone has no organization left: it is counted (and
+/// so repaired) only for the default organization.
+fn fts_check(c: &Connection, ix: &FtsIndex, org: &str) -> UaResult<Value> {
+    let count = |sql: String, scoped: bool| -> UaResult<i64> {
+        Ok(if scoped {
+            c.query_row(&sql, [org], |r| r.get(0))?
+        } else {
+            c.query_row(&sql, [], |r| r.get(0))?
+        })
+    };
     let (n, t, k) = (&ix.name, &ix.content, &ix.rowid);
-    let base = count(format!("SELECT COUNT(*) FROM \"{t}\""))?;
-    let indexed = count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""))?;
-    let orphans = count(format!(
-        "SELECT COUNT(*) FROM \"{n}_docsize\" d WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
-    ))?;
-    let missing = count(format!(
-        "SELECT COUNT(*) FROM \"{t}\" b WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
-    ))?;
+    let tenant: bool = c.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = 'org_id')"),
+        [],
+        |r| r.get(0),
+    )?;
+    let (base, indexed, missing) = if tenant {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\" WHERE org_id = ?1"), true)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                     WHERE EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id AND b.org_id = ?1)"
+                ),
+                true,
+            )?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b WHERE b.org_id = ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                true,
+            )?,
+        )
+    } else {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\""), false)?,
+            count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""), false)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b \
+                     WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                false,
+            )?,
+        )
+    };
+    let orphans = if tenant && org != ua_core::DEFAULT_ORG {
+        0
+    } else {
+        count(
+            format!(
+                "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                 WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
+            ),
+            false,
+        )?
+    };
     Ok(json!({
         "index": n,
         "table": t,
         "table_rows": base,
-        "indexed_rows": indexed,
+        "indexed_rows": indexed + if tenant { orphans } else { 0 },
         "missing_from_index": missing,
         "orphaned_in_index": orphans,
-        "in_sync": missing == 0 && orphans == 0 && base == indexed,
+        "in_sync": missing == 0 && orphans == 0 && (tenant || base == indexed),
     }))
 }
 
@@ -672,18 +738,20 @@ fn dangling(c: &Connection) -> UaResult<Value> {
 }
 
 async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let (fts, refs, chain, counts) = ctx
         .hub
         .db()
-        .read_async(|c| {
-            let fts: Vec<Value> = fts_indexes(c)?.iter().map(|ix| fts_check(c, ix)).collect::<UaResult<_>>()?;
+        .read_async(move |c| {
+            let fts: Vec<Value> =
+                fts_indexes(c)?.iter().map(|ix| fts_check(c, ix, &org)).collect::<UaResult<_>>()?;
             let counts: (i64, i64) = (
                 c.query_row(
                     "SELECT COUNT(*) FROM memory WHERE id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",
                     [],
                     |r| r.get(0),
                 )?,
-                c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM tasks WHERE org_id = ?1", [&org], |r| r.get(0))?,
             );
             Ok((fts, dangling(c)?, chain_integrity(c)?, counts))
         })

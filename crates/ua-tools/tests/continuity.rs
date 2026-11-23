@@ -732,6 +732,62 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
     }
 }
 
+/// A handoff's key is the hub's own: `task_add` refuses a client key in the
+/// handoff form, so the key older hubs derived (from the conversation, title,
+/// project and priority alone) can neither replay a stored task id nor be
+/// squatted for the real handoff to link to. The handoff stays idempotent
+/// for its own retries, per actor.
+#[tokio::test]
+async fn a_conversation_handoff_key_can_be_neither_probed_nor_squatted() {
+    use sha2::Digest;
+    let h = H::new();
+    let conv = h
+        .ok(&builder(), "message_send", json!({ "act": "request", "to_agent": "builder-2", "body": "plan" }))
+        .await["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let material = json!([conv, "Plan it", "", "high"]).to_string();
+    let derived =
+        format!("conversation-handoff:{}", &hex::encode(sha2::Sha256::digest(material.as_bytes()))[..40]);
+    // An older hub's stored reply under the derived key.
+    let secret_task = h.task("handed off earlier", None).await;
+    h.sql(&format!(
+        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
+         VALUES ('task_add:{derived}', 'task_add', '{{\"id\":{secret_task}}}', 'x')"
+    ));
+    let tasks_before = h.n("SELECT COUNT(*) FROM tasks");
+
+    // A prober outside the conversation, with the derived key or any key in
+    // that form, gets no task id and creates nothing.
+    let prober = caller("builder-3", ActorKind::Agent, Profile::Developer);
+    for key in [derived.as_str(), "conversation-handoff:squat"] {
+        let e = h
+            .call(&prober, "task_add", json!({ "title": "Plan it", "idempotency_key": key }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "invalid_argument", "{e}");
+        assert!(!e.to_string().contains(&secret_task.to_string()), "{e}");
+    }
+    assert_eq!(h.n("SELECT COUNT(*) FROM tasks"), tasks_before);
+
+    // The real handoff creates its own task, and replays it on a retry.
+    let args = json!({ "conversation_id": conv, "title": "Plan it", "priority": "high" });
+    let created = h.act_ok(&other(), "conversation_handoff", args.clone()).await;
+    let t = created["task_id"].as_i64().unwrap();
+    assert_eq!(created["created"], true, "{created}");
+    assert_ne!(t, secret_task);
+    let again = h.act_ok(&other(), "conversation_handoff", args.clone()).await;
+    assert_eq!((again["task_id"].as_i64(), again["created"].as_bool()), (Some(t), Some(false)));
+    assert_eq!(h.n("SELECT COUNT(*) FROM tasks"), tasks_before + 1);
+    // Stored under the handoff's own tool, never task_add.
+    assert_eq!(h.n("SELECT COUNT(*) FROM idempotency_keys WHERE tool = 'conversation_handoff'"), 1);
+    // Another participant's handoff is its own.
+    let theirs = h.act_ok(&builder(), "conversation_handoff", args).await;
+    assert_eq!(theirs["created"], true, "{theirs}");
+    assert_ne!(theirs["task_id"].as_i64(), Some(t));
+}
+
 // --- queue closure ------------------------------------------------------------------
 
 fn days_ago(days: i64) -> String {

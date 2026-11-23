@@ -380,6 +380,7 @@ pub struct FileArgs {
 
 /// `coordination_manage(action="work_proposal_file")`.
 pub(crate) async fn work_proposal_file(ctx: ToolCtx, a: FileArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     let named = a.proposer.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let who = match verified(&ctx.caller) {
         Some(v) => {
@@ -530,8 +531,25 @@ fn apply_edits(i: &Item, edits: Option<&ItemEdits>) -> UaResult<(Clean, bool)> {
     Ok((clean_item(&merged, i.idx as usize)?, true))
 }
 
+/// Work proposals carry no organization yet (they convert in a later
+/// change), so they are the default organization's: another organization's
+/// caller is refused before anything is read or written, rather than see,
+/// file into or decide the default organization's queue. A proposal's
+/// spawned task is therefore always a default-organization task.
+fn default_only(ctx: &ToolCtx) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "work proposals belong to the default organization until they carry an organization; nothing was \
+             read or changed",
+        ));
+    }
+    Ok(())
+}
+
 /// `coordination_manage(action="work_proposal_decide")`.
 pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     let who = approver(&ctx, a.approver.as_deref())?;
     if a.decisions.is_empty() {
         return Err(UaError::invalid("decide needs at least one decision {index, approve, edits?}"));
@@ -587,7 +605,12 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                 let scope_json = canonical(&frozen.scope);
                 let notes =
                     compose_task_notes(&frozen.notes, &scope_json, &pid, d.index, &frozen.digest, &p.reporting_mode);
-                let task_id = insert_task(tx, NewTask::simple(frozen.title.clone(), notes, &frozen.priority), &who)?;
+                let task_id = insert_task(
+                    tx,
+                    ua_core::DEFAULT_ORG,
+                    NewTask::simple(frozen.title.clone(), notes, &frozen.priority),
+                    &who,
+                )?;
                 tx.execute(
                     "UPDATE work_proposal_items SET title = ?3, notes = ?4, scope_json = ?5, priority = ?6, \
                      contract_digest = ?7, edited = ?8, status = 'approved', approving_by = ?9, approving_at = ?10, \
@@ -636,6 +659,7 @@ pub struct WithdrawArgs {
 
 /// `coordination_manage(action="work_proposal_withdraw")`.
 pub(crate) async fn work_proposal_withdraw(ctx: ToolCtx, a: WithdrawArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     let who = crate::families::tasks::acting_identity(&ctx.caller, a.actor.as_deref())?;
     let reason = super::clean_reason(a.reason.as_deref(), None)?;
     let pid = a.proposal_id.trim().to_string();
@@ -702,6 +726,7 @@ pub struct ListArgs {
 
 /// `coordination_manage(action="work_proposal_get")`.
 pub(crate) async fn work_proposal_get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     ctx.hub
         .db()
         .read_async(move |c| Ok(json!({ "proposal": public(c, &load(c, &a.proposal_id)?, true)? })))
@@ -710,6 +735,7 @@ pub(crate) async fn work_proposal_get(ctx: ToolCtx, a: GetArgs) -> UaResult<Valu
 
 /// `coordination_manage(action="work_proposal_list")`.
 pub(crate) async fn work_proposal_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     if let Some(s) = &a.status
         && !STATUSES.contains(&s.as_str())
     {
@@ -747,9 +773,12 @@ pub struct RecoverArgs {
 fn find_task(c: &Connection, pid: &str, idx: i64, digest: &str) -> UaResult<Option<i64>> {
     let marker = format!("[proposal: {pid}#{idx}]");
     let contract = format!("[contract: {digest}]");
-    let mut stmt = c.prepare("SELECT id, notes FROM tasks WHERE instr(notes, ?1) > 0 ORDER BY id")?;
-    let rows: Vec<(i64, Option<String>)> =
-        stmt.query_map([&marker], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    // A proposal's task is always a default-organization task ([`default_only`]).
+    let mut stmt =
+        c.prepare("SELECT id, notes FROM tasks WHERE org_id = ?2 AND instr(notes, ?1) > 0 ORDER BY id")?;
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map(params![&marker, ua_core::DEFAULT_ORG], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
     Ok(rows.into_iter().find(|(_, n)| n.as_deref().unwrap_or("").contains(&contract)).map(|(id, _)| id))
 }
 
@@ -757,6 +786,7 @@ fn find_task(c: &Connection, pid: &str, idx: i64, digest: &str) -> UaResult<Opti
 /// in `approving`: forward to `approved` when the task for the item's current
 /// contract exists, else back to `pending`. Idempotent.
 pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaResult<Value> {
+    default_only(&ctx)?;
     let older = a.older_than_s.unwrap_or(DEFAULT_STALE_S);
     if older < 0 {
         return Err(UaError::invalid("older_than_s must be a non-negative number"));
@@ -841,12 +871,16 @@ fn mismatch(msg: String) -> UaError {
 /// [`check_contract`] over the task's stored title and notes. `None` for a
 /// task that does not exist (the caller reports that) or carries no
 /// contract.
-pub(crate) fn task_contract(c: &Connection, task_id: i64) -> UaResult<Option<String>> {
+pub(crate) fn task_contract(c: &Connection, org: &str, task_id: i64) -> UaResult<Option<String>> {
     let row: Option<(String, Option<String>)> = c
-        .query_row("SELECT title, notes FROM tasks WHERE id = ?1", [task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(
+            "SELECT title, notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+            params![org, task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     match row {
-        Some((title, notes)) => check_contract(c, task_id, &title, notes.as_deref().unwrap_or("")),
+        Some((title, notes)) => check_contract(c, org, task_id, &title, notes.as_deref().unwrap_or("")),
         None => Ok(None),
     }
 }
@@ -855,8 +889,15 @@ pub(crate) fn task_contract(c: &Connection, task_id: i64) -> UaResult<Option<Str
 /// contract. A task with neither a proposal nor a contract marker passes
 /// (`None`). For a task that matches, returns its contract block: the
 /// approved work order, without anything appended after [`CONTRACT_END`].
+///
+/// Work proposals carry no organization yet and every proposal's task is a
+/// default-organization task, so for a task of organization `org` outside
+/// the default one nothing is looked up: no marker passes, and any proposal
+/// or contract marker is refused with one generic mismatch, never the
+/// default organization's proposal items.
 pub(crate) fn check_contract(
     c: &Connection,
+    org: &str,
     task_id: i64,
     title: &str,
     notes: &str,
@@ -867,6 +908,15 @@ pub(crate) fn check_contract(
     let proposals: BTreeSet<(String, String)> =
         prx.captures_iter(notes).map(|m| (m[1].to_string(), m[2].to_string())).collect();
     let contracts: Vec<String> = crx.captures_iter(notes).map(|m| m[1].to_string()).collect();
+    if org != ua_core::DEFAULT_ORG {
+        if proposals.is_empty() && contracts.is_empty() {
+            return Ok(None);
+        }
+        return Err(mismatch(format!(
+            "task {task_id} carries a work-proposal contract marker, which no task outside the default \
+             organization can hold; the claim is refused"
+        )));
+    }
     if proposals.is_empty() && contracts.is_empty() {
         // A task an approval spawned must keep its markers: rewriting the
         // notes away does not take it out of its contract.
