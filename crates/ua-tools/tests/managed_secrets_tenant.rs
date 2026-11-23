@@ -792,15 +792,19 @@ async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
     let coord = |c: Caller| Caller { profile: Profile::Coordinator, ..c };
     for who in [agent(ORG_B), human(ORG_B)] {
         let (gw, who) = (dev(who.clone()), coord(who));
-        for args in [
-            json!({ "server": "docs", "tool": "echo" }),
-            json!({ "action": "list", "server": "docs", "live": true }),
-        ] {
-            let e = h.err(&gw, "mcp_gateway", args.clone()).await;
-            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+        // mcp_gateway exists only in a build with the `mcp-gateway` feature;
+        // the relay half runs in every build.
+        if cfg!(feature = "mcp-gateway") {
+            for args in [
+                json!({ "server": "docs", "tool": "echo" }),
+                json!({ "action": "list", "server": "docs", "live": true }),
+            ] {
+                let e = h.err(&gw, "mcp_gateway", args.clone()).await;
+                assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+            }
+            // A static list reads no secret and is not refused.
+            h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "docs" })).await;
         }
-        // A static list reads no secret and is not refused.
-        h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "docs" })).await;
 
         for (action, params) in [
             ("request_send", json!({ "draft_id": 1 })),
@@ -812,8 +816,11 @@ async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
     }
     // The default organization's caller passes the check and fails later,
     // for the ordinary reason (no secret stored, no such draft).
-    let e = h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "docs", "tool": "echo" })).await;
-    assert_eq!(reason(&e), "secret_unavailable", "{e:?}");
+    if cfg!(feature = "mcp-gateway") {
+        let e =
+            h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "docs", "tool": "echo" })).await;
+        assert_eq!(reason(&e), "secret_unavailable", "{e:?}");
+    }
     let e = h
         .err(
             &coord(agent(DEFAULT_ORG)),
