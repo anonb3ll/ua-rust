@@ -38,10 +38,12 @@ pub(crate) enum Kind {
     /// because `dispatch_runs` are not imported. Legacy tasks are imported
     /// into the default organization.
     Tasks,
-    /// Task dependencies, comments and comment threads: imported into the
-    /// default organization, with their tasks.
+    /// Task dependencies, comments, comment threads, workflow records,
+    /// checks and hold members: imported into the default organization, with
+    /// their tasks.
     TaskChildren,
-    /// Task subtree holds: require valid `status` and refuse duplicate active holds.
+    /// Task subtree holds: require valid `status` and refuse duplicate active
+    /// holds. Imported into the default organization.
     TaskHolds,
     /// Project repository bindings: validate `project` slug and `repo`, and
     /// normalize `default_branch` (clearing invalid values to NULL). Legacy
@@ -74,6 +76,7 @@ impl Kind {
             Kind::GraphCanvas
                 | Kind::Tasks
                 | Kind::TaskChildren
+                | Kind::TaskHolds
                 | Kind::SkillRegistry
                 | Kind::ProjectRepoBindings
                 | Kind::HarnessConfig
@@ -137,8 +140,8 @@ pub(crate) const MAPS: &[TableMap] = &[
         refs: &[TASK_REF, Ref { col: "goal_id", table: "goals", key: "id" }],
         ..plain("task_goal_links")
     },
-    TableMap { refs: &[TASK_REF], ..plain("task_workflow") },
-    TableMap { refs: &[TASK_REF], ..plain("task_checks") },
+    TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_workflow") },
+    TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_checks") },
     // A handoff note keeps its task id as a record even when the task is gone.
     plain("session_handoff_notes"),
     TableMap { kind: Kind::Plans, ..plain("plans") },
@@ -155,6 +158,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { kind: Kind::TaskHolds, ..plain("task_holds") },
     TableMap {
         refs: &[Ref { col: "hold_id", table: "task_holds", key: "id" }, TASK_REF],
+        kind: Kind::TaskChildren,
         ..plain("task_hold_members")
     },
     TableMap { kind: Kind::ProjectRepoBindings, ..plain("project_repo_bindings") },

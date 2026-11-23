@@ -267,7 +267,10 @@ fn list(conn: &Connection, org: &str, a: ListArgs, pin: Option<Option<i64>>) -> 
                 crate::families::continuity::STAGES
             )));
         }
-        f.push("id IN (SELECT task_id FROM task_workflow WHERE stage = ?)", [Sql::Text(stage.to_string())]);
+        f.push(
+            "id IN (SELECT task_id FROM task_workflow WHERE org_id = ? AND stage = ?)",
+            [Sql::Text(org.to_string()), Sql::Text(stage.to_string())],
+        );
     }
     if let Some(p) = a.parent_id {
         f.push("parent_id = ?", [Sql::Integer(p)]);

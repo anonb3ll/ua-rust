@@ -34,7 +34,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use super::lifecycle::stop_runs;
 use super::{clean_reason, now};
@@ -44,6 +44,68 @@ use crate::families::node_queue;
 use crate::families::tasks::{acting_identity, subtree_ids};
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
+
+/// `organization.v1.tools.holds`: `org_id` on `task_holds` and
+/// `task_hold_members`, and their generated `*_org_exists` /
+/// `*_org_immutable` triggers. No key rebuild: a hold id is a hub-global
+/// AUTOINCREMENT id, a member's key `(hold_id, task_id)` is led by it, and the
+/// one-active-hold-per-root index stays keyed by the hub-global root task id.
+/// The column fills with the default organization here; [`HOLDS_ORG_SCOPE`]
+/// then moves each row to its root task's organization. Applied after the
+/// governance parts and `tasks.v2.org_scope`.
+pub const HOLDS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.holds", &["task_holds", "task_hold_members"]);
+
+/// `governance.v3.holds_org_scope`: holds written before
+/// [`HOLDS_TENANT_PART`] move to their root task's organization (a hold whose
+/// root is gone stays in the default organization) and members to their
+/// hold's; indexes led by `org_id` for the hold list and the member lookup
+/// of the claim gate; and triggers that keep a hold's root task, a member's
+/// task and a member's hold inside the row's organization (`root_task_id`
+/// has no foreign key, and the members' foreign keys alone would accept
+/// another organization's row). The backfill drops each `*_org_immutable`
+/// trigger for its one `UPDATE` and puts the same trigger back, in this
+/// part's transaction.
+pub const HOLDS_ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "governance.v3.holds_org_scope",
+    sql: concat!(
+        "
+DROP TRIGGER task_holds_org_immutable;
+UPDATE task_holds SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = task_holds.root_task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_holds.root_task_id AND t.org_id IS NOT task_holds.org_id);
+",
+        crate::families::continuity::org_immutable!("task_holds"),
+        "
+DROP TRIGGER task_hold_members_org_immutable;
+UPDATE task_hold_members SET org_id = (SELECT h.org_id FROM task_holds h WHERE h.id = task_hold_members.hold_id)
+WHERE EXISTS (
+    SELECT 1 FROM task_holds h WHERE h.id = task_hold_members.hold_id AND h.org_id IS NOT task_hold_members.org_id
+);
+",
+        crate::families::continuity::org_immutable!("task_hold_members"),
+        "
+CREATE INDEX IF NOT EXISTS idx_task_holds_org_status ON task_holds(org_id, status, root_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_hold_members_org_task ON task_hold_members(org_id, task_id);
+
+CREATE TRIGGER IF NOT EXISTS task_holds_org_parent BEFORE INSERT ON task_holds
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.root_task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_holds_org_parent_update BEFORE UPDATE OF root_task_id ON task_holds
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.root_task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_hold_members_org_parent BEFORE INSERT ON task_hold_members
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM task_holds WHERE id = NEW.hold_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or hold belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_hold_members_org_parent_update
+BEFORE UPDATE OF task_id, hold_id ON task_hold_members
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM task_holds WHERE id = NEW.hold_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task or hold belongs to another organization'); END;
+"
+    ),
+};
 
 pub const CHANNEL: &str = "agent.task.hold";
 const MODES: [&str; 4] = ["pause", "cancel", "resume", "restore"];
@@ -58,9 +120,8 @@ const NO_AUTO_RELEASE_CANCEL: &str = "release_policy after_active_runs_finish ca
 #[derive(Debug, Clone)]
 struct Hold {
     id: i64,
-    /// The organization of the hold's root task (`task_holds` carries no
-    /// `org_id` yet); a hold whose root is gone is the default
-    /// organization's.
+    /// The hold's organization (`task_holds.org_id`): its root task's, kept
+    /// when the root is deleted.
     org: String,
     root_task_id: i64,
     mode: String,
@@ -75,14 +136,7 @@ struct Hold {
 }
 
 const HOLD_COLS: &str = "h.id, h.root_task_id, h.mode, h.status, h.reason, h.release_policy, h.created_by, \
-     h.created_at, h.released_by, h.released_at, h.cancelling_at, \
-     COALESCE((SELECT rt.org_id FROM tasks rt WHERE rt.id = h.root_task_id), 'default')";
-
-/// A hold's organization, as a SQL expression over `h`: its root task's.
-/// Until `task_holds` carries `org_id` (a later change), a hold whose root
-/// was deleted has no organization left and stays the default
-/// organization's, as every hold was before.
-const HOLD_ORG: &str = "COALESCE((SELECT rt.org_id FROM tasks rt WHERE rt.id = h.root_task_id), 'default')";
+     h.created_at, h.released_by, h.released_at, h.cancelling_at, h.org_id";
 
 fn hold_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hold> {
     Ok(Hold {
@@ -110,17 +164,13 @@ fn holds_where(c: &Connection, filter: &str, p: impl rusqlite::Params) -> UaResu
 /// Hold `id` of organization `org`; another organization's hold answers as
 /// a missing one.
 fn load_hold(c: &Connection, org: &str, id: i64) -> UaResult<Option<Hold>> {
-    Ok(holds_where(c, &format!("h.id = ?1 AND {HOLD_ORG} = ?2"), params![id, org])?.into_iter().next())
+    Ok(holds_where(c, "h.org_id = ?2 AND h.id = ?1", params![id, org])?.into_iter().next())
 }
 
 fn active_for_root(c: &Connection, org: &str, root: i64) -> UaResult<Option<Hold>> {
-    Ok(holds_where(
-        c,
-        &format!("h.root_task_id = ?1 AND h.status = 'active' AND {HOLD_ORG} = ?2"),
-        params![root, org],
-    )?
-    .into_iter()
-    .next())
+    Ok(holds_where(c, "h.org_id = ?2 AND h.root_task_id = ?1 AND h.status = 'active'", params![root, org])?
+        .into_iter()
+        .next())
 }
 
 /// Whether a cancel on this hold is still recording its requests.
@@ -130,18 +180,19 @@ fn cancelling(h: &Hold) -> bool {
 }
 
 /// Members with live work: a claimed `doing` row on a live lease, a live
-/// dispatch run, or a queued or claimed node item.
+/// dispatch run, or a queued or claimed node item. Only the hold's own
+/// organization's members count.
 fn live_run_task_ids(c: &Connection, h: &Hold) -> UaResult<Vec<i64>> {
     let mut stmt = c.prepare(
         "SELECT t.id FROM task_hold_members m JOIN tasks t ON t.id = m.task_id AND t.org_id = ?3
-         WHERE m.hold_id = ?1 AND t.status = 'doing' AND t.claimed_by IS NOT NULL
+         WHERE m.org_id = ?3 AND m.hold_id = ?1 AND t.status = 'doing' AND t.claimed_by IS NOT NULL
            AND t.lock_expires_at IS NOT NULL AND t.lock_expires_at > ?2
          UNION
          SELECT d.task_id FROM dispatch_runs d JOIN task_hold_members m ON m.task_id = d.task_id
-         WHERE m.hold_id = ?1 AND d.state IN ('claimed','launched','running')
+         WHERE m.org_id = ?3 AND m.hold_id = ?1 AND d.state IN ('claimed','launched','running')
          UNION
          SELECT n.task_id FROM node_dispatch n JOIN task_hold_members m ON m.task_id = n.task_id
-         WHERE m.hold_id = ?1 AND n.status IN ('queued','claimed')
+         WHERE m.org_id = ?3 AND m.hold_id = ?1 AND n.status IN ('queued','claimed')
          ORDER BY 1",
     )?;
     let ids = stmt.query_map(params![h.id, now(), h.org], |r| r.get(0))?.collect::<Result<_, _>>()?;
@@ -179,8 +230,8 @@ fn release_in_tx(
 ) -> UaResult<()> {
     let n = tx.execute(
         "UPDATE task_holds SET status = 'released', released_by = ?2, released_at = ?3 \
-         WHERE id = ?1 AND status = 'active'",
-        params![h.id, who, now()],
+         WHERE org_id = ?4 AND id = ?1 AND status = 'active'",
+        params![h.id, who, now(), h.org],
     )?;
     if n != 1 {
         return Err(UaError::conflict(format!("hold #{} changed while it was being released; retry", h.id)));
@@ -208,11 +259,15 @@ fn auto_release(tx: &mut WriteTx<'_>, h: &Hold) -> UaResult<()> {
     )
 }
 
-/// Release every due `after_active_runs_finish` hold: the read-time check.
-/// Hub maintenance over every organization's holds; each release acts in
-/// its hold's own organization.
-fn settle_due(tx: &mut WriteTx<'_>) -> UaResult<()> {
-    for h in holds_where(tx, "h.status = 'active' AND h.release_policy = 'after_active_runs_finish'", [])? {
+/// Release every due `after_active_runs_finish` hold of organization `org`:
+/// the read-time check. Another organization's due holds are released when
+/// that organization reads its holds or a claim meets them.
+fn settle_due(tx: &mut WriteTx<'_>, org: &str) -> UaResult<()> {
+    for h in holds_where(
+        tx,
+        "h.org_id = ?1 AND h.status = 'active' AND h.release_policy = 'after_active_runs_finish'",
+        [org],
+    )? {
         if live_run_task_ids(tx, &h)?.is_empty() {
             auto_release(tx, &h)?;
         }
@@ -225,10 +280,8 @@ fn settle_due(tx: &mut WriteTx<'_>) -> UaResult<()> {
 pub(crate) fn subtree_block(tx: &mut WriteTx<'_>, org: &str, task_id: i64) -> UaResult<Option<String>> {
     let rows = holds_where(
         tx,
-        &format!(
-            "h.status = 'active' AND {HOLD_ORG} = ?2 \
-             AND h.id IN (SELECT hold_id FROM task_hold_members WHERE task_id = ?1) ORDER BY h.id"
-        ),
+        "h.org_id = ?2 AND h.status = 'active' \
+         AND h.id IN (SELECT hold_id FROM task_hold_members WHERE org_id = ?2 AND task_id = ?1) ORDER BY h.id",
         params![task_id, org],
     )?;
     for h in rows {
@@ -263,7 +316,7 @@ fn members(c: &Connection, org: &str, hold_id: i64) -> UaResult<Vec<Member>> {
         "SELECT m.task_id, m.status_at_hold, m.cancel_requested_by_hold, m.cancelled_run_id, m.cancelled_run_agent, \
          m.restored_at, t.status, t.claimed_by FROM task_hold_members m \
          JOIN tasks t ON t.id = m.task_id AND t.org_id = ?2 \
-         WHERE m.hold_id = ?1 ORDER BY m.task_id",
+         WHERE m.org_id = ?2 AND m.hold_id = ?1 ORDER BY m.task_id",
     )?;
     let rows = stmt
         .query_map(params![hold_id, org], |r| {
@@ -368,17 +421,16 @@ pub(crate) async fn task_holds(ctx: ToolCtx, a: HoldsArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            settle_due(tx)?;
+            settle_due(tx, &org)?;
             let rows = holds_where(
                 tx,
-                &format!(
-                    "{HOLD_ORG} = ?4 AND (?1 = 'all' OR h.status = ?1) AND (?2 IS NULL OR h.root_task_id = ?2) \
-                     ORDER BY h.id DESC LIMIT ?3"
-                ),
+                "h.org_id = ?4 AND (?1 = 'all' OR h.status = ?1) AND (?2 IS NULL OR h.root_task_id = ?2) \
+                 ORDER BY h.id DESC LIMIT ?3",
                 params![view, a.root_task_id, cap + 1, org],
             )?;
             let truncated = rows.len() as i64 > cap;
-            let holds = rows.iter().take(cap as usize).map(|h| serialize(tx, h)).collect::<UaResult<Vec<_>>>()?;
+            let holds =
+                rows.iter().take(cap as usize).map(|h| serialize(tx, h)).collect::<UaResult<Vec<_>>>()?;
             Ok(json!({ "holds": holds, "truncated": truncated }))
         })
         .await
@@ -390,7 +442,7 @@ pub(crate) async fn task_hold_get(ctx: ToolCtx, a: HoldGetArgs) -> UaResult<Valu
     ctx.hub
         .db()
         .write_async(move |tx| {
-            settle_due(tx)?;
+            settle_due(tx, &org)?;
             get(tx, &org, a.hold_id)
         })
         .await
@@ -428,15 +480,15 @@ fn create(
     who: &str,
 ) -> UaResult<i64> {
     tx.execute(
-        "INSERT INTO task_holds (root_task_id, mode, status, reason, release_policy, created_by, created_at, \
-         cancelling_at) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7)",
-        params![root, mode, reason, policy, who, now(), (mode == "cancel").then(now)],
+        "INSERT INTO task_holds (org_id, root_task_id, mode, status, reason, release_policy, created_by, \
+         created_at, cancelling_at) VALUES (?8, ?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7)",
+        params![root, mode, reason, policy, who, now(), (mode == "cancel").then(now), org],
     )?;
     let id = tx.last_insert_rowid();
     for task_id in subtree_ids(tx, org, root)? {
         tx.execute(
-            "INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) \
-             SELECT ?1, id, status FROM tasks WHERE org_id = ?3 AND id = ?2",
+            "INSERT INTO task_hold_members (org_id, hold_id, task_id, status_at_hold) \
+             SELECT ?3, ?1, id, status FROM tasks WHERE org_id = ?3 AND id = ?2",
             params![id, task_id, org],
         )?;
     }
@@ -491,8 +543,8 @@ fn restore_in_tx(
             continue;
         }
         tx.execute(
-            "UPDATE task_hold_members SET restored_at = ?3 WHERE hold_id = ?1 AND task_id = ?2",
-            params![h.id, m.task_id, stamp],
+            "UPDATE task_hold_members SET restored_at = ?3 WHERE org_id = ?4 AND hold_id = ?1 AND task_id = ?2",
+            params![h.id, m.task_id, stamp, h.org],
         )?;
         let mut v = with("closed", "the cancelled run has closed; the task keeps its status".into());
         v["status"] = json!(m.status);
@@ -548,7 +600,18 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             let (verb, who, reason, org) = (v2, w2, r2, o2);
             crate::families::tasks::require_org(tx, &org)?;
-            let existing = active_for_root(tx, &org, root)?;
+            let mut existing = active_for_root(tx, &org, root)?;
+            // A due after_active_runs_finish hold would release itself on the
+            // next read. Settle it first, so a pause or cancel takes effect
+            // instead of finding a hold that is about to go.
+            if matches!(verb.as_str(), "pause" | "cancel")
+                && let Some(h) = &existing
+                && h.release_policy == "after_active_runs_finish"
+                && live_run_task_ids(tx, h)?.is_empty()
+            {
+                auto_release(tx, h)?;
+                existing = None;
+            }
             // Existing holds can outlive their roots. Releasing one still
             // uses its stored creator and the same release authority check.
             if existing.is_none() || matches!(verb.as_str(), "pause" | "cancel") {
@@ -574,8 +637,8 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
                         }
                         out.hold_id = h.id;
                         tx.execute(
-                            "UPDATE task_holds SET mode = 'cancel', cancelling_at = ?2 WHERE id = ?1",
-                            params![h.id, now()],
+                            "UPDATE task_holds SET mode = 'cancel', cancelling_at = ?2 WHERE org_id = ?3 AND id = ?1",
+                            params![h.id, now(), org],
                         )?;
                     }
                     None => {
@@ -781,11 +844,14 @@ async fn request_cancels(
             for (run_id, agent, task_id) in &flagged {
                 tx.execute(
                     "UPDATE task_hold_members SET cancel_requested_by_hold = 1, cancelled_run_id = ?3, \
-                     cancelled_run_agent = ?4 WHERE hold_id = ?1 AND task_id = ?2",
-                    params![hold_id, task_id, run_id, agent],
+                     cancelled_run_agent = ?4 WHERE org_id = ?5 AND hold_id = ?1 AND task_id = ?2",
+                    params![hold_id, task_id, run_id, agent, org3],
                 )?;
             }
-            tx.execute("UPDATE task_holds SET cancelling_at = NULL WHERE id = ?1", [hold_id])?;
+            tx.execute(
+                "UPDATE task_holds SET cancelling_at = NULL WHERE org_id = ?2 AND id = ?1",
+                params![hold_id, org3],
+            )?;
             record(
                 tx,
                 &org3,

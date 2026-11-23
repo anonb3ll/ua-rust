@@ -410,6 +410,27 @@ from its commit history.
   itself under `task_add`'s gate, with a key scoped to the organization and
   actor stored under its own tool name, while `task_add` refuses client keys
   starting with `conversation-handoff:`.
+- The task workflow and hold tables are organization-scoped:
+  `organization.v1.tools.continuity` adds `org_id` and the organization
+  triggers to `task_workflow`, `task_checks` and `review_ready_notices`,
+  and `organization.v1.tools.holds` to `task_holds` and
+  `task_hold_members`. `continuity.v2.org_scope` and
+  `governance.v3.holds_org_scope` move existing rows to their task's (a
+  hold's root task's, a member's hold's) organization, a row whose task is
+  gone staying in `default`, and add indexes led by `org_id` and
+  same-organization triggers for every row's task, a hold's root and a
+  member's hold. No key rebuild: every key is led by a hub-global task or
+  hold id. The workflow record, checks and their verification, the
+  review-at-head merge gate, `review_ready` and its notices, the session
+  packet's workflow block, deliverables' workflow head, `task_list`'s stage
+  filter and every hold read, write and claim check filter on the
+  organization; a hold's organization is its own column instead of its root
+  task's. The read-time release of `after_active_runs_finish` holds settles
+  only the reader's organization's holds. Head re-verification from the
+  GitHub webhook and poller stays default-only (`ORG-GITHUB-DEFAULT`).
+  Replies keep their shape. The importer writes legacy workflow records,
+  checks, holds and members to `default`. Results and events in the default
+  organization are unchanged.
 - Delegations are organization-scoped: `organization.v1.tools.delegation`
   adds `org_id` and the organization triggers to `delegations`, and
   `delegation.v2.org_scope` moves each existing delegation to its task's
@@ -594,10 +615,10 @@ from its commit history.
   another organization's caller is refused (`org_unsupported`) by the
   proposal actions and `queue_close_merged`, and the hub's GitHub paths only
   read and close default-organization tasks (`ORG-GITHUB-DEFAULT`).
-- Task holds and policy authorizations carry no organization yet; each is
-  reached only through its task's organization, so another organization's
-  hold or authorization answers as a missing one. Delegation to another
-  organization's agent is still allowed; that agent can never claim it.
+- Policy authorizations carry no organization yet; each is reached only
+  through its task's organization, so another organization's authorization
+  answers as a missing one. Delegation to another organization's agent is
+  still allowed; that agent can never claim it.
 - `observability_manage`'s `delegation_stats` counts only the caller's
   organization's delegations (it counted every organization's).
 - A `delegate` idempotency key stores its delegating agent's label with

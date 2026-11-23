@@ -463,6 +463,45 @@ async fn an_after_runs_finish_hold_releases_itself_when_the_subtree_goes_idle() 
     assert_eq!(all["holds"][0]["released_by"], "task-hold:after_active_runs_finish");
 }
 
+/// A pause on a root whose `after_active_runs_finish` hold is already due
+/// settles that hold and takes effect, rather than finding the due hold
+/// (`changed=false`) and leaving the task unheld once a read releases it.
+#[tokio::test]
+async fn a_pause_over_a_due_after_runs_finish_hold_takes_effect() {
+    let h = H::new();
+    let root = h.task("Sprint", None).await;
+    let child = h.task("Running", Some(root)).await;
+    h.ok(&builder(), "task_claim", json!({ "id": child })).await;
+    let due = h
+        .act_ok(
+            &lead(),
+            "task_hold",
+            json!({ "root_task_id": root, "reason": "drain", "release_policy": "after_active_runs_finish" }),
+        )
+        .await["hold"]["id"]
+        .as_i64()
+        .unwrap();
+    h.ok(&builder(), "task_update", json!({ "id": child, "status": "done" })).await;
+
+    let out = h.act_ok(&lead(), "task_hold", json!({ "root_task_id": root, "reason": "stop here" })).await;
+    assert_eq!(out["changed"], true, "{out}");
+    let new = out["hold"]["id"].as_i64().unwrap();
+    assert_ne!(new, due, "{out}");
+    assert_eq!(out["hold"]["status"], "active", "{out}");
+    assert_eq!(out["hold"]["mode"], "pause", "{out}");
+    assert_eq!(out["hold"]["release_policy"], "manual", "{out}");
+    // A read does not release the new pause; the due hold was settled.
+    let list = h.act_ok(&lead(), "task_holds", json!({})).await;
+    let holds = list["holds"].as_array().unwrap();
+    assert_eq!(holds.len(), 1, "{list}");
+    assert_eq!(holds[0]["id"], new, "{list}");
+    let all = h.act_ok(&lead(), "task_holds", json!({ "status": "all" })).await;
+    let old = all["holds"].as_array().unwrap().iter().find(|x| x["id"] == due).unwrap();
+    assert_eq!(old["released_by"], "task-hold:after_active_runs_finish", "{all}");
+    let e = h.err(&builder(), "task_claim", json!({ "id": root })).await;
+    assert_eq!(reason(&e), "task_held");
+}
+
 #[tokio::test]
 async fn a_cancel_hold_stops_member_node_work_and_restore_releases_it() {
     let h = H::new();

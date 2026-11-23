@@ -835,6 +835,9 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
     if let Some(r) = map.rowid_to {
         keys.push(vec![r.to_string()]);
     }
+    // Hub-wide on purpose: the one-active-hold index is keyed by the
+    // hub-global root task id across every organization, so a clash in any
+    // organization would fail the copy.
     let active_hold_probe_sql = (map.kind == Kind::TaskHolds)
         .then_some("SELECT 1 FROM task_holds WHERE root_task_id = ?1 AND status = 'active' LIMIT 1");
     if keys.is_empty() && active_hold_probe_sql.is_none() {

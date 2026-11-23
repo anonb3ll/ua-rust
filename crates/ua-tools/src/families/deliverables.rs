@@ -147,7 +147,7 @@ fn bound_repo(
 fn view(conn: &Connection, d: &ua_deliverables::Deliverable) -> UaResult<Value> {
     let revisions = ua_deliverables::revisions(conn, &d.org_id, d.id, REVISIONS_PER_READ)?;
     let count = ua_deliverables::revision_count(conn, &d.org_id, d.id)?;
-    let head = capsule_head(conn, d.task_id)?;
+    let head = capsule_head(conn, &d.org_id, d.task_id)?;
     let latest = revisions.first();
     Ok(json!({
         "deliverable": d.to_json(),
@@ -214,7 +214,7 @@ async fn revise(ctx: ToolCtx, a: ReviseArgs) -> UaResult<Value> {
             )?;
             // The capsule head moves to the revision through the workflow
             // record's own write (and its ledger event), in this transaction.
-            let moved = capsule_head(tx, d.task_id)?.as_deref() != Some(rev.identity.as_str());
+            let moved = capsule_head(tx, org, d.task_id)?.as_deref() != Some(rev.identity.as_str());
             if moved {
                 write_capsule(
                     tx,
@@ -266,7 +266,7 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
         }
         Ok(json!({
             "task_id": task_id,
-            "workflow_head": capsule_head(c, task_id)?,
+            "workflow_head": capsule_head(c, &ctx.caller.org_id, task_id)?,
             "deliverables": items,
         }))
     })

@@ -204,7 +204,7 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
         .read_async(move |c| {
             let mut stmt = c.prepare(
                 "SELECT k.task_id, k.name FROM task_checks k JOIN tasks t ON t.id = k.task_id AND t.org_id = ?4 \
-                 WHERE lower(k.repo) = ?1 AND lower(k.head_sha) = ?2 AND k.ref_kind = 'ci_run' ORDER BY k.id LIMIT ?3",
+                 WHERE k.org_id = ?4 AND lower(k.repo) = ?1 AND lower(k.head_sha) = ?2 AND k.ref_kind = 'ci_run' ORDER BY k.id LIMIT ?3",
             )?;
             let rows = stmt
                 .query_map(rusqlite::params![r, h, REVERIFY_CAP, crate::families::tasks::TASK_ORG], |row| {

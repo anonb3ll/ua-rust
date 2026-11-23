@@ -35,7 +35,7 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (37 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (32 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
@@ -45,8 +45,9 @@ here for memory columns, owners and defaults.
   `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `plans`,
   `plan_steps`, `plan_checkpoints`, `autonomous_cycles`,
   `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `approvals`,
-  `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` and
-  `delegations` having left it;
+  `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`,
+  `task_workflow`, `task_checks`, `review_ready_notices`, `task_holds`,
+  `task_hold_members` and `delegations` having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -209,7 +210,8 @@ here for memory columns, owners and defaults.
   caller's: `review_ready` uses its task row's.
   `review_ready_notices` stays with the tasks family: it belongs to the task
   workflow (continuity), is keyed by the hub-global task id, and is read in
-  the same transaction as `task_workflow`, so it converts with `tasks`. The
+  the same transaction as `task_workflow`, so it converts with
+  `task_workflow` (the continuity tables below). The
   queued, settled and Zulip events are `ORG-EVENT-DEFAULT` sites; their
   payloads carry ids, counts, hashes and categories, never message text.
   `crates/ua-tools/tests/notify_tenant.rs` holds the upgrade and the
@@ -419,9 +421,8 @@ here for memory columns, owners and defaults.
     (`org_unsupported`). (c) A delegation to another organization's agent
     is still allowed, but it can never be claimed: the delegate looks the
     task up in its own organization and finds none, so it fails closed.
-    Holds and policy authorizations, which carry no `org_id` yet, are
-    reached only through their task's organization; delegations carry their
-    own (below).
+    Policy authorizations, which carry no `org_id` yet, are reached only
+    through their task's organization; delegations carry their own (below).
     (d) Task replies carry no `org_id`.
   - The migration manifest (`export_migration_manifest`,
     `compare_migration_manifests`, and both through `export_data`) is a
@@ -442,12 +443,15 @@ here for memory columns, owners and defaults.
     name (`conversation_handoff`). `task_add` refuses client keys starting
     with `conversation-handoff:`.
   - Deleting another organization's task deletes, in the same transaction,
-    the holds rooted in its subtree (and their members) and the policy
-    authorizations naming a task in it: with no `org_id` and no foreign key
-    to `tasks`, they would otherwise fall into the default organization.
-    They are deleted, not blanked, because a blanked row would still be a
-    default-organization row it never created. The default organization's
-    holds and authorizations outlive their task, as before.
+    the policy authorizations naming a task in its subtree: with no
+    `org_id` and no foreign key to `tasks`, they would otherwise fall into
+    the default organization. They are deleted, not blanked, because a
+    blanked row would still be a default-organization row it never created.
+    The holds rooted in the subtree (and their members) are deleted with it
+    too, in their own organization only: they now carry `org_id` and could
+    not fall into the default organization, but the outcome of deleting
+    another organization's task is kept. The default organization's holds
+    and authorizations outlive their task, as before.
   - Work proposals carry no organization yet, so their actions are refused
     to another organization's caller (`org_unsupported`) and a proposal's
     task is always a default-organization task. A proposal or contract
@@ -470,6 +474,43 @@ here for memory columns, owners and defaults.
     `default`. A routine fire in another organization now creates its task
     there. `crates/ua-tools/tests/tasks_tenant.rs` holds the upgrade and the
     isolation tests.
+- The task workflow and hold tables: `organization.v1.tools.continuity`
+  gives `task_workflow`, `task_checks` and `review_ready_notices` their
+  `org_id` and triggers, and `continuity.v2.org_scope` moves each existing
+  row to its task's organization (a row whose task is gone stays in
+  `default`), adds indexes led by `org_id` for `task_list`'s stage filter
+  and the re-verification scan by repository and head, and the
+  `*_org_parent` triggers that keep every row's `task_id` inside the row's
+  organization. `organization.v1.tools.holds` and
+  `governance.v3.holds_org_scope` do the same for `task_holds` (moved to its
+  root task's organization) and `task_hold_members` (moved to its hold's),
+  with triggers that keep a hold's root task, a member's task and a
+  member's hold inside one organization. The backfill drops each generated
+  `*_org_immutable` trigger for its one `UPDATE` and recreates it, in the
+  part's transaction. No rebuild: every key is led by a hub-global task or
+  hold id, and the one-active-hold-per-root index stays keyed by the root
+  task id. Every statement on the five tables filters `org_id`: the
+  workflow record, checks and their verification, the review-at-head merge
+  gate, `review_ready` and its notices (in the task row's organization, read
+  in the same transaction as the record), the session packet's workflow
+  block, deliverables' workflow head, `task_list`'s stage filter, and every
+  hold read, write and claim-gate check. A hold's organization is its
+  `org_id`, no longer derived from its root task, so a hold outlives its
+  root inside its own organization. The read-time release of
+  `after_active_runs_finish` holds settles only the reader's organization's
+  holds; another organization's are released by its own reads and claims.
+  A write for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes, and replies carry no
+  `org_id` (owner decision (d)). The hub's head re-verification
+  (`reverify_head`, from the webhook and the poller) scans only the default
+  organization's checks (`ORG-GITHUB-DEFAULT`, owner decision (b)). Events
+  stay `ORG-EVENT-DEFAULT`: for another organization, check names and hold
+  reasons, actors and outcomes are `null` and the originator is `system`;
+  workflow goals and focus never reach an event. The importer writes legacy
+  workflow records, checks, holds and members to `default`; its
+  active-hold clash probe stays hub-wide, because the one-active-hold index
+  is. `crates/ua-tools/tests/continuity_tenant.rs` holds the upgrade and the
+  isolation tests.
 - The delegations table: `organization.v1.tools.delegation` gives
   `delegations` its `org_id` and triggers, and `delegation.v2.org_scope`
   moves each existing delegation to its task's organization (in practice
@@ -1634,7 +1675,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_workflow`, `task_checks`, `review_ready_notices` (`organization.v1.tools.continuity` and `continuity.v2.org_scope`: existing rows moved to their task's organization, every workflow, check and notice read and write, same-organization task triggers; re-verification default-only), `task_holds`, `task_hold_members` (`organization.v1.tools.holds` and `governance.v3.holds_org_scope`: a hold in its root task's organization, every hold read, write and claim check, same-organization root, task and hold triggers), `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
