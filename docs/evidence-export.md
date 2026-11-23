@@ -41,8 +41,11 @@ Three claims are separate, and the output must keep them separate:
   *relative to a pinned checkpoint*, and the basis depends on the bundle class
   (next section): for a `hub` bundle, every global `seq` in the window appears
   exactly once and the chain from the end back to the pinned point is
-  continuous; for an `org` bundle, that organization's rows form a contiguous
-  `org_seq` `1..N` whose running hash and count are signed in the checkpoint.
+  continuous; for an `org` bundle, that organization's rows occupy an absolute
+  `org_seq` range `[pinned_count + 1 .. pinned_count + N]` whose running hash,
+  cumulative count and the global window's bounding hashes are signed in the
+  checkpoint — complete *relative to the hub's signed statement of the window*,
+  not proof that the hub omitted nothing (see Bundle classes).
   Neither class can prove the hub did not end the range early; a verifier given
   a later pinned checkpoint can detect a shortened range, one that was not,
   cannot. The output says which case it is in.
@@ -65,23 +68,45 @@ class in `manifest.json`:
 | Class | Rows | Sequence basis | Chain claim |
 | --- | --- | --- | --- |
 | `hub` | every row in the window | global `seq` | full: continuity back to the pinned checkpoint or genesis, no gaps, no duplicates |
-| `org` | one organization's rows | `org_seq` (`1..N`, assigned in global `seq` order at export) | each row's own hash, plus a per-organization running hash signed in the checkpoint; cross-organization linkage is reported as *not provable from this bundle* |
+| `org` | one organization's rows | `org_seq`, absolute from genesis in global `seq` order | each row's own hash, plus a per-organization running hash signed in the checkpoint; cross-organization linkage is reported as *not provable from this bundle* |
 
 For an `org` bundle the checkpoint signs `{class: "org", org_id, window,
-org_row_count, org_chain_hash, key_id, signed_at}`, where `org_chain_hash` is
-the fold `H(prev_org_chain_hash || entry_hash)` over that organization's rows in
-`org_seq` order, seeded from the pinned checkpoint's value (or an empty seed at
-genesis). The verifier recomputes each row's `entry_hash` under its `hash_v`,
-checks `org_seq` is `1..N` with no gap or duplicate, and refolds the running
-hash against the signed value and count.
+global_from_hash, global_head_hash, org_row_count, org_chain_hash, key_id,
+signed_at}`:
 
-That proves the organization's own history was neither edited nor truncated
-after the signed point. It does not prove what happened in other organizations,
-and it cannot prove the hub did not end the window early — the same limit the
-`hub` class has, stated against a different basis. `ua evidence export --class
-hub` is operator-only; an organization exporting for itself always gets `org`.
-The verdict prints the class, so a reader cannot mistake the narrower claim for
-the wider one.
+- `org_seq` is **absolute** — the organization's cumulative row index from
+  genesis — so a bundle covers `[pinned_count + 1, pinned_count + N]` and
+  continuity across successive bundles is checkable against the pinned
+  checkpoint's count instead of restarting at 1 in every file.
+- `org_chain_hash` is the fold `H(prev_org_chain_hash || entry_hash)` over that
+  organization's rows from genesis, seeded from the pinned checkpoint's value
+  (empty at genesis). `org_row_count` is the cumulative count at the window's
+  closing row, not the number of rows in this bundle.
+- `global_from_hash` is the `entry_hash` of the global row the window starts
+  after, and `global_head_hash` the `entry_hash` of its closing row. They pin
+  where the window sits on the global chain by hash alone: the checkpoint
+  carries **no global sequence number**, because two endpoints would be
+  subtracted to recover the hub-wide row count for the window — the volume
+  `docs/organization.md` keeps out of an organization's export. A holder of a
+  hub checkpoint locates both hashes in the global chain itself.
+- `window` is the export window's time bounds, not a sequence range.
+
+The verifier recomputes each row's `entry_hash` under its `hash_v`, checks
+`org_seq` runs from `pinned_count + 1` to `pinned_count + N` with no gap or
+duplicate, refolds the running hash, and compares both against the signed
+values. When a later hub checkpoint or a `hub` bundle is available it also
+resolves `global_from_hash` and `global_head_hash` in the global chain and
+confirms the window sits where the hub places it.
+
+That proves the organization's own rows were neither edited, reordered nor
+dropped *relative to the hub's signed statement of the window*. It cannot, by
+itself, prove the hub included every row it held: `org_seq`, the fold, the
+count and the window hashes are all produced by the same hub at export time, so
+a row omitted mid-window yields a bundle that is internally consistent.
+Detecting that omission needs the global chain — a `hub` bundle, or a verifier
+that can resolve the signed hashes against a later hub checkpoint.
+The verdict prints the class and this limitation, so a reader cannot mistake
+the narrower claim for the wider one.
 
 ## Bundle layout
 
@@ -91,7 +116,7 @@ bundle/
   manifest.sig             # Ed25519 signature over manifest.json's digest
   producer.json            # export time, host, tool version — reported, never hashed
   ledger/events.jsonl      # canonical JSON, one event per line, ascending seq (hub) or org_seq (org)
-  ledger/checkpoint.json   # {class, seq|org_row_count, hash|org_chain_hash, key_id, signed_at, signature}
+  ledger/checkpoint.json   # {class, seq|global_from_hash,global_head_hash,org_row_count,org_chain_hash, key_id, signed_at, signature}
   approvals/<id>.json      # one receipt per approval in range
   evidence/rows.jsonl      # evidence records and their labels
   policy/revisions.json    # the policy revisions the receipts cite
@@ -136,8 +161,9 @@ On top of that:
   therefore "the holder of key `K` attested this checkpoint and the manifest it
   signs", not a per-receipt signature.
 - A checkpoint's signature covers `{class, org_id, seq, hash, key_id,
-  signed_at}` for class `hub` and `{class, org_id, window, org_row_count,
-  org_chain_hash, key_id, signed_at}` for class `org`.
+  signed_at}` for class `hub` and `{class, org_id, window, global_from_hash,
+  global_head_hash, org_row_count, org_chain_hash, key_id, signed_at}` for
+  class `org`.
 
 ## The approval receipt
 
@@ -189,9 +215,14 @@ unsupported version). A refusal is never downgraded to a warning.
    checkpoint back to the pinned point or genesis. For class `org`, continuity
    is the signed running hash (check 5).
 5. **Sequence basis.** Class `hub`: every global `seq` in the window appears
-   once, in order, with no gap or duplicate. Class `org`: `org_seq` is `1..N`
-   with no gap or duplicate, and the refolded `org_chain_hash` plus
-   `org_row_count` equal the signed checkpoint values. A mismatch is a refusal.
+   once, in order, with no gap or duplicate. Class `org`: `org_seq` runs from
+   `pinned_count + 1` to `pinned_count + N` with no gap or duplicate, the
+   refolded `org_chain_hash` and the cumulative `org_row_count` equal the signed
+   values, and — when a later hub checkpoint is available — the signed
+   `global_from_hash` and `global_head_hash` resolve in the global chain with
+   the bundle's rows between them. A mismatch is a refusal; an `org` bundle
+   with no pinned checkpoint or hub cross-check reports completeness as
+   `unverified`, never as a pass.
 6. **Downgrade refusal** — a `hash_v = 1` row after the first `hash_v = 2` row.
 7. **Receipts** — digest matches the manifest, `action_digest` matches the event
    payload, resolver is a verified human, separation of duties holds, `covers`
