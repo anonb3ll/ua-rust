@@ -666,7 +666,17 @@ here for memory columns, owners and defaults.
   (`github.v2.poll_repos` copies every row of `github_poll_state` to the
   default organization; no row is dropped, and the old table stays unread);
   repositories whose last poll failed are counted on the `system_doctor`
-  line. `crates/ua-tools/src/families/github/org_automation_tests.rs` holds
+  line. **What another organization's GitHub events still show.** The
+  `agent.github.*` events stay in the default ledger (`ORG-EVENT-DEFAULT`).
+  For another organization the repository, branch names (`base_ref`,
+  `merge_branch`), check names and closure text are redacted (`null`, or a
+  count), but head and merge commit SHAs and pull request numbers stay
+  visible, as task ids already do: they identify commits and numbers, not
+  names, and the default organization's operators can correlate them only
+  with a repository they can already see. The webhook's HTTP answer for
+  any delivery another organization matched carries no organization id,
+  repository or task (`{"ok", "matched", "statuses"}`).
+  `crates/ua-tools/src/families/github/org_automation_tests.rs` holds
   the per-organization automation tests. The importer has
   no managed-secret mapping (the Python hub kept none), so it writes nothing
   here. `crates/ua-tools/tests/managed_secrets_tenant.rs` holds the upgrade,

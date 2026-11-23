@@ -109,3 +109,5 @@ organization.v1.tools.proposals
 governance.v4.proposals_org_scope
 managed_secrets.v2.tenant_keys
 organization.v1.tools.managed_secrets
+github.v2.poll_repos
+organization.v1.tools.github_poll

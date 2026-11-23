@@ -105,6 +105,25 @@ impl GhError {
             GhError::Decode(e) => format!("GitHub response is not the expected JSON: {e}"),
         }
     }
+
+    /// A fixed code for a stored record (`github_poll_repos.last_error`):
+    /// never library error text, a URL or a value.
+    pub(crate) fn code(&self) -> String {
+        match self {
+            GhError::NotConfigured(_) => "not_configured".into(),
+            GhError::CredentialOff(_) => "credential_off".into(),
+            GhError::Unusable(_) => "unusable".into(),
+            GhError::NotFound => "not_found".into(),
+            GhError::Unauthorized => "unauthorized".into(),
+            GhError::Forbidden => "forbidden".into(),
+            GhError::RateLimited(_) => "rate_limited".into(),
+            GhError::Status(s) => format!("http_{s}"),
+            GhError::Redirect(s) => format!("redirect_{s}"),
+            GhError::Network(_) => "network".into(),
+            GhError::TooLarge => "too_large".into(),
+            GhError::Decode(_) => "decode".into(),
+        }
+    }
 }
 
 /// A repository some project is bound to, normalized `owner/name`. The only
@@ -208,6 +227,15 @@ fn shared_client(base: &Url, allow_loopback: bool) -> Result<(Arc<Outbound>, boo
 fn blocks() -> &'static Mutex<HashMap<String, i64>> {
     static BLOCKS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
     BLOCKS.get_or_init(Mutex::default)
+}
+
+/// Forget every rate-limit block of organization `org`'s token, on every
+/// host: its token was set or cleared, and a new token has its own limit.
+pub(crate) fn clear_blocks(org: &str) {
+    let suffix = format!(" {org}");
+    if let Ok(mut map) = blocks().lock() {
+        map.retain(|key, _| !key.ends_with(&suffix));
+    }
 }
 
 fn now_s() -> i64 {
@@ -463,5 +491,20 @@ mod tests {
         let b = GitHub::with_token(&cfg, "org-b", "fake-b-not-real".to_string().into()).unwrap();
         assert_ne!(a.host_key(), b.host_key());
         assert_eq!(b.org(), "org-b");
+    }
+
+    #[test]
+    fn clearing_an_organizations_blocks_leaves_the_others() {
+        let cfg =
+            Config { github_api_url: "https://ghe-clear-blocks.example.com".into(), ..Config::default() };
+        let a = GitHub::with_token(&cfg, "default", "fake-a-not-real".to_string().into()).unwrap();
+        let b = GitHub::with_token(&cfg, "org-clear-b", "fake-b-not-real".to_string().into()).unwrap();
+        let until = now_s() + 600;
+        blocks().lock().unwrap().insert(a.host_key(), until);
+        blocks().lock().unwrap().insert(b.host_key(), until);
+        clear_blocks("org-clear-b");
+        let map = blocks().lock().unwrap();
+        assert_eq!(map.get(&a.host_key()), Some(&until));
+        assert!(!map.contains_key(&b.host_key()));
     }
 }

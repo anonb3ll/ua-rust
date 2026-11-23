@@ -1389,7 +1389,8 @@ const GITHUB_ORGS_SHOWN: usize = 50;
 /// default-organization caller and over its own for any other. The
 /// automation runs per organization, so the line also counts, over the same
 /// organizations, repositories whose last poll failed (no values, no
-/// names). LIVE when one is configured, DEGRADED when a stored one is
+/// names): only those still bound, in an organization whose token is still
+/// usable. LIVE when one is configured, DEGRADED when a stored one is
 /// unusable or a poll is failing, DORMANT when all are off.
 fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Caller) -> UaResult<Value> {
     use crate::families::github::credentials::{self, CredentialKind, CredentialSource, CredentialState};
@@ -1445,10 +1446,19 @@ fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Call
         });
         lines.push(format!("{} organization(s): {}", orgs.len(), per_kind.collect::<Vec<_>>().join(", ")));
     }
+    // Only repositories the poller still polls: bound now, in an
+    // organization whose token is still usable. A row left by a repository
+    // since unbound, or by a token since cleared, is history, not a failure.
     let mut failing = 0i64;
     for org in &orgs {
+        if credentials::credential_status(c, cfg, org, CredentialKind::Token)?.state
+            != CredentialState::Configured
+        {
+            continue;
+        }
         failing += c.query_row(
-            "SELECT count(*) FROM github_poll_repos WHERE org_id = ?1 AND last_error IS NOT NULL",
+            "SELECT count(*) FROM github_poll_repos p WHERE p.org_id = ?1 AND p.last_error IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM project_repo_bindings b WHERE b.org_id = p.org_id AND lower(b.repo) = p.repo)",
             [org],
             |r| r.get::<_, i64>(0),
         )?;

@@ -13,7 +13,9 @@
 //!
 //! Only the first page (100 newest open PRs) is compared; a PR older than
 //! the page's oldest is never taken for closed. The list, its ETag, the poll
-//! time and the last failure (a fixed description, never a value) are kept
+//! time and the last failure (a fixed code such as `unauthorized`,
+//! `rate_limited`, `network`, `decode` or `http_<status>`: never library
+//! error text, a URL or a value) are kept
 //! per organization and repository in `github_poll_repos`. A poll that
 //! changes something appends `agent.github.polled`.
 //!
@@ -27,7 +29,10 @@
 //! token), and one whose stored token is unusable is reported `unusable`
 //! and skipped. One organization's failure (a refused token, a rate limit,
 //! a database error) is recorded for that organization and never stops the
-//! others; `system_doctor` counts repositories whose last poll failed.
+//! others; `system_doctor` counts repositories whose last poll failed,
+//! among those still bound in an organization that still holds a usable
+//! token. A rate limit blocks only the organization whose token hit it;
+//! setting or clearing that organization's token lifts the block.
 
 use std::collections::BTreeMap;
 
@@ -151,10 +156,11 @@ async fn poll_repo(hub: &Hub, gh: &GitHub, repo: &BoundRepo) -> UaResult<Value> 
         }
         Ok(Got::Fresh { etag, body }) => (etag, body.as_array().cloned().unwrap_or_default()),
         Err(e) => {
-            // Recorded for the doctor: a fixed description, never a value. A
-            // repository never listed keeps no open list (`null`), so its
-            // first successful poll re-verifies nothing, as before.
-            let (o, n, t, why) = (org.clone(), name.clone(), now.clone(), e.detail());
+            // Recorded for the doctor: a fixed code, never library text or
+            // a value. A repository never listed keeps no open list
+            // (`null`), so its first successful poll re-verifies nothing, as
+            // before.
+            let (o, n, t, why) = (org.clone(), name.clone(), now.clone(), e.code());
             hub.db()
                 .write_async(move |tx| {
                     tx.execute(

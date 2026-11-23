@@ -13,7 +13,6 @@
 //! Every value is fake. The mock records a short SHA-256 fingerprint of each
 //! request's `Authorization` header, never the header, and assertions print
 //! fingerprints and organization ids only.
-
 //!
 //! The cases sit in a `#[cfg(test)]` module so the workspace's source guards
 //! (`org_guard`, `authz_guard`, the insert guard), which skip test items,
@@ -49,6 +48,8 @@ mod cases {
     const SHARED: &str = "shared/repo";
     const B_OWN: &str = "owner-b/falcon";
     const MERGE_SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    /// A check name distinctive enough to search event payloads for.
+    const CHECK_NAME: &str = "lint-check-name-91c2";
 
     /// A short fingerprint of a bearer token, as the mock records it.
     fn fp(token: &str) -> String {
@@ -65,6 +66,9 @@ mod cases {
         pulls: HashMap<(String, u64), Value>,
         /// A token fingerprint the mock refuses with 401.
         refuse: Option<String>,
+        /// A token fingerprint whose rate limit the mock reports exhausted
+        /// (`x-ratelimit-remaining: 0`, reset in ten minutes).
+        limited: Option<String>,
         /// (repository, rest of the path, token fingerprint), per request.
         log: Vec<(String, String, String)>,
     }
@@ -97,7 +101,13 @@ mod cases {
             Some(body) => (StatusCode::OK, axum::Json(body)).into_response(),
             None => (StatusCode::NOT_FOUND, axum::Json(json!({ "message": "Not Found" }))).into_response(),
         };
-        resp.headers_mut().insert("x-ratelimit-remaining", "4999".parse().unwrap());
+        if m.limited.as_deref() == Some(seen.as_str()) {
+            let reset = ua_core::time::now_ms() / 1000 + 600;
+            resp.headers_mut().insert("x-ratelimit-remaining", "0".parse().unwrap());
+            resp.headers_mut().insert("x-ratelimit-reset", reset.to_string().parse().unwrap());
+        } else {
+            resp.headers_mut().insert("x-ratelimit-remaining", "4999".parse().unwrap());
+        }
         resp
     }
 
@@ -111,11 +121,16 @@ mod cases {
     }
 
     fn merged_pr(repo: &str, number: u64) -> Value {
+        merged_into(repo, number, "main")
+    }
+
+    /// A merged pull request whose base branch is `base`.
+    fn merged_into(repo: &str, number: u64, base: &str) -> Value {
         json!({
             "number": number, "merged": true, "merged_at": ua_core::time::now(), "updated_at": ua_core::time::now(),
             "merge_commit_sha": MERGE_SHA, "html_url": format!("https://github.com/{repo}/pull/{number}"),
             "head": { "ref": format!("feature-{number}"), "sha": "f".repeat(40) },
-            "base": { "ref": "main", "repo": { "full_name": repo, "default_branch": "main" } },
+            "base": { "ref": base, "repo": { "full_name": repo, "default_branch": "main" } },
         })
     }
 
@@ -253,8 +268,58 @@ mod cases {
 
         /// A task of `org` in `project` whose evidence names `link`.
         async fn task(&self, org: &str, project: &str, link: &str) -> i64 {
-            let args = json!({ "title": "ships", "project": project, "evidence_ref": link });
+            self.task_titled(org, project, link, "ships").await
+        }
+
+        async fn task_titled(&self, org: &str, project: &str, link: &str, title: &str) -> i64 {
+            let args = json!({ "title": title, "project": project, "evidence_ref": link });
             self.ok(&agent(org), "task_add", args).await["id"].as_i64().unwrap()
+        }
+
+        /// The payloads of `org`'s events on `channel`, oldest first.
+        fn events(&self, channel: &str, org: &str) -> Vec<Value> {
+            let (channel, org) = (channel.to_string(), org.to_string());
+            self.hub
+                .db()
+                .read(move |c| {
+                    let mut stmt = c.prepare(
+                        "SELECT payload FROM event_log WHERE channel = ?1 \
+                         AND json_extract(payload, '$.org_id') = ?2 ORDER BY rowid",
+                    )?;
+                    let rows = stmt
+                        .query_map([&channel, &org], |r| r.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows.iter().map(|p| serde_json::from_str(p).unwrap()).collect())
+                })
+                .unwrap()
+        }
+
+        /// Replace `to`'s stored credential of `kind` with `from`'s sealed
+        /// row, as if its ciphertext were moved across organizations: it is
+        /// sealed to `from`, so it never opens in `to`.
+        fn move_sealed(&self, from: &str, to: &str, kind: CredentialKind) {
+            let name = kind.secret_name();
+            self.sql(&format!(
+                "DELETE FROM managed_secrets WHERE org_id = '{to}' AND name = '{name}';
+                 INSERT INTO managed_secrets (org_id, name, consumer, key_id, nonce, ciphertext, fingerprint,
+                    value_bytes, created_by, created_at, updated_by, updated_at, aad_v)
+                 SELECT '{to}', name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, created_by,
+                    created_at, updated_by, updated_at, aad_v
+                 FROM managed_secrets WHERE org_id = '{from}' AND name = '{name}';"
+            ));
+        }
+
+        /// The doctor's `github_credentials` detail, as the hub's own agent sees it.
+        async fn doctor_line(&self) -> String {
+            let report = self.ok(&agent(DEFAULT_ORG), "system_doctor", json!({ "refresh": true })).await;
+            let line = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["capability"] == "github_credentials")
+                .cloned()
+                .unwrap();
+            line["detail"].as_str().unwrap().to_string()
         }
 
         fn status(&self, id: i64) -> String {
@@ -325,8 +390,15 @@ mod cases {
         let body = merge_body(SHARED, 8);
 
         let out = h.deliver(Some(B_HOOK), "pull_request", "merge-8-b", &body).await.unwrap();
-        assert_eq!(out["org_id"], ORG_B, "{out}");
-        assert_eq!(closed_ids(&out), [tb], "{out}");
+        // Another organization's delivery is answered neutrally; what it did
+        // is in its own ledger.
+        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        let closed: Vec<i64> = h
+            .events("agent.github.closed_on_merge", ORG_B)
+            .iter()
+            .map(|e| e["task_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(closed, [tb]);
         assert_eq!((h.status(ta), h.status(tb), h.status(tc)), ("open".into(), "done".into(), "open".into()));
         // Its event is organization B's: repository redacted, neutral originator.
         let (repo, by) = (
@@ -412,30 +484,43 @@ mod cases {
             WebhookError::BadSignature
         );
         let out = h.deliver(Some(B_HOOK), "ping", "n-3", b"{}").await.unwrap();
-        assert_eq!((out["org_id"].as_str(), out["handled"].as_str()), (Some(ORG_B), Some("ping")), "{out}");
+        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        assert_eq!(h.events("agent.github.webhook.received", ORG_B).len(), 1);
+        assert!(h.events("agent.github.webhook.received", DEFAULT_ORG).is_empty());
     }
 
     /// The multi-match rule: two organizations configured with the same secret
     /// both verify a delivery, and it is processed for each, in a fixed order,
-    /// against each one's own tasks.
+    /// against each one's own tasks. The answer is organization-neutral: no
+    /// organization id, title or task of either reaches the sender.
     #[tokio::test]
     async fn a_secret_two_organizations_share_processes_the_delivery_for_each() {
+        const C_TITLE: &str = "org-c-private-title-4";
         let h =
             H::new(Creds { hub: true, b_token: false, b_hook: Some(B_HOOK), c_hook: Some(HUB_HOOK) }).await;
         let link = format!("{SHARED}#4");
         let (ta, tb, tc) = (
-            h.task(DEFAULT_ORG, "web", &link).await,
+            h.task_titled(DEFAULT_ORG, "web", &link, "default-title-4").await,
             h.task(ORG_B, "web", &link).await,
-            h.task(ORG_C, "web", &link).await,
+            h.task_titled(ORG_C, "web", &link, C_TITLE).await,
         );
         let body = merge_body(SHARED, 4);
         let out = h.deliver(Some(HUB_HOOK), "pull_request", "multi-4", &body).await.unwrap();
-        let orgs: Vec<&str> =
-            out["orgs"].as_array().unwrap().iter().map(|o| o["org_id"].as_str().unwrap()).collect();
-        assert_eq!(orgs, [DEFAULT_ORG, ORG_C], "{out}");
-        let per: Vec<Vec<i64>> =
-            out["orgs"].as_array().unwrap().iter().map(|o| closed_ids(&o["result"])).collect();
-        assert_eq!(per, [vec![ta], vec![tc]], "{out}");
+        assert_eq!(out, json!({ "ok": true, "matched": 2, "statuses": [200, 200] }));
+        let text = out.to_string();
+        for leak in [C_TITLE, "default-title-4", ORG_C, DEFAULT_ORG, "task_id", SHARED] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        assert_eq!((h.status(ta), h.status(tc)), ("done".into(), "done".into()));
+        // Each organization's own ledger has its closure.
+        for (org, id) in [(DEFAULT_ORG, ta), (ORG_C, tc)] {
+            let closed: Vec<i64> = h
+                .events("agent.github.closed_on_merge", org)
+                .iter()
+                .map(|e| e["task_id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(closed, [id], "{org}");
+        }
         assert_eq!(h.status(tb), "open", "organization B's secret did not sign it");
         // Again: a replay for both.
         assert_eq!(
@@ -464,7 +549,7 @@ mod cases {
                 &agent(org),
                 "coordination_manage",
                 json!({ "action": "task_check_record", "params": {
-                "task_id": id, "name": "ci", "outcome": "pass", "head_sha": head,
+                "task_id": id, "name": CHECK_NAME, "outcome": "pass", "head_sha": head,
                 "ref": { "kind": "ci_run", "ref": "41" }, "verify": false } }),
             )
             .await;
@@ -474,18 +559,31 @@ mod cases {
             serde_json::to_vec(&json!({ "after": head, "repository": { "full_name": SHARED } })).unwrap();
 
         let out = h.deliver(Some(B_HOOK), "push", "push-b", &body).await.unwrap();
-        let checks: Vec<i64> =
-            out["checks"].as_array().unwrap().iter().map(|c| c["task_id"].as_i64().unwrap()).collect();
-        assert_eq!(checks, [tasks[ORG_B]], "{out}");
+        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        let reverified = h.events("agent.github.checks_reverified", ORG_B);
+        assert_eq!(reverified.len(), 1);
+        let checks: Vec<i64> = reverified[0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["task_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(checks, [tasks[ORG_B]]);
+        // Another organization's event names no check and no repository.
+        let text = reverified[0].to_string();
+        for leak in [CHECK_NAME, SHARED] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        assert_eq!(reverified[0]["repo"], Value::Null);
         let seen = h.tokens_for(SHARED);
         assert!(!seen.is_empty() && seen.iter().all(|f| *f == fp(B_TOKEN)), "{seen:?}");
 
         let before = h.all_tokens().len();
-        let out = h.deliver(Some(C_HOOK), "push", "push-c", &body).await.unwrap();
-        let checks: Vec<i64> =
-            out["checks"].as_array().unwrap().iter().map(|c| c["task_id"].as_i64().unwrap()).collect();
-        assert_eq!(checks, [tasks[ORG_C]], "{out}");
-        assert_eq!(out["checks"][0]["verdict"], "unverifiable", "{out}");
+        h.deliver(Some(C_HOOK), "push", "push-c", &body).await.unwrap();
+        let reverified = h.events("agent.github.checks_reverified", ORG_C);
+        assert_eq!(reverified.len(), 1);
+        assert_eq!(reverified[0]["checks"][0]["task_id"].as_i64(), Some(tasks[ORG_C]));
+        assert_eq!(reverified[0]["checks"][0]["verdict"], "unverifiable");
         assert_eq!(h.all_tokens().len(), before, "organization C made no request");
         let detail = h
             .text(&format!(
@@ -562,6 +660,20 @@ mod cases {
             .iter()
             .any(|(r, t, f)| r == B_OWN && t == "pulls/6" && *f == fp(B_TOKEN));
         assert!(b_lookup);
+        // Organization B's poll events carry counts and numbers, never its
+        // repositories' names.
+        let polled = h.events("agent.github.polled", ORG_B);
+        assert!(!polled.is_empty());
+        for e in &polled {
+            let text = e.to_string();
+            assert!(!text.contains(B_OWN) && !text.contains(SHARED), "{text}");
+            assert_eq!(e["repo"], Value::Null, "{text}");
+        }
+        let default_polled = h.events("agent.github.polled", DEFAULT_ORG);
+        assert!(
+            default_polled.iter().any(|e| e["repo"] == SHARED),
+            "the default organization's keep the name"
+        );
 
         // B's token is refused: the default organization is still polled, B's
         // failure is recorded (no value) and counted by the doctor.
@@ -584,10 +696,22 @@ mod cases {
             ),
             0
         );
-        let stored: String = h.text("SELECT group_concat(last_error) FROM github_poll_repos").unwrap();
-        for v in [HUB_TOKEN, B_TOKEN] {
-            assert!(!stored.contains(v));
-        }
+        // A fixed code, never library text or a value.
+        let stored: String =
+            h.text("SELECT group_concat(DISTINCT last_error) FROM github_poll_repos").unwrap();
+        assert_eq!(stored, "unauthorized");
+
+        // The doctor counts both, then only what is still polled: a
+        // repository unbound since, or an organization whose token was
+        // cleared since, is no longer a failure.
+        let line = h.doctor_line().await;
+        assert!(line.contains("2 bound repositories whose last poll failed"), "{line}");
+        h.sql(&format!("DELETE FROM project_repo_bindings WHERE org_id = '{ORG_B}' AND project = 'falcon'"));
+        let line = h.doctor_line().await;
+        assert!(line.contains("1 bound repository whose last poll failed"), "{line}");
+        h.sql(&format!("DELETE FROM managed_secrets WHERE org_id = '{ORG_B}' AND name = 'github:token'"));
+        let line = h.doctor_line().await;
+        assert!(line.contains("0 bound repositories whose last poll failed"), "{line}");
     }
 
     #[tokio::test]
@@ -649,5 +773,289 @@ mod cases {
         for t in [ta, tb, tb_own] {
             assert_eq!(h.status(t), "open", "a dry run changes nothing");
         }
+    }
+
+    // --- the signature header -------------------------------------------------------------
+
+    /// A missing or malformed `X-Hub-Signature-256` is refused (401) before
+    /// any secret is looked up: on a hub with no secret at all, where any
+    /// lookup would answer `not_configured` (503), it still answers
+    /// `bad_signature`. A well-formed one reaches the lookup.
+    #[tokio::test]
+    async fn a_missing_or_malformed_signature_is_refused_before_any_lookup() {
+        let h = H::new(Creds { hub: false, b_token: false, b_hook: None, c_hook: None }).await;
+        let body = b"{}";
+        let hex64 = "a".repeat(64);
+        let malformed = [
+            None,
+            Some(String::new()),
+            Some("sha256=".to_string()),
+            Some(format!("sha1={hex64}")),
+            Some(format!("sha256={}", &hex64[..63])),
+            Some(format!("sha256={hex64}a")),
+            Some(format!("sha256={}", "g".repeat(64))),
+            Some(format!("SHA256={hex64}")),
+        ];
+        for sig in &malformed {
+            let e = receive(
+                &h.hub,
+                WebhookDelivery { event: "ping", delivery_id: "sig-1", signature: sig.as_deref(), body },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e, WebhookError::BadSignature, "{sig:?}");
+            assert_eq!(e.http_status(), 401);
+        }
+        let well_formed = format!("sha256={hex64}");
+        let e = receive(
+            &h.hub,
+            WebhookDelivery { event: "ping", delivery_id: "sig-2", signature: Some(&well_formed), body },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, WebhookError::NotConfigured, "a well-formed header goes on to the lookup");
+        assert_eq!(h.count("SELECT count(*) FROM inbound_deliveries"), 0);
+    }
+
+    // --- unusable and suspended -----------------------------------------------------------
+
+    /// Organization C's stored secret is organization B's ciphertext moved
+    /// across: it never opens in C, so C is skipped. A delivery signed with
+    /// B's secret belongs to B alone (C is never handed B's secret), and one
+    /// signed with C's old secret verifies nowhere.
+    #[tokio::test]
+    async fn an_unusable_stored_secret_is_skipped_and_never_replaced() {
+        let h = H::new(ALL).await;
+        h.move_sealed(ORG_B, ORG_C, CredentialKind::WebhookSecret);
+        let link = format!("{SHARED}#21");
+        let (tb, tc) = (h.task(ORG_B, "web", &link).await, h.task(ORG_C, "web", &link).await);
+        let body = merge_body(SHARED, 21);
+        let out = h.deliver(Some(B_HOOK), "pull_request", "moved-1", &body).await.unwrap();
+        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        assert_eq!((h.status(tb), h.status(tc)), ("done".into(), "open".into()));
+        assert!(h.events("agent.github.webhook.received", ORG_C).is_empty());
+        assert_eq!(
+            h.deliver(Some(C_HOOK), "pull_request", "moved-2", &body).await.unwrap_err(),
+            WebhookError::BadSignature
+        );
+        assert_eq!(h.status(tc), "open");
+    }
+
+    /// A suspended organization's secret is never consulted.
+    #[tokio::test]
+    async fn a_suspended_organizations_secret_verifies_nothing() {
+        let h = H::new(ALL).await;
+        h.sql(&format!("UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_C}'"));
+        let held = h
+            .hub
+            .db()
+            .read(|c| super::super::credentials::orgs_holding(c, CredentialKind::WebhookSecret))
+            .unwrap();
+        assert_eq!(held, [DEFAULT_ORG, ORG_B]);
+        assert_eq!(
+            h.deliver(Some(C_HOOK), "ping", "suspended-1", b"{}").await.unwrap_err(),
+            WebhookError::BadSignature
+        );
+        assert!(h.events("agent.github.webhook.received", ORG_C).is_empty());
+    }
+
+    // --- multi-match outcomes -------------------------------------------------------------
+
+    /// The default organization and C share a secret. C's handling fails
+    /// (an injected database failure): the delivery answers 500, C's records
+    /// are released, and the default organization's are kept. GitHub's
+    /// redelivery is then processed for C only; the default organization
+    /// reports a replay. The PR merged off the merge branch, so each
+    /// organization ledgers `merged_to_non_default`: the default
+    /// organization's names the branches, C's does not.
+    #[tokio::test]
+    async fn a_partial_failure_is_redelivered_to_the_failed_organization_only() {
+        const BASE: &str = "release-branch-91c2";
+        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(HUB_HOOK) }).await;
+        let link = format!("{SHARED}#12");
+        let (ta, tc) = (h.task(DEFAULT_ORG, "web", &link).await, h.task(ORG_C, "web", &link).await);
+        let body = serde_json::to_vec(&json!({
+            "action": "closed", "number": 12, "pull_request": merged_into(SHARED, 12, BASE),
+            "repository": { "full_name": SHARED, "default_branch": "main" },
+        }))
+        .unwrap();
+        h.sql(
+            "CREATE TRIGGER fail_org_c_off_branch BEFORE INSERT ON event_log
+             WHEN NEW.channel = 'agent.github.merged_to_non_default'
+              AND json_extract(NEW.payload, '$.org_id') = 'org-c'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        );
+        let e = h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap_err();
+        assert!(matches!(e, WebhookError::Internal(_)), "{e:?}");
+        assert_eq!(e.http_status(), 500);
+        assert!(!e.message().contains(ORG_C), "{}", e.message());
+        assert_eq!(h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(), 1);
+        assert!(h.events("agent.github.merged_to_non_default", ORG_C).is_empty());
+
+        h.sql("DROP TRIGGER fail_org_c_off_branch;");
+        let out = h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap();
+        assert_eq!(out, json!({ "ok": true, "matched": 2, "statuses": [409, 200] }));
+        assert_eq!(
+            h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(),
+            1,
+            "not processed twice"
+        );
+        let c_events = h.events("agent.github.merged_to_non_default", ORG_C);
+        assert_eq!(c_events.len(), 1);
+        // Redaction: C's event keeps ids, numbers and the merge commit, never
+        // the repository or a branch.
+        let c = &c_events[0];
+        assert_eq!(c["task_id"].as_i64(), Some(tc));
+        assert_eq!(
+            (c["repo"].clone(), c["base_ref"].clone(), c["merge_branch"].clone()),
+            (Value::Null, Value::Null, Value::Null)
+        );
+        let text = c.to_string();
+        for leak in [BASE, SHARED, "\"main\""] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        let d = &h.events("agent.github.merged_to_non_default", DEFAULT_ORG)[0];
+        assert_eq!((d["base_ref"].as_str(), d["merge_branch"].as_str()), (Some(BASE), Some("main")));
+        assert_eq!((h.status(ta), h.status(tc)), ("open".into(), "open".into()));
+        // A third copy is a replay for both.
+        assert_eq!(
+            h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap_err(),
+            WebhookError::Replayed
+        );
+    }
+
+    /// When every matched organization refuses a delivery as a bad request,
+    /// the answer is 400, as for a single match.
+    #[tokio::test]
+    async fn every_matched_organization_refusing_it_answers_bad_request() {
+        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(HUB_HOOK) }).await;
+        let mut pr = merged_pr(SHARED, 13);
+        pr.as_object_mut().unwrap().remove("merge_commit_sha");
+        let body = serde_json::to_vec(&json!({
+            "action": "closed", "number": 13, "pull_request": pr,
+            "repository": { "full_name": SHARED, "default_branch": "main" },
+        }))
+        .unwrap();
+        let e = h.deliver(Some(HUB_HOOK), "pull_request", "bad-13", &body).await.unwrap_err();
+        assert!(matches!(e, WebhookError::BadRequest(_)), "{e:?}");
+        assert_eq!(e.http_status(), 400);
+        // Both organizations finished it: the next copy is a replay for both.
+        assert_eq!(
+            h.deliver(Some(HUB_HOOK), "pull_request", "bad-13", &body).await.unwrap_err(),
+            WebhookError::Replayed
+        );
+    }
+
+    // --- the poller: unusable token, rate limits -----------------------------------------
+
+    /// Organization C's stored token is B's ciphertext moved across: C is
+    /// reported `unusable` and never polled, while B and the default
+    /// organization are.
+    #[tokio::test]
+    async fn the_poller_reports_an_unusable_token() {
+        let h = H::new(ALL).await;
+        h.move_sealed(ORG_B, ORG_C, CredentialKind::Token);
+        let out = super::super::poll_once(&h.hub).await.unwrap();
+        let states: Vec<(&str, &str)> = out["orgs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| (o["org_id"].as_str().unwrap(), o["state"].as_str().unwrap()))
+            .collect();
+        assert_eq!(states, [(DEFAULT_ORG, "polled"), (ORG_B, "polled"), (ORG_C, "unusable")], "{out}");
+        // The shared repository: once for the default organization, once for B.
+        assert_eq!(h.tokens_for(SHARED).len(), 2);
+        assert_eq!(h.count("SELECT count(*) FROM github_poll_repos WHERE org_id = 'org-c'"), 0);
+    }
+
+    /// Organization B's token exhausts its rate limit: B's next poll sends
+    /// nothing and records `rate_limited`; the default organization, on the
+    /// same host, is polled as before.
+    #[tokio::test]
+    async fn one_organizations_rate_limit_does_not_block_another() {
+        let h = H::new(ALL).await;
+        h.mock.lock().unwrap().limited = Some(fp(B_TOKEN));
+        super::super::poll_once(&h.hub).await.unwrap();
+        let count = |f: &str| h.all_tokens().iter().filter(|t| *t == f).count();
+        let (b_before, d_before) = (count(&fp(B_TOKEN)), count(&fp(HUB_TOKEN)));
+        assert!(b_before >= 1 && d_before == 1, "{b_before} {d_before}");
+
+        let out = super::super::poll_once(&h.hub).await.unwrap();
+        assert_eq!(count(&fp(B_TOKEN)), b_before, "B is blocked: nothing sent");
+        assert_eq!(count(&fp(HUB_TOKEN)), d_before + 1, "the default organization is polled");
+        let default_repos = out["orgs"][0]["repos"].as_array().unwrap();
+        assert!(default_repos.iter().all(|r| r.get("error").is_none()), "{out}");
+        let b_repos = out["orgs"][1]["repos"].as_array().unwrap();
+        assert!(
+            b_repos.iter().all(|r| r["error"].as_str().is_some_and(|e| e.contains("rate limit"))),
+            "{out}"
+        );
+        assert_eq!(
+            h.text("SELECT group_concat(DISTINCT last_error) FROM github_poll_repos WHERE org_id = 'org-b'")
+                .as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            h.count(
+                "SELECT count(*) FROM github_poll_repos WHERE org_id = 'default' AND last_error IS NOT NULL"
+            ),
+            0
+        );
+    }
+
+    // --- the migration --------------------------------------------------------------------
+
+    /// `github.v2.poll_repos` copies every row of the old hub-wide
+    /// `github_poll_state` into `github_poll_repos` under the default
+    /// organization, field for field, and keeps the old table; run again it
+    /// changes nothing.
+    #[test]
+    fn the_migration_copies_every_poll_row_into_the_default_organization() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(super::super::SCHEMA.sql).unwrap();
+        c.execute_batch(
+            "INSERT INTO github_poll_state (repo, etag, open_json, polled_at, changed_at) VALUES
+                ('a/one', 'W/\"e1\"', '{\"1\":\"aaaa\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('b/two', NULL, '{}', '2026-01-02T00:00:00Z', NULL),
+                ('c/three', 'W/\"e3\"', '{\"7\":\"cccc\"}', '2026-01-03T00:00:00Z', NULL);",
+        )
+        .unwrap();
+        type OldRow = (String, Option<String>, String, String, Option<String>);
+        let old = |c: &rusqlite::Connection| -> Vec<OldRow> {
+            let mut stmt = c
+                .prepare("SELECT repo, etag, open_json, polled_at, changed_at FROM github_poll_state ORDER BY repo")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = old(&c);
+        for _ in 0..2 {
+            c.execute_batch(super::super::POLL_REPOS_SCHEMA.sql).unwrap();
+        }
+        let mut stmt = c
+            .prepare(
+                "SELECT org_id, repo, etag, open_json, polled_at, changed_at, last_error FROM github_poll_repos \
+                 ORDER BY repo",
+            )
+            .unwrap();
+        type Row = (String, String, Option<String>, String, String, Option<String>, Option<String>);
+        let copied: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(copied.len(), before.len());
+        for ((org, repo, etag, open, polled, changed, err), (r0, e0, o0, p0, c0)) in
+            copied.iter().zip(&before)
+        {
+            assert_eq!(org, DEFAULT_ORG);
+            assert_eq!((repo, etag, open, polled, changed), (r0, e0, o0, p0, c0));
+            assert_eq!(*err, None);
+        }
+        assert_eq!(old(&c), before, "the old table is kept as it was");
     }
 }

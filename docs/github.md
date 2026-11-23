@@ -318,27 +318,49 @@ another's:
   secret verifies its `X-Hub-Signature-256` (the default organization's
   `github_webhook_secret_env`, every other organization's
   `github:webhook-secret`), each compared in constant time; the payload's
-  repository never decides. None verifies: `bad_signature` (401); no
-  organization has a secret: `not_configured` (503). It is then recorded
+  repository never decides. The header must be `sha256=` and 64 hex digits,
+  checked before the database is touched (`bad_signature`, 401). No active
+  organization holds a secret (decided from metadata, nothing decrypted):
+  `not_configured` (503). Each held secret is then decrypted in one read and
+  the MACs computed after it; none verifies: `bad_signature` (401). It is then recorded
   (replay keys in that organization), ledgered and handled against that
   organization's bound repositories and tasks only, as the hub identity
   acting for it. **Multi-match rule:** when two organizations configured the
   same secret, the delivery belongs to both and is processed once for each,
   in a fixed order (the default organization first, then by id), each
-  against its own tasks; the response lists each organization's result
-  (`orgs`), is `replayed` only when every one had already processed it, and
-  is 500 when any one failed internally, so GitHub redelivers. A stored
-  secret that cannot be used is skipped, never replaced by another's.
+  against its own tasks. A stored secret that cannot be used is skipped,
+  never replaced by another's, and its warning is logged at most once per
+  five minutes per organization; a suspended organization's secret is never
+  consulted.
+- **Webhook response.** A delivery only the default organization matched is
+  answered with its result, as before organizations. Any other (one other
+  organization, or several) is answered organization-neutrally:
+  `{"ok": true, "matched": n, "statuses": [...]}`, one HTTP status per
+  matched organization in the fixed order, with no organization id,
+  repository, task id or title; what each did is in its own ledger. When
+  several matched, the status is: 500 when any failed internally (its replay
+  records are released, so GitHub's redelivery is processed for it while
+  the others answer it as a replay; every effect is idempotent); else 200
+  when any succeeded; else 400 when any refused it as a bad request, the
+  same as a single match; else 409 `replayed` (every one had already
+  processed it).
 - **Poller.** Each pass polls every organization that has a token, its bound
   repositories with its token; an organization without one is skipped and
   one whose stored token is unusable is reported `unusable`. A repository
   two organizations bind is polled once per organization, each with its own
   ETag and open list (`github_poll_repos`). One organization's failure (a
-  refused token, a rate limit, which is kept per host and organization) is
-  recorded for its repositories (`last_error`, a fixed description, never a
-  value) and does not stop the others; `system_doctor`'s
-  `github_credentials` line counts repositories whose last poll failed and
-  turns DEGRADED.
+  refused token, a rate limit) is recorded for its repositories and does not
+  stop the others. `last_error` holds a fixed code, never library error
+  text, a URL or a value: `unauthorized`, `forbidden`, `not_found`,
+  `rate_limited`, `network`, `decode`, `too_large`, `not_configured`,
+  `redirect_<status>` or `http_<status>`. A rate limit blocks only the
+  organization whose token hit it (the block is kept per host and
+  organization, in memory); setting or clearing that organization's token
+  with `github_credential_set`/`github_credential_clear` lifts it, and the
+  default organization's token, which is configuration, starts clean on the
+  restart that changes it. `system_doctor`'s `github_credentials` line
+  counts repositories whose last poll failed, only those still bound in an
+  organization that still holds a usable token, and turns DEGRADED.
 - **CI.** A check's run is looked up with the task's organization's token in
   that organization's binding. A task in an organization without a token is
   `unverifiable` (credential off) and nothing is requested; the hub's token
@@ -350,8 +372,10 @@ another's:
   organization's.
 - **Events.** `agent.github.*` events carry `org_id`. They stay in the
   default ledger (`ORG-EVENT-DEFAULT`); for another organization the
-  repository, branch names and check names are `null` and the originator is
-  `system`.
+  repository, branch names (`base_ref`, `merge_branch`) and check names are
+  `null` and the originator is `system`. Head and merge commit SHAs, pull
+  request numbers and task ids stay visible there
+  ([organization.md](organization.md)).
 
 ## Polling
 

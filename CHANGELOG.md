@@ -494,11 +494,21 @@ from its commit history.
   its signature (constant-time, never logged) and is recorded, ledgered and
   handled against that organization's bindings and tasks only; when two
   organizations share a secret it is processed once for each, the default
-  organization first, then by id. The poller polls each organization that
+  organization first, then by id. A missing or malformed
+  `X-Hub-Signature-256` is refused (401) before the database is touched;
+  secrets are decrypted in one read and the MACs computed after it; a
+  suspended organization's secret is never consulted. A delivery any
+  organization other than the default matched is answered
+  organization-neutrally (`{"ok", "matched", "statuses"}`); with several,
+  any internal failure answers 500, any success 200, else any bad request
+  400, else 409. The poller polls each organization that
   has a token with that token and skips one without; one organization's
-  failure is recorded per repository (`github_poll_repos.last_error`, no
-  values), counted on the `system_doctor` `github_credentials` line and
-  never stops the others. CI run lookups and `queue_close_merged` use the
+  failure is recorded per repository (`github_poll_repos.last_error`, a
+  fixed code such as `unauthorized` or `rate_limited`, never library text
+  or a value), counted on the `system_doctor` `github_credentials` line
+  (only repositories still bound in an organization with a usable token)
+  and never stops the others; setting or clearing an organization's token
+  lifts its rate-limit block. CI run lookups and `queue_close_merged` use the
   task's or caller's organization's token and bindings; an organization
   without a token is credential-off and the hub's token is never used for
   it. The GitHub client is built per organization and keeps rate-limit
@@ -508,7 +518,8 @@ from its commit history.
   old table stays unread), and `organization.v1.tools.github_poll` adds its
   triggers. The `ORG-GITHUB-DEFAULT` marker and the `TASK_ORG` constant are
   gone; `org_guard` admits one `Caller::system_for` site
-  (`github_caller_for`).
+  (`github_caller_for`, now crate-private) and refuses a call to
+  `github_caller_for` outside the GitHub family.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

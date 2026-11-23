@@ -40,7 +40,8 @@ pub mod credentials;
 pub mod poll;
 pub mod webhook;
 
-#[cfg(test)]
+// Its cases sit in their own `#[cfg(test)]` module, which the source guards
+// see as test code; the declaration needs no second one.
 mod org_automation_tests;
 
 use serde_json::{Value, json};
@@ -201,7 +202,11 @@ pub fn github_caller() -> Caller {
 /// grant [`grant_refusal`] enforces. The `operator` profile here only
 /// selects the tool surface; a profile grants no authority, and as a system
 /// caller it holds neither `Operator` nor `LifecycleOperator`.
-pub fn github_caller_for(org: &str) -> Caller {
+///
+/// Crate-private, and `org_guard` refuses a call to it outside the GitHub
+/// family: only a delivery verified by `org`'s own secret or a poll with
+/// `org`'s own token acts as it.
+pub(crate) fn github_caller_for(org: &str) -> Caller {
     Caller { label: GITHUB_ACTOR.into(), profile: ua_core::Profile::Operator, ..Caller::system_for(org) }
 }
 

@@ -217,12 +217,13 @@ pub fn github_credential_for(
 
 /// Every organization that may hold a GitHub credential of `kind`, in a
 /// fixed order: the default organization first (its credential is the hub
-/// configuration), then each other organization that stores the managed
-/// secret bound to its consumer, by id. Resolve each with
+/// configuration), then each other active organization (a suspended one
+/// is never served) that stores the managed secret bound to its consumer,
+/// by id. Resolve each with
 /// [`github_credential_for`]; nothing here decrypts.
 pub fn orgs_holding(conn: &Connection, kind: CredentialKind) -> UaResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT m.org_id FROM managed_secrets m JOIN orgs o ON o.id = m.org_id \
+        "SELECT m.org_id FROM managed_secrets m JOIN orgs o ON o.id = m.org_id AND o.status = 'active' \
          WHERE m.name = ?1 AND m.consumer = ?2 AND m.org_id <> ?3 ORDER BY m.org_id",
     )?;
     let others = stmt
@@ -390,6 +391,7 @@ async fn github_credential_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
     // consumed a pass for this exact payload.
     let registry_gated = cfg.approval_tools.iter().any(|t| t == TOOL);
     let hub = ctx.hub.clone();
+    let blocked_org = org.clone();
     let out = ctx
         .hub
         .db()
@@ -428,6 +430,10 @@ async fn github_credential_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
             })))
         })
         .await?;
+    if out.is_ok() && kind == CredentialKind::Token {
+        // A new token has its own rate limit.
+        super::client::clear_blocks(&blocked_org);
+    }
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: TOOL.into(), approval_id })
 }
 
@@ -448,6 +454,7 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
     }
     let kind = a.kind;
     let hub = ctx.hub.clone();
+    let blocked_org = org.clone();
     let out = ctx
         .hub
         .db()
@@ -482,6 +489,10 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
             })))
         })
         .await?;
+    if out.is_ok() && kind == CredentialKind::Token {
+        // No token, no block to keep: a token set later starts clean.
+        super::client::clear_blocks(&blocked_org);
+    }
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: TOOL.into(), approval_id })
 }
 

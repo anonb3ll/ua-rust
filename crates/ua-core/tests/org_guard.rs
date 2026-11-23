@@ -16,7 +16,9 @@
 //!   [`SYSTEM_FOR_ALLOWED`] site: callerless per-organization work (a
 //!   webhook delivery verified by an organization's own secret, a poll with
 //!   its own token) acts as the hub identity in that organization, and
-//!   nowhere else does.
+//!   nowhere else does;
+//! - `github_caller_for(` (that site's wrapper, a caller for any
+//!   organization) is called only inside `families/github/`.
 //!
 //! Test code is excluded by removing each `#[cfg(test)]` item (a `mod`
 //! block found by brace matching, or the single item that follows), wherever
@@ -98,6 +100,9 @@ fn org_field(body: &str) -> Option<&str> {
 /// delivery or a poll belongs to.
 const SYSTEM_FOR_ALLOWED: &[(&str, usize)] = &[("ua-tools/src/families/github/mod.rs", 1)];
 
+/// The one directory whose code may call `github_caller_for`.
+const GITHUB_CALLER_FOR_HOME: &str = "ua-tools/src/families/github/";
+
 fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (path, src) in files {
@@ -162,6 +167,19 @@ fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
                 line_of(&m, at)
             ));
         }
+        if !unix.contains(GITHUB_CALLER_FOR_HOME) {
+            for at in find_all(&m, "github_caller_for(") {
+                // Its definition is not a call.
+                if m[..at].trim_end().strip_suffix("fn").is_some_and(|b| b.ends_with(char::is_whitespace)) {
+                    continue;
+                }
+                out.push(format!(
+                    "{name}:{}: calls github_caller_for outside the GitHub family (a caller for any \
+                     organization)",
+                    line_of(&m, at)
+                ));
+            }
+        }
     }
     out
 }
@@ -196,6 +214,21 @@ fn the_guard_catches_a_caller_in_another_organization() {
     };
     assert!(github("fn f(o: &str) { Caller::system_for(o); }").is_empty());
     assert_eq!(github("fn f(o: &str) { Caller::system_for(o); Caller::system_for(o); }").len(), 1);
+    // `github_caller_for` is callable inside the GitHub family only.
+    let at = |path: &str, src: &str| findings(&[(PathBuf::from(path), src.to_string())]);
+    let call = "fn f(o: &str) { let c = github_caller_for(o); }";
+    assert!(at("crates/ua-tools/src/families/github/webhook.rs", call).is_empty());
+    let found = at("crates/ua-tools/src/families/tasks/mod.rs", call);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("outside the GitHub family"), "{found:?}");
+    assert_eq!(
+        at("crates/ua-tools/src/ci.rs", "fn f() { super::github::github_caller_for(\"org-b\"); }").len(),
+        1
+    );
+    // Its definition is not a call.
+    assert!(
+        at("crates/ua-tools/src/families/other.rs", "pub(crate) fn github_caller_for(o: &str) {}").is_empty()
+    );
     assert!(
         one("fn f() -> Caller { Caller { label: x, org_id: ua_core::DEFAULT_ORG.into(), kind: k } }")
             .is_empty()
