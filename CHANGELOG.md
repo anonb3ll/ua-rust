@@ -473,6 +473,21 @@ from its commit history.
   another organization's reasons and proposer are `null` in them and the
   originator is `system`. The importer writes legacy goals, links,
   proposals and items to `default` and never copies a source `org_id`.
+- Managed secrets are organization-scoped and each organization can hold
+  its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
+  table around `(org_id, name)` and adds `aad_v` (new writes bind the
+  organization into the associated data; a row stored before decrypts only
+  in the default organization), and `organization.v1.tools.managed_secrets`
+  adds the organization triggers. `github_credential_for(org, kind)`
+  resolves the default organization to the hub's configured token and
+  webhook secret and every other organization to its own reserved managed
+  secrets (`github:token`, `github:webhook-secret`), never another's.
+  `github_credential_set`, `github_credential_clear` and
+  `github_credential_status` act in the caller's organization; a
+  `system_doctor` line names each organization's credential state for a hub
+  operator and gives counts only to anyone else. An upgrade finding a
+  legacy row with a NULL name stops with its row ids and the fix instead of
+  dropping it.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -621,6 +636,18 @@ from its commit history.
 
 ### Behaviour changes
 
+- `managed_secret_set` refuses the names `github:token` and
+  `github:webhook-secret` and consumers of kind `github`
+  (`reserved_secret`). **Upgrade note:** a secret already stored under one
+  of those names (for example the relay's token named by
+  `relay_github_secret`) can no longer be rotated with `managed_secret_set`;
+  it still loads in the default organization, so delete it with
+  `managed_secret_delete`, store the value under a new name and point the
+  setting at it. `managed_secret_list` shows such a row without its
+  fingerprint, size or key id.
+- The relay's `request_send` and `send`, and `mcp_gateway` `call` and live
+  `list` on a server that injects secrets, refuse another organization's
+  caller (`org_unsupported`): they use the default organization's secrets.
 - `skill_registry` approval payloads (publish, assign, unassign) now carry
   `org_id`, so a pass is never consumed across organizations. An approval
   parked in the old payload shape no longer matches its call: it can never

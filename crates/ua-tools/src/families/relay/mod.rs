@@ -553,7 +553,7 @@ fn recheck(c: &Connection, cfg: &Config, row: &Row) -> UaResult<(Target, String)
     }
     github::api_base(cfg)?;
     let name = github::secret_name(cfg)?;
-    if !managed_secrets::bound_to(c, name, github::CONSUMER)? {
+    if !managed_secrets::bound_to(c, ua_core::DEFAULT_ORG, name, github::CONSUMER)? {
         return Err(UaError::denied(
             "relay_unavailable",
             format!("managed secret {name:?} is not set or not bound to consumer {:?}", github::CONSUMER),
@@ -573,15 +573,17 @@ struct Credential {
 fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Credential> {
     let name = github::secret_name(cfg)?.to_string();
     let (token, fingerprint) =
-        managed_secrets::load_for_consumer(tx, cfg, &name, github::CONSUMER).map_err(|e| {
-            UaError::denied(
-                "relay_unavailable",
-                format!(
-                    "the relay's GitHub credential is not usable: {}",
-                    e.reason_code().unwrap_or(e.code())
-                ),
-            )
-        })?;
+        managed_secrets::load_for_consumer(tx, cfg, ua_core::DEFAULT_ORG, &name, github::CONSUMER).map_err(
+            |e| {
+                UaError::denied(
+                    "relay_unavailable",
+                    format!(
+                        "the relay's GitHub credential is not usable: {}",
+                        e.reason_code().unwrap_or(e.code())
+                    ),
+                )
+            },
+        )?;
     if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
         return Err(UaError::denied(
             "relay_unavailable",
@@ -591,8 +593,25 @@ fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Cred
     Ok(Credential { name, token, fingerprint })
 }
 
+/// The relay posts with the hub's GitHub credential, a managed secret of the
+/// default organization: another organization's caller is refused before
+/// anything is read, so it never sends under that credential.
+fn require_hub_org(caller: &Caller, action: &str) -> UaResult<()> {
+    if caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "relay {action} posts with the hub's GitHub credential and serves the default organization only; \
+                 nothing was read or sent"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "request_send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     ctx.hub
         .db()
@@ -917,6 +936,7 @@ fn begin_send(
 
 async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let ready = ctx.hub.db().write_async(move |tx| begin_send(tx, hub.cfg(), &caller, &p)).await??;
     let outcome = github::post_comment(ctx.hub.cfg(), &ready.token, &ready.target, &ready.text).await;

@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 
 /// Ledger channel of registry changes.
 pub const REGISTRY_CHANNEL: &str = "agent.mcp_server";
+/// The organization whose managed secrets a downstream MCP server's
+/// credentials are. MCP servers are hub-scoped (`mcp_servers` is a hub
+/// table and only hub operators register them), so their secrets are the
+/// default organization's, which operates the hub.
+pub(crate) const HUB_SECRETS_ORG: &str = ua_core::DEFAULT_ORG;
 const MAX_TOOLS: usize = 256;
 const MAX_ARGS: usize = 64;
 const MAX_ARG_CHARS: usize = 1024;
@@ -588,7 +593,8 @@ impl Server {
             .iter()
             .map(|s| {
                 let stored =
-                    managed_secrets::bound_to(conn, &s.secret, &mcp_consumer(&self.name)).unwrap_or(false);
+                    managed_secrets::bound_to(conn, HUB_SECRETS_ORG, &s.secret, &mcp_consumer(&self.name))
+                        .unwrap_or(false);
                 json!({ "secret": s.secret, "inject": s.inject, "stored": stored })
             })
             .collect();
@@ -990,7 +996,7 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
             // The secrets this revocation orphans, bound into the approval: a
             // secret set or rotated after the request needs a new approval.
             let consumer = mcp_consumer(&name);
-            let orphans: Vec<Value> = managed_secrets::bound_secrets(tx, &consumer)?
+            let orphans: Vec<Value> = managed_secrets::bound_secrets(tx, HUB_SECRETS_ORG, &consumer)?
                 .into_iter()
                 .map(|(secret, fingerprint)| json!({ "secret": secret, "fingerprint": fingerprint }))
                 .collect();
@@ -1002,7 +1008,14 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
                 Err(id) => return Ok(Err(id)),
             };
             let orphaned =
-                managed_secrets::orphan_consumer(tx, &consumer, &caller.label, approval_id, "mcp_server_revoked")?;
+                managed_secrets::orphan_consumer(
+                tx,
+                HUB_SECRETS_ORG,
+                &consumer,
+                &caller.label,
+                approval_id,
+                "mcp_server_revoked",
+            )?;
             let now = ua_core::time::now();
             match server.source {
                 Source::Registry => {

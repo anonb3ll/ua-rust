@@ -107,3 +107,5 @@ organization.v1.tools.goals
 goals.v2.org_scope
 organization.v1.tools.proposals
 governance.v4.proposals_org_scope
+managed_secrets.v2.tenant_keys
+organization.v1.tools.managed_secrets

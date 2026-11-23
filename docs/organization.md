@@ -604,6 +604,60 @@ here for memory columns, owners and defaults.
   to `default` and never copies a source `org_id`.
   `crates/ua-tools/tests/goals_tenant.rs` holds the upgrade and the
   isolation tests.
+- The managed-secret store and per-organization GitHub credentials: the
+  standalone procedure `managed_secrets.v2.tenant_keys` rebuilds
+  `managed_secrets` around `(org_id, name)` (existing secrets move to
+  `default`) and adds `aad_v`, the associated-data form a row was sealed
+  under; `organization.v1.tools.managed_secrets` installs the organization
+  triggers. Every write now seals with `aad_v = 2`, which binds the
+  organization, name and consumer, so a row copied into another
+  organization does not decrypt; a legacy row (`aad_v = 1`, name and
+  consumer) decrypts only in the default organization, and setting it again
+  re-seals it. Every statement filters `org_id`; `managed_secret_set`,
+  `managed_secret_list` and `managed_secret_delete` act in the caller's
+  organization only, and another organization's secret of the same name
+  answers as a missing one. Writing needs `Operator` in the caller's
+  organization, which admits only the default organization's humans until
+  memberships exist, so another organization's secrets cannot be written by
+  any caller yet (fail closed); a write for an organization `orgs` does not
+  hold is refused (`unknown_organization`). The hub-scoped consumers (MCP
+  servers, the relay) keep their secrets in the default organization.
+  **Owner decision (2026-11-23):** GitHub automation (the webhook, the
+  poller, CI verification and merged-PR reconciliation) will run per task
+  organization, each under its own GitHub credentials, and an organization
+  without one stays off; this supersedes "GitHub stays default-only until
+  per-organization tokens exist". The credential layer is in the tree
+  (`crates/ua-tools/src/families/github/credentials.rs`):
+  `github_credential_for(org, kind)` answers the default organization with
+  the hub's configured token and webhook secret (`github_token_env`,
+  `github_webhook_secret_env`), unchanged, and every other organization with
+  its own managed secrets `github:token` (consumer `github:api`) and
+  `github:webhook-secret` (consumer `github:webhook`), never with the hub's
+  or another organization's (`None`, reported `off`). Those names and the
+  consumer kind `github` are reserved: only `github_credential_set` and
+  `github_credential_clear` write them, under the same authority, with the
+  default organization refused (its credentials are configuration) and
+  replacing or clearing one gated by a one-time human approval bound to the
+  keyed fingerprint. `github_credential_status` and a `system_doctor` line
+  (each organization by name for a hub operator, a verified human of the
+  default organization; counts only for any other caller, over its own
+  organization outside the default) report `configured`, `off` or
+  `unusable`, never a value or fingerprint; `managed_secret_list` shows a
+  reserved row's name, consumer and who set it, without fingerprint, size
+  or key id. The fingerprint is visible only in the one-time approval a
+  replacement or clear binds, as for every managed secret. The relay
+  (`relay_manage` `request_send`, `send`) and an MCP server that injects
+  secrets (`mcp_gateway` `call`, live `list`) use the default
+  organization's secrets, so another organization's caller is refused
+  (`org_unsupported`) before anything is read. The `github.credential.*` and `managed_secret.*` events are
+  `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
+  consumer are `null` and the originator is `system`. The automation paths
+  themselves still run for the default organization only
+  (`ORG-GITHUB-DEFAULT`); the follow-up switches each to
+  `github_credential_for(task_org)` and removes `TASK_ORG`. The importer has
+  no managed-secret mapping (the Python hub kept none), so it writes nothing
+  here. `crates/ua-tools/tests/managed_secrets_tenant.rs` holds the upgrade,
+  isolation, authority and leak tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -1181,7 +1235,7 @@ global key in the tree is classified:
 | `agents.label`, `users.label` | Hub namespace | One case-insensitive label namespace (above). An agent belongs to one organization. |
 | `nodes.node` | Hub namespace | Node names are registered hub-wide; a node serves one organization. |
 | `provider_accounts.label`, `mcp_servers.name`, `dispatch_meta.key` | Hub table | Hub-scoped configuration and hub salts, managed by hub owners. |
-| `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`. |
+| `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`, rebuilt in the standalone procedure `managed_secrets.v2.tenant_keys`, which also adds `aad_v` so new rows bind the organization into their associated data. |
 | `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`, rebuilt in the standalone procedure `skill_registry.v2.tenant_keys`. |
 | `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`, rebuilt in `skill_registry.v2.tenant_keys` together with `skill_versions`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`, rebuilt in the standalone procedure `harness_config.v3.tenant_keys`. |
@@ -1729,7 +1783,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |

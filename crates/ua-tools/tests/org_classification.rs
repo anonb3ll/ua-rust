@@ -165,8 +165,10 @@ const TENANT: &[&str] = &[
 /// (`organization.v1.tools.workflows`), the three plans tables
 /// (`organization.v1.tools.plans`), the three autonomous-cycle tables
 /// (`organization.v1.tools.cycles`), `approvals`
-/// (`organization.v1.tools.approvals`), and `tasks`, `task_dependencies`,
-/// `task_comments` and `task_comment_threads` (`organization.v1.tools.tasks`).
+/// (`organization.v1.tools.approvals`), `tasks`, `task_dependencies`,
+/// `task_comments` and `task_comment_threads` (`organization.v1.tools.tasks`),
+/// and `managed_secrets` (`managed_secrets.v2.tenant_keys`,
+/// `organization.v1.tools.managed_secrets`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -175,7 +177,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "idempotency_keys",
-    "managed_secrets",
     "memory",
     "memory_embeddings",
     "memory_versions",

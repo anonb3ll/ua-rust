@@ -11,6 +11,10 @@
 //!   finishes ([`crate::families::continuity::merged`]).
 //! - [`poll`]: the same effects without a public endpoint, polling the bound
 //!   repositories' open pull requests with ETags under `ua serve`.
+//! - [`credentials`]: each organization's GitHub token and webhook secret
+//!   (the default organization's are the hub's configuration, another's
+//!   its own managed secrets, never a fallback) and the tools that set,
+//!   clear and report them.
 //! - [`authz`]: `policy_authorization_record` and `policy_authorization_list`,
 //!   a human's standing-policy authorization to merge one exact head, which
 //!   `git_merge_task` accepts in place of a one-time approval.
@@ -25,6 +29,7 @@
 
 pub(crate) mod authz;
 pub(crate) mod client;
+pub mod credentials;
 pub mod poll;
 pub mod webhook;
 
@@ -142,6 +147,7 @@ ALTER TABLE policy_authorizations ADD COLUMN revoke_reason TEXT;
 
 pub fn register(r: &mut Registry) {
     authz::register(r);
+    credentials::register(r);
 }
 
 /// The hub identity GitHub effects run as. Its reach is the grant
