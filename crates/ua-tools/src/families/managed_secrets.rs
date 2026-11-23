@@ -613,17 +613,24 @@ pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
     Ok(())
 }
 
-/// A secret admin of organization `org`: an authenticated caller holding
-/// [`Authority::Operator`] there. Until memberships exist that is a verified
-/// human of the default organization only, so another organization's
-/// secrets cannot be written by any caller.
-pub(crate) fn require_admin(cfg: &Config, caller: &Caller, org: &str, doing: &str) -> UaResult<()> {
+/// Refuse an anonymous caller: every secret or credential write needs an
+/// authenticated identity before any authority is weighed.
+pub(crate) fn require_identity(caller: &Caller, doing: &str) -> UaResult<()> {
     if caller.kind == ActorKind::Anonymous {
         return Err(UaError::denied(
             "identity_required",
             format!("{doing} requires an authenticated identity"),
         ));
     }
+    Ok(())
+}
+
+/// A secret admin of organization `org`: an authenticated caller holding
+/// [`Authority::Operator`] there. Until memberships exist that is a verified
+/// human of the default organization only, so another organization's
+/// secrets cannot be written by any caller.
+pub(crate) fn require_admin(cfg: &Config, caller: &Caller, org: &str, doing: &str) -> UaResult<()> {
+    require_identity(caller, doing)?;
     if !Authz::new(cfg).holds(caller, &[Authority::Operator], org) {
         return Err(UaError::denied(
             "operator_only",

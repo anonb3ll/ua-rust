@@ -57,7 +57,7 @@ use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, UaError, UaResult};
+use ua_core::{Caller, Config, DEFAULT_ORG, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
 use crate::approvals;
@@ -312,12 +312,7 @@ fn require_credential_admin(
     org: &str,
     doing: &str,
 ) -> UaResult<()> {
-    if caller.kind == ActorKind::Anonymous {
-        return Err(UaError::denied(
-            "identity_required",
-            format!("{doing} requires an authenticated identity"),
-        ));
-    }
+    managed_secrets::require_identity(caller, doing)?;
     managed_secrets::require_org(c, org)?;
     if !Authz::new(cfg).holds(caller, &[Authority::Operator], org) {
         return Err(UaError::denied(
