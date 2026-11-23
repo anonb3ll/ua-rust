@@ -50,6 +50,19 @@ const LIFECYCLE_KINDS: [&str; 8] = [
     "stop",
     "handoff",
 ];
+/// The channel a hook-reported `handoff` observation is recorded on. It is not
+/// `agent.lifecycle.handoff`, which carries only the authoritative handoff-note
+/// events, so a caller cannot place a note-shaped row in another session's
+/// view.
+pub(crate) const HOOK_HANDOFF_CHANNEL: &str = "agent.lifecycle.handoff_hook";
+
+/// The ledger channel for a lifecycle `kind`.
+fn lifecycle_channel(kind: &str) -> String {
+    match kind {
+        "handoff" => HOOK_HANDOFF_CHANNEL.to_string(),
+        other => format!("agent.lifecycle.{other}"),
+    }
+}
 /// Tools whose lifecycle observations are never captured.
 const LIFECYCLE_EXCLUDED_TOOLS: [&str; 2] = ["gemini_ask", "pi_run_task"];
 /// Payload keys dropped (not redacted) at any depth, compared case-insensitively,
@@ -1023,7 +1036,7 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
             let event = ledger::append(
                 tx,
                 EventInput {
-                    channel: format!("agent.lifecycle.{kind}"),
+                    channel: lifecycle_channel(&kind),
                     payload: json!({
                         "kind": kind, "session_id": session_id, "task_id": task_id,
                         "tool": tool_name, "payload": body,
@@ -1114,7 +1127,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "lifecycle_record",
-            "Record one sanitized lifecycle observation on agent.lifecycle.<kind>. Unknown kinds, excluded tools and storage failures return {accepted: false, reason}. A repeated idempotency_key returns the first result. Transcripts, prompts and credentials in the payload are dropped.",
+            "Record one sanitized lifecycle observation on agent.lifecycle.<kind> (kind handoff goes to agent.lifecycle.handoff_hook, readable only by its writer and note-reading operators). Unknown kinds, excluded tools and storage failures return {accepted: false, reason}. A repeated idempotency_key returns the first result. Transcripts, prompts and credentials in the payload are dropped.",
             lifecycle_record,
         )
         .family("agents"),

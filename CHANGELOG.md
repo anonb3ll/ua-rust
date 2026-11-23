@@ -800,6 +800,12 @@ from its commit history.
   `message_id`. `message_send`
   refuses a client-chosen `message_id` with an external-thread prefix
   (`ts:`).
+- `lifecycle_record` with `kind: "handoff"` now writes to
+  `agent.lifecycle.handoff_hook` instead of `agent.lifecycle.handoff`, and
+  only its writer and note-reading operators can read it. Before, any agent
+  could name another agent's session and have a handoff row appear in that
+  owner's ledger view and `session_packet` as if it were a handoff-note event
+  (#111).
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one
