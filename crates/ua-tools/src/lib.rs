@@ -154,6 +154,18 @@ pub fn schema_parts() -> Vec<Part> {
     // organization's GitHub credentials.
     parts.push(families::managed_secrets::TENANT_KEYS.into());
     parts.push(families::managed_secrets::TENANT_PART.into());
+    // The organization column and triggers of `policy_authorizations` (no
+    // key rebuild: its only key is an AUTOINCREMENT id), then each
+    // authorization moved to its task's organization, the organization-led
+    // indexes and the rule that an authorization's task is in its own
+    // organization.
+    parts.push(families::github::POLICY_AUTH_TENANT_PART.into());
+    parts.push(families::github::POLICY_AUTH_ORG_SCOPE.into());
+    // The organization column and triggers of the per-call telemetry (no key
+    // rebuild: its only key is an AUTOINCREMENT id; every existing row is the
+    // default organization's), then its organization-led indexes.
+    parts.push(families::core_schema::TOOL_CALLS_TENANT_PART.into());
+    parts.push(families::core_schema::TOOL_CALLS_ORG_SCOPE.into());
     parts
 }
 

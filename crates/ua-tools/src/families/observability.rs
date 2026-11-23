@@ -25,7 +25,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
-use crate::families::events::{EventReader, VISIBLE_EVENT};
+use crate::families::events::{CALL_SCOPE, EventReader, VISIBLE_EVENT};
 use crate::families::nodes;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -264,12 +264,15 @@ fn metrics_snapshot(
             }
         }
     }
-    // The call totals carry the same rule as perf_summary: restricted
-    // readers count only their own calls.
+    // The call totals carry the same rule as perf_summary: the reader's
+    // organization only, and in it restricted readers count only their own
+    // calls.
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
-         WHERE started_at >= ?1 AND page = 0 AND (?2 OR caller = ?3)",
-        rusqlite::params![week, reader.unrestricted(), reader.party()],
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 AND {CALL_SCOPE}"
+        ),
+        params_from_iter(std::iter::once(&week as &dyn rusqlite::ToSql).chain(reader.call_bindings())),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let size = match db_file_sizes(db_path) {
@@ -359,14 +362,15 @@ fn rss_bytes() -> Option<u64> {
 fn perf_summary(c: &Connection, reader: &EventReader, a: PerfArgs) -> UaResult<Value> {
     let hours = a.since_hours.filter(|h| h.is_finite() && *h > 0.0).unwrap_or(PERF_WINDOW_HOURS_DEFAULT);
     let cutoff = agents::ago((hours * 3600.0).min(1e12) as i64);
-    // Other callers' governed calls are private activity: a restricted
-    // reader's buckets count only its own calls, like evidence's
-    // tool_call_window.
-    let mut stmt = c.prepare(
+    // Other callers' governed calls are private activity: a reader counts
+    // only its own organization's calls, and a restricted reader's buckets
+    // count only its own calls, like evidence's tool_call_window.
+    let mut stmt = c.prepare(&format!(
         "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ? AND page = 0 \
-         AND (? OR caller = ?) ORDER BY id DESC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![cutoff, reader.unrestricted(), reader.party()], |r| {
+         AND {CALL_SCOPE} ORDER BY id DESC"
+    ))?;
+    let args = std::iter::once(&cutoff as &dyn rusqlite::ToSql).chain(reader.call_bindings());
+    let rows = stmt.query_map(params_from_iter(args), |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
     })?;
     let mut by_tool: BTreeMap<String, Bucket> = BTreeMap::new();
@@ -618,18 +622,21 @@ fn check_anomalies(c: &Connection, org: &str, reader: &EventReader) -> UaResult<
         }
     }
 
-    // tool_error_rate (from tool_calls, last 24 h): a restricted reader's
-    // rule counts only its own calls, same as perf_summary.
+    // tool_error_rate (from tool_calls, last 24 h): the reader's
+    // organization only, and a restricted reader's rule counts only its own
+    // calls, same as perf_summary.
     {
         let cutoff = agents::ago(86_400);
-        let mut stmt = c.prepare(
+        let mut stmt = c.prepare(&format!(
             "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ? AND page = 0 \
-             AND (? OR caller = ?) GROUP BY tool HAVING COUNT(*) >= ? ORDER BY tool",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![cutoff, reader.unrestricted(), reader.party(), TOOL_ERROR_MIN_CALLS],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-        )?;
+             AND {CALL_SCOPE} GROUP BY tool HAVING COUNT(*) >= ? ORDER BY tool"
+        ))?;
+        let args = std::iter::once(&cutoff as &dyn rusqlite::ToSql)
+            .chain(reader.call_bindings())
+            .chain(std::iter::once(&TOOL_ERROR_MIN_CALLS as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
         for row in rows {
             let (tool, calls, errors) = row?;
             let r = rate(errors, calls);
@@ -1805,13 +1812,15 @@ pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::To
 }
 
 fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
-    // Every bucket is fed by the same scoped rows as perf_summary: a
-    // restricted reader counts only its own calls.
-    let scope = "AND (? OR caller = ?)";
+    // Every bucket is fed by the same scoped rows as perf_summary: the
+    // reader's organization only, and a restricted reader counts only its
+    // own calls.
+    let scope = format!("AND {CALL_SCOPE}");
     let day = agents::ago(86_400);
+    let windowed = || std::iter::once(&day as &dyn rusqlite::ToSql).chain(reader.call_bindings());
     let (total, last_call): (i64, Option<String>) = c.query_row(
         &format!("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0 {scope}"),
-        rusqlite::params![reader.unrestricted(), reader.party()],
+        params_from_iter(reader.call_bindings()),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let (calls, errors): (i64, i64) = c.query_row(
@@ -1819,7 +1828,7 @@ fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
             "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
              WHERE started_at >= ? AND page = 0 {scope}"
         ),
-        rusqlite::params![day, reader.unrestricted(), reader.party()],
+        params_from_iter(windowed()),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let mut by_transport = Map::new();
@@ -1828,7 +1837,7 @@ fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
             "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
              WHERE started_at >= ? AND page = 0 {scope} GROUP BY transport ORDER BY transport"
         ))?;
-        let rows = stmt.query_map(rusqlite::params![day, reader.unrestricted(), reader.party()], |r| {
+        let rows = stmt.query_map(params_from_iter(windowed()), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
         })?;
         for row in rows {
@@ -1842,7 +1851,7 @@ fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
             "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
              WHERE started_at >= ? AND page = 0 {scope} GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20"
         ))?;
-        let rows = stmt.query_map(rusqlite::params![day, reader.unrestricted(), reader.party()], |r| {
+        let rows = stmt.query_map(params_from_iter(windowed()), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
         })?;
         for row in rows {

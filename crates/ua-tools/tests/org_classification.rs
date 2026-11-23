@@ -169,8 +169,10 @@ const TENANT: &[&str] = &[
 /// (`organization.v1.tools.cycles`), `approvals`
 /// (`organization.v1.tools.approvals`), `tasks`, `task_dependencies`,
 /// `task_comments` and `task_comment_threads` (`organization.v1.tools.tasks`),
-/// and `managed_secrets` (`managed_secrets.v2.tenant_keys`,
-/// `organization.v1.tools.managed_secrets`).
+/// `managed_secrets` (`managed_secrets.v2.tenant_keys`,
+/// `organization.v1.tools.managed_secrets`), `policy_authorizations`
+/// (`organization.v1.tools.policy_authorizations`) and `tool_calls`
+/// (`organization.v1.tools.tool_calls`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -191,14 +193,12 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "policy_authorizations",
     "relay_messages",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",
     "session_wake",
     "session_wake_offers",
-    "tool_calls",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];

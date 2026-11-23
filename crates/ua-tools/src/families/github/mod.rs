@@ -187,6 +187,51 @@ INSERT INTO github_poll_repos (org_id, repo, etag, open_json, polled_at, changed
 pub const POLL_REPOS_TENANT_PART: Procedure =
     ua_store::org::tenant_part("organization.v1.tools.github_poll", &["github_poll_repos"]);
 
+/// `organization.v1.tools.policy_authorizations`: `org_id` on
+/// `policy_authorizations` (existing rows take the default organization;
+/// [`POLICY_AUTH_ORG_SCOPE`] then moves each to its task's) and the generated
+/// `policy_authorizations_org_exists` / `policy_authorizations_org_immutable`
+/// triggers. No key rebuild: an authorization id is a hub-global
+/// AUTOINCREMENT id and no other key exists. Applied after the tasks parts
+/// (`tasks.v2.org_scope`).
+pub const POLICY_AUTH_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.policy_authorizations", &["policy_authorizations"]);
+
+/// `github.v3.policy_authorizations_org_scope`: each existing authorization
+/// moves to its task's organization, which is the organization every reader
+/// already resolved it to (the generated immutability trigger is dropped for
+/// that one update and recreated exactly as [`POLICY_AUTH_TENANT_PART`] made
+/// it; an authorization whose task is gone stays the default organization's,
+/// as the readers already treated it). No row is dropped or rewritten
+/// otherwise. Then indexes led by `org_id` for the list (newest first), the
+/// head lookup and the task lookup, and triggers that keep an
+/// authorization's `task_id` inside its own organization. The table has no
+/// foreign key to `tasks`, so an authorization naming no existing task is
+/// not refused here (the tools always look the task up first).
+pub const POLICY_AUTH_ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "github.v3.policy_authorizations_org_scope",
+    sql: "
+DROP TRIGGER IF EXISTS policy_authorizations_org_immutable;
+UPDATE policy_authorizations SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = policy_authorizations.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = policy_authorizations.task_id
+              AND t.org_id IS NOT policy_authorizations.org_id);
+CREATE TRIGGER policy_authorizations_org_immutable BEFORE UPDATE OF org_id ON policy_authorizations \
+WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id \
+BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;
+
+CREATE INDEX IF NOT EXISTS idx_policy_authorizations_org_id ON policy_authorizations(org_id, id);
+CREATE INDEX IF NOT EXISTS idx_policy_authorizations_org_head ON policy_authorizations(org_id, repo, head_sha);
+CREATE INDEX IF NOT EXISTS idx_policy_authorizations_org_task ON policy_authorizations(org_id, task_id);
+
+CREATE TRIGGER IF NOT EXISTS policy_authorizations_org_parent BEFORE INSERT ON policy_authorizations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS policy_authorizations_org_parent_update BEFORE UPDATE OF task_id ON policy_authorizations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+",
+};
+
 pub fn register(r: &mut Registry) {
     authz::register(r);
     credentials::register(r);

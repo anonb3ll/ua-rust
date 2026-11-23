@@ -520,6 +520,24 @@ from its commit history.
   gone; `org_guard` admits one `Caller::system_for` site
   (`github_caller_for`, now crate-private) and refuses a call to
   `github_caller_for` outside the GitHub family.
+- Policy authorizations and tool-call telemetry are organization-scoped:
+  `organization.v1.tools.policy_authorizations` and
+  `organization.v1.tools.tool_calls` add `org_id` and the organization
+  triggers. `github.v3.policy_authorizations_org_scope` moves each existing
+  authorization to its task's organization (one whose task is gone stays in
+  `default`), adds org-led indexes and the same-organization task triggers;
+  `core.v5.tool_calls_org_scope` adds two org-led indexes. Every existing
+  call row is the default organization's. No row is dropped; no key rebuild.
+  The policy-authorization tools, the merge path's check, spend and restore,
+  and the task delete act only on the caller's organization's rows, and its
+  refusals are ledgered under it (another organization's requester is
+  `null`, originator `system`). The registry records the caller's
+  organization on every call row with no extra query; every telemetry
+  reader (`perf_summary`, `metrics_snapshot`, `check_anomalies`,
+  `mcp_health_telemetry`, `evidence_report`) and the policy rate limits and
+  cooldowns count only the reader's organization's calls, keeping the
+  own-calls rule inside it. Another organization's authorization events
+  carry no repository or policy reference.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

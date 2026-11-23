@@ -819,18 +819,25 @@ fn age_seconds(ts: &str) -> Option<f64> {
     Some((ua_core::time::now_ms() - t.as_millisecond()) as f64 / 1000.0)
 }
 
-/// Completed calls of `tool` by `label` inside the last `window` seconds,
-/// including calls of a consolidated tool whose action ran `tool`
-/// (`action_tool`). Timestamps have second precision: a call counts while
-/// `now - start < window`.
-pub fn recent_calls(conn: &Connection, tool: &str, label: &str, window: f64) -> rusqlite::Result<i64> {
+/// Completed calls of `tool` by `label` in organization `org` inside the
+/// last `window` seconds, including calls of a consolidated tool whose action
+/// ran `tool` (`action_tool`). Timestamps have second precision: a call
+/// counts while `now - start < window`.
+pub fn recent_calls(
+    conn: &Connection,
+    org: &str,
+    tool: &str,
+    label: &str,
+    window: f64,
+) -> rusqlite::Result<i64> {
     let cutoff_ms = ua_core::time::now_ms() - (window * 1000.0) as i64;
     let cutoff = jiff::Timestamp::from_millisecond(cutoff_ms)
         .map(ua_core::time::format_ts)
         .unwrap_or_else(|_| ua_core::time::now());
     conn.query_row(
-        "SELECT COUNT(*) FROM tool_calls WHERE (tool = ?1 OR action_tool = ?1) AND caller = ?2 AND started_at > ?3",
-        params![tool, label, cutoff],
+        "SELECT COUNT(*) FROM tool_calls WHERE org_id = ?4 AND caller = ?2 AND (tool = ?1 OR action_tool = ?1) \
+         AND started_at > ?3",
+        params![tool, label, cutoff, org],
         |r| r.get(0),
     )
 }
@@ -992,9 +999,9 @@ fn evaluate_with(
                         // Per caller: one identity's call must not put every
                         // other identity into cooldown.
                         .query_row(
-                            "SELECT MAX(started_at) FROM tool_calls WHERE (tool = ?1 OR action_tool = ?1) \
-                             AND caller = ?2",
-                            params![tool, caller.label],
+                            "SELECT MAX(started_at) FROM tool_calls WHERE org_id = ?3 AND caller = ?2 \
+                             AND (tool = ?1 OR action_tool = ?1)",
+                            params![tool, caller.label, caller.org_id],
                             |r| r.get(0),
                         )
                         .optional()
@@ -1021,7 +1028,8 @@ fn evaluate_with(
     // Rate limits are checked after every deny and before any approval pass.
     for rule in matching.iter().filter(|r| r.kind == RuleKind::RateLimit) {
         let (Some(max_calls), Some(window)) = (rule.max_calls, rule.window_seconds) else { continue };
-        let used = recent_calls(conn, tool, &caller.label, window).map_err(|e| unavailable(&rule.name, e))?;
+        let used = recent_calls(conn, &caller.org_id, tool, &caller.label, window)
+            .map_err(|e| unavailable(&rule.name, e))?;
         if used >= max_calls {
             return Err(Refusal::new(
                 "rate_limited",
