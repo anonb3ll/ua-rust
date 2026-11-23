@@ -103,6 +103,17 @@ impl EventReader {
         }
     }
 
+    /// May read every mailbox and restricted record (LocalTrustReader or
+    /// Operator, so auth-off board readers too).
+    pub(super) fn unrestricted(&self) -> bool {
+        self.unrestricted
+    }
+
+    /// The caller's verified label in the default organization.
+    pub(super) fn party(&self) -> Option<&str> {
+        self.party.as_deref()
+    }
+
     pub(super) fn bindings(&self) -> [&dyn ToSql; 19] {
         [
             &DEFAULT_ORG,

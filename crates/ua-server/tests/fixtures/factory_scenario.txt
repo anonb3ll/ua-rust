@@ -56,7 +56,7 @@
 4 isolation.same-org-ledger-read pass
 4 isolation.same-org-stream pass
 4 isolation.same-org-handoffs-in-retrieval pass
-4 isolation.same-org-evidence fail
+4 isolation.same-org-evidence pass
 4 isolation.same-org-exports pass
 4 isolation.same-org-retrieval-and-explanations pass
 
