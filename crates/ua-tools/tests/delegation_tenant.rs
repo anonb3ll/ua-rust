@@ -197,11 +197,16 @@ fn ids(v: &Value) -> Vec<i64> {
 
 /// `got` (about delegation `id`) reads exactly as `missing` (about
 /// [`ABSENT`]) does.
-fn same_as_missing(got: &Result<Value, UaError>, missing: &Result<Value, UaError>, id: i64) {
-    let norm = |r: &Result<Value, UaError>, n: i64| match r {
+/// An answer with the delegation id `n` in its text replaced, to compare an
+/// answer about one delegation with an answer about another.
+fn norm(r: &Result<Value, UaError>, n: i64) -> String {
+    match r {
         Ok(v) => format!("ok {v}"),
         Err(e) => format!("err {} {}", e.code(), e.to_string().replace(&n.to_string(), "ID")),
-    };
+    }
+}
+
+fn same_as_missing(got: &Result<Value, UaError>, missing: &Result<Value, UaError>, id: i64) {
     assert_eq!(
         norm(got, id),
         norm(missing, ABSENT),
@@ -517,34 +522,98 @@ async fn an_organization_b_delegation_creates_its_task_in_organization_b() {
     assert_eq!((h.snapshot(), h.events()), before);
 }
 
-/// Run- and task-fenced transitions name a delegation, its task and a run:
-/// across organizations each answers exactly as a missing delegation.
+/// Arguments of a fenced transition, from (delegation id, claim generation,
+/// task id).
+type Args = fn(i64, i64, i64) -> Value;
+
+/// Each case on a fresh hub: a default-organization delegation to
+/// `builder-1`, claimed by it, whose task (when `running`) is `doing` under
+/// run `run-1` of `builder-1`, so every guard but the organization passes.
+/// Organization B's `builder-1` then sends `action`: it must answer as for a
+/// missing delegation and change nothing. Returns each case that did not.
+async fn fenced_cases(running: bool, cases: &[(&str, Args)]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (action, args) in cases {
+        let h = H::new();
+        let a = agent_named("builder-1", DEFAULT_ORG);
+        let b = agent_named("builder-1", ORG_B);
+        let (d, task) = h.delegate(&agent_named("lead-1", DEFAULT_ORG), "builder-1").await;
+        let g = h.claim(&a, d).await;
+        if running {
+            h.sql(&format!(
+                "UPDATE tasks SET status = 'doing', claimed_by = 'builder-1', current_run_id = 'run-1', \
+                 current_run_agent = 'builder-1' WHERE id = {task}"
+            ))
+            .unwrap();
+        }
+        let before = (h.snapshot(), h.events());
+        let got = h.manage(&b, action, args(d, g, task)).await;
+        let missing = h.manage(&b, action, args(ABSENT, g, task)).await;
+        let (got, missing) = (norm(&got, d), norm(&missing, ABSENT));
+        if got != missing || (h.snapshot(), h.events()) != before {
+            wrong.push(format!("{action}({}): {got} != {missing}", args(d, g, task)));
+        }
+        // The same call in its own organization moves it: only the
+        // organization refused organization B.
+        let own = h.manage(&a, action, args(d, g, task)).await;
+        if (h.snapshot(), h.events()) == before {
+            wrong.push(format!(
+                "{action}({}) changed nothing in its own organization: {own:?}",
+                args(d, g, task)
+            ));
+        }
+    }
+    wrong
+}
+
+/// Task-fenced transitions (and cancels a run does not hold back) across
+/// organizations each answer exactly as a missing delegation.
 #[tokio::test]
-async fn fenced_transitions_across_organizations_answer_as_missing() {
+async fn task_fenced_transitions_across_organizations_answer_as_missing() {
+    let cases: [(&str, Args); 5] = [
+        ("release", |d, g, t| json!({ "id": d, "expected_claim_generation": g, "task_id": t })),
+        ("retry", |d, g, t| json!({ "id": d, "expected_claim_generation": g, "task_id": t })),
+        ("complete", |d, g, t| json!({ "id": d, "expected_claim_generation": g, "task_id": t })),
+        // No run holds the task, so neither guard holds the cancel back.
+        ("cancel", |d, g, _| json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-0" })),
+        ("cancel", |d, _, _| json!({ "id": d, "require_no_run": true })),
+    ];
+    let wrong = fenced_cases(false, &cases).await;
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Run-fenced transitions while the run is current: the run guard passes in
+/// organization A, so only the organization filter refuses organization B.
+#[tokio::test]
+async fn run_fenced_transitions_across_organizations_answer_as_missing() {
+    let cases: [(&str, Args); 3] = [
+        ("release", |d, g, _| json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-1" })),
+        ("fail", |d, g, _| json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-1" })),
+        // A cancel names the superseded run: `run-1` took over from `run-0`.
+        ("cancel", |d, g, _| json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-0" })),
+    ];
+    let wrong = fenced_cases(true, &cases).await;
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A claim names only the delegation: another organization's pending one
+/// answers as a missing one, and an in-flight one changes nothing.
+#[tokio::test]
+async fn a_claim_across_organizations_answers_as_missing() {
     let h = H::new();
     let a = agent_named("builder-1", DEFAULT_ORG);
     let b = agent_named("builder-1", ORG_B);
-    let (d, task) = h.delegate(&agent_named("lead-1", DEFAULT_ORG), "builder-1").await;
-    let g = h.claim(&a, d).await;
+    let (pending, _) = h.delegate(&agent_named("lead-1", DEFAULT_ORG), "builder-1").await;
+    let (claimed, _) = h.delegate(&agent_named("lead-1", DEFAULT_ORG), "builder-1").await;
+    let g = h.claim(&a, claimed).await;
     let before = (h.snapshot(), h.events());
-    for (action, args) in [
-        ("claim", json!({ "id": d })),
-        ("release", json!({ "id": d, "expected_claim_generation": g, "task_id": task })),
-        ("release", json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-1" })),
-        ("retry", json!({ "id": d, "expected_claim_generation": g, "task_id": task })),
-        ("complete", json!({ "id": d, "expected_claim_generation": g, "task_id": task })),
-        ("fail", json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-1" })),
-        ("cancel", json!({ "id": d, "expected_claim_generation": g, "expected_run_id": "run-1" })),
-        ("cancel", json!({ "id": d, "require_no_run": true })),
-    ] {
-        let got = h.manage(&b, action, args.clone()).await;
-        let mut absent = args.clone();
-        absent["id"] = json!(ABSENT);
-        same_as_missing(&got, &h.manage(&b, action, absent).await, d);
+    for d in [pending, claimed] {
+        let got = h.manage(&b, "claim", json!({ "id": d })).await;
+        same_as_missing(&got, &h.manage(&b, "claim", json!({ "id": ABSENT })).await, d);
     }
     assert_eq!((h.snapshot(), h.events()), before, "nothing moved");
-    let v =
-        h.manage(&a, "release", json!({ "id": d, "expected_claim_generation": g, "task_id": task })).await;
+    h.claim(&a, pending).await;
+    let v = h.manage(&a, "release", json!({ "id": claimed, "expected_claim_generation": g })).await;
     assert_eq!(v.unwrap()["released"], true);
 }
 
@@ -642,6 +711,58 @@ async fn an_idempotency_key_never_replays_across_organizations() {
         .await;
     assert_ne!(r1["delegation_id"], r2["delegation_id"]);
     assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'delegate:lead%3Ax:k'"), 1);
+}
+
+/// A receipt stored before labels were escaped, under its old key
+/// `delegate:lead:x:k` (written here by SQL), still replays to its own agent:
+/// a retry after the upgrade creates nothing, and `lookup` finds it.
+#[tokio::test]
+async fn a_receipt_under_the_old_unescaped_key_replays_to_its_own_agent() {
+    let h = H::new();
+    let colon = agent_named("lead:x", DEFAULT_ORG);
+    let req = json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": "k" });
+    let first = h.ok(&colon, "delegate", req.clone()).await;
+    h.sql("UPDATE idempotency_keys SET key = 'delegate:lead:x:k' WHERE key = 'delegate:lead%3Ax:k'").unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'delegate:lead:x:k'"), 1);
+    let before = (h.snapshot(), h.events());
+
+    assert_eq!(h.ok(&colon, "delegate", req.clone()).await, first, "the old receipt replayed");
+    assert_eq!((h.snapshot(), h.events()), before, "no second task or delegation");
+    assert_eq!(h.count("SELECT COUNT(*) FROM delegations"), 1);
+    let v = h.manage(&colon, "lookup", json!({ "idempotency_key": "k" })).await.unwrap();
+    assert_eq!(v["state"], "committed", "{v}");
+    assert_eq!(v["result"], first);
+    // The same key from an agent with no `:` in its label is another request.
+    let plain = agent_named("lead", DEFAULT_ORG);
+    let v = h.manage(&plain, "lookup", json!({ "idempotency_key": "x:k" })).await.unwrap();
+    assert_eq!(v["state"], "committed", "the old key is that agent's own current key: {v}");
+}
+
+/// The old key `delegate:lead:x:k` holding another agent's receipt (`lead`
+/// with key `x:k` stores exactly that key) never replays to `lead:x` with key
+/// `k`: its digest names another `from_agent`, so it reads as not found and
+/// the request runs fresh.
+#[tokio::test]
+async fn an_old_key_holding_another_agent_s_receipt_never_replays() {
+    let h = H::new();
+    let plain = agent_named("lead", DEFAULT_ORG);
+    let colon = agent_named("lead:x", DEFAULT_ORG);
+    let req = |key: &str| json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": key });
+    let theirs = h.ok(&plain, "delegate", req("x:k")).await;
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'delegate:lead:x:k'"), 1);
+
+    let v = h.manage(&colon, "lookup", json!({ "idempotency_key": "k" })).await.unwrap();
+    assert_eq!(v["state"], "not_found", "{v}");
+    let mine = h.ok(&colon, "delegate", req("k")).await;
+    assert_ne!(mine["delegation_id"], theirs["delegation_id"], "a fresh delegation, not a replay");
+    assert_eq!(
+        h.text(&format!("SELECT from_agent FROM delegations WHERE id = {}", mine["delegation_id"])).unwrap(),
+        "lead:x"
+    );
+    // Its own retry now replays its own receipt, under the escaped key.
+    assert_eq!(h.ok(&colon, "delegate", req("k")).await, mine);
+    assert_eq!(h.ok(&plain, "delegate", req("x:k")).await, theirs);
+    assert_eq!(h.count("SELECT COUNT(*) FROM delegations"), 2);
 }
 
 #[tokio::test]

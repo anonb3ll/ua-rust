@@ -231,11 +231,23 @@ fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
 /// (`crate::families::tasks::idem_key`) and never replays the default
 /// organization's receipt, or a third's; the default keeps the
 /// `delegate:<label>:<key>` form. Only a label holding `:` is stored
-/// differently from before, and a receipt stored under its old unescaped form
-/// is not read.
+/// differently from before; [`legacy_receipt_key`] names its old form.
 fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
-    let label = from_agent.replace('%', "%25").replace(':', "%3A").replace('/', "%2F");
-    crate::families::tasks::idem_key(org, "delegate", &format!("{label}:{key}"))
+    crate::families::tasks::idem_key(org, "delegate", &format!("{}:{key}", escape_label(from_agent)))
+}
+
+fn escape_label(label: &str) -> String {
+    label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
+}
+
+/// The key a receipt was stored under before labels were escaped, when that
+/// differs from [`receipt_key`] (a label holding `:`). That form is ambiguous
+/// (`a:b` with key `k` and `a` with key `b:k` share it), so a receipt found
+/// there counts only once it is shown to be this agent's: by the request
+/// digest, which covers `from_agent`, or by its delegation's `from_agent`.
+fn legacy_receipt_key(org: &str, from_agent: &str, key: &str) -> Option<String> {
+    (escape_label(from_agent) != from_agent)
+        .then(|| crate::families::tasks::idem_key(org, "delegate", &format!("{from_agent}:{key}")))
 }
 
 /// A delegation event about a delegation of organization `org`, through the
@@ -283,6 +295,24 @@ fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Va
         }
         None => Ok(None),
     }
+}
+
+/// The committed result of this request, if any: its receipt under the
+/// current key (a different request there is a conflict), else under the old
+/// unescaped key when its digest is this request's. The digest covers
+/// `from_agent`, so the old key never replays another agent's receipt; any
+/// other receipt there reads as none, and the request runs fresh.
+fn find_receipt(c: &Connection, keys: &(String, Option<String>), digest: &str) -> UaResult<Option<Value>> {
+    if let Some(done) = replay(read_receipt(c, &keys.0)?, digest)? {
+        return Ok(Some(done));
+    }
+    if let Some(old) = &keys.1
+        && let Some((d, result)) = read_receipt(c, old)?
+        && d == digest
+    {
+        return Ok(Some(result));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -517,12 +547,15 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     });
     let digest = hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()));
     let org = ctx.caller.org_id.clone();
-    let rkey = idem.as_deref().map(|k| receipt_key(&org, &from_agent, k));
+    let rkeys = idem
+        .as_deref()
+        .map(|k| (receipt_key(&org, &from_agent, k), legacy_receipt_key(&org, &from_agent, k)));
+    let rkey = rkeys.as_ref().map(|k| k.0.clone());
 
     // A committed retry replays before any gate: no second approval, no effect.
-    if let Some(k) = rkey.clone() {
-        let existing = ctx.hub.db().read(|c| read_receipt(c, &k))?;
-        if let Some(done) = replay(existing, &digest)? {
+    if let Some(k) = rkeys.clone() {
+        let found = ctx.hub.db().read(|c| find_receipt(c, &k, &digest))?;
+        if let Some(done) = found {
             return Ok(done);
         }
     }
@@ -530,8 +563,8 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
-        if let Some(k) = rkey.as_deref()
-            && let Some(done) = replay(read_receipt(tx, k)?, &digest)?
+        if let Some(k) = rkeys.as_ref()
+            && let Some(done) = find_receipt(tx, k, &digest)?
         {
             return Ok(done);
         }
@@ -622,8 +655,28 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let actor = validate_label(&write_identity(&ctx.caller, a.from_agent.as_deref())?, "from_agent")?;
     let key = validate_idempotency_key(&a.idempotency_key)?;
-    let rkey = receipt_key(&ctx.caller.org_id, &actor, &key);
-    let found = ctx.hub.db().read(|c| read_receipt(c, &rkey))?;
+    let org = ctx.caller.org_id.clone();
+    let rkey = receipt_key(&org, &actor, &key);
+    let old = legacy_receipt_key(&org, &actor, &key);
+    let found = ctx.hub.db().read(|c| {
+        if let Some(hit) = read_receipt(c, &rkey)? {
+            return Ok(Some(hit));
+        }
+        // A receipt under the old unescaped key counts only when its
+        // delegation is this agent's: that key is shared with another label.
+        let Some(old) = old else { return Ok(None) };
+        let Some((d, result)) = read_receipt(c, &old)? else { return Ok(None) };
+        let Some(id) = result["delegation_id"].as_i64() else { return Ok(None) };
+        let mine = c
+            .query_row(
+                "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2 AND from_agent = ?3",
+                params![org, id, actor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(mine.then_some((d, result)))
+    })?;
     Ok(match found {
         Some((_, result)) => json!({ "idempotency_key": key, "state": "committed", "result": result }),
         None => json!({ "idempotency_key": key, "state": "not_found" }),

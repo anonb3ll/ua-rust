@@ -499,8 +499,14 @@ here for memory columns, owners and defaults.
   idempotency keys are stored per delegating agent as
   `delegate:<label>:<key>`, organization-prefixed outside the default
   (owner decision (a)), with `%`, `:` and `/` in the label percent-escaped
-  as `task_update`'s are; only a label holding `:` changes its stored form,
-  and a receipt in the old unescaped form is not read. The
+  as `task_update`'s are; only a label holding `:` changes its stored form.
+  A retry or `lookup` from such a label also reads its old unescaped key,
+  which another label can share (`a:b` with key `k`, `a` with key `b:k`), so
+  a receipt there counts only when it is shown to be the caller's: a retry
+  replays it only when its request digest, which covers `from_agent`,
+  matches (any other receipt there reads as not found, and the request runs
+  fresh), and `lookup` reports it only when its delegation's `from_agent`
+  is the caller. The
   `agent.delegation.*` events, and the `agent.task.created` event of a
   delegation's task, are `ORG-EVENT-DEFAULT` sites through the shared
   `emit`: for a delegation outside the default organization its title,

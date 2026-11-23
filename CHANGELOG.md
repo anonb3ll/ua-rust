@@ -603,7 +603,11 @@ from its commit history.
 - A `delegate` idempotency key stores its delegating agent's label with
   `%`, `:` and `/` percent-escaped, as `task_update` keys do, so two agents
   never share a stored key. Only a label holding `:` changes its stored
-  form; a receipt stored under the old unescaped form is not read.
+  form; a retry or `lookup` from such a label still finds a receipt stored
+  under the old unescaped form, but only when it is the caller's (its
+  request digest, or its delegation's `from_agent`, names the caller), so a
+  retry across the upgrade creates no second delegation and never replays
+  another agent's receipt.
 - `cleanup_stale_worktrees` judges a worktree only against the caller's
   organization's tasks and skips (`other_organization`) a worktree of
   another organization's task.
