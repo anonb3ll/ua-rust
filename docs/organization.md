@@ -35,7 +35,7 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (46 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (45 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
@@ -43,7 +43,7 @@ here for memory columns, owners and defaults.
   `harness_config_bundles`, `harness_config_proposals`,
   `harness_config_drift`, `harness_config_report_window`, `routines`,
   `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `plans`,
-  `plan_steps` and `plan_checkpoints` having left it;
+  `plan_steps`, `plan_checkpoints` and `approvals` having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -287,6 +287,42 @@ here for memory columns, owners and defaults.
   payload keeps its shape. The other fields are ids, counts, step indexes
   and enumerated statuses. The importer writes legacy plans,
   steps and checkpoints to `default`. `crates/ua-tools/tests/plans_tenant.rs`
+  holds the upgrade and the isolation tests.
+- The approval queue: `organization.v1.tools.approvals` gives `approvals`
+  its `org_id` and triggers, and `approvals.v3.org_indexes` adds indexes led
+  by `org_id` for the gate's match and the per-organization queue. No
+  rebuild: the table's only key is an AUTOINCREMENT id, and no unique key or
+  payload-hash constraint exists; the gate's match on `(tool, payload,
+  requested_by)` is a query key, which now filters on `org_id`, as in the
+  [binding rule](#approvals-routed-by-team). Existing rows move to
+  `default`; their payloads did not change, so no open approval is expired.
+  An approval belongs to the organization of its **requester** (the gate
+  caller's `org_id`). `gate`, `gate_via`, `request`, `peek` and the
+  stale-pass checks match only the caller's organization, so a pass parked
+  in organization A never satisfies the identical call in B, even with the
+  same tool, payload and requester label; expiry happens at gate time, per
+  organization. Runners without a human caller (workflow steps, harness
+  config, skills, routines, dispatch, the relay) gate with the caller they
+  already build, whose organization is the row's. `approval_pending`, the
+  `/api/approvals` routes, the inbox, `platform_object_get`, the session
+  packet, the evidence report and the `approval_queue_age` anomaly show only
+  the reader's organization. `approval_resolve` answers another
+  organization's approval exactly as a missing id on every transport (MCP,
+  HTTP, UI, CLI, Slack all resolve through it). Every existing resolver rule
+  holds (`not_human`, `self_approval`, `resolver_mismatch`, Slack's
+  `can_approve`); approving, and a human's deny or revoke, also needs
+  `ua_org::authz::require_same_org`, which admits only the default
+  organization until memberships exist (a human identity is hub
+  configuration, so it always resolves there), so another organization's
+  approvals can be withdrawn by their requester but approved by no one yet:
+  fail closed. A gate or request for an organization `orgs` does not hold
+  is refused (`unknown_organization`) before anything changes. The
+  `agent.approval.*` events are `ORG-EVENT-DEFAULT` sites; for an approval
+  outside the default organization `requested_by` and `resolved_by` are
+  `null` in their payloads (the other fields are ids, tool names, hashes and
+  enumerated codes). A policy-authorization refusal stays a default
+  organization event until `policy_authorizations` converts. The importer
+  writes legacy approvals to `default`. `crates/ua-tools/tests/approvals_tenant.rs`
   holds the upgrade and the isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
@@ -879,6 +915,7 @@ global key in the tree is classified:
 | `notify_outbox`, `pending_notifications`, `zulip_sends` | No key | AUTOINCREMENT ids only, so no rebuild (`organization.v1.tools.notify`, `organization.v1.tools.zulip`). The digest category count and the Zulip duplicate check (`stream, topic, content_sha256`) are query keys and filter on `org_id`. |
 | `routine_runs UNIQUE(routine_id, fire_key)`, `workflow_runs.run_id`, `workflow_checkpoints UNIQUE(run_id, seq)` | Global, safe | Led by a hub-global id (a routine's AUTOINCREMENT id, a hub-generated ULID run id), never client text alone, so two organizations cannot collide; no rebuild (`organization.v1.tools.routines`, `organization.v1.tools.workflows`). The child tables carry a same-organization trigger against their parent. |
 | `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
+| `approvals.id`; the gate's `(tool, payload, requested_by)` match | No key | AUTOINCREMENT id only, so no rebuild (`organization.v1.tools.approvals`, `approvals.v3.org_indexes`). The gate's match is a query key and filters on `org_id`. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
@@ -1407,7 +1444,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
-| Tenant: approvals and policy | `approvals`, `policy_authorizations` | `org_id`, routing `team_id`, required authority |
+| Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets`, `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |

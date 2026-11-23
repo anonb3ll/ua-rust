@@ -428,7 +428,7 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
                     format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
                 ))),
                 GateOutcome::Pending { approval_id } => {
-                    let stale = approvals::stale_pass(tx, cfg, &caller.label, MERGE_TOOL, &payload, &["task_id"])?;
+                    let stale = approvals::stale_pass(tx, cfg, &caller.org_id, &caller.label, MERGE_TOOL, &payload, &["task_id"])?;
                     let Some(stale) = stale else {
                         return Ok(Err(UaError::ApprovalRequired { tool: MERGE_TOOL.into(), approval_id }));
                     };
@@ -439,7 +439,7 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
                         .task(Some(task_id))
                         .hashes(Some(stale.approved_sha256), Some(approvals::payload_sha256(MERGE_TOOL, &payload)))
                         .changed(changed.clone());
-                    approvals::refused(tx, &caller.label, &r, None)?;
+                    approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
                     Ok(Err(UaError::denied(
                         "approval_binding_changed",
                         format!(

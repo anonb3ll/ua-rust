@@ -897,7 +897,8 @@ async fn a_denied_approval_drops_the_text_everywhere() {
 /// approval stays in the ledger with its own approver and transport.
 #[tokio::test]
 async fn the_approval_row_records_the_latest_decision_on_both_revoke_paths() {
-    let row = |h: &H, id: i64| h.hub.db().read(|c| ua_tools::approvals::get(c, id)).unwrap();
+    let row =
+        |h: &H, id: i64| h.hub.db().read(|c| ua_tools::approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap();
     let via = |c: Caller, t: Transport| Caller { transport: t, ..c };
 
     // Path 1: approved from Slack, then the relay withdraws the draft (CLI).

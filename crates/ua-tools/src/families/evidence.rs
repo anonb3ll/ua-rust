@@ -291,6 +291,7 @@ fn client_asserted(rows: &[Map<String, Value>]) -> Value {
 fn build_report(
     c: &Connection,
     a: &ReportArgs,
+    org: &str,
     caller_label: &str,
     verified_caller: bool,
     reader: &EventReader,
@@ -421,9 +422,10 @@ fn build_report(
                 "SELECT CAST(COALESCE(json_extract(payload, '$.task_id'), json_extract(payload, '$.parent_task_id')) \
                  AS INTEGER) AS _task, id, tool, status, requested_by, resolved_by, reason, created_at, resolved_at \
                  FROM approvals WHERE json_valid(payload) AND CAST(COALESCE(json_extract(payload, '$.task_id'), \
-                 json_extract(payload, '$.parent_task_id')) AS INTEGER) IN ({ids}) ORDER BY id",
+                 json_extract(payload, '$.parent_task_id')) AS INTEGER) IN ({ids}) AND org_id = ? ORDER BY id",
                 &ids,
-                &[],
+                // Only the reader's organization's approvals.
+                &[&org],
             )?,
             grouped(
                 c,
@@ -588,7 +590,8 @@ async fn evidence_report(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
     let label = ctx.caller.label.clone();
     let verified = matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human);
     let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
-    ctx.hub.db().read_async(move |c| build_report(c, &a, &label, verified, &reader)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| build_report(c, &a, &org, &label, verified, &reader)).await
 }
 
 // ---------------------------------------------------------------------------

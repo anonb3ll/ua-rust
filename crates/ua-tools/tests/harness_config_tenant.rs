@@ -748,7 +748,12 @@ async fn organization_b_writes_through_the_tools_land_in_organization_b() {
             Ok(())
         })
         .unwrap();
+    // The approval is in organization B's queue (its requester's), and only
+    // there.
+    let b_human = Caller { org_id: ORG_B.into(), ..human() };
     let queue = h.ok(&human(), "approval_pending", json!({})).await;
+    assert!(queue["pending"].as_array().unwrap().iter().all(|a| a["id"] != approval_id), "{queue}");
+    let queue = h.ok(&b_human, "approval_pending", json!({})).await;
     let row = queue["pending"].as_array().unwrap().iter().find(|a| a["id"] == approval_id).cloned().unwrap();
     assert_eq!(row["display"]["proposal_id"], proposal_id.as_str(), "{row}");
     assert!(row["display"]["diff"].as_str().unwrap().contains("+org b rules"), "{row}");
@@ -762,7 +767,22 @@ async fn organization_b_writes_through_the_tools_land_in_organization_b() {
         2
     );
 
-    h.approve(approval_id).await;
+    // A default-organization human cannot resolve it (it answers as a
+    // missing approval), and `ua_org::authz` admits no organization-B human
+    // yet, so the pass is granted by SQL.
+    let e = h.call(&human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    assert_eq!(e.unwrap_err().to_string(), UaError::not_found(format!("approval {approval_id}")).to_string());
+    h.hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2, \
+                 updated_at = ?2 WHERE org_id = 'org-b' AND id = ?1",
+                rusqlite::params![approval_id, ua_core::time::now()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let applied = json!({ "action": "applied", "surface": "claude", "desired_hash": got["rendered"]["claude"]["hash"] });
     let out = h.config(&b, "node-b", applied).await.unwrap();
     assert_eq!(out["proposal_id"], proposal_id.as_str());

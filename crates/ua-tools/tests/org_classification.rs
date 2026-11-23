@@ -169,7 +169,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_sessions",
     "agent_tokens",
     "agents",
-    "approvals",
     "autonomous_cycle_transitions",
     "autonomous_cycle_usage",
     "autonomous_cycles",

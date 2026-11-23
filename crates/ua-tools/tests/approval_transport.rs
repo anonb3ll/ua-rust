@@ -76,7 +76,7 @@ async fn the_decision_records_the_transport_it_came_through() {
             .await
             .unwrap();
     }
-    let row = |id: i64| hub.db().read(|c| approvals::get(c, id)).unwrap();
+    let row = |id: i64| hub.db().read(|c| approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap();
     assert_eq!(row(from_slack).resolved_transport.as_deref(), Some("slack"));
     assert_eq!(row(from_ui).resolved_transport.as_deref(), Some("ui"));
     assert_eq!(row(denied_over_http).resolved_transport.as_deref(), Some("http"));
@@ -116,7 +116,9 @@ async fn gate_behaviour_is_unchanged_by_the_transport() {
     let err =
         reg.call(&hub, &a, "approval_resolve", json!({ "id": id, "decision": "approve" })).await.unwrap_err();
     assert_eq!(err.reason_code(), Some("not_human"));
-    assert!(hub.db().read(|c| approvals::get(c, id)).unwrap().resolved_transport.is_none());
+    assert!(
+        hub.db().read(|c| approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap().resolved_transport.is_none()
+    );
 }
 
 /// A database from before `approvals.v2`: the column is added, old rows read
@@ -137,7 +139,7 @@ fn an_older_database_gains_the_column_and_old_rows_read_as_unknown() {
     let id = conn.last_insert_rowid();
     let applied = ua_store::schema::apply(&mut conn, &all).unwrap();
     assert_eq!(applied, ["approvals.v2"]);
-    let row = approvals::get(&conn, id).unwrap();
+    let row = approvals::get(&conn, ua_core::DEFAULT_ORG, id).unwrap();
     assert_eq!(row.resolved_by.as_deref(), Some("operator"));
     assert!(row.resolved_transport.is_none());
     let v = serde_json::to_value(&row).unwrap();

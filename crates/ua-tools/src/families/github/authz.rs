@@ -176,7 +176,9 @@ pub(crate) fn binding_sha256(b: &Value) -> String {
 /// the refusal cannot be ledgered, that error is returned instead: the call
 /// is refused either way.
 fn refuse(tx: &mut WriteTx<'_>, caller: &str, r: Refusal, err: UaError) -> UaError {
-    match approvals::refused(tx, caller, &r, None) {
+    // The refusal is about a policy authorization, a default-organization
+    // row until `policy_authorizations` carries `org_id`.
+    match approvals::refused(tx, ua_core::DEFAULT_ORG, caller, &r, None) {
         Ok(()) => err,
         Err(e) => e,
     }

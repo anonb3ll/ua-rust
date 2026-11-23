@@ -320,6 +320,28 @@ from its commit history.
   `agent.plan.handoff`, and `reason` on `agent.plan.closed`. The importer writes legacy plans to
   `default`. Results and events in the default organization are unchanged,
   except that plan rows now carry `org_id`.
+- The approval queue (`approvals`) is organization-scoped:
+  `organization.v1.tools.approvals` adds `org_id` and the organization
+  triggers, and `approvals.v3.org_indexes` adds indexes led by `org_id`. No
+  key rebuild: the only key is an AUTOINCREMENT id. Existing rows move to
+  `default`. An approval belongs to its requester's organization: the gate
+  (`gate`, `gate_via`, `request`, `peek`, the stale-pass checks) matches a
+  denial, pass or pending request only within the caller's organization, so
+  a pass granted in one organization never satisfies an identical call in
+  another, and an expired pass is expired by its own organization's call.
+  `approval_pending`, `GET /api/approvals` and `/api/approvals/{id}`, the
+  inbox, `platform_object_get`, the session packet, the evidence report and
+  the `approval_queue_age` anomaly show only the reader's organization;
+  `approval_resolve` (and so the UI, HTTP and Slack routes over it) answers
+  another organization's approval exactly as a missing id. Approving, and a
+  human's deny or revoke, also needs `ua_org::authz::require_same_org`, which
+  admits only the default organization until memberships exist; the
+  requester may still deny or revoke its own request. A gate for an
+  organization `orgs` does not hold is refused (`unknown_organization`)
+  before anything changes. Approval events stay in the default
+  organization's ledger with another organization's `requested_by` and
+  `resolved_by` left out (`null`). The importer writes legacy approvals to
+  `default`. Results and events in the default organization are unchanged.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

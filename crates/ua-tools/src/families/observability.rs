@@ -393,7 +393,7 @@ fn mem_available_percent() -> Option<(f64, u64, u64)> {
     (total > 0).then(|| (avail as f64 * 100.0 / total as f64, avail, total))
 }
 
-fn check_anomalies(c: &Connection) -> UaResult<Value> {
+fn check_anomalies(c: &Connection, org: &str) -> UaResult<Value> {
     let mut out: Vec<Value> = Vec::new();
 
     // stale_doing_task
@@ -536,8 +536,9 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
     {
         let cutoff = agents::ago(APPROVAL_AGE_HOURS * 3600);
         let (n, oldest): (i64, Option<String>) = c.query_row(
-            "SELECT COUNT(*), MIN(created_at) FROM approvals WHERE status = 'pending' AND created_at < ?1",
-            [&cutoff],
+            "SELECT COUNT(*), MIN(created_at) FROM approvals WHERE org_id = ?2 AND status = 'pending' \
+             AND created_at < ?1",
+            rusqlite::params![cutoff, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if n > 0 {
@@ -832,7 +833,8 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
         }
         "anomalies" => {
             let _: NoArgs = parse_params("observability", act, p)?;
-            read(&ctx, check_anomalies).await
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| check_anomalies(c, &org)).await
         }
         "performance" => {
             let args: PerfArgs = parse_params("observability", act, p)?;
@@ -1781,7 +1783,10 @@ pub fn register(r: &mut Registry) {
              task_reassignment_thrash, agent_never_completes, approval_queue_age, unverified_done, \
              tool_error_rate, ledger_chain, host_low_memory. Returns {anomalies: [{rule, subject, detail, \
              severity}]}; empty when healthy.",
-            |ctx: ToolCtx, _a: NoArgs| async move { read(&ctx, check_anomalies).await },
+            |ctx: ToolCtx, _a: NoArgs| async move {
+                let org = ctx.caller.org_id.clone();
+                read(&ctx, move |c| check_anomalies(c, &org)).await
+            },
         )
         .family("observability")
         .read_only(),
