@@ -35,8 +35,12 @@ pub(crate) enum Kind {
     /// `facts_json` starts empty and the node's next registration fills it.
     Nodes,
     /// Tasks: `current_run_id` and `current_run_agent` are cleared to NULL
-    /// because `dispatch_runs` are not imported.
+    /// because `dispatch_runs` are not imported. Legacy tasks are imported
+    /// into the default organization.
     Tasks,
+    /// Task dependencies, comments and comment threads: imported into the
+    /// default organization, with their tasks.
+    TaskChildren,
     /// Task subtree holds: require valid `status` and refuse duplicate active holds.
     TaskHolds,
     /// Project repository bindings: validate `project` slug and `repo`, and
@@ -65,6 +69,8 @@ impl Kind {
         matches!(
             self,
             Kind::GraphCanvas
+                | Kind::Tasks
+                | Kind::TaskChildren
                 | Kind::SkillRegistry
                 | Kind::ProjectRepoBindings
                 | Kind::HarnessConfig
@@ -112,12 +118,14 @@ pub(crate) const MAPS: &[TableMap] = &[
     },
     TableMap {
         refs: &[TASK_REF, Ref { col: "depends_on_task_id", table: "tasks", key: "id" }],
+        kind: Kind::TaskChildren,
         ..plain("task_dependencies")
     },
-    TableMap { refs: &[TASK_REF], ..plain("task_comment_threads") },
+    TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_comment_threads") },
     TableMap {
         refs: &[TASK_REF],
         self_ref: Some(Ref { col: "parent_comment_id", table: "task_comments", key: "id" }),
+        kind: Kind::TaskChildren,
         ..plain("task_comments")
     },
     TableMap { self_ref: Some(Ref { col: "parent_goal_id", table: "goals", key: "id" }), ..plain("goals") },

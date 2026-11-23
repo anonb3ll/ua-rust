@@ -284,12 +284,20 @@ async fn load_task(ui: &Ui, id: i64) -> UaResult<Option<Value>> {
             format!("task_list is not available to profile {}", ui.caller.profile),
         ));
     }
+    // The viewer's organization's task only; another organization's task
+    // answers as a missing one.
+    let org = ui.caller.org_id.clone();
     ui.state
         .hub
         .db()
         .read_async(move |c| {
             use rusqlite::OptionalExtension;
-            Ok(c.query_row("SELECT * FROM tasks WHERE id = ?1", [id], row_value).optional()?)
+            Ok(c.query_row(
+                "SELECT * FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, id],
+                row_value,
+            )
+            .optional()?)
         })
         .await
 }
