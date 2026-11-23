@@ -435,15 +435,19 @@ pub(crate) fn ancestors(conn: &Connection, org: &str, id: i64) -> UaResult<Vec<i
         if !seen.insert(current) {
             return Err(UaError::internal(format!("task {id} has a parent cycle")));
         }
-        let parent: Option<Option<i64>> = conn
+        // The parent counts only when it is in `org` too: the
+        // `tasks_org_parent` triggers keep it there, and this does not rely
+        // on them.
+        let parent: Option<i64> = conn
             .query_row(
-                "SELECT parent_id FROM tasks WHERE org_id = ?1 AND id = ?2",
+                "SELECT p.id FROM tasks t JOIN tasks p ON p.id = t.parent_id AND p.org_id = ?1 \
+                 WHERE t.org_id = ?1 AND t.id = ?2",
                 params![org, current],
                 |r| r.get(0),
             )
             .optional()?;
         match parent {
-            Some(Some(p)) => {
+            Some(p) => {
                 chain.push(p);
                 current = p;
             }
