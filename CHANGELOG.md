@@ -963,6 +963,17 @@ from its commit history.
   is normalised to `api.github.com`; before, a trailing dot selected
   `github.enterprise`. Any other host keeps the spelling the operator wrote,
   trailing dot included.
+- Five tool-call telemetry reads now count only the reader's own calls
+  unless the reader may read every mailbox (scope `all`; anything else is
+  `own_calls`, and an unverified or other-organization reader counts
+  nothing): `perf_summary` (`observability_manage` `performance` and the
+  `perf_summary` tool), the `metrics_snapshot` tool-call totals,
+  `check_anomalies`' `tool_error_rate` rule, `mcp_health_telemetry`, and
+  `evidence_report`'s `tool_call_window` (which gains `scope` and
+  `counted_callers` fields alongside the participant `callers`). Note that a
+  fleet-wide tool-error spike is now detected only for a mail-unrestricted
+  (operator) reader: a restricted reader's `tool_error_rate` sees only its
+  own calls.
 
 ### Security
 
