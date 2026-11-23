@@ -89,13 +89,20 @@ fn allowed_tools(reg: &Registry, profile: Profile) -> Option<BTreeSet<String>> {
     Some(reg.all().filter(|t| profile.allows_tool(t.name)).map(|t| t.name.to_string()).collect())
 }
 
-fn check(c: &Connection, hub: &Hub, reg: &Registry, task_id: i64, agent: &str) -> UaResult<Value> {
+/// `task_id` is read in the caller's organization `org`; another
+/// organization's task answers as a missing one.
+fn check(c: &Connection, hub: &Hub, reg: &Registry, org: &str, task_id: i64, agent: &str) -> UaResult<Value> {
     let agent = agent.trim();
     if agent.is_empty() || !known_label(c, hub.cfg(), agent)? {
         return Err(UaError::invalid(format!("agent_label {agent:?} is not a known agent")));
     }
-    let notes: Option<Option<String>> =
-        c.query_row("SELECT notes FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?;
+    let notes: Option<Option<String>> = c
+        .query_row(
+            "SELECT notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+            rusqlite::params![org, task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let Some(notes) = notes else { return Err(UaError::not_found(format!("no task with id {task_id}"))) };
     let required = required_tools(notes.as_deref().unwrap_or(""));
     let registered: BTreeSet<String> = reg.all().map(|t| t.name.to_string()).collect();
@@ -129,9 +136,12 @@ pub struct CheckArgs {
 
 async fn check_agent_capability(ctx: ToolCtx, a: CheckArgs) -> UaResult<Value> {
     let hub = ctx.hub.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
-        .read_async(move |c| check(c, &hub, crate::builtin_registry_shared(), a.task_id, &a.agent_label))
+        .read_async(move |c| {
+            check(c, &hub, crate::builtin_registry_shared(), &org, a.task_id, &a.agent_label)
+        })
         .await
 }
 
@@ -320,11 +330,12 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         g.sort_unstable();
         g
     };
+    let org = ctx.caller.org_id.clone();
     let (agents_list, prerequisites) = ctx
         .hub
         .db()
         .read_async(move |c| {
-            let agents: Vec<Value> = agents::list_agents(c)?
+            let agents: Vec<Value> = agents::list_agents(c, &org)?
                 .into_iter()
                 .map(|a| {
                     let mut row = json!({
@@ -339,7 +350,7 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
             let pre = match check_pair {
                 None => None,
                 Some((t, l)) => {
-                    let mut m = check(c, &hub, crate::builtin_registry_shared(), t, &l)?;
+                    let mut m = check(c, &hub, crate::builtin_registry_shared(), &org, t, &l)?;
                     let missing = missing_config(c, hub.cfg(), &l)?;
                     m["ready"] = json!(m["capable"] == json!(true) && missing.is_empty());
                     m["missing_config"] = json!(missing);

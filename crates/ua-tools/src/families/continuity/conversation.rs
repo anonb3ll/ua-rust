@@ -174,11 +174,16 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                     .as_deref(),
             )
             .await?;
+            let org = ctx.caller.org_id.clone();
             let exists: bool = ctx
                 .hub
                 .db()
                 .read_async(move |c| {
-                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [id], |r| r.get(0))?)
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2)",
+                        params![org, id],
+                        |r| r.get(0),
+                    )?)
                 })
                 .await?;
             if !exists {
@@ -190,14 +195,14 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
             let title: String = title.chars().take(MAX_TITLE).collect();
             let priority = a.priority.unwrap_or_else(|| "med".into());
             let key = create_key(&cid, &title, a.project.as_deref(), &priority);
-            let k2 = key.clone();
+            let k2 = crate::families::tasks::idem_key(&ctx.caller.org_id, "task_add", &key);
             let seen: bool = ctx
                 .hub
                 .db()
                 .read_async(move |c| {
                     Ok(c.query_row(
                         "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE tool = 'task_add' AND key = ?1)",
-                        [format!("task_add:{k2}")],
+                        [k2],
                         |r| r.get(0),
                     )?)
                 })
@@ -216,6 +221,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
     };
 
     let (c2, a2) = (cid.clone(), actor.clone());
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -230,14 +236,19 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 return Ok(());
             }
             let key = if created { format!("{base}:created") } else { base };
+            // ORG-EVENT-DEFAULT: another organization's handoff names no
+            // agent in the default ledger and has a neutral originator.
+            let default = org == ua_core::DEFAULT_ORG;
+            let by = if default { a2.clone() } else { "system".to_string() };
             ledger::append(
                 tx,
                 EventInput::new(
                     ua_core::DEFAULT_ORG,
                     CHANNEL,
-                    json!({ "conversation_id": c2, "task_id": task_id, "created": created, "by": a2 }),
+                    json!({ "conversation_id": c2, "task_id": task_id, "created": created,
+                            "by": crate::families::tasks::ledger_text(&org, &a2) }),
                 )
-                .by(a2.clone())
+                .by(by)
                 .dedupe(key),
             )?;
             Ok(())
@@ -257,16 +268,18 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
     if !is_id_safe(&cid) {
         return Err(UaError::invalid("conversation_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
     }
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             if !visible(c, &cid, viewer.as_deref())? {
                 return Err(UaError::not_found("conversation not found"));
             }
-            let mut stmt =
-                c.prepare("SELECT id FROM tasks WHERE instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id")?;
+            let mut stmt = c.prepare(
+                "SELECT id FROM tasks WHERE org_id = ?2 AND instr(COALESCE(notes, ''), ?1) > 0 ORDER BY id",
+            )?;
             let noted: BTreeSet<i64> =
-                stmt.query_map([reference(&cid)], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                stmt.query_map(params![reference(&cid), org], |r| r.get(0))?.collect::<Result<_, _>>()?;
             // The first event per task says who handed off and when.
             let mut audit: BTreeMap<i64, (Option<String>, String)> = BTreeMap::new();
             let mut stmt = c.prepare(
@@ -283,7 +296,12 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
                 }
             }
             let task = |id: i64| -> UaResult<Option<(String, String)>> {
-                Ok(c.query_row("SELECT title, status FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                Ok(c
+                    .query_row(
+                        "SELECT title, status FROM tasks WHERE org_id = ?1 AND id = ?2",
+                        params![org, id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .optional()?)
             };
             let mut handoffs = Vec::new();

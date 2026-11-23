@@ -24,7 +24,6 @@ use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 
 use super::engine::{self, Definition, Report, RunRow, StepDef};
-use crate::families::tasks::TASK_ORG;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -141,19 +140,15 @@ struct TaskState {
     lock_expires_at: Option<String>,
 }
 
-/// A task as `org` sees it. ORG-TASK-DEFAULT: tasks carry no organization
-/// yet, so they are all the task organization's; any other organization sees
-/// none, and a run is never tied to a task of another organization. Take the
-/// task's own organization when tasks gain one.
+/// A task as `org` sees it: another organization's task answers as a
+/// missing one, so a run is never tied to a task of another organization.
 async fn task_state(hub: &Hub, org: &str, task_id: i64) -> UaResult<Option<TaskState>> {
-    if org != TASK_ORG {
-        return Ok(None);
-    }
+    let org = org.to_string();
     hub.db()
         .read_async(move |c| {
             Ok(c.query_row(
-                "SELECT status, claimed_by, lock_expires_at FROM tasks WHERE id = ?1",
-                [task_id],
+                "SELECT status, claimed_by, lock_expires_at FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, task_id],
                 |r| Ok(TaskState { status: r.get(0)?, claimed_by: r.get(1)?, lock_expires_at: r.get(2)? }),
             )
             .optional()?)

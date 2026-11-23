@@ -89,7 +89,8 @@ pub fn register(r: &mut Registry) {
              next_cursor, limit}.",
             |ctx: ToolCtx, a: ListArgs| async move {
                 let pin = crate::grant::pinned_task();
-                ctx.hub.db().read_async(move |c| list(c, a, pin)).await
+                let org = ctx.caller.org_id.clone();
+                ctx.hub.db().read_async(move |c| list(c, &org, a, pin)).await
             },
         )
         .family("tasks")
@@ -177,8 +178,13 @@ fn compact(row: &mut Map<String, Value>) {
     row.insert("notes_archived".into(), json!(notes.to_ascii_lowercase().contains("[archived")));
 }
 
-fn shape(conn: &Connection, mut row: Map<String, Value>, compact_rows: bool) -> UaResult<Map<String, Value>> {
-    decorate(conn, &mut row)?;
+fn shape(
+    conn: &Connection,
+    org: &str,
+    mut row: Map<String, Value>,
+    compact_rows: bool,
+) -> UaResult<Map<String, Value>> {
+    decorate(conn, org, &mut row)?;
     if compact_rows {
         compact(&mut row);
     }
@@ -187,7 +193,8 @@ fn shape(conn: &Connection, mut row: Map<String, Value>, compact_rows: bool) -> 
 
 /// `pin`: a session credential's task ([`crate::grant::pinned_task`]); the
 /// listing then holds that task at most, whatever the other filters say.
-fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Value> {
+/// Only organization `org`'s tasks are listed or searched.
+fn list(conn: &Connection, org: &str, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Value> {
     let default_status = if a.stage.is_some() { UNFINISHED } else { "open" };
     let status = a.status.clone().unwrap_or_else(|| default_status.into());
     if status != "all" && status != UNFINISHED {
@@ -209,6 +216,10 @@ fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Va
     }
 
     let mut f = Filter { clauses: Vec::new(), values: Vec::new() };
+    // The organization leads every listing and the ranked search's
+    // `eligible` set, so another organization's rows never reach the FTS
+    // candidate cap.
+    f.push("org_id = ?", [Sql::Text(org.to_string())]);
     match pin {
         None => {}
         Some(Some(id)) => f.push("id = ?", [Sql::Integer(id)]),
@@ -232,8 +243,8 @@ fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Va
     if a.frontier {
         f.push(
             "status NOT IN ('done', 'cancelled') AND NOT EXISTS (SELECT 1 FROM task_dependencies d \
-             JOIN tasks pre ON pre.id = d.depends_on_task_id WHERE d.task_id = tasks.id \
-             AND pre.status NOT IN ('done', 'cancelled'))",
+             JOIN tasks pre ON pre.id = d.depends_on_task_id AND pre.org_id = tasks.org_id \
+             WHERE d.task_id = tasks.id AND d.org_id = tasks.org_id AND pre.status NOT IN ('done', 'cancelled'))",
             [],
         );
     }
@@ -285,7 +296,7 @@ fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Va
 
     let limit = a.limit.unwrap_or(100);
     if let Some(q) = &a.query {
-        return ranked(conn, q, &f, limit.clamp(1, 100), compact_rows);
+        return ranked(conn, org, q, &f, limit.clamp(1, 100), compact_rows);
     }
 
     if let Some(c) = &a.cursor {
@@ -312,7 +323,7 @@ fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Va
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows: Vec<Map<String, Value>> =
-        stmt.query_map(params_from_iter(f.values.iter()), row_object)?.collect::<Result<_, _>>()?;
+        stmt.query_map(params_from_iter(f.values.iter()), task_row)?.collect::<Result<_, _>>()?;
     let truncated = rows.len() as i64 > effective;
     rows.truncate(effective as usize);
     let next_cursor = if truncated {
@@ -329,7 +340,7 @@ fn list(conn: &Connection, a: ListArgs, pin: Option<Option<i64>>) -> UaResult<Va
     let mut tasks = Vec::with_capacity(rows.len());
     for mut row in rows {
         row.remove("_page_rank");
-        tasks.push(Value::Object(shape(conn, row, compact_rows)?));
+        tasks.push(Value::Object(shape(conn, org, row, compact_rows)?));
     }
     Ok(json!({ "tasks": tasks, "truncated": truncated, "next_cursor": next_cursor, "limit": effective }))
 }
@@ -346,7 +357,19 @@ fn fts_or_query(query: &str) -> String {
         .join(" OR ")
 }
 
-fn ranked(conn: &Connection, query: &str, f: &Filter, limit: i64, compact_rows: bool) -> UaResult<Value> {
+/// Ranked search over `f`'s eligible rows, which lead with `org`'s filter.
+/// Accepted residual: bm25's term statistics (document frequencies, average
+/// length) come from the whole hub-wide `task_fts` index, so another
+/// organization's tasks can shift a score's value, but never which rows
+/// match or are returned.
+fn ranked(
+    conn: &Connection,
+    org: &str,
+    query: &str,
+    f: &Filter,
+    limit: i64,
+    compact_rows: bool,
+) -> UaResult<Value> {
     let cleaned = query.trim();
     if cleaned.is_empty() {
         return Err(UaError::invalid("query must contain at least one search term"));
@@ -383,7 +406,7 @@ fn ranked(conn: &Connection, query: &str, f: &Filter, limit: i64, compact_rows: 
     let now_ms = ua_core::time::now_ms();
     let mut scored = Vec::with_capacity(hits.len());
     for (id, bm25, snippet) in hits {
-        let Some(row) = task_object(conn, id)? else { continue };
+        let Some(row) = task_object(conn, org, id)? else { continue };
         let lexical = if best > 0.0 { ((-bm25) / best).clamp(0.0, 1.0) } else { 1.0 };
         let age_days = str_field(&row, "updated_at")
             .and_then(ua_core::time::parse_ts)
@@ -412,7 +435,7 @@ fn ranked(conn: &Connection, query: &str, f: &Filter, limit: i64, compact_rows: 
     scored.truncate(limit as usize);
     let mut tasks = Vec::with_capacity(scored.len());
     for (score, _, row, explanation) in scored {
-        let mut row = shape(conn, row, compact_rows)?;
+        let mut row = shape(conn, org, row, compact_rows)?;
         row.insert("combined_score".into(), json!((score * 1e6).round() / 1e6));
         row.insert("explanation".into(), explanation);
         tasks.push(Value::Object(row));

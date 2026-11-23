@@ -118,6 +118,10 @@ fn author(ctx: &ToolCtx, claimed: Option<&str>) -> UaResult<String> {
 async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
     let action = crate::routes::action_of("goal_manage", Some(&a.action))?;
     let db = ctx.hub.db().clone();
+    // Goals are not yet organization-scoped (they convert in a later change),
+    // but every task a goal action names is looked up in the caller's
+    // organization.
+    let org = ctx.caller.org_id.clone();
     match action {
         "add" => {
             let p: AddParams = parse_params("add", a.params)?;
@@ -142,12 +146,12 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
         "link" => {
             let p: LinkParams = parse_params("link", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| link(tx, p, &who)).await
+            db.write_async(move |tx| link(tx, &org, p, &who)).await
         }
         "unlink" => {
             let p: LinkParams = parse_params("unlink", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| unlink(tx, p, &who)).await
+            db.write_async(move |tx| unlink(tx, &org, p, &who)).await
         }
         "edit" => {
             let p: EditParams = parse_params("edit", a.params)?;
@@ -170,7 +174,7 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
         }
         "ancestry" => {
             let p: TaskIdParams = parse_params("ancestry", a.params)?;
-            db.read_async(move |c| why_chain(c, p.task_id)).await
+            db.read_async(move |c| why_chain(c, &org, p.task_id)).await
         }
         other => Err(crate::routes::unhandled("goal_manage", other)),
     }
@@ -260,7 +264,13 @@ fn add(tx: &mut ua_store::WriteTx<'_>, p: AddParams, who: &str) -> UaResult<Valu
         params![title, statement, p.parent_goal_id, project, who, ts],
     )?;
     let id = tx.last_insert_rowid();
-    emit(tx, "agent.goal.created", json!({ "goal_id": id, "parent_goal_id": p.parent_goal_id }), who)?;
+    emit(
+        tx,
+        ua_core::DEFAULT_ORG,
+        "agent.goal.created",
+        json!({ "goal_id": id, "parent_goal_id": p.parent_goal_id }),
+        who,
+    )?;
     goal_reply(tx, id)
 }
 
@@ -319,9 +329,9 @@ fn linked_goal(conn: &Connection, task_id: i64) -> UaResult<Option<i64>> {
         .optional()?)
 }
 
-fn why_chain(conn: &Connection, task_id: i64) -> UaResult<Value> {
-    let task =
-        task_object(conn, task_id)?.ok_or_else(|| UaError::not_found(format!("unknown task: {task_id}")))?;
+fn why_chain(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
+    let task = task_object(conn, org, task_id)?
+        .ok_or_else(|| UaError::not_found(format!("unknown task: {task_id}")))?;
     let unlinked = json!({ "task_id": task_id, "goal_id": null, "edge": EDGE_ANCESTRY, "chain": [], "meaning": MEANING });
     let Some(goal_id) = linked_goal(conn, task_id)? else { return Ok(unlinked) };
     let Some(g) = goal(conn, goal_id)? else { return Ok(unlinked) };
@@ -334,8 +344,9 @@ fn why_chain(conn: &Connection, task_id: i64) -> UaResult<Value> {
     )
 }
 
-fn link(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Value> {
-    let task = task_object(tx, p.task_id)?
+fn link(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
+    let task = task_object(tx, org, p.task_id)?
         .ok_or_else(|| UaError::not_found(format!("unknown task: {}", p.task_id)))?;
     let g = require_goal(tx, p.goal_id)?;
     if str_field(&task, "project") != str_field(&g, "project") {
@@ -354,18 +365,19 @@ fn link(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Va
             "INSERT INTO task_goal_links (task_id, goal_id, linked_by, linked_at) VALUES (?1, ?2, ?3, ?4)",
             params![p.task_id, p.goal_id, who, now()],
         )?;
-        emit(tx, "agent.goal.linked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
+        emit(tx, org, "agent.goal.linked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     }
     Ok(json!({
         "task_id": p.task_id,
         "goal_id": p.goal_id,
         "edge": EDGE_TASK,
-        "why_chain": why_chain(tx, p.task_id)?,
+        "why_chain": why_chain(tx, org, p.task_id)?,
     }))
 }
 
-fn unlink(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Value> {
-    if task_object(tx, p.task_id)?.is_none() {
+fn unlink(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
+    if task_object(tx, org, p.task_id)?.is_none() {
         return Err(UaError::not_found(format!("unknown task: {}", p.task_id)));
     }
     require_goal(tx, p.goal_id)?;
@@ -380,7 +392,7 @@ fn unlink(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<
         Some(_) => {}
     }
     tx.execute("DELETE FROM task_goal_links WHERE task_id = ?1", [p.task_id])?;
-    emit(tx, "agent.goal.unlinked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
+    emit(tx, org, "agent.goal.unlinked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     Ok(json!({ "task_id": p.task_id, "goal_id": p.goal_id, "edge": EDGE_TASK, "unlinked": true }))
 }
 
@@ -404,7 +416,13 @@ fn edit(tx: &mut ua_store::WriteTx<'_>, p: EditParams, who: &str) -> UaResult<Va
     if statement.is_some() {
         fields.push("statement");
     }
-    emit(tx, "agent.goal.updated", json!({ "goal_id": p.goal_id, "fields": fields }), who)?;
+    emit(
+        tx,
+        ua_core::DEFAULT_ORG,
+        "agent.goal.updated",
+        json!({ "goal_id": p.goal_id, "fields": fields }),
+        who,
+    )?;
     goal_reply(tx, p.goal_id)
 }
 
@@ -427,6 +445,7 @@ fn set_status(tx: &mut ua_store::WriteTx<'_>, p: StatusParams, status: &str, who
     let channel = if status == "open" { "agent.goal.reopened" } else { "agent.goal.closed" };
     emit(
         tx,
+        ua_core::DEFAULT_ORG,
         channel,
         json!({ "goal_id": p.goal_id, "from": current, "status": status, "reason": reason }),
         who,

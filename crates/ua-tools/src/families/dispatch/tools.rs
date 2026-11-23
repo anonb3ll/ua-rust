@@ -281,13 +281,16 @@ fn resolve_workdir(raw: &str, ua_home: &Path) -> UaResult<PathBuf> {
 }
 
 /// Refuse a task another agent holds, a terminal task, or one with a live run.
+/// `task_id` is a task of organization `org`; another organization's task
+/// answers as a missing one.
 fn check_task_free(
     conn: &rusqlite::Connection,
+    org: &str,
     task_id: i64,
     agent: &str,
     run_id: Option<&str>,
 ) -> UaResult<()> {
-    let task = require_task(conn, task_id)?;
+    let task = require_task(conn, org, task_id)?;
     let status = str_field(&task, "status").unwrap_or_default();
     if crate::families::tasks::is_terminal(status) {
         return Err(UaError::conflict(format!("task_terminal: task {task_id} is {status}")));
@@ -309,6 +312,7 @@ fn check_task_free(
 /// Point the task at the run and claim it for the agent.
 fn bind_task(
     tx: &rusqlite::Connection,
+    org: &str,
     task_id: i64,
     run_id: &str,
     agent: &str,
@@ -317,8 +321,8 @@ fn bind_task(
     tx.execute(
         "UPDATE tasks SET claimed_by = ?2, claimed_at = ?3, lock_expires_at = ?4, current_run_id = ?5, \
          current_run_agent = ?2, status = CASE WHEN status = 'open' THEN 'doing' ELSE status END, updated_at = ?6 \
-         WHERE id = ?1",
-        params![task_id, agent, now(), lease, run_id, next_revision(None)],
+         WHERE id = ?1 AND org_id = ?7",
+        params![task_id, agent, now(), lease, run_id, next_revision(None), org],
     )?;
     Ok(())
 }
@@ -603,6 +607,7 @@ fn node_route(
 fn route_to_node(
     tx: &mut ua_store::WriteTx<'_>,
     hub: &crate::hub::Hub,
+    org: &str,
     actor: &str,
     run_id: &str,
     task_id: i64,
@@ -625,7 +630,7 @@ fn route_to_node(
         None,
     )?;
     n.run_id = Some(run_id.to_string());
-    let queued = node_queue::insert_item(tx, hub, &n, row, actor)?;
+    let queued = node_queue::insert_item(tx, hub, org, &n, row, actor)?;
     let item_id = queued["item_id"].as_str().unwrap_or_default().to_string();
     let evidence = node_queue::evidence_ref(&row.node, &item_id);
     let run = load_run(tx, run_id)?.ok_or_else(|| UaError::internal("routed run vanished"))?;
@@ -710,10 +715,11 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let task = require_task(tx, tid)?;
-            check_task_free(tx, tid, &ag, None)?;
+            crate::families::tasks::require_org(tx, &caller.org_id)?;
+            let task = require_task(tx, &caller.org_id, tid)?;
+            check_task_free(tx, &caller.org_id, tid, &ag, None)?;
             // The one claim gate: a stopped agent or a held task takes no run.
-            governance::check_claim(tx, Some(&ag), Some(tid), false)?;
+            governance::check_claim(tx, &caller.org_id, Some(&ag), Some(tid), false)?;
             // A proposal-spawned task must still match its frozen contract,
             // and its work order is the contract block: notes appended after
             // it never reach a prompt the hub builds.
@@ -840,11 +846,11 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     payload["provider_account"].as_str(),
                 ],
             )?;
-            bind_task(tx, tid, &run_id, &ag, &lease_at)?;
+            bind_task(tx, &caller.org_id, tid, &run_id, &ag, &lease_at)?;
             link_approval_id(tx, &caller.org_id, approval_id, &run_id)?;
             record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
             if let Some((row, backend, cwd)) = route {
-                let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
+                let out = route_to_node(tx, &hub, &caller.org_id, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
                 return Ok(Gated::Routed(out));
             }
             let program = payload["program"].as_str().map(PathBuf::from);
@@ -1322,12 +1328,12 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 provider_accounts::check_available(tx, name, h)?;
                 provider_accounts::check_billing_env(tx, name, h)?;
             }
-            check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
+            check_task_free(tx, &caller.org_id, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
             // A resumed attempt is new work: the one claim gate applies, and
             // a proposal-spawned task must still match its frozen contract.
-            governance::check_claim(tx, Some(&run.agent_label), Some(run.task_id), false)?;
-            governance::task_contract(tx, run.task_id)?;
+            governance::check_claim(tx, &caller.org_id, Some(&run.agent_label), Some(run.task_id), false)?;
+            governance::task_contract(tx, &caller.org_id, run.task_id)?;
             // The approver sees what will run, and the attempt it replaces:
             // a pass resumes this attempt only.
             let mut payload = json!({
@@ -1374,7 +1380,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Err(why) = transition(tx, &run, edge)? {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            bind_task(tx, run.task_id, &rid2, &run.agent_label, &lease_at)?;
+            bind_task(tx, &caller.org_id, run.task_id, &rid2, &run.agent_label, &lease_at)?;
             link_approval_id(tx, &caller.org_id, approval_id, &rid2)?;
             record_transition(
                 tx,
@@ -1462,8 +1468,11 @@ fn build_receipt(conn: &rusqlite::Connection, org: &str, run_id: &str) -> UaResu
     };
     let get = |k: &str| run.get(k).cloned().unwrap_or(Value::Null);
     let task_id = run.get("task_id").and_then(Value::as_i64).unwrap_or_default();
-    let task_state: Option<String> =
-        conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?;
+    let task_state: Option<String> = conn
+        .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, task_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
     let transitions = transitions(conn, run_id)?;
     let approval: Option<(i64, String)> = conn
         .query_row(

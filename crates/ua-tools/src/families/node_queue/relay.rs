@@ -435,7 +435,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
     // Only a human writes without a gate; an agent's follow-up is new
     // instructions to a running session and needs its own approval. A routine
     // running unattended under a human's label is an agent here.
-    let operator = Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
+    let operator = Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], &ctx.caller.org_id);
     if !operator
         && let Err(refusal) = crate::policy::check_prod_action(ctx.hub.cfg(), &ctx.caller, FOLLOWUP_GATE)
     {
@@ -450,7 +450,7 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !operator {
-                if !(item.created_by == who || item.agent == who || Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator, Authority::LifecycleOperator], ua_core::DEFAULT_ORG)) {
+                if !(item.created_by == who || item.agent == who || Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator, Authority::LifecycleOperator], &caller.org_id)) {
                     return Err(UaError::denied(
                         "not_item_owner",
                         format!("{who:?} did not request {id}; only its requester or an operator sends follow-ups"),
@@ -458,7 +458,11 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                 }
                 if let Some(t) = item.task_id {
                     let holder: Option<Option<String>> = tx
-                        .query_row("SELECT claimed_by FROM tasks WHERE id = ?1", [t], |r| r.get(0))
+                        .query_row(
+                            "SELECT claimed_by FROM tasks WHERE org_id = ?1 AND id = ?2",
+                            rusqlite::params![caller.org_id, t],
+                            |r| r.get(0),
+                        )
                         .optional()?;
                     if let Some(Some(h)) = holder
                         && h != who

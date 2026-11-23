@@ -158,6 +158,8 @@ impl GitHubCiVerifier {
             Err(e) => return Err(CiOutcome::new(Verdict::Unverifiable, e.detail()).observed(seen)),
         };
         let repo = run.repo.clone();
+        // ORG-GITHUB-DEFAULT: the hub's GitHub client looks runs up only in
+        // the default organization's bound repositories.
         let bound =
             self.db.read_async(move |c| BoundRepo::check(c, crate::families::tasks::TASK_ORG, &repo)).await;
         match bound {

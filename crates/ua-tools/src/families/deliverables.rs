@@ -36,7 +36,7 @@ use ua_deliverables::{Kind, NewDeliverable, NewRevision, REVISIONS_PER_READ};
 use ua_store::{Part, SchemaPart};
 
 use crate::families::continuity::{capsule_head, require_writer, review_ready, task_repo, write_capsule};
-use crate::families::tasks::{TASK_ORG, acting_identity, require_task};
+use crate::families::tasks::{acting_identity, require_task};
 use crate::registry::{Registry, ToolCtx, tool};
 
 const FAMILY: &str = "deliverables";
@@ -110,16 +110,29 @@ fn positive(id: i64, field: &str) -> UaResult<i64> {
     if id > 0 { Ok(id) } else { Err(UaError::invalid(format!("{field} must be a positive integer"))) }
 }
 
-/// Refuse a caller of an unknown organization, or of another organization
-/// than the task's.
+/// Refuse a caller of an unknown organization, and run the organization
+/// half of the authority check against the caller's organization, which is
+/// the organization of every task it can name (`caller_task`).
 fn require_caller_org(conn: &Connection, ctx: &ToolCtx) -> UaResult<()> {
     ua_deliverables::require_org_exists(conn, &ctx.caller.org_id)?;
-    ua_org::authz::require_same_org(&ctx.caller, TASK_ORG)
+    ua_org::authz::require_same_org(&ctx.caller, &ctx.caller.org_id)
+}
+
+/// Task `id` as the caller's organization sees it: another organization's
+/// task answers as a missing one, so a deliverable is always in its task
+/// row's organization.
+fn caller_task(conn: &Connection, ctx: &ToolCtx, id: i64) -> UaResult<serde_json::Map<String, Value>> {
+    require_task(conn, &ctx.caller.org_id, id)
 }
 
 /// The task's bound repository, or a refusal: a commit deliverable needs one.
-fn bound_repo(conn: &Connection, task: &serde_json::Map<String, Value>, id: i64) -> UaResult<String> {
-    task_repo(conn, task)?.ok_or_else(|| {
+fn bound_repo(
+    conn: &Connection,
+    org: &str,
+    task: &serde_json::Map<String, Value>,
+    id: i64,
+) -> UaResult<String> {
+    task_repo(conn, org, task)?.ok_or_else(|| {
         UaError::denied(
             "repo_unbound",
             format!(
@@ -156,12 +169,13 @@ async fn create(ctx: ToolCtx, a: CreateArgs) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             require_caller_org(tx, &ctx2)?;
-            let task = require_task(tx, task_id)?;
+            let org = ctx2.caller.org_id.as_str();
+            let task = caller_task(tx, &ctx2, task_id)?;
             require_writer(&ctx2, &task, &who, task_id)?;
-            let repo = bound_repo(tx, &task, task_id)?;
+            let repo = bound_repo(tx, org, &task, task_id)?;
             let (d, created) = ua_deliverables::create(
                 tx,
-                NewDeliverable { org_id: TASK_ORG, task_id, kind, title: &title, repo: &repo, by: &who },
+                NewDeliverable { org_id: org, task_id, kind, title: &title, repo: &repo, by: &who },
             )?;
             let mut out = view(tx, &d)?;
             out["created"] = json!(created);
@@ -183,13 +197,14 @@ async fn revise(ctx: ToolCtx, a: ReviseArgs) -> UaResult<Value> {
             require_caller_org(tx, &ctx2)?;
             let d = ua_deliverables::deliverable(tx, &ctx2.caller.org_id, id)?
                 .ok_or_else(|| UaError::not_found(format!("no deliverable with id {id}")))?;
-            let task = require_task(tx, d.task_id)?;
+            let org = ctx2.caller.org_id.as_str();
+            let task = caller_task(tx, &ctx2, d.task_id)?;
             require_writer(&ctx2, &task, &who, d.task_id)?;
-            let repo = bound_repo(tx, &task, d.task_id)?;
+            let repo = bound_repo(tx, org, &task, d.task_id)?;
             let (d, rev, recorded) = ua_deliverables::record_revision(
                 tx,
                 NewRevision {
-                    org_id: TASK_ORG,
+                    org_id: org,
                     deliverable_id: d.id,
                     commit: &commit,
                     repo: &repo,
@@ -239,7 +254,7 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     let db = ctx.hub.db().clone();
     db.read_async(move |c| {
         require_caller_org(c, &ctx)?;
-        require_task(c, task_id)?;
+        caller_task(c, &ctx, task_id)?;
         let rows = ua_deliverables::for_task(c, &ctx.caller.org_id, task_id)?;
         let mut items = Vec::with_capacity(rows.len());
         for d in &rows {

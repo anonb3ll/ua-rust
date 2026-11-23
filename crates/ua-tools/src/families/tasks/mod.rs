@@ -17,7 +17,7 @@ mod write;
 pub(crate) use write::{NewTask, insert_task};
 
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
@@ -192,12 +192,15 @@ pub(crate) const DEFAULT_LEASE_SECONDS: i64 = 3600;
 pub(crate) const MAX_LEASE_SECONDS: i64 = 7 * 86400;
 pub(crate) const PROJECT_SPEC_MARKER: &str = "[project-spec]";
 
-/// ORG-TASK-DEFAULT: the organization every task is in. Tasks carry no
-/// `org_id` yet, so every lookup that starts from a task (its project's
-/// repository binding, its deliverables, authority over it) names this
-/// organization. Every use is a site of the resolver work item in
-/// `docs/organization.md`: when tasks gain `org_id`, each must take the
-/// task's organization instead, in the same change.
+/// ORG-GITHUB-DEFAULT: the organization the hub's GitHub and CI paths
+/// without a caller (the webhook, the poller, the CI status check, the head
+/// re-verification and merged-PR reconciliation) act in. Those paths run as
+/// the hub, which is the default organization, and every task they scan or
+/// close is filtered to it (`t.org_id = TASK_ORG`), so a delivery for a
+/// repository two organizations bind never touches another organization's
+/// task. Every other task lookup takes the task row's own organization.
+/// Removed when the GitHub family resolves each delivery to its task's
+/// organization (`docs/organization.md`).
 pub(crate) const TASK_ORG: &str = ua_core::DEFAULT_ORG;
 /// Active statuses in rollup order: the first present wins `derived_status`.
 const ROLLUP_ORDER: [&str; 4] = ["blocked", "doing", "waiting_review", "open"];
@@ -352,13 +355,44 @@ pub(crate) fn row_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String
     Ok(out)
 }
 
-/// A task row as a JSON object, or `None` when it does not exist.
-pub(crate) fn task_object(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(conn.query_row("SELECT * FROM tasks WHERE id = ?1", [id], row_object).optional()?)
+/// A task row as a JSON object without its `org_id`: a task reply keeps the
+/// shape it had before tasks carried an organization (the caller's own).
+pub(crate) fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
+    let mut m = row_object(row)?;
+    m.remove("org_id");
+    Ok(m)
 }
 
-pub(crate) fn require_task(conn: &Connection, id: i64) -> UaResult<Map<String, Value>> {
-    task_object(conn, id)?.ok_or_else(|| UaError::not_found(format!("no task with id {id}")))
+/// Task `id` of organization `org` as a JSON object, or `None` when it does
+/// not exist. Another organization's task answers exactly as a missing one.
+pub(crate) fn task_object(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn
+        .query_row("SELECT * FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, id], task_row)
+        .optional()?)
+}
+
+pub(crate) fn require_task(conn: &Connection, org: &str, id: i64) -> UaResult<Map<String, Value>> {
+    task_object(conn, org, id)?.ok_or_else(|| UaError::not_found(format!("no task with id {id}")))
+}
+
+/// The organization task `id` belongs to, for a job with no caller that acts
+/// on the task's own organization. `None` when the task does not exist.
+pub(crate) fn task_org(conn: &Connection, id: i64) -> UaResult<Option<String>> {
+    Ok(conn.query_row("SELECT org_id FROM tasks WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+}
+
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// The `org_exists` triggers fire only on insert, so a write with nothing to
+/// insert (an update, a delete) would otherwise pass.
+pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no task was changed"),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn str_field<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -372,28 +406,28 @@ pub(crate) fn int_field(row: &Map<String, Value>, key: &str) -> Option<i64> {
 /// Add the derived fields every task reply carries: `urgency`,
 /// `urgency_rank`, `lineage` (ancestor ids root-first) and, on a
 /// `[project-spec]` root, `rollup`.
-pub(crate) fn decorate(conn: &Connection, row: &mut Map<String, Value>) -> UaResult<()> {
+pub(crate) fn decorate(conn: &Connection, org: &str, row: &mut Map<String, Value>) -> UaResult<()> {
     let id = int_field(row, "id").unwrap_or_default();
     let notes = str_field(row, "notes").unwrap_or_default().to_string();
     let level = urgency(&notes);
     row.insert("urgency".into(), json!(level));
     row.insert("urgency_rank".into(), json!(urgency_rank(level)));
-    row.insert("lineage".into(), json!(ancestors(conn, id)?));
+    row.insert("lineage".into(), json!(ancestors(conn, org, id)?));
     if has_marker(&notes, PROJECT_SPEC_MARKER) {
-        row.insert("rollup".into(), rollup(conn, id)?);
+        row.insert("rollup".into(), rollup(conn, org, id)?);
     }
     Ok(())
 }
 
 /// The full task reply: row plus derived fields.
-pub(crate) fn task_reply(conn: &Connection, id: i64) -> UaResult<Value> {
-    let mut row = require_task(conn, id)?;
-    decorate(conn, &mut row)?;
+pub(crate) fn task_reply(conn: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    let mut row = require_task(conn, org, id)?;
+    decorate(conn, org, &mut row)?;
     Ok(Value::Object(row))
 }
 
 /// Ancestor ids root-first, excluding `id`. A stored cycle fails closed.
-pub(crate) fn ancestors(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
+pub(crate) fn ancestors(conn: &Connection, org: &str, id: i64) -> UaResult<Vec<i64>> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut current = id;
@@ -402,7 +436,11 @@ pub(crate) fn ancestors(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
             return Err(UaError::internal(format!("task {id} has a parent cycle")));
         }
         let parent: Option<Option<i64>> = conn
-            .query_row("SELECT parent_id FROM tasks WHERE id = ?1", [current], |r| r.get(0))
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE org_id = ?1 AND id = ?2",
+                params![org, current],
+                |r| r.get(0),
+            )
             .optional()?;
         match parent {
             Some(Some(p)) => {
@@ -416,29 +454,30 @@ pub(crate) fn ancestors(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
     Ok(chain)
 }
 
-/// `id` plus every descendant.
-pub(crate) fn subtree_ids(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
+/// `id` plus every descendant, in organization `org` (empty when `id` is
+/// another organization's task).
+pub(crate) fn subtree_ids(conn: &Connection, org: &str, id: i64) -> UaResult<Vec<i64>> {
     let mut stmt = conn.prepare(
         "WITH RECURSIVE subtree(id) AS (
-            SELECT id FROM tasks WHERE id = ?1
+            SELECT id FROM tasks WHERE org_id = ?1 AND id = ?2
             UNION ALL
-            SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
+            SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id WHERE t.org_id = ?1
         ) SELECT id FROM subtree",
     )?;
-    let ids = stmt.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let ids = stmt.query_map(params![org, id], |r| r.get(0))?.collect::<Result<_, _>>()?;
     Ok(ids)
 }
 
 /// Longest downward path from `id` to a leaf (0 for a leaf).
-pub(crate) fn subtree_height(conn: &Connection, id: i64) -> UaResult<usize> {
+pub(crate) fn subtree_height(conn: &Connection, org: &str, id: i64) -> UaResult<usize> {
     let h: Option<i64> = conn.query_row(
         "WITH RECURSIVE subtree(id, depth) AS (
-            SELECT id, 0 FROM tasks WHERE id = ?1
+            SELECT id, 0 FROM tasks WHERE org_id = ?1 AND id = ?2
             UNION ALL
             SELECT t.id, s.depth + 1 FROM tasks t JOIN subtree s ON t.parent_id = s.id
-            WHERE s.depth < 64
+            WHERE t.org_id = ?1 AND s.depth < 64
         ) SELECT MAX(depth) FROM subtree",
-        [id],
+        params![org, id],
         |r| r.get(0),
     )?;
     Ok(h.unwrap_or(0).max(0) as usize)
@@ -446,21 +485,26 @@ pub(crate) fn subtree_height(conn: &Connection, id: i64) -> UaResult<usize> {
 
 /// Refuse a missing parent, a cycle, or a depth-cap breach. `moving` is the
 /// task being reparented (`None` when creating a child).
-pub(crate) fn check_nesting(conn: &Connection, parent_id: i64, moving: Option<i64>) -> UaResult<()> {
+pub(crate) fn check_nesting(
+    conn: &Connection,
+    org: &str,
+    parent_id: i64,
+    moving: Option<i64>,
+) -> UaResult<()> {
     if moving == Some(parent_id) {
         return Err(UaError::invalid("a task cannot be its own parent"));
     }
-    if task_object(conn, parent_id)?.is_none() {
+    if task_object(conn, org, parent_id)?.is_none() {
         return Err(UaError::invalid(format!("no task with id {parent_id} to use as parent")));
     }
-    let lineage = ancestors(conn, parent_id)?;
+    let lineage = ancestors(conn, org, parent_id)?;
     if let Some(m) = moving
         && lineage.contains(&m)
     {
         return Err(UaError::invalid(format!("reparenting task {m} under {parent_id} would create a cycle")));
     }
     let extra = match moving {
-        Some(m) => subtree_height(conn, m)?,
+        Some(m) => subtree_height(conn, org, m)?,
         None => 0,
     };
     if lineage.len() + 1 + extra > MAX_DEPTH {
@@ -474,17 +518,18 @@ pub(crate) fn check_nesting(conn: &Connection, parent_id: i64, moving: Option<i6
 }
 
 /// Derived status of a `[project-spec]` root from its whole subtree.
-pub(crate) fn rollup(conn: &Connection, root: i64) -> UaResult<Value> {
+pub(crate) fn rollup(conn: &Connection, org: &str, root: i64) -> UaResult<Value> {
     let mut stmt = conn.prepare(
         "WITH RECURSIVE subtree(id) AS (
-            SELECT id FROM tasks WHERE parent_id = ?1
+            SELECT id FROM tasks WHERE org_id = ?1 AND parent_id = ?2
             UNION ALL
-            SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id
+            SELECT t.id FROM tasks t JOIN subtree s ON t.parent_id = s.id WHERE t.org_id = ?1
         ) SELECT tasks.id, tasks.title, tasks.status FROM tasks JOIN subtree ON subtree.id = tasks.id
-          ORDER BY tasks.id",
+          WHERE tasks.org_id = ?1 ORDER BY tasks.id",
     )?;
-    let rows: Vec<(i64, String, String)> =
-        stmt.query_map([root], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map(params![org, root], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
     let mut counts = Map::new();
     for s in STATUSES {
         counts.insert(s.into(), json!(0));
@@ -513,31 +558,57 @@ pub(crate) fn rollup(conn: &Connection, root: i64) -> UaResult<Value> {
 // Ledger and idempotency
 // ---------------------------------------------------------------------------
 
-pub(crate) fn emit(tx: &mut WriteTx<'_>, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+/// Append a task event about a row of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization until
+/// `org_guard` admits another. So a non-default task's event carries no free
+/// text and no caller-supplied label (callers pass titles, notes, comment
+/// bodies, reasons and labels through [`ledger_text`] / [`ledger_label`]),
+/// and its originator is the neutral `system`, never the acting agent.
+pub(crate) fn emit(tx: &mut WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+    let by = if org == ua_core::DEFAULT_ORG { by } else { "system" };
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
     Ok(())
 }
 
-fn idem_key(tool: &str, key: &str) -> String {
-    format!("{tool}:{key}")
+pub(crate) use crate::families::plans::{ledger_label, ledger_text};
+
+/// The stored key of a client idempotency key. `idempotency_keys` is still a
+/// hub-wide table (its `(org_id, principal, key)` rebuild is a later change),
+/// so another organization's key is prefixed with its organization and can
+/// never replay the default organization's reply, or a third's. The default
+/// organization keeps the `<tool>:<key>` form other readers rely on.
+pub(crate) fn idem_key(org: &str, tool: &str, key: &str) -> String {
+    if org == ua_core::DEFAULT_ORG { format!("{tool}:{key}") } else { format!("org:{org}/{tool}:{key}") }
 }
 
 /// A stored reply for (`tool`, `key`), if this key was already used.
-pub(crate) fn idempotent_replay(conn: &Connection, tool: &str, key: &str) -> UaResult<Option<Value>> {
+pub(crate) fn idempotent_replay(
+    conn: &Connection,
+    org: &str,
+    tool: &str,
+    key: &str,
+) -> UaResult<Option<Value>> {
     let stored: Option<String> = conn
         .query_row(
             "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-            [idem_key(tool, key), tool.to_string()],
+            [idem_key(org, tool, key), tool.to_string()],
             |r| r.get(0),
         )
         .optional()?;
     Ok(stored.map(|s| serde_json::from_str(&s).unwrap_or(Value::String(s))))
 }
 
-pub(crate) fn idempotent_record(tx: &WriteTx<'_>, tool: &str, key: &str, result: &Value) -> UaResult<()> {
+pub(crate) fn idempotent_record(
+    tx: &WriteTx<'_>,
+    org: &str,
+    tool: &str,
+    key: &str,
+    result: &Value,
+) -> UaResult<()> {
     tx.execute(
         "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![idem_key(tool, key), tool, result.to_string(), now()],
+        params![idem_key(org, tool, key), tool, result.to_string(), now()],
     )?;
     Ok(())
 }

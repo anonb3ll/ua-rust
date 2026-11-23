@@ -63,7 +63,7 @@ pub(super) const VISIBLE_EVENT: &str = "(
             AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
     ) OR EXISTS (
         SELECT 1 FROM tasks t
-          WHERE t.id = json_extract(event_log.payload, '$.task_id')
+          WHERE t.id = json_extract(event_log.payload, '$.task_id') AND t.org_id = event_log.org_id
             AND ? IN (t.claimed_by, t.next_owner)
     )))
     OR (channel GLOB 'agent.mailbox.*' AND org_id = ? AND ?)

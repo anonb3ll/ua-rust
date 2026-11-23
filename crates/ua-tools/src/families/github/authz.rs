@@ -45,7 +45,7 @@ use super::client::{BoundRepo, full_sha};
 use crate::approvals::{self, Refusal, RefusalReason};
 use crate::families::continuity::same_label;
 use crate::families::governance::{bound_repo, normalize_repo};
-use crate::families::tasks::{TASK_ORG, emit, is_terminal, require_task, row_object, str_field};
+use crate::families::tasks::{emit, is_terminal, require_org, require_task, row_object, str_field};
 use crate::registry::{Registry, ToolCtx, tool};
 
 const DEFAULT_HOURS: u32 = 24;
@@ -136,13 +136,27 @@ fn public(mut row: Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
-fn get(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(conn.query_row("SELECT * FROM policy_authorizations WHERE id = ?1", [id], row_object).optional()?)
+/// An authorization's organization, as a SQL expression over `p`: its
+/// task's. `policy_authorizations` carries no `org_id` yet (a later change);
+/// one whose task was deleted stays the default organization's, as every
+/// authorization was before.
+const AUTH_ORG: &str = "COALESCE((SELECT t.org_id FROM tasks t WHERE t.id = p.task_id), 'default')";
+
+/// Authorization `id` of organization `org`; another organization's answers
+/// as a missing one.
+fn get(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT p.* FROM policy_authorizations p WHERE p.id = ?1 AND {AUTH_ORG} = ?2"),
+            params![id, org],
+            row_object,
+        )
+        .optional()?)
 }
 
-/// One authorization row, if it exists.
-pub(crate) fn row(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    get(conn, id)
+/// One authorization row of organization `org`, if it exists.
+pub(crate) fn row(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    get(conn, org, id)
 }
 
 /// The tool a policy authorization stands in for.
@@ -203,19 +217,22 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("expires_in_hours must be 1-{MAX_HOURS}")));
     }
     let (id, pr, in_flight) = (a.task_id, a.pr, a.allow_in_flight);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            // The task's organization's bindings decide.
-            BoundRepo::check(tx, TASK_ORG, &repo)?;
-            let task = require_task(tx, id)?;
+            require_org(tx, &org)?;
+            // The task's organization's bindings decide: the task is looked
+            // up in the caller's organization, so that is the task row's.
+            BoundRepo::check(tx, &org, &repo)?;
+            let task = require_task(tx, &org, id)?;
             if is_terminal(str_field(&task, "status").unwrap_or("open")) {
                 return Err(UaError::conflict(format!(
                     "task {id} is closed; a policy authorization is a pre-merge step"
                 )));
             }
             let project = str_field(&task, "project").unwrap_or("default");
-            match bound_repo(tx, TASK_ORG, project)? {
+            match bound_repo(tx, &org, project)? {
                 Some(b) if b.eq_ignore_ascii_case(&repo) => {}
                 other => {
                     return Err(UaError::denied(
@@ -248,6 +265,7 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
             let sha = binding_sha256(&binding(id, Some(&repo), &head));
             emit(
                 tx,
+                &org,
                 "agent.github.policy_authorization.recorded",
                 json!({
                     "authorization_id": auth_id, "repo": repo, "pr": pr, "head_sha": head, "task_id": id,
@@ -256,7 +274,7 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
                 }),
                 &who,
             )?;
-            let row = get(tx, auth_id)?.unwrap_or_default();
+            let row = get(tx, &org, auth_id)?.unwrap_or_default();
             Ok(json!({ "status": "recorded", "authorization": public(row) }))
         })
         .await
@@ -271,15 +289,17 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
         .map(|h| full_sha(h).ok_or_else(|| UaError::invalid("head_sha must be 40 hex")))
         .transpose()?;
     let limit = a.limit.unwrap_or(50).clamp(1, 500);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT * FROM policy_authorizations WHERE (?1 IS NULL OR repo = ?1) AND (?2 IS NULL OR task_id = ?2) \
-                 AND (?3 IS NULL OR head_sha = ?3) AND (?5 IS NULL OR pr = ?5) ORDER BY id DESC LIMIT ?4",
-            )?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT p.* FROM policy_authorizations p WHERE {AUTH_ORG} = ?6 AND (?1 IS NULL OR p.repo = ?1) \
+                 AND (?2 IS NULL OR p.task_id = ?2) AND (?3 IS NULL OR p.head_sha = ?3) \
+                 AND (?5 IS NULL OR p.pr = ?5) ORDER BY p.id DESC LIMIT ?4"
+            ))?;
             let rows: Vec<Map<String, Value>> = stmt
-                .query_map(params![repo, a.task_id, head, SCAN_MAX, a.pr.map(|p| p as i64)], row_object)?
+                .query_map(params![repo, a.task_id, head, SCAN_MAX, a.pr.map(|p| p as i64), org], row_object)?
                 .collect::<Result<_, _>>()?;
             let mut out: Vec<Value> =
                 rows.into_iter().map(public).filter(|r| a.include_inactive || r["valid"] == true).collect();
@@ -298,10 +318,13 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
     let reason =
         a.reason.as_deref().map(|r| crate::families::continuity::bounded(r, "reason", 500)).transpose()?;
     let id = a.id;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = get(tx, id)?.ok_or_else(|| UaError::not_found(format!("policy authorization {id}")))?;
+            require_org(tx, &org)?;
+            let row =
+                get(tx, &org, id)?.ok_or_else(|| UaError::not_found(format!("policy authorization {id}")))?;
             if str_field(&row, "status") != Some("active") {
                 return Err(UaError::conflict(format!(
                     "policy authorization {id} is {}; only an active one can be revoked",
@@ -319,11 +342,13 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
             }
             emit(
                 tx,
+                &org,
                 "agent.github.policy_authorization.revoked",
-                json!({ "authorization_id": id, "task_id": row.get("task_id"), "reason": reason }),
+                json!({ "authorization_id": id, "task_id": row.get("task_id"),
+                        "reason": reason.as_deref().map(|r| crate::families::tasks::ledger_text(&org, r)) }),
                 &who,
             )?;
-            let row = get(tx, id)?.unwrap_or_default();
+            let row = get(tx, &org, id)?.unwrap_or_default();
             Ok(json!({ "status": "revoked", "authorization": public(row) }))
         })
         .await
@@ -336,6 +361,7 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
 pub(crate) fn covering(
     tx: &mut WriteTx<'_>,
     cfg: &Config,
+    org: &str,
     auth_id: i64,
     task_id: i64,
     repo: Option<&str>,
@@ -351,7 +377,7 @@ pub(crate) fn covering(
             .task(Some(task_id))
             .hashes(None, Some(presented_sha.clone()))
     };
-    let Some(row) = get(tx, auth_id)? else {
+    let Some(row) = get(tx, org, auth_id)? else {
         let r = base(RefusalReason::NoMatchingApproval);
         return Err(refuse(tx, caller, r, UaError::not_found(format!("policy authorization {auth_id}"))));
     };
@@ -441,6 +467,7 @@ pub(crate) fn allows_in_flight(row: &Map<String, Value>) -> bool {
 /// caller's write). Returns the `consumed_at` stamp [`restore`] fences on.
 pub(crate) fn consume(
     tx: &mut WriteTx<'_>,
+    org: &str,
     auth: &Map<String, Value>,
     auth_id: i64,
     task_id: i64,
@@ -458,6 +485,7 @@ pub(crate) fn consume(
     }
     emit(
         tx,
+        org,
         "agent.github.policy_authorization.consumed",
         json!({
             "authorization_id": auth_id, "task_id": task_id, "head_sha": head, "tool": MERGE_TOOL,
@@ -473,6 +501,7 @@ pub(crate) fn consume(
 /// revives one spent or revoked by anyone else.
 pub(crate) fn restore(
     tx: &mut WriteTx<'_>,
+    org: &str,
     auth_id: i64,
     head: &str,
     caller: &str,
@@ -488,8 +517,10 @@ pub(crate) fn restore(
         let why: String = why.chars().take(300).collect();
         emit(
             tx,
+            org,
             "agent.github.policy_authorization.restored",
-            json!({ "authorization_id": auth_id, "head_sha": head, "reason": why }),
+            json!({ "authorization_id": auth_id, "head_sha": head,
+                    "reason": crate::families::tasks::ledger_text(org, &why) }),
             caller,
         )?;
     }

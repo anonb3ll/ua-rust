@@ -81,14 +81,16 @@ fn safe_text(s: &str, max: usize) -> String {
 
 // --- session rows ----------------------------------------------------------------------
 
-fn load_session(conn: &Connection, id: &str) -> UaResult<Option<Value>> {
+/// Session `id`; its task's title is read in the reader's organization `org`
+/// (another organization's task shows no title).
+fn load_session(conn: &Connection, org: &str, id: &str) -> UaResult<Option<Value>> {
     Ok(conn
         .query_row(
             "SELECT s.id, s.agent, s.kind, s.status, s.task_id, s.delegation_id, s.worktree_path, s.branch, \
              s.host, s.started_at, s.ended_at, s.last_heartbeat_at, s.exit_status, s.summary, \
              s.external_session_id, s.model, t.title \
-             FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id WHERE s.id = ?1",
-            [id],
+             FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id AND t.org_id = ?2 WHERE s.id = ?1",
+            params![id, org],
             |r| {
                 Ok(json!({
                     "id": r.get::<_, String>(0)?,
@@ -115,8 +117,8 @@ fn load_session(conn: &Connection, id: &str) -> UaResult<Option<Value>> {
         .optional()?)
 }
 
-fn needs_session(conn: &Connection, id: &str) -> UaResult<Value> {
-    load_session(conn, id)?.ok_or_else(|| UaError::not_found(format!("unknown session {id}")))
+fn needs_session(conn: &Connection, org: &str, id: &str) -> UaResult<Value> {
+    load_session(conn, org, id)?.ok_or_else(|| UaError::not_found(format!("unknown session {id}")))
 }
 
 // --- session_packet ---------------------------------------------------------------------
@@ -174,7 +176,7 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         return Err(UaError::invalid("pass task_id or session_id"));
     }
     let session = match sid {
-        Some(id) => Some(needs_session(conn, id)?),
+        Some(id) => Some(needs_session(conn, &ctx.caller.org_id, id)?),
         None => None,
     };
     let mut task_id = a.task_id;
@@ -195,8 +197,8 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         Some(t) => conn
             .query_row(
                 "SELECT id, title, status, priority, project, lane, claimed_by, branch, worktree_path, \
-                 notes, evidence_ref, parent_id, updated_at FROM tasks WHERE id = ?1",
-                [t],
+                 notes, evidence_ref, parent_id, updated_at FROM tasks WHERE org_id = ?2 AND id = ?1",
+                params![t, ctx.caller.org_id],
                 |r| {
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
@@ -860,13 +862,14 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
     let vault_root = vault.as_ref().ok().map(|v| v.root.clone());
     let rel = proposal_relpath(&inbox, &sid);
     let (rel2, inbox2, sid2) = (rel.clone(), inbox.clone(), sid.clone());
+    let org = ctx.caller.org_id.clone();
 
     // Candidate extraction reads only; the write comes after.
     let (session, project, candidates) = ctx
         .hub
         .db()
         .read_async(move |conn| {
-            let session = needs_session(conn, &sid2)
+            let session = needs_session(conn, &org, &sid2)
                 .map_err(|_| UaError::not_found(format!("no such session: {sid2}")))?;
             if session["status"] != "completed" {
                 return Err(UaError::conflict("learning proposals are only emitted for completed sessions"));
@@ -874,10 +877,14 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
             let task_id = session["task_id"].as_i64();
             let project: String = task_id
                 .and_then(|t| {
-                    conn.query_row("SELECT project FROM tasks WHERE id = ?1", [t], |r| r.get(0))
-                        .optional()
-                        .ok()
-                        .flatten()
+                    conn.query_row(
+                        "SELECT project FROM tasks WHERE org_id = ?1 AND id = ?2",
+                        params![org, t],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
                 })
                 .unwrap_or_else(|| "(none)".into());
             let mut extracted = extract_from_lifecycle(conn, &sid2, task_id);
@@ -1047,6 +1054,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
     }
     let cap = a.limit.unwrap_or(50).clamp(1, 200);
     let sid2 = sid.clone();
+    let org = ctx.caller.org_id.clone();
     // A verified caller without the mail-unrestricted grant sees only the
     // crew's messages it sent or received, as in its own mailbox.
     let party = verified(&ctx.caller)
@@ -1057,7 +1065,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         .hub
         .db()
         .read_async(move |conn| {
-            let session = needs_session(conn, &sid2)?;
+            let session = needs_session(conn, &org, &sid2)?;
             let rows = query_rows(
                 conn,
                 "SELECT i.event_seq, i.event_ulid, i.created_at, i.message_id, i.act, i.conversation_id, i.reply_to, \
@@ -1143,7 +1151,8 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
     let text = redact_secrets(&text).0;
 
     let sid2 = sid.clone();
-    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &sid2)).await?;
+    let org = ctx.caller.org_id.clone();
+    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &org, &sid2)).await?;
     let recipient = session["agent"].as_str().unwrap_or("").trim().to_string();
     if recipient.is_empty() {
         return Err(UaError::invalid(format!("session {sid} has no agent")));

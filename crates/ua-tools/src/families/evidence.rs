@@ -312,8 +312,13 @@ fn build_report(
     let chain_ok = chain["verified"].as_bool().unwrap_or(false);
 
     if let Some(pid) = a.project_id {
-        let notes: Option<Option<String>> =
-            c.query_row("SELECT notes FROM tasks WHERE id = ?1", [pid], |r| r.get(0)).optional()?;
+        let notes: Option<Option<String>> = c
+            .query_row(
+                "SELECT notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, pid],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(notes) = notes else { return Err(UaError::not_found(format!("no task with id {pid}"))) };
         if !has_project_marker(notes.as_deref().unwrap_or("")) {
             return Err(UaError::invalid(format!("task {pid} does not carry [project-spec]")));
@@ -324,16 +329,21 @@ fn build_report(
     let mut args: Vec<&dyn ToSql> = Vec::new();
     let visibility = reader.bindings();
     let claimed_by_marker = a.agent.as_ref().map(|agent| format!("claimed-by: {agent}"));
+    // Only the reader's organization's tasks.
+    let org_s = org.to_string();
     if let Some(pid) = &a.project_id {
         sql.push_str(
-            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks WHERE id = ? \
+            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks \
+             WHERE id = ? AND org_id = ? \
              UNION ALL SELECT t.id, s.depth + 1, s.path || '.' || printf('%020d', t.id) \
-             FROM tasks t JOIN sub s ON t.parent_id = s.id) \
-             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id WHERE 1=1",
+             FROM tasks t JOIN sub s ON t.parent_id = s.id WHERE t.org_id = ?) \
+             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id \
+             WHERE tasks.org_id = ?",
         );
-        args.push(pid);
+        args.extend([pid as &dyn ToSql, &org_s, &org_s, &org_s]);
     } else {
-        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE 1=1");
+        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE tasks.org_id = ?");
+        args.push(&org_s);
     }
     if a.item.is_some() {
         sql.push_str(" AND 0");
@@ -381,7 +391,13 @@ fn build_report(
 
     let mut tasks: Vec<Map<String, Value>> = {
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), row_map)?;
+        // A task row keeps the shape it had before tasks carried `org_id`.
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            row_map(r).map(|mut m| {
+                m.remove("org_id");
+                m
+            })
+        })?;
         rows.collect::<Result<_, _>>()?
     };
     let truncated = tasks.len() as i64 > limit;
@@ -672,10 +688,11 @@ fn dangling(c: &Connection) -> UaResult<Value> {
 }
 
 async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let (fts, refs, chain, counts) = ctx
         .hub
         .db()
-        .read_async(|c| {
+        .read_async(move |c| {
             let fts: Vec<Value> = fts_indexes(c)?.iter().map(|ix| fts_check(c, ix)).collect::<UaResult<_>>()?;
             let counts: (i64, i64) = (
                 c.query_row(
@@ -683,7 +700,7 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
                     [],
                     |r| r.get(0),
                 )?,
-                c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM tasks WHERE org_id = ?1", [&org], |r| r.get(0))?,
             );
             Ok((fts, dangling(c)?, chain_integrity(c)?, counts))
         })

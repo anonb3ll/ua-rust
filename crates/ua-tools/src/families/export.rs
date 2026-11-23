@@ -179,13 +179,15 @@ fn md_cell(v: &Value) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
+/// Organization `org`'s tasks.
 fn task_rows(
     c: &Connection,
+    org: &str,
     status: Option<&str>,
     project: Option<&str>,
 ) -> UaResult<Vec<Map<String, Value>>> {
-    let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", TASK_COLUMNS.join(", "));
-    let mut args: Vec<SqlValue> = Vec::new();
+    let mut sql = format!("SELECT {} FROM tasks WHERE org_id = ?", TASK_COLUMNS.join(", "));
+    let mut args: Vec<SqlValue> = vec![SqlValue::Text(org.into())];
     if let Some(s) = status {
         sql.push_str(" AND status = ?");
         args.push(SqlValue::Text(s.into()));
@@ -213,7 +215,9 @@ async fn export_tasks(ctx: ToolCtx, a: TasksArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {TASK_STATUSES:?} or all, got {s:?}")));
     }
     let project = a.project.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let rows = ctx.hub.db().read_async(move |c| task_rows(c, status.as_deref(), project.as_deref())).await?;
+    let org = ctx.caller.org_id.clone();
+    let rows =
+        ctx.hub.db().read_async(move |c| task_rows(c, &org, status.as_deref(), project.as_deref())).await?;
     let n = rows.len();
     let null = Value::Null;
     let cell = |r: &Map<String, Value>, k: &str| -> Value { r.get(k).unwrap_or(&null).clone() };

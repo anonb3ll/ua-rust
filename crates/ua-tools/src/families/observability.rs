@@ -217,7 +217,13 @@ fn agent_activity(c: &Connection, reader: &EventReader, a: ActivityArgs) -> UaRe
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
-fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>) -> UaResult<Value> {
+/// `org` is the reader's organization: the task counts are its own.
+fn metrics_snapshot(
+    c: &Connection,
+    org: &str,
+    reader: &EventReader,
+    db_path: Option<&Path>,
+) -> UaResult<Value> {
     let week = agents::ago(7 * 86_400);
     let mut events: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     {
@@ -237,8 +243,8 @@ fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>
     }
     let mut by_status = Map::new();
     {
-        let mut stmt = c.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut stmt = c.prepare("SELECT status, COUNT(*) FROM tasks WHERE org_id = ?1 GROUP BY status")?;
+        let rows = stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (s, n) = row?;
             by_status.insert(s, json!(n));
@@ -247,9 +253,10 @@ fn metrics_snapshot(c: &Connection, reader: &EventReader, db_path: Option<&Path>
     let mut cycle: Vec<f64> = Vec::new();
     {
         let mut stmt = c.prepare(
-            "SELECT created_at, completed_at FROM tasks WHERE status = 'done' AND completed_at IS NOT NULL",
+            "SELECT created_at, completed_at FROM tasks WHERE org_id = ?1 AND status = 'done' \
+             AND completed_at IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (created, completed) = row?;
             if let (Some(a), Some(b)) = (parse_ts(&created), parse_ts(&completed)) {
@@ -406,9 +413,9 @@ fn check_anomalies(c: &Connection, org: &str) -> UaResult<Value> {
         let cutoff = agents::ago(STALE_DOING_DAYS * 86_400);
         let mut stmt = c.prepare(
             "SELECT id, title, updated_at, claimed_by FROM tasks \
-             WHERE status = 'doing' AND archived_at IS NULL AND updated_at < ?1 ORDER BY id",
+             WHERE org_id = ?2 AND status = 'doing' AND archived_at IS NULL AND updated_at < ?1 ORDER BY id",
         )?;
-        let rows = stmt.query_map([&cutoff], |r| {
+        let rows = stmt.query_map([cutoff.as_str(), org], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -434,11 +441,12 @@ fn check_anomalies(c: &Connection, org: &str) -> UaResult<Value> {
     {
         let cutoff = agents::ago(REVIEW_WAIT_HOURS * 3600);
         let mut stmt = c.prepare(
-            "SELECT id, updated_at FROM tasks WHERE status NOT IN ('done','cancelled') AND archived_at IS NULL \
-             AND instr(COALESCE(notes, ''), '[waiting-for: review]') > 0 \
+            "SELECT id, updated_at FROM tasks WHERE org_id = ?2 AND status NOT IN ('done','cancelled') \
+             AND archived_at IS NULL AND instr(COALESCE(notes, ''), '[waiting-for: review]') > 0 \
              AND instr(COALESCE(notes, ''), '[review:') = 0 AND updated_at < ?1 ORDER BY id",
         )?;
-        let rows = stmt.query_map([&cutoff], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows =
+            stmt.query_map([cutoff.as_str(), org], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, updated) = row?;
             out.push(anomaly(
@@ -470,8 +478,26 @@ fn check_anomalies(c: &Connection, org: &str) -> UaResult<Value> {
             claims.push((task, agent, at));
         }
     }
+    // Claims of another organization's tasks are not this reader's (a
+    // deleted task has no organization left and stays counted, as before).
+    {
+        let mut foreign = BTreeSet::new();
+        for (task, _, _) in &claims {
+            let owner: Option<String> =
+                c.query_row("SELECT org_id FROM tasks WHERE id = ?1", [task], |r| r.get(0)).optional()?;
+            if owner.is_some_and(|o| o != org) {
+                foreign.insert(*task);
+            }
+        }
+        claims.retain(|(task, _, _)| !foreign.contains(task));
+    }
     let task_status = |id: i64| -> UaResult<Option<String>> {
-        Ok(c.query_row("SELECT status FROM tasks WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+        Ok(c.query_row(
+            "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
+            rusqlite::params![org, id],
+            |r| r.get(0),
+        )
+        .optional()?)
     };
 
     // task_reassignment_thrash
@@ -562,13 +588,13 @@ fn check_anomalies(c: &Connection, org: &str) -> UaResult<Value> {
     // unverified_done
     {
         let mut stmt = c.prepare(
-            "SELECT id FROM tasks WHERE status = 'done' AND archived_at IS NULL \
+            "SELECT id FROM tasks WHERE org_id = ?1 AND status = 'done' AND archived_at IS NULL \
              AND instr(COALESCE(notes, ''), '[code-task]') > 0 \
              AND COALESCE(trim(evidence_ref), '') = '' \
              AND instr(COALESCE(notes, ''), '[review:') = 0 \
              AND instr(COALESCE(notes, ''), '[merged commit:') = 0 ORDER BY id",
         )?;
-        let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let ids = stmt.query_map([org], |r| r.get::<_, i64>(0))?;
         for id in ids {
             let id = id?;
             out.push(anomaly(
@@ -836,7 +862,8 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
             let _: NoArgs = parse_params("observability", act, p)?;
             let path = ctx.hub.db().path().map(Path::to_path_buf);
             let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
-            read(&ctx, move |c| metrics_snapshot(c, &reader, path.as_deref())).await
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| metrics_snapshot(c, &org, &reader, path.as_deref())).await
         }
         "anomalies" => {
             let _: NoArgs = parse_params("observability", act, p)?;
@@ -1771,7 +1798,8 @@ pub fn register(r: &mut Registry) {
             |ctx: ToolCtx, _a: NoArgs| async move {
                 let path = ctx.hub.db().path().map(Path::to_path_buf);
                 let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
-                read(&ctx, move |c| metrics_snapshot(c, &reader, path.as_deref())).await
+                let org = ctx.caller.org_id.clone();
+                read(&ctx, move |c| metrics_snapshot(c, &org, &reader, path.as_deref())).await
             },
         )
         .family("observability")

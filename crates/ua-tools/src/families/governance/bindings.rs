@@ -300,8 +300,7 @@ pub(crate) async fn project_repo_get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value
 
 /// `coordination_manage(action="project_repo_list")`: every project stream in
 /// use by a task or a binding of the caller's organization, each with its
-/// binding or `null`. Tasks are all in the default organization, so only its
-/// callers see the task streams.
+/// binding or `null`.
 pub(crate) async fn project_repo_list(ctx: ToolCtx, _a: ListArgs) -> UaResult<Value> {
     let org = ctx.caller.org_id.clone();
     ctx.hub
@@ -309,10 +308,10 @@ pub(crate) async fn project_repo_list(ctx: ToolCtx, _a: ListArgs) -> UaResult<Va
         .read_async(move |c| {
             let projects: Vec<String> = c
                 .prepare(
-                    "SELECT project FROM tasks WHERE ?1 = ?2 \
+                    "SELECT project FROM tasks WHERE org_id = ?1 \
                      UNION SELECT project FROM project_repo_bindings WHERE org_id = ?1 ORDER BY 1",
                 )?
-                .query_map([org.as_str(), ua_core::DEFAULT_ORG], |r| r.get(0))?
+                .query_map([org.as_str()], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             let rows = projects
                 .iter()

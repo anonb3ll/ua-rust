@@ -347,8 +347,10 @@ pub(crate) fn availability(conn: &Connection, label: &str) -> UaResult<(Value, O
 
 // --- session rows ---------------------------------------------------------------
 
+/// A session row with its task's title and status. `?1` is the reader's
+/// organization: another organization's task shows no title or status.
 const SESSION_SELECT: &str = "SELECT s.*, t.title AS task_title, t.status AS task_status \
-                              FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id";
+                              FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id AND t.org_id = ?1";
 
 fn session_json(r: &Row<'_>, now: i64) -> rusqlite::Result<Value> {
     let status: String = r.get("status")?;
@@ -386,22 +388,24 @@ fn session_json(r: &Row<'_>, now: i64) -> rusqlite::Result<Value> {
     }))
 }
 
-fn get_session(conn: &Connection, id: &str) -> UaResult<Option<Value>> {
+fn get_session(conn: &Connection, org: &str, id: &str) -> UaResult<Option<Value>> {
     let now = now_s();
     Ok(conn
-        .query_row(&format!("{SESSION_SELECT} WHERE s.id = ?1"), [id], |r| session_json(r, now))
+        .query_row(&format!("{SESSION_SELECT} WHERE s.id = ?2"), [org, id], |r| session_json(r, now))
         .optional()?)
 }
 
 fn list_sessions(
     conn: &Connection,
+    org: &str,
     agent: Option<&str>,
     status: Option<&str>,
     limit: i64,
     live_only: bool,
 ) -> UaResult<Vec<Value>> {
     let mut clauses: Vec<String> = Vec::new();
-    let mut args: Vec<SqlValue> = Vec::new();
+    // `?1` in SESSION_SELECT; the bare `?`s that follow number from 2.
+    let mut args: Vec<SqlValue> = vec![SqlValue::Text(org.to_string())];
     if let Some(a) = agent {
         clauses.push("s.agent = ?".into());
         args.push(SqlValue::Text(a.to_string()));
@@ -431,15 +435,17 @@ fn list_sessions(
 /// Live sessions as compact message targets, newest first. `task_source` is
 /// `session` when the session names its task, `claim` when it names none and
 /// its agent holds exactly one `doing` task, else the task is null.
-fn live_sessions_compact(conn: &Connection) -> UaResult<Vec<Value>> {
-    let rows = list_sessions(conn, None, None, 500, true)?;
+fn live_sessions_compact(conn: &Connection, org: &str) -> UaResult<Vec<Value>> {
+    let rows = list_sessions(conn, org, None, None, 500, true)?;
     let mut claims: std::collections::BTreeMap<String, Vec<(i64, String)>> = Default::default();
     if rows.iter().any(|s| s["task_id"].is_null()) {
         let mut stmt = conn.prepare(
-            "SELECT id, title, claimed_by FROM tasks WHERE status = 'doing' AND claimed_by IS NOT NULL ORDER BY id",
+            "SELECT id, title, claimed_by FROM tasks WHERE org_id = ?1 AND status = 'doing' \
+             AND claimed_by IS NOT NULL ORDER BY id",
         )?;
-        let found = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let found = stmt.query_map([org], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
         for row in found {
             let (id, title, by) = row?;
             claims.entry(by).or_default().push((id, title));
@@ -501,19 +507,28 @@ fn get_agent(conn: &Connection, label: &str) -> UaResult<Option<Value>> {
     Ok(conn.query_row("SELECT * FROM agents WHERE label = ?1", [label], |r| agent_json(r, now)).optional()?)
 }
 
-pub(crate) fn list_agents(conn: &Connection) -> UaResult<Vec<Value>> {
+/// Every agent, with its open sessions and its `doing` tasks in the
+/// reader's organization `org`.
+pub(crate) fn list_agents(conn: &Connection, org: &str) -> UaResult<Vec<Value>> {
     let now = now_s();
-    let count_by = |sql: &str| -> UaResult<std::collections::BTreeMap<String, i64>> {
+    let count_by = |sql: &str, p: &[&str]| -> UaResult<std::collections::BTreeMap<String, i64>> {
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(p.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     };
-    let open = count_by(&format!(
-        "SELECT agent, COUNT(*) FROM agent_sessions WHERE status IN ({}) GROUP BY agent",
-        open_marks()
-    ))?;
+    let open = count_by(
+        &format!(
+            "SELECT agent, COUNT(*) FROM agent_sessions WHERE status IN ({}) GROUP BY agent",
+            open_marks()
+        ),
+        &[],
+    )?;
     let active = count_by(
-        "SELECT claimed_by, COUNT(*) FROM tasks WHERE claimed_by IS NOT NULL AND status = 'doing' GROUP BY claimed_by",
+        "SELECT claimed_by, COUNT(*) FROM tasks WHERE org_id = ?1 AND claimed_by IS NOT NULL AND status = 'doing' \
+         GROUP BY claimed_by",
+        &[org],
     )?;
     let mut stmt =
         conn.prepare("SELECT * FROM agents ORDER BY (last_seen IS NULL), last_seen DESC, label")?;
@@ -682,10 +697,11 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
 
 /// `agent_list`, also the `agent_list` action of `coordination_manage`.
 pub(crate) async fn agent_list(ctx: ToolCtx, _a: AgentListArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
-        .read_async(|c| {
-            let agents = list_agents(c)?;
+        .read_async(move |c| {
+            let agents = list_agents(c, &org)?;
             let mut counts = Map::new();
             for a in &agents {
                 let status = a["status"].as_str().unwrap_or("unknown").to_string();
@@ -707,12 +723,13 @@ pub(crate) async fn agent_context(ctx: ToolCtx, _a: AgentContextArgs) -> UaResul
     let identity = verified(&ctx.caller).map(str::to_string);
     let profile = ctx.caller.profile.as_str();
     let workspace = ctx.hub.cfg().workspace_root().to_string_lossy().into_owned();
+    let org = ctx.caller.org_id.clone();
     let (agents, live) = ctx
         .hub
         .db()
-        .write_async(|tx| {
+        .write_async(move |tx| {
             reap(tx)?;
-            Ok((list_agents(tx)?, live_sessions_compact(tx)?))
+            Ok((list_agents(tx, &org)?, live_sessions_compact(tx, &org)?))
         })
         .await?;
     let peers: Vec<Value> = agents
@@ -764,6 +781,7 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
         Some(_) => return Err(UaError::invalid("meta must be a JSON object")),
     };
     let verified_self = verified(&ctx.caller).is_some();
+    let org = ctx.caller.org_id.clone();
     let ext = clean(a.external_session_id.as_deref());
     let (worktree, branch, transcript, host) = (
         clean(a.worktree_path.as_deref()),
@@ -777,7 +795,9 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             reap(tx)?;
             if let Some(tid) = task_id {
-                let found = tx.query_row("SELECT 1 FROM tasks WHERE id = ?1", [tid], |_| Ok(())).optional()?;
+                let found = tx
+                    .query_row("SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, tid], |_| Ok(()))
+                    .optional()?;
                 if found.is_none() {
                     return Err(UaError::not_found(format!("no task with id {tid}")));
                 }
@@ -861,7 +881,7 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                     .by(label.clone()),
                 )?;
             }
-            let row = get_session(tx, &session_id)?.unwrap_or_else(|| json!({}));
+            let row = get_session(tx, &org, &session_id)?.unwrap_or_else(|| json!({}));
             let mut out = json!({
                 "session_id": session_id,
                 "agent": label,
@@ -969,12 +989,13 @@ async fn session_list(ctx: ToolCtx, a: SessionListArgs) -> UaResult<Value> {
     let agent = clean(a.agent.as_deref());
     let limit = a.limit.unwrap_or(50);
     let live_only = a.live_only;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
             reap(tx)?;
             let status = if live_only { Some("open".to_string()) } else { status };
-            let sessions = list_sessions(tx, agent.as_deref(), status.as_deref(), limit, live_only)?;
+            let sessions = list_sessions(tx, &org, agent.as_deref(), status.as_deref(), limit, live_only)?;
             let open = sessions.iter().filter(|s| s["status"].as_str().is_some_and(is_open)).count();
             let live = sessions.iter().filter(|s| s["live"] == json!(true)).count();
             let total = sessions.len();

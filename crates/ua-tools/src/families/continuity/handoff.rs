@@ -294,6 +294,7 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
         return Err(UaError::invalid("session_id is required"));
     }
     let (task_arg, supersede) = (a.task_id, a.supersede);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -339,7 +340,11 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
             check_limits(tx, &sid, now)?;
             let task_id = task_arg.or(session_task);
             if let Some(t) = task_id {
-                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [t], |r| r.get(0))?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2)",
+                    params![org, t],
+                    |r| r.get(0),
+                )?;
                 if !exists {
                     return Err(UaError::not_found(format!(
                         "task {t} not found: a handoff note can only reference a task here"

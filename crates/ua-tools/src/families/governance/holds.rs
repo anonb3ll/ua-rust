@@ -58,6 +58,10 @@ const NO_AUTO_RELEASE_CANCEL: &str = "release_policy after_active_runs_finish ca
 #[derive(Debug, Clone)]
 struct Hold {
     id: i64,
+    /// The organization of the hold's root task (`task_holds` carries no
+    /// `org_id` yet); a hold whose root is gone is the default
+    /// organization's.
+    org: String,
     root_task_id: i64,
     mode: String,
     status: String,
@@ -71,7 +75,14 @@ struct Hold {
 }
 
 const HOLD_COLS: &str = "h.id, h.root_task_id, h.mode, h.status, h.reason, h.release_policy, h.created_by, \
-     h.created_at, h.released_by, h.released_at, h.cancelling_at";
+     h.created_at, h.released_by, h.released_at, h.cancelling_at, \
+     COALESCE((SELECT rt.org_id FROM tasks rt WHERE rt.id = h.root_task_id), 'default')";
+
+/// A hold's organization, as a SQL expression over `h`: its root task's.
+/// Until `task_holds` carries `org_id` (a later change), a hold whose root
+/// was deleted has no organization left and stays the default
+/// organization's, as every hold was before.
+const HOLD_ORG: &str = "COALESCE((SELECT rt.org_id FROM tasks rt WHERE rt.id = h.root_task_id), 'default')";
 
 fn hold_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hold> {
     Ok(Hold {
@@ -86,6 +97,7 @@ fn hold_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hold> {
         released_by: r.get(8)?,
         released_at: r.get(9)?,
         cancelling_at: r.get(10)?,
+        org: r.get(11)?,
     })
 }
 
@@ -95,12 +107,20 @@ fn holds_where(c: &Connection, filter: &str, p: impl rusqlite::Params) -> UaResu
     Ok(rows)
 }
 
-fn load_hold(c: &Connection, id: i64) -> UaResult<Option<Hold>> {
-    Ok(holds_where(c, "h.id = ?1", [id])?.into_iter().next())
+/// Hold `id` of organization `org`; another organization's hold answers as
+/// a missing one.
+fn load_hold(c: &Connection, org: &str, id: i64) -> UaResult<Option<Hold>> {
+    Ok(holds_where(c, &format!("h.id = ?1 AND {HOLD_ORG} = ?2"), params![id, org])?.into_iter().next())
 }
 
-fn active_for_root(c: &Connection, root: i64) -> UaResult<Option<Hold>> {
-    Ok(holds_where(c, "h.root_task_id = ?1 AND h.status = 'active'", [root])?.into_iter().next())
+fn active_for_root(c: &Connection, org: &str, root: i64) -> UaResult<Option<Hold>> {
+    Ok(holds_where(
+        c,
+        &format!("h.root_task_id = ?1 AND h.status = 'active' AND {HOLD_ORG} = ?2"),
+        params![root, org],
+    )?
+    .into_iter()
+    .next())
 }
 
 /// Whether a cancel on this hold is still recording its requests.
@@ -111,9 +131,9 @@ fn cancelling(h: &Hold) -> bool {
 
 /// Members with live work: a claimed `doing` row on a live lease, a live
 /// dispatch run, or a queued or claimed node item.
-fn live_run_task_ids(c: &Connection, hold_id: i64) -> UaResult<Vec<i64>> {
+fn live_run_task_ids(c: &Connection, h: &Hold) -> UaResult<Vec<i64>> {
     let mut stmt = c.prepare(
-        "SELECT t.id FROM task_hold_members m JOIN tasks t ON t.id = m.task_id
+        "SELECT t.id FROM task_hold_members m JOIN tasks t ON t.id = m.task_id AND t.org_id = ?3
          WHERE m.hold_id = ?1 AND t.status = 'doing' AND t.claimed_by IS NOT NULL
            AND t.lock_expires_at IS NOT NULL AND t.lock_expires_at > ?2
          UNION
@@ -124,15 +144,28 @@ fn live_run_task_ids(c: &Connection, hold_id: i64) -> UaResult<Vec<i64>> {
          WHERE m.hold_id = ?1 AND n.status IN ('queued','claimed')
          ORDER BY 1",
     )?;
-    let ids = stmt.query_map(params![hold_id, now()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let ids = stmt.query_map(params![h.id, now(), h.org], |r| r.get(0))?.collect::<Result<_, _>>()?;
     Ok(ids)
 }
 
-fn record(tx: &mut WriteTx<'_>, who: &str, mut payload: Value) -> UaResult<()> {
+/// Record a hold event about a hold of organization `org`. ORG-EVENT-DEFAULT:
+/// the row stays in the default ledger, so another organization's reason,
+/// actor and per-member outcomes (which carry agent labels) are `null` and
+/// the originator is the neutral `system`; ids and the action remain.
+fn record(tx: &mut WriteTx<'_>, org: &str, who: &str, mut payload: Value) -> UaResult<()> {
     payload["kind"] = json!("task.hold");
     payload["actor"] = json!(who);
     payload["at"] = json!(now());
-    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(who.to_string()))?;
+    let mut by = who.to_string();
+    if org != ua_core::DEFAULT_ORG {
+        by = "system".into();
+        for key in ["actor", "reason", "outcomes", "restored"] {
+            if let Some(v) = payload.get_mut(key) {
+                *v = Value::Null;
+            }
+        }
+    }
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by))?;
     Ok(())
 }
 
@@ -161,7 +194,7 @@ fn release_in_tx(
     if let (Some(p), Value::Object(e)) = (payload.as_object_mut(), extra) {
         p.extend(e);
     }
-    record(tx, who, payload)
+    record(tx, &h.org, who, payload)
 }
 
 fn auto_release(tx: &mut WriteTx<'_>, h: &Hold) -> UaResult<()> {
@@ -176,9 +209,11 @@ fn auto_release(tx: &mut WriteTx<'_>, h: &Hold) -> UaResult<()> {
 }
 
 /// Release every due `after_active_runs_finish` hold: the read-time check.
+/// Hub maintenance over every organization's holds; each release acts in
+/// its hold's own organization.
 fn settle_due(tx: &mut WriteTx<'_>) -> UaResult<()> {
     for h in holds_where(tx, "h.status = 'active' AND h.release_policy = 'after_active_runs_finish'", [])? {
-        if live_run_task_ids(tx, h.id)?.is_empty() {
+        if live_run_task_ids(tx, &h)?.is_empty() {
             auto_release(tx, &h)?;
         }
     }
@@ -187,14 +222,17 @@ fn settle_due(tx: &mut WriteTx<'_>) -> UaResult<()> {
 
 /// The active hold over `task_id`, as a refusal message, after releasing
 /// any `after_active_runs_finish` hold over it that is due.
-pub(crate) fn subtree_block(tx: &mut WriteTx<'_>, task_id: i64) -> UaResult<Option<String>> {
+pub(crate) fn subtree_block(tx: &mut WriteTx<'_>, org: &str, task_id: i64) -> UaResult<Option<String>> {
     let rows = holds_where(
         tx,
-        "h.status = 'active' AND h.id IN (SELECT hold_id FROM task_hold_members WHERE task_id = ?1) ORDER BY h.id",
-        [task_id],
+        &format!(
+            "h.status = 'active' AND {HOLD_ORG} = ?2 \
+             AND h.id IN (SELECT hold_id FROM task_hold_members WHERE task_id = ?1) ORDER BY h.id"
+        ),
+        params![task_id, org],
     )?;
     for h in rows {
-        if h.release_policy == "after_active_runs_finish" && live_run_task_ids(tx, h.id)?.is_empty() {
+        if h.release_policy == "after_active_runs_finish" && live_run_task_ids(tx, &h)?.is_empty() {
             auto_release(tx, &h)?;
             continue;
         }
@@ -220,14 +258,15 @@ struct Member {
     claimed_by: Option<String>,
 }
 
-fn members(c: &Connection, hold_id: i64) -> UaResult<Vec<Member>> {
+fn members(c: &Connection, org: &str, hold_id: i64) -> UaResult<Vec<Member>> {
     let mut stmt = c.prepare(
         "SELECT m.task_id, m.status_at_hold, m.cancel_requested_by_hold, m.cancelled_run_id, m.cancelled_run_agent, \
-         m.restored_at, t.status, t.claimed_by FROM task_hold_members m JOIN tasks t ON t.id = m.task_id \
+         m.restored_at, t.status, t.claimed_by FROM task_hold_members m \
+         JOIN tasks t ON t.id = m.task_id AND t.org_id = ?2 \
          WHERE m.hold_id = ?1 ORDER BY m.task_id",
     )?;
     let rows = stmt
-        .query_map([hold_id], |r| {
+        .query_map(params![hold_id, org], |r| {
             Ok(Member {
                 task_id: r.get(0)?,
                 status_at_hold: r.get(1)?,
@@ -244,7 +283,7 @@ fn members(c: &Connection, hold_id: i64) -> UaResult<Vec<Member>> {
 }
 
 fn serialize(c: &Connection, h: &Hold) -> UaResult<Value> {
-    let ms = members(c, h.id)?;
+    let ms = members(c, &h.org, h.id)?;
     let active = h.status == "active";
     Ok(json!({
         "id": h.id,
@@ -267,12 +306,12 @@ fn serialize(c: &Connection, h: &Hold) -> UaResult<Value> {
             "cancelled_run_id": m.cancelled_run_id,
             "restored_at": m.restored_at,
         })).collect::<Vec<_>>(),
-        "live_run_task_ids": if active { live_run_task_ids(c, h.id)? } else { Vec::new() },
+        "live_run_task_ids": if active { live_run_task_ids(c, h)? } else { Vec::new() },
     }))
 }
 
-fn get(c: &Connection, id: i64) -> UaResult<Value> {
-    let h = load_hold(c, id)?.ok_or_else(|| UaError::not_found(format!("no task hold with id {id}")))?;
+fn get(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    let h = load_hold(c, org, id)?.ok_or_else(|| UaError::not_found(format!("no task hold with id {id}")))?;
     serialize(c, &h)
 }
 
@@ -325,14 +364,18 @@ pub(crate) async fn task_holds(ctx: ToolCtx, a: HoldsArgs) -> UaResult<Value> {
         return Err(UaError::invalid("status must be one of active, released, all"));
     }
     let cap = a.limit.unwrap_or(200).clamp(1, LIST_MAX);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
             settle_due(tx)?;
             let rows = holds_where(
                 tx,
-                "(?1 = 'all' OR h.status = ?1) AND (?2 IS NULL OR h.root_task_id = ?2) ORDER BY h.id DESC LIMIT ?3",
-                params![view, a.root_task_id, cap + 1],
+                &format!(
+                    "{HOLD_ORG} = ?4 AND (?1 = 'all' OR h.status = ?1) AND (?2 IS NULL OR h.root_task_id = ?2) \
+                     ORDER BY h.id DESC LIMIT ?3"
+                ),
+                params![view, a.root_task_id, cap + 1, org],
             )?;
             let truncated = rows.len() as i64 > cap;
             let holds = rows.iter().take(cap as usize).map(|h| serialize(tx, h)).collect::<UaResult<Vec<_>>>()?;
@@ -343,11 +386,12 @@ pub(crate) async fn task_holds(ctx: ToolCtx, a: HoldsArgs) -> UaResult<Value> {
 
 /// `coordination_manage(action="task_hold_get")`.
 pub(crate) async fn task_hold_get(ctx: ToolCtx, a: HoldGetArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
             settle_due(tx)?;
-            get(tx, a.hold_id)
+            get(tx, &org, a.hold_id)
         })
         .await
 }
@@ -376,6 +420,7 @@ fn release_authority(h: &Hold, who: &str, verified: bool, maintainer: bool) -> U
 
 fn create(
     tx: &mut WriteTx<'_>,
+    org: &str,
     root: i64,
     mode: &str,
     reason: &str,
@@ -388,11 +433,11 @@ fn create(
         params![root, mode, reason, policy, who, now(), (mode == "cancel").then(now)],
     )?;
     let id = tx.last_insert_rowid();
-    for task_id in subtree_ids(tx, root)? {
+    for task_id in subtree_ids(tx, org, root)? {
         tx.execute(
             "INSERT INTO task_hold_members (hold_id, task_id, status_at_hold) \
-             SELECT ?1, id, status FROM tasks WHERE id = ?2",
-            params![id, task_id],
+             SELECT ?1, id, status FROM tasks WHERE org_id = ?3 AND id = ?2",
+            params![id, task_id, org],
         )?;
     }
     Ok(id)
@@ -410,7 +455,7 @@ fn restore_in_tx(
     let mut out = Vec::new();
     let mut settled = true;
     let stamp = now();
-    for m in members(tx, h.id)? {
+    for m in members(tx, &h.org, h.id)? {
         if !m.cancel_requested_by_hold || crate::families::tasks::is_terminal(&m.status_at_hold) {
             continue;
         }
@@ -485,27 +530,29 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
     }
     let who = acting_identity(&ctx.caller, a.actor.as_deref())?;
     let is_verified = verified(&ctx.caller).is_some();
+    let org = ctx.caller.org_id.clone();
     let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        &org,
     );
     let reason = clean_reason(
         a.reason.as_deref(),
         matches!(verb.as_str(), "pause" | "cancel").then_some("hold a subtree"),
     )?;
     let root = a.root_task_id;
-    let (v2, w2, r2) = (verb.clone(), who.clone(), reason.clone());
+    let (v2, w2, r2, o2) = (verb.clone(), who.clone(), reason.clone(), org.clone());
     let out = ctx
         .hub
         .db()
         .write_async(move |tx| {
-            let (verb, who, reason) = (v2, w2, r2);
-            let existing = active_for_root(tx, root)?;
+            let (verb, who, reason, org) = (v2, w2, r2, o2);
+            crate::families::tasks::require_org(tx, &org)?;
+            let existing = active_for_root(tx, &org, root)?;
             // Existing holds can outlive their roots. Releasing one still
             // uses its stored creator and the same release authority check.
             if existing.is_none() || matches!(verb.as_str(), "pause" | "cancel") {
-                crate::families::tasks::require_task(tx, root)?;
+                crate::families::tasks::require_task(tx, &org, root)?;
             }
             if let Some(want) = a.hold_id
                 && existing.as_ref().map(|h| h.id) != Some(want)
@@ -532,9 +579,10 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
                         )?;
                     }
                     None => {
-                        out.hold_id = create(tx, root, &verb, &reason, &policy, &who)?;
-                        if policy == "after_active_runs_finish"
-                            && live_run_task_ids(tx, out.hold_id)?.is_empty()
+                        out.hold_id = create(tx, &org, root, &verb, &reason, &policy, &who)?;
+                        let created = load_hold(tx, &org, out.hold_id)?
+                            .ok_or_else(|| UaError::internal(format!("hold #{} vanished", out.hold_id)))?;
+                        if policy == "after_active_runs_finish" && live_run_task_ids(tx, &created)?.is_empty()
                         {
                             return Err(UaError::invalid(format!(
                                 "nothing is running in task #{root}'s subtree, so release_policy \
@@ -545,9 +593,10 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
                     }
                 }
                 if out.changed {
-                    let ids: Vec<i64> = members(tx, out.hold_id)?.iter().map(|m| m.task_id).collect();
+                    let ids: Vec<i64> = members(tx, &org, out.hold_id)?.iter().map(|m| m.task_id).collect();
                     record(
                         tx,
+                        &org,
                         &who,
                         json!({
                             "action": verb,
@@ -585,6 +634,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
                 } else {
                     record(
                         tx,
+                        &org,
                         &who,
                         json!({
                             "action": "restore_pending",
@@ -603,7 +653,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
     let mut result = json!({ "action": verb, "changed": out.changed });
     if out.cancel {
         result["cancel_requests"] =
-            json!(request_cancels(&ctx, out.hold_id, root, &who, maintainer, &reason).await?);
+            json!(request_cancels(&ctx, &org, out.hold_id, root, &who, maintainer, &reason).await?);
     }
     if verb == "resume" || verb == "restore" {
         result["released"] = json!(out.released);
@@ -619,7 +669,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
         result["restored"] = json!(out.restored);
     }
     let id = out.hold_id;
-    result["hold"] = ctx.hub.db().read_async(move |c| get(c, id)).await?;
+    result["hold"] = ctx.hub.db().read_async(move |c| get(c, &org, id)).await?;
     Ok(result)
 }
 
@@ -628,6 +678,7 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
 /// until the outcomes are recorded; the mark is always cleared.
 async fn request_cancels(
     ctx: &ToolCtx,
+    org: &str,
     hold_id: i64,
     root: i64,
     who: &str,
@@ -636,11 +687,12 @@ async fn request_cancels(
 ) -> UaResult<Vec<Value>> {
     let is_verified = verified(&ctx.caller).is_some();
     type Run = (String, i64, String);
+    let org1 = org.to_string();
     let (runs, items): (Vec<Run>, Vec<(node_queue::Item, Option<String>)>) = ctx
         .hub
         .db()
         .read_async(move |c| {
-            let live: Vec<Member> = members(c, hold_id)?
+            let live: Vec<Member> = members(c, &org1, hold_id)?
                 .into_iter()
                 .filter(|m| !crate::families::tasks::is_terminal(&m.status_at_hold))
                 .collect();
@@ -722,7 +774,7 @@ async fn request_cancels(
         .unwrap_or_else(|e| vec![json!({ "path": "node", "control": "failed", "detail": e.to_string() })]);
     outcomes.append(&mut node_out);
 
-    let (who3, recorded) = (who.to_string(), outcomes.clone());
+    let (who3, recorded, org3) = (who.to_string(), outcomes.clone(), org.to_string());
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -736,6 +788,7 @@ async fn request_cancels(
             tx.execute("UPDATE task_holds SET cancelling_at = NULL WHERE id = ?1", [hold_id])?;
             record(
                 tx,
+                &org3,
                 &who3,
                 json!({ "action": "cancel_requested", "hold_id": hold_id, "root_task_id": root, "outcomes": recorded }),
             )
