@@ -302,6 +302,24 @@ from its commit history.
   `org_id`, so an approval parked before this change is not reused: resuming
   such a run parks a new one. Results and events in the default organization
   are otherwise unchanged.
+- Plans, plan steps and plan checkpoints (`plans`, `plan_steps`,
+  `plan_checkpoints`) are organization-scoped: `organization.v1.tools.plans`
+  adds `org_id` and the organization triggers, and `plans.v2.org_scope`
+  adds an index led by `org_id` and triggers that keep a step or checkpoint
+  in its plan's organization. No key rebuild: plan ids are hub-generated,
+  and the step and checkpoint keys hang off them. Existing rows move to
+  `default`. Every `plan_manage` action, the legacy `plan_*` tools and the
+  `plan` kind of `platform_object_get` read and write only the caller's
+  organization's rows; another organization's plan answers as a missing
+  one, and a write for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes. Plan events stay in the
+  default organization's ledger, with another organization's text and
+  labels left out (`null`): `goal` and `scope` on `agent.plan.created`,
+  `owner` on `agent.plan.step_updated`, `agent` on
+  `agent.plan.step_claimed`, `agent` and `next_owner` on
+  `agent.plan.handoff`, and `reason` on `agent.plan.closed`. The importer writes legacy plans to
+  `default`. Results and events in the default organization are unchanged,
+  except that plan rows now carry `org_id`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

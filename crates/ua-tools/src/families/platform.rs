@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -658,14 +658,21 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
                 v
             })
         }
-        "plan" => match one_row(c, "SELECT * FROM plans WHERE id = ?1", id)? {
+        // The caller's organization's plan only: another organization's
+        // answers as a missing one.
+        "plan" => match c
+            .query_row("SELECT * FROM plans WHERE org_id = ?1 AND id = ?2", params![caller.org_id, id], row_map)
+            .optional()?
+        {
             None => None,
             Some(mut p) => {
                 let escalated = p.get("escalated").and_then(Value::as_i64).unwrap_or(0) != 0;
                 p.insert("needs_human".into(), json!(escalated));
-                let mut stmt = c.prepare("SELECT * FROM plan_steps WHERE plan_id = ?1 ORDER BY step_idx, id")?;
+                let mut stmt = c.prepare(
+                    "SELECT * FROM plan_steps WHERE org_id = ?1 AND plan_id = ?2 ORDER BY step_idx, id",
+                )?;
                 let steps: Vec<Value> = stmt
-                    .query_map([id], row_map)?
+                    .query_map(params![caller.org_id, id], row_map)?
                     .map(|r| {
                         r.map(|mut s| {
                             decode(&mut s, &["depends_on", "outputs"]);

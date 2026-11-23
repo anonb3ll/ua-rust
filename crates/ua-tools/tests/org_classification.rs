@@ -160,9 +160,10 @@ const TENANT: &[&str] = &[
 /// `pending_notifications` (`organization.v1.tools.notify`), `zulip_sends`
 /// (`organization.v1.tools.zulip`), the four harness config tables
 /// (`harness_config.v3.tenant_keys`, `organization.v1.tools.harness_config`),
-/// `routines` and `routine_runs` (`organization.v1.tools.routines`), and
+/// `routines` and `routine_runs` (`organization.v1.tools.routines`),
 /// `workflow_runs` and `workflow_checkpoints`
-/// (`organization.v1.tools.workflows`).
+/// (`organization.v1.tools.workflows`), and the three plans tables
+/// (`organization.v1.tools.plans`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -190,9 +191,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "plan_checkpoints",
-    "plan_steps",
-    "plans",
     "policy_authorizations",
     "relay_messages",
     "review_ready_notices",
