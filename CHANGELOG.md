@@ -800,8 +800,13 @@ from its commit history.
   the worktree `.ua/interventions.jsonl` line holds only `{ts, session_id,
   message_id}`. `crew_view` resolves each line's `message_id` against the
   mailbox under the reader's rule and drops a line that is not a crew
-  intervention into that session, so a planted line shows nothing; the file
-  is never written or read through a symlink. `message_send`
+  `request` into that session, so a planted line shows nothing; only the
+  newest 1000 lines are resolved. On unix the file is opened relative to an
+  `O_NOFOLLOW` descriptor of `.ua` with `O_NOFOLLOW` itself, and must be a
+  regular file with one link, so neither a symlink (of the file or of `.ua`,
+  even swapped in between check and open) nor a hard link is written or
+  read; other platforms only check before opening and do not detect hard
+  links. `message_send`
   refuses a client-chosen `message_id` with an external-thread prefix
   (`ts:`).
 - `message_send`: a client-chosen `message_id` is the sender's own
@@ -816,6 +821,23 @@ from its commit history.
   old id and its sender's retry still finds it. Hub-node command notices
   record the hub-minted id. A restricted caller's `conversation not found`
   now says to omit `conversation_id` or answer with `reply_to`.
+  `ua-import` does not carry `idempotency_keys` over, so a client id from
+  imported (or otherwise pre-upgrade, unkeyed) data now produces a new
+  message on reuse instead of `conflict`.
+- `message_list` takes `client_message_id`: only messages whose sender keyed
+  them with that id. A restricted caller still sees only its own mail, so
+  the filter finds nothing it could not already list.
+- `message_send`: an unverified caller (auth enforcement off) may no longer
+  send as a label the hub sends as itself (`hub-node`, `system`,
+  `pr-watch`, ignoring case), so it cannot take a hub client id such as
+  `node-command-…` first.
+- `memory_save`: an `idempotency_key` is stored as
+  `memory_save/<caller>/<key>` and looked up only among `memory_save` rows.
+  Another tool's use of the same text (a `message_send` client id, a
+  hub-node `node-command-…` id) is no longer reported as `conflict … already
+  used by message_send`, and a memory key can no longer occupy another
+  tool's key and make its later write fail. A key `memory_save` stored before
+  this change still replays for a retry.
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

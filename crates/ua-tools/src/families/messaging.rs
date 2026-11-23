@@ -268,6 +268,11 @@ pub struct ListArgs {
     pub waiting_on_reply: bool,
     /// Only this message.
     pub message_id: Option<String>,
+    /// Only messages whose sender keyed them with this client `message_id`
+    /// (echoed as `client_message_id`). A caller limited to its own mail
+    /// still sees only its own mail, so the filter finds nothing it could
+    /// not already list. Pruned messages carry no client id and never match.
+    pub client_message_id: Option<String>,
     /// Read your mailbox as one of your sessions: label mail plus mail
     /// addressed to that session, with that session's read state. Counts as
     /// the session's heartbeat.
@@ -586,6 +591,24 @@ fn parent(conn: &Connection, message_id: &str) -> UaResult<Option<Parent>> {
         .optional()?)
 }
 
+/// Sender labels the hub itself sends as. An unverified caller may not claim
+/// one: it could take a hub client id first (`node-command-…` under
+/// `hub-node`) or pass as hub mail. The hub's own sends (`send_system`) carry
+/// the label as their identity and never reach this check.
+pub(crate) const RESERVED_SENDERS: [&str; 3] =
+    [crate::families::node_queue::command::NOTICE_SENDER, "system", "pr-watch"];
+
+/// `label`, unless it is a reserved hub sender (compared ignoring ASCII case).
+fn unreserved(label: String) -> UaResult<String> {
+    if RESERVED_SENDERS.iter().any(|r| r.eq_ignore_ascii_case(&label)) {
+        return Err(UaError::denied(
+            "reserved_sender",
+            format!("from_agent {label:?} is reserved for the hub's own messages; send as your own label"),
+        ));
+    }
+    Ok(label)
+}
+
 /// The idempotency key of a client-chosen id, scoped to its sender. Neither a
 /// label nor a client id may contain `/`, so the key is unambiguous, and it
 /// never matches a pre-scoping key (`message_send:<id>`).
@@ -769,10 +792,10 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     }
     let sender = match &v.identity {
         Some(id) => id.clone(),
-        None => validate_label(
+        None => unreserved(validate_label(
             Some(clean(a.from_agent.as_deref()).as_deref().unwrap_or(&v.local_label)),
             "from_agent",
-        )?,
+        )?)?,
     };
     agents::reap(tx)?;
     // The sender's own session is checked and heartbeated first, so a session
@@ -1045,6 +1068,7 @@ struct Filters {
     conversation_id: Option<String>,
     act: Option<String>,
     message_id: Option<String>,
+    client_message_id: Option<String>,
     after_seq: Option<i64>,
     unread_only: bool,
     waiting_on_reply: bool,
@@ -1071,6 +1095,10 @@ impl Filters {
                 clauses.push(format!("{column} = ?"));
                 args.push(text(v));
             }
+        }
+        if let Some(c) = &self.client_message_id {
+            clauses.push("json_extract(e.payload, '$.client_message_id') = ?".into());
+            args.push(text(c));
         }
         if let Some(p) = &self.party {
             clauses.push("(i.recipient = ? OR i.sender = ?)".into());
@@ -1326,6 +1354,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
             Some(m) => Some(own_message_id(conn, me.as_deref().unwrap_or(&v.local_label), m)?),
             None => None,
         },
+        client_message_id: clean(q.client_message_id.as_deref()),
         after_seq: q.after_seq,
         unread_only: q.unread_only,
         waiting_on_reply: q.waiting_on_reply,

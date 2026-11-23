@@ -303,17 +303,41 @@ fn similar_notes(conn: &rusqlite::Connection, model: &str, v: &[f32], content: &
     Ok(out)
 }
 
+/// The stored key of a save's `idempotency_key`: scoped to `memory_save` and
+/// to the caller, so a memory key never shares a row with another tool's key
+/// (a `message_send` client id, say) or another caller's. `%` and `/` in the
+/// label are escaped, so the caller part always ends at the first `/` after
+/// the prefix and two callers' keys never meet.
+fn scoped_key(caller: &Caller, key: &str) -> String {
+    let label = caller.label.replace('%', "%25").replace('/', "%2F");
+    format!("{SAVE_TOOL}/{label}/{key}")
+}
+
+const SAVE_TOOL: &str = "memory_save";
+
+/// The saved receipt of an earlier save under `key`: this caller's scoped key,
+/// else a pre-upgrade raw key that `memory_save` itself wrote. Only
+/// `memory_save` rows are read, so another tool's use of the same text is
+/// invisible and the key answers like a fresh one.
+fn saved_receipt(tx: &WriteTx<'_>, caller: &Caller, key: &str) -> UaResult<Option<String>> {
+    let read = |k: &str| -> UaResult<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
+                params![k, SAVE_TOOL],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    match read(&scoped_key(caller, key))? {
+        Some(raw) => Ok(Some(raw)),
+        None => read(key),
+    }
+}
+
 fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResult<Option<Value>> {
     let Some(key) = &p.idempotency_key else { return Ok(None) };
-    let row: Option<(String, String)> = tx
-        .query_row("SELECT tool, result_json FROM idempotency_keys WHERE key = ?1", [key], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()?;
-    let Some((tool, raw)) = row else { return Ok(None) };
-    if tool != "memory_save" {
-        return Err(UaError::conflict(format!("idempotency_key {key:?} was already used by {tool}")));
-    }
+    let Some(raw) = saved_receipt(tx, caller, key)? else { return Ok(None) };
     let cached: Value = serde_json::from_str(&raw).map_err(|e| UaError::internal(e.to_string()))?;
     // The receipt is returned only if this caller could make the save now.
     let check_id = p.id.clone().or_else(|| cached.get("id").and_then(Value::as_str).map(str::to_string));
@@ -335,11 +359,11 @@ fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResul
     Ok(Some(cached))
 }
 
-fn record_idempotency(tx: &WriteTx<'_>, p: &Prepared, result: &Value) -> UaResult<()> {
+fn record_idempotency(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared, result: &Value) -> UaResult<()> {
     if let Some(key) = &p.idempotency_key {
         tx.execute(
-            "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, 'memory_save', ?2, ?3)",
-            params![key, result.to_string(), ua_core::time::now()],
+            "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![scoped_key(caller, key), SAVE_TOOL, result.to_string(), ua_core::time::now()],
         )?;
     }
     Ok(())
@@ -507,7 +531,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
         .by(caller.label.clone()),
     )?;
     let result = json!({ "id": id, "created": false, "revision": revision });
-    record_idempotency(tx, &p, &result)?;
+    record_idempotency(tx, caller, &p, &result)?;
     let changed =
         (old.title.as_deref(), old.content.as_str()) != (saved.title.as_deref(), saved.content.as_str());
     let embed_after = changed.then(|| (id.to_string(), saved.title.clone(), saved.content.clone()));
@@ -678,6 +702,6 @@ fn create(
     if let Some(sid) = &p.supersedes {
         result["supersedes"] = json!(sid);
     }
-    record_idempotency(tx, &p, &result)?;
+    record_idempotency(tx, caller, &p, &result)?;
     Ok(Outcome { result, embed_after: None })
 }

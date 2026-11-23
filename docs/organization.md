@@ -1579,13 +1579,18 @@ readers get the drop file's `interventions_path`. The worktree's
 fs tools, so each line holds only `{ts, session_id, message_id}`: no
 parties, task or body. `crew_view` treats a line as a pointer, joins its
 `message_id` to the mailbox index under the reader's rule, and drops any
-line that does not name a crew intervention into that session, so a line
-planted by anyone with workspace write access shows nothing. The drop file
+line that does not name a crew `request` into that session, so a line
+planted by anyone with workspace write access shows nothing. Only the newest
+1000 lines are resolved. The drop file
 and the task-note marker (`[intervention @ <time>] session=<sid>`, readable
 by every caller) show only that the session was steered and when; that
 existence and timing are the residual, like the chain metadata above. The
-file is opened without following links: `.ua` must be the worktree's own
-directory and the file a regular file.
+file is opened without following links on unix: the worktree and its `.ua`
+are opened as directories with `O_NOFOLLOW`, the file is opened relative to
+the `.ua` descriptor with `O_NOFOLLOW`, and it must be a regular file with a
+single link, so a symlinked file or `.ua` (even one swapped in after a check)
+and a hard link to a file elsewhere are refused. Other platforms check only
+before opening: a swap in between, and a hard link, are not caught.
 
 The recipient of session-targeted mail (including the session owner in its
 `crew:<session>` thread) is not a party for naming the conversation or
@@ -1599,6 +1604,14 @@ the same id returns the first result; another sender's use of the same id
 is independent and answers exactly like a fresh id, so the id reveals
 nothing about other senders' messages. The sender's own client id also
 resolves as its `reply_to` and in `message_list(message_id=...)`.
+`message_list(client_message_id=...)` filters by a sender's key for any
+reader, under the same reader rule, so a restricted caller finds only its
+own mail. No other tool sees a send's key: `memory_save` stores its keys as
+`memory_save/<caller>/<key>` and reads only its own rows, so a memory key
+spelling a send's key is a fresh key, never `conflict`, and never occupies
+the send's row. An unverified caller may not send as a label the hub sends
+as itself (`hub-node`, `system`, `pr-watch`), so it cannot take a hub client
+id first.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.

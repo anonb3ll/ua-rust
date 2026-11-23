@@ -759,3 +759,105 @@ async fn the_drop_file_is_never_followed_through_a_link() {
         assert_eq!(v["worktree_interventions"], json!([]), "{v}");
     }
 }
+
+/// A hard link to a file elsewhere is refused for writing and for reading.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_drop_file_is_never_a_hard_link() {
+    let e = Env::new();
+    let (b, lead) = (agent("builder-1"), agent("lead-1"));
+    // Same filesystem as the worktree, so the link can be made.
+    let target = e.ws.path().join("victim.jsonl");
+    std::fs::write(&target, "").unwrap();
+    let wt = e.ws.path().join("wt-hard");
+    std::fs::create_dir_all(wt.join(".ua")).unwrap();
+    std::fs::hard_link(&target, wt.join(".ua/interventions.jsonl")).unwrap();
+    let s = e.start(&b, json!({ "worktree_path": wt.to_str().unwrap() })).await;
+    let r = approved_call(&e, &lead, json!({ "session_id": s, "message": "hi" })).await.unwrap();
+    assert_eq!(r["worktree_written"], false, "{r}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+
+    let real = r["message"]["message_id"].as_str().unwrap();
+    std::fs::write(&target, format!("{}\n", json!({ "ts": "x", "session_id": s, "message_id": real })))
+        .unwrap();
+    let v = e.ok(&lead, "crew_view", json!({ "session_id": s })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+}
+
+/// `.ua` swapped for a symlink after the drop file was first written: the
+/// next write and every read refuse it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_drop_dir_swapped_for_a_symlink_is_refused() {
+    let e = Env::new();
+    let (b, lead) = (agent("builder-1"), agent("lead-1"));
+    let wt = e.ws.path().join("wt-swap");
+    std::fs::create_dir_all(&wt).unwrap();
+    let s = e.start(&b, json!({ "worktree_path": wt.to_str().unwrap() })).await;
+    let first = approved_call(&e, &lead, json!({ "session_id": s, "message": "one" })).await.unwrap();
+    assert_eq!(first["worktree_written"], true, "{first}");
+    let v = e.ok(&lead, "crew_view", json!({ "session_id": s })).await;
+    assert_eq!(v["worktree_interventions"].as_array().unwrap().len(), 1, "{v}");
+
+    let outside = tempfile::tempdir().unwrap();
+    let copied = std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap();
+    std::fs::write(outside.path().join("interventions.jsonl"), &copied).unwrap();
+    std::fs::remove_dir_all(wt.join(".ua")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join(".ua")).unwrap();
+
+    let second = approved_call(&e, &lead, json!({ "session_id": s, "message": "two" })).await.unwrap();
+    assert_eq!(second["worktree_written"], false, "{second}");
+    assert_eq!(std::fs::read_to_string(outside.path().join("interventions.jsonl")).unwrap(), copied);
+    let v = e.ok(&lead, "crew_view", json!({ "session_id": s })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+}
+
+/// `crew_view` resolves only the newest drop-file lines, and only lines that
+/// name a crew `request` into the session.
+#[tokio::test]
+async fn crew_view_resolves_only_recent_request_pointers() {
+    let e = Env::new();
+    let (b2, lead) = (agent("builder-2"), agent("lead-1"));
+    let wt = e.ws.path().join("wt-cap");
+    std::fs::create_dir_all(&wt).unwrap();
+    let s = e.start(&b2, json!({ "worktree_path": wt.to_str().unwrap() })).await;
+    let r = approved_call(&e, &lead, json!({ "session_id": s, "message": "steer" })).await.unwrap();
+    let real = r["message"]["message_id"].as_str().unwrap().to_string();
+    let drop = wt.join(".ua/interventions.jsonl");
+    let original = std::fs::read_to_string(&drop).unwrap();
+
+    // An `inform` in the crew thread to the session agent is not an
+    // intervention, even for a reader who may see it.
+    let inform = e
+        .ok(
+            &human(),
+            "message_send",
+            json!({ "act": "inform", "to_agent": "builder-2", "to_session": s, "body": "fyi",
+                    "conversation_id": format!("crew:{s}") }),
+        )
+        .await;
+    assert_eq!(inform["conversation_id"], format!("crew:{s}"), "{inform}");
+    let line = json!({ "ts": "x", "session_id": s, "message_id": inform["message_id"] });
+    std::fs::write(&drop, format!("{original}{line}\n")).unwrap();
+    let v = e.ok(&human(), "crew_view", json!({ "session_id": s })).await;
+    let ids: Vec<&str> = v["worktree_interventions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["message_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [real.as_str()], "{v}");
+
+    // 999 newer lines keep the real pointer in range; 1000 push it out.
+    let pad = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("{}\n", json!({ "ts": "x", "session_id": s, "message_id": format!("pad-{i}") })))
+            .collect()
+    };
+    std::fs::write(&drop, format!("{original}{}", pad(999))).unwrap();
+    let v = e.ok(&lead, "crew_view", json!({ "session_id": s })).await;
+    assert_eq!(v["worktree_interventions"].as_array().unwrap().len(), 1, "{v}");
+    std::fs::write(&drop, format!("{original}{}", pad(1000))).unwrap();
+    let v = e.ok(&lead, "crew_view", json!({ "session_id": s })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+}

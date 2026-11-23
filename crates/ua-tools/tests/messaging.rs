@@ -697,3 +697,109 @@ async fn reading_every_mailbox_needs_an_operator_not_the_coordinator_profile() {
     let own = call(&reg, &hub, &agent("builder-2"), "message_list", json!({})).await;
     assert_eq!(own["total"], 1);
 }
+
+/// `memory_save` shares the idempotency table but not its keys: a memory key
+/// that spells a send's key neither reveals the send nor blocks it.
+#[tokio::test]
+async fn memory_keys_neither_probe_nor_plant_client_message_ids() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let (a, c) = (agent("builder-1"), agent("builder-3"));
+    let msg = |id: &str| json!({"act": "inform", "to_agent": "builder-2", "body": "hi", "message_id": id});
+    send(&reg, &hub, &a, msg("secret-id")).await;
+
+    // Probe: a sent id answers like an unused one.
+    let probe = |key: &str| json!({"content": format!("probe {key}"), "idempotency_key": key});
+    let hit = call(&reg, &hub, &c, "memory_save", probe("message_send/builder-1/secret-id")).await;
+    let miss = call(&reg, &hub, &c, "memory_save", probe("message_send/builder-1/unused-id")).await;
+    let keys = |v: &Value| {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(keys(&hit), keys(&miss), "{hit} vs {miss}");
+
+    // Plant: a memory key spelling a future send's key, and a hub-node one.
+    call(&reg, &hub, &c, "memory_save", probe("message_send/builder-1/later-id")).await;
+    call(&reg, &hub, &c, "memory_save", probe("message_send/hub-node/node-command-x-1-done")).await;
+    let later = send(&reg, &hub, &a, msg("later-id")).await;
+    assert_eq!(
+        (later["accepted"].clone(), later["duplicate"].clone()),
+        (json!(true), json!(false)),
+        "{later}"
+    );
+    let retry = send(&reg, &hub, &a, msg("later-id")).await;
+    assert_eq!(
+        (retry["duplicate"].clone(), retry["message_id"].clone()),
+        (json!(true), later["message_id"].clone())
+    );
+}
+
+/// An unverified caller may not send as a label the hub itself sends as.
+#[tokio::test]
+async fn an_unverified_caller_cannot_claim_a_hub_sender_label() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let local = Caller::local("local-agent", Transport::Stdio);
+    for label in ["hub-node", "system", "pr-watch", "Hub-Node"] {
+        let e = reg
+            .call(
+                &hub,
+                &local,
+                "message_send",
+                json!({"act": "inform", "from_agent": label, "to_agent": "builder-2", "body": "x",
+                       "message_id": "node-command-1-1-done"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("reserved"), "{label}: {e}");
+    }
+    // Configured as one, too.
+    let posing = Caller::local("hub-node", Transport::Stdio);
+    let e = reg
+        .call(&hub, &posing, "message_send", json!({"act": "inform", "to_agent": "builder-2", "body": "x"}))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("reserved"), "{e}");
+    assert_eq!(events(&hub, "agent.message."), 0);
+}
+
+/// `client_message_id` finds a message by its sender's key for an
+/// unrestricted reader, and never past a restricted reader's own mail.
+#[tokio::test]
+async fn message_list_filters_by_client_message_id_within_the_reader_rule() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let (a, c, b) = (agent("builder-1"), agent("builder-3"), agent("builder-2"));
+    let msg =
+        |to: &str, body: &str| json!({"act": "inform", "to_agent": to, "body": body, "message_id": "k-1"});
+    let a1 = send(&reg, &hub, &a, msg("builder-2", "a to b")).await;
+    let c1 = send(&reg, &hub, &c, msg("builder-4", "c to d")).await;
+    send(
+        &reg,
+        &hub,
+        &a,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "other", "message_id": "k-2"}),
+    )
+    .await;
+
+    let operator = Caller { kind: ActorKind::Human, enforce_profile: false, ..agent("operator") };
+    let all = call(&reg, &hub, &operator, "message_list", json!({"client_message_id": "k-1"})).await;
+    let mut ids: Vec<&str> =
+        all["messages"].as_array().unwrap().iter().map(|m| m["message_id"].as_str().unwrap()).collect();
+    ids.sort();
+    let mut want = vec![a1["message_id"].as_str().unwrap(), c1["message_id"].as_str().unwrap()];
+    want.sort();
+    assert_eq!(ids, want, "{all}");
+    let local = Caller::local("local-agent", Transport::Stdio);
+    let board = call(&reg, &hub, &local, "message_list", json!({"client_message_id": "k-2"})).await;
+    assert_eq!(board["total"], 1, "{board}");
+
+    // Restricted: the recipient sees only its own; a non-party sees nothing,
+    // exactly as for an unused id.
+    let mine = call(&reg, &hub, &b, "message_list", json!({"client_message_id": "k-1"})).await;
+    assert_eq!(mine["total"], 1, "{mine}");
+    assert_eq!(mine["messages"][0]["message_id"], a1["message_id"]);
+    let outsider = agent("builder-9");
+    for id in ["k-1", "k-2", "unused"] {
+        let v = call(&reg, &hub, &outsider, "message_list", json!({"client_message_id": id})).await;
+        assert_eq!(v["total"], 0, "{id}: {v}");
+    }
+}

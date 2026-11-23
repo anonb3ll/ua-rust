@@ -1025,22 +1025,79 @@ fn intervention_path(ctx: &ToolCtx, worktree: Option<&str>) -> Option<PathBuf> {
 
 /// Largest tail of the drop file `crew_view` reads.
 const DROP_READ_MAX: u64 = 1 << 20;
+/// Most drop-file lines `crew_view` resolves: the newest ones.
+const DROP_LINES_MAX: usize = 1000;
+const DROP_DIR: &str = ".ua";
+const DROP_FILE: &str = "interventions.jsonl";
 
 /// Open the drop file at `path` (from [`intervention_path`], so its worktree
-/// is canonical and inside the roots) without following a link anywhere
-/// below the worktree: `.ua` must resolve to the worktree's own `.ua`
-/// directory, and the file is opened with `O_NOFOLLOW` and must be a regular
-/// file. Writing creates `.ua` and the file when missing.
+/// is canonical and inside the roots). Writing creates `.ua` and the file
+/// when missing.
+///
+/// On unix nothing below the worktree is reached through a link, and the
+/// check cannot race the open: the worktree and then `.ua` are opened as
+/// directories with `O_NOFOLLOW`, the file is opened relative to the `.ua`
+/// descriptor with `O_NOFOLLOW`, and the opened file must be a regular file
+/// with exactly one link, so a hard link to a file elsewhere is refused too.
 fn open_drop(path: &Path, write: bool) -> Option<std::fs::File> {
     let dir = path.parent()?;
     let worktree = dir.parent()?;
-    if write {
-        std::fs::create_dir_all(dir).ok()?;
-    }
-    if dir.canonicalize().ok()? != worktree.join(".ua") {
+    if dir.file_name()? != DROP_DIR || path.file_name()? != DROP_FILE {
         return None;
     }
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+    open_drop_in(worktree, write)
+}
+
+#[cfg(unix)]
+fn open_drop_in(worktree: &Path, write: bool) -> Option<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let open_at = |at: libc::c_int, name: &CString, flags: libc::c_int| -> Option<OwnedFd> {
+        // SAFETY: `name` is a valid NUL-terminated string; a non-negative
+        // return is a new descriptor that we own.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), flags, 0o644 as libc::c_uint) };
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let wt = CString::new(worktree.as_os_str().as_bytes()).ok()?;
+    let wt_fd = open_at(libc::AT_FDCWD, &wt, dir_flags)?;
+    let ua = CString::new(DROP_DIR).ok()?;
+    if write {
+        // SAFETY: valid descriptor and NUL-terminated name. An existing
+        // entry (directory or not) is left for the O_DIRECTORY open to judge.
+        unsafe { libc::mkdirat(wt_fd.as_raw_fd(), ua.as_ptr(), 0o755) };
+    }
+    let ua_fd = open_at(wt_fd.as_raw_fd(), &ua, dir_flags)?;
+    let file_flags = libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | if write { libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT } else { libc::O_RDONLY };
+    let fd = open_at(ua_fd.as_raw_fd(), &CString::new(DROP_FILE).ok()?, file_flags)?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().ok()?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.is_file() && meta.nlink() == 1).then_some(file)
+    }
+}
+
+/// Without `openat`, a weaker best effort: `.ua` must resolve to the
+/// worktree's own directory and the file must not be a symlink, but both are
+/// checked before the open (a swap in between is not caught) and a hard link
+/// is not detected.
+#[cfg(not(unix))]
+fn open_drop_in(worktree: &Path, write: bool) -> Option<std::fs::File> {
+    let dir = worktree.join(DROP_DIR);
+    let path = dir.join(DROP_FILE);
+    if write {
+        std::fs::create_dir_all(&dir).ok()?;
+    }
+    if dir.canonicalize().ok()? != dir {
+        return None;
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return None;
     }
     let mut opts = std::fs::OpenOptions::new();
@@ -1049,12 +1106,7 @@ fn open_drop(path: &Path, write: bool) -> Option<std::fs::File> {
     } else {
         opts.read(true);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = opts.open(path).ok()?;
+    let file = opts.open(&path).ok()?;
     file.metadata().ok().filter(std::fs::Metadata::is_file)?;
     Some(file)
 }
@@ -1075,10 +1127,13 @@ fn drop_message_ids(path: Option<&Path>) -> Vec<String> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&bytes);
-    // A tail read may start mid-line.
-    let lines = text.lines().skip(usize::from(skip > 0));
+    // A tail read may start mid-line. Only the newest DROP_LINES_MAX lines
+    // are resolved, so a padded file costs a bounded number of lookups.
+    let lines: Vec<&str> = text.lines().skip(usize::from(skip > 0)).collect();
+    let newest = &lines[lines.len().saturating_sub(DROP_LINES_MAX)..];
     let mut seen = BTreeSet::new();
-    lines
+    newest
+        .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter_map(|v| v["message_id"].as_str().map(str::to_string))
         .filter(|id| seen.insert(id.clone()))
@@ -1160,7 +1215,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
                     conn,
                     "SELECT message_id, created_at, sender, recipient, target_session, task_id, delegation_id, \
                      event_seq FROM message_index \
-                     WHERE message_id = ?1 AND conversation_id = ?2 AND recipient = ?3 \
+                     WHERE message_id = ?1 AND conversation_id = ?2 AND recipient = ?3 AND act = 'request' \
                      AND (?4 IS NULL OR sender = ?4 OR (recipient = ?4 \
                           AND (target_session IS NULL OR target_session = ?5)))",
                     params![id, crew_conversation_id(&sid2), session["agent"].as_str(), party_q, sid2],
@@ -1357,7 +1412,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "crew_intervene",
-            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task (time and session only) and appends a pointer line ({ts, session_id, message_id}: no parties, never the body) to the session worktree's .ua/interventions.jsonl (inside the workspace only, never through a link). Always approval-gated.",
+            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task (time and session only) and appends a pointer line ({ts, session_id, message_id}: no parties, never the body) to the session worktree's .ua/interventions.jsonl (inside the workspace only; on unix never through a symlink or a hard link). Always approval-gated.",
             crew_intervene,
         )
         .family("sessions")
