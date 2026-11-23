@@ -163,14 +163,14 @@ const TENANT: &[&str] = &[
 /// `routines` and `routine_runs` (`organization.v1.tools.routines`),
 /// `workflow_runs` and `workflow_checkpoints`
 /// (`organization.v1.tools.workflows`), the three plans tables
-/// (`organization.v1.tools.plans`), and the three autonomous-cycle tables
-/// (`organization.v1.tools.cycles`).
+/// (`organization.v1.tools.plans`), the three autonomous-cycle tables
+/// (`organization.v1.tools.cycles`), and `approvals`
+/// (`organization.v1.tools.approvals`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
     "agent_tokens",
     "agents",
-    "approvals",
     "delegations",
     "dispatch_receipts",
     "dispatch_runs",

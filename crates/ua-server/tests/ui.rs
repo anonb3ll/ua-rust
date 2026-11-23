@@ -121,7 +121,7 @@ fn form(
 }
 
 fn approval_status(state: &AppState, id: i64) -> String {
-    state.hub.db().read(|c| ua_tools::approvals::get(c, id)).unwrap().status
+    state.hub.db().read(|c| ua_tools::approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap().status
 }
 
 /// builder-1 calls a gated tool and gets a pending approval id.
@@ -1075,4 +1075,100 @@ async fn sign_out_is_a_post_form_with_the_session_csrf_token() {
     assert_eq!(common::location(&out), "/login");
     let after = hub.send(common::get("/api/whoami", Some(&cookie), None)).await;
     assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Another organization's approval answers every HTTP and UI surface
+/// exactly as a missing id (`docs/organization.md`, the approvals family):
+/// the queue, the detail, the inbox and both resolve routes. Every HTTP
+/// caller resolves to the default organization today, so the
+/// organization-B row is parked through the registry with a hand-built
+/// organization-B caller.
+#[tokio::test]
+async fn another_organizations_approval_is_missing_over_http_and_the_ui() {
+    let (app, state) = app(gated_config());
+    state
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at) \
+                 VALUES ('org-b', 'org-b', 'Org B', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mine = park(&state, "Default request").await;
+    // Distinctive ids, so a body compared with the id masked out differs
+    // in nothing else.
+    state
+        .hub
+        .db()
+        .write(|tx| Ok(tx.execute("UPDATE sqlite_sequence SET seq = 7340000 WHERE name = 'approvals'", [])?))
+        .unwrap();
+    let org_b = Caller { org_id: "org-b".into(), ..builder() };
+    let theirs = match call(&state, &org_b, "task_add", json!({ "title": "Org B request" })).await {
+        Err(UaError::ApprovalRequired { approval_id, .. }) => approval_id,
+        other => panic!("expected approval_required, got {other:?}"),
+    };
+    assert_eq!(theirs, 7_340_001);
+    let missing = 7_349_999;
+    let same = |a: String, b: String| {
+        assert_eq!(a.replace(&theirs.to_string(), "N"), b.replace(&missing.to_string(), "N"))
+    };
+
+    let v = body_json(send(&app, get("/api/approvals", Some(OPERATOR_TOKEN))).await).await;
+    let ids: Vec<i64> = v["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, [mine], "{v}");
+
+    let detail = |id: i64| send(&app, get(&format!("/api/approvals/{id}"), Some(OPERATOR_TOKEN)));
+    let (a, b) = (detail(theirs).await, detail(missing).await);
+    assert_eq!((a.status(), b.status()), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND));
+    same(body_text(a).await, body_text(b).await);
+
+    let html = body_text(send(&app, get("/ui/inbox", Some(OPERATOR_TOKEN))).await).await;
+    assert!(html.contains(&format!("approval-{mine}")) && !html.contains(&format!("approval-{theirs}")));
+    assert!(!html.contains("Org B request"));
+
+    let action = |id: i64| {
+        send(
+            &app,
+            post_json(
+                "/api/action/approval",
+                Some(OPERATOR_TOKEN),
+                json!({ "id": id, "decision": "approve" }),
+            ),
+        )
+    };
+    let (a, b) = (action(theirs).await, action(missing).await);
+    assert_eq!(a.status(), b.status());
+    assert_eq!(a.status(), StatusCode::NOT_FOUND);
+    same(body_text(a).await, body_text(b).await);
+
+    let csrf = csrf_cookie(&app, Some(OPERATOR_TOKEN)).await;
+    let ui = |id: i64| {
+        send(
+            &app,
+            form(
+                &format!("/ui/approvals/{id}/resolve"),
+                Some(OPERATOR_TOKEN),
+                Some(&csrf),
+                None,
+                &format!("_csrf={csrf}&decision=approve"),
+            ),
+        )
+    };
+    let (a, b) = (ui(theirs).await, ui(missing).await);
+    assert_eq!(a.status(), b.status());
+    assert_eq!(a.status(), StatusCode::NOT_FOUND);
+    let (ta, tb) = (body_text(a).await, body_text(b).await);
+    assert!(ta.contains(&format!("approval {theirs}")), "{ta}");
+    same(ta, tb);
+
+    let status: String = state
+        .hub
+        .db()
+        .read(move |c| Ok(c.query_row("SELECT status FROM approvals WHERE id = ?1", [theirs], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(status, "pending", "nothing resolved organization B's approval");
 }

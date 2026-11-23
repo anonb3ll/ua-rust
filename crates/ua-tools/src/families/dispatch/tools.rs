@@ -323,11 +323,12 @@ fn bind_task(
     Ok(())
 }
 
-/// Attach approval `approval_id` (just consumed) to the run.
-fn link_approval_id(tx: &rusqlite::Connection, approval_id: i64, run_id: &str) -> UaResult<()> {
+/// Attach approval `approval_id` of organization `org` (just consumed) to
+/// the run.
+fn link_approval_id(tx: &rusqlite::Connection, org: &str, approval_id: i64, run_id: &str) -> UaResult<()> {
     let n = tx.execute(
-        "UPDATE approvals SET run_id = ?1 WHERE id = ?2 AND status = 'consumed' AND run_id IS NULL",
-        params![run_id, approval_id],
+        "UPDATE approvals SET run_id = ?1 WHERE org_id = ?3 AND id = ?2 AND status = 'consumed' AND run_id IS NULL",
+        params![run_id, approval_id, org],
     )?;
     expect_one_link(n, run_id)
 }
@@ -480,6 +481,7 @@ fn default_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: 
 fn stale_pass(
     tx: &rusqlite::Connection,
     cfg: &ua_core::Config,
+    org: &str,
     requester: &str,
     payload: &Value,
 ) -> UaResult<Option<(i64, Vec<String>, String)>> {
@@ -487,11 +489,11 @@ fn stale_pass(
     let cutoff =
         ua_core::time::format_ts(jiff::Timestamp::now().checked_sub(ttl).unwrap_or(jiff::Timestamp::MIN));
     let mut stmt = tx.prepare(
-        "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND requested_by = ?1 \
+        "SELECT id, payload FROM approvals WHERE org_id = ?4 AND tool = 'dispatch_task' AND requested_by = ?1 \
          AND status = 'approved' AND resolved_at >= ?2 ORDER BY id DESC LIMIT ?3",
     )?;
     let rows: Vec<(i64, String)> = stmt
-        .query_map(params![requester, cutoff, STALE_PASS_SCAN], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![requester, cutoff, STALE_PASS_SCAN, org], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (id, text) in rows {
         let Ok(old) = serde_json::from_str::<Value>(&text) else { continue };
@@ -801,7 +803,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_task", &payload)? {
                 GateOutcome::Pass { approval_id } => approval_id,
                 GateOutcome::Pending { approval_id } => {
-                    let stale = stale_pass(tx, hub.cfg(), &caller.label, &payload)?;
+                    let stale = stale_pass(tx, hub.cfg(), &caller.org_id, &caller.label, &payload)?;
                     let stale = match stale {
                         Some((old, changed, approved_sha)) => {
                             let r = Refusal::new("dispatch_task", RefusalReason::BindingChanged)
@@ -809,7 +811,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                                 .task(Some(tid))
                                 .hashes(Some(approved_sha), Some(approvals::payload_sha256("dispatch_task", &payload)))
                                 .changed(changed.clone());
-                            approvals::refused(tx, &caller.label, &r, None)?;
+                            approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
                             Some((old, changed))
                         }
                         None => None,
@@ -839,7 +841,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                 ],
             )?;
             bind_task(tx, tid, &run_id, &ag, &lease_at)?;
-            link_approval_id(tx, approval_id, &run_id)?;
+            link_approval_id(tx, &caller.org_id, approval_id, &run_id)?;
             record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
             if let Some((row, backend, cwd)) = route {
                 let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
@@ -1197,6 +1199,7 @@ const RESUME_BOUND_KEYS: [&str; 14] = [
 /// checked against.
 fn check_resume_binding(
     tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
     caller: &str,
     run: &super::Run,
     harness: Option<&(String, ua_core::config::HarnessConfig)>,
@@ -1204,9 +1207,9 @@ fn check_resume_binding(
 ) -> UaResult<Map<String, Value>> {
     let bound: Option<(i64, String)> = tx
         .query_row(
-            "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
+            "SELECT id, payload FROM approvals WHERE org_id = ?2 AND tool = 'dispatch_task' AND run_id = ?1 \
              AND status = 'consumed' ORDER BY id LIMIT 1",
-            [&run.run_id],
+            params![run.run_id, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1214,7 +1217,7 @@ fn check_resume_binding(
         bound.and_then(|(id, t)| serde_json::from_str::<Value>(&t).ok().map(|v| (id, v)))
     else {
         let r = Refusal::new("dispatch_resume", RefusalReason::NoMatchingApproval).task(Some(run.task_id));
-        approvals::refused(tx, caller, &r, None)?;
+        approvals::refused(tx, org, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!("run {} has no dispatch_task approval to resume under", run.run_id),
@@ -1244,7 +1247,7 @@ fn check_resume_binding(
                 Some(approvals::payload_sha256("dispatch_task", &presented)),
             )
             .changed(changed.iter().map(|k| k.to_string()).collect());
-        approvals::refused(tx, caller, &r, None)?;
+        approvals::refused(tx, org, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!(
@@ -1311,7 +1314,8 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Some(why) = resume_refusal(&run) {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            let binding = check_resume_binding(tx, &caller.label, &run, h2.as_ref(), w2.as_deref())?;
+            let binding =
+                check_resume_binding(tx, &caller.org_id, &caller.label, &run, h2.as_ref(), w2.as_deref())?;
             // A resume runs what was approved: it is refused, never rerouted,
             // while the harness's provider account cannot take a run.
             if let Some((name, h)) = &h2 {
@@ -1371,7 +1375,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
             bind_task(tx, run.task_id, &rid2, &run.agent_label, &lease_at)?;
-            link_approval_id(tx, approval_id, &rid2)?;
+            link_approval_id(tx, &caller.org_id, approval_id, &rid2)?;
             record_transition(
                 tx,
                 &rid2,
@@ -1452,7 +1456,7 @@ fn transitions(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Vec<Value>
         .collect())
 }
 
-fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
+fn build_receipt(conn: &rusqlite::Connection, org: &str, run_id: &str) -> UaResult<Value> {
     let Some(run) = run_object(conn, run_id)? else {
         return Err(UaError::not_found(format!("unknown dispatch run: {run_id}")));
     };
@@ -1463,8 +1467,8 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
     let transitions = transitions(conn, run_id)?;
     let approval: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, status FROM approvals WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
-            [run_id],
+            "SELECT id, status FROM approvals WHERE org_id = ?2 AND run_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![run_id, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1537,7 +1541,8 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
 
 async fn delivery_receipt(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let rid = trimmed("run_id", &a.run_id)?;
-    ctx.hub.db().read_async(move |c| build_receipt(c, &rid)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| build_receipt(c, &org, &rid)).await
 }
 
 const SUMMARY_FIELDS: [&str; 15] = [

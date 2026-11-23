@@ -233,10 +233,10 @@ pub(crate) fn without_text(payload: &Value) -> Value {
     p
 }
 
-fn drop_approval_text(tx: &WriteTx<'_>, approval_id: i64, payload: &Value) -> UaResult<()> {
+fn drop_approval_text(tx: &WriteTx<'_>, org: &str, approval_id: i64, payload: &Value) -> UaResult<()> {
     tx.execute(
-        "UPDATE approvals SET payload = ?2 WHERE id = ?1",
-        params![approval_id, approvals::canonical_payload(&without_text(payload))],
+        "UPDATE approvals SET payload = ?2 WHERE org_id = ?3 AND id = ?1",
+        params![approval_id, approvals::canonical_payload(&without_text(payload)), org],
     )?;
     Ok(())
 }
@@ -275,7 +275,7 @@ pub fn approval_decided(
     approval: &approvals::ApprovalRow,
     status: &str,
 ) -> UaResult<()> {
-    drop_approval_text(tx, approval.id, &approval.payload)?;
+    drop_approval_text(tx, &approval.org_id, approval.id, &approval.payload)?;
     if matches!(status, "denied" | "revoked") {
         let row = tx
             .query_row(
@@ -602,7 +602,7 @@ async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
             match row.status.as_str() {
                 "draft" => {}
                 "pending_approval" => {
-                    let approval = row.approval_id.map(|a| approvals::get(tx, a)).transpose()?;
+                    let approval = row.approval_id.map(|a| approvals::get(tx, &caller.org_id, a)).transpose()?;
                     return Ok(json!({
                         "draft_id": row.id, "status": row.status, "approval_id": row.approval_id,
                         "approval_status": approval.map(|a| a.status), "already_requested": true,
@@ -680,7 +680,7 @@ fn refuse_send(
 ) -> UaResult<()> {
     let mut r = Refusal::new(TOOL, reason);
     if let Some(id) = row.approval_id {
-        let approved = approvals::get(tx, id)?.payload;
+        let approved = approvals::get(tx, &caller.org_id, id)?.payload;
         let shown = presented(&approved);
         r = r
             .approval(id)
@@ -690,7 +690,7 @@ fn refuse_send(
             )
             .changed(approvals::changed_fields(&without_text(&approved), &shown));
     }
-    approvals::refused(tx, &caller.label, &r, None)
+    approvals::refused(tx, &caller.org_id, &caller.label, &r, None)
 }
 
 fn first_difference(a: &str, b: &str) -> usize {
@@ -782,7 +782,7 @@ fn begin_send(
     let id = row.approval_id.ok_or_else(|| {
         UaError::conflict(format!("relay draft {} has no approval; call request_send", row.id))
     })?;
-    let approval = approvals::get(tx, id)?;
+    let approval = approvals::get(tx, &caller.org_id, id)?;
     // The record drops the text once decided; the SHA-256 still binds it.
     let stored_text = approval.payload.get("text").filter(|t| !t.is_null());
     let bound = approval.tool == TOOL
@@ -802,7 +802,7 @@ fn begin_send(
                 Some(approvals::payload_sha256(TOOL, &payload)),
             )
             .changed(changed);
-        approvals::refused(tx, &caller.label, &r, None)?;
+        approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
         return Err(UaError::denied(
             "approval_mismatch",
             format!(
@@ -818,8 +818,13 @@ fn begin_send(
             let now = ua_core::time::now();
             tx.execute(
                 "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2, payload = ?3 \
-                 WHERE id = ?1 AND status = 'approved'",
-                params![id, now, approvals::canonical_payload(&without_text(&approval.payload))],
+                 WHERE org_id = ?4 AND id = ?1 AND status = 'approved'",
+                params![
+                    id,
+                    now,
+                    approvals::canonical_payload(&without_text(&approval.payload)),
+                    approval.org_id
+                ],
             )?;
             ledger::append(
                 tx,
@@ -839,16 +844,22 @@ fn begin_send(
         "approved" => {
             // The pass expired unspent: ask a human again.
             tx.execute(
-                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
-                params![id, ua_core::time::now()],
+                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE org_id = ?3 AND id = ?1",
+                params![id, ua_core::time::now(), approval.org_id],
             )?;
             let sha = approvals::payload_sha256(TOOL, &approval.payload);
             let r = Refusal::new(TOOL, RefusalReason::Expired)
                 .approval(id)
                 .hashes(Some(sha.clone()), Some(sha))
                 .expired_at(approvals::pass_expires_at(cfg, approval.resolved_at.as_deref()));
-            approvals::refused(tx, &caller.label, &r, Some(format!("{}:expired:{id}", approvals::REFUSED)))?;
-            drop_approval_text(tx, id, &approval.payload)?;
+            approvals::refused(
+                tx,
+                &approval.org_id,
+                &caller.label,
+                &r,
+                Some(format!("{}:expired:{id}", approvals::REFUSED)),
+            )?;
+            drop_approval_text(tx, &approval.org_id, id, &approval.payload)?;
             let GateOutcome::Pending { approval_id } = approvals::gate(tx, cfg, caller, TOOL, &payload)?
             else {
                 return Err(UaError::internal(format!(
@@ -868,8 +879,8 @@ fn begin_send(
                 .approval(id)
                 .hashes(Some(sha.clone()), Some(sha))
                 .status(status);
-            approvals::refused(tx, &caller.label, &r, None)?;
-            drop_approval_text(tx, id, &approval.payload)?;
+            approvals::refused(tx, &approval.org_id, &caller.label, &r, None)?;
+            drop_approval_text(tx, &approval.org_id, id, &approval.payload)?;
             cancel_withdrawn(tx, caller, &row, id, status)?;
             return Ok(Err(UaError::denied(
                 "approval_denied",
@@ -998,7 +1009,7 @@ async fn status(ctx: ToolCtx, p: StatusParams) -> UaResult<Value> {
             if !caller.is_human() && row.requested_by != caller.label {
                 return Err(UaError::not_found(format!("relay draft {}", row.id)));
             }
-            let approval = row.approval_id.map(|a| approvals::get(c, a)).transpose()?;
+            let approval = row.approval_id.map(|a| approvals::get(c, &caller.org_id, a)).transpose()?;
             let mut out = row.summary();
             out["findings"] = row.findings.get("findings").cloned().unwrap_or(json!([]));
             out["approval_status"] = json!(approval.as_ref().map(|a| a.status.clone()));
@@ -1060,22 +1071,22 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
             // approval stays in the ledger (`agent.approval.resolved`).
             let mut approval_status = None;
             if let Some(a) = row.approval_id {
-                let new = match approvals::get(tx, a)?.status.as_str() {
+                let approval = approvals::get(tx, &caller.org_id, a)?;
+                let new = match approval.status.as_str() {
                     "pending" => Some("denied"),
                     "approved" => Some("revoked"),
                     _ => None,
                 };
-                let approval = approvals::get(tx, a)?;
                 if let Some(new) = new {
                     tx.execute(
                         "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, \
-                         updated_at = ?5, resolved_transport = ?6 WHERE id = ?1",
-                        params![a, new, reason, caller.label, now, approvals::transport_name(&caller)],
+                         updated_at = ?5, resolved_transport = ?6 WHERE org_id = ?7 AND id = ?1",
+                        params![a, new, reason, caller.label, now, approvals::transport_name(&caller), approval.org_id],
                     )?;
                     approval_status = Some(new);
                 }
                 // Neither record keeps text that will never be sent.
-                drop_approval_text(tx, a, &approval.payload)?;
+                drop_approval_text(tx, &approval.org_id, a, &approval.payload)?;
             }
             // The text never went out; do not keep it.
             tx.execute(

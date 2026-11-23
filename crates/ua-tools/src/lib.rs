@@ -94,6 +94,11 @@ pub fn schema_parts() -> Vec<Part> {
     // same-organization parent triggers.
     parts.push(families::cycles::TENANT_PART.into());
     parts.push(families::cycles::ORG_SCOPE.into());
+    // The organization column and triggers of the approval queue (no key
+    // rebuild: its only key is an AUTOINCREMENT id), then its
+    // organization-led indexes.
+    parts.push(approvals::TENANT_PART.into());
+    parts.push(approvals::ORG_INDEXES.into());
     parts.push(config_revisions::SCHEMA.into());
     // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
     // family's delivery rows into it. Both need `organization.v1.store` and

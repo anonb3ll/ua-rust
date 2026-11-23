@@ -628,7 +628,7 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
         "run" => runs::read_one(hub, caller, c, id)?,
         "approval" => {
             let Ok(n) = id.parse::<i64>() else { return Ok(None) };
-            match approvals::get(c, n) {
+            match approvals::get(c, &caller.org_id, n) {
                 Ok(row) => {
                     let mut v = serde_json::to_value(row)?;
                     v["payload"] = redact(&v["payload"]);

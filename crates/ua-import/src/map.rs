@@ -21,7 +21,7 @@ pub(crate) struct Ref {
 pub(crate) enum Kind {
     Plain,
     /// History only: a pending request or an approved, unconsumed pass is
-    /// never imported.
+    /// never imported. Imported into the default organization.
     Approvals,
     /// Hashes only, and only in the scheme ua-rust verifies (hex SHA-256).
     Tokens,
@@ -69,6 +69,7 @@ impl Kind {
                 | Kind::ProjectRepoBindings
                 | Kind::HarnessConfig
                 | Kind::Plans
+                | Kind::Approvals
         )
     }
 }

@@ -4,6 +4,14 @@
 //! canonical arguments, same requester, approved by a different human within
 //! the pass TTL), fails with a recorded denial, or parks as `pending`. A retry
 //! of an identical pending request reuses the existing row.
+//!
+//! Approvals are tenant data (`organization.v1.tools.approvals`,
+//! `approvals.v3.org_indexes`). An approval belongs to the organization of
+//! its requester (the gate caller's `org_id`), and every match, read and
+//! decision is scoped to one organization: a pass granted in one
+//! organization never satisfies a gate in another, even for an identical
+//! tool, payload and requester label, and another organization's approval
+//! answers every reader exactly as a missing one.
 
 use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
@@ -11,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{Caller, Config, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
@@ -56,6 +64,48 @@ pub const SCHEMA_V2: SchemaPart = SchemaPart {
 ALTER TABLE approvals ADD COLUMN resolved_transport TEXT;
 ",
 };
+
+/// `organization.v1.tools.approvals`: `org_id` on `approvals` (existing rows
+/// backfilled to the default organization) and its generated
+/// `approvals_org_exists` / `approvals_org_immutable` triggers. No key
+/// rebuild: the table's only key is an AUTOINCREMENT id, and the gate's
+/// match on `(tool, payload, requested_by)` is a query key, which filters
+/// on `org_id`. Applied after `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.approvals", &["approvals"]);
+
+/// `approvals.v3.org_indexes`: indexes led by `org_id` for the gate's match
+/// and the per-organization queue (`approval_pending`). Applied after
+/// [`TENANT_PART`].
+pub const ORG_INDEXES: SchemaPart = SchemaPart {
+    name: "approvals.v3.org_indexes",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_approvals_org_lookup ON approvals(org_id, tool, status, requested_by);
+CREATE INDEX IF NOT EXISTS idx_approvals_org_status ON approvals(org_id, status, id);
+",
+};
+
+/// Refuse an organization `orgs` does not hold, before anything is read or
+/// written. The `org_exists` trigger fires only on insert, so a gate that
+/// would only update rows (consume or expire a pass) would otherwise pass.
+pub(crate) fn require_org(c: &rusqlite::Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no approval was changed"),
+        ));
+    }
+    Ok(())
+}
+
+/// A label (a requester, a resolver) for an approval event's payload.
+/// Approval events are still written to the default organization's ledger
+/// (`ORG-EVENT-DEFAULT`), so another organization's labels are left out
+/// (`null`) rather than recorded there; the payload keeps its shape.
+fn ledger_label(org: &str, label: &str) -> Value {
+    if org == ua_core::DEFAULT_ORG { json!(label) } else { Value::Null }
+}
 
 /// The caller's transport as stored and ledgered (`"slack"`, `"ui"`, ...).
 pub(crate) fn transport_name(caller: &Caller) -> String {
@@ -248,11 +298,11 @@ impl Refusal {
         self
     }
 
-    fn payload(&self, requested_by: &str) -> Value {
+    fn payload(&self, org: &str, requested_by: &str) -> Value {
         let mut out = json!({
             "tool": self.tool,
             "reason": self.reason.code(),
-            "requested_by": requested_by,
+            "requested_by": ledger_label(org, requested_by),
         });
         let fields: [(&str, Option<Value>); 10] = [
             ("approval_id", self.approval_id.map(Value::from)),
@@ -279,16 +329,20 @@ impl Refusal {
 /// event survives the refused call: appended with
 /// [`ledger::append_surviving`], it is recorded even when the call's write
 /// transaction then fails and rolls back. `dedupe` makes a repeat of the
-/// same refusal fact (one expiry) a no-op. Every approval and authorization
-/// row is in the default organization, so the event is too.
+/// same refusal fact (one expiry) a no-op. `org` is the organization of the
+/// approval or authorization the refusal is about (for an approval, its
+/// requester's).
 pub fn refused(
     tx: &mut WriteTx<'_>,
+    org: &str,
     requested_by: &str,
     r: &Refusal,
     dedupe: Option<String>,
 ) -> UaResult<()> {
-    let mut input =
-        EventInput::new(ua_core::DEFAULT_ORG, REFUSED, r.payload(requested_by)).by(requested_by.to_string());
+    // ORG-EVENT-DEFAULT: use `org` once org_guard allows it. Until then
+    // another organization's requester label is `null` in the payload.
+    let mut input = EventInput::new(ua_core::DEFAULT_ORG, REFUSED, r.payload(org, requested_by))
+        .by(requested_by.to_string());
     if let Some(k) = dedupe {
         input = input.dedupe(k);
     }
@@ -298,9 +352,9 @@ pub fn refused(
 
 /// [`refused`] in a write of its own, for a refusal decided before any
 /// write transaction was opened.
-pub async fn refused_now(hub: &crate::Hub, requested_by: &str, r: Refusal) -> UaResult<()> {
-    let who = requested_by.to_string();
-    hub.db().write_async(move |tx| refused(tx, &who, &r, None)).await
+pub async fn refused_now(hub: &crate::Hub, org: &str, requested_by: &str, r: Refusal) -> UaResult<()> {
+    let (org, who) = (org.to_string(), requested_by.to_string());
+    hub.db().write_async(move |tx| refused(tx, &org, &who, &r, None)).await
 }
 
 /// A live pass for the same action bound to other values: what
@@ -317,14 +371,15 @@ pub struct Stale {
 /// Live passes [`stale_pass`] looks at, newest first.
 const STALE_SCAN: i64 = 200;
 
-/// The newest live (approved, unexpired, unconsumed) pass of `requester`
-/// for `tool` that agrees with `presented` on every `subject` field (the
+/// The newest live (approved, unexpired, unconsumed) pass of `requester` in
+/// organization `org` for `tool` that agrees with `presented` on every `subject` field (the
 /// same task, say) but differs from it elsewhere: the human approved this
 /// action for other values (an older head, another target). `None` when
 /// there is none, or when `subject` is empty.
 pub fn stale_pass(
     c: &rusqlite::Connection,
     cfg: &Config,
+    org: &str,
     requester: &str,
     tool: &str,
     presented: &Value,
@@ -334,11 +389,11 @@ pub fn stale_pass(
         return Ok(None);
     }
     let mut stmt = c.prepare(
-        "SELECT id, payload, resolved_at FROM approvals WHERE tool = ?1 AND requested_by = ?2 \
+        "SELECT id, payload, resolved_at FROM approvals WHERE org_id = ?4 AND tool = ?1 AND requested_by = ?2 \
          AND status = 'approved' ORDER BY id DESC LIMIT ?3",
     )?;
     let rows: Vec<(i64, String, Option<String>)> = stmt
-        .query_map(params![tool, requester, STALE_SCAN], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(params![tool, requester, STALE_SCAN, org], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
     for (id, text, resolved_at) in rows {
         if pass_expired(cfg, resolved_at.as_deref()) {
@@ -376,6 +431,8 @@ fn jiff_now_s() -> i64 {
 }
 
 /// Evaluate the gate for one call inside the caller's write transaction.
+/// Only approvals of the caller's organization are matched, and a new
+/// request is parked in it.
 pub fn gate(
     tx: &mut WriteTx<'_>,
     cfg: &Config,
@@ -398,6 +455,8 @@ pub fn gate_via(
     args: &Value,
     via: Option<&str>,
 ) -> UaResult<GateOutcome> {
+    let org = caller.org_id.as_str();
+    require_org(tx, org)?;
     let canon = canonical_payload(args);
     let sha = payload_sha256(tool, args);
     let now = ua_core::time::now();
@@ -406,9 +465,9 @@ pub fn gate_via(
     // A recorded denial of this exact call wins.
     let denied: Option<(i64, Option<String>)> = tx
         .query_row(
-            "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'denied' ORDER BY id DESC LIMIT 1",
-            params![tool, canon, caller.label],
+            "SELECT id, reason FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 \
+             AND requested_by = ?3 AND status = 'denied' ORDER BY id DESC LIMIT 1",
+            params![tool, canon, caller.label, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -418,17 +477,17 @@ pub fn gate_via(
             .task(task_id)
             .hashes(Some(sha.clone()), Some(sha))
             .via(via);
-        refused(tx, &caller.label, &r, None)?;
+        refused(tx, org, &caller.label, &r, None)?;
         return Ok(GateOutcome::Denied { approval_id, reason });
     }
 
     // Consume the oldest live pass.
     let passes: Vec<(i64, Option<String>)> = {
         let mut stmt = tx.prepare(
-            "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'approved' ORDER BY id ASC",
+            "SELECT id, resolved_at FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 \
+             AND requested_by = ?3 AND status = 'approved' ORDER BY id ASC",
         )?;
-        stmt.query_map(params![tool, canon, caller.label], |r| Ok((r.get(0)?, r.get(1)?)))?
+        stmt.query_map(params![tool, canon, caller.label, org], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?
     };
     // The newest pass found expired, if no live one covers the call.
@@ -436,20 +495,21 @@ pub fn gate_via(
     for (id, resolved_at) in passes {
         if pass_expired(cfg, resolved_at.as_deref()) {
             tx.execute(
-                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
-                params![id, now],
+                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE org_id = ?3 AND id = ?1",
+                params![id, now, org],
             )?;
             lapsed = Some((id, resolved_at));
             continue;
         }
         tx.execute(
-            "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2 WHERE id = ?1",
-            params![id, now],
+            "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2 WHERE org_id = ?3 AND id = ?1",
+            params![id, now, org],
         )?;
         let mut event = json!({ "approval_id": id, "tool": tool, "payload_sha256": sha });
         if let Some(v) = via {
             event["via"] = json!(v);
         }
+        // ORG-EVENT-DEFAULT: ids, the tool and a hash only.
         ledger::append(
             tx,
             EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.consumed", event).by(caller.label.clone()),
@@ -465,15 +525,15 @@ pub fn gate_via(
             .hashes(Some(sha.clone()), Some(sha.clone()))
             .expired_at(pass_expires_at(cfg, resolved_at.as_deref()))
             .via(via);
-        refused(tx, &caller.label, &r, Some(format!("{REFUSED}:expired:{id}")))?;
+        refused(tx, org, &caller.label, &r, Some(format!("{REFUSED}:expired:{id}")))?;
     }
 
     // Reuse an identical pending request, or park a new one.
     let pending: Option<i64> = tx
         .query_row(
-            "SELECT id FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+            "SELECT id FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 AND requested_by = ?3 \
              AND status = 'pending' ORDER BY id ASC LIMIT 1",
-            params![tool, canon, caller.label],
+            params![tool, canon, caller.label, org],
             |r| r.get(0),
         )
         .optional()?;
@@ -491,7 +551,8 @@ fn canonical_sha256_of(tool: &str, canon: &str) -> String {
     }
 }
 
-/// Insert a pending request for `canon` and ledger it.
+/// Insert a pending request for `canon` in the caller's organization and
+/// ledger it.
 fn park(
     tx: &mut WriteTx<'_>,
     caller: &Caller,
@@ -500,21 +561,23 @@ fn park(
     now: &str,
     via: Option<&str>,
 ) -> UaResult<i64> {
+    let org = caller.org_id.as_str();
     tx.execute(
-        "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
-        params![tool, canon, caller.label, now],
+        "INSERT INTO approvals (org_id, tool, payload, requested_by, status, created_at, updated_at) \
+         VALUES (?5, ?1, ?2, ?3, 'pending', ?4, ?4)",
+        params![tool, canon, caller.label, now, org],
     )?;
     let approval_id = tx.last_insert_rowid();
     let mut event = json!({
         "approval_id": approval_id,
         "tool": tool,
-        "requested_by": caller.label,
+        "requested_by": ledger_label(org, &caller.label),
         "payload_sha256": canonical_sha256_of(tool, canon),
     });
     if let Some(v) = via {
         event["via"] = json!(v);
     }
+    // ORG-EVENT-DEFAULT: another organization's requester label is `null`.
     ledger::append(
         tx,
         EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.requested", event).by(caller.label.clone()),
@@ -556,12 +619,13 @@ impl RequestState {
     }
 }
 
-/// The state of `requester`'s approval for this exact call, read-only: a
-/// denial wins (as in [`gate`]), then a live pass, then a pending request.
-/// `None` when nothing was asked yet.
+/// The state of `requester`'s approval in organization `org` for this exact
+/// call, read-only: a denial wins (as in [`gate`]), then a live pass, then a
+/// pending request. `None` when nothing was asked yet in `org`.
 pub fn peek(
     c: &rusqlite::Connection,
     cfg: &Config,
+    org: &str,
     requester: &str,
     tool: &str,
     args: &Value,
@@ -569,9 +633,9 @@ pub fn peek(
     let canon = canonical_payload(args);
     let denied: Option<(i64, Option<String>)> = c
         .query_row(
-            "SELECT id, reason FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-             AND status = 'denied' ORDER BY id DESC LIMIT 1",
-            params![tool, canon, requester],
+            "SELECT id, reason FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 \
+             AND requested_by = ?3 AND status = 'denied' ORDER BY id DESC LIMIT 1",
+            params![tool, canon, requester, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -579,20 +643,20 @@ pub fn peek(
         return Ok(Some(RequestState::Denied { approval_id, reason }));
     }
     let mut stmt = c.prepare(
-        "SELECT id, resolved_at FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
-         AND status = 'approved' ORDER BY id ASC",
+        "SELECT id, resolved_at FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 \
+         AND requested_by = ?3 AND status = 'approved' ORDER BY id ASC",
     )?;
     let passes: Vec<(i64, Option<String>)> = stmt
-        .query_map(params![tool, canon, requester], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![tool, canon, requester, org], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     if let Some((approval_id, _)) = passes.into_iter().find(|(_, at)| !pass_expired(cfg, at.as_deref())) {
         return Ok(Some(RequestState::Approved { approval_id }));
     }
     let pending: Option<i64> = c
         .query_row(
-            "SELECT id FROM approvals WHERE tool = ?1 AND payload = ?2 AND requested_by = ?3 \
+            "SELECT id FROM approvals WHERE org_id = ?4 AND tool = ?1 AND payload = ?2 AND requested_by = ?3 \
              AND status = 'pending' ORDER BY id ASC LIMIT 1",
-            params![tool, canon, requester],
+            params![tool, canon, requester, org],
             |r| r.get(0),
         )
         .optional()?;
@@ -610,7 +674,8 @@ pub fn request(
     tool: &str,
     args: &Value,
 ) -> UaResult<RequestState> {
-    if let Some(state) = peek(tx, cfg, &caller.label, tool, args)? {
+    require_org(tx, &caller.org_id)?;
+    if let Some(state) = peek(tx, cfg, &caller.org_id, &caller.label, tool, args)? {
         return Ok(state);
     }
     let now = ua_core::time::now();
@@ -622,6 +687,11 @@ pub fn request(
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalRow {
     pub id: i64,
+    /// The organization of the requester; every reader sees only its own.
+    /// Not serialized: a reader is only ever shown its own organization's
+    /// rows, and the client shape stays as it was.
+    #[serde(skip_serializing)]
+    pub org_id: String,
     pub tool: String,
     pub payload: Value,
     pub requested_by: Option<String>,
@@ -650,7 +720,7 @@ pub struct ApprovalRow {
 /// Display-only detail for a pending approval ([`ApprovalRow::display`]).
 fn display(c: &rusqlite::Connection, row: &ApprovalRow) -> UaResult<Option<Value>> {
     if row.tool == crate::families::harness_config::APPLY_TOOL {
-        return crate::families::harness_config::approval_display(c, row.id, &row.payload);
+        return crate::families::harness_config::approval_display(c, &row.org_id, row.id, &row.payload);
     }
     Ok(None)
 }
@@ -659,6 +729,7 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
     let payload: String = r.get("payload")?;
     Ok(ApprovalRow {
         id: r.get("id")?,
+        org_id: r.get("org_id")?,
         tool: r.get("tool")?,
         payload: serde_json::from_str(&payload).unwrap_or(Value::String(payload)),
         requested_by: r.get("requested_by")?,
@@ -675,12 +746,13 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
     })
 }
 
-/// One approval row, with its display-only detail ([`ApprovalRow::display`])
-/// whatever its status, so every reader of one approval sees what the
-/// approver saw.
-pub fn get(conn: &rusqlite::Connection, id: i64) -> UaResult<ApprovalRow> {
+/// One approval row of organization `org`, with its display-only detail
+/// ([`ApprovalRow::display`]) whatever its status, so every reader of one
+/// approval sees what the approver saw. Another organization's approval
+/// answers exactly as a missing one.
+pub fn get(conn: &rusqlite::Connection, org: &str, id: i64) -> UaResult<ApprovalRow> {
     let mut row = conn
-        .query_row("SELECT * FROM approvals WHERE id = ?1", [id], row_to_approval)
+        .query_row("SELECT * FROM approvals WHERE org_id = ?1 AND id = ?2", params![org, id], row_to_approval)
         .optional()?
         .ok_or_else(|| UaError::not_found(format!("approval {id}")))?;
     row.display = display(conn, &row)?;
@@ -723,29 +795,33 @@ pub struct ResolveArgs {
 fn list_pending(ctx: &ToolCtx, args: PendingArgs) -> UaResult<Value> {
     let limit = args.limit.clamp(1, 500) as usize;
     let cfg = ctx.hub.cfg().clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
         let tool_filter = args.tool.clone();
-        // Bounded in SQL: the oldest `limit` pending requests, and the newest
-        // APPROVED_SCAN approved rows (live passes are recent; older ones
-        // are only counted).
+        // Only the caller's organization. Bounded in SQL: the oldest `limit`
+        // pending requests, and the newest APPROVED_SCAN approved rows (live
+        // passes are recent; older ones are only counted).
         let mut stmt = c.prepare(
-            "SELECT * FROM approvals WHERE status = 'pending' AND (?1 IS NULL OR tool = ?1) ORDER BY id ASC LIMIT ?2",
+            "SELECT * FROM approvals WHERE org_id = ?3 AND status = 'pending' AND (?1 IS NULL OR tool = ?1) \
+             ORDER BY id ASC LIMIT ?2",
         )?;
-        let mut pending: Vec<ApprovalRow> =
-            stmt.query_map(params![tool_filter, limit as i64], row_to_approval)?.collect::<Result<_, _>>()?;
+        let mut pending: Vec<ApprovalRow> = stmt
+            .query_map(params![tool_filter, limit as i64, org], row_to_approval)?
+            .collect::<Result<_, _>>()?;
         for a in &mut pending {
             a.display = display(c, a)?;
         }
         let mut stmt = c.prepare(
-            "SELECT * FROM approvals WHERE status = 'approved' AND (?1 IS NULL OR tool = ?1) \
+            "SELECT * FROM approvals WHERE org_id = ?3 AND status = 'approved' AND (?1 IS NULL OR tool = ?1) \
              ORDER BY id DESC LIMIT ?2",
         )?;
-        let mut approved: Vec<ApprovalRow> =
-            stmt.query_map(params![tool_filter, APPROVED_SCAN], row_to_approval)?.collect::<Result<_, _>>()?;
+        let mut approved: Vec<ApprovalRow> = stmt
+            .query_map(params![tool_filter, APPROVED_SCAN, org], row_to_approval)?
+            .collect::<Result<_, _>>()?;
         approved.reverse();
         let approved_total: i64 = c.query_row(
-            "SELECT COUNT(*) FROM approvals WHERE status = 'approved' AND (?1 IS NULL OR tool = ?1)",
-            params![tool_filter],
+            "SELECT COUNT(*) FROM approvals WHERE org_id = ?2 AND status = 'approved' AND (?1 IS NULL OR tool = ?1)",
+            params![tool_filter, org],
             |r| r.get(0),
         )?;
         let (mut live, mut expired): (Vec<_>, Vec<_>) =
@@ -779,7 +855,8 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
     let caller = ctx.caller.clone();
     let cfg = ctx.hub.cfg().clone();
     ctx.hub.db().write(|tx| {
-        let row = get(tx, args.id)?;
+        // Another organization's approval answers exactly as a missing one.
+        let row = get(tx, &caller.org_id, args.id)?;
         // The resolver is always the caller. `resolved_by` is accepted for
         // contract compatibility but never trusted: an unverified caller
         // naming a human must not be able to approve as that human.
@@ -826,17 +903,25 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             }
             other => return Err(UaError::invalid(format!("decision must be approve, deny or revoke, not {other:?}"))),
         };
+        let by_requester = row.requested_by.as_deref() == Some(resolver.as_str());
         if new_status != "approved" && !caller.is_human() {
             // Deny and revoke stay open to the requester.
-            if row.requested_by.as_deref() != Some(resolver.as_str()) {
+            if !by_requester {
                 return Err(UaError::denied("not_human", "only a human or the requester can deny or revoke"));
             }
+        }
+        if new_status == "approved" || !by_requester {
+            // A human decision: the human must be in the approval's
+            // organization, and until memberships exist `ua_org::authz`
+            // admits only the default one (a human identity is hub
+            // configuration, so it always resolves there).
+            ua_org::authz::require_same_org(&caller, &row.org_id)?;
         }
         let transport = transport_name(&caller);
         tx.execute(
             "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, updated_at = ?5, \
-             resolved_transport = ?6 WHERE id = ?1",
-            params![row.id, new_status, args.reason, resolver, now, transport],
+             resolved_transport = ?6 WHERE org_id = ?7 AND id = ?1",
+            params![row.id, new_status, args.reason, resolver, now, transport, row.org_id],
         )?;
         if row.tool == crate::families::relay::TOOL {
             // The relay keeps a message's text in its approval only while
@@ -847,7 +932,7 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             "approval_id": row.id,
             "tool": row.tool,
             "decision": args.decision,
-            "resolved_by": resolver,
+            "resolved_by": ledger_label(&row.org_id, &resolver),
             "transport": transport,
             "payload_sha256": payload_sha256(&row.tool, &row.payload),
         });
@@ -855,11 +940,12 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
             // The expiry under the TTL configured when the human approved.
             event["expires_at"] = json!(pass_expires_at(&cfg, Some(&now)));
         }
+        // ORG-EVENT-DEFAULT: another organization's resolver label is `null`.
         ledger::append(
             tx,
             EventInput::new(ua_core::DEFAULT_ORG, "agent.approval.resolved", event).by(caller.label.clone()),
         )?;
-        Ok(json!({ "ok": true, "approval": get(tx, row.id)? }))
+        Ok(json!({ "ok": true, "approval": get(tx, &row.org_id, row.id)? }))
     })
 }
 

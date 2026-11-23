@@ -570,6 +570,8 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals WHERE status IN ('pending','approved')"), 0);
     assert_eq!(table(&r, "approvals").skipped.get("live_approval"), Some(&2));
+    // Approval history lands in the default organization.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals WHERE org_id <> 'default'"), 0);
 
     // Memory keeps ids, and the rebuilt index finds the note.
     let hit: String = db

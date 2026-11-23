@@ -412,13 +412,22 @@ fn canonical(
 /// added and removed. Not part of what the approval binds. A diff computed
 /// from another base than the one `payload` binds
 /// (`change_summary.from_text_sha256`) is never shown in its place. Only
-/// proposals of the organization the payload binds are read.
-pub(crate) fn approval_display(c: &Connection, approval_id: i64, payload: &Value) -> UaResult<Option<Value>> {
+/// proposals of the organization the payload binds are read, and only when
+/// that is the approval's own organization (`approval_org`).
+pub(crate) fn approval_display(
+    c: &Connection,
+    approval_org: &str,
+    approval_id: i64,
+    payload: &Value,
+) -> UaResult<Option<Value>> {
     let bound = payload["change_summary"]["from_text_sha256"].as_str().unwrap_or("none").to_string();
     // A payload without `org_id` predates organization keys (and
     // `harness_config.v3.tenant_keys` expired every open one): its proposals
     // were moved to the default organization.
     let org = payload["org_id"].as_str().unwrap_or(ua_core::DEFAULT_ORG);
+    if org != approval_org {
+        return Ok(None);
+    }
     let mut stmt = c.prepare(
         "SELECT id, diff_text, diff_base FROM harness_config_proposals WHERE org_id = ?1 AND approval_id = ?2 \
          ORDER BY updated_at DESC, rowid DESC",
@@ -468,7 +477,7 @@ fn apply_grants(
         let last = last_applied(c, org, node, agent, &surface)?;
         let payload = canonical(org, node, &surface, &path, version, &r.content, &last);
         if let Some(RequestState::Approved { approval_id }) =
-            approvals::peek(c, hub.cfg(), agent, APPLY_TOOL, &payload)?
+            approvals::peek(c, hub.cfg(), org, agent, APPLY_TOOL, &payload)?
         {
             grants.push(json!({
                 "proposal_id": id,
@@ -488,7 +497,7 @@ fn apply_grants(
 fn settle(tx: &mut WriteTx<'_>, hub: &Hub, org: &str, node: &str, agent: &str, by: &str) -> UaResult<usize> {
     let mut stmt = tx.prepare(
         "SELECT p.id, a.status, a.resolved_at FROM harness_config_proposals p \
-         JOIN approvals a ON a.id = p.approval_id \
+         JOIN approvals a ON a.org_id = p.org_id AND a.id = p.approval_id \
          WHERE p.org_id = ?1 AND p.node = ?2 AND p.agent = ?3 AND p.status = 'pending'",
     )?;
     let rows: Vec<(String, String, Option<String>)> = stmt

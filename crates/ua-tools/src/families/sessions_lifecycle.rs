@@ -258,11 +258,12 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
             let parent = task.as_ref().and_then(|x| x["parent_id"].as_i64()).unwrap_or(-1);
             query_rows(
                 conn,
+                // Only the reader's organization's approvals.
                 "SELECT id, tool, status, requested_by, created_at FROM approvals \
-                 WHERE status IN ('pending','approved') \
+                 WHERE org_id = ?4 AND status IN ('pending','approved') \
                  AND (json_extract(payload, '$.task_id') IN (?1, ?2) OR json_extract(payload, '$.parent_task_id') IN (?1, ?2)) \
                  ORDER BY id DESC LIMIT ?3",
-                params![t, parent, APPROVAL_LIMIT as i64],
+                params![t, parent, APPROVAL_LIMIT as i64, ctx.caller.org_id],
                 |r| {
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?, "tool": r.get::<_, String>(1)?,

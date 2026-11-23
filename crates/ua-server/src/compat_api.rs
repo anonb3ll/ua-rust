@@ -523,11 +523,14 @@ async fn approval_detail(
             format!("approval_pending is not available to profile {}", caller.profile),
         );
     }
+    // Only the caller's organization: another organization's approval
+    // answers exactly as a missing one.
+    let org = caller.org_id.clone();
     let row = match state
         .hub
         .db()
         .read_async(move |c| {
-            approvals::get(c, approval_id).map(Some).or_else(|e| match e {
+            approvals::get(c, &org, approval_id).map(Some).or_else(|e| match e {
                 UaError::NotFound(_) => Ok(None),
                 other => Err(other),
             })
@@ -705,18 +708,19 @@ async fn approval_request(
             // A request already on record for this exact call (denied, a
             // live pass, or pending) answers as it stands, whatever the caps
             // say. Read-only: nothing is consumed.
-            if let Some(state) = approvals::peek(tx, cfg, &c.label, &t, &p)? {
+            if let Some(state) = approvals::peek(tx, cfg, &c.org_id, &c.label, &t, &p)? {
                 return Ok(RequestOutcome::Recorded(state));
             }
             // Bound the human inbox: one requester cannot queue more than
             // MAX_PENDING_PER_REQUESTER open requests, nor file more than
-            // MAX_REQUESTS_PER_HOUR that are open or that it withdrew itself.
+            // MAX_REQUESTS_PER_HOUR that are open or that it withdrew itself,
+            // counted in its own organization.
             let hour_ago = ua_core::time::format_ts(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
             let (open, recent): (i64, i64) = tx.query_row(
                 "SELECT COALESCE(SUM(status = 'pending'), 0), COALESCE(SUM(created_at >= ?2 AND (status = 'pending' \
                  OR (status IN ('denied', 'revoked') AND resolved_by = requested_by))), 0) \
-                 FROM approvals WHERE requested_by = ?1",
-                params![c.label, hour_ago],
+                 FROM approvals WHERE org_id = ?3 AND requested_by = ?1",
+                params![c.label, hour_ago, c.org_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             if open >= MAX_PENDING_PER_REQUESTER {
