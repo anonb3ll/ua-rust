@@ -571,7 +571,14 @@ async fn crew_view_shows_a_restricted_caller_only_its_own_mail() {
     }
     let v = e.ok(&outsider, "crew_view", json!({ "session_id": steered })).await;
     assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+    assert_eq!(v["interventions_path"], Value::Null, "the drop file's path is the session agent's: {v}");
     assert!(!v.to_string().contains("Secret"), "{v}");
+    let mine = e.ok(&b2, "crew_view", json!({ "session_id": steered })).await;
+    assert!(mine["interventions_path"].is_string(), "{mine}");
+    // The drop file sits in the workspace, where fs tools reach: it holds the
+    // parties and message id, never the body (that is in the mailbox).
+    let line = std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap();
+    assert!(line.contains("message_id") && !line.contains("Secret"), "{line}");
     let notes = e.ok(&outsider, "task_list", json!({ "status": "all" })).await;
     assert!(notes.to_string().contains("[intervention @"), "{notes}");
     assert!(!notes.to_string().contains("Secret"), "{notes}");

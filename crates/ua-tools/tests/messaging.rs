@@ -196,6 +196,31 @@ async fn send_cannot_name_a_conversation_it_is_not_in() {
     }
     assert_eq!(answers[0], answers[1]);
 
+    // A legacy hub row whose id carries the external prefix is never chained
+    // from: a non-party's reply_to it gets no hop from it.
+    let legacy =
+        send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "builder-2", "body": "old", "hop": 2}))
+            .await;
+    let legacy_id = legacy["message_id"].as_str().unwrap().to_string();
+    hub.db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE message_index SET message_id = 'ts:legacy' WHERE message_id = ?1",
+                [&legacy_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let ext = send(
+        &reg,
+        &hub,
+        &c,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "a reply to an external thread",
+               "reply_to": "ts:legacy"}),
+    )
+    .await;
+    assert_eq!(ext["hop"], 0, "{ext}");
+
     // An external-thread prefix is not a message id a client may choose.
     let err = reg
         .call(

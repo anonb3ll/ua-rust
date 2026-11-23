@@ -1027,13 +1027,16 @@ fn read_interventions(path: Option<&Path>, limit: usize, party: Option<&str>) ->
     let Some(path) = path.filter(|p| p.is_file()) else { return Vec::new() };
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(limit)..]
-        .iter()
+    // Filter first, then window, so other agents' lines never crowd out the
+    // reader's own.
+    let mut rows: Vec<Value> = text
+        .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(Value::is_object)
         .filter(|v| party.is_none_or(|p| v["from_agent"] == p || v["to_agent"] == p))
-        .collect()
+        .collect();
+    rows.drain(..rows.len().saturating_sub(limit));
+    rows
 }
 
 async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
@@ -1101,7 +1104,12 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         "conversation_id": crew_conversation_id(&sid),
         "messages": messages,
         "message_total": total,
-        "interventions_path": drop_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        // The drop file's location is the session agent's and unrestricted
+        // readers' business only.
+        "interventions_path": drop_path
+            .as_ref()
+            .filter(|_| party.is_none() || party.as_deref() == session["agent"].as_str())
+            .map(|p| p.to_string_lossy().into_owned()),
         "worktree_interventions": read_interventions(drop_path.as_deref(), cap as usize, party.as_deref()),
     }))
 }
@@ -1190,13 +1198,10 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
     let task_id = session["task_id"].as_i64();
     let mut note_recorded = false;
     if let Some(t) = task_id {
-        // Task notes are readable by every caller: the marker names the
-        // message, never its body, which stays with the mailbox rule.
-        let marker = format!(
-            "[intervention @ {}] session={sid} from {sender}: message {}",
-            ua_core::time::now(),
-            message["message_id"].as_str().unwrap_or("?")
-        );
+        // Task notes are readable by every caller: the marker records only
+        // that the session was steered and when. Sender, message and body
+        // stay with the mailbox rule.
+        let marker = format!("[intervention @ {}] session={sid}", ua_core::time::now());
         let mut upd = json!({ "id": t, "append_note": marker });
         if let Some(n) = &named {
             upd["actor"] = json!(n);
@@ -1210,7 +1215,7 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
         let line = json!({
             "ts": ua_core::time::now(), "session_id": sid, "from_agent": sender, "to_agent": recipient,
             "to_session": sid, "message_id": message["message_id"], "task_id": task_id,
-            "delegation_id": session["delegation_id"], "body": text,
+            "delegation_id": session["delegation_id"],
         });
         let path = path.clone();
         worktree_written = blocking(move || {
@@ -1276,7 +1281,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "crew_intervene",
-            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task and appends an audit line to the session worktree's .ua/interventions.jsonl (inside the workspace only). Always approval-gated.",
+            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task (time and session only) and appends an audit line (parties and message_id, never the body) to the session worktree's .ua/interventions.jsonl (inside the workspace only). Always approval-gated.",
             crew_intervene,
         )
         .family("sessions")

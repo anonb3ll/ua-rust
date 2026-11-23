@@ -860,13 +860,15 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     let mut loop_warning = None;
     let human = |l: &str| v.humans.iter().any(|h| h == l);
     if !(human(&sender) || human(&recipient)) {
-        hop = reply_hop(tx, reply.as_deref(), hop)?;
+        // An external reply_to names no hub message to chain from.
+        let chained = reply.as_deref().filter(|r| !is_external_reply(r));
+        hop = reply_hop(tx, chained, hop)?;
         if hop >= MAX_HOPS {
             return Err(UaError::invalid(format!(
                 "reply chain reached hop {hop} (limit {MAX_HOPS}); stop replying here, or send without reply_to if this is new work"
             )));
         }
-        loop_warning = check_pair_streak(tx, reply.as_deref(), &sender, &recipient, &body)?;
+        loop_warning = check_pair_streak(tx, chained, &sender, &recipient, &body)?;
     }
     let event_id = clean(a.event_id.as_deref());
     let mut payload = json!({

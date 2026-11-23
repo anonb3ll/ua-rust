@@ -771,8 +771,11 @@ from its commit history.
   the gated `crew_intervene` opens or joins a session's `crew:<session>`
   thread. `crew_view` no longer returns other agents' private mail: a
   restricted caller sees only the crew's messages and worktree intervention
-  lines it sent or received. The task-note marker `crew_intervene` writes
-  now names the message id instead of quoting the body. `message_send`
+  lines it sent or received, and only the session agent gets the drop file's
+  path. `crew_intervene` no longer copies the body anywhere outside the
+  mailbox: the task-note marker records only the time and session, and the
+  worktree `.ua/interventions.jsonl` line carries the parties and
+  `message_id`. `message_send`
   refuses a client-chosen `message_id` with an external-thread prefix
   (`ts:`).
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
