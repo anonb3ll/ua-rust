@@ -785,7 +785,9 @@ async fn the_drop_file_is_never_a_hard_link() {
 }
 
 /// `.ua` swapped for a symlink after the drop file was first written: the
-/// next write and every read refuse it.
+/// next write and every read refuse it. This is a swap made between calls,
+/// which a check-then-open would also catch; the swap of an ancestor that
+/// races the open is covered by the unit tests in `sessions_lifecycle`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_drop_dir_swapped_for_a_symlink_is_refused() {

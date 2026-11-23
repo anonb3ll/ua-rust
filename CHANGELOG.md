@@ -933,16 +933,22 @@ from its commit history.
   them with that id. A restricted caller still sees only its own mail, so
   the filter finds nothing it could not already list.
 - `message_send`: an unverified caller (auth enforcement off) may no longer
-  send as a label the hub sends as itself (`hub-node`, `system`,
-  `pr-watch`, ignoring case), so it cannot take a hub client id such as
-  `node-command-…` first.
+  send as a label the hub sends as itself (`system`, `pr-watch`, or any
+  label starting with `hub-`, such as `hub-node`, ignoring case), so it
+  cannot take a hub client id such as `node-command-…` first.
 - `memory_save`: an `idempotency_key` is stored as
   `memory_save/<caller>/<key>` and looked up only among `memory_save` rows.
   Another tool's use of the same text (a `message_send` client id, a
   hub-node `node-command-…` id) is no longer reported as `conflict … already
   used by message_send`, and a memory key can no longer occupy another
   tool's key and make its later write fail. A key `memory_save` stored before
-  this change still replays for a retry.
+  this change still replays for a retry by the caller that wrote or last
+  updated the note it names; another caller reusing it gets its own save
+  instead of that receipt.
+- `crew_intervene` / `crew_view` drop file: on unix the worktree path is
+  walked from `/` with `O_NOFOLLOW` at every directory, so a symlink swapped
+  in for an ancestor of the worktree after the containment check is refused
+  instead of followed out of the workspace.
 - `lifecycle_record` with `kind: "handoff"` now writes to
   `agent.lifecycle.handoff_hook` instead of `agent.lifecycle.handoff`, and
   only its writer and note-reading operators can read it. Before, any agent

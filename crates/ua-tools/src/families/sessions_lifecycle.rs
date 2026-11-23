@@ -1042,11 +1042,14 @@ const DROP_FILE: &str = "interventions.jsonl";
 /// is canonical and inside the roots). Writing creates `.ua` and the file
 /// when missing.
 ///
-/// On unix nothing below the worktree is reached through a link, and the
-/// check cannot race the open: the worktree and then `.ua` are opened as
-/// directories with `O_NOFOLLOW`, the file is opened relative to the `.ua`
-/// descriptor with `O_NOFOLLOW`, and the opened file must be a regular file
-/// with exactly one link, so a hard link to a file elsewhere is refused too.
+/// On unix no part of the path is reached through a link, and the check
+/// cannot race the open: the worktree's canonical path is walked from `/` one
+/// directory at a time with `O_NOFOLLOW`, so a symlink swapped in for any
+/// ancestor after `intervention_path` canonicalized it is refused instead of
+/// followed out of the roots; `.ua` is opened the same way, the file is
+/// opened relative to the `.ua` descriptor with `O_NOFOLLOW`, and the opened
+/// file must be a regular file with exactly one link, so a hard link to a
+/// file elsewhere is refused too.
 fn open_drop(path: &Path, write: bool) -> Option<std::fs::File> {
     let dir = path.parent()?;
     let worktree = dir.parent()?;
@@ -1069,8 +1072,21 @@ fn open_drop_in(worktree: &Path, write: bool) -> Option<std::fs::File> {
         let fd = unsafe { libc::openat(at, name.as_ptr(), flags, 0o644 as libc::c_uint) };
         (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     };
-    let wt = CString::new(worktree.as_os_str().as_bytes()).ok()?;
-    let wt_fd = open_at(libc::AT_FDCWD, &wt, dir_flags)?;
+    // The worktree is canonical (no `.`, `..` or links at check time), so
+    // every component is a plain name and any link met now was swapped in.
+    let mut wt_fd: Option<OwnedFd> = None;
+    for part in worktree.components() {
+        let next = match part {
+            std::path::Component::RootDir => open_at(libc::AT_FDCWD, &CString::new("/").ok()?, dir_flags)?,
+            std::path::Component::Normal(name) => {
+                let at = wt_fd.as_ref()?.as_raw_fd();
+                open_at(at, &CString::new(name.as_bytes()).ok()?, dir_flags)?
+            }
+            _ => return None,
+        };
+        wt_fd = Some(next);
+    }
+    let wt_fd = wt_fd?;
     let ua = CString::new(DROP_DIR).ok()?;
     if write {
         // SAFETY: valid descriptor and NUL-terminated name. An existing
@@ -1428,4 +1444,51 @@ pub fn register(r: &mut Registry) {
         .family("sessions")
         .always_gated(),
     );
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn drop_path(worktree: &Path) -> PathBuf {
+        worktree.join(DROP_DIR).join(DROP_FILE)
+    }
+
+    /// The worktree was canonical and inside the roots when it was checked;
+    /// then one of its ancestors is swapped for a symlink to a directory that
+    /// holds a look-alike worktree. Opening by the checked path must not
+    /// follow it, for reading or writing.
+    #[test]
+    fn an_ancestor_swapped_for_a_symlink_is_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let wt = root.join("ws").join("wt");
+        std::fs::create_dir_all(wt.join(DROP_DIR)).unwrap();
+        std::fs::write(drop_path(&wt), "{}\n").unwrap();
+        assert!(open_drop(&drop_path(&wt), false).is_some(), "the real worktree opens");
+
+        // Elsewhere, a look-alike tree with its own drop file.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("wt").join(DROP_DIR)).unwrap();
+        std::fs::write(drop_path(&elsewhere.join("wt")), "planted\n").unwrap();
+        std::fs::rename(root.join("ws"), root.join("ws-moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("ws")).unwrap();
+
+        assert!(open_drop(&drop_path(&wt), false).is_none(), "a read must not follow the ancestor link");
+        assert!(open_drop(&drop_path(&wt), true).is_none(), "a write must not follow the ancestor link");
+        let planted = std::fs::read_to_string(drop_path(&elsewhere.join("wt"))).unwrap();
+        assert_eq!(planted, "planted\n");
+    }
+
+    /// A path that is not absolute and canonical is refused outright.
+    #[test]
+    fn a_non_canonical_worktree_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(wt.join(DROP_DIR)).unwrap();
+        std::fs::write(drop_path(&wt), "{}\n").unwrap();
+        let dotted = root.join("wt").join("..").join("wt");
+        assert!(open_drop(&drop_path(&dotted), false).is_none());
+    }
 }

@@ -229,6 +229,20 @@ async fn idempotency_keys_are_scoped_to_memory_save_and_the_caller() {
     let retry =
         t.ok(&b1, "memory_save", json!({ "content": "pre-upgrade", "idempotency_key": "old-raw" })).await;
     assert_eq!(retry["id"], pre["id"], "a pre-upgrade key still replays: {retry}");
+
+    // The raw key was hub-wide; another caller reusing it gets its own save,
+    // not builder-1's receipt with its content silently dropped.
+    let other =
+        t.ok(&b2, "memory_save", json!({ "content": "someone else", "idempotency_key": "old-raw" })).await;
+    assert_ne!(other["id"], pre["id"], "another caller's pre-upgrade key is fresh: {other}");
+    let kept = t.ok(&b2, "memory_get", json!({ "id": other["id"] })).await;
+    assert!(kept.to_string().contains("someone else"), "{kept}");
+    let other_again =
+        t.ok(&b2, "memory_save", json!({ "content": "someone else", "idempotency_key": "old-raw" })).await;
+    assert_eq!(other_again["id"], other["id"], "and its retry replays under its own key");
+    let owner_again =
+        t.ok(&b1, "memory_save", json!({ "content": "pre-upgrade", "idempotency_key": "old-raw" })).await;
+    assert_eq!(owner_again["id"], pre["id"], "the writer still replays the raw key");
 }
 
 #[tokio::test]

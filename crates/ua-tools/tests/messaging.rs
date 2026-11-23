@@ -739,7 +739,7 @@ async fn memory_keys_neither_probe_nor_plant_client_message_ids() {
 async fn an_unverified_caller_cannot_claim_a_hub_sender_label() {
     let (hub, reg) = (hub(), builtin_registry());
     let local = Caller::local("local-agent", Transport::Stdio);
-    for label in ["hub-node", "system", "pr-watch", "Hub-Node"] {
+    for label in ["hub-node", "system", "pr-watch", "Hub-Node", "hub-github", "HUB-anything"] {
         let e = reg
             .call(
                 &hub,
