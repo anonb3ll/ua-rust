@@ -197,11 +197,12 @@ pub(crate) fn parse_params<T: DeserializeOwned>(
 pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
     // ORG-EVENT-DEFAULT: use the row's organization once callers can resolve
     // to other organizations and org_guard allows it. The cycles and
-    // delegation families share this function; the `agent.plan.*` and
-    // `agent.cycle.*` callers pass another organization's free text and
-    // labels through `ledger_text` or `ledger_label`, so only ids, counts and
-    // statuses reach this ledger. The delegation family scrubs another
-    // organization's payloads before calling it (`delegation::org_emit`).
+    // delegation families share this function; the `agent.plan.*`,
+    // `agent.cycle.*` and `agent.delegation.*` callers pass another
+    // organization's free text and labels through `ledger_text` or
+    // `ledger_label`, so only ids, counts and statuses reach this ledger
+    // (`delegation::org_emit` also gives such an event the neutral `system`
+    // originator).
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }

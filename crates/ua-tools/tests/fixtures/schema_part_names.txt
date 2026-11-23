@@ -97,3 +97,5 @@ routines.v3.task_org
 workflows.v3.task_org
 cycles.v3.task_org
 deliverables.v2.task_org
+organization.v1.tools.delegation
+delegation.v2.org_scope

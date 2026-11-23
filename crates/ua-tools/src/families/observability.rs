@@ -711,8 +711,9 @@ fn latency(mut v: Vec<i64>) -> Value {
 /// Per-agent delegation counts, states and latencies over a window, read
 /// from the `delegations` table. Latencies are in seconds: `completion` from
 /// creation to a terminal state (`completed_at`), `first_claim` from creation
-/// to the claim of delegations claimed exactly once.
-fn delegation_stats(c: &Connection, a: DelegationStatsArgs) -> UaResult<Value> {
+/// to the claim of delegations claimed exactly once. Only the reader's
+/// organization `org`'s delegations are counted.
+fn delegation_stats(c: &Connection, org: &str, a: DelegationStatsArgs) -> UaResult<Value> {
     let now = Timestamp::now();
     let since = match a.since.as_deref() {
         Some(raw) => normalize_since("since", raw)?,
@@ -726,11 +727,11 @@ fn delegation_stats(c: &Connection, a: DelegationStatsArgs) -> UaResult<Value> {
     let agent = a.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let mut sql = String::from(
         "SELECT from_agent, to_agent, status, created_at, completed_at, attempts, last_attempt_at \
-         FROM delegations WHERE created_at >= ?1",
+         FROM delegations WHERE org_id = ?1 AND created_at >= ?2",
     );
-    let mut args = vec![since.clone()];
+    let mut args = vec![org.to_string(), since.clone()];
     if let Some(ag) = &agent {
-        sql.push_str(" AND (from_agent = ?2 OR to_agent = ?2)");
+        sql.push_str(" AND (from_agent = ?3 OR to_agent = ?3)");
         args.push(ag.clone());
     }
     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", DELEGATION_ROW_CAP + 1));
@@ -884,7 +885,8 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
         }
         "delegation_stats" => {
             let args: DelegationStatsArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| delegation_stats(c, args)).await
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| delegation_stats(c, &org, args)).await
         }
         other => Err(crate::routes::unhandled("observability_manage", other)),
     }

@@ -58,6 +58,9 @@ pub(crate) enum Kind {
     /// Legacy plans, their steps and checkpoints are imported into the
     /// default organization.
     Plans,
+    /// Legacy delegations are imported into the default organization, with
+    /// their tasks (a source `org_id` is never copied).
+    Delegations,
 }
 
 impl Kind {
@@ -76,6 +79,7 @@ impl Kind {
                 | Kind::HarnessConfig
                 | Kind::Plans
                 | Kind::Approvals
+                | Kind::Delegations
         )
     }
 }
@@ -140,7 +144,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { kind: Kind::Plans, ..plain("plans") },
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_steps") },
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_checkpoints") },
-    TableMap { refs: &[TASK_REF], ..plain("delegations") },
+    TableMap { refs: &[TASK_REF], kind: Kind::Delegations, ..plain("delegations") },
     plain("work_proposals"),
     TableMap {
         refs: &[Ref { col: "proposal_id", table: "work_proposals", key: "id" }],

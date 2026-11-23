@@ -433,8 +433,8 @@ INSERT INTO plans (id, goal, created_at, updated_at) VALUES ('p1', 'Plan the wor
 INSERT INTO plan_steps (plan_id, step_idx, description, created_at, updated_at) VALUES
   ('p1', 0, 'step zero', '{T0}', '{T0}'), ('p1', 1, 'step one', '{T0}', '{T0}');
 INSERT INTO plan_checkpoints (plan_id, seq, created_at) VALUES ('p1', 1, '{T0}');
-INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, created_at, updated_at) VALUES
-  ('agent-1', 'agent-2', 1, '{{}}', '{T0}', '{T0}');
+INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, created_at, updated_at, org_id) VALUES
+  ('agent-1', 'agent-2', 1, '{{}}', '{T0}', '{T0}', 'org-a');
 INSERT INTO memory (id, title, content, tags, author, created_at, updated_at) VALUES
   ('note-a', 'Wombat facts', 'wombats have cube shaped droppings', '[\"zoo\"]', 'agent-1', '{T0}', '{T0}'),
   ('note-b', 'Other', 'nothing to see', '[]', 'agent-2', '{T0}', '{T0}');
@@ -537,6 +537,9 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
         assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
     }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations"), 1);
+    // Delegations land in the default organization, with their tasks: the
+    // source `org_id` is never copied.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations WHERE org_id <> 'default'"), 0);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
@@ -622,6 +625,7 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
 
     // Unmapped columns are reported, with how many values they held.
     assert_eq!(r.unmapped_columns["tasks"]["org_id"], 1);
+    assert_eq!(r.unmapped_columns["delegations"]["org_id"], 1);
     assert!(r.unmapped_tables.contains(&"zulip_cursors".to_string()));
     assert!(r.unmapped_tables.contains(&"memory_embeddings".to_string()));
     assert!(r.derived_tables.contains(&"memory_fts".to_string()));
@@ -916,7 +920,8 @@ fn the_dry_run_reports_org_scope_either_way() {
     let f = fixture();
     let r = ua_import::dry_run(&f.path).unwrap();
     assert_eq!(r.org_scoped_rows.get("tasks"), Some(&1));
-    assert_eq!(r.org_scoped_rows.len(), 1);
+    assert_eq!(r.org_scoped_rows.get("delegations"), Some(&1));
+    assert_eq!(r.org_scoped_rows.len(), 2, "{:?}", r.org_scoped_rows);
 }
 
 #[test]

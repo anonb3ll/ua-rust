@@ -708,7 +708,9 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
                 Some(Value::Object(p))
             }
         },
-        "delegation" => one_row(c, "SELECT * FROM delegations WHERE id = ?1", id)?.map(Value::Object),
+        // A delegation of the reader's organization, without `org_id`.
+        "delegation" => org_row(c, "SELECT * FROM delegations WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(Value::Object),
         "agent" => one_row(c, "SELECT * FROM agents WHERE label = ?1", id)?.map(|mut a| {
             decode(&mut a, &["meta"]);
             Value::Object(a)

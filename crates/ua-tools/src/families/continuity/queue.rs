@@ -253,8 +253,9 @@ fn short(row: &Row) -> Value {
     json!({ "task_id": int_field(row, "id"), "title": s(row, "title"), "status": status(row) })
 }
 
-/// Why a task is being worked right now. Empty when nothing is live.
-fn live_reasons(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
+/// Why task `row` of organization `org` is being worked right now. Empty
+/// when nothing is live.
+fn live_reasons(conn: &Connection, org: &str, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
     let id = int_field(row, "id").unwrap_or_default();
     let mut out = Vec::new();
     if status(row) == "doing"
@@ -270,8 +271,9 @@ fn live_reasons(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<
     }
     let delegation: Option<String> = conn
         .query_row(
-            "SELECT status FROM delegations WHERE task_id = ?1 AND status IN ('pending','in_flight') LIMIT 1",
-            [id],
+            "SELECT status FROM delegations WHERE org_id = ?2 AND task_id = ?1 \
+             AND status IN ('pending','in_flight') LIMIT 1",
+            params![id, org],
             |r| r.get(0),
         )
         .optional()?;
@@ -328,13 +330,19 @@ fn gate_reasons(row: &Row) -> Vec<String> {
     out
 }
 
-/// Everything that keeps the sweep from proposing a park.
-pub(super) fn protection(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
+/// Everything that keeps the sweep from proposing a park of task `row` of
+/// organization `org`.
+pub(super) fn protection(
+    conn: &Connection,
+    org: &str,
+    row: &Row,
+    now: jiff::Timestamp,
+) -> UaResult<Vec<String>> {
     let mut out = gate_reasons(row);
     if s(row, "lane") == Some("tracking") {
         out.push("tracking lane".into());
     }
-    out.extend(live_reasons(conn, row, now)?);
+    out.extend(live_reasons(conn, org, row, now)?);
     Ok(out)
 }
 
@@ -388,7 +396,7 @@ fn stale_tasks(conn: &Connection, org: &str, now: jiff::Timestamp, days: i64) ->
     let mut out = Vec::new();
     for row in active_rows(conn, org)? {
         let Some(touched) = last_touch(&row) else { continue };
-        if touched.as_second() > cutoff || !live_reasons(conn, &row, now)?.is_empty() {
+        if touched.as_second() > cutoff || !live_reasons(conn, org, &row, now)?.is_empty() {
             continue;
         }
         let age = (now.as_second() - touched.as_second()) as f64 / 86_400.0;
@@ -509,7 +517,7 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 )));
             }
             let now = jiff::Timestamp::now();
-            let live = live_reasons(tx, &row, now)?;
+            let live = live_reasons(tx, &org, &row, now)?;
             if !live.is_empty() {
                 return Err(UaError::conflict_code(
                     "task_live",
@@ -529,7 +537,7 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
             require_holder(&writer, &row, "park")?;
             let open: Vec<Row> = descendants(tx, &org, id)?.into_iter().filter(is_active).collect();
             for child in &open {
-                let child_live = live_reasons(tx, child, now)?;
+                let child_live = live_reasons(tx, &org, child, now)?;
                 if !child_live.is_empty() {
                     return Err(UaError::conflict_code(
                         "task_live",
@@ -625,7 +633,7 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
                     if is_parked(&row) { "parked" } else { "not open" }
                 )));
             }
-            let live = live_reasons(tx, &row, jiff::Timestamp::now())?;
+            let live = live_reasons(tx, &org, &row, jiff::Timestamp::now())?;
             if !live.is_empty() {
                 return Err(UaError::conflict_code(
                     "task_live",
@@ -730,7 +738,7 @@ pub(crate) async fn queue_stale(ctx: ToolCtx, a: StaleArgs) -> UaResult<Value> {
                     "lane": s(&i.row, "lane"),
                     "last_touched": iso(i.touched),
                     "age_days": i.age_days,
-                    "protected": protection(c, &i.row, now)?,
+                    "protected": protection(c, &org, &i.row, now)?,
                 }));
             }
             Ok(json!({
@@ -771,7 +779,7 @@ fn sweep(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
             if !is_active(&child) || proposed.contains(&cid) {
                 continue;
             }
-            let live = live_reasons(c, &child, now)?;
+            let live = live_reasons(c, org, &child, now)?;
             if !live.is_empty() {
                 let mut entry = short(&child);
                 entry["would_be"] = json!("fold");
@@ -809,7 +817,7 @@ fn sweep(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
         if proposed.contains(&id) || covered.contains(&id) {
             continue;
         }
-        let protected = protection(c, row, now)?;
+        let protected = protection(c, org, row, now)?;
         let mut entry = short(row);
         if !protected.is_empty() {
             entry["would_be"] = json!("park");
@@ -821,7 +829,7 @@ fn sweep(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
         let open: Vec<Row> = descendants(c, org, id)?.into_iter().filter(is_active).collect();
         let mut blocking = None;
         for child in &open {
-            let live = live_reasons(c, child, now)?;
+            let live = live_reasons(c, org, child, now)?;
             if !live.is_empty() {
                 blocking = Some((int_field(child, "id").unwrap_or_default(), live));
                 break;
@@ -906,7 +914,7 @@ fn health(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
     let stale = stale_tasks(c, org, now, days)?;
     let mut actionable = 0;
     for item in &stale {
-        if protection(c, &item.row, now)?.is_empty() {
+        if protection(c, org, &item.row, now)?.is_empty() {
             actionable += 1;
         }
     }
