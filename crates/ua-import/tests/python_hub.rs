@@ -547,6 +547,10 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations WHERE org_id <> 'default'"), 0);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);
+    // Notes and their versions land in the default organization.
+    for t in ["memory", "memory_versions"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_reads"), 1);
     assert_eq!(table(&r, "tasks").copied, 4);

@@ -473,6 +473,26 @@ from its commit history.
   another organization's reasons and proposer are `null` in them and the
   originator is `system`. The importer writes legacy goals, links,
   proposals and items to `default` and never copies a source `org_id`.
+- Memory notes are organization-scoped: `organization.v1.memory` adds
+  `org_id` and the organization triggers to `memory`, `memory_versions` and
+  `memory_embeddings`; every existing row lands in `default` and none is
+  dropped. `memory.v2.org_scope` recreates `memory_versions_capture` so a
+  version names its note's organization, adds same-organization triggers
+  for versions, vectors and supersede pointers, and indexes led by
+  `org_id`. No key rebuild: a note id is hub-generated. Every memory tool,
+  both search legs (FTS and vectors, scoped inside the ranked query),
+  `export_memory`, `platform_object_get`, the session packet,
+  `vault_ingest`, `state_sync_verify` and `system_doctor` read and write
+  only the caller's organization's notes; another organization's note
+  answers as a missing one, and a write for an unknown organization is
+  refused (`unknown_organization`). `memory_promote` is refused outside the
+  default organization (`org_unsupported`). Another organization's save
+  keys are stored as `org:<org>/memory_save/<label>/<key>`. Memory events
+  stay in the default ledger with another organization's titles, tags,
+  revisions and labels `null` and the originator `system`. The importer
+  writes legacy notes and versions to `default`. Accepted leak candidate:
+  bm25 corpus statistics over the one `memory_fts` index span every
+  organization.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the

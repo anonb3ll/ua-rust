@@ -275,12 +275,19 @@ fn is_index_id(id: &str) -> bool {
     id.starts_with("masterindex") || id.starts_with("tagindex_")
 }
 
-fn memory_records(c: &Connection, tag: Option<&str>, since_day: Option<&str>) -> UaResult<Vec<Value>> {
+/// Organization `org`'s notes.
+fn memory_records(
+    c: &Connection,
+    org: &str,
+    tag: Option<&str>,
+    since_day: Option<&str>,
+) -> UaResult<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT id, title, content, tags, author, created_at, updated_at, salience, confidence, superseded_by, \
-         source_host, epistemic, evidence, valid_from, contradicts, valid_to FROM memory ORDER BY updated_at, id",
+         source_host, epistemic, evidence, valid_from, contradicts, valid_to FROM memory WHERE org_id = ?1 \
+         ORDER BY updated_at, id",
     )?;
-    let rows = stmt.query_map([], row_map)?;
+    let rows = stmt.query_map([org], row_map)?;
     let mut out = Vec::new();
     for row in rows {
         let r = row?;
@@ -331,9 +338,12 @@ async fn export_memory(ctx: ToolCtx, a: MemoryArgs) -> UaResult<Value> {
     }
     let since_day =
         a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
-    let tag = a.tag.clone();
-    let records =
-        ctx.hub.db().read_async(move |c| memory_records(c, tag.as_deref(), since_day.as_deref())).await?;
+    let (tag, org) = (a.tag.clone(), ctx.caller.org_id.clone());
+    let records = ctx
+        .hub
+        .db()
+        .read_async(move |c| memory_records(c, &org, tag.as_deref(), since_day.as_deref()))
+        .await?;
     let n = records.len();
     let (content, ext) = if format == "jsonl" {
         let mut out = String::new();

@@ -246,20 +246,24 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { (dot / (na.sqrt() * nb.sqrt())) as f32 }
 }
 
-/// Store (or replace) a note's vector.
+/// Store (or replace) the vector of organization `org`'s note. The
+/// `memory_embeddings_org_parent` trigger refuses a note of another
+/// organization, and the upsert never rewrites a row of another one.
 pub(crate) fn store_vector(
     conn: &Connection,
+    org: &str,
     note_id: &str,
     model: &str,
     v: &[f32],
     content_sha: &str,
 ) -> UaResult<()> {
     conn.execute(
-        "INSERT INTO memory_embeddings (note_id, model, dim, embedding, content_sha, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+        "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(note_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, \
-           embedding = excluded.embedding, content_sha = excluded.content_sha, updated_at = excluded.updated_at",
-        params![note_id, model, v.len() as i64, to_blob(v), content_sha, ua_core::time::now()],
+           embedding = excluded.embedding, content_sha = excluded.content_sha, updated_at = excluded.updated_at \
+         WHERE memory_embeddings.org_id = excluded.org_id",
+        params![org, note_id, model, v.len() as i64, to_blob(v), content_sha, ua_core::time::now()],
     )?;
     Ok(())
 }
@@ -267,7 +271,8 @@ pub(crate) fn store_vector(
 /// Nearest-neighbour lookup over stored note vectors.
 pub trait VectorIndex: Send + Sync {
     /// The `k` best notes passing `filter` with similarity >= `min_similarity`,
-    /// best first (ties by id).
+    /// best first (ties by id). `filter` names the organization, so only its
+    /// notes' vectors are scanned, ranked or returned.
     fn nearest(
         &self,
         conn: &Connection,
@@ -278,10 +283,12 @@ pub trait VectorIndex: Send + Sync {
         k: usize,
     ) -> UaResult<Vec<(String, f32)>>;
 
-    /// Similarity of each listed note that has a vector of `model`.
+    /// Similarity of each listed note of organization `org` that has a vector
+    /// of `model`.
     fn similarities(
         &self,
         conn: &Connection,
+        org: &str,
         model: &str,
         query: &[f32],
         ids: &[String],
@@ -303,7 +310,8 @@ impl VectorIndex for BruteForceIndex {
         k: usize,
     ) -> UaResult<Vec<(String, f32)>> {
         let sql = format!(
-            "SELECT e.note_id, e.embedding FROM memory_embeddings e JOIN memory m ON m.id = e.note_id \
+            "SELECT e.note_id, e.embedding FROM memory_embeddings e \
+             JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
              WHERE e.model = ? AND e.dim = ? AND {}",
             filter.sql
         );
@@ -331,6 +339,7 @@ impl VectorIndex for BruteForceIndex {
     fn similarities(
         &self,
         conn: &Connection,
+        org: &str,
         model: &str,
         query: &[f32],
         ids: &[String],
@@ -341,11 +350,12 @@ impl VectorIndex for BruteForceIndex {
         }
         let mut stmt = conn.prepare(
             "SELECT note_id, embedding FROM memory_embeddings \
-             WHERE model = ?1 AND note_id IN (SELECT value FROM json_each(?2))",
+             WHERE org_id = ?1 AND model = ?2 AND note_id IN (SELECT value FROM json_each(?3))",
         )?;
         let ids_json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-        let rows = stmt
-            .query_map(params![model, ids_json], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let rows = stmt.query_map(params![org, model, ids_json], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
         for row in rows {
             let (id, blob) = row?;
             out.insert(id, cosine(query, &from_blob(&blob)));

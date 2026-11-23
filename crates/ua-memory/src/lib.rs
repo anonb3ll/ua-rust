@@ -41,7 +41,9 @@ pub use embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
 pub use note::{Filter, mark_untrusted};
-pub use schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA, schema_parts};
+pub use schema::{
+    EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA, org_parts, schema_parts,
+};
 
 use ua_core::{UaError, UaResult};
 

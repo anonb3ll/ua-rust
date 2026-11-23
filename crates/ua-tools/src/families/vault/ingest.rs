@@ -279,19 +279,20 @@ async fn to_memory(ctx: ToolCtx, a: ToMemoryArgs) -> UaResult<Value> {
             continue;
         }
         let sub_tag = format!("vault:{}", sub.trim_matches('/').to_lowercase().replace(' ', "_"));
-        let (t, st) = (title.clone(), sub_tag.clone());
-        // The note this vault page was copied into before, if any.
+        let (t, st, org) = (title.clone(), sub_tag.clone(), ctx.caller.org_id.clone());
+        // The note this vault page was copied into before, if any, in the
+        // caller's organization (the save below writes there too).
         let existing: Option<(String, String)> = ctx
             .hub
             .db()
             .read_async(move |conn| {
                 Ok(conn
                     .query_row(
-                        "SELECT id, content FROM memory WHERE title = ?1 \
+                        "SELECT id, content FROM memory WHERE title = ?1 AND org_id = ?3 \
                          AND EXISTS (SELECT 1 FROM json_each(memory.tags) WHERE value = ?2) \
                          AND NOT EXISTS (SELECT 1 FROM json_each(memory.tags) WHERE value = 'meta:deleted') \
                          ORDER BY seq LIMIT 1",
-                        params![t, st],
+                        params![t, st, org],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?)

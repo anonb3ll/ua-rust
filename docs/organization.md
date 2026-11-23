@@ -681,14 +681,64 @@ here for memory columns, owners and defaults.
   no managed-secret mapping (the Python hub kept none), so it writes nothing
   here. `crates/ua-tools/tests/managed_secrets_tenant.rs` holds the upgrade,
   isolation, authority and leak tests.
+- The memory tables: `organization.v1.memory` gives `memory`,
+  `memory_versions` and `memory_embeddings` `org_id` and the organization
+  triggers; every existing row lands in `default`, and nothing is moved or
+  dropped (so no dropped-row record is needed). `memory.v2.org_scope`
+  recreates `memory_versions_capture` so a history row names `OLD.org_id`
+  (the released `memory_versions.v1` trigger left it to the default),
+  adds `memory_versions_org_parent`, `memory_embeddings_org_parent` (and
+  their `_update` twins) and `memory_org_superseded_by`, which keep a
+  version, a vector and a supersede pointer in their note's organization,
+  and the indexes `idx_memory_org_updated` and
+  `idx_memory_embeddings_org_model`. No key rebuild: a note id is
+  hub-generated (random, never caller-chosen), and `memory_versions
+  (note_id, version)` and `memory_embeddings(note_id)` are led by it. Every
+  statement filters `org_id`: `memory_save` (create, update, append,
+  overwrite, supersede, contradicts, the similar-note check), `memory_search`
+  (the FTS leg, the vector scan and the exact-similarity lookup, each with
+  the organization inside the ranked query, so another organization's notes
+  never take a candidate slot or a rank), `memory_list`, `memory_get` (with
+  its versions, links and contradiction counts), `memory_delete`,
+  `memory_restore`, `memory_feedback`, `memory_prune_candidates`,
+  `recall_maintenance`, the access counters, `export_memory`,
+  `platform_object_get`, the session packet's related notes and the
+  learning proposals' duplicate check, `vault_ingest`'s lookup,
+  `state_sync_verify`'s count and dangling-pointer check and
+  `system_doctor`'s note and vector counts. The UI and the compatibility
+  API reach memory only through these tools. Another organization's note
+  answers exactly as a missing one; a write for an organization `orgs` does
+  not hold is refused (`unknown_organization`) before anything changes.
+  `memory_promote` copies a note into the hub-wide vault, so another
+  organization's caller is refused (`org_unsupported`). A save's
+  idempotency key is stored as `org:<org>/memory_save/<label>/<key>` in
+  another organization (the default keeps `memory_save/<label>/<key>`), and
+  a pre-upgrade raw key replays only in the default organization. Memory
+  events are `ORG-EVENT-DEFAULT` sites: for another organization the title,
+  tags, revision hash, author, owner and actor are `null` and the
+  originator is `system`; ids, modes, signals and timestamps remain. The
+  importer writes legacy notes and versions to `default` and never copies a
+  source `org_id`. The migration manifest and `ua backup` stay hub-wide
+  (default organization and the operator only). **Accepted leak
+  candidates.** `memory_fts` is one hub-wide FTS5 index, so bm25's corpus
+  statistics (document frequencies, average length) count every
+  organization's notes: another organization's notes can shift the value of
+  a lexical `score` and its `explanation.lexical`, never which notes match,
+  rank against each other in a candidate cap, or are returned. Avoiding it
+  needs one FTS index per organization. The vector scan has no shared index
+  state (vectors are read per organization), so it leaks nothing.
+  `crates/ua-tools/tests/memory_tenant.rs` holds the upgrade, isolation,
+  semantic-search, idempotency, unknown-organization and ledger tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
-  [Converting a table family](#converting-a-table-family).
+  [Converting a table family](#converting-a-table-family). A released,
+  checksum-locked part whose trigger a later part recreates naming `org_id`
+  is excused by its exact text (today only `memory_versions.v1`); the live
+  trigger is still checked.
 
 Not yet: the tenant parts for the other families, the label and launch-key
-indexes, the `memory_versions_capture` trigger, `hash_v = 2`, and everything
-after `organization.v1`.
+indexes, `hash_v = 2`, and everything after `organization.v1`.
 
 ## Decision
 
@@ -1276,6 +1326,7 @@ global key in the tree is classified:
 | `tasks.id`, `task_dependencies.id`, `task_comments.id`, `task_comment_threads.task_id` | Global, safe | AUTOINCREMENT ids (and a thread keyed by its task's), never client text, so no rebuild (`organization.v1.tools.tasks`, `tasks.v2.org_scope`); the `*_org_parent` triggers keep every reference in one organization. The client-chosen comment idempotency key is unique per `(task_id, author, key)`, led by the hub-global task id. Accepted residual: the id gaps one organization sees reveal the hub's total task volume. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `autonomous_cycles.id`, `autonomous_cycle_transitions (cycle_id, idempotency_key)`, `autonomous_cycle_usage (cycle_id, usage_run_id, usage_id)` | Global, safe | A cycle id is hub-generated (random, never caller-chosen), and the transition and usage keys are led by it, so the caller-chosen idempotency and usage keys cannot collide across organizations; no rebuild (`organization.v1.tools.cycles`, `cycles.v2.org_scope`). The `*_org_parent` triggers keep transitions and usage in their cycle's organization. |
+| `memory.id`, `memory_versions (note_id, version)`, `memory_embeddings.note_id` | Global, safe | A note id is hub-generated (random, never caller-chosen), and the version and vector keys are led by it, so no rebuild (`organization.v1.memory`, `memory.v2.org_scope`). The `*_org_parent` triggers keep versions and vectors in their note's organization. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
@@ -1802,12 +1853,12 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
-| Tenant: memory | `memory`, `memory_versions`, `memory_embeddings`, and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
+| Tenant: memory | `memory`, `memory_versions`, `memory_embeddings` (`organization.v1.memory` and `memory.v2.org_scope`: every note read and write, search legs scoped inside the ranked query, versions and vectors in their note's organization), and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`; a GitHub delivery's replay keys are recorded in each organization whose secret verified it), `github_poll_repos` (`github.v2.poll_repos` creates it keyed `(org_id, repo)` and copies `github_poll_state`'s rows to the default organization, `organization.v1.tools.github_poll` adds the triggers) | `org_id`; keys rebuilt where listed above |
-| Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
+| Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there. Accepted leak: bm25's corpus statistics span every organization |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
 | Global identity | `users`, `passkeys`, `webauthn_states`, `login_links`, `oauth_clients`, `oauth_codes`, `oauth_grants`, `oauth_requests`, `oauth_tokens`, `ui_keys`, `ui_sessions`, `org_bootstrap` | Identity is global; the **grant** carries the organization (`oauth_grants.org_id`, `ui_sessions.org_id`, `agent_tokens.org_id`) |

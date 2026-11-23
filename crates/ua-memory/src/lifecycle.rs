@@ -5,14 +5,17 @@
 use rusqlite::params;
 use serde_json::{Value, json};
 use ua_core::{Caller, Config, UaError, UaResult};
-use ua_store::{Db, EventInput, ledger};
+use ua_store::Db;
 
 use super::note::{
-    self, DELETED_BY_HUMAN_TAG, DELETED_TAG, assert_privileged, json_list, json_text, verified,
+    self, DELETED_BY_HUMAN_TAG, DELETED_TAG, assert_privileged, emit, json_list, json_text, ledger_label,
+    verified,
 };
 
-/// Soft-delete note `id` as `caller`: its content becomes an attributed
-/// tombstone and it is tagged [`DELETED_TAG`]. Returns `{deleted}`.
+/// Soft-delete note `id` of the caller's organization as `caller`: its
+/// content becomes an attributed tombstone and it is tagged [`DELETED_TAG`].
+/// Returns `{deleted}`; `false` for a missing note, and for another
+/// organization's, alike.
 pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
     let Some(actor) = verified(caller).map(str::to_string) else {
         return Err(UaError::denied(
@@ -21,9 +24,10 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
         ));
     };
     let human = ua_org::authz::human(caller);
-    let label = caller.label.clone();
+    let (label, org) = (caller.label.clone(), caller.org_id.clone());
     db.write_async(move |tx| {
-        let Some(n) = note::fetch(tx, &id)? else { return Ok(json!({ "deleted": false })) };
+        note::require_org(tx, &org)?;
+        let Some(n) = note::fetch(tx, &org, &id)? else { return Ok(json!({ "deleted": false })) };
         if n.is_deleted() {
             return Ok(json!({ "deleted": false }));
         }
@@ -51,32 +55,39 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
         // The row stays: the tombstone keeps the text, the version
         // history keeps the prior state, and memory_restore undoes it.
         tx.execute(
-            "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 WHERE id = ?5",
-            params![tombstone.trim_start_matches('\n'), json_text(&tags), ts, actor, id],
+            "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
+             WHERE id = ?5 AND org_id = ?6",
+            params![tombstone.trim_start_matches('\n'), json_text(&tags), ts, actor, id, org],
         )?;
-        ledger::append(
+        emit(
             tx,
-            EventInput::new(
-                ua_core::DEFAULT_ORG,
-                "agent.memory.deleted",
-                json!({ "id": id, "owner": n.author, "actor": actor, "by_human": human }),
-            )
-            .by(label),
+            &org,
+            "agent.memory.deleted",
+            json!({
+                "id": id,
+                "owner": ledger_label(&org, n.author.as_deref()),
+                "actor": ledger_label(&org, Some(&actor)),
+                "by_human": human,
+            }),
+            &label,
         )?;
         Ok(json!({ "deleted": true }))
     })
     .await
 }
 
-/// Re-promote superseded note `id`, or undo its soft delete from the newest
-/// version recorded before the delete, as `caller`. `cfg.human_identities`
+/// Re-promote superseded note `id` of the caller's organization, or undo its
+/// soft delete from the newest version recorded before the delete, as
+/// `caller`. `cfg.human_identities`
 /// names the identities whose deletes only a human may undo.
 pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaResult<Value> {
     let caller = caller.clone();
     // Only what `Config::is_human` reads, not the whole config.
     let humans = cfg.human_identities.clone();
     db.write_async(move |tx| {
-        let n = note::require(tx, &id)?;
+        let org = caller.org_id.clone();
+        note::require_org(tx, &org)?;
+        let n = note::require(tx, &org, &id)?;
         let actor = verified(&caller).map(str::to_string);
         let human = ua_org::authz::human(&caller);
         if n.is_deleted() {
@@ -115,9 +126,10 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             }
             let prior = {
                 let mut stmt = tx.prepare(
-                    "SELECT version, content, tags FROM memory_versions WHERE note_id = ?1 ORDER BY version DESC",
+                    "SELECT version, content, tags FROM memory_versions WHERE note_id = ?1 AND org_id = ?2 \
+                     ORDER BY version DESC",
                 )?;
-                let rows = stmt.query_map([&id], |r| {
+                let rows = stmt.query_map(params![id, org], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
                 })?;
                 let mut found = None;
@@ -145,18 +157,23 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             assert_privileged(&caller, &tags, None)?;
             let ts = ua_core::time::now();
             tx.execute(
-                "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 WHERE id = ?5",
-                params![content, json_text(&tags), ts, actor, id],
+                "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
+                 WHERE id = ?5 AND org_id = ?6",
+                params![content, json_text(&tags), ts, actor, id, org],
             )?;
-            ledger::append(
+            emit(
                 tx,
-                EventInput::new(ua_core::DEFAULT_ORG,
-                    "agent.memory.restored",
-                    json!({ "id": id, "was_deleted": true, "restored_version": version, "actor": actor }),
-                )
-                .by(caller.label.clone()),
+                &org,
+                "agent.memory.restored",
+                json!({
+                    "id": id,
+                    "was_deleted": true,
+                    "restored_version": version,
+                    "actor": ledger_label(&org, Some(&actor)),
+                }),
+                &caller.label,
             )?;
-            let revision = note::require(tx, &id)?.revision();
+            let revision = note::require(tx, &org, &id)?.revision();
             let mut res = json!({
                 "id": id,
                 "restored": true,
@@ -180,16 +197,21 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             && !human
             && n.author.as_deref() != Some(actor.as_str())
         {
-            return Err(UaError::denied("not_owner", "only the note owner or a verified human can restore it"));
+            return Err(UaError::denied(
+                "not_owner",
+                "only the note owner or a verified human can restore it",
+            ));
         }
-        tx.execute("UPDATE memory SET superseded_by = NULL, valid_to = NULL WHERE id = ?1", [&id])?;
-        ledger::append(
+        tx.execute(
+            "UPDATE memory SET superseded_by = NULL, valid_to = NULL WHERE id = ?1 AND org_id = ?2",
+            params![id, org],
+        )?;
+        emit(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG,
-                "agent.memory.restored",
-                json!({ "id": id, "was_superseded_by": was, "actor": actor }),
-            )
-            .by(caller.label.clone()),
+            &org,
+            "agent.memory.restored",
+            json!({ "id": id, "was_superseded_by": was, "actor": ledger_label(&org, actor.as_deref()) }),
+            &caller.label,
         )?;
         Ok(json!({ "id": id, "restored": true, "was_superseded_by": was }))
     })
@@ -204,31 +226,28 @@ const SIGNALS: [(&str, &str); 4] = [
 ];
 
 /// Record `signal` (`helpful`, `not_helpful`, `stale` or `wrong`) on note
-/// `id`. Returns the note's counters and its `confidence_posterior`.
+/// `id` of the caller's organization. Returns the note's counters and its
+/// `confidence_posterior`.
 pub async fn feedback(db: &Db, caller: &Caller, id: String, signal: String) -> UaResult<Value> {
     let signal = signal.trim().to_lowercase();
     let Some((_, column)) = SIGNALS.iter().find(|(s, _)| *s == signal) else {
         return Err(UaError::invalid("signal must be one of helpful, not_helpful, stale, wrong"));
     };
     let column = *column;
-    let label = caller.label.clone();
+    let (label, org) = (caller.label.clone(), caller.org_id.clone());
     db.write_async(move |tx| {
-        note::require(tx, &id)?;
+        note::require_org(tx, &org)?;
+        note::require(tx, &org, &id)?;
         // Feedback is not an edit: content, tags and updated_at stay. A
         // helpful vote is also an explicit upvote for ranking.
         let upvote = if signal == "helpful" { ", upvoted_count = upvoted_count + 1" } else { "" };
-        tx.execute(&format!("UPDATE memory SET {column} = {column} + 1{upvote} WHERE id = ?1"), [&id])?;
-        ledger::append(
-            tx,
-            EventInput::new(
-                ua_core::DEFAULT_ORG,
-                "agent.memory.feedback",
-                json!({ "id": id, "signal": signal }),
-            )
-            .by(label),
+        tx.execute(
+            &format!("UPDATE memory SET {column} = {column} + 1{upvote} WHERE id = ?1 AND org_id = ?2"),
+            params![id, org],
         )?;
-        let n = note::require(tx, &id)?;
-        let open = note::open_contradictions(tx, None)?.get(&id).copied().unwrap_or(0);
+        emit(tx, &org, "agent.memory.feedback", json!({ "id": id, "signal": signal }), &label)?;
+        let n = note::require(tx, &org, &id)?;
+        let open = note::open_contradictions(tx, &org, None)?.get(&id).copied().unwrap_or(0);
         let mut res = json!({ "id": id, "signal": signal });
         if let (Some(obj), Value::Object(summary)) = (res.as_object_mut(), n.summary()) {
             obj.extend(summary);

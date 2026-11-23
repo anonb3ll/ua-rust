@@ -9,7 +9,8 @@
 //! the registrations with their descriptions and read-only and side-effect
 //! flags, and the glue from a [`ToolCtx`] (hub and verified caller) to the
 //! `ua_memory` functions. Storage, ranking, embeddings and every rule about
-//! who may change a note live in `ua_memory`.
+//! who may change a note live in `ua_memory`. Every tool reads and writes
+//! only the caller's organization's notes (`ctx.caller.org_id`).
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -25,7 +26,7 @@ pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
 pub(crate) use ua_memory::mark_untrusted;
-pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA};
+pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA};
 
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -257,15 +258,15 @@ impl From<GetArgs> for GetRequest {
 }
 
 async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
-    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), a.into()).await
+    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    ua_memory::search::list(ctx.hub.db(), a.into()).await
+    ua_memory::search::list(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ua_memory::search::get(ctx.hub.db(), a.into()).await
+    ua_memory::search::get(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_search(r: &mut Registry) {
@@ -427,11 +428,11 @@ impl From<MaintenanceArgs> for MaintenanceRequest {
 }
 
 async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
-    ua_memory::maintenance::prune_candidates(ctx.hub.db(), a.into()).await
+    ua_memory::maintenance::prune_candidates(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), a.into()).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_maintenance(r: &mut Registry) {

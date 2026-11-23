@@ -140,19 +140,21 @@ fn fts_query(text: &str) -> Option<String> {
     (!toks.is_empty()).then(|| toks.join(" OR "))
 }
 
-/// Live notes related to `text`, best match first.
-fn related_memory(conn: &Connection, text: &str, limit: usize) -> Vec<Value> {
+/// Organization `org`'s live notes related to `text`, best match first. The
+/// organization is filtered inside the ranked query, so another
+/// organization's notes never take one of the `limit` slots.
+fn related_memory(conn: &Connection, org: &str, text: &str, limit: usize) -> Vec<Value> {
     let Some(q) = fts_query(text) else { return Vec::new() };
     let Ok(mut stmt) = conn.prepare(
         "SELECT m.id, m.title, m.content, m.author, m.epistemic, m.confidence, m.evidence, m.valid_from \
          FROM memory_fts JOIN memory m ON m.seq = memory_fts.rowid \
-         WHERE memory_fts MATCH ?1 AND m.superseded_by IS NULL \
+         WHERE memory_fts MATCH ?1 AND m.org_id = ?3 AND m.superseded_by IS NULL \
          AND m.id NOT LIKE 'masterindex%' AND m.id NOT LIKE 'tagindex_%' \
          ORDER BY bm25(memory_fts) LIMIT ?2",
     ) else {
         return Vec::new();
     };
-    let rows = stmt.query_map(params![q, limit as i64], |r| {
+    let rows = stmt.query_map(params![q, limit as i64, org], |r| {
         let author: Option<String> = r.get(3)?;
         let mut row = json!({
             "id": r.get::<_, String>(0)?,
@@ -291,7 +293,7 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
 
     let memory = task
         .as_ref()
-        .map(|t| related_memory(conn, t["title"].as_str().unwrap_or(""), MEMORY_LIMIT))
+        .map(|t| related_memory(conn, &ctx.caller.org_id, t["title"].as_str().unwrap_or(""), MEMORY_LIMIT))
         .unwrap_or_default();
 
     let experience = match task_id {
@@ -720,9 +722,9 @@ fn proposal_relpath(inbox: &str, session_id: &str) -> String {
     format!("{inbox}/Session-Learning-{safe}.md")
 }
 
-/// Drop candidates that repeat each other, a live memory note, or an earlier
-/// proposal in the inbox.
-fn dedupe(conn: &Connection, candidates: Vec<Value>, earlier: &[String]) -> Vec<Value> {
+/// Drop candidates that repeat each other, a live memory note of
+/// organization `org`, or an earlier proposal in the inbox.
+fn dedupe(conn: &Connection, org: &str, candidates: Vec<Value>, earlier: &[String]) -> Vec<Value> {
     let mut kept: Vec<Value> = Vec::new();
     for cand in candidates {
         let text = cand["text"].as_str().unwrap_or("").to_string();
@@ -735,8 +737,8 @@ fn dedupe(conn: &Connection, candidates: Vec<Value>, earlier: &[String]) -> Vec<
                     query_rows(
                         conn,
                         "SELECT m.title, m.content FROM memory_fts JOIN memory m ON m.seq = memory_fts.rowid \
-                         WHERE memory_fts MATCH ?1 AND m.superseded_by IS NULL LIMIT 20",
-                        [q],
+                         WHERE memory_fts MATCH ?1 AND m.org_id = ?2 AND m.superseded_by IS NULL LIMIT 20",
+                        params![q, org],
                         |r| {
                             Ok(json!(format!(
                                 "{}\n{}",
@@ -918,7 +920,7 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
             let own =
                 Path::new(&rel2).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let earlier = vault_root.as_deref().map(|r| inbox_bodies(r, &inbox2, &own)).unwrap_or_default();
-            Ok((session, project, dedupe(conn, extracted, &earlier)))
+            Ok((session, project, dedupe(conn, &org, extracted, &earlier)))
         })
         .await?;
 
