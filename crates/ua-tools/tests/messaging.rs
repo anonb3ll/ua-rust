@@ -184,6 +184,18 @@ async fn send_cannot_name_a_conversation_it_is_not_in() {
     assert_eq!(missing.code(), "not_found");
     assert_eq!(foreign.to_string(), missing.to_string());
 
+    // A reply with no address: a missing parent and a foreign one answer alike.
+    let parent = sent["message_id"].as_str().unwrap().to_string();
+    let mut answers = Vec::new();
+    for reply_to in [parent.as_str(), "msg-absent"] {
+        let e = reg
+            .call(&hub, &c, "message_send", json!({"act": "inform", "body": "re", "reply_to": reply_to}))
+            .await
+            .unwrap_err();
+        answers.push((e.code().to_string(), e.to_string().replace(reply_to, "<id>")));
+    }
+    assert_eq!(answers[0], answers[1]);
+
     // A party continues its own conversation by id.
     let reply = send(
         &reg,

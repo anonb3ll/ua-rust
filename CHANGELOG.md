@@ -741,11 +741,14 @@ from its commit history.
   placeholder per hidden row — chain metadata stays visible as the accepted
   integrity exception, never the rows' contents, channels or parties).
   `message_send` accepts an explicit `conversation_id` from a restricted
-  caller only when the sender is already a party (or it is the addressed
-  session's `crew:<session>` thread); a missing and a foreign id answer the
-  same `not_found`, so the call is no existence test. New conversations take
-  a hub-minted id or inherit one through `reply_to`; a mail-unrestricted
-  reader may still start one under a chosen id.
+  caller only when the sender is already a party; a missing and a foreign id
+  answer the same `not_found`, as do a missing and a foreign `reply_to`
+  parent, so neither tests whether a conversation or message exists. New
+  conversations take a hub-minted id or inherit one through `reply_to`; a
+  mail-unrestricted reader may still start one under a chosen id, and only
+  the gated `crew_intervene` opens or joins a session's `crew:<session>`
+  thread. `crew_view` no longer returns other agents' private mail: a
+  restricted caller sees only the crew's messages it sent or received.
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

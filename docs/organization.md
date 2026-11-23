@@ -1467,8 +1467,10 @@ chain-continuous on its own, because the chain links through other
 organizations' rows.
 
 **Chain metadata is the accepted integrity exception to event visibility.**
-Rows a caller may not see — private mailbox messages, session-handoff notes
-and conversation-handoff links outside its reach — are hidden whole: their
+Rows a caller may not see — private mailbox messages and their inbox
+read/ack receipts (`agent.mailbox.*`, visible to the mailbox owner),
+session-handoff notes and conversation-handoff links outside its reach — are
+hidden whole: their
 channel, parties, task and payload never leak. The chain itself still does:
 sequence numbers, `prev_hash`/`entry_hash` links, the chain head
 (`head_ulid`/`head_hash`), verified totals such as `total_verified`, and the
@@ -1485,6 +1487,20 @@ One grant widens a restricted row beyond its parties: an
 holders (`tasks.claimed_by` or `next_owner`), because a task that was handed
 a conversation needs the link — `conversation_id`, `task_id`, `created`,
 `by` — to reach it.
+
+Who is a conversation's party is never self-granted. `message_send` accepts
+an explicit `conversation_id` from a restricted caller only when it is
+already the sender, or the label recipient, of a message in it; a missing
+and a foreign id answer the same `not_found`, and a `reply_to` naming a
+missing or a foreign message answers alike too. New conversations take a
+hub-minted id or inherit one through `reply_to`. The one exception is
+`crew_intervene`, which after its own profile check and approval gate may
+open or join the session's `crew:<session>` thread; a direct `message_send`
+naming that id is refused like any other. `crew_view` applies the mailbox
+rule: a restricted caller sees only the crew's messages it sent or received.
+A client-chosen `message_id` that collides with any existing message still
+answers `conflict`, which shows that some message holds that id, never its
+content or parties.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.

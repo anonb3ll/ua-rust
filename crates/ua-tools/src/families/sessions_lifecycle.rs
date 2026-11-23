@@ -1040,6 +1040,11 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
     }
     let cap = a.limit.unwrap_or(50).clamp(1, 200);
     let sid2 = sid.clone();
+    // A verified caller without the mail-unrestricted grant sees only the
+    // crew's messages it sent or received, as in its own mailbox.
+    let party = verified(&ctx.caller)
+        .filter(|_| !super::messaging::may_read_all_mail(ctx.hub.cfg(), &ctx.caller))
+        .map(str::to_string);
     let (session, mut messages) = ctx
         .hub
         .db()
@@ -1051,9 +1056,16 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
                  i.sender, i.recipient, i.task_id, i.delegation_id, i.target_session, i.sender_session, \
                  i.read_at, i.acked_at, e.payload \
                  FROM message_index i LEFT JOIN event_log e ON e.ulid = i.event_ulid \
-                 WHERE i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
-                 OR (?3 IS NOT NULL AND i.delegation_id = ?3) ORDER BY i.event_seq DESC LIMIT ?4",
-                params![crew_conversation_id(&sid2), session["task_id"].as_i64(), session["delegation_id"].as_i64(), cap],
+                 WHERE (i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
+                 OR (?3 IS NOT NULL AND i.delegation_id = ?3)) \
+                 AND (?5 IS NULL OR i.sender = ?5 OR i.recipient = ?5) ORDER BY i.event_seq DESC LIMIT ?4",
+                params![
+                    crew_conversation_id(&sid2),
+                    session["task_id"].as_i64(),
+                    session["delegation_id"].as_i64(),
+                    cap,
+                    party
+                ],
                 |r| {
                     let payload: Option<String> = r.get(15)?;
                     let payload: Value = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
@@ -1162,7 +1174,13 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
     }
     // Delivery goes through the messaging family's own tool, so its identity,
     // duplicate and loop guards apply unchanged.
-    let message = registry().call(&ctx.hub, &ctx.caller, "message_send", Value::Object(args)).await?;
+    // Bound as a crew delivery, the send may open or join crew:<sid> even
+    // when the session has gone quiet and delivery falls back to its label.
+    let message = super::messaging::as_crew_delivery(
+        sid.clone(),
+        registry().call(&ctx.hub, &ctx.caller, "message_send", Value::Object(args)),
+    )
+    .await?;
     let duplicate = message["duplicate"] == json!(true);
 
     let task_id = session["task_id"].as_i64();

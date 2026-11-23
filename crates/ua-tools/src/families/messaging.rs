@@ -713,7 +713,7 @@ fn check_pair_streak(
     }))
 }
 
-fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
+fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> UaResult<Value> {
     let act = a.act.trim().to_string();
     if !ACTS.contains(&act.as_str()) {
         return Err(UaError::invalid(format!("act must be one of {}", ACTS.join(", "))));
@@ -758,6 +758,9 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     }
 
     let reply = clean(a.reply_to.as_deref());
+    // Party-check reply_to before it can default the recipient, so a missing
+    // and a foreign parent answer alike.
+    let inherited = check_reply(tx, reply.as_deref(), &sender)?;
     let mut to_agent = clean(a.to_agent.as_deref());
     let mut target = clean(a.to_session.as_deref());
     if target.is_none()
@@ -823,14 +826,11 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     if parent(tx, &mid)?.is_some() {
         return Err(UaError::conflict(format!("message_id {mid:?} is already used by another message")));
     }
-    let inherited = check_reply(tx, reply.as_deref(), &sender)?;
     if let Some(cid) = &explicit_conversation
         && !v.unrestricted
-        // Naming the session's canonical crew conversation while addressing
-        // that session is the deterministic convention, not a chosen id.
-        && !target.as_deref().is_some_and(|t| {
-            *cid == format!("{}{t}", super::sessions_lifecycle::CREW_CONVERSATION_PREFIX)
-        })
+        // A gated crew_intervene delivery may open or join the session's
+        // crew thread; a direct message_send never gets this grant.
+        && !crew.is_some_and(|s| *cid == format!("{}{s}", super::sessions_lifecycle::CREW_CONVERSATION_PREFIX))
         && !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
              AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
@@ -1509,12 +1509,27 @@ pub(crate) fn send_system(
             to_session: to_session.map(str::to_string),
             from_session: None,
         },
+        None,
     )
 }
 
 async fn message_send(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
     let v = Viewer::of(&ctx);
-    ctx.hub.db().write_async(move |tx| send(tx, &v, a)).await
+    let crew = CREW_DELIVERY.try_with(Clone::clone).ok();
+    ctx.hub.db().write_async(move |tx| send(tx, &v, a, crew.as_deref())).await
+}
+
+tokio::task_local! {
+    /// The session a `crew_intervene` call is delivering to. Only that tool
+    /// binds it, after its own profile and approval gates, never a client.
+    static CREW_DELIVERY: String;
+}
+
+/// Run `f` (a registry `message_send` call) as a `crew_intervene` delivery
+/// to `session_id`: the sender may name that session's `crew:<session>`
+/// thread without already being a party to it.
+pub(super) async fn as_crew_delivery<F: std::future::Future>(session_id: String, f: F) -> F::Output {
+    CREW_DELIVERY.scope(session_id, f).await
 }
 
 async fn message_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
@@ -1689,7 +1704,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "message_send",
-            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one.",
+            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. crew_intervene alone may open or join a session's crew:<session> thread.",
             message_send,
         )
         .family("messaging"),

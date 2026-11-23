@@ -118,7 +118,8 @@ fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool>
             |r| r.get(0),
         )?,
         Some(me) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 AND (sender = ?2 OR recipient = ?2))",
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+             AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
             params![cid, me],
             |r| r.get(0),
         )?,
@@ -165,7 +166,12 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 &ctx.caller,
                 "conversation handoff",
                 "task_update",
-                "conversation_handoff",
+                "coordination_manage",
+                crate::routes::route("coordination_manage", &json!({ "action": "conversation_handoff" }))
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.recorded())
+                    .as_deref(),
             )
             .await?;
             let exists: bool = ctx

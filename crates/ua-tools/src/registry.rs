@@ -929,7 +929,7 @@ pub(crate) async fn record_decision_rule(hub: &Hub, caller: &Caller, tool: &str,
 /// [`record_decision_rule`] for a call of a consolidated tool: the event
 /// names the tool called (`tool`) and the action it would have run
 /// (`action_tool`: the standalone tool or `tool:action` key).
-async fn record_decision_routed(
+pub(crate) async fn record_decision_routed(
     hub: &Hub,
     caller: &Caller,
     tool: &str,

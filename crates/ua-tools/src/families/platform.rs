@@ -41,7 +41,7 @@ use super::runs;
 use crate::approvals;
 use crate::hub::Hub;
 use crate::policy::{self, Verdict};
-use crate::registry::{Registry, ToolCtx, record_decision_rule, tool};
+use crate::registry::{Registry, ToolCtx, record_decision_routed, tool};
 
 /// Bumped when a manifest field changes meaning or disappears.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
@@ -466,19 +466,22 @@ pub fn may_read(caller: &Caller, tool: &str) -> bool {
 /// that tool, evaluated as the caller with no arguments. The refusal codes are
 /// the ones a direct call of `tool` would get. A tool the policy or
 /// `approval_tools` sends through the approval gate cannot be read around it.
-/// A refusal is recorded as a gateway decision on the calling tool's name
-/// (`recorded_tool`, `platform_object_get` for the kind reader).
+/// A refusal is recorded as a gateway decision on the tool called
+/// (`recorded_tool`, `platform_object_get` for the kind reader) and, for a
+/// consolidated tool's action, the action it ran (`action_tool`, as the
+/// registry records it).
 pub async fn check_read(
     hub: &Hub,
     caller: &Caller,
     kind: &str,
     tool: &'static str,
     recorded_tool: &'static str,
+    action_tool: Option<&str>,
 ) -> UaResult<()> {
     match read_gate(hub, caller, kind, tool).await {
         Ok(()) => Ok(()),
         Err((err, rule)) => {
-            record_decision_rule(hub, caller, recorded_tool, &err, &rule).await;
+            record_decision_routed(hub, caller, recorded_tool, action_tool, &err, &rule).await;
             Err(err)
         }
     }
@@ -732,7 +735,7 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
     if !t.served {
         return Err(UaError::not_found(format!("object kind {kind:?} is not served by this hub")));
     }
-    check_read(hub, caller, kind, t.profile_tool, "platform_object_get").await?;
+    check_read(hub, caller, kind, t.profile_tool, "platform_object_get", None).await?;
     let id = id.map(str::to_string).filter(|i| !i.is_empty());
     if t.collection {
         if id.is_some() {
