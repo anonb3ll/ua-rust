@@ -414,7 +414,10 @@ from its commit history.
   another. `relay_manage status` answers a draft whose approval is in
   another organization with `approval_status: null` instead of failing the
   call; `cancel` still fails closed. Isolation tests now cover the session
-  packet's and the evidence report's approval reads.
+  packet's and the evidence report's approval reads. Excluded: a
+  policy-authorization refusal (`github/authz.rs:181`) is still ledgered as
+  a default-organization event and writes the caller's label to the default
+  ledger until `policy_authorizations` carries `org_id`.
 
 - `scripts/vocab-check.sh`: an allowlist entry now silences only the pattern
   class it was written for. A `vocab` entry (the legacy profile names) no
@@ -512,10 +515,16 @@ from its commit history.
 - `skill_registry` approval payloads (publish, assign, unassign) now carry
   `org_id`, so a pass is never consumed across organizations. An approval
   parked in the old payload shape no longer matches its call: it can never
-  be consumed, so no migration expires it. **Upgrade note:** deny any
-  pending `skill_registry` approval at upgrade and retry the call, which
-  parks a new approval in the new shape.
-
+  be consumed, so no migration expires it. **Upgrade note:** deny or revoke
+  pending or approved `skill_registry` approvals at upgrade and retry the
+  call, which parks a new approval in the new shape.
+- `conversation_handoff` no longer writes the
+  `[conversation: <id>] handed off from the agent conversation` line into the
+  task's notes and no longer returns `reference`: the link is recorded only
+  by the audited `agent.conversation.handoff` ledger event, visible per the
+  event-visibility rule, and the task's notes and `updated_at` stay
+  untouched. `conversation_handoffs` still reports legacy notes-only links
+  under `unaudited` and whether the line survives (`note_reference`).
 - `harness_config_publish` and `harness_config_apply` approval payloads now
   carry `org_id`, the organization the bundle or surface write belongs to, so
   an approval is never consumed across organizations. Upgrading expires every
@@ -783,6 +792,35 @@ from its commit history.
 
 ### Security
 
+- Ledger event visibility: `agent.message.*`, `agent.mailbox.*` (inbox
+  read/ack receipts), `agent.lifecycle.handoff` and
+  `agent.conversation.handoff` rows are now visible only to the readers the
+  record concerns — a message's sender and recipient, a receipt's mailbox
+  owner (its writer), a handoff note's
+  parties and the session's owner (or a note-reading operator), a
+  conversation's participants and the linked task's holders, or a
+  mail-unrestricted reader. The rule (`VISIBLE_EVENT`) applies to
+  `event_log_query`, the live event stream, `session_packet` event lists,
+  `observability_manage` activity and metrics, evidence reports and the
+  migration manifest (which keeps a `{ulid, entry_hash, redacted}`
+  placeholder per hidden row — chain metadata stays visible as the accepted
+  integrity exception, never the rows' contents, channels or parties).
+  `message_send` accepts an explicit `conversation_id` from a restricted
+  caller only when the sender is already a party; a missing and a foreign id
+  answer the same `not_found`, as do a missing and a foreign `reply_to`
+  parent, so neither tests whether a conversation or message exists. New
+  conversations take a hub-minted id or inherit one through `reply_to`; a
+  mail-unrestricted reader may still start one under a chosen id, and only
+  the gated `crew_intervene` opens or joins a session's `crew:<session>`
+  thread. `crew_view` no longer returns other agents' private mail: a
+  restricted caller sees only the crew's messages and worktree intervention
+  lines it sent or received, and only the session agent gets the drop file's
+  path. `crew_intervene` no longer copies the body anywhere outside the
+  mailbox: the task-note marker records only the time and session, and the
+  worktree `.ua/interventions.jsonl` line carries the parties and
+  `message_id`. `message_send`
+  refuses a client-chosen `message_id` with an external-thread prefix
+  (`ts:`).
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

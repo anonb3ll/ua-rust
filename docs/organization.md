@@ -370,8 +370,12 @@ here for memory columns, owners and defaults.
   another organization with `approval_status: null`; its `cancel` still
   fails closed (`not found`), so a draft is never marked cancelled while
   its approval stays live where the caller cannot withdraw it. Skill
-  registry approvals (publish, assign, unassign) bind `org_id`. A policy-authorization refusal stays a default
-  organization event until `policy_authorizations` converts. The importer
+  registry approvals (publish, assign, unassign) bind `org_id`. A
+  policy-authorization refusal stays a default organization event until
+  `policy_authorizations` converts, and is an excluded site: its
+  `refuse` (`crates/ua-tools/src/families/github/authz.rs:181`) ledgers the
+  refusal as a default-organization one, so its payload and `originator`
+  carry the caller's label whatever the caller's organization. The importer
   writes legacy approvals to `default`. `crates/ua-tools/tests/approvals_tenant.rs`
   holds the upgrade and the isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
@@ -1553,6 +1557,52 @@ rows with `prev_hash` and `entry_hash` but **without `seq`**, whose gaps would
 reveal hub-wide volume; every row's own hash is checkable, but the export is not
 chain-continuous on its own, because the chain links through other
 organizations' rows.
+
+**Chain metadata is the accepted integrity exception to event visibility.**
+Rows a caller may not see — private mailbox messages and their inbox
+read/ack receipts (`agent.mailbox.*`, visible to the mailbox owner),
+session-handoff notes and conversation-handoff links outside its reach — are
+hidden whole: their
+channel, parties, task and payload never leak. The chain itself still does:
+sequence numbers, `prev_hash`/`entry_hash` links, the chain head
+(`head_ulid`/`head_hash`), verified totals such as `total_verified`, and the
+migration manifest's `{ulid, entry_hash, redacted: true}` placeholder for each
+hidden row. That metadata proves the ledger is intact and reveals that a row
+exists and roughly when it was written — placeholder and chain-head ULIDs
+encode millisecond creation time, and a hidden row's `seq` position bounds how
+many rows surround it — so its timing can be correlated with a known author's
+other visible activity. It never reveals the row's content, channel or
+parties.
+
+One grant widens a restricted row beyond its parties: an
+`agent.conversation.handoff` row is also visible to the linked task's
+holders (`tasks.claimed_by` or `next_owner`), because a task that was handed
+a conversation needs the link — `conversation_id`, `task_id`, `created`,
+`by` — to reach it.
+
+Who is a conversation's party is never self-granted. `message_send` accepts
+an explicit `conversation_id` from a restricted caller only when it is
+already the sender, or the label recipient, of a message in it; a missing
+and a foreign id answer the same `not_found`, and a `reply_to` naming a
+missing or a foreign message answers alike too. New conversations take a
+hub-minted id or inherit one through `reply_to`. The one exception is
+`crew_intervene`, which after its own profile check and approval gate may
+open or join the session's `crew:<session>` thread; a direct `message_send`
+naming that id is refused like any other. `crew_view` applies the mailbox
+rule to its messages and its `worktree_interventions` audit lines: a
+restricted caller sees only those it sent or received, and only the session
+agent and unrestricted readers get the drop file's `interventions_path`.
+The body lives only in the mailbox: the worktree's
+`.ua/interventions.jsonl` line (readable through the workspace's fs tools)
+carries the parties and `message_id`, and the task-note marker
+(`[intervention @ <time>] session=<sid>`, readable by every caller) only
+shows that the session was steered and when — that existence and timing are
+the residual, like the chain metadata above. The recipient of session-targeted mail (including the
+session owner in its `crew:<session>` thread) is not a party for naming the
+conversation or reading its handoff links; it answers through `reply_to`.
+A client-chosen `message_id` that collides with any existing message still
+answers `conflict`, which shows that some message holds that id, never its
+content or parties.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.

@@ -38,7 +38,7 @@ use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use crate::families::events::{EventReader, VISIBLE_MESSAGE};
+use crate::families::events::{EventReader, VISIBLE_EVENT};
 use crate::families::injection::mark_untrusted;
 use crate::families::observability::{normalize_since, normalize_until};
 use crate::families::plans::row_map;
@@ -351,7 +351,7 @@ fn build_report(
             " AND (tasks.claimed_by = ? OR instr(COALESCE(tasks.notes, ''), ?) > 0 OR EXISTS (\
              SELECT 1 FROM event_log WHERE originator = ? AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
              AND json_valid(payload) AND CAST(json_extract(payload, '$.task_id') AS INTEGER) = tasks.id \
-             AND ({VISIBLE_MESSAGE})))",
+             AND ({VISIBLE_EVENT})))",
         ));
         args.extend([agent as &dyn ToSql, &claimed_by_marker, agent]);
         args.extend(visibility);
@@ -399,7 +399,7 @@ fn build_report(
                      originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
                      AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
                      AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({{ids}}) \
-                     AND ({VISIBLE_MESSAGE}) ORDER BY seq"
+                     AND ({VISIBLE_EVENT}) ORDER BY seq"
                 ),
                 &ids,
                 &visibility,

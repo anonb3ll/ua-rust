@@ -731,8 +731,6 @@ enum Acquire {
     Busy,
 }
 
-/// Execute (or continue) a run as `caller` until it finishes, fails, is
-/// denied or waits on an approval.
 /// Refuse to run a step of a run in organization `run_org` as a caller of
 /// another organization. A gated step's approval payload binds the run's
 /// organization, but [`approvals::gate`] parks and matches in the caller's,
@@ -750,6 +748,8 @@ pub(crate) fn require_caller_in_run_org(caller: &Caller, run_org: &str) -> UaRes
     )))
 }
 
+/// Execute (or continue) a run as `caller` until it finishes, fails, is
+/// denied or waits on an approval.
 pub(crate) async fn execute(hub: &Hub, caller: &Caller, run: &RunRow, def: &Definition) -> UaResult<Report> {
     // Before the lease: a refused run is left exactly as it was.
     require_caller_in_run_org(caller, &run.org_id)?;

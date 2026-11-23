@@ -175,6 +175,62 @@ async fn packet_selects_the_latest_handoff_visible_to_the_caller() {
 }
 
 #[tokio::test]
+async fn packet_recent_events_hide_messages_the_caller_cannot_read() {
+    let e = Env::new();
+    let (sender, recipient, other) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task = e.ok(&sender, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+    e.ok(
+        &sender,
+        "message_send",
+        json!({ "act": "request", "to_agent": recipient.label, "task_id": task, "body": "please review" }),
+    )
+    .await;
+    e.ok(
+        &sender,
+        "message_send",
+        json!({ "act": "handoff", "to_agent": recipient.label, "task_id": task, "body": "Ready for review",
+                "handoff": { "done": ["prepare"], "next_action": "Review the summary" } }),
+    )
+    .await;
+    let session = e.start(&recipient, json!({ "task_id": task })).await;
+    let note = e
+        .ok(
+            &recipient,
+            "coordination_manage",
+            json!({ "action": "session_handoff_propose",
+                    "params": { "session_id": session, "done": ["a"], "next_steps": ["b"] } }),
+        )
+        .await;
+    e.ok(
+        &recipient,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note["id"] } }),
+    )
+    .await;
+
+    let leaks_private = |p: &Value| {
+        ["recent_events", "lifecycle"].iter().any(|key| {
+            p[key].as_array().unwrap().iter().any(|ev| {
+                let ch = ev["channel"].as_str().unwrap_or("");
+                ch.starts_with("agent.message.") || ch == "agent.lifecycle.handoff"
+            })
+        })
+    };
+    let has_channel = |p: &Value, key: &str, channel: &str| {
+        p[key].as_array().unwrap().iter().any(|ev| ev["channel"] == channel)
+    };
+
+    let outsider = e.ok(&other, "session_packet", json!({ "task_id": task })).await;
+    assert!(!leaks_private(&outsider), "{outsider}");
+
+    let to_recipient = e.ok(&recipient, "session_packet", json!({ "task_id": task })).await;
+    assert!(has_channel(&to_recipient, "recent_events", "agent.message.request"), "{to_recipient}");
+    assert!(has_channel(&to_recipient, "lifecycle", "agent.lifecycle.handoff"), "{to_recipient}");
+    let to_sender = e.ok(&sender, "session_packet", json!({ "task_id": task })).await;
+    assert!(has_channel(&to_sender, "recent_events", "agent.message.request"), "{to_sender}");
+}
+
+#[tokio::test]
 async fn an_oversized_packet_is_trimmed_to_the_cap() {
     let e = Env::new();
     let b = agent("builder-1");
@@ -468,4 +524,105 @@ async fn a_worktree_outside_the_workspace_is_never_written() {
     assert_eq!(r["worktree_written"], false);
     assert_eq!(r["interventions_path"], Value::Null);
     assert!(!outside.path().join(".ua").exists());
+}
+
+#[tokio::test]
+async fn crew_view_shows_a_restricted_caller_only_its_own_mail() {
+    let e = Env::new();
+    let (b1, b2, outsider) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let task = e.ok(&b1, "task_add", json!({ "title": "Rotation task" })).await["id"].as_i64().unwrap();
+    let owner_session = e.start(&b2, json!({ "task_id": task })).await;
+    e.ok(
+        &b1,
+        "message_send",
+        json!({ "act": "request", "to_agent": "builder-2", "body": "Private: the key", "task_id": task }),
+    )
+    .await;
+
+    // The parties see the task's mail through the owner's session.
+    for who in [&b1, &b2] {
+        let v = e.ok(who, "crew_view", json!({ "session_id": owner_session })).await;
+        assert_eq!(v["message_total"], 1, "{v}");
+    }
+    // An outsider sees none of it: neither through the owner's session nor
+    // through a session of its own on the same task.
+    let own = e.start(&outsider, json!({ "task_id": task })).await;
+    for sid in [&owner_session, &own] {
+        let v = e.ok(&outsider, "crew_view", json!({ "session_id": sid })).await;
+        assert_eq!(v["message_total"], 0, "{v}");
+        assert!(!v.to_string().contains("Private"), "{v}");
+    }
+    // A mail-unrestricted reader sees everything.
+    let all = e.ok(&human(), "crew_view", json!({ "session_id": owner_session })).await;
+    assert_eq!(all["message_total"], 1, "{all}");
+
+    // An intervention into a session with a worktree: its audit copy follows
+    // the same rule, and the task's notes name the message, not its body.
+    let wt = e.ws.path().join("wt-private");
+    std::fs::create_dir_all(&wt).unwrap();
+    let steered = e.start(&b2, json!({ "task_id": task, "worktree_path": wt.to_str().unwrap() })).await;
+    let lead = agent("lead-1");
+    approved_call(&e, &lead, json!({ "session_id": steered, "message": "Secret: rotate now" }))
+        .await
+        .unwrap();
+    for who in [&lead, &b2] {
+        let v = e.ok(who, "crew_view", json!({ "session_id": steered })).await;
+        assert_eq!(v["worktree_interventions"].as_array().unwrap().len(), 1, "{v}");
+    }
+    let v = e.ok(&outsider, "crew_view", json!({ "session_id": steered })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+    assert_eq!(v["interventions_path"], Value::Null, "the drop file's path is the session agent's: {v}");
+    assert!(!v.to_string().contains("Secret"), "{v}");
+    let mine = e.ok(&b2, "crew_view", json!({ "session_id": steered })).await;
+    assert!(mine["interventions_path"].is_string(), "{mine}");
+    // The drop file sits in the workspace, where fs tools reach: it holds the
+    // parties and message id, never the body (that is in the mailbox).
+    let line = std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap();
+    assert!(line.contains("message_id") && !line.contains("Secret"), "{line}");
+    let notes = e.ok(&outsider, "task_list", json!({ "status": "all" })).await;
+    assert!(notes.to_string().contains("[intervention @"), "{notes}");
+    assert!(!notes.to_string().contains("Secret"), "{notes}");
+}
+
+#[tokio::test]
+async fn only_crew_intervene_opens_a_crew_thread() {
+    let e = Env::new();
+    let (b, lead, lead2, outsider) =
+        (agent("builder-1"), agent("lead-1"), agent("lead-2"), agent("builder-3"));
+    let s = e.start(&b, json!({})).await;
+    let crew = format!("crew:{s}");
+
+    // Naming the crew thread directly is refused like any foreign id, both
+    // before and after the thread exists.
+    let direct = json!({ "act": "inform", "to_agent": "builder-1", "to_session": s, "body": "hi",
+                         "conversation_id": crew });
+    assert_eq!(e.err(&outsider, "message_send", direct.clone()).await.code(), "not_found");
+    let first = approved_call(&e, &lead, json!({ "session_id": s, "message": "rebase" })).await.unwrap();
+    assert_eq!(first["message"]["conversation_id"], crew.as_str(), "{first}");
+    assert_eq!(e.err(&outsider, "message_send", direct).await.code(), "not_found");
+
+    // A second intervener joins the same thread.
+    let second = approved_call(&e, &lead2, json!({ "session_id": s, "message": "and test" })).await.unwrap();
+    assert_eq!(second["message"]["conversation_id"], crew.as_str(), "{second}");
+
+    // A session gone quiet (open, no recent heartbeat) still takes an
+    // intervention: delivery falls back to the label, the thread stays.
+    let sid = s.clone();
+    e.hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE agent_sessions SET last_heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE id = ?1",
+                [&sid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // A fresh intervener, not yet a party to the thread, so only the crew
+    // grant can let it in.
+    let lead3 = agent("lead-3");
+    let quiet =
+        approved_call(&e, &lead3, json!({ "session_id": s, "message": "still there?" })).await.unwrap();
+    assert!(quiet["message"]["to_session"].is_null(), "delivery fell back to the label: {quiet}");
+    assert_eq!(quiet["message"]["conversation_id"], crew.as_str(), "{quiet}");
 }

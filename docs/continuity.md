@@ -155,13 +155,27 @@ draft --seal--> sealed --> assigned --> delivered
 
 `conversation_handoff` (`conversation_id`, then `task_id` to link or `title`,
 `project`, `priority` to create) ties a mailbox conversation to a task. The
-task gets one notes line, `[conversation: <id>] handed off from the agent
-conversation`; no message is copied. The caller must have sent or received a
+link is one `agent.conversation.handoff` ledger event; no message is copied
+and no conversation id is written into the task (whose notes and updates
+every caller can read). Tasks handed off by older or imported hubs may carry
+a notes line, `[conversation: <id>] handed off from the agent conversation`;
+`conversation_handoffs` still reports those as `unaudited`, and a ledgered
+handoff reports whether the line is still there (`note_reference`). The
+caller must have sent or received a
 message in the conversation (an operator, a verified human, sees every
-conversation; a profile grants nothing). The task write goes through the registry as `task_add` or
-`task_update`, so the caller's profile, the policy file and the approval gate
-apply as they do to a direct call. Creating is idempotent per conversation,
-title, project and priority.
+conversation; a profile grants nothing). Linking applies `task_update`'s
+read gate — the profile allow-list and the policy file, with the same
+refusal codes a call would get — before it checks the task exists; the
+`coordination_manage` call itself already passed the registry's policy and
+approval gate. Creating goes through
+the registry as `task_add`, so the caller's profile, the policy file and the
+approval gate apply as they do to a direct call. Creating is idempotent per
+conversation, title, project and priority.
+
+The ledger event is also readable by the linked task's holders — its
+`claimed_by` or `next_owner` — because a task that was handed a conversation
+needs the link (`conversation_id`, `task_id`, `created`, `by`) to reach it;
+the row stays invisible to everyone else outside the conversation.
 
 `conversation_handoffs` has the same caller rule (a verified caller that can
 see the conversation; anyone else reads `not_found`), and is also open to a

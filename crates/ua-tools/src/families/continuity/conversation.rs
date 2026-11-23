@@ -3,15 +3,18 @@
 //! A conversation is a `message_send` thread (`conversation_id`). Handing it
 //! off creates a task, or links an existing one, that *references* the
 //! conversation by id. The transcript keeps one owner: no message body is
-//! copied into task notes or any other table.
+//! copied into task notes or any other table, and the conversation id never
+//! reaches the task, whose notes and updates every caller can read.
 //!
-//! The link is recorded twice: a
-//! `[conversation: <id>] handed off from the agent conversation` line in the
-//! task notes, and one `agent.conversation.handoff` ledger event (who handed
-//! off, and when). The event is the audited record: `conversation_handoffs`
-//! lists a task under `handoffs` only when a handoff event links it, and a
-//! task whose notes merely carry the line (anyone who can write notes can
-//! type it) under `unaudited`, so a note line never passes for a handoff.
+//! The link is recorded once, as an `agent.conversation.handoff` ledger
+//! event (who handed off, and when) — visible only to the conversation's
+//! participants and mail-unrestricted readers. The event is the audited
+//! record: `conversation_handoffs` lists a task under `handoffs` only when
+//! a handoff event links it. A task whose notes carry the legacy
+//! `[conversation: <id>] handed off from the agent conversation` line
+//! (older and imported hubs wrote it; anyone who can write notes can type
+//! it) is listed under `unaudited`, so a note line never passes for a
+//! handoff.
 //!
 //! Rules:
 //!
@@ -21,16 +24,18 @@
 //!   Listing handoffs follows the same rule, and is also open to a caller
 //!   with no verified identity (auth enforcement off), for whom mailboxes
 //!   and conversations are a message board to read.
-//! - Only an id-safe conversation id (1-200 letters, digits, `.`, `_`, `:`
-//!   or `-`) is written into notes, so an id cannot forge a note marker.
-//! - The task write is the registered `task_add` (create) or `task_update`
-//!   (link, `append_note`) called through the governed registry as the
-//!   caller, so the caller's profile, the policy file and the approval gate
-//!   apply exactly as to a direct call.
+//! - Linking applies `task_update`'s read gate (profile allow-list and
+//!   policy file, the same refusal codes as a call would get) before it
+//!   checks the task exists, so a refused caller cannot probe task ids.
+//!   The `coordination_manage` call itself already passed the registry's
+//!   policy and approval gate. Creating calls the registered `task_add`
+//!   through the governed registry as the caller, so the caller's profile,
+//!   the policy file and the approval gate apply exactly as to a direct
+//!   call.
 //! - Creating is idempotent per conversation, title, project and priority
 //!   (a `task_add` idempotency key derived from them): a repeat returns the
-//!   same task. Relinking appends nothing new (`task_update` suppresses a
-//!   verbatim repeat of a note line).
+//!   same task. Relinking appends nothing new (the handoff event is
+//!   deduplicated).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,7 +118,8 @@ fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool>
             |r| r.get(0),
         )?,
         Some(me) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 AND (sender = ?2 OR recipient = ?2))",
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+             AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
             params![cid, me],
             |r| r.get(0),
         )?,
@@ -149,13 +155,36 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
         return Err(UaError::not_found("conversation not found"));
     }
 
-    let line = reference(&cid);
     let (task_id, created) = match (a.task_id, title) {
         (Some(id), _) => {
-            let reply = registry()
-                .call(&ctx.hub, &ctx.caller, "task_update", json!({ "id": id, "append_note": line }))
+            // The link is only the audited handoff event below: the task's
+            // notes and updated_at stay untouched. The profile and policy
+            // check runs before the task's existence, so a refused caller
+            // learns nothing about task ids.
+            crate::families::platform::check_read(
+                &ctx.hub,
+                &ctx.caller,
+                "conversation handoff",
+                "task_update",
+                "coordination_manage",
+                crate::routes::route("coordination_manage", &json!({ "action": "conversation_handoff" }))
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.recorded())
+                    .as_deref(),
+            )
+            .await?;
+            let exists: bool = ctx
+                .hub
+                .db()
+                .read_async(move |c| {
+                    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [id], |r| r.get(0))?)
+                })
                 .await?;
-            (reply["id"].as_i64().unwrap_or(id), false)
+            if !exists {
+                return Err(UaError::not_found(format!("no task with id {id}")));
+            }
+            (id, false)
         }
         (None, Some(title)) => {
             let title: String = title.chars().take(MAX_TITLE).collect();
@@ -173,8 +202,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                     )?)
                 })
                 .await?;
-            let mut args =
-                json!({ "title": title, "notes": line, "priority": priority, "idempotency_key": key });
+            let mut args = json!({ "title": title, "priority": priority, "idempotency_key": key });
             if let Some(p) = a.project {
                 args["project"] = json!(p);
             }
@@ -215,7 +243,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
             Ok(())
         })
         .await?;
-    Ok(json!({ "conversation_id": cid, "task_id": task_id, "created": created, "reference": line }))
+    Ok(json!({ "conversation_id": cid, "task_id": task_id, "created": created }))
 }
 
 /// `coordination_manage(action="conversation_handoffs")`: the tasks a visible

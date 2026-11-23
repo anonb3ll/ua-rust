@@ -591,12 +591,16 @@ async fn organization_b_labels_never_reach_the_default_ledger() {
         ));
         assert_eq!(leaked, 0, "{needle:?} reached the default organization's ledger");
     }
-    // Every one of organization B's approval events is attributed to the
-    // neutral originator, never to its requester or resolver.
-    let originators = h.count(&format!(
-        "SELECT COUNT(*) FROM event_log WHERE channel LIKE 'agent.approval.%' AND originator <> '{}'",
-        approvals::NEUTRAL_ORIGINATOR
-    ));
+    // Every one of organization B's approval events (requested twice,
+    // resolved, refused twice, consumed) is attributed to the neutral
+    // originator, never to its requester or resolver.
+    let b_events = format!(
+        "SELECT COUNT(*) FROM event_log WHERE channel LIKE 'agent.approval.%' \
+         AND json_extract(payload, '$.approval_id') IN (SELECT id FROM approvals WHERE org_id = '{ORG_B}')"
+    );
+    assert_eq!(h.count(&b_events), 6, "organization B's approval events");
+    let originators =
+        h.count(&format!("{b_events} AND originator IS NOT '{}'", approvals::NEUTRAL_ORIGINATOR));
     assert_eq!(originators, 0, "an organization B approval event names a label as its originator");
     // Organization B keeps its own text.
     let v = h.call(&b_agent, "approval_pending", json!({})).await.unwrap();

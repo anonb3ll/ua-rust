@@ -24,6 +24,24 @@ async fn call(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) 
     reg.call(hub, who, tool, args).await.unwrap_or_else(|e| panic!("{tool} failed: {e}"))
 }
 
+async fn manage(reg: &Registry, hub: &Hub, who: &Caller, action: &str, params: Value) -> Value {
+    call(reg, hub, who, "coordination_manage", json!({ "action": action, "params": params })).await
+}
+
+async fn handoff_channels(reg: &Registry, hub: &Hub, who: &Caller) -> Vec<String> {
+    let channels = json!(["agent.lifecycle.handoff", "agent.conversation.handoff"]);
+    let rows = call(reg, hub, who, "event_log_query", json!({ "channels": channels })).await;
+    let mut chs: Vec<String> = rows["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["channel"].as_str().unwrap().to_string())
+        .collect();
+    chs.sort();
+    chs.dedup();
+    chs
+}
+
 #[tokio::test]
 async fn ledger_paginates_the_callers_visible_message_rows() {
     let hub = hub();
@@ -72,6 +90,138 @@ async fn ledger_paginates_the_callers_visible_message_rows() {
     let recent =
         call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 2 })).await;
     assert_eq!(recent["events"], json!([first_page["events"][0], second_page["events"][0]]));
+
+    // `count` and `next_after_seq` describe the caller's visible rows only:
+    // hidden message rows between the tasks consume neither.
+    let page =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": channels, "limit": 100 })).await;
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["next_after_seq"], second_page["events"][0]["seq"]);
+    let hidden_only =
+        call(&reg, &hub, &observer, "event_log_query", json!({ "channels": ["agent.message.inform"] })).await;
+    assert_eq!(hidden_only["count"], 0);
+    assert_eq!(hidden_only["next_after_seq"], Value::Null);
+}
+
+#[tokio::test]
+async fn ledger_hides_handoff_note_and_conversation_handoff_events_from_outsiders() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (owner, participant, outsider) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let operator = Caller { kind: ActorKind::Human, profile: Profile::Operator, ..agent("operator") };
+    let task =
+        call(&reg, &hub, &owner, "task_add", json!({ "title": "Review the change" })).await["id"].clone();
+
+    // A sealed handoff note ledgered as `agent.lifecycle.handoff`.
+    let sid = call(&reg, &hub, &owner, "session_start", json!({ "kind": "interactive", "task_id": task }))
+        .await["session_id"]
+        .clone();
+    let note = manage(
+        &reg,
+        &hub,
+        &owner,
+        "session_handoff_propose",
+        json!({ "session_id": sid, "done": ["a"], "next_steps": ["b"] }),
+    )
+    .await;
+    manage(&reg, &hub, &owner, "session_handoff_seal", json!({ "note_id": note["id"] })).await;
+
+    // A conversation the outsider is not in, handed off to the task.
+    let conv = call(
+        &reg,
+        &hub,
+        &owner,
+        "message_send",
+        json!({ "act": "request", "to_agent": participant.label, "body": "the plan", "task_id": task }),
+    )
+    .await["conversation_id"]
+        .clone();
+    manage(&reg, &hub, &owner, "conversation_handoff", json!({ "conversation_id": conv, "task_id": task }))
+        .await;
+
+    // The task's holder is let in on the conversation-handoff link.
+    let holder = agent("builder-4");
+    call(&reg, &hub, &holder, "task_claim", json!({ "id": task })).await;
+
+    let want = ["agent.conversation.handoff", "agent.lifecycle.handoff"].map(String::from);
+    assert_eq!(handoff_channels(&reg, &hub, &outsider).await, Vec::<String>::new());
+    assert_eq!(handoff_channels(&reg, &hub, &participant).await, want[..1]);
+    assert_eq!(handoff_channels(&reg, &hub, &holder).await, want[..1]);
+    assert_eq!(handoff_channels(&reg, &hub, &owner).await, want);
+    assert_eq!(handoff_channels(&reg, &hub, &operator).await, want);
+}
+
+#[tokio::test]
+async fn ledger_hides_mailbox_read_and_ack_receipts_from_outsiders() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (sender, owner, outsider) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+    let operator = Caller { kind: ActorKind::Human, profile: Profile::Operator, ..agent("operator") };
+
+    // Mail for builder-2, then builder-2 reads its inbox (agent.mailbox.read)
+    // and acks it (agent.mailbox.acked). The receipts are the owner's own
+    // telemetry.
+    call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": owner.label, "body": "for your eyes" }),
+    )
+    .await;
+    let inbox = manage(&reg, &hub, &owner, "message_inbox", json!({})).await;
+    let mid = inbox["messages"][0]["message_id"].clone();
+    assert!(mid.is_string(), "{inbox}");
+    manage(&reg, &hub, &owner, "message_ack", json!({ "message_id": mid })).await;
+
+    let receipts = |rows: &Value| -> Vec<String> {
+        let mut ch: Vec<String> = rows["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["channel"].as_str().unwrap().into())
+            .collect();
+        ch.sort();
+        ch.dedup();
+        ch
+    };
+    let q = json!({ "channel_prefix": "agent.mailbox." });
+    let want = ["agent.mailbox.acked", "agent.mailbox.read"].map(String::from);
+    assert_eq!(receipts(&call(&reg, &hub, &owner, "event_log_query", q.clone()).await), want);
+    assert_eq!(receipts(&call(&reg, &hub, &operator, "event_log_query", q.clone()).await), want);
+    // Another agent in the same organization sees no mailbox rows at all.
+    let out = call(&reg, &hub, &outsider, "event_log_query", q).await;
+    assert_eq!(out["events"], json!([]));
+    assert_eq!(out["count"], 0);
+}
+
+#[tokio::test]
+async fn a_restricted_rows_writer_sees_its_own_write() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let (writer, outsider) = (agent("builder-1"), agent("builder-3"));
+
+    // lifecycle_record kind=handoff writes an agent.lifecycle.handoff row
+    // whose payload has no note or session for the visibility joins: only the
+    // writer (its originator) may read it back.
+    let recorded = call(
+        &reg,
+        &hub,
+        &writer,
+        "lifecycle_record",
+        json!({ "kind": "handoff", "payload": { "note": "handing off privately" } }),
+    )
+    .await;
+    assert_eq!(recorded["accepted"], true);
+    let ulid = recorded["event_id"].clone();
+
+    let q = json!({ "channels": ["agent.lifecycle.handoff"] });
+    let own = call(&reg, &hub, &writer, "event_log_query", q.clone()).await;
+    assert_eq!(own["events"].as_array().unwrap().len(), 1, "{own}");
+    assert_eq!(own["events"][0]["ulid"], ulid);
+    let out = call(&reg, &hub, &outsider, "event_log_query", q).await;
+    assert_eq!(out["events"], json!([]));
+    assert_eq!(out["count"], 0);
 }
 
 fn exec(hub: &Hub, sql: &str) {
