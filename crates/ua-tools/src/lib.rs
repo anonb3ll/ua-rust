@@ -88,6 +88,12 @@ pub fn schema_parts() -> Vec<Part> {
     // parent triggers.
     parts.push(families::plans::TENANT_PART.into());
     parts.push(families::plans::ORG_SCOPE.into());
+    // The organization column and triggers of the autonomous-cycle tables
+    // (no key rebuild: a cycle id is hub-generated, and the transition and
+    // usage keys are led by it), then the organization-led index and
+    // same-organization parent triggers.
+    parts.push(families::cycles::TENANT_PART.into());
+    parts.push(families::cycles::ORG_SCOPE.into());
     // The organization column and triggers of the approval queue (no key
     // rebuild: its only key is an AUTOINCREMENT id), then its
     // organization-led indexes.

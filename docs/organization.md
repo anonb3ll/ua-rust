@@ -35,7 +35,7 @@ here for memory columns, owners and defaults.
   [Scoping per subsystem](#scoping-per-subsystem), plus `schema_procedures`
   as a hub table. **The test is the authority on classification**; the table
   in that section is a copy kept in step with it. Two temporary relaxations
-  may only shrink: the tenant tables still missing `org_id` (45 of the frozen
+  may only shrink: the tenant tables still missing `org_id` (42 of the frozen
   baseline of 68 today, `code_symbols`, `graph_canvas_scenes`,
   `graph_canvas_revisions`, `web_search_cache`, `skill_versions`,
   `skill_assignments`, `skill_publish_staging`, `project_repo_bindings`,
@@ -43,7 +43,9 @@ here for memory columns, owners and defaults.
   `harness_config_bundles`, `harness_config_proposals`,
   `harness_config_drift`, `harness_config_report_window`, `routines`,
   `routine_runs`, `workflow_runs`, `workflow_checkpoints`, `plans`,
-  `plan_steps`, `plan_checkpoints` and `approvals` having left it;
+  `plan_steps`, `plan_checkpoints`, `autonomous_cycles`,
+  `autonomous_cycle_transitions`, `autonomous_cycle_usage` and `approvals`
+  having left it;
   a new table cannot join it), and the grant tables
   `oauth_grants` and `ui_sessions`, which must carry `org_id` and do not yet.
 - The procedure checksum covers the part's name, `version` and arguments,
@@ -288,6 +290,40 @@ here for memory columns, owners and defaults.
   and enumerated statuses. The importer writes legacy plans,
   steps and checkpoints to `default`. `crates/ua-tools/tests/plans_tenant.rs`
   holds the upgrade and the isolation tests.
+- The autonomous-cycle tables: `organization.v1.tools.cycles` gives
+  `autonomous_cycles`, `autonomous_cycle_transitions` and
+  `autonomous_cycle_usage` their `org_id` and triggers, and
+  `cycles.v2.org_scope` adds an index led by `org_id` for the cycle list and
+  the `*_org_parent` triggers (on insert and on a changed `cycle_id`) that
+  keep a transition or usage row in its cycle's organization. No rebuild: a
+  cycle id is a hub-generated random id, and the transition key
+  `(cycle_id, idempotency_key)` and usage key
+  `(cycle_id, usage_run_id, usage_id)` are led by it. Every
+  `autonomous_cycle_manage` action, legacy `autonomous_cycle_*` tool and the
+  green-path check reads and writes only the caller's organization's rows;
+  another organization's cycle answers exactly as a missing one, and an
+  organization `orgs` does not hold is refused (`unknown_organization`)
+  before anything changes, including before a gated transition reaches the
+  approval queue. A gated transition's approval payload binds `org_id`.
+  Nothing runs a cycle without a caller. A cycle may name a task and a
+  delegation, which carry no organization yet (`ORG-TASK-DEFAULT`): only a
+  cycle in the task organization can bind either, and to any other
+  organization a task or delegation id answers as a missing one, so its
+  cycles never read `tasks` (attempt-keyed usage is refused as `not_owner`,
+  and the green path finds no worktree). `autonomous_cycles.task_id` is
+  optional and the table is keyed by its own id, so it converts here, not
+  with `tasks`. `agent.cycle.updated` is an `ORG-EVENT-DEFAULT` site: for a
+  cycle outside the default organization its `stop_reason` (which carries
+  kill reasons, capability names and the acting agent) is `null`, and the
+  event is attributed to the caller's own label, never to the agent a system
+  or anonymous caller claims. The importer copies none of these tables.
+  `crates/ua-tools/tests/cycles_tenant.rs` holds the upgrade and the
+  isolation tests.
+- `delegations` stays with the tasks family, like `review_ready_notices`:
+  every delegation creates its task in the same transaction (the task's
+  notes carry the whole spec, so scoping the delegation alone would hide
+  nothing), the fenced transitions read the task row in the same statement,
+  and the task queue reads delegations by task id. It converts with `tasks`.
 - The approval queue: `organization.v1.tools.approvals` gives `approvals`
   its `org_id` and triggers, and `approvals.v3.org_indexes` adds indexes led
   by `org_id` for the gate's match and the per-organization queue. No
@@ -917,6 +953,7 @@ global key in the tree is classified:
 | `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
 | `approvals.id`; the gate's `(tool, payload, requested_by)` match | No key | AUTOINCREMENT id only, so no rebuild (`organization.v1.tools.approvals`, `approvals.v3.org_indexes`). The gate's match is a query key and filters on `org_id`. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
+| `autonomous_cycles.id`, `autonomous_cycle_transitions (cycle_id, idempotency_key)`, `autonomous_cycle_usage (cycle_id, usage_run_id, usage_id)` | Global, safe | A cycle id is hub-generated (random, never caller-chosen), and the transition and usage keys are led by it, so the caller-chosen idempotency and usage keys cannot collide across organizations; no rebuild (`organization.v1.tools.cycles`, `cycles.v2.org_scope`). The `*_org_parent` triggers keep transitions and usage in their cycle's organization. |
 | `graph_canvas_scenes.board_id`, `graph_canvas_revisions (board_id, revision)` | **Rebuild** | Keys become `(org_id, board_id)` and `(org_id, board_id, revision)`, rebuilt together in `graph_canvas.v2.tenant_keys`. |
 
 Without the rebuilds, organization B could not create a secret, skill, binding
@@ -1439,7 +1476,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations`, `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage`, `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads`, `task_checks`, `task_holds`, `task_hold_members`, `task_workflow`, `task_goal_links`, `goals`, `work_proposals`, `work_proposal_items`, `review_ready_notices`, `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (converts with `tasks`), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; only the task organization binds a task or delegation), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
