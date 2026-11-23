@@ -154,11 +154,16 @@ const TENANT: &[&str] = &[
 /// `org_id`), `code_symbols`, the two graph canvas tables,
 /// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`),
 /// the three skill registry tables (`skill_registry.v2.tenant_keys`,
-/// `organization.v1.tools.skills`), and `project_repo_bindings`
+/// `organization.v1.tools.skills`), `project_repo_bindings`
 /// (`governance.v2.project_bindings_tenant_keys`,
-/// `organization.v1.tools.project_bindings`):
-/// `harness_config_bundles` and `harness_config_proposals` carry a nullable
-/// `org_id` and no triggers.
+/// `organization.v1.tools.project_bindings`), `notify_outbox` and
+/// `pending_notifications` (`organization.v1.tools.notify`), `zulip_sends`
+/// (`organization.v1.tools.zulip`), the four harness config tables
+/// (`harness_config.v3.tenant_keys`, `organization.v1.tools.harness_config`),
+/// `routines` and `routine_runs` (`organization.v1.tools.routines`),
+/// `workflow_runs` and `workflow_checkpoints`
+/// (`organization.v1.tools.workflows`), and the three plans tables
+/// (`organization.v1.tools.plans`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -172,10 +177,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "goals",
-    "harness_config_bundles",
-    "harness_config_drift",
-    "harness_config_proposals",
-    "harness_config_report_window",
     "idempotency_keys",
     "managed_secrets",
     "memory",
@@ -190,16 +191,9 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "notify_outbox",
-    "pending_notifications",
-    "plan_checkpoints",
-    "plan_steps",
-    "plans",
     "policy_authorizations",
     "relay_messages",
     "review_ready_notices",
-    "routine_runs",
-    "routines",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",
@@ -217,9 +211,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "tool_calls",
     "work_proposal_items",
     "work_proposals",
-    "workflow_checkpoints",
-    "workflow_runs",
-    "zulip_sends",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];

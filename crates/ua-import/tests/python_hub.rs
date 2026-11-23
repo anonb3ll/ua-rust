@@ -532,6 +532,10 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plans"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_steps"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_checkpoints"), 1);
+    // Plans, steps and checkpoints land in the default organization.
+    for t in ["plans", "plan_steps", "plan_checkpoints"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);

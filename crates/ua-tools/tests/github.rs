@@ -642,6 +642,11 @@ async fn review_ready_notifies_once_when_every_expected_check_is_verified() {
         format!("Task #{t} is ready for review (head {}; verified checks: ci, lint)", &FULL[..12])
     );
     assert!(!text.contains("wire funds"), "the agent-written title never reaches the channel: {text}");
+    // The hub-originated notice is in its task's organization (the default,
+    // until tasks carry `org_id`), not in whichever caller recorded the check.
+    let org: String =
+        h.hub.db().read(|c| Ok(c.query_row("SELECT org_id FROM notify_outbox", [], |r| r.get(0))?)).unwrap();
+    assert_eq!(org, ua_core::DEFAULT_ORG);
     // Verifying again at the same head does not notify twice.
     h.act_ok(&builder(), "task_check_verify", json!({ "task_id": t, "name": "ci", "head_sha": FULL })).await;
     assert_eq!(outbox(&h.hub).len(), 1);

@@ -48,6 +48,12 @@ pub(crate) enum Kind {
     /// Legacy skill versions and assignments are imported into the default
     /// organization.
     SkillRegistry,
+    /// Legacy harness config bundles are imported into the default
+    /// organization (a source `org_id` is reported and dropped, never copied).
+    HarnessConfig,
+    /// Legacy plans, their steps and checkpoints are imported into the
+    /// default organization.
+    Plans,
 }
 
 impl Kind {
@@ -56,7 +62,14 @@ impl Kind {
     /// Python source has no organization to copy. A source `org_id` is never
     /// copied by column name.
     pub(crate) fn writes_default_org(self) -> bool {
-        matches!(self, Kind::GraphCanvas | Kind::SkillRegistry | Kind::ProjectRepoBindings)
+        matches!(
+            self,
+            Kind::GraphCanvas
+                | Kind::SkillRegistry
+                | Kind::ProjectRepoBindings
+                | Kind::HarnessConfig
+                | Kind::Plans
+        )
     }
 }
 
@@ -81,6 +94,7 @@ const fn plain(source: &'static str) -> TableMap {
 }
 
 const TASK_REF: Ref = Ref { col: "task_id", table: "tasks", key: "id" };
+const PLAN_REF: Ref = Ref { col: "plan_id", table: "plans", key: "id" };
 
 /// Copy order: referenced tables before the tables that point at them.
 pub(crate) const MAPS: &[TableMap] = &[
@@ -114,9 +128,9 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[TASK_REF], ..plain("task_checks") },
     // A handoff note keeps its task id as a record even when the task is gone.
     plain("session_handoff_notes"),
-    plain("plans"),
-    TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_steps") },
-    TableMap { refs: &[Ref { col: "plan_id", table: "plans", key: "id" }], ..plain("plan_checkpoints") },
+    TableMap { kind: Kind::Plans, ..plain("plans") },
+    TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_steps") },
+    TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_checkpoints") },
     TableMap { refs: &[TASK_REF], ..plain("delegations") },
     plain("work_proposals"),
     TableMap {
@@ -140,7 +154,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     // pending or unconsumed passes, which are never imported.
     TableMap { kind: Kind::SkillRegistry, ..plain("skill_versions") },
     TableMap { kind: Kind::SkillRegistry, ..plain("skill_assignments") },
-    plain("harness_config_bundles"),
+    TableMap { kind: Kind::HarnessConfig, ..plain("harness_config_bundles") },
     TableMap { kind: Kind::GraphCanvas, ..plain("graph_canvas_scenes") },
     TableMap { kind: Kind::Ledger, ..plain("event_log") },
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },

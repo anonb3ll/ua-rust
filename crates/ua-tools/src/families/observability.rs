@@ -908,10 +908,14 @@ fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
     )
     .map_err(|e| e.to_string());
     let count = |sql: &str| -> UaResult<i64> { Ok(c.query_row(sql, [], |r| r.get(0)).unwrap_or(0)) };
+    // The hub's webhook is the default organization's destination
+    // (`families::notify`): its health is that organization's last delivery.
     let last_delivery = c
-        .query_row("SELECT status, last_error FROM notify_outbox ORDER BY id DESC LIMIT 1", [], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-        })
+        .query_row(
+            "SELECT status, last_error FROM notify_outbox WHERE org_id = ?1 ORDER BY id DESC LIMIT 1",
+            [ua_core::DEFAULT_ORG],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
         .optional()
         .unwrap_or(None);
     let quick_check =

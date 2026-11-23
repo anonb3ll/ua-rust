@@ -644,6 +644,21 @@ async fn a_node_is_served_its_own_organizations_skills() {
     let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked:?}") };
     h.approve(approval_id).await;
     h.reg.call(&h.hub, &publisher, "harness_config_publish", args).await.unwrap();
+    // Each organization serves its own active bundle, and B's callers cannot
+    // publish until memberships exist: B's copy is written as B's publish
+    // would write it.
+    h.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO harness_config_bundles (org_id, version, published_at, published_by, bundle_json, active)
+                 SELECT ?1, version, published_at, published_by, bundle_json, 1 FROM harness_config_bundles
+                 WHERE org_id = 'default' AND active = 1",
+                [ORG_B],
+            )?;
+            Ok(())
+        })
+        .unwrap();
 
     for (org, node, body) in
         [(DEFAULT_ORG, "node-a", "Read the whole diff."), (ORG_B, "node-b", "org b body")]

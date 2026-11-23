@@ -67,6 +67,27 @@ pub fn schema_parts() -> Vec<Part> {
     // The organization key rebuild and triggers of the project repository bindings table.
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_KEYS.into());
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_PART.into());
+    // The organization column and triggers of the notification tables (no
+    // key rebuild: neither family has a key beyond an AUTOINCREMENT id).
+    parts.push(families::notify::TENANT_PART.into());
+    parts.push(families::notify::ORG_INDEXES.into());
+    parts.push(families::zulip::TENANT_PART.into());
+    // The organization key rebuild and triggers of the harness config tables.
+    parts.push(families::harness_config::TENANT_KEYS.into());
+    parts.push(families::harness_config::TENANT_PART.into());
+    // The organization column, triggers, indexes and same-organization rules
+    // of the routine and workflow-run tables (no key rebuild: their keys are
+    // AUTOINCREMENT ids and hub-generated run ids).
+    parts.push(families::routines::TENANT_PART.into());
+    parts.push(families::routines::ORG_SCHEMA.into());
+    parts.push(families::workflows::TENANT_PART.into());
+    parts.push(families::workflows::ORG_SCHEMA.into());
+    // The organization column and triggers of the plans tables (no key
+    // rebuild: a plan id is hub-generated, and the step and checkpoint keys
+    // hang off it), then the organization-led index and same-organization
+    // parent triggers.
+    parts.push(families::plans::TENANT_PART.into());
+    parts.push(families::plans::ORG_SCOPE.into());
     parts.push(config_revisions::SCHEMA.into());
     // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
     // family's delivery rows into it. Both need `organization.v1.store` and
