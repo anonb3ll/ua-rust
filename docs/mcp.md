@@ -40,7 +40,12 @@ pieces make this work:
   `github:webhook-secret` and consumers of kind `github` are an
   organization's GitHub credentials and are written only by
   `github_credential_set` and `github_credential_clear`
-  ([github](github.md#credentials-per-organization)).
+  ([github](github.md#credentials-per-organization)); a secret stored
+  under one of those names before (say, the relay's) can no longer be
+  rotated with `managed_secret_set`: delete it and store it under a new
+  name. Because the MCP servers' secrets are the default organization's,
+  another organization's caller is refused (`org_unsupported`) by
+  `mcp_gateway` `call` and live `list` on a server that injects secrets.
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
   secret's organization, name and consumer as associated data, so a row
   copied into another organization or under another name or consumer does

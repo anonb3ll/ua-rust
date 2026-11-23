@@ -593,8 +593,25 @@ fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Cred
     Ok(Credential { name, token, fingerprint })
 }
 
+/// The relay posts with the hub's GitHub credential, a managed secret of the
+/// default organization: another organization's caller is refused before
+/// anything is read, so it never sends under that credential.
+fn require_hub_org(caller: &Caller, action: &str) -> UaResult<()> {
+    if caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "relay {action} posts with the hub's GitHub credential and serves the default organization only; \
+                 nothing was read or sent"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "request_send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     ctx.hub
         .db()
@@ -919,6 +936,7 @@ fn begin_send(
 
 async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let ready = ctx.hub.db().write_async(move |tx| begin_send(tx, hub.cfg(), &caller, &p)).await??;
     let outcome = github::post_comment(ctx.hub.cfg(), &ready.token, &ready.target, &ready.text).await;

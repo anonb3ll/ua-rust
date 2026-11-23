@@ -54,6 +54,8 @@
 //! * **Fingerprint, not digest.** Metadata carries an HMAC-SHA256 of the value
 //!   under a key derived from the encryption key, so a reader of the metadata
 //!   or the approval queue cannot confirm a guessed value offline.
+//!   `managed_secret_list` leaves it (and the size and key id) out for a
+//!   reserved GitHub credential row.
 //! * **Ledger names only.** Events carry the name and consumer, never the
 //!   value or its fingerprint; for another organization's secret even the
 //!   name and consumer are `null` and the originator is `system`
@@ -261,6 +263,13 @@ fn aad(aad_v: i64, org: &str, name: &str, consumer: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether a row of organization `org` sealed under form `aad_v` can be
+/// opened there at all (no decryption): form 2 anywhere, form 1 in the
+/// default organization only.
+pub(crate) fn form_accepted(aad_v: i64, org: &str) -> bool {
+    aad(aad_v, org, "", "").is_some()
+}
+
 fn seal(key: &Key, org: &str, name: &str, consumer: &str, value: &str) -> UaResult<(Vec<u8>, Vec<u8>)> {
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng
@@ -359,13 +368,21 @@ pub(crate) fn bound_to(conn: &Connection, org: &str, name: &str, consumer: &str)
     Ok(bound.as_deref() == Some(consumer))
 }
 
-/// The consumer and key id of `name` in organization `org` (no decryption).
-pub(crate) fn sealed_with(conn: &Connection, org: &str, name: &str) -> UaResult<Option<(String, String)>> {
+/// How a stored secret was sealed: its consumer, key id and associated-data
+/// form. Holds no value and no fingerprint.
+pub(crate) struct SealedWith {
+    pub(crate) consumer: String,
+    pub(crate) key_id: String,
+    pub(crate) aad_v: i64,
+}
+
+/// How `name` in organization `org` was sealed (no decryption).
+pub(crate) fn sealed_with(conn: &Connection, org: &str, name: &str) -> UaResult<Option<SealedWith>> {
     Ok(conn
         .query_row(
-            "SELECT consumer, key_id FROM managed_secrets WHERE org_id = ?1 AND name = ?2",
+            "SELECT consumer, key_id, aad_v FROM managed_secrets WHERE org_id = ?1 AND name = ?2",
             [org, name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok(SealedWith { consumer: r.get(0)?, key_id: r.get(1)?, aad_v: r.get(2)? }),
         )
         .optional()?)
 }
@@ -721,10 +738,26 @@ async fn managed_secret_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
             )?;
             let rows = stmt
                 .query_map(params![org, a.consumer], |r| {
+                    let (name, consumer): (String, String) = (r.get(0)?, r.get(1)?);
                     let key_id: String = r.get(2)?;
+                    // A GitHub credential row is its own tools' (and, in the
+                    // default organization, inert): listed so it can be
+                    // seen and removed, with no fingerprint, size or key.
+                    if reserved(&name, &consumer) {
+                        return Ok(json!({
+                            "name": name, "consumer": consumer, "reserved": true,
+                            "key_id": null, "key_current": null, "decryptable": null,
+                            "fingerprint": null, "value_bytes": null,
+                            "created_by": r.get::<_, String>(5)?,
+                            "created_at": r.get::<_, String>(6)?,
+                            "updated_by": r.get::<_, String>(7)?,
+                            "updated_at": r.get::<_, String>(8)?,
+                        }));
+                    }
                     Ok(json!({
-                        "name": r.get::<_, String>(0)?,
-                        "consumer": r.get::<_, String>(1)?,
+                        "name": name,
+                        "consumer": consumer,
+                        "reserved": false,
                         "key_id": key_id,
                         "key_current": write_id.as_deref() == Some(key_id.as_str()),
                         "decryptable": current.contains(&key_id),
@@ -765,9 +798,9 @@ async fn managed_secret_delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             // Another organization's GitHub credential is its tools' to
             // clear; in the default organization such a row is never read.
             if org != DEFAULT_ORG
-                && let Some((consumer, _)) = sealed_with(tx, &org, &name)?
+                && let Some(found) = sealed_with(tx, &org, &name)?
             {
-                refuse_reserved(&name, &consumer, "managed_secret_delete")?;
+                refuse_reserved(&name, &found.consumer, "managed_secret_delete")?;
             }
             let (consumer, approval_id) =
                 match remove(tx, hub.cfg(), &caller, &org, "managed_secret_delete", &name)? {
@@ -816,7 +849,9 @@ pub fn register(r: &mut Registry) {
         tool(
             "managed_secret_list",
             "List the caller's organization's managed secrets: name, consumer, keyed fingerprint, size, key id \
-             and who set them. Never values.",
+             and who set them. Never values. A reserved GitHub credential row (`github:token`, \
+             `github:webhook-secret`, consumer kind `github`) shows only its name, consumer and who set it; \
+             github_credential_status reports those.",
             managed_secret_list,
         )
         .read_only()
@@ -903,6 +938,144 @@ mod tests {
         );
         let bad = Bound { org: DEFAULT_ORG, name: "tok", consumer: "mcp:docs", aad_v: 3 };
         assert!(unseal(&key, &bad, &nonce, &ct).is_err(), "an unknown form is refused");
+    }
+
+    fn person(label: &str, org: &str) -> Caller {
+        Caller {
+            label: label.into(),
+            kind: ActorKind::Human,
+            profile: ua_core::Profile::Operator,
+            enforce_profile: false,
+            session_key: Some(format!("{label}-s")),
+            transport: ua_core::identity::Transport::Mcp,
+            org_id: org.into(),
+        }
+    }
+
+    fn row_form(c: &Connection, org: &str, name: &str) -> i64 {
+        c.query_row("SELECT aad_v FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// End to end over the real store: a row sealed with the
+    /// `managed_secrets.v1` associated data survives the upgrade, decrypts
+    /// for its consumer in the default organization, and is re-sealed in
+    /// form 2 when replaced under an approval. A form-2 row of another
+    /// organization moved into the default organization and relabelled
+    /// form 1 never decrypts.
+    #[tokio::test]
+    async fn a_pre_organization_row_upgrades_decrypts_and_reseals_and_a_downgrade_does_not_decrypt() {
+        const V1: &str = "fake-legacy-docs-token-not-real";
+        const V2: &str = "fake-rotated-docs-token-not-real";
+        const B_VALUE: &str = "fake-org-b-docs-token-not-real";
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_home(dir.path());
+        cfg.managed_secret_key = Some(SecretString::from(K1.to_string()));
+        cfg.human_identities = vec!["operator".into(), "approver".into()];
+        let key = write_key(&cfg).unwrap();
+
+        // Before the upgrade: seal exactly as managed_secrets.v1 did.
+        let pre: Vec<_> = crate::schema_parts()
+            .into_iter()
+            .filter(|p| p.name != TENANT_KEYS.name && p.name != TENANT_PART.name)
+            .collect();
+        {
+            let db = ua_store::Db::open(&cfg.db_path(), &pre).unwrap();
+            let nonce = [5u8; 12];
+            let legacy_aad = format!("{AAD_V1_PREFIX}\0docs-token\0mcp:docs").into_bytes();
+            let cipher = <Aes256Gcm as AeadKeyInit>::new_from_slice(&key.bytes).unwrap();
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg: V1.as_bytes(), aad: &legacy_aad })
+                .unwrap();
+            let (kid, fp) = (key.id.clone(), fingerprint(&key, V1));
+            db.write(move |tx| {
+                tx.execute(
+                    "INSERT INTO managed_secrets (name, consumer, key_id, nonce, ciphertext, fingerprint, \
+                     value_bytes, created_by, created_at, updated_by, updated_at) \
+                     VALUES ('docs-token', 'mcp:docs', ?1, ?2, ?3, ?4, ?5, 'operator', 'then', 'operator', 'then')",
+                    params![kid, nonce.to_vec(), ct, fp, V1.len() as i64],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let hub = crate::Hub::open(cfg.clone()).unwrap();
+        let load = |org: &'static str, name: &'static str| {
+            let cfg = cfg.clone();
+            hub.db().read(move |c| {
+                load_for_consumer(c, &cfg, org, name, "mcp:docs")
+                    .map(|(v, fp)| (v.expose_secret().to_string(), fp))
+            })
+        };
+        assert_eq!(hub.db().read(|c| Ok(row_form(c, DEFAULT_ORG, "docs-token"))).unwrap(), 1);
+        let (value, fp) = load(DEFAULT_ORG, "docs-token").unwrap();
+        assert_eq!(value, V1);
+        assert_eq!(fp, fingerprint(&key, V1));
+
+        // Replacing it is gated; the approved retry re-seals it in form 2.
+        let reg = crate::builtin_registry();
+        let (op, approver) = (person("operator", DEFAULT_ORG), person("approver", DEFAULT_ORG));
+        let args = json!({ "name": "docs-token", "consumer": "mcp:docs", "value": V2 });
+        let e = reg.call(&hub, &op, "managed_secret_set", args.clone()).await.unwrap_err();
+        let UaError::ApprovalRequired { approval_id, .. } = e else { panic!("{e:?}") };
+        reg.call(&hub, &approver, "approval_resolve", json!({ "id": approval_id, "decision": "approve" }))
+            .await
+            .unwrap();
+        let out = reg.call(&hub, &op, "managed_secret_set", args).await.unwrap();
+        assert_eq!(out["replaced"], true);
+        assert_eq!(hub.db().read(|c| Ok(row_form(c, DEFAULT_ORG, "docs-token"))).unwrap(), AAD_V);
+        assert_eq!(load(DEFAULT_ORG, "docs-token").unwrap().0, V2);
+
+        // Downgrade: org B's form-2 row copied into the default organization
+        // and relabelled form 1 (or left form 2) does not decrypt there.
+        let sealed = seal_value(&cfg, "org-b", "b-token", "mcp:docs", B_VALUE).unwrap();
+        let (put_cfg, system) = (cfg.clone(), Caller::system_for("org-b"));
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'org-b', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                let out = put(
+                    tx,
+                    &put_cfg,
+                    &system,
+                    "org-b",
+                    "managed_secret_set",
+                    "b-token",
+                    "mcp:docs",
+                    &sealed,
+                    true,
+                )?;
+                assert!(out.is_ok());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(load("org-b", "b-token").unwrap().0, B_VALUE);
+        for aad_v in [1, 2] {
+            hub.db()
+                .write(move |tx| {
+                    let gone = "DELETE FROM managed_secrets WHERE org_id = 'default' AND name = 'b-token'";
+                    tx.execute(gone, [])?;
+                    tx.execute(
+                        "INSERT INTO managed_secrets (org_id, name, consumer, key_id, nonce, ciphertext, fingerprint, \
+                         value_bytes, created_by, created_at, updated_by, updated_at, aad_v) \
+                         SELECT 'default', name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
+                         created_by, created_at, updated_by, updated_at, ?1 FROM managed_secrets \
+                         WHERE org_id = 'org-b' AND name = 'b-token'",
+                        [aad_v],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let e = load(DEFAULT_ORG, "b-token").unwrap_err();
+            assert!(!format!("{e:?}").contains(B_VALUE), "{e:?}");
+            assert!(format!("{e}").contains("did not decrypt"), "aad_v {aad_v}: {e}");
+        }
     }
 
     #[test]

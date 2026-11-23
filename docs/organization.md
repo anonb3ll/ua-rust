@@ -639,9 +639,17 @@ here for memory columns, owners and defaults.
   default organization refused (its credentials are configuration) and
   replacing or clearing one gated by a one-time human approval bound to the
   keyed fingerprint. `github_credential_status` and a `system_doctor` line
-  (every organization for a default-organization caller, its own for any
-  other) report `configured`, `off` or `unusable`, never a value or
-  fingerprint. The `github.credential.*` and `managed_secret.*` events are
+  (each organization by name for a hub operator, a verified human of the
+  default organization; counts only for any other caller, over its own
+  organization outside the default) report `configured`, `off` or
+  `unusable`, never a value or fingerprint; `managed_secret_list` shows a
+  reserved row's name, consumer and who set it, without fingerprint, size
+  or key id. The fingerprint is visible only in the one-time approval a
+  replacement or clear binds, as for every managed secret. The relay
+  (`relay_manage` `request_send`, `send`) and an MCP server that injects
+  secrets (`mcp_gateway` `call`, live `list`) use the default
+  organization's secrets, so another organization's caller is refused
+  (`org_unsupported`) before anything is read. The `github.credential.*` and `managed_secret.*` events are
   `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
   consumer are `null` and the originator is `system`. The automation paths
   themselves still run for the default organization only

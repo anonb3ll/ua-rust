@@ -89,12 +89,24 @@ it.
   another organization's credential (fail closed). `managed_secret_set`
   and `managed_secret_delete` refuse the reserved names and the consumer
   kind `github` (`reserved_secret`), so these rows have one write path.
+  **Upgrade note:** a secret already stored under `github:token` or
+  `github:webhook-secret` (for example the relay's, named by
+  `relay_github_secret`) can no longer be rotated with
+  `managed_secret_set`. In the default organization it stays readable by
+  its consumer and `managed_secret_delete` still removes it: delete it,
+  store the value under a new name, and point the setting at that name.
 - **Reporting.** `github_credential_status` shows, for the caller's
-  organization, each credential as `configured`, `off` or `unusable` (stored
-  under a key the hub no longer has) and its source (`hub_config` or
-  `managed_secret`); `system_doctor` has a `github_credentials` line with
-  every organization for a default-organization caller and only its own for
-  any other. Neither shows a value or a fingerprint. Events
+  organization, each credential as `configured`, `off` or `unusable`
+  (stored under a key the hub no longer has, or sealed in an
+  associated-data form the organization refuses, such as a pre-organization
+  row outside the default organization) and its source (`hub_config` or
+  `managed_secret`); `system_doctor` has a `github_credentials` line that
+  names each organization for a hub operator (a verified human of the
+  default organization) and gives every other caller counts only (over its
+  own organization outside the default). Neither shows a value or a
+  fingerprint, and `managed_secret_list` lists a reserved row without its
+  fingerprint, size or key id. The keyed fingerprint appears only in the
+  one-time approval a replacement or clear binds. Events
   (`github.credential.set`, `github.credential.cleared`) carry the kind,
   whether a value was replaced and the approval id.
 - **Webhooks per organization (next).** A delivery will be checked against

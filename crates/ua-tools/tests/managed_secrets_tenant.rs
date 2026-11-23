@@ -11,7 +11,7 @@
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, identity::Transport};
 use ua_tools::families::github::credentials::{
-    API_CONSUMER, CredentialKind, CredentialSource, TOKEN_SECRET, github_credential_for,
+    API_CONSUMER, CredentialKind, CredentialSource, TOKEN_SECRET, WEBHOOK_SECRET, github_credential_for,
 };
 use ua_tools::{Hub, Registry, builtin_registry};
 
@@ -82,14 +82,20 @@ struct H {
 
 impl H {
     fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    fn with(f: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let hub = Hub::in_memory(cfg(&dir.path().join("home"))).unwrap();
+        let mut c = cfg(&dir.path().join("home"));
+        f(&mut c);
+        let hub = Hub::in_memory(c).unwrap();
         for org in [ORG_B, ORG_C] {
             hub.db()
                 .write(|tx| {
                     tx.execute(
                         "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
-                         VALUES (?1, ?1, ?1, '[\"developer\",\"operator\"]', '2026-01-01T00:00:00+00:00')",
+                         VALUES (?1, ?1, ?1, '[\"developer\",\"coordinator\",\"operator\"]', '2026-01-01T00:00:00+00:00')",
                         [org],
                     )?;
                     Ok(())
@@ -185,6 +191,24 @@ impl H {
                 Ok(hits)
             })
             .unwrap()
+    }
+
+    /// Overwrite one row's metadata (never its organization, which is
+    /// immutable) to simulate a row sealed differently.
+    fn set_meta(&self, org: &str, name: &str, column: &str, value: Value) {
+        let sql = format!("UPDATE managed_secrets SET {column} = ?3 WHERE org_id = ?1 AND name = ?2");
+        self.hub
+            .db()
+            .write(move |tx| {
+                let v: rusqlite::types::Value = match value {
+                    Value::Number(n) => rusqlite::types::Value::Integer(n.as_i64().unwrap()),
+                    Value::String(s) => rusqlite::types::Value::Text(s),
+                    other => panic!("unsupported {other}"),
+                };
+                assert_eq!(tx.execute(&sql, rusqlite::params![org, name, v])?, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn resolve(&self, org: &str, kind: CredentialKind) -> Result<Option<String>, UaError> {
@@ -561,15 +585,40 @@ async fn status_and_doctor_report_each_organization_without_values() {
     assert!(detail.contains("org-b: token configured (managed secret), webhook_secret off"), "{detail}");
     assert!(detail.contains("org-c: token off, webhook_secret off"), "{detail}");
     assert_eq!(hub_view["status"], "LIVE");
-    // Another organization sees its own line only.
+    // Anyone but a hub operator gets counts only: a default-organization
+    // agent over every organization, another organization's caller over its
+    // own. No organization is named to them.
+    let dev_default = Caller { profile: Profile::Developer, ..agent(DEFAULT_ORG) };
+    let agent_view = line(&h.ok(&dev_default, "system_doctor", json!({})).await);
+    let detail = agent_view["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(
+            "3 organization(s): token 2 configured, 0 unusable, 1 off, webhook_secret 1 configured, 0 unusable, \
+             2 off"
+        ),
+        "{detail}"
+    );
+    assert_eq!(agent_view["status"], "LIVE");
     let developer = Caller { profile: Profile::Developer, ..agent(ORG_C) };
     let c_view = line(&h.ok(&developer, "system_doctor", json!({})).await);
     let detail = c_view["detail"].as_str().unwrap();
-    assert!(detail.starts_with("org-c: token off"), "{detail}");
-    assert!(!detail.contains("org-b") && !detail.contains("default:"), "{detail}");
+    assert!(
+        detail.starts_with(
+            "1 organization(s): token 0 configured, 0 unusable, 1 off, webhook_secret 0 configured, 0 unusable, \
+             1 off"
+        ),
+        "{detail}"
+    );
     assert_eq!(c_view["status"], "DORMANT");
+    for view in [&agent_view, &c_view] {
+        let detail = view["detail"].as_str().unwrap();
+        for org in [DEFAULT_ORG, ORG_B, ORG_C] {
+            assert!(!detail.contains(&format!("{org}:")), "{detail}");
+        }
+        assert!(!detail.contains("hub config") && !detail.contains("managed secret"), "{detail}");
+    }
 
-    for out in [&d, &b, &c, &hub_view, &c_view] {
+    for out in [&d, &b, &c, &hub_view, &agent_view, &c_view] {
         let text = out.to_string();
         for v in VALUES {
             assert!(!text.contains(v), "{text}");
@@ -597,10 +646,60 @@ async fn no_secret_value_reaches_any_table_reply_or_event() {
         panic!("a replacement is gated")
     };
     h.ok(&approver(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+    // The registry did not gate this call (managed_secret_set is not in
+    // approval_tools), so put() parked and then consumed the approval
+    // itself.
+    assert!(!h.hub.cfg().approval_tools.iter().any(|t| t == "managed_secret_set"));
     let replaced = h.ok(&op, "managed_secret_set", args).await;
+    assert_eq!(replaced["replaced"], true);
+    assert_eq!(replaced["approval_id"], approval_id);
     let fingerprint = replaced["fingerprint"].as_str().unwrap().to_string();
     replies.push(replaced);
-    replies.push(h.ok(&op, "managed_secret_list", json!({})).await);
+    // That approval binds the new value's keyed fingerprint, never the value.
+    let (tool, status, payload): (String, String, String) = h
+        .hub
+        .db()
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT tool, status, payload FROM approvals WHERE id = ?1",
+                [approval_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!((tool.as_str(), status.as_str()), ("managed_secret_set", "consumed"));
+    let bound: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(bound["fingerprint"], fingerprint.as_str(), "{payload}");
+    assert_eq!(bound["value_bytes"], DOCS_V2.len());
+    for v in VALUES {
+        assert!(!payload.contains(v), "{v} in the approval: {payload}");
+    }
+    assert!(!h.cells_containing(DOCS_V2).iter().any(|t| t == "approvals"));
+    assert!(h.cells_containing(&fingerprint).iter().any(|t| t == "approvals"));
+
+    // Reserved GitHub rows, in B and (inert) in the default organization,
+    // with metadata markers: no list shows their fingerprint, size or key.
+    const RESERVED_FP: &str = "fake-reserved-fingerprint-not-real";
+    const RESERVED_KEY: &str = "fake-reserved-key-id-not-real";
+    for (org, name) in [(ORG_B, TOKEN_SECRET), (DEFAULT_ORG, WEBHOOK_SECRET)] {
+        let consumer = if name == TOKEN_SECRET { API_CONSUMER } else { "relay:github" };
+        h.copy_row("docs-token", org, name, consumer);
+        h.set_meta(org, name, "fingerprint", json!(RESERVED_FP));
+        h.set_meta(org, name, "key_id", json!(RESERVED_KEY));
+        h.set_meta(org, name, "value_bytes", json!(4242));
+    }
+    for who in [op.clone(), agent(ORG_B)] {
+        let list = h.ok(&who, "managed_secret_list", json!({})).await;
+        let text = list.to_string();
+        assert!(!text.contains(RESERVED_FP) && !text.contains(RESERVED_KEY), "{text}");
+        let reserved: Vec<&Value> =
+            list["secrets"].as_array().unwrap().iter().filter(|r| r["reserved"] == true).collect();
+        assert_eq!(reserved.len(), 1, "{text}");
+        for field in ["fingerprint", "value_bytes", "key_id", "key_current", "decryptable"] {
+            assert_eq!(reserved[0][field], Value::Null, "{field}: {text}");
+        }
+        replies.push(list);
+    }
     // Every GitHub credential attempt carries a value, and every one is refused.
     for who in [human(DEFAULT_ORG), agent(DEFAULT_ORG), human(ORG_B), agent(ORG_B), anonymous()] {
         for kind in ["token", "webhook_secret"] {
@@ -625,7 +724,158 @@ async fn no_secret_value_reaches_any_table_reply_or_event() {
     let calls: i64 = h
         .hub
         .db()
-        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM tool_calls WHERE tool LIKE '%secret%' OR tool LIKE 'github_credential%'", [], |r| r.get(0))?))
+        .read(|c| {
+            let sql = "SELECT COUNT(*) FROM tool_calls \
+                       WHERE tool LIKE '%secret%' OR tool LIKE 'github_credential%'";
+            Ok(c.query_row(sql, [], |r| r.get(0))?)
+        })
         .unwrap();
     assert!(calls > 0);
+}
+
+#[tokio::test]
+async fn status_calls_a_row_the_resolver_refuses_unusable() {
+    let h = H::new();
+    let op = human(DEFAULT_ORG);
+    h.ok(
+        &op,
+        "managed_secret_set",
+        json!({ "name": "docs-token", "consumer": "mcp:docs", "value": DOCS_V1 }),
+    )
+    .await;
+    h.copy_row("docs-token", ORG_B, TOKEN_SECRET, API_CONSUMER);
+    let doctor = |report: Value| {
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "github_credentials").cloned()
+    };
+
+    // A pre-organization form (aad_v 1) outside the default organization,
+    // and a form this build does not know: never decrypted, so never
+    // reported configured.
+    for aad_v in [1, 7] {
+        h.set_meta(ORG_B, TOKEN_SECRET, "aad_v", json!(aad_v));
+        let b = h.ok(&agent(ORG_B), "github_credential_status", json!({})).await;
+        assert_eq!(b["token"]["state"], "unusable", "aad_v {aad_v}: {b}");
+        assert_eq!(b["token"]["source"], "managed_secret");
+        let e = h.resolve(ORG_B, CredentialKind::Token).unwrap_err();
+        assert!(!format!("{e:?}").contains(DOCS_V1));
+        let line = doctor(h.ok(&op, "system_doctor", json!({})).await).unwrap();
+        assert_eq!(line["status"], "DEGRADED", "{line}");
+        assert!(line["detail"].as_str().unwrap().contains("org-b: token unusable"), "{line}");
+    }
+    // The key rotated away is unusable too, whatever the form.
+    h.set_meta(ORG_B, TOKEN_SECRET, "aad_v", json!(2));
+    h.set_meta(ORG_B, TOKEN_SECRET, "key_id", json!("fake-retired-key-not-real"));
+    let b = h.ok(&agent(ORG_B), "github_credential_status", json!({})).await;
+    assert_eq!(b["token"]["state"], "unusable", "{b}");
+}
+
+#[tokio::test]
+async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
+    // A reviewed config server that injects a hub secret. The refusal comes
+    // before anything is spawned, so the command never runs.
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "docs".into(),
+            json!({
+                "transport": "stdio",
+                "command": "/nonexistent/fake-mcp-server-not-real",
+                "secrets": [{ "secret": "docs-token", "inject": "env:FAKE_TOKEN" }],
+                "tools": { "echo": "read" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+            }),
+        );
+    });
+    let events = h.events();
+    // mcp_gateway is a developer tool, relay_manage a coordinator one.
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    let coord = |c: Caller| Caller { profile: Profile::Coordinator, ..c };
+    for who in [agent(ORG_B), human(ORG_B)] {
+        let (gw, who) = (dev(who.clone()), coord(who));
+        for args in [
+            json!({ "server": "docs", "tool": "echo" }),
+            json!({ "action": "list", "server": "docs", "live": true }),
+        ] {
+            let e = h.err(&gw, "mcp_gateway", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+        }
+        // A static list reads no secret and is not refused.
+        h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "docs" })).await;
+
+        for (action, params) in [
+            ("request_send", json!({ "draft_id": 1 })),
+            ("send", json!({ "draft_id": 1, "text": "fake relay text not real" })),
+        ] {
+            let e = h.err(&who, "relay_manage", json!({ "action": action, "params": params })).await;
+            assert_eq!(reason(&e), "org_unsupported", "{action}: {e:?}");
+        }
+    }
+    // The default organization's caller passes the check and fails later,
+    // for the ordinary reason (no secret stored, no such draft).
+    let e = h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "docs", "tool": "echo" })).await;
+    assert_eq!(reason(&e), "secret_unavailable", "{e:?}");
+    let e = h
+        .err(
+            &coord(agent(DEFAULT_ORG)),
+            "relay_manage",
+            json!({ "action": "request_send", "params": { "draft_id": 1 } }),
+        )
+        .await;
+    assert_eq!(e.code(), "not_found", "{e:?}");
+    assert!(h.rows().is_empty());
+    assert!(h.events() >= events);
+}
+
+#[test]
+fn a_legacy_row_with_a_null_name_stops_the_upgrade_with_its_row_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = cfg(dir.path());
+    let insert = |name: Option<&str>| {
+        format!(
+            "INSERT INTO managed_secrets (name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
+             created_by, created_at, updated_by, updated_at) VALUES ({}, 'mcp:docs', 'k1', x'00', x'00', 'fp', 1, \
+             'operator', 'now', 'operator', 'now')",
+            name.map(|n| format!("'{n}'")).unwrap_or_else(|| "NULL".into())
+        )
+    };
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &old_parts()).unwrap();
+        db.write(|tx| {
+            tx.execute_batch(&insert(Some("docs-token")))?;
+            tx.execute_batch(&insert(None))?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let e = Hub::open(cfg.clone()).err().expect("the upgrade stops");
+    let msg = format!("{e:#}");
+    assert!(msg.contains("1 row(s) with a NULL name (rowid 2)"), "{msg}");
+    assert!(msg.contains("DELETE FROM managed_secrets WHERE name IS NULL"), "{msg}");
+
+    // Nothing changed: both rows are there, under the v1 shape.
+    let conn = rusqlite::Connection::open(cfg.db_path()).unwrap();
+    let n: i64 = conn.query_row("SELECT count(*) FROM managed_secrets", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+    let has_org: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('managed_secrets') WHERE name = 'org_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_org, 0);
+
+    // After the operator removes it, the upgrade runs.
+    conn.execute("DELETE FROM managed_secrets WHERE name IS NULL", []).unwrap();
+    drop(conn);
+    let hub = Hub::open(cfg).unwrap();
+    let rows: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT count(*) FROM managed_secrets WHERE org_id = 'default'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    assert_eq!(rows, 1);
 }

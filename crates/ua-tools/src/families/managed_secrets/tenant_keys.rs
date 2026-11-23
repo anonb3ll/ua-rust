@@ -26,6 +26,9 @@ const TABLE: &str = "managed_secrets";
 /// trigger is kept, and `idx_managed_secrets_org_consumer`, led by `org_id`,
 /// is added for the consumer lookups.
 ///
+/// A row with a NULL `name` (which `managed_secrets.v1`'s key allowed) stops
+/// the upgrade with its row ids and a fix, rather than being dropped.
+///
 /// Runs standalone outside the shared migration transaction so
 /// `PRAGMA foreign_keys = OFF` takes effect before the rebuild transaction and
 /// `PRAGMA foreign_keys = ON` is restored afterwards. Safe to re-run after a
@@ -114,6 +117,24 @@ fn rebuild_body(conn: &Connection, log: &mut Vec<String>) -> anyhow::Result<()> 
         "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY rowid",
     )?;
     let views_before: BTreeSet<String> = views.iter().map(|(name, _)| name.clone()).collect();
+
+    // `managed_secrets.v1` declared `name TEXT PRIMARY KEY`, which SQLite
+    // lets hold NULL. Such a row can never be loaded, listed by name or
+    // deleted by a tool, and the new key refuses it. Rather than drop it
+    // silently, stop with its row ids (never a value) so the operator removes
+    // it by hand; the rebuild rolls back and nothing changes.
+    let null_names: Vec<i64> = conn
+        .prepare("SELECT rowid FROM managed_secrets WHERE name IS NULL ORDER BY rowid")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    anyhow::ensure!(
+        null_names.is_empty(),
+        "{TABLE} has {} row(s) with a NULL name (rowid {}); no tool can load or delete them and the \
+         (org_id, name) key refuses them. Delete them with `DELETE FROM {TABLE} WHERE name IS NULL` and \
+         restart; nothing was changed",
+        null_names.len(),
+        null_names.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+    );
 
     let org_expr = if has_column(conn, "org_id")? { "COALESCE(org_id, 'default')" } else { "'default'" };
     let aad_expr = if has_column(conn, "aad_v")? { "COALESCE(aad_v, 1)" } else { "1" };

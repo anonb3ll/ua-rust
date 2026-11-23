@@ -40,9 +40,13 @@
 //! credential needs a one-time human approval bound to the new value's
 //! keyed fingerprint; clearing one always does.
 //!
-//! **Never a value.** No tool returns a credential or its fingerprint.
-//! `github_credential_status` and the `system_doctor` line report
-//! `configured`, `off` or `unusable` and where the credential comes from.
+//! **Never a value.** No tool returns a credential's value.
+//! `github_credential_status`, the `system_doctor` line and
+//! `managed_secret_list` never show its keyed fingerprint either: they
+//! report `configured`, `off` or `unusable` and where the credential comes
+//! from. The fingerprint appears only where every managed secret's does: in
+//! the one-time approval a replacement or a clear binds, which the approval
+//! queue's readers can see.
 //! Events (`github.credential.set`, `github.credential.cleared`) carry the
 //! kind, whether a value was replaced and the approval id; they stay in the
 //! default organization's ledger (`ORG-EVENT-DEFAULT`) with originator
@@ -217,7 +221,8 @@ pub fn github_credential_for(
 pub enum CredentialState {
     Configured,
     Off,
-    /// Stored, but sealed with a key the hub no longer has (or none is set).
+    /// Stored, but sealed with a key the hub no longer has (or none is
+    /// set), or in an associated-data form this organization refuses.
     Unusable,
 }
 
@@ -235,7 +240,8 @@ pub struct CredentialStatus {
 
 /// The status of organization `org`'s credential of `kind`. Reads metadata
 /// only: a stored credential is `configured` when the key it was sealed
-/// with is still configured.
+/// with is still configured and its associated-data form is one this
+/// organization opens.
 pub fn credential_status(
     conn: &Connection,
     cfg: &Config,
@@ -251,9 +257,14 @@ pub fn credential_status(
             set_with: kind.config_key(),
         });
     }
+    // Mirrors what github_credential_for would refuse without decrypting:
+    // a key no longer configured, or an associated-data form this
+    // organization never opens (form 1 outside the default organization, or
+    // an unknown form).
     let state = match managed_secrets::sealed_with(conn, org, kind.secret_name())? {
-        Some((consumer, key_id)) if consumer == kind.consumer() => {
-            if managed_secrets::key_ids(cfg).contains(&key_id) {
+        Some(found) if found.consumer == kind.consumer() => {
+            let key = managed_secrets::key_ids(cfg).contains(&found.key_id);
+            if key && managed_secrets::form_accepted(found.aad_v, org) {
                 CredentialState::Configured
             } else {
                 CredentialState::Unusable
@@ -404,7 +415,8 @@ async fn github_credential_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
             )?;
             Ok(Ok(json!({
                 "kind": kind, "state": CredentialState::Configured, "source": CredentialSource::ManagedSecret,
-                "replaced": stored.replaced, "updated_at": stored.updated_at, "approval_id": stored.approval_id,
+                "replaced": stored.replaced, "updated_at": stored.updated_at,
+                "approval_id": stored.approval_id,
             })))
         })
         .await?;
@@ -434,7 +446,7 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
         .write_async(move |tx| {
             require_credential_admin(tx, hub.cfg(), &caller, &org, TOOL)?;
             match managed_secrets::sealed_with(tx, &org, kind.secret_name())? {
-                Some((consumer, _)) if consumer == kind.consumer() => {}
+                Some(found) if found.consumer == kind.consumer() => {}
                 _ => {
                     return Err(UaError::not_found(format!(
                         "the organization has no GitHub {} to clear",
@@ -442,7 +454,8 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
                     )));
                 }
             }
-            let (_, approval_id) = match managed_secrets::remove(tx, hub.cfg(), &caller, &org, TOOL, kind.secret_name())? {
+            let removed = managed_secrets::remove(tx, hub.cfg(), &caller, &org, TOOL, kind.secret_name())?;
+            let (_, approval_id) = match removed {
                 Ok(done) => done,
                 Err(pending) => return Ok(Err(pending)),
             };
@@ -456,7 +469,9 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
                 )
                 .by(approvals::ledger_originator(&org, &caller.label)),
             )?;
-            Ok(Ok(json!({ "kind": kind, "state": CredentialState::Off, "cleared": true, "approval_id": approval_id })))
+            Ok(Ok(json!({
+                "kind": kind, "state": CredentialState::Off, "cleared": true, "approval_id": approval_id,
+            })))
         })
         .await?;
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: TOOL.into(), approval_id })

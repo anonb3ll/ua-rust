@@ -182,6 +182,9 @@ async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value
     let (cfg, name) = (ctx.hub.cfg().clone(), a.server.clone());
     let server = ctx.hub.db().read_async(move |c| resolve(c, &cfg, &name)).await?;
     server.usable()?;
+    if t.action == "call" || a.live {
+        require_hub_org_for_secrets(ctx, &server)?;
+    }
     if t.action == "list" {
         return list(ctx, &server, a.live, t).await;
     }
@@ -455,6 +458,24 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 
 // --- secrets ----------------------------------------------------------------------
 
+/// A downstream server's credentials are the hub's (the default
+/// organization's managed secrets): another organization's caller never has
+/// them injected on its behalf. Checked before the policy check, the slot
+/// and any approval. Fail closed until servers are per organization.
+fn require_hub_org_for_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
+    if !server.spec.secrets.is_empty() && ctx.caller.org_id != super::HUB_SECRETS_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "MCP server {:?} injects the hub's credentials, which serve the default organization only; \
+                 nothing was read or sent",
+                server.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The injected secrets, and each one's keyed fingerprint by name.
 type Loaded = (Vec<(Inject, SecretString)>, BTreeMap<String, String>);
 
@@ -467,7 +488,9 @@ async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Loaded> {
             let (mut out, mut fingerprints) = (Vec::new(), BTreeMap::new());
             for r in refs {
                 let inject = r.parse()?;
-                let (value, fp) = managed_secrets::load_for_consumer(c, &cfg, super::HUB_SECRETS_ORG, &r.secret, &consumer).map_err(|e| {
+                let loaded =
+                    managed_secrets::load_for_consumer(c, &cfg, super::HUB_SECRETS_ORG, &r.secret, &consumer);
+                let (value, fp) = loaded.map_err(|e| {
                     UaError::denied(
                         "secret_unavailable",
                         format!(

@@ -1383,41 +1383,65 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
 const GITHUB_ORGS_SHOWN: usize = 50;
 
 /// Each organization's GitHub credentials: `configured`, `off` or
-/// `unusable` and where from, never a value. A default-organization caller
-/// (the hub's operators) sees every organization; any other caller only its
-/// own. LIVE when one is configured, DEGRADED when a stored one is unusable,
-/// DORMANT when all are off.
-fn github_credentials_check(c: &Connection, cfg: &Config, caller_org: &str) -> UaResult<Value> {
-    use crate::families::github::credentials::{self, CredentialKind, CredentialState};
+/// `unusable` and where from, never a value. Only a hub operator (a
+/// verified human of the default organization) sees each organization by
+/// name; any other caller sees counts only, over every organization for a
+/// default-organization caller and over its own for any other. LIVE when
+/// one is configured, DEGRADED when a stored one is unusable, DORMANT when
+/// all are off.
+fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Caller) -> UaResult<Value> {
+    use crate::families::github::credentials::{self, CredentialKind, CredentialSource, CredentialState};
     let gate = "github_token_env, github_webhook_secret_env (default organization); github_credential_set \
                 (another organization)";
+    let caller_org = caller.org_id.as_str();
     let orgs: Vec<String> = if caller_org == ua_core::DEFAULT_ORG {
         let mut stmt = c.prepare("SELECT id FROM orgs ORDER BY id = ?1 DESC, id")?;
         stmt.query_map([ua_core::DEFAULT_ORG], |r| r.get(0))?.collect::<Result<_, _>>()?
     } else {
         vec![caller_org.to_string()]
     };
+    let full_view =
+        caller_org == ua_core::DEFAULT_ORG && crate::families::managed_secrets::is_secret_admin(cfg, caller);
     let (mut lines, mut configured, mut unusable) = (Vec::new(), false, false);
-    for org in orgs.iter().take(GITHUB_ORGS_SHOWN) {
+    // Per kind: configured, unusable, off.
+    let mut counts = [[0usize; 3]; 2];
+    for (i, org) in orgs.iter().enumerate() {
         let mut parts = Vec::new();
-        for kind in CredentialKind::ALL {
+        for (k, kind) in CredentialKind::ALL.into_iter().enumerate() {
             let s = credentials::credential_status(c, cfg, org, kind)?;
             configured |= s.state == CredentialState::Configured;
             unusable |= s.state == CredentialState::Unusable;
+            let slot = match s.state {
+                CredentialState::Configured => 0,
+                CredentialState::Unusable => 1,
+                CredentialState::Off => 2,
+            };
+            counts[k][slot] += 1;
+            if !full_view || i >= GITHUB_ORGS_SHOWN {
+                continue;
+            }
             let state = match (s.state, s.source) {
-                (CredentialState::Configured, Some(credentials::CredentialSource::HubConfig)) => {
-                    "configured (hub config)"
-                }
+                (CredentialState::Configured, Some(CredentialSource::HubConfig)) => "configured (hub config)",
                 (CredentialState::Configured, _) => "configured (managed secret)",
-                (CredentialState::Unusable, _) => "unusable (its key is not configured)",
+                (CredentialState::Unusable, _) => {
+                    "unusable (its key is not configured or its form is refused)"
+                }
                 (CredentialState::Off, _) => "off",
             };
             parts.push(format!("{} {state}", kind.as_str()));
         }
-        lines.push(format!("{org}: {}", parts.join(", ")));
+        if full_view && i < GITHUB_ORGS_SHOWN {
+            lines.push(format!("{org}: {}", parts.join(", ")));
+        }
     }
-    if orgs.len() > GITHUB_ORGS_SHOWN {
+    if full_view && orgs.len() > GITHUB_ORGS_SHOWN {
         lines.push(format!("and {} more organization(s)", orgs.len() - GITHUB_ORGS_SHOWN));
+    }
+    if !full_view {
+        let per_kind = CredentialKind::ALL.into_iter().zip(counts).map(|(kind, [ok, bad, off])| {
+            format!("{} {ok} configured, {bad} unusable, {off} off", kind.as_str())
+        });
+        lines.push(format!("{} organization(s): {}", orgs.len(), per_kind.collect::<Vec<_>>().join(", ")));
     }
     let detail = format!("{}; automation serves the default organization only for now", lines.join("; "));
     let status = if unusable {
@@ -1637,8 +1661,8 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let deep = a.refresh;
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
     let github = {
-        let (cfg, org) = (ctx.hub.cfg().clone(), ctx.caller.org_id.clone());
-        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &org)).await?
+        let (cfg, caller) = (ctx.hub.cfg().clone(), ctx.caller.clone());
+        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller)).await?
     };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
