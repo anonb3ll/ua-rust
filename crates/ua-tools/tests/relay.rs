@@ -962,3 +962,52 @@ async fn the_approval_row_records_the_latest_decision_on_both_revoke_paths() {
     );
     assert_eq!(h.events("relay.cancelled")[0]["transport"], "ui");
 }
+
+/// Review finding: `relay_messages` carries no organization yet, so a
+/// draft's approval can be in another organization than the reader's. Its
+/// status then reports no approval (`approval_status: null`) instead of
+/// failing the whole call; a cancel still fails closed, leaving the draft
+/// and the other organization's approval as they were.
+#[tokio::test]
+async fn a_drafts_approval_in_another_organization_reads_as_none() {
+    let h = H::new().await;
+    let (id, _) = h.requested(CLEAN).await;
+    let other = h
+        .hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                 ('org-b', 'org-b', 'Org B', '[\"coordinator\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO approvals (org_id, tool, payload, requested_by, status, created_at, updated_at) \
+                 VALUES ('org-b', 'relay_manage', '{}', 'relay-agent', 'pending', 'x', 'x')",
+                [],
+            )?;
+            let other = tx.last_insert_rowid();
+            tx.execute("UPDATE relay_messages SET approval_id = ?1 WHERE id = ?2", [other, id])?;
+            Ok(other)
+        })
+        .unwrap();
+
+    for who in [human(), agent()] {
+        let st = h.relay(&who, "status", json!({ "draft_id": id })).await;
+        assert_eq!(st["status"], "pending_approval", "{st}");
+        assert!(st["approval_status"].is_null() && st["resolved_by"].is_null(), "{st}");
+    }
+    let st = h.relay(&agent(), "status", json!({ "approval_id": other })).await;
+    assert!(st["approval_status"].is_null(), "{st}");
+
+    let e = h.refused(&agent(), "cancel", json!({ "draft_id": id })).await;
+    assert_eq!(reason(&e), "not_found", "{e}");
+    let st = h.relay(&agent(), "status", json!({ "draft_id": id })).await;
+    assert_eq!(st["status"], "pending_approval", "{st}");
+    let status: String = h
+        .hub
+        .db()
+        .read(move |c| Ok(c.query_row("SELECT status FROM approvals WHERE id = ?1", [other], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(status, "pending");
+}

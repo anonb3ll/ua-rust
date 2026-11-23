@@ -404,6 +404,21 @@ from its commit history.
 
 ### Fixed
 
+- Organization hardening of the approval queue (latent: every caller is in
+  the default organization today). Approval events for another
+  organization's approval record the neutral originator `system` instead of
+  the requester's or resolver's label (the payload already left it out),
+  including the relay's `consumed` event. The workflow engine refuses to run
+  a run whose organization differs from its caller's, before taking the
+  lease, so a gated step can no longer check one organization and park in
+  another. `relay_manage status` answers a draft whose approval is in
+  another organization with `approval_status: null` instead of failing the
+  call; `cancel` still fails closed. Isolation tests now cover the session
+  packet's and the evidence report's approval reads. Excluded: a
+  policy-authorization refusal (`github/authz.rs:181`) is still ledgered as
+  a default-organization event and writes the caller's label to the default
+  ledger until `policy_authorizations` carries `org_id`.
+
 - `scripts/vocab-check.sh`: an allowlist entry now silences only the pattern
   class it was written for. A `vocab` entry (the legacy profile names) no
   longer hides a private address, home path or tailnet name on the same line,
@@ -497,6 +512,12 @@ from its commit history.
 
 ### Behaviour changes
 
+- `skill_registry` approval payloads (publish, assign, unassign) now carry
+  `org_id`, so a pass is never consumed across organizations. An approval
+  parked in the old payload shape no longer matches its call: it can never
+  be consumed, so no migration expires it. **Upgrade note:** deny or revoke
+  pending or approved `skill_registry` approvals at upgrade and retry the
+  call, which parks a new approval in the new shape.
 - `conversation_handoff` no longer writes the
   `[conversation: <id>] handed off from the agent conversation` line into the
   task's notes and no longer returns `reference`: the link is recorded only
