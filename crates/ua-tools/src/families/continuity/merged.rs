@@ -41,6 +41,14 @@
 //! PR that an unfinished task links up on GitHub. `dry_run` defaults to true
 //! there and only reports; `dry_run=false` is for a lifecycle operator or a
 //! human.
+//!
+//! Everything runs in one organization: the acting caller's
+//! ([`close_merged`] takes it from the actor; the webhook and the poller act
+//! as [`crate::families::github::github_caller_for`] the delivery's or the
+//! poll's organization). Only that organization's bindings, tasks,
+//! descendants and protections are read, only its tasks close, and
+//! `queue_close_merged` looks PRs up with that organization's own token. A
+//! repository two organizations bind is reconciled for each separately.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -53,8 +61,8 @@ use ua_core::{Caller, UaError, UaResult};
 
 use super::queue::{Row, descendants, is_active, protection, task_rows};
 use crate::Hub;
-use crate::families::github::client::{BoundRepo, GitHub, full_sha};
-use crate::families::tasks::{TASK_ORG, emit, int_field, str_field};
+use crate::families::github::client::{BoundRepo, GhError, GitHub, full_sha};
+use crate::families::tasks::{emit, int_field, ledger_text, str_field};
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
 
@@ -171,22 +179,22 @@ fn task_links(row: &Row, host: &str) -> (PrLinks, PrLinks) {
     (evidence, markers)
 }
 
-/// Unfinished tasks in projects bound to `repo`. ORG-GITHUB-DEFAULT:
-/// merged-PR reconciliation runs as the hub, so only the default
-/// organization's tasks and bindings join (`TASK_ORG`).
-fn candidates(conn: &rusqlite::Connection, repo: &str) -> UaResult<Vec<Row>> {
+/// Organization `org`'s unfinished tasks in its projects bound to `repo`.
+/// Another organization's tasks and bindings never join.
+fn candidates(conn: &rusqlite::Connection, org: &str, repo: &str) -> UaResult<Vec<Row>> {
     task_rows(
         conn,
         "SELECT t.* FROM tasks t JOIN project_repo_bindings b ON b.org_id = ?2 AND b.project = t.project \
          WHERE t.org_id = ?2 AND lower(b.repo) = ?1 AND t.status IN ('open','doing','waiting_review','blocked') \
          ORDER BY t.id",
-        [repo, TASK_ORG],
+        [repo, org],
     )
 }
 
 /// One task's verdict for one merged PR.
 fn assess(
     conn: &rusqlite::Connection,
+    org: &str,
     row: &Row,
     pr: &MergedPr,
     now: jiff::Timestamp,
@@ -235,7 +243,7 @@ fn assess(
         ));
         return Ok(Some(entry));
     }
-    let mut reasons = protection(conn, TASK_ORG, row, now)?;
+    let mut reasons = protection(conn, org, row, now)?;
     if let (Some(merged), Some(created)) = (
         pr.merged_at.as_deref().and_then(ua_core::time::parse_ts),
         str_field(row, "created_at").and_then(ua_core::time::parse_ts),
@@ -243,7 +251,7 @@ fn assess(
     {
         reasons.push("the pull request merged before the task was created".into());
     }
-    let open_children: Vec<String> = descendants(conn, TASK_ORG, id)?
+    let open_children: Vec<String> = descendants(conn, org, id)?
         .iter()
         .filter(|c| is_active(c))
         .filter_map(|c| int_field(c, "id").map(|i| format!("#{i}")))
@@ -270,8 +278,8 @@ fn assess(
     Ok(Some(entry))
 }
 
-/// Match `prs` to tasks and, unless `dry_run`, close the clear matches as
-/// `actor` through `task_update`.
+/// Match `prs` to tasks of `actor`'s organization and, unless `dry_run`,
+/// close the clear matches as `actor` through `task_update`.
 pub(crate) async fn close_merged(
     hub: &Hub,
     actor: &Caller,
@@ -280,14 +288,16 @@ pub(crate) async fn close_merged(
 ) -> UaResult<Value> {
     let considered = prs.len();
     let rules = Rules::of(hub.cfg());
+    let org = actor.org_id.clone();
+    let o = org.clone();
     let matches: Vec<Value> = hub
         .db()
         .read_async(move |c| {
             let now = jiff::Timestamp::now();
             let mut out = Vec::new();
             for pr in &prs {
-                for row in candidates(c, &pr.repo)? {
-                    if let Some(m) = assess(c, &row, pr, now, &rules)? {
+                for row in candidates(c, &o, &pr.repo)? {
+                    if let Some(m) = assess(c, &o, &row, pr, now, &rules)? {
                         out.push(m);
                     }
                 }
@@ -318,15 +328,16 @@ pub(crate) async fn close_merged(
         }
     }
     if !dry_run && !off_branch.is_empty() {
-        let (events, by) = (off_branch.clone(), actor.label.clone());
+        let (events, by, org) = (off_branch.clone(), actor.label.clone(), org.clone());
         hub.db()
             .write_async(move |tx| {
                 for m in &events {
                     let payload = json!({
-                        "task_id": m["task_id"], "repo": m["repo"], "pr": m["pr"], "merge_sha": m["merge_sha"],
-                        "base_ref": m["base_ref"], "merge_branch": m["merge_branch"],
+                        "org_id": org, "task_id": m["task_id"], "repo": text_of(&org, &m["repo"]), "pr": m["pr"],
+                        "merge_sha": m["merge_sha"], "base_ref": text_of(&org, &m["base_ref"]),
+                        "merge_branch": text_of(&org, &m["merge_branch"]),
                     });
-                    emit(tx, TASK_ORG, OFF_BRANCH_CHANNEL, payload, &by)?;
+                    emit(tx, &org, OFF_BRANCH_CHANNEL, payload, &by)?;
                 }
                 Ok(())
             })
@@ -342,6 +353,15 @@ pub(crate) async fn close_merged(
         "blocked": blocked,
         "merged_to_non_default": off_branch,
     }))
+}
+
+/// A text field of a match as an event of organization `org` carries it:
+/// `null` outside the default organization (`ledger_text`).
+fn text_of(org: &str, v: &Value) -> Value {
+    match v.as_str() {
+        Some(t) => ledger_text(org, t),
+        None => Value::Null,
+    }
 }
 
 async fn close_one(hub: &Hub, actor: &Caller, m: &Value) -> UaResult<()> {
@@ -368,24 +388,19 @@ async fn close_one(hub: &Hub, actor: &Caller, m: &Value) -> UaResult<()> {
         args["expected_updated_at"] = json!(rev);
     }
     crate::builtin_registry_shared().call(hub, actor, "task_update", args).await?;
+    let org = actor.org_id.clone();
     let payload = json!({
-        "task_id": id, "repo": m["repo"], "pr": m["pr"], "merge_sha": sha, "matched_by": m["matched_by"],
+        "org_id": org, "task_id": id, "repo": text_of(&org, &m["repo"]), "pr": m["pr"], "merge_sha": sha,
+        "matched_by": m["matched_by"],
     });
     let by = actor.label.clone();
-    hub.db().write_async(move |tx| emit(tx, TASK_ORG, CHANNEL, payload, &by)).await
+    hub.db().write_async(move |tx| emit(tx, &org, CHANNEL, payload, &by)).await
 }
 
-/// `coordination_manage(action="queue_close_merged")`.
+/// `coordination_manage(action="queue_close_merged")`: in the caller's
+/// organization, with its bindings, its tasks and its own GitHub token.
 pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaResult<Value> {
-    // ORG-GITHUB-DEFAULT: this reads and closes only the default
-    // organization's tasks, so another organization's caller is refused
-    // rather than shown them.
-    if ctx.caller.org_id != TASK_ORG {
-        return Err(UaError::denied(
-            "org_unsupported",
-            "merged-PR reconciliation covers the default organization's tasks only; nothing was read or changed",
-        ));
-    }
+    let org = ctx.caller.org_id.clone();
     let dry_run = a.dry_run.unwrap_or(true);
     if !dry_run {
         // Closing other agents' tasks in bulk is an operator act: a lifecycle
@@ -394,7 +409,7 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
         if !Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
-            TASK_ORG,
+            &org,
         ) {
             return Err(UaError::denied(
                 "operator_required",
@@ -404,19 +419,30 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
     }
     let host = ctx.hub.cfg().github_web_host();
     let only = a.repo.as_deref().map(crate::families::governance::normalize_repo).transpose()?;
-    let gh = GitHub::require(ctx.hub.cfg()).map_err(|e| UaError::invalid(e.detail()))?;
-    // Every PR an unfinished task in a bound project links, in that repository.
+    let (cfg, o) = (ctx.hub.cfg().clone(), org.clone());
+    let gh = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            GitHub::require_for(c, &cfg, &o).map_err(|e| match e {
+                GhError::CredentialOff(_) => UaError::denied("github_credential_off", e.detail()),
+                GhError::Unusable(_) => UaError::denied("github_credential_unusable", e.detail()),
+                e => UaError::invalid(e.detail()),
+            })
+        })
+        .await?;
+    // Every PR an unfinished task in a bound project of the organization
+    // links, in that repository.
     let wanted: Vec<(BoundRepo, u64)> = ctx
         .hub
         .db()
         .read_async(move |c| {
             let mut out: BTreeSet<(BoundRepo, u64)> = BTreeSet::new();
-            // ORG-GITHUB-DEFAULT: the default organization's bindings only.
-            for repo in BoundRepo::all(c, TASK_ORG)? {
+            for repo in BoundRepo::all(c, &org)? {
                 if only.as_deref().is_some_and(|o| o != repo.as_str()) {
                     continue;
                 }
-                for row in candidates(c, repo.as_str())? {
+                for row in candidates(c, &org, repo.as_str())? {
                     let (evidence, markers) = task_links(&row, &host);
                     for (r, n) in evidence.into_iter().chain(markers) {
                         if r == repo.as_str() {

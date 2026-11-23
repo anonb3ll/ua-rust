@@ -1014,6 +1014,7 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
             let repo = bound.clone().unwrap_or_default();
             let job = row.ref_job.clone().or_else(|| want_job.clone());
             let run = CiRun {
+                org: org.clone(),
                 repo,
                 run_id: run_id.clone(),
                 head_sha: row.head_sha.clone(),

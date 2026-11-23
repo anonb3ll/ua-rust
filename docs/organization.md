@@ -131,8 +131,9 @@ here for memory columns, owners and defaults.
   organization have callers, or the default organization's ledger would
   record another organization's activity. A second resolver work item,
   `ORG-TASK-DEFAULT`, covered every lookup that starts from a task; it was
-  resolved when tasks gained `org_id` (the tasks family below), except for
-  the hub's GitHub and CI paths, which are marked `ORG-GITHUB-DEFAULT`.
+  resolved when tasks gained `org_id` (the tasks family below). The hub's
+  GitHub and CI paths, held default-only for a while, now run per
+  organization (see managed secrets below).
   `code_symbols` has no index led by
   `org_id`; its queries use the existing `(workspace, …)` indexes, which is
   enough while one organization holds the rows. A large tenant table gets an
@@ -179,10 +180,8 @@ here for memory columns, owners and defaults.
   binding of the task row's own organization (the tasks family below). The
   hub's GitHub and CI paths without a caller (the webhook, the poller, the
   CI run lookup, the head re-verification and merged-PR reconciliation) read
-  only the default organization's bindings and tasks: they are marked
-  `ORG-GITHUB-DEFAULT` and name the constant `TASK_ORG`
-  (`crates/ua-tools/src/families/tasks/mod.rs`), which is removed when the
-  GitHub family resolves each delivery to its task's organization. The
+  the bindings of the organization they act for: the delivery's (by its
+  verified secret), the poll's, or the task's. The
   Python importer explicitly writes legacy bindings to `default`.
   `crates/ua-tools/tests/project_bindings_tenant.rs` holds
   another organization's binding of the same project and checks that none
@@ -289,7 +288,7 @@ here for memory columns, owners and defaults.
   writes only the caller's organization's rows; another organization's plan
   answers exactly as a missing one, and a write for an organization `orgs`
   does not hold is refused (`unknown_organization`) before anything
-  changes. Plans do not link to tasks, so no `TASK_ORG` rule applies, and
+  changes. Plans do not link to tasks, so no task-organization rule applies, and
   no plan action has an approval gate of its own. The `agent.plan.*`
   events are `ORG-EVENT-DEFAULT` sites: for a plan outside the default
   organization their free text and caller-supplied labels are `null`
@@ -414,12 +413,13 @@ here for memory columns, owners and defaults.
     with its organization prefixed (`org:<org>/<tool>:<key>`), so a key
     reused in another organization never replays, and the default
     organization keeps its `<tool>:<key>` form. (b) The GitHub and CI paths
-    without a caller stay default-only under the marker
-    `ORG-GITHUB-DEFAULT` (`TASK_ORG`), and their task scans filter
-    `t.org_id = 'default'`, so a delivery for a repository two
-    organizations bind only touches default-organization tasks; another
-    organization's caller is refused `queue_close_merged`
-    (`org_unsupported`). (c) A delegation to another organization's agent
+    without a caller stayed default-only until they ran per organization
+    (superseded; see
+    managed secrets below): every task scan now filters on the
+    organization the path acts for, so a delivery for a repository two
+    organizations bind touches only the tasks of the organizations whose
+    secret verified it, and `queue_close_merged` runs in the caller's
+    organization. (c) A delegation to another organization's agent
     is still allowed, but it can never be claimed: the delegate looks the
     task up in its own organization and finds none, so it fails closed.
     Policy authorizations, which carry no `org_id` yet, are reached only
@@ -501,8 +501,9 @@ here for memory columns, owners and defaults.
   A write for an organization `orgs` does not hold is refused
   (`unknown_organization`) before anything changes, and replies carry no
   `org_id` (owner decision (d)). The hub's head re-verification
-  (`reverify_head`, from the webhook and the poller) scans only the default
-  organization's checks (`ORG-GITHUB-DEFAULT`, owner decision (b)). Events
+  (`reverify_head`, from the webhook and the poller) scans only the checks
+  of the organization the delivery or poll belongs to, and looks runs up
+  with that organization's token. Events
   stay `ORG-EVENT-DEFAULT`: for another organization, check names and hold
   reasons, actors and outcomes are `null` and the originator is `system`;
   workflow goals and focus never reach an event. The importer writes legacy
@@ -623,7 +624,7 @@ here for memory columns, owners and defaults.
   hold is refused (`unknown_organization`). The hub-scoped consumers (MCP
   servers, the relay) keep their secrets in the default organization.
   **Owner decision (2026-11-23):** GitHub automation (the webhook, the
-  poller, CI verification and merged-PR reconciliation) will run per task
+  poller, CI verification and merged-PR reconciliation) runs per task
   organization, each under its own GitHub credentials, and an organization
   without one stays off; this supersedes "GitHub stays default-only until
   per-organization tokens exist". The credential layer is in the tree
@@ -652,9 +653,21 @@ here for memory columns, owners and defaults.
   (`org_unsupported`) before anything is read. The `github.credential.*` and `managed_secret.*` events are
   `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
   consumer are `null` and the originator is `system`. The automation paths
-  themselves still run for the default organization only
-  (`ORG-GITHUB-DEFAULT`); the follow-up switches each to
-  `github_credential_for(task_org)` and removes `TASK_ORG`. The importer has
+  run per organization through `github_credential_for` (the
+  `ORG-GITHUB-DEFAULT` marker and the `TASK_ORG` constant are gone): a
+  webhook delivery belongs to every organization whose own secret verifies
+  it (the multi-match rule in [github.md](github.md#automation-per-organization)),
+  the poller polls each organization with its own token and skips one
+  without, CI lookups and `queue_close_merged` use the task's or caller's
+  organization's token and bindings, and the hub's token never serves
+  another organization. They act as the hub identity in that organization
+  (`github_caller_for`, the one `Caller::system_for` site `org_guard`
+  admits). The poller's state is per organization in `github_poll_repos`
+  (`github.v2.poll_repos` copies every row of `github_poll_state` to the
+  default organization; no row is dropped, and the old table stays unread);
+  repositories whose last poll failed are counted on the `system_doctor`
+  line. `crates/ua-tools/src/families/github/org_automation_tests.rs` holds
+  the per-organization automation tests. The importer has
   no managed-secret mapping (the Python hub kept none), so it writes nothing
   here. `crates/ua-tools/tests/managed_secrets_tenant.rs` holds the upgrade,
   isolation, authority and leak tests.
@@ -1775,7 +1788,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 | Class | Tables | Rule |
 |---|---|---|
-| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths default-only, `ORG-GITHUB-DEFAULT`), `task_workflow`, `task_checks`, `review_ready_notices` (`organization.v1.tools.continuity` and `continuity.v2.org_scope`: existing rows moved to their task's organization, every workflow, check and notice read and write, same-organization task triggers; re-verification default-only), `task_holds`, `task_hold_members` (`organization.v1.tools.holds` and `governance.v3.holds_org_scope`: a hold in its root task's organization, every hold read, write and claim check, same-organization root, task and hold triggers), `goals`, `task_goal_links` (`organization.v1.tools.goals` and `goals.v2.org_scope`: a link in its task's organization, every goal and link read and write, same-organization parent, task and goal triggers), `work_proposals`, `work_proposal_items` (`organization.v1.tools.proposals` and `governance.v4.proposals_org_scope`: an item in its proposal's organization, every proposal read and write and the contract check in the task's organization, an approved item's task in the proposal's organization, deciding authority-gated and so default-only today), `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
+| Tenant: tasks and planning | `tasks`, `task_dependencies`, `task_comments`, `task_comment_threads` (`organization.v1.tools.tasks` and `tasks.v2.org_scope`: every task read and write, same-organization reference triggers, ranked search scoped before the candidate cap; the hub's GitHub paths in the delivery's, poll's or task's organization), `task_workflow`, `task_checks`, `review_ready_notices` (`organization.v1.tools.continuity` and `continuity.v2.org_scope`: existing rows moved to their task's organization, every workflow, check and notice read and write, same-organization task triggers; re-verification in the delivery's or poll's organization), `task_holds`, `task_hold_members` (`organization.v1.tools.holds` and `governance.v3.holds_org_scope`: a hold in its root task's organization, every hold read, write and claim check, same-organization root, task and hold triggers), `goals`, `task_goal_links` (`organization.v1.tools.goals` and `goals.v2.org_scope`: a link in its task's organization, every goal and link read and write, same-organization parent, task and goal triggers), `work_proposals`, `work_proposal_items` (`organization.v1.tools.proposals` and `governance.v4.proposals_org_scope`: an item in its proposal's organization, every proposal read and write and the contract check in the task's organization, an approved item's task in the proposal's organization, deciding authority-gated and so default-only today), `project_repo_bindings` (`governance.v2.project_bindings_tenant_keys` and `organization.v1.tools.project_bindings`, scoped key, reads and writes), `plans`, `plan_steps`, `plan_checkpoints` (`organization.v1.tools.plans` and `plans.v2.org_scope`: every plan read and write, same-organization parent triggers), `routines` and `routine_runs` (`organization.v1.tools.routines` and `routines.v2.org_indexes`: scoped reads and writes, each fire in its routine's organization), `workflow_runs` and `workflow_checkpoints` (`organization.v1.tools.workflows` and `workflows.v2.org_indexes`: scoped reads and writes, a run in its starter's or routine's organization, gated approvals bind `org_id`), `delegations` (`organization.v1.tools.delegation` and `delegation.v2.org_scope`: every delegation read and write, a delegation's task in its own organization, created with its task in the delegator's organization), `autonomous_cycles`, `autonomous_cycle_transitions`, `autonomous_cycle_usage` (`organization.v1.tools.cycles` and `cycles.v2.org_scope`: every cycle read and write, same-organization parent triggers, gated approvals bind `org_id`; a cycle binds only its own organization's task or delegation, `cycles.v3.task_org`), `deliverables` and `deliverable_revisions` (carry `org_id` and their triggers from their first part, `organization.v1.deliverables`) | `org_id`; `tasks` also has optional `team_id` |
 | Tenant: agents and sessions | `agents`, `agent_sessions`, `agent_tokens`, `agent_lifecycle`, `session_profiles`, `session_credentials`, `session_handoff_notes`, `session_wake`, `session_wake_offers`, `dispatch_receipts`, `dispatch_runs` | An agent belongs to exactly one organization |
 | Tenant: nodes | `nodes`, `node_acceptance`, `node_claim_ops`, `node_command`, `node_command_notice`, `node_dispatch`, `node_followups` | A node serves one organization |
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
@@ -1783,12 +1796,12 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`) | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls`, `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`; a GitHub delivery's replay keys are recorded in each organization whose secret verified it), `github_poll_repos` (`github.v2.poll_repos` creates it keyed `(org_id, repo)` and copies `github_poll_state`'s rows to the default organization, `organization.v1.tools.github_poll` adds the triggers) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
 | Global identity | `users`, `passkeys`, `webauthn_states`, `login_links`, `oauth_clients`, `oauth_codes`, `oauth_grants`, `oauth_requests`, `oauth_tokens`, `ui_keys`, `ui_sessions`, `org_bootstrap` | Identity is global; the **grant** carries the organization (`oauth_grants.org_id`, `ui_sessions.org_id`, `agent_tokens.org_id`) |
-| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state`, `slack_seen_signatures`, `slack_seen_deliveries`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `import_org_map`, `import_finalized`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
+| Hub | `orgs`, `config_revisions`, `mcp_servers`, `provider_accounts`, `dispatch_meta`, `github_deliveries`, `github_delivery_bodies`, `github_poll_state` (unread since `github.v2.poll_repos`), `slack_seen_signatures`, `slack_seen_deliveries`, `zulip_fetch_cursors`, `vault_ingest_ledger`, `import_runs`, `import_org_map`, `import_finalized`, `schema_parts`, `ledger_meta` | Hub-scoped tools only; hub owners |
 
 The vault is hub-scoped, so anything that copies tenant data into it —
 `memory_promote` above all — is allowed only in `'default'` (see

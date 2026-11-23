@@ -12,7 +12,11 @@
 //! - `org_id` in a `Caller { .. }` literal must be `DEFAULT_ORG`; the
 //!   shorthand `Caller { org_id, .. }` fails too;
 //! - nothing assigns `.org_id = ...` except from `DEFAULT_ORG`;
-//! - `Caller::system_for` is called nowhere yet.
+//! - `Caller::system_for` is called nowhere except the GitHub family's
+//!   [`SYSTEM_FOR_ALLOWED`] site: callerless per-organization work (a
+//!   webhook delivery verified by an organization's own secret, a poll with
+//!   its own token) acts as the hub identity in that organization, and
+//!   nowhere else does.
 //!
 //! Test code is excluded by removing each `#[cfg(test)]` item (a `mod`
 //! block found by brace matching, or the single item that follows), wherever
@@ -88,6 +92,12 @@ fn org_field(body: &str) -> Option<&str> {
     None
 }
 
+/// The only places `Caller::system_for` may be called outside tests, as
+/// (path suffix, calls allowed there): the GitHub family's
+/// `github_caller_for`, the hub identity acting for the organization a
+/// delivery or a poll belongs to.
+const SYSTEM_FOR_ALLOWED: &[(&str, usize)] = &[("ua-tools/src/families/github/mod.rs", 1)];
+
 fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (path, src) in files {
@@ -134,10 +144,17 @@ fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
                 out.push(format!("{name}:{}: assigns org_id from `{v}`, not DEFAULT_ORG", line_of(&m, at)));
             }
         }
+        let unix = path.to_string_lossy().replace('\\', "/");
+        let mut allowed =
+            SYSTEM_FOR_ALLOWED.iter().find(|(suffix, _)| unix.ends_with(suffix)).map_or(0, |(_, n)| *n);
         for at in find_all(&m, "system_for(") {
             let line_start = m[..at].rfind('\n').map_or(0, |n| n + 1);
             let line = m[line_start..].lines().next().unwrap_or("");
             if line.contains("fn system_for(") || line.contains("Self::system_for(DEFAULT_ORG)") {
+                continue;
+            }
+            if allowed > 0 {
+                allowed -= 1;
                 continue;
             }
             out.push(format!(
@@ -173,6 +190,12 @@ fn the_guard_catches_a_caller_in_another_organization() {
     assert!(found[0].contains("org_id to `org_id`"), "{found:?}");
     assert_eq!(one("fn f() { c.org_id = other; }").len(), 1);
     assert_eq!(one("fn f() { Caller::system_for(\"org-b\"); }").len(), 1);
+    // The GitHub family's one site is allowed, a second call there is not.
+    let github = |src: &str| {
+        findings(&[(PathBuf::from("crates/ua-tools/src/families/github/mod.rs"), src.to_string())])
+    };
+    assert!(github("fn f(o: &str) { Caller::system_for(o); }").is_empty());
+    assert_eq!(github("fn f(o: &str) { Caller::system_for(o); Caller::system_for(o); }").len(), 1);
     assert!(
         one("fn f() -> Caller { Caller { label: x, org_id: ua_core::DEFAULT_ORG.into(), kind: k } }")
             .is_empty()

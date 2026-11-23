@@ -246,16 +246,6 @@ pub(crate) const DEFAULT_LEASE_SECONDS: i64 = 3600;
 pub(crate) const MAX_LEASE_SECONDS: i64 = 7 * 86400;
 pub(crate) const PROJECT_SPEC_MARKER: &str = "[project-spec]";
 
-/// ORG-GITHUB-DEFAULT: the organization the hub's GitHub and CI paths
-/// without a caller (the webhook, the poller, the CI status check, the head
-/// re-verification and merged-PR reconciliation) act in. Those paths run as
-/// the hub, which is the default organization, and every task they scan or
-/// close is filtered to it (`t.org_id = TASK_ORG`), so a delivery for a
-/// repository two organizations bind never touches another organization's
-/// task. Every other task lookup takes the task row's own organization.
-/// Removed when the GitHub family resolves each delivery to its task's
-/// organization (`docs/organization.md`).
-pub(crate) const TASK_ORG: &str = ua_core::DEFAULT_ORG;
 /// Active statuses in rollup order: the first present wins `derived_status`.
 const ROLLUP_ORDER: [&str; 4] = ["blocked", "doing", "waiting_review", "open"];
 
