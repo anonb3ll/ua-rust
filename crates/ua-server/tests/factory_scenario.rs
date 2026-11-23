@@ -1531,9 +1531,8 @@ impl View {
 /// also the owner-accepted integrity exception for task 2775: ledger chain
 /// metadata stays visible to restricted readers so the chain still proves
 /// intact, and the scorecard strips it here rather than scoring it.
-const VOLATILE: [&str; 9] = [
+const VOLATILE: [&str; 8] = [
     "generated_at",
-    "until",
     "head_hash",
     "head_ulid",
     "total_verified",
@@ -1542,6 +1541,21 @@ const VOLATILE: [&str; 9] = [
     "fingerprint",
     "bytes",
 ];
+
+/// Drop `until` from each evidence record's `tool_calls.window`: it is the
+/// capture's own clock (the task's `completed_at`, or now for an open task),
+/// not another reader's hidden record. Kept out of [`VOLATILE`] because
+/// `until` is a stable argument echo on other surfaces (holds, approvals).
+fn strip_tool_call_window_until(mut v: Value) -> Value {
+    if let Some(records) = v.get_mut("records").and_then(Value::as_array_mut) {
+        for r in records {
+            if let Some(window) = r["tool_calls"]["window"].as_object_mut() {
+                window.remove("until");
+            }
+        }
+    }
+    v
+}
 
 /// `v` without the [`VOLATILE`] fields, without rows the caller wrote itself
 /// (`originator`, `created_by` or `author` naming it) and without its own
@@ -1771,8 +1785,12 @@ async fn outsider_view(
     );
     v.surfaces
         .insert("packet", shown(s.call(&me, "session_packet", json!({ "task_id": hidden_task })).await));
-    v.surfaces
-        .insert("evidence", shown(s.call(&me, "evidence_report", json!({ "task_id": hidden_task })).await));
+    v.surfaces.insert(
+        "evidence",
+        strip_tool_call_window_until(shown(
+            s.call(&me, "evidence_report", json!({ "task_id": hidden_task })).await,
+        )),
+    );
     v.surfaces.insert(
         "retrieval",
         json!({
