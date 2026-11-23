@@ -97,3 +97,7 @@ routines.v3.task_org
 workflows.v3.task_org
 cycles.v3.task_org
 deliverables.v2.task_org
+organization.v1.tools.continuity
+continuity.v2.org_scope
+organization.v1.tools.holds
+governance.v3.holds_org_scope

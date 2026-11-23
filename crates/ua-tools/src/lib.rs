@@ -121,6 +121,14 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::workflows::TASK_ORG_SCHEMA.into());
     parts.push(families::cycles::TASK_ORG_SCHEMA.into());
     parts.push(families::deliverables::TASK_ORG_SCHEMA.into());
+    // The task workflow record, its checks and review notices, then the task
+    // holds and their members: `org_id` (no key rebuild: every key is led by
+    // a hub-global task or hold id), each existing row moved to its task's
+    // organization, organization-led indexes and same-organization triggers.
+    parts.push(families::continuity::TENANT_PART.into());
+    parts.push(families::continuity::ORG_SCOPE.into());
+    parts.push(families::governance::HOLDS_TENANT_PART.into());
+    parts.push(families::governance::HOLDS_ORG_SCOPE.into());
     parts
 }
 

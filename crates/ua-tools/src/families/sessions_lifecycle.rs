@@ -356,7 +356,8 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         Some(id) => super::continuity::recover_note(conn, id, ctx).ok().flatten().unwrap_or(Value::Null),
         None => Value::Null,
     };
-    let workflow = super::continuity::packet_section(conn, task_id).unwrap_or(Value::Null);
+    let workflow =
+        super::continuity::packet_section(conn, &ctx.caller.org_id, task_id).unwrap_or(Value::Null);
 
     let session_section = session.as_ref().map(|s| {
         json!({

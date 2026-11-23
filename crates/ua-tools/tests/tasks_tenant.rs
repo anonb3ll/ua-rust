@@ -47,8 +47,19 @@ const B_MENTION: &str = "osprey-counsel";
 const B_CHECK: &str = "falcon-secret-check";
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
+/// Parts registered after this family's, which need its `org_id` columns.
+const LATER: [&str; 4] = [
+    "organization.v1.tools.continuity",
+    "continuity.v2.org_scope",
+    "organization.v1.tools.holds",
+    "governance.v3.holds_org_scope",
+];
+
 fn old_parts() -> Vec<ua_store::Part> {
-    ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
+    ua_tools::schema_parts()
+        .into_iter()
+        .filter(|p| !PARTS.contains(&p.name) && !LATER.contains(&p.name))
+        .collect()
 }
 
 fn add_org(hub: &Hub, id: &str) {
