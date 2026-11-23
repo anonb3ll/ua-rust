@@ -467,7 +467,7 @@ async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Loaded> {
             let (mut out, mut fingerprints) = (Vec::new(), BTreeMap::new());
             for r in refs {
                 let inject = r.parse()?;
-                let (value, fp) = managed_secrets::load_for_consumer(c, &cfg, &r.secret, &consumer).map_err(|e| {
+                let (value, fp) = managed_secrets::load_for_consumer(c, &cfg, super::HUB_SECRETS_ORG, &r.secret, &consumer).map_err(|e| {
                     UaError::denied(
                         "secret_unavailable",
                         format!(

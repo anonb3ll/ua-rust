@@ -553,7 +553,7 @@ fn recheck(c: &Connection, cfg: &Config, row: &Row) -> UaResult<(Target, String)
     }
     github::api_base(cfg)?;
     let name = github::secret_name(cfg)?;
-    if !managed_secrets::bound_to(c, name, github::CONSUMER)? {
+    if !managed_secrets::bound_to(c, ua_core::DEFAULT_ORG, name, github::CONSUMER)? {
         return Err(UaError::denied(
             "relay_unavailable",
             format!("managed secret {name:?} is not set or not bound to consumer {:?}", github::CONSUMER),
@@ -573,15 +573,17 @@ struct Credential {
 fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Credential> {
     let name = github::secret_name(cfg)?.to_string();
     let (token, fingerprint) =
-        managed_secrets::load_for_consumer(tx, cfg, &name, github::CONSUMER).map_err(|e| {
-            UaError::denied(
-                "relay_unavailable",
-                format!(
-                    "the relay's GitHub credential is not usable: {}",
-                    e.reason_code().unwrap_or(e.code())
-                ),
-            )
-        })?;
+        managed_secrets::load_for_consumer(tx, cfg, ua_core::DEFAULT_ORG, &name, github::CONSUMER).map_err(
+            |e| {
+                UaError::denied(
+                    "relay_unavailable",
+                    format!(
+                        "the relay's GitHub credential is not usable: {}",
+                        e.reason_code().unwrap_or(e.code())
+                    ),
+                )
+            },
+        )?;
     if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
         return Err(UaError::denied(
             "relay_unavailable",

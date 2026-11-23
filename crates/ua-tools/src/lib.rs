@@ -145,6 +145,11 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::tasks::GOALS_ORG_SCOPE.into());
     parts.push(families::governance::PROPOSALS_TENANT_PART.into());
     parts.push(families::governance::PROPOSALS_ORG_SCOPE.into());
+    // The organization key rebuild and triggers of the managed-secret store
+    // (a secret is keyed by its organization and name), which holds another
+    // organization's GitHub credentials.
+    parts.push(families::managed_secrets::TENANT_KEYS.into());
+    parts.push(families::managed_secrets::TENANT_PART.into());
     parts
 }
 

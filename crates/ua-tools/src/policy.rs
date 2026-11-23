@@ -1048,7 +1048,7 @@ pub fn prod_action(tool: &str) -> &str {
         "deploy" => "deploy",
         "fleet_host_action" => "restart",
         "oauth_device_manage" | "mcp_server_revoke" => "revoke",
-        "managed_secret_delete" => "delete",
+        "managed_secret_delete" | "github_credential_clear" => "delete",
         "node_dispatch" | "node_followup" | "acp_permission" | "dispatch_task" | "dispatch_resume" => {
             "dispatch"
         }

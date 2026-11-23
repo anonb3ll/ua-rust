@@ -1,15 +1,36 @@
 //! Managed secrets: a write-only store for credentials the hub hands to a
-//! consumer (today, a downstream MCP server) without any agent seeing them.
+//! consumer (a downstream MCP server, the relay, an organization's GitHub
+//! automation) without any agent seeing them.
 //!
 //! Tools: `managed_secret_set` (a human or operator stores a value; replacing
 //! an existing value needs a one-time human approval bound to the new
 //! fingerprint), `managed_secret_list` (metadata only) and
 //! `managed_secret_delete` (always needs a one-time human approval).
 //!
-//! Who is an admin is decided by identity, never by profile: a verified human,
-//! or an authenticated agent listed in `human_identities` or
-//! `lifecycle_operators`. Any agent can activate the `operator` profile (the
-//! profile check is by rank only), so that profile grants nothing here.
+//! Who is an admin is decided by identity, never by profile: a verified human
+//! of the secret's organization ([`Authority::Operator`] in the caller's
+//! organization). Any agent can activate the `operator` profile (the profile
+//! check is by rank only), so that profile grants nothing here.
+//!
+//! **Organizations.** A secret belongs to one organization: the table is
+//! keyed by `(org_id, name)` (`managed_secrets.v2.tenant_keys`), every
+//! statement filters `org_id`, and the tools act in the caller's
+//! organization only. Another organization's secret of the same name answers
+//! exactly as a missing one. The hub-scoped consumers (downstream MCP
+//! servers, the relay) keep their secrets in the default organization, which
+//! operates the hub. Until memberships exist only the default organization's
+//! humans hold [`Authority::Operator`], so another organization's secrets
+//! cannot be set or deleted by any caller (fail closed).
+//!
+//! **Reserved for GitHub.** The names `github:token` and
+//! `github:webhook-secret` and consumers of kind `github` belong to the
+//! per-organization GitHub credentials
+//! ([`crate::families::github::credentials`]). `managed_secret_set` refuses
+//! them (`reserved_secret`), and so does `managed_secret_delete` outside the
+//! default organization, so those rows have one write path with its own
+//! rules. The default organization's GitHub credential is the hub's
+//! configuration, never such a row, so one found there (stored before this
+//! rule) is inert and `managed_secret_delete` may remove it.
 //!
 //! A secret for a downstream MCP server is bound to the server's name
 //! (`mcp:<server>`). Revoking the server orphans it: every secret bound to
@@ -22,23 +43,31 @@
 //! * **No read path.** No tool returns a value. Only [`load_for_consumer`],
 //!   called in-process by the consumer it is bound to, decrypts one.
 //! * **Encrypted at rest.** AES-256-GCM with a random 96-bit nonce per write
-//!   and the name and consumer as associated data, so a row copied under
-//!   another name or consumer does not decrypt. The key comes from config
-//!   (`managed_secret_key` / `UA_MANAGED_SECRET_KEY`), never the database.
-//!   With no key, writes are refused; there is no plaintext mode.
+//!   and the organization, name and consumer as associated data (`aad_v`
+//!   2), so a row copied under another organization, name or consumer does
+//!   not decrypt. Rows sealed before organizations (`aad_v` 1: name and
+//!   consumer only) decrypt only in the default organization. The key comes
+//!   from config (`managed_secret_key` / `UA_MANAGED_SECRET_KEY`), never the
+//!   database. With no key, writes are refused; there is no plaintext mode.
 //! * **Consumer scope.** Every secret names the one consumer that may load it
 //!   (`mcp:<server>` for a downstream MCP server). There is no default.
 //! * **Fingerprint, not digest.** Metadata carries an HMAC-SHA256 of the value
 //!   under a key derived from the encryption key, so a reader of the metadata
 //!   or the approval queue cannot confirm a guessed value offline.
 //! * **Ledger names only.** Events carry the name and consumer, never the
-//!   value or its fingerprint. `tool_calls` rows never hold arguments, and an
+//!   value or its fingerprint; for another organization's secret even the
+//!   name and consumer are `null` and the originator is `system`
+//!   (`ORG-EVENT-DEFAULT`). `tool_calls` rows never hold arguments, and an
 //!   approval for `managed_secret_set` (when an operator lists it in
 //!   `approval_tools`) binds the fingerprint, not the value.
 //!
 //! Key rotation: list the new key first and the old one after it. Existing
 //! rows keep decrypting; `managed_secret_list` shows `key_current: false` for
 //! rows sealed with an older key, and setting the value again re-seals it.
+
+mod tenant_keys;
+
+pub use tenant_keys::{TENANT_KEYS, TENANT_PART};
 
 use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -51,10 +80,11 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ua_core::{ActorKind, Caller, Config, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, ledger};
+use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, UaError, UaResult};
+use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use crate::approvals::{self, GateOutcome};
+use crate::families::github::credentials as gh_credentials;
 use crate::registry::{Registry, ToolCtx, tool};
 use ua_org::authz::{Authority, Authz};
 
@@ -81,7 +111,10 @@ CREATE INDEX IF NOT EXISTS idx_managed_secrets_consumer ON managed_secrets(consu
 /// Largest value accepted, in bytes.
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 const NAME_MAX: usize = 128;
-const AAD_PREFIX: &str = "ua-managed-secret/v1";
+const AAD_V1_PREFIX: &str = "ua-managed-secret/v1";
+const AAD_V2_PREFIX: &str = "ua-managed-secret/v2";
+/// The associated-data form every write uses: organization, name, consumer.
+const AAD_V: i64 = 2;
 
 // --- names ------------------------------------------------------------------------
 
@@ -125,6 +158,28 @@ pub fn mcp_consumer(server: &str) -> String {
     format!("mcp:{server}")
 }
 
+/// Whether `name` or `consumer` belongs to the per-organization GitHub
+/// credentials, which only their own tools write.
+fn reserved(name: &str, consumer: &str) -> bool {
+    gh_credentials::RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
+        || consumer.split(':').next() == Some(gh_credentials::RESERVED_CONSUMER_KIND)
+}
+
+fn refuse_reserved(name: &str, consumer: &str, doing: &str) -> UaResult<()> {
+    if reserved(name, consumer) {
+        return Err(UaError::denied(
+            "reserved_secret",
+            format!(
+                "{doing}: the names {:?} and consumers of kind {:?} are the organization's GitHub \
+                 credentials; use github_credential_set or github_credential_clear",
+                gh_credentials::RESERVED_NAMES,
+                gh_credentials::RESERVED_CONSUMER_KIND
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // --- keys -----------------------------------------------------------------------
 
 struct Key {
@@ -148,6 +203,12 @@ fn keyring(cfg: &Config) -> UaResult<Option<Vec<Key>>> {
         keys.push(Key { id: hex::encode(h.finalize())[..16].to_string(), bytes });
     }
     Ok((!keys.is_empty()).then_some(keys))
+}
+
+/// The ids of the configured keys, the write key first; empty when no key
+/// is set or the setting does not parse.
+pub(crate) fn key_ids(cfg: &Config) -> Vec<String> {
+    keyring(cfg).ok().flatten().map(|k| k.into_iter().map(|k| k.id).collect()).unwrap_or_default()
 }
 
 fn decode_key(s: &str) -> Option<[u8; 32]> {
@@ -188,31 +249,50 @@ pub(crate) fn config_fingerprint(cfg: &Config, value: &str) -> Option<String> {
     write_key(cfg).ok().map(|k| fingerprint(&k, value))
 }
 
-fn aad(name: &str, consumer: &str) -> Vec<u8> {
-    format!("{AAD_PREFIX}\0{name}\0{consumer}").into_bytes()
+/// The associated data for a row of organization `org` sealed under form
+/// `aad_v`. Form 1 (before organizations) binds the name and consumer only
+/// and is accepted for the default organization alone; form 2 binds the
+/// organization too. Any other form is refused.
+fn aad(aad_v: i64, org: &str, name: &str, consumer: &str) -> Option<Vec<u8>> {
+    match aad_v {
+        1 if org == DEFAULT_ORG => Some(format!("{AAD_V1_PREFIX}\0{name}\0{consumer}").into_bytes()),
+        2 => Some(format!("{AAD_V2_PREFIX}\0{org}\0{name}\0{consumer}").into_bytes()),
+        _ => None,
+    }
 }
 
-fn seal(key: &Key, name: &str, consumer: &str, value: &str) -> UaResult<(Vec<u8>, Vec<u8>)> {
+fn seal(key: &Key, org: &str, name: &str, consumer: &str, value: &str) -> UaResult<(Vec<u8>, Vec<u8>)> {
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng
         .try_fill_bytes(&mut nonce)
         .map_err(|_| UaError::internal("the operating system random source failed"))?;
     let cipher = <Aes256Gcm as AeadKeyInit>::new_from_slice(&key.bytes)
         .map_err(|_| UaError::internal("invalid secret key length"))?;
-    let aad = aad(name, consumer);
+    let aad = aad(AAD_V, org, name, consumer).expect("the write form is always accepted");
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), Payload { msg: value.as_bytes(), aad: &aad })
         .map_err(|_| UaError::internal("managed secret encryption failed"))?;
     Ok((nonce.to_vec(), ct))
 }
 
-fn unseal(key: &Key, name: &str, consumer: &str, nonce: &[u8], ct: &[u8]) -> UaResult<SecretString> {
+/// Where a sealed row lives and how it was sealed.
+struct Bound<'a> {
+    org: &'a str,
+    name: &'a str,
+    consumer: &'a str,
+    aad_v: i64,
+}
+
+fn unseal(key: &Key, at: &Bound<'_>, nonce: &[u8], ct: &[u8]) -> UaResult<SecretString> {
+    let name = at.name;
     if nonce.len() != 12 {
         return Err(UaError::internal(format!("managed secret {name:?} is corrupt")));
     }
+    let aad = aad(at.aad_v, at.org, name, at.consumer).ok_or_else(|| {
+        UaError::internal(format!("managed secret {name:?} was sealed in a form this organization refuses"))
+    })?;
     let cipher = <Aes256Gcm as AeadKeyInit>::new_from_slice(&key.bytes)
         .map_err(|_| UaError::internal("invalid secret key length"))?;
-    let aad = aad(name, consumer);
     let plain = cipher
         .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
         .map_err(|_| UaError::internal(format!("managed secret {name:?} did not decrypt with its key")))?;
@@ -223,24 +303,27 @@ fn unseal(key: &Key, name: &str, consumer: &str, nonce: &[u8], ct: &[u8]) -> UaR
 
 // --- the consumer path -------------------------------------------------------------
 
-/// Decrypt one secret for its bound consumer, with its stored keyed
-/// fingerprint (what an approval binds). In-process only: no tool returns the
-/// value. Refuses a secret bound to any other consumer.
+/// Decrypt one secret of organization `org` for its bound consumer, with its
+/// stored keyed fingerprint (what an approval binds). In-process only: no
+/// tool returns the value. Refuses a secret bound to any other consumer;
+/// another organization's secret of the same name is not found.
 pub(crate) fn load_for_consumer(
     conn: &Connection,
     cfg: &Config,
+    org: &str,
     name: &str,
     consumer: &str,
 ) -> UaResult<(SecretString, String)> {
-    type Sealed = (String, String, Vec<u8>, Vec<u8>, String);
+    type Sealed = (String, String, Vec<u8>, Vec<u8>, String, i64);
     let row: Option<Sealed> = conn
         .query_row(
-            "SELECT consumer, key_id, nonce, ciphertext, fingerprint FROM managed_secrets WHERE name = ?1",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            "SELECT consumer, key_id, nonce, ciphertext, fingerprint, aad_v FROM managed_secrets \
+             WHERE org_id = ?1 AND name = ?2",
+            [org, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?;
-    let Some((bound, key_id, nonce, ct, fp)) = row else {
+    let Some((bound, key_id, nonce, ct, fp, aad_v)) = row else {
         return Err(UaError::not_found(format!("managed secret {name:?} is not set")));
     };
     if bound != consumer {
@@ -261,67 +344,274 @@ pub(crate) fn load_for_consumer(
             format!("managed secret {name:?} was sealed with a key that is no longer configured"),
         )
     })?;
-    Ok((unseal(key, name, consumer, &nonce, &ct)?, fp))
+    let at = Bound { org, name, consumer, aad_v };
+    Ok((unseal(key, &at, &nonce, &ct)?, fp))
 }
 
-/// Whether `name` is stored and bound to `consumer` (no decryption).
-pub(crate) fn bound_to(conn: &Connection, name: &str, consumer: &str) -> UaResult<bool> {
+/// Whether `name` is stored in organization `org` and bound to `consumer`
+/// (no decryption).
+pub(crate) fn bound_to(conn: &Connection, org: &str, name: &str, consumer: &str) -> UaResult<bool> {
     let bound: Option<String> = conn
-        .query_row("SELECT consumer FROM managed_secrets WHERE name = ?1", [name], |r| r.get(0))
+        .query_row("SELECT consumer FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name], |r| {
+            r.get(0)
+        })
         .optional()?;
     Ok(bound.as_deref() == Some(consumer))
 }
 
-/// Name and keyed fingerprint of every secret bound to `consumer`, by name.
-pub(crate) fn bound_secrets(conn: &Connection, consumer: &str) -> UaResult<Vec<(String, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT name, fingerprint FROM managed_secrets WHERE consumer = ?1 ORDER BY name")?;
-    let rows = stmt.query_map([consumer], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+/// The consumer and key id of `name` in organization `org` (no decryption).
+pub(crate) fn sealed_with(conn: &Connection, org: &str, name: &str) -> UaResult<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT consumer, key_id FROM managed_secrets WHERE org_id = ?1 AND name = ?2",
+            [org, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Name and keyed fingerprint of every secret of organization `org` bound to
+/// `consumer`, by name.
+pub(crate) fn bound_secrets(conn: &Connection, org: &str, consumer: &str) -> UaResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, fingerprint FROM managed_secrets WHERE org_id = ?1 AND consumer = ?2 ORDER BY name",
+    )?;
+    let rows = stmt.query_map([org, consumer], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-/// Delete every secret bound to `consumer` (the caller holds the approval
-/// that listed them), one `managed_secret.deleted` event each. Returns the names.
+/// Delete every secret of organization `org` bound to `consumer` (the caller
+/// holds the approval that listed them), one `managed_secret.deleted` event
+/// each. Returns the names.
 pub(crate) fn orphan_consumer(
-    tx: &mut ua_store::WriteTx<'_>,
+    tx: &mut WriteTx<'_>,
+    org: &str,
     consumer: &str,
     by: &str,
     approval_id: i64,
     why: &str,
 ) -> UaResult<Vec<String>> {
-    let names: Vec<String> = bound_secrets(tx, consumer)?.into_iter().map(|(n, _)| n).collect();
-    tx.execute("DELETE FROM managed_secrets WHERE consumer = ?1", [consumer])?;
+    let names: Vec<String> = bound_secrets(tx, org, consumer)?.into_iter().map(|(n, _)| n).collect();
+    tx.execute("DELETE FROM managed_secrets WHERE org_id = ?1 AND consumer = ?2", [org, consumer])?;
     for name in &names {
+        // ORG-EVENT-DEFAULT: another organization's names stay out of the
+        // default organization's ledger.
         ledger::append(
             tx,
             EventInput::new(
                 ua_core::DEFAULT_ORG,
                 "managed_secret.deleted",
-                json!({ "name": name, "consumer": consumer, "approval_id": approval_id, "reason": why }),
+                json!({
+                    "name": ledger_text(org, name), "consumer": ledger_text(org, consumer),
+                    "approval_id": approval_id, "reason": why,
+                }),
             )
-            .by(by.to_string()),
+            .by(approvals::ledger_originator(org, by)),
         )?;
     }
     Ok(names)
 }
 
+/// A caller-chosen name or label for an event: events stay in the default
+/// organization's ledger (`ORG-EVENT-DEFAULT`), so another organization's
+/// are `null` there.
+fn ledger_text(org: &str, text: &str) -> Value {
+    if org == DEFAULT_ORG { json!(text) } else { Value::Null }
+}
+
+// --- the shared write path -----------------------------------------------------------
+
+/// A value sealed for one organization, name and consumer. Holds no
+/// plaintext.
+pub(crate) struct Sealed {
+    key_id: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+    pub(crate) fingerprint: String,
+    pub(crate) value_bytes: usize,
+}
+
+/// Check the size of `value`, then seal it for `org`, `name` and `consumer`
+/// under the write key. Refused when no key is configured.
+pub(crate) fn seal_value(
+    cfg: &Config,
+    org: &str,
+    name: &str,
+    consumer: &str,
+    value: &str,
+) -> UaResult<Sealed> {
+    if value.is_empty() || value.len() > MAX_VALUE_BYTES {
+        return Err(UaError::invalid(format!("value must be 1-{MAX_VALUE_BYTES} bytes")));
+    }
+    let key = write_key(cfg)?;
+    let fingerprint = fingerprint(&key, value);
+    let (nonce, ciphertext) = seal(&key, org, name, consumer, value)?;
+    Ok(Sealed { key_id: key.id, nonce, ciphertext, fingerprint, value_bytes: value.len() })
+}
+
+/// What an approval of a secret write binds: never the value.
+pub(crate) fn set_payload(name: &str, consumer: &str, fp: Option<&str>, value_bytes: usize) -> Value {
+    json!({ "name": name, "consumer": consumer, "fingerprint": fp, "value_bytes": value_bytes })
+}
+
+/// What [`put`] did.
+pub(crate) struct Stored {
+    pub(crate) replaced: bool,
+    pub(crate) approval_id: Option<i64>,
+    pub(crate) updated_at: String,
+}
+
+/// Store `sealed` as secret `name` of organization `org`, inside the
+/// caller's write transaction. A name already bound to another consumer is
+/// refused. Replacing a value is as consequential as deleting it: unless
+/// the registry already consumed a pass for this call (`registry_gated`),
+/// it needs a one-time human approval of `tool`, bound to the new value's
+/// fingerprint. `Ok(Err(id))` is a pending approval. Writes no event: the
+/// tool records its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn put(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    caller: &Caller,
+    org: &str,
+    tool: &str,
+    name: &str,
+    consumer: &str,
+    sealed: &Sealed,
+    registry_gated: bool,
+) -> UaResult<Result<Stored, i64>> {
+    let prior: Option<String> = tx
+        .query_row("SELECT consumer FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(prior) = &prior
+        && prior != consumer
+    {
+        return Err(UaError::conflict_code(
+            "secret_consumer_change",
+            format!(
+                "managed secret {name:?} is bound to {prior:?}; delete it before binding the name to another consumer"
+            ),
+        ));
+    }
+    let mut approval_id = None;
+    if prior.is_some() && !registry_gated {
+        let payload = set_payload(name, consumer, Some(&sealed.fingerprint), sealed.value_bytes);
+        match approvals::gate(tx, cfg, caller, tool, &payload)? {
+            GateOutcome::Pass { approval_id: id } => approval_id = Some(id),
+            GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
+            GateOutcome::Denied { approval_id, reason } => {
+                return Err(UaError::denied(
+                    "approval_denied",
+                    format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+                ));
+            }
+        }
+    }
+    let now = ua_core::time::now();
+    tx.execute(
+        "INSERT INTO managed_secrets (org_id, name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
+         created_by, created_at, updated_by, updated_at, aad_v) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?9, ?10, ?11) \
+         ON CONFLICT(org_id, name) DO UPDATE SET key_id = ?4, nonce = ?5, ciphertext = ?6, fingerprint = ?7, \
+         value_bytes = ?8, updated_by = ?9, updated_at = ?10, aad_v = ?11",
+        params![
+            org,
+            name,
+            consumer,
+            sealed.key_id,
+            sealed.nonce,
+            sealed.ciphertext,
+            sealed.fingerprint,
+            sealed.value_bytes as i64,
+            caller.label,
+            now,
+            AAD_V
+        ],
+    )?;
+    Ok(Ok(Stored { replaced: prior.is_some(), approval_id, updated_at: now }))
+}
+
+/// Delete secret `name` of organization `org`, inside the caller's write
+/// transaction, under a one-time human approval of `tool` bound to the name,
+/// consumer and current fingerprint (a rotation after the request needs a
+/// new approval). Returns the consumer and approval id, or `Ok(Err(id))` for
+/// a pending approval. Another organization's secret is not found. Writes
+/// no event: the tool records its own.
+pub(crate) fn remove(
+    tx: &mut WriteTx<'_>,
+    cfg: &Config,
+    caller: &Caller,
+    org: &str,
+    tool: &str,
+    name: &str,
+) -> UaResult<Result<(String, i64), i64>> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT consumer, fingerprint FROM managed_secrets WHERE org_id = ?1 AND name = ?2",
+            [org, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((consumer, fp)) = row else {
+        return Err(UaError::not_found(format!("managed secret {name:?} is not set")));
+    };
+    let payload = json!({ "name": name, "consumer": consumer, "fingerprint": fp });
+    let approval_id = match approvals::gate(tx, cfg, caller, tool, &payload)? {
+        GateOutcome::Pass { approval_id } => approval_id,
+        GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
+        GateOutcome::Denied { approval_id, reason } => {
+            return Err(UaError::denied(
+                "approval_denied",
+                format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
+            ));
+        }
+    };
+    tx.execute("DELETE FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name])?;
+    Ok(Ok((consumer, approval_id)))
+}
+
 // --- who may write ------------------------------------------------------------------
 
-/// An operator: a verified human ([`Authority::Operator`]). Keyed on
-/// identity, never on profile; a profile grants no authority.
+/// An operator of the hub: a verified human of the default organization
+/// ([`Authority::Operator`]), for the hub-scoped consumers (downstream MCP
+/// servers). Keyed on identity, never on profile; a profile grants no
+/// authority.
 pub(crate) fn is_secret_admin(cfg: &Config, caller: &Caller) -> bool {
     Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
-fn require_admin(cfg: &Config, caller: &Caller, doing: &str) -> UaResult<()> {
+/// Refuse an organization `orgs` does not hold. Runs before anything is
+/// read, and again first in every write transaction: the `org_exists`
+/// trigger only sees inserts, so a delete would otherwise pass.
+pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no secret was changed"),
+        ));
+    }
+    Ok(())
+}
+
+/// A secret admin of organization `org`: an authenticated caller holding
+/// [`Authority::Operator`] there. Until memberships exist that is a verified
+/// human of the default organization only, so another organization's
+/// secrets cannot be written by any caller.
+pub(crate) fn require_admin(cfg: &Config, caller: &Caller, org: &str, doing: &str) -> UaResult<()> {
     if caller.kind == ActorKind::Anonymous {
         return Err(UaError::denied(
             "identity_required",
             format!("{doing} requires an authenticated identity"),
         ));
     }
-    if !is_secret_admin(cfg, caller) {
-        return Err(UaError::denied("operator_only", format!("{doing} is for a human or an operator")));
+    if !Authz::new(cfg).holds(caller, &[Authority::Operator], org) {
+        return Err(UaError::denied(
+            "operator_only",
+            format!("{doing} is for a verified human of the secret's organization"),
+        ));
     }
     Ok(())
 }
@@ -345,11 +635,6 @@ impl std::fmt::Debug for SetArgs {
     }
 }
 
-/// What an approval of `managed_secret_set` binds: never the value.
-fn set_payload(name: &str, consumer: &str, fp: Option<&str>, value_bytes: usize) -> Value {
-    json!({ "name": name, "consumer": consumer, "fingerprint": fp, "value_bytes": value_bytes })
-}
-
 fn set_gate_payload(cfg: &Config, args: &Value) -> Value {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let value = s("value");
@@ -359,19 +644,16 @@ fn set_gate_payload(cfg: &Config, args: &Value) -> Value {
 
 async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
     let cfg = ctx.hub.cfg().clone();
-    require_admin(&cfg, &ctx.caller, "managed_secret_set")?;
+    let org = ctx.caller.org_id.clone();
+    let known = org.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &known)).await?;
+    require_admin(&cfg, &ctx.caller, &org, "managed_secret_set")?;
     check_name(&a.name)?;
     check_consumer(&a.consumer)?;
-    if a.value.is_empty() || a.value.len() > MAX_VALUE_BYTES {
-        return Err(UaError::invalid(format!("value must be 1-{MAX_VALUE_BYTES} bytes")));
-    }
-    let key = write_key(&cfg)?;
-    let fp = fingerprint(&key, &a.value);
-    let (nonce, ct) = seal(&key, &a.name, &a.consumer, &a.value)?;
-    let (who, value_bytes) = (ctx.caller.label.clone(), a.value.len() as i64);
-    let gate_payload = set_payload(&a.name, &a.consumer, Some(&fp), a.value.len());
+    refuse_reserved(&a.name, &a.consumer, "managed_secret_set")?;
+    let sealed = seal_value(&cfg, &org, &a.name, &a.consumer, &a.value)?;
     drop(a.value);
-    let (name, consumer, key_id) = (a.name, a.consumer, key.id);
+    let (name, consumer) = (a.name, a.consumer);
     // With managed_secret_set in approval_tools the registry has already
     // consumed a pass for this exact payload.
     let registry_gated = cfg.approval_tools.iter().any(|t| t == "managed_secret_set");
@@ -380,55 +662,39 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let prior: Option<String> = tx
-                .query_row("SELECT consumer FROM managed_secrets WHERE name = ?1", [&name], |r| r.get(0))
-                .optional()?;
-            if let Some(prior) = &prior
-                && prior != &consumer
-            {
-                return Err(UaError::conflict_code(
-                    "secret_consumer_change",
-                    format!(
-                        "managed secret {name:?} is bound to {prior:?}; delete it before binding the name to another consumer"
-                    ),
-                ));
-            }
-            // Replacing a credential is as consequential as deleting it: a
-            // one-time human approval bound to the new value's fingerprint.
-            let mut approval_id = None;
-            if prior.is_some() && !registry_gated {
-                match approvals::gate(tx, hub.cfg(), &caller, "managed_secret_set", &gate_payload)? {
-                    GateOutcome::Pass { approval_id: id } => approval_id = Some(id),
-                    GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
-                    GateOutcome::Denied { approval_id, reason } => {
-                        return Err(UaError::denied(
-                            "approval_denied",
-                            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-                        ));
-                    }
-                }
-            }
-            let now = ua_core::time::now();
-            tx.execute(
-                "INSERT INTO managed_secrets (name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
-                 created_by, created_at, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8, ?9) \
-                 ON CONFLICT(name) DO UPDATE SET key_id = ?3, nonce = ?4, ciphertext = ?5, fingerprint = ?6, \
-                 value_bytes = ?7, updated_by = ?8, updated_at = ?9",
-                params![name, consumer, key_id, nonce, ct, fp, value_bytes, who, now],
-            )?;
-            let replaced = prior.is_some();
+            require_org(tx, &org)?;
+            let stored = match put(
+                tx,
+                hub.cfg(),
+                &caller,
+                &org,
+                "managed_secret_set",
+                &name,
+                &consumer,
+                &sealed,
+                registry_gated,
+            )? {
+                Ok(s) => s,
+                Err(pending) => return Ok(Err(pending)),
+            };
+            // ORG-EVENT-DEFAULT: use the secret's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
-                EventInput::new(ua_core::DEFAULT_ORG,
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "managed_secret.set",
-                    json!({ "name": name, "consumer": consumer, "replaced": replaced, "approval_id": approval_id }),
+                    json!({
+                        "name": ledger_text(&org, &name), "consumer": ledger_text(&org, &consumer),
+                        "replaced": stored.replaced, "approval_id": stored.approval_id,
+                    }),
                 )
-                .by(who.clone()),
+                .by(approvals::ledger_originator(&org, &caller.label)),
             )?;
             Ok(Ok(json!({
-                "name": name, "consumer": consumer, "fingerprint": fp, "key_id": key_id,
-                "value_bytes": value_bytes, "replaced": replaced, "updated_at": now, "stored": true,
-                "approval_id": approval_id,
+                "name": name, "consumer": consumer, "fingerprint": sealed.fingerprint, "key_id": sealed.key_id,
+                "value_bytes": sealed.value_bytes, "replaced": stored.replaced, "updated_at": stored.updated_at,
+                "stored": true, "approval_id": stored.approval_id,
             })))
         })
         .await?;
@@ -443,21 +709,18 @@ pub struct ListArgs {
 }
 
 async fn managed_secret_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    let current: Vec<String> = keyring(ctx.hub.cfg())
-        .ok()
-        .flatten()
-        .map(|k| k.into_iter().map(|k| k.id).collect())
-        .unwrap_or_default();
+    let current = key_ids(ctx.hub.cfg());
     let write_id = current.first().cloned();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
                 "SELECT name, consumer, key_id, fingerprint, value_bytes, created_by, created_at, updated_by, \
-                 updated_at FROM managed_secrets WHERE (?1 IS NULL OR consumer = ?1) ORDER BY name",
+                 updated_at FROM managed_secrets WHERE org_id = ?1 AND (?2 IS NULL OR consumer = ?2) ORDER BY name",
             )?;
             let rows = stmt
-                .query_map([a.consumer], |r| {
+                .query_map(params![org, a.consumer], |r| {
                     let key_id: String = r.get(2)?;
                     Ok(json!({
                         "name": r.get::<_, String>(0)?,
@@ -488,45 +751,42 @@ pub struct DeleteArgs {
 
 async fn managed_secret_delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
     let cfg = ctx.hub.cfg().clone();
-    require_admin(&cfg, &ctx.caller, "managed_secret_delete")?;
+    let org = ctx.caller.org_id.clone();
+    let known = org.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &known)).await?;
+    require_admin(&cfg, &ctx.caller, &org, "managed_secret_delete")?;
     check_name(&a.name)?;
     let (hub, caller, name) = (ctx.hub.clone(), ctx.caller.clone(), a.name);
     let out = ctx
         .hub
         .db()
         .write_async(move |tx| {
-            let row: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT consumer, fingerprint FROM managed_secrets WHERE name = ?1",
-                    [&name],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((consumer, fp)) = row else {
-                return Err(UaError::not_found(format!("managed secret {name:?} is not set")));
-            };
-            // Bound to the exact value: a rotation after the request needs a new approval.
-            let payload = json!({ "name": name, "consumer": consumer, "fingerprint": fp });
-            let approval_id =
-                match approvals::gate(tx, hub.cfg(), &caller, "managed_secret_delete", &payload)? {
-                    GateOutcome::Pass { approval_id } => approval_id,
-                    GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
-                    GateOutcome::Denied { approval_id, reason } => {
-                        return Err(UaError::denied(
-                            "approval_denied",
-                            format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-                        ));
-                    }
+            require_org(tx, &org)?;
+            // Another organization's GitHub credential is its tools' to
+            // clear; in the default organization such a row is never read.
+            if org != DEFAULT_ORG
+                && let Some((consumer, _)) = sealed_with(tx, &org, &name)?
+            {
+                refuse_reserved(&name, &consumer, "managed_secret_delete")?;
+            }
+            let (consumer, approval_id) =
+                match remove(tx, hub.cfg(), &caller, &org, "managed_secret_delete", &name)? {
+                    Ok(done) => done,
+                    Err(pending) => return Ok(Err(pending)),
                 };
-            tx.execute("DELETE FROM managed_secrets WHERE name = ?1", [&name])?;
+            // ORG-EVENT-DEFAULT: use the secret's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(
                     ua_core::DEFAULT_ORG,
                     "managed_secret.deleted",
-                    json!({ "name": name, "consumer": consumer, "approval_id": approval_id }),
+                    json!({
+                        "name": ledger_text(&org, &name), "consumer": ledger_text(&org, &consumer),
+                        "approval_id": approval_id,
+                    }),
                 )
-                .by(caller.label.clone()),
+                .by(approvals::ledger_originator(&org, &caller.label)),
             )?;
             Ok(Ok(json!({ "name": name, "consumer": consumer, "deleted": true, "approval_id": approval_id })))
         })
@@ -538,12 +798,13 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "managed_secret_set",
-            "Store a credential for one consumer (e.g. `mcp:docs`, the MCP server docs), encrypted at rest. \
-             For a human or a configured operator identity. The value is never returned by any tool; the \
-             result and managed_secret_list show only metadata and a keyed fingerprint. Replacing an existing \
-             value needs a one-time human approval bound to the new value's fingerprint (the identical retry \
-             after approval stores it). Refused when the hub has no managed_secret_key. Rebinding a name to \
-             another consumer needs a delete first.",
+            "Store a credential for one consumer (e.g. `mcp:docs`, the MCP server docs), encrypted at rest, in \
+             the caller's organization. For a verified human of that organization. The value is never returned \
+             by any tool; the result and managed_secret_list show only metadata and a keyed fingerprint. \
+             Replacing an existing value needs a one-time human approval bound to the new value's fingerprint \
+             (the identical retry after approval stores it). Refused when the hub has no managed_secret_key. \
+             Rebinding a name to another consumer needs a delete first. The names `github:token` and \
+             `github:webhook-secret` and consumers of kind `github` are refused: use github_credential_set.",
             managed_secret_set,
         )
         .gate_payload(set_gate_payload)
@@ -554,7 +815,8 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "managed_secret_list",
-            "List managed secrets: name, consumer, keyed fingerprint, size, key id and who set them. Never values.",
+            "List the caller's organization's managed secrets: name, consumer, keyed fingerprint, size, key id \
+             and who set them. Never values.",
             managed_secret_list,
         )
         .read_only()
@@ -563,8 +825,10 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "managed_secret_delete",
-            "Delete one managed secret. For a human or a configured operator identity, and always needs a one-time human approval \
-             bound to the name, consumer and current fingerprint; the identical retry after approval deletes it.",
+            "Delete one managed secret of the caller's organization. For a verified human of that organization, \
+             and always needs a one-time human approval bound to the name, consumer and current fingerprint; the \
+             identical retry after approval deletes it. A GitHub credential is cleared with \
+             github_credential_clear instead.",
             managed_secret_delete,
         )
         .always_gated()
@@ -585,6 +849,10 @@ mod tests {
 
     const K1: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
+    fn at<'a>(org: &'a str, name: &'a str, consumer: &'a str) -> Bound<'a> {
+        Bound { org, name, consumer, aad_v: AAD_V }
+    }
+
     #[test]
     fn keys_decode_from_hex_and_base64_and_reject_other_lengths() {
         assert!(decode_key(K1).is_some());
@@ -598,15 +866,43 @@ mod tests {
     }
 
     #[test]
-    fn seal_round_trips_and_binds_name_and_consumer() {
+    fn seal_round_trips_and_binds_organization_name_and_consumer() {
         let key = write_key(&cfg_with(K1)).unwrap();
-        let (nonce, ct) = seal(&key, "tok", "mcp:docs", "s3cret").unwrap();
+        let (nonce, ct) = seal(&key, DEFAULT_ORG, "tok", "mcp:docs", "s3cret").unwrap();
         assert!(!ct.windows(6).any(|w| w == b"s3cret"), "ciphertext must not hold the plaintext");
-        assert_eq!(unseal(&key, "tok", "mcp:docs", &nonce, &ct).unwrap().expose_secret(), "s3cret");
-        assert!(unseal(&key, "other", "mcp:docs", &nonce, &ct).is_err(), "renamed rows do not decrypt");
-        assert!(unseal(&key, "tok", "mcp:evil", &nonce, &ct).is_err(), "rebound rows do not decrypt");
-        let (n2, _) = seal(&key, "tok", "mcp:docs", "s3cret").unwrap();
+        let open = |b: Bound<'_>| unseal(&key, &b, &nonce, &ct);
+        assert_eq!(open(at(DEFAULT_ORG, "tok", "mcp:docs")).unwrap().expose_secret(), "s3cret");
+        assert!(open(at(DEFAULT_ORG, "other", "mcp:docs")).is_err(), "renamed rows do not decrypt");
+        assert!(open(at(DEFAULT_ORG, "tok", "mcp:evil")).is_err(), "rebound rows do not decrypt");
+        assert!(
+            open(at("org-b", "tok", "mcp:docs")).is_err(),
+            "a row moved to another organization does not decrypt"
+        );
+        let (n2, _) = seal(&key, DEFAULT_ORG, "tok", "mcp:docs", "s3cret").unwrap();
         assert_ne!(nonce, n2, "every write takes a fresh nonce");
+    }
+
+    #[test]
+    fn rows_sealed_before_organizations_decrypt_only_in_the_default_organization() {
+        let key = write_key(&cfg_with(K1)).unwrap();
+        // The managed_secrets.v1 form: name and consumer only.
+        let cipher = <Aes256Gcm as AeadKeyInit>::new_from_slice(&key.bytes).unwrap();
+        let nonce = [3u8; 12];
+        let legacy_aad = format!("{AAD_V1_PREFIX}\0tok\0mcp:docs").into_bytes();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: b"legacy-value-not-real", aad: &legacy_aad })
+            .unwrap();
+        let v1 = |org| Bound { org, name: "tok", consumer: "mcp:docs", aad_v: 1 };
+        assert_eq!(
+            unseal(&key, &v1(DEFAULT_ORG), &nonce, &ct).unwrap().expose_secret(),
+            "legacy-value-not-real"
+        );
+        assert!(
+            unseal(&key, &v1("org-b"), &nonce, &ct).is_err(),
+            "form 1 is the default organization's only"
+        );
+        let bad = Bound { org: DEFAULT_ORG, name: "tok", consumer: "mcp:docs", aad_v: 3 };
+        assert!(unseal(&key, &bad, &nonce, &ct).is_err(), "an unknown form is refused");
     }
 
     #[test]
@@ -630,5 +926,16 @@ mod tests {
         assert!(check_consumer("MCP:docs").is_err());
         assert!(check_consumer("mcp:").is_err());
         assert!(check_consumer("mcp:a:b").is_err());
+    }
+
+    #[test]
+    fn github_names_and_consumers_are_reserved() {
+        assert!(reserved("github:token", "mcp:docs"));
+        assert!(reserved("GitHub:Webhook-Secret", "mcp:docs"));
+        assert!(reserved("docs-token", "github"));
+        assert!(reserved("docs-token", "github:api"));
+        assert!(!reserved("github:relay", "relay:github"), "the relay's name and consumer are its own");
+        assert!(!reserved("githubish", "mcp:docs"));
+        assert!(!reserved("gh", "mcp:github"));
     }
 }

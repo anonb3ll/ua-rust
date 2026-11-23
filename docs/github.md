@@ -52,12 +52,56 @@ request (one connection pool), not rebuilt per call.
   token there are no GitHub requests at all: checks stay `attested` with
   verdict `unverifiable`, the poller skips, and `queue_close_merged` refuses.
 - **Later sources.** A GitHub App installation token can replace the
-  personal token behind the same client. Once the managed-secret store
-  (slice 4) is merged, it becomes the token's and webhook secret's source;
-  `github_token_env` stays as the fallback.
+  personal token behind the same client.
 - **Webhook secret.** `github_webhook_secret_env` names the variable holding
   the secret set on the GitHub webhook. Without it the endpoint answers 503
   to everything.
+
+### Credentials per organization
+
+Owner decision (2026-11-23): GitHub automation runs per task organization,
+each organization under its own credentials, and an organization without
+one stays off. The credential layer is in place; the webhook, the poller,
+CI verification and merged-PR reconciliation still serve the default
+organization only (`ORG-GITHUB-DEFAULT` in the source) until they switch to
+it.
+
+| Organization | Token | Webhook secret |
+|---|---|---|
+| `default` | `github_token_env` (above), unchanged | `github_webhook_secret_env` (above), unchanged |
+| any other | its managed secret `github:token`, consumer `github:api` | its managed secret `github:webhook-secret`, consumer `github:webhook` |
+
+- **No fallback.** `github_credential_for(org, kind)`
+  (`crates/ua-tools/src/families/github/credentials.rs`) answers each
+  organization with its own credential or with none. The default
+  organization never reads a managed secret; another organization never
+  reads the hub's configuration or another organization's secret. A secret
+  is sealed with its organization in the associated data, so a row copied
+  into another organization does not decrypt.
+- **Setting one.** `github_credential_set` (`kind`: `token` or
+  `webhook_secret`, and the `value`) and `github_credential_clear` act in
+  the caller's organization only, for a verified human of it. The default
+  organization's are configuration and are refused there
+  (`github_credential_in_hub_config`). Replacing a stored value needs a
+  one-time human approval bound to the new value's keyed fingerprint;
+  clearing always does. Until memberships exist only the default
+  organization's humans hold operator authority, so today no caller can set
+  another organization's credential (fail closed). `managed_secret_set`
+  and `managed_secret_delete` refuse the reserved names and the consumer
+  kind `github` (`reserved_secret`), so these rows have one write path.
+- **Reporting.** `github_credential_status` shows, for the caller's
+  organization, each credential as `configured`, `off` or `unusable` (stored
+  under a key the hub no longer has) and its source (`hub_config` or
+  `managed_secret`); `system_doctor` has a `github_credentials` line with
+  every organization for a default-organization caller and only its own for
+  any other. Neither shows a value or a fingerprint. Events
+  (`github.credential.set`, `github.credential.cleared`) carry the kind,
+  whether a value was replaced and the approval id.
+- **Webhooks per organization (next).** A delivery will be checked against
+  the webhook secret of the organization its URL names, and only that one:
+  an organization with no secret answers 503 (`not_configured`) and is
+  never verified with another organization's or the hub's secret. The
+  default organization keeps `POST /api/github/webhook`.
 
 ## Security model
 

@@ -1379,6 +1379,57 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
     }
 }
 
+/// Organizations the GitHub credential line names at most.
+const GITHUB_ORGS_SHOWN: usize = 50;
+
+/// Each organization's GitHub credentials: `configured`, `off` or
+/// `unusable` and where from, never a value. A default-organization caller
+/// (the hub's operators) sees every organization; any other caller only its
+/// own. LIVE when one is configured, DEGRADED when a stored one is unusable,
+/// DORMANT when all are off.
+fn github_credentials_check(c: &Connection, cfg: &Config, caller_org: &str) -> UaResult<Value> {
+    use crate::families::github::credentials::{self, CredentialKind, CredentialState};
+    let gate = "github_token_env, github_webhook_secret_env (default organization); github_credential_set \
+                (another organization)";
+    let orgs: Vec<String> = if caller_org == ua_core::DEFAULT_ORG {
+        let mut stmt = c.prepare("SELECT id FROM orgs ORDER BY id = ?1 DESC, id")?;
+        stmt.query_map([ua_core::DEFAULT_ORG], |r| r.get(0))?.collect::<Result<_, _>>()?
+    } else {
+        vec![caller_org.to_string()]
+    };
+    let (mut lines, mut configured, mut unusable) = (Vec::new(), false, false);
+    for org in orgs.iter().take(GITHUB_ORGS_SHOWN) {
+        let mut parts = Vec::new();
+        for kind in CredentialKind::ALL {
+            let s = credentials::credential_status(c, cfg, org, kind)?;
+            configured |= s.state == CredentialState::Configured;
+            unusable |= s.state == CredentialState::Unusable;
+            let state = match (s.state, s.source) {
+                (CredentialState::Configured, Some(credentials::CredentialSource::HubConfig)) => {
+                    "configured (hub config)"
+                }
+                (CredentialState::Configured, _) => "configured (managed secret)",
+                (CredentialState::Unusable, _) => "unusable (its key is not configured)",
+                (CredentialState::Off, _) => "off",
+            };
+            parts.push(format!("{} {state}", kind.as_str()));
+        }
+        lines.push(format!("{org}: {}", parts.join(", ")));
+    }
+    if orgs.len() > GITHUB_ORGS_SHOWN {
+        lines.push(format!("and {} more organization(s)", orgs.len() - GITHUB_ORGS_SHOWN));
+    }
+    let detail = format!("{}; automation serves the default organization only for now", lines.join("; "));
+    let status = if unusable {
+        DEGRADED
+    } else if configured {
+        LIVE
+    } else {
+        DORMANT
+    };
+    Ok(finding("github_credentials", status, detail, gate))
+}
+
 /// Slack: the HTTP routes (mounted or why not) and the Socket Mode
 /// transport (off, not compiled, connecting, connected, auth failed). The
 /// signing secret and the app token are only checked for presence.
@@ -1585,6 +1636,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
     let deep = a.refresh;
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
+    let github = {
+        let (cfg, org) = (ctx.hub.cfg().clone(), ctx.caller.org_id.clone());
+        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &org)).await?
+    };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
@@ -1604,6 +1659,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         notify_check(cfg, &facts),
         zulip_check(cfg),
         slack_check(cfg),
+        github,
         policy_check(cfg),
         fleet_nodes_check(&facts),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),

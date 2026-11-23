@@ -26,9 +26,11 @@
 //!   (or `retry-after`), without touching the network.
 //! - **The token** comes from [`Config::github_token`] (the variable
 //!   `github_token_env` names). It is sent as a sensitive header and never
-//!   stored, returned or logged. A GitHub App installation token can stand
-//!   in for it later; once the managed-secret store lands, it becomes the
-//!   token's source.
+//!   stored, returned or logged. That is the default organization's token
+//!   ([`super::credentials::github_credential_for`]); another
+//!   organization's is its own managed secret, which this client takes once
+//!   the automation paths run per organization. A GitHub App installation
+//!   token can stand in for either later.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
