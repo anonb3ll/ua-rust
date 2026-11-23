@@ -600,7 +600,18 @@ pub(crate) async fn task_hold(ctx: ToolCtx, a: HoldArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             let (verb, who, reason, org) = (v2, w2, r2, o2);
             crate::families::tasks::require_org(tx, &org)?;
-            let existing = active_for_root(tx, &org, root)?;
+            let mut existing = active_for_root(tx, &org, root)?;
+            // A due after_active_runs_finish hold would release itself on the
+            // next read. Settle it first, so a pause or cancel takes effect
+            // instead of finding a hold that is about to go.
+            if matches!(verb.as_str(), "pause" | "cancel")
+                && let Some(h) = &existing
+                && h.release_policy == "after_active_runs_finish"
+                && live_run_task_ids(tx, h)?.is_empty()
+            {
+                auto_release(tx, h)?;
+                existing = None;
+            }
             // Existing holds can outlive their roots. Releasing one still
             // uses its stored creator and the same release authority check.
             if existing.is_none() || matches!(verb.as_str(), "pause" | "cancel") {

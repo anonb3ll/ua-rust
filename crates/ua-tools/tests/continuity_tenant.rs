@@ -318,6 +318,20 @@ fn a_legacy_database_upgrades_each_row_into_its_tasks_organization() {
                 ] {
                     assert!(names(c, "index", t).contains(&want.to_string()), "{t}: {want}");
                 }
+                // The recreated immutable triggers are spelled exactly as
+                // the generated one: guards the `org_immutable!` macro.
+                let sql = |name: &str| -> String {
+                    c.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+                };
+                let generated = sql("tasks_org_immutable");
+                for t in TABLES {
+                    assert_eq!(sql(&format!("{t}_org_immutable")), generated.replace("tasks", t), "{t}");
+                }
                 let dangling: i64 =
                     c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
                 assert_eq!(dangling, 0);
@@ -588,15 +602,22 @@ async fn the_lookups_never_follow_a_row_into_another_organization() {
         h.coord_err(&a, "task_check_verify", json!({ "task_id": ta, "name": "ci", "head_sha": ha })).await;
     assert_eq!(e.code(), "not_found", "{e}");
     // Recording at the same name and head never overwrites the other
-    // organization's row; nor is the other organization's job binding the
-    // caller's (a ref naming another job is accepted).
-    h.coord_ok(
-        &a,
-        "task_check_record",
-        json!({ "task_id": ta, "name": "ci", "outcome": "fail", "head_sha": ha,
-                "ref": { "kind": "ci_run", "ref": "7", "repo": "owner-a/repo", "job": "a-job" }, "verify": false }),
-    )
-    .await;
+    // organization's row, and the skipped upsert is a conflict, not a
+    // recorded check, with no ledger event. Nor is the other organization's
+    // job binding the caller's: a ref naming another job passes that check
+    // (else the refusal would be `invalid_argument`).
+    let before = h.events();
+    let e = h
+        .coord_err(
+            &a,
+            "task_check_record",
+            json!({ "task_id": ta, "name": "ci", "outcome": "fail", "head_sha": ha,
+                    "ref": { "kind": "ci_run", "ref": "7", "repo": "owner-a/repo", "job": "a-job" },
+                    "verify": false }),
+        )
+        .await;
+    assert_eq!(e.code(), "conflict", "{e}");
+    assert_eq!(h.events(), before, "a skipped upsert writes no ledger event");
     assert_eq!(
         h.text(&format!(
             "SELECT grade || '/' || outcome FROM task_checks WHERE org_id = 'org-b' AND task_id = {ta}"
@@ -934,4 +955,37 @@ async fn organization_b_text_and_labels_never_reach_the_default_ledger() {
             h.text(&format!("SELECT payload || '|' || originator FROM event_log WHERE {filter}")).unwrap();
         assert!(p.contains(want) && p.ends_with("|builder-1"), "{p}");
     }
+}
+
+/// The read-time settle on a default-organization hold read releases only
+/// the default organization's due holds: organization B's due hold stays
+/// active until organization B reads its holds.
+#[tokio::test]
+async fn a_hold_read_settles_only_the_readers_due_holds() {
+    let h = H::new();
+    let (a, b) = (agent(DEFAULT_ORG), agent(ORG_B));
+    let root = h.ok(&b, "task_add", json!({ "title": "B root" })).await["id"].as_i64().unwrap();
+    let child =
+        h.ok(&b, "task_add", json!({ "title": "B child", "parent_id": root })).await["id"].as_i64().unwrap();
+    h.ok(&b, "task_claim", json!({ "id": child })).await;
+    let hold = h
+        .coord_ok(
+            &b,
+            "task_hold",
+            json!({ "root_task_id": root, "reason": "drain", "release_policy": "after_active_runs_finish" }),
+        )
+        .await["hold"]["id"]
+        .as_i64()
+        .unwrap();
+    // Organization B's member run ends: the hold is now due.
+    h.ok(&b, "task_update", json!({ "id": child, "status": "done" })).await;
+    let status = |h: &H| h.text(&format!("SELECT status FROM task_holds WHERE id = {hold}"));
+
+    let v = h.coord_ok(&a, "task_holds", json!({ "status": "all" })).await;
+    assert_eq!(v["holds"], json!([]), "{v}");
+    assert_eq!(status(&h).as_deref(), Some("active"), "a default read must not settle organization B's hold");
+
+    let v = h.coord_ok(&b, "task_holds", json!({})).await;
+    assert_eq!(v["holds"], json!([]), "released on organization B's read: {v}");
+    assert_eq!(status(&h).as_deref(), Some("released"));
 }

@@ -898,7 +898,7 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
                 None => (None, None, None, None),
             };
             let has_repo = repo.is_some();
-            tx.execute(
+            let n = tx.execute(
                 "INSERT INTO task_checks (org_id, task_id, name, head_sha, outcome, grade, ref_kind, ref, repo, \
                  ref_job, detail, verification_json, recorded_by, recorded_at, verified_at) \
                  VALUES (?12, ?1, ?2, ?3, ?4, 'attested', ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, NULL) \
@@ -909,6 +909,13 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
                  WHERE task_checks.org_id = excluded.org_id",
                 params![id, name2, head2, outcome, kind, run, repo, job, detail, who2, now_micros(), org],
             )?;
+            // The upsert's organization guard skips the update and changes
+            // nothing: never report that as a recorded check.
+            if n != 1 {
+                return Err(UaError::conflict(format!(
+                    "check {name2:?} on task {id} at {head2} was not recorded; retry"
+                )));
+            }
             emit(
                 tx,
                 &org,
