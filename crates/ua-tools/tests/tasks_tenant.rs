@@ -48,8 +48,9 @@ const B_CHECK: &str = "falcon-secret-check";
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
 /// Parts registered after this family's, which need its `org_id` columns
-/// (the continuity, holds and delegation families').
-const LATER: [&str; 10] = [
+/// (the continuity, holds, delegation, goal, proposal and policy
+/// authorization families').
+const LATER: [&str; 12] = [
     "organization.v1.tools.continuity",
     "continuity.v2.org_scope",
     "organization.v1.tools.holds",
@@ -60,6 +61,8 @@ const LATER: [&str; 10] = [
     "goals.v2.org_scope",
     "organization.v1.tools.proposals",
     "governance.v4.proposals_org_scope",
+    "organization.v1.tools.policy_authorizations",
+    "github.v3.policy_authorizations_org_scope",
 ];
 
 fn old_parts() -> Vec<ua_store::Part> {
@@ -734,12 +737,12 @@ async fn deleting_an_organization_b_task_takes_its_holds_and_authorizations_with
     h.coord(&b, "task_hold", json!({ "root_task_id": child, "reason": B_REASON })).await.unwrap();
     let ta = h.add(&a, json!({ "title": "A held" })).await;
     h.coord(&a, "task_hold", json!({ "root_task_id": ta, "reason": "A reason" })).await.unwrap();
-    // No caller outside the default organization can record one yet.
+    // Seeded by SQL: recording one needs the organization's binding.
     let sha = "d".repeat(40);
     h.sql(&format!(
-        "INSERT INTO policy_authorizations (repo, pr, head_sha, task_id, policy_ref, authorized_by, created_at, expires_at)
-         VALUES ('owner-b/falcon', 3, '{sha}', {child}, 'osprey-policy', 'operator', 'x', '2999-01-01T00:00:00Z'),
-                ('owner-a/repo', 4, '{sha}', {ta}, 'a-policy', 'operator', 'x', '2999-01-01T00:00:00Z');"
+        "INSERT INTO policy_authorizations (org_id, repo, pr, head_sha, task_id, policy_ref, authorized_by, created_at, expires_at)
+         VALUES ('org-b', 'owner-b/falcon', 3, '{sha}', {child}, 'osprey-policy', 'operator', 'x', '2999-01-01T00:00:00Z'),
+                ('default', 'owner-a/repo', 4, '{sha}', {ta}, 'a-policy', 'operator', 'x', '2999-01-01T00:00:00Z');"
     ))
     .unwrap();
     assert_eq!(h.count("SELECT COUNT(*) FROM task_hold_members"), 4);

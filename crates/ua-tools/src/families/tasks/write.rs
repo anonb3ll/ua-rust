@@ -767,19 +767,13 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
 /// authorizations naming a task in it, before organization `org`'s
 /// (non-default) task is deleted.
 ///
-/// `policy_authorizations` carries no `org_id` yet and no foreign key to
-/// `tasks`: its organization is its task's, and once that task is gone the
-/// lookup falls back to the default organization. Left behind, another
-/// organization's authorization repository, PR and head would show in the
-/// default organization's views. The row is deleted rather than blanked: a
-/// blanked row would still be a default organization row it never created.
-///
-/// Holds carry their organization (`task_holds.org_id`), so a hold of a
+/// Holds and policy authorizations carry their organization
+/// (`task_holds.org_id`, `policy_authorizations.org_id`), so a row of a
 /// deleted task can no longer fall into the default organization; they are
-/// still deleted with their root, in their own organization only, so that
-/// deleting another organization's task leaves the same state as before
-/// holds had the column. The default organization keeps its rows, as before:
-/// its holds may outlive their root.
+/// still deleted with their task, in their own organization only, so that
+/// deleting another organization's task leaves the same state as before the
+/// tables had the column. The default organization keeps its rows, as
+/// before: its holds and authorizations may outlive their task.
 fn drop_orphaned_task_rows(tx: &rusqlite::Connection, org: &str, subtree: &[i64]) -> UaResult<()> {
     let has = |name: &str| -> UaResult<bool> {
         Ok(tx
@@ -803,8 +797,8 @@ fn drop_orphaned_task_rows(tx: &rusqlite::Connection, org: &str, subtree: &[i64]
     }
     if has("policy_authorizations")? {
         tx.execute(
-            "DELETE FROM policy_authorizations WHERE task_id IN (SELECT value FROM json_each(?1))",
-            [&ids],
+            "DELETE FROM policy_authorizations WHERE org_id = ?2 AND task_id IN (SELECT value FROM json_each(?1))",
+            params![ids, org],
         )?;
     }
     Ok(())

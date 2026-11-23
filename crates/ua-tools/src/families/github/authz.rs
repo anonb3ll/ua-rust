@@ -136,22 +136,35 @@ fn public(mut row: Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
-/// An authorization's organization, as a SQL expression over `p`: its
-/// task's. `policy_authorizations` carries no `org_id` yet (a later change);
-/// one whose task was deleted stays the default organization's, as every
-/// authorization was before.
-const AUTH_ORG: &str = "COALESCE((SELECT t.org_id FROM tasks t WHERE t.id = p.task_id), 'default')";
+/// An authorization row as a reply: the row without its `org_id` (replies
+/// keep their shape).
+fn reply_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
+    let mut m = row_object(r)?;
+    m.remove("org_id");
+    Ok(m)
+}
 
 /// Authorization `id` of organization `org`; another organization's answers
-/// as a missing one.
+/// exactly as a missing one.
 fn get(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
     Ok(conn
         .query_row(
-            &format!("SELECT p.* FROM policy_authorizations p WHERE p.id = ?1 AND {AUTH_ORG} = ?2"),
-            params![id, org],
-            row_object,
+            "SELECT * FROM policy_authorizations WHERE org_id = ?1 AND id = ?2",
+            params![org, id],
+            reply_row,
         )
         .optional()?)
+}
+
+/// What a policy-authorization event may say about `text` (a repository or
+/// a policy reference) of organization `org`. These events are still written
+/// to the default organization's ledger (`ORG-EVENT-DEFAULT`), so another
+/// organization's names are `null` there; ids, the head SHA, the pull request
+/// number and the binding hash stay, as in the other `agent.github.*` events
+/// (`docs/organization.md`, "What another organization's GitHub events still
+/// show").
+fn ledger(org: &str, text: &str) -> Value {
+    crate::families::tasks::ledger_text(org, text)
 }
 
 /// One authorization row of organization `org`, if it exists.
@@ -186,13 +199,13 @@ pub(crate) fn binding_sha256(b: &Value) -> String {
     approvals::payload_sha256(MERGE_TOOL, b)
 }
 
-/// Ledger `r` as a refusal by `caller` and return the refusal error. When
-/// the refusal cannot be ledgered, that error is returned instead: the call
-/// is refused either way.
-fn refuse(tx: &mut WriteTx<'_>, caller: &str, r: Refusal, err: UaError) -> UaError {
-    // The refusal is about a policy authorization, a default-organization
-    // row until `policy_authorizations` carries `org_id`.
-    match approvals::refused(tx, ua_core::DEFAULT_ORG, caller, &r, None) {
+/// Ledger `r` as a refusal by `caller` in organization `org` (the
+/// authorization's, which is the caller's: another organization's
+/// authorization answers as a missing one) and return the refusal error.
+/// When the refusal cannot be ledgered, that error is returned instead: the
+/// call is refused either way.
+fn refuse(tx: &mut WriteTx<'_>, org: &str, caller: &str, r: Refusal, err: UaError) -> UaError {
+    match approvals::refused(tx, org, caller, &r, None) {
         Ok(()) => err,
         Err(e) => e,
     }
@@ -256,10 +269,10 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             let expires = after_hours(hours);
             tx.execute(
-                "INSERT INTO policy_authorizations (repo, pr, head_sha, task_id, policy_ref, authorized_by, \
+                "INSERT INTO policy_authorizations (org_id, repo, pr, head_sha, task_id, policy_ref, authorized_by, \
                  task_claimant, status, created_at, expires_at, allow_in_flight) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
-                params![repo, pr.map(|p| p as i64), head, id, policy, who, claimant, now, expires, in_flight],
+                 VALUES (?11, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+                params![repo, pr.map(|p| p as i64), head, id, policy, who, claimant, now, expires, in_flight, org],
             )?;
             let auth_id = tx.last_insert_rowid();
             let sha = binding_sha256(&binding(id, Some(&repo), &head));
@@ -268,8 +281,9 @@ async fn record(ctx: ToolCtx, a: RecordArgs) -> UaResult<Value> {
                 &org,
                 "agent.github.policy_authorization.recorded",
                 json!({
-                    "authorization_id": auth_id, "repo": repo, "pr": pr, "head_sha": head, "task_id": id,
-                    "policy_ref": policy, "expires_at": expires, "allow_in_flight": in_flight,
+                    "authorization_id": auth_id, "repo": ledger(&org, &repo), "pr": pr, "head_sha": head,
+                    "task_id": id,
+                    "policy_ref": ledger(&org, &policy), "expires_at": expires, "allow_in_flight": in_flight,
                     "payload_sha256": sha,
                 }),
                 &who,
@@ -293,13 +307,13 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .read_async(move |c| {
-            let mut stmt = c.prepare(&format!(
-                "SELECT p.* FROM policy_authorizations p WHERE {AUTH_ORG} = ?6 AND (?1 IS NULL OR p.repo = ?1) \
-                 AND (?2 IS NULL OR p.task_id = ?2) AND (?3 IS NULL OR p.head_sha = ?3) \
-                 AND (?5 IS NULL OR p.pr = ?5) ORDER BY p.id DESC LIMIT ?4"
-            ))?;
+            let mut stmt = c.prepare(
+                "SELECT * FROM policy_authorizations WHERE org_id = ?6 AND (?1 IS NULL OR repo = ?1) \
+                 AND (?2 IS NULL OR task_id = ?2) AND (?3 IS NULL OR head_sha = ?3) \
+                 AND (?5 IS NULL OR pr = ?5) ORDER BY id DESC LIMIT ?4",
+            )?;
             let rows: Vec<Map<String, Value>> = stmt
-                .query_map(params![repo, a.task_id, head, SCAN_MAX, a.pr.map(|p| p as i64), org], row_object)?
+                .query_map(params![repo, a.task_id, head, SCAN_MAX, a.pr.map(|p| p as i64), org], reply_row)?
                 .collect::<Result<_, _>>()?;
             let mut out: Vec<Value> =
                 rows.into_iter().map(public).filter(|r| a.include_inactive || r["valid"] == true).collect();
@@ -334,8 +348,8 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             let n = tx.execute(
                 "UPDATE policy_authorizations SET status = 'revoked', revoked_at = ?2, revoked_by = ?3, \
-                 revoke_reason = ?4 WHERE id = ?1 AND status = 'active'",
-                params![id, now, who, reason],
+                 revoke_reason = ?4 WHERE org_id = ?5 AND id = ?1 AND status = 'active'",
+                params![id, now, who, reason, org],
             )?;
             if n != 1 {
                 return Err(UaError::conflict(format!("policy authorization {id} changed meanwhile")));
@@ -380,7 +394,13 @@ pub(crate) fn covering(
     };
     let Some(row) = get(tx, org, auth_id)? else {
         let r = base(RefusalReason::NoMatchingApproval);
-        return Err(refuse(tx, caller, r, UaError::not_found(format!("policy authorization {auth_id}"))));
+        return Err(refuse(
+            tx,
+            org,
+            caller,
+            r,
+            UaError::not_found(format!("policy authorization {auth_id}")),
+        ));
     };
     let approved = row_binding(&row);
     let approved_sha = Some(binding_sha256(&approved));
@@ -388,11 +408,23 @@ pub(crate) fn covering(
     let status = str_field(&row, "status").unwrap_or("?").to_string();
     if status != "active" {
         let r = base(RefusalReason::NoMatchingApproval).status(status.clone());
-        return Err(refuse(tx, caller, r, mismatch(format!("policy authorization {auth_id} is {status}"))));
+        return Err(refuse(
+            tx,
+            org,
+            caller,
+            r,
+            mismatch(format!("policy authorization {auth_id} is {status}")),
+        ));
     }
     if str_field(&row, "expires_at").is_none_or(expired) {
         let r = base(RefusalReason::Expired).expired_at(str_field(&row, "expires_at").map(str::to_string));
-        return Err(refuse(tx, caller, r, mismatch(format!("policy authorization {auth_id} has expired"))));
+        return Err(refuse(
+            tx,
+            org,
+            caller,
+            r,
+            mismatch(format!("policy authorization {auth_id} has expired")),
+        ));
     }
     let changed = approvals::changed_fields(&approved, &presented);
     let why = if row.get("task_id").and_then(Value::as_i64) != Some(task_id) {
@@ -411,12 +443,13 @@ pub(crate) fn covering(
     };
     if let Some(why) = why {
         let r = base(RefusalReason::BindingChanged).changed(changed);
-        return Err(refuse(tx, caller, r, mismatch(why)));
+        return Err(refuse(tx, org, caller, r, mismatch(why)));
     }
     if same_label(str_field(&row, "authorized_by"), caller) {
         let r = base(RefusalReason::NotEligible).detail("self_spend");
         return Err(refuse(
             tx,
+            org,
             caller,
             r,
             mismatch("the authorizer may not spend its own authorization".into()),
@@ -433,7 +466,7 @@ pub(crate) fn covering(
                 "policy authorization {auth_id} was recorded by {by:?}, who is no longer a human identity"
             ),
         );
-        return Err(refuse(tx, caller, r, err));
+        return Err(refuse(tx, org, caller, r, err));
     }
     Ok(row)
 }
@@ -441,8 +474,10 @@ pub(crate) fn covering(
 /// Ledger the refusal of a merge under authorization `auth_id` that the
 /// authorization binds but does not cover in this mode (`detail`: `force`,
 /// `in_flight`), and return `err`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn refuse_mode(
     tx: &mut WriteTx<'_>,
+    org: &str,
     caller: &str,
     auth_id: i64,
     task_id: i64,
@@ -456,7 +491,7 @@ pub(crate) fn refuse_mode(
         .task(Some(task_id))
         .hashes(sha, None)
         .detail(detail);
-    refuse(tx, caller, r, err)
+    refuse(tx, org, caller, r, err)
 }
 
 /// Whether authorization row `row` also covers an in-flight task.
@@ -478,8 +513,8 @@ pub(crate) fn consume(
     let now = crate::families::continuity::now_micros();
     let n = tx.execute(
         "UPDATE policy_authorizations SET status = 'consumed', consumed_at = ?2, consumed_by = ?3 \
-         WHERE id = ?1 AND status = 'active' AND head_sha = ?4 AND task_id = ?5",
-        params![auth_id, now, caller, head, task_id],
+         WHERE org_id = ?6 AND id = ?1 AND status = 'active' AND head_sha = ?4 AND task_id = ?5",
+        params![auth_id, now, caller, head, task_id, org],
     )?;
     if n != 1 {
         return Err(UaError::conflict(format!("policy authorization {auth_id} was spent meanwhile")));
@@ -511,8 +546,9 @@ pub(crate) fn restore(
 ) -> UaResult<bool> {
     let n = tx.execute(
         "UPDATE policy_authorizations SET status = 'active', consumed_at = NULL, consumed_by = NULL \
-         WHERE id = ?1 AND status = 'consumed' AND consumed_by = ?2 AND consumed_at = ?3 AND head_sha = ?4",
-        params![auth_id, caller, consumed_at, head],
+         WHERE org_id = ?5 AND id = ?1 AND status = 'consumed' AND consumed_by = ?2 AND consumed_at = ?3 \
+         AND head_sha = ?4",
+        params![auth_id, caller, consumed_at, head, org],
     )?;
     if n == 1 {
         let why: String = why.chars().take(300).collect();

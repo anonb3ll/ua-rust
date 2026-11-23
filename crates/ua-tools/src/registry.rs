@@ -367,7 +367,7 @@ impl Registry {
             let gate_args = match bind.payload(hub.cfg()) {
                 Ok(p) => p,
                 Err(e) => {
-                    release_reservation(hub, reservation).await;
+                    release_reservation(hub, caller, reservation).await;
                     return Err(e);
                 }
             };
@@ -381,7 +381,7 @@ impl Registry {
             {
                 Ok(o) => o,
                 Err(e) => {
-                    release_reservation(hub, reservation).await;
+                    release_reservation(hub, caller, reservation).await;
                     return Err(e);
                 }
             };
@@ -389,7 +389,7 @@ impl Registry {
                 GateOutcome::Pass { .. } => {}
                 GateOutcome::Pending { approval_id } => {
                     // A parked call has not run; it does not count against limits.
-                    release_reservation(hub, reservation).await;
+                    release_reservation(hub, caller, reservation).await;
                     return Err(UaError::ApprovalRequired { tool: gate_tool, approval_id });
                 }
                 GateOutcome::Denied { approval_id, reason } => {
@@ -398,7 +398,7 @@ impl Registry {
                         format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
                     );
                     record_decision_routed(hub, caller, name, routed.as_deref(), &err, "").await;
-                    release_reservation(hub, reservation).await;
+                    release_reservation(hub, caller, reservation).await;
                     return Err(err);
                 }
             }
@@ -720,7 +720,7 @@ impl Registry {
         for prod in def.always_gated.then_some(name).into_iter().chain(standalone_always) {
             if let Err(refusal) = policy::check_prod_action(hub.cfg(), &caller, prod) {
                 record_decision_routed(hub, &caller, name, routed, &refusal.error, &refusal.rule).await;
-                release_reservation(hub, reservation).await;
+                release_reservation(hub, &caller, reservation).await;
                 return Err(refusal.error);
             }
         }
@@ -810,6 +810,8 @@ pub enum ApprovalRequest {
 
 /// One `tool_calls` row (no arguments, no results).
 struct Row {
+    /// The caller's organization: every row records where the call was made.
+    org_id: String,
     tool: String,
     /// For a call of a consolidated tool, the standalone tool (or
     /// `tool:action` key) its action ran.
@@ -833,6 +835,7 @@ impl Row {
         page: bool,
     ) -> Self {
         Self {
+            org_id: caller.org_id.clone(),
             tool: tool.tool.to_string(),
             action_tool: tool.action_tool.map(str::to_string),
             caller: caller.label.clone(),
@@ -851,8 +854,8 @@ async fn insert_row(hub: &Hub, row: Row) {
         .db()
         .write_async(move |tx| {
             tx.execute(
-                "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, page, \
-                 action_tool) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO tool_calls (org_id, tool, caller, profile, transport, started_at, duration_ms, outcome, \
+                 page, action_tool) VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     row.tool,
                     row.caller,
@@ -862,7 +865,8 @@ async fn insert_row(hub: &Hub, row: Row) {
                     row.duration_ms,
                     row.outcome,
                     row.page,
-                    row.action_tool
+                    row.action_tool,
+                    row.org_id
                 ],
             )?;
             Ok(())
@@ -897,8 +901,8 @@ async fn record_call(
         .db()
         .write_async(move |tx| {
             tx.execute(
-                "UPDATE tool_calls SET duration_ms = ?2, outcome = ?3 WHERE id = ?1",
-                rusqlite::params![id, row.duration_ms, row.outcome],
+                "UPDATE tool_calls SET duration_ms = ?2, outcome = ?3 WHERE org_id = ?4 AND id = ?1",
+                rusqlite::params![id, row.duration_ms, row.outcome, row.org_id],
             )?;
             Ok(())
         })
@@ -986,27 +990,33 @@ fn reserve_call(
     action_tool: Option<&str>,
 ) -> rusqlite::Result<i64> {
     tx.execute(
-        "INSERT INTO tool_calls (tool, caller, profile, transport, started_at, duration_ms, outcome, action_tool) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'running', ?6)",
+        "INSERT INTO tool_calls (org_id, tool, caller, profile, transport, started_at, duration_ms, outcome, \
+         action_tool) VALUES (?7, ?1, ?2, ?3, ?4, ?5, 0, 'running', ?6)",
         rusqlite::params![
             tool,
             caller.label,
             caller.profile.as_str(),
             transport_name(caller),
             ua_core::time::now(),
-            action_tool
+            action_tool,
+            caller.org_id
         ],
     )?;
     Ok(tx.last_insert_rowid())
 }
 
-/// Drop a reservation for a call that never ran (parked or refused later).
-async fn release_reservation(hub: &Hub, reservation: Option<i64>) {
+/// Drop `caller`'s reservation for a call that never ran (parked or refused
+/// later).
+async fn release_reservation(hub: &Hub, caller: &Caller, reservation: Option<i64>) {
     let Some(id) = reservation else { return };
+    let org = caller.org_id.clone();
     let res = hub
         .db()
         .write_async(move |tx| {
-            tx.execute("DELETE FROM tool_calls WHERE id = ?1 AND outcome = 'running'", [id])?;
+            tx.execute(
+                "DELETE FROM tool_calls WHERE org_id = ?2 AND id = ?1 AND outcome = 'running'",
+                rusqlite::params![id, org],
+            )?;
             Ok(())
         })
         .await;

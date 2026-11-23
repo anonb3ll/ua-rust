@@ -221,10 +221,12 @@ fn grouped(
     Ok(out)
 }
 
-/// Governed-call counts for `callers` in the window. A mail-unrestricted
-/// reader counts every participant's calls (`scope: "all"`); anyone else
-/// counts only their own (`scope: "own_calls"`), so another agent's private
-/// activity never moves the numbers. `callers` still lists the participants.
+/// Governed-call counts for `callers` in the window, in the reader's
+/// organization only (another organization's calls never count, whatever
+/// their caller label). A mail-unrestricted reader counts every
+/// participant's calls (`scope: "all"`); anyone else counts only their own
+/// (`scope: "own_calls"`), so another agent's private activity never moves
+/// the numbers. `callers` still lists the participants.
 fn tool_call_window(
     c: &Connection,
     reader: &EventReader,
@@ -233,11 +235,7 @@ fn tool_call_window(
     until: &str,
 ) -> UaResult<Value> {
     let scope = if reader.unrestricted() { "all" } else { "own_calls" };
-    let counted: Vec<&String> = if reader.unrestricted() {
-        callers.iter().collect()
-    } else {
-        callers.iter().filter(|l| Some(l.as_str()) == reader.party()).collect()
-    };
+    let counted: Vec<&String> = callers.iter().filter(|l| reader.counts_calls_of(l)).collect();
     if counted.is_empty() {
         return Ok(json!({
             "attribution": "caller_and_window",
@@ -249,9 +247,11 @@ fn tool_call_window(
     let marks = vec!["?"; counted.len()].join(",");
     let sql = format!(
         "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
-         WHERE caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 GROUP BY tool ORDER BY tool"
+         WHERE org_id = ? AND caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 \
+         GROUP BY tool ORDER BY tool"
     );
-    let mut args: Vec<String> = counted.iter().map(|l| (*l).clone()).collect();
+    let mut args: Vec<String> = vec![reader.org().to_string()];
+    args.extend(counted.iter().map(|l| (*l).clone()));
     args.push(since.to_string());
     args.push(until.to_string());
     let mut stmt = c.prepare(&sql)?;

@@ -501,7 +501,7 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
                     "force=true is refused under a policy authorization: it covers a clean merge only; ask for a \
                      one-time approval instead",
                 );
-                Err::<(), _>(authz::refuse_mode(tx, &who, auth_id, id, row.as_ref(), "force", err))
+                Err::<(), _>(authz::refuse_mode(tx, &org2, &who, auth_id, id, row.as_ref(), "force", err))
             })
             .await
             .unwrap_err());
@@ -611,7 +611,7 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
                              record one with allow_in_flight=true"
                         ),
                     );
-                    return Err(authz::refuse_mode(tx, &who, auth_id, id, Some(&auth), "in_flight", err));
+                    return Err(authz::refuse_mode(tx, &org3, &who, auth_id, id, Some(&auth), "in_flight", err));
                 }
                 continuity::require_review_at_head(tx, &org3, id, &h)?;
                 if dry { Ok(None) } else { authz::consume(tx, &org3, &auth, auth_id, id, &h, &who).map(Some) }
