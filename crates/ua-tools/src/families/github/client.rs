@@ -24,13 +24,15 @@
 //! - **Rate-limit aware.** `x-ratelimit-remaining: 0` (or a 403/429 that says
 //!   so) blocks further requests to that host until `x-ratelimit-reset`
 //!   (or `retry-after`), without touching the network.
-//! - **The token** comes from [`Config::github_token`] (the variable
-//!   `github_token_env` names). It is sent as a sensitive header and never
-//!   stored, returned or logged. That is the default organization's token
-//!   ([`super::credentials::github_credential_for`]); another
-//!   organization's is its own managed secret, which this client takes once
-//!   the automation paths run per organization. A GitHub App installation
-//!   token can stand in for either later.
+//! - **The token** is one organization's ([`super::credentials::github_credential_for`]):
+//!   the default organization's is the hub configuration (`github_token_env`),
+//!   another's is its own managed secret. A client is built per call for
+//!   one organization ([`GitHub::for_org`]) and holds only that
+//!   organization's token; nothing here reads the hub configuration's token
+//!   directly, so another organization can never reach it. It is sent as a
+//!   sensitive header and never stored, returned or logged. A rate-limit
+//!   block is kept per (host, organization), so one organization's
+//!   exhausted token does not stop another's.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,6 +45,8 @@ use serde_json::Value;
 use ua_core::{Config, UaError, UaResult};
 use ua_ingress::{Outbound, OutboundError, Request, policy};
 
+use super::credentials::{CredentialKind, github_credential_for};
+
 /// The policies' body cap (both GitHub policies have the same).
 const MAX_BODY: usize = policy::GITHUB_REST.max_body_bytes;
 const API_VERSION: &str = "2022-11-28";
@@ -52,8 +56,13 @@ const MAX_BLOCK_S: i64 = 3600;
 /// Why a GitHub request did not produce a usable answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GhError {
-    /// No token configured, or the base URL is unusable.
+    /// The base URL is unusable, or the client could not be built.
     NotConfigured(String),
+    /// The organization has no GitHub token (`true`: the default
+    /// organization, whose token is the hub configuration).
+    CredentialOff(bool),
+    /// The organization's stored token cannot be used (its reason code).
+    Unusable(String),
     NotFound,
     /// 401: the token is missing, expired or wrong.
     Unauthorized,
@@ -75,6 +84,13 @@ impl GhError {
     pub(crate) fn detail(&self) -> String {
         match self {
             GhError::NotConfigured(why) => why.clone(),
+            GhError::CredentialOff(true) => {
+                "no GitHub token is configured (github_token_env names an unset variable)".into()
+            }
+            GhError::CredentialOff(false) => {
+                "the organization has no GitHub token (github_credential_set kind token)".into()
+            }
+            GhError::Unusable(code) => format!("the organization's GitHub token is unusable ({code})"),
             GhError::NotFound => "GitHub answered 404 (missing, or the token cannot see it)".into(),
             GhError::Unauthorized => "GitHub refused the token (401)".into(),
             GhError::Forbidden => "the token may not read this (403)".into(),
@@ -89,14 +105,33 @@ impl GhError {
             GhError::Decode(e) => format!("GitHub response is not the expected JSON: {e}"),
         }
     }
+
+    /// A fixed code for a stored record (`github_poll_repos.last_error`):
+    /// never library error text, a URL or a value.
+    pub(crate) fn code(&self) -> String {
+        match self {
+            GhError::NotConfigured(_) => "not_configured".into(),
+            GhError::CredentialOff(_) => "credential_off".into(),
+            GhError::Unusable(_) => "unusable".into(),
+            GhError::NotFound => "not_found".into(),
+            GhError::Unauthorized => "unauthorized".into(),
+            GhError::Forbidden => "forbidden".into(),
+            GhError::RateLimited(_) => "rate_limited".into(),
+            GhError::Status(s) => format!("http_{s}"),
+            GhError::Redirect(s) => format!("redirect_{s}"),
+            GhError::Network(_) => "network".into(),
+            GhError::TooLarge => "too_large".into(),
+            GhError::Decode(_) => "decode".into(),
+        }
+    }
 }
 
 /// A repository some project is bound to, normalized `owner/name`. The only
 /// way to name a repository to [`GitHub`].
 ///
-/// Bindings are per organization. The GitHub family's own data (deliveries,
-/// poll state, the tasks it links) is not organization-scoped yet, so its
-/// callers look up the default organization's bindings.
+/// Bindings are per organization: every GitHub path checks the binding in
+/// the organization it acts for, and a client only ever pairs a binding
+/// with the same organization's token.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BoundRepo(String);
 
@@ -144,6 +179,8 @@ pub(crate) enum Got {
 pub(crate) struct GitHub {
     base: Url,
     http: Arc<Outbound>,
+    /// The organization whose token this is.
+    org: String,
     token: SecretString,
 }
 
@@ -192,6 +229,15 @@ fn blocks() -> &'static Mutex<HashMap<String, i64>> {
     BLOCKS.get_or_init(Mutex::default)
 }
 
+/// Forget every rate-limit block of organization `org`'s token, on every
+/// host: its token was set or cleared, and a new token has its own limit.
+pub(crate) fn clear_blocks(org: &str) {
+    let suffix = format!(" {org}");
+    if let Ok(mut map) = blocks().lock() {
+        map.retain(|key, _| !key.ends_with(&suffix));
+    }
+}
+
 fn now_s() -> i64 {
     ua_core::time::now_ms() / 1000
 }
@@ -236,25 +282,41 @@ pub(crate) fn api_base(cfg: &Config) -> Result<Url, GhError> {
 }
 
 impl GitHub {
-    /// The client for `cfg`, `Ok(None)` when no token is configured.
-    pub(crate) fn from_config(cfg: &Config) -> Result<Option<GitHub>, GhError> {
-        let Some(token) = cfg.github_token() else { return Ok(None) };
+    /// A client for organization `org` with that organization's `token`.
+    fn with_token(cfg: &Config, org: &str, token: SecretString) -> Result<GitHub, GhError> {
         let base = api_base(cfg)?;
         let (http, _) = shared_client(&base, cfg.fetch_allow_loopback)?;
-        Ok(Some(GitHub { base, http, token }))
+        Ok(GitHub { base, http, org: org.to_string(), token })
     }
 
-    /// The client, or an error saying why there is none.
-    pub(crate) fn require(cfg: &Config) -> Result<GitHub, GhError> {
-        GitHub::from_config(cfg)?.ok_or_else(|| {
-            GhError::NotConfigured(
-                "no GitHub token is configured (github_token_env names an unset variable)".into(),
-            )
-        })
+    /// The client for organization `org`, with its own token
+    /// ([`github_credential_for`]): `Ok(None)` when it has none. Never another
+    /// organization's token, and never the hub configuration's for an
+    /// organization other than the default.
+    pub(crate) fn for_org(conn: &Connection, cfg: &Config, org: &str) -> Result<Option<GitHub>, GhError> {
+        match github_credential_for(conn, cfg, org, CredentialKind::Token) {
+            Ok(Some(cred)) => GitHub::with_token(cfg, org, cred.secret().clone()).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                Err(GhError::Unusable(e.reason_code().unwrap_or("github_credential_unusable").to_string()))
+            }
+        }
     }
 
+    /// [`GitHub::for_org`], or an error saying why there is none.
+    pub(crate) fn require_for(conn: &Connection, cfg: &Config, org: &str) -> Result<GitHub, GhError> {
+        GitHub::for_org(conn, cfg, org)?.ok_or_else(|| GhError::CredentialOff(org == ua_core::DEFAULT_ORG))
+    }
+
+    /// The organization whose token this client sends.
+    pub(crate) fn org(&self) -> &str {
+        &self.org
+    }
+
+    /// The rate-limit block key: the host and the organization, since each
+    /// organization's token has its own limit.
     fn host_key(&self) -> String {
-        self.base.origin().ascii_serialization()
+        format!("{} {}", self.base.origin().ascii_serialization(), self.org)
     }
 
     fn url(&self, repo: &BoundRepo, path: &str) -> Result<Url, GhError> {
@@ -391,11 +453,10 @@ mod tests {
             let (_, built) = shared_client(&base, false).unwrap();
             assert!(!built, "later requests reuse it");
         }
-        let mut cfg = Config { github_api_url: base.to_string(), ..Config::default() };
-        cfg.github_token_value = Some("t".to_string().into());
-        GitHub::from_config(&cfg).unwrap().unwrap();
+        let cfg = Config { github_api_url: base.to_string(), ..Config::default() };
+        GitHub::with_token(&cfg, ua_core::DEFAULT_ORG, "fake-token-not-real".to_string().into()).unwrap();
         let (_, built) = shared_client(&api_base(&cfg).unwrap(), false).unwrap();
-        assert!(!built, "from_config shares the cached client");
+        assert!(!built, "a client for an organization shares the cached client");
     }
 
     #[test]
@@ -424,7 +485,26 @@ mod tests {
     }
 
     #[test]
-    fn no_token_means_no_client() {
-        assert!(GitHub::from_config(&Config::default()).unwrap().is_none());
+    fn rate_limit_blocks_are_kept_per_organization() {
+        let cfg = Config::default();
+        let a = GitHub::with_token(&cfg, "default", "fake-a-not-real".to_string().into()).unwrap();
+        let b = GitHub::with_token(&cfg, "org-b", "fake-b-not-real".to_string().into()).unwrap();
+        assert_ne!(a.host_key(), b.host_key());
+        assert_eq!(b.org(), "org-b");
+    }
+
+    #[test]
+    fn clearing_an_organizations_blocks_leaves_the_others() {
+        let cfg =
+            Config { github_api_url: "https://ghe-clear-blocks.example.com".into(), ..Config::default() };
+        let a = GitHub::with_token(&cfg, "default", "fake-a-not-real".to_string().into()).unwrap();
+        let b = GitHub::with_token(&cfg, "org-clear-b", "fake-b-not-real".to_string().into()).unwrap();
+        let until = now_s() + 600;
+        blocks().lock().unwrap().insert(a.host_key(), until);
+        blocks().lock().unwrap().insert(b.host_key(), until);
+        clear_blocks("org-clear-b");
+        let map = blocks().lock().unwrap();
+        assert_eq!(map.get(&a.host_key()), Some(&until));
+        assert!(!map.contains_key(&b.host_key()));
     }
 }

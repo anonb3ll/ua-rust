@@ -1386,9 +1386,12 @@ const GITHUB_ORGS_SHOWN: usize = 50;
 /// `unusable` and where from, never a value. Only a hub operator (a
 /// verified human of the default organization) sees each organization by
 /// name; any other caller sees counts only, over every organization for a
-/// default-organization caller and over its own for any other. LIVE when
-/// one is configured, DEGRADED when a stored one is unusable, DORMANT when
-/// all are off.
+/// default-organization caller and over its own for any other. The
+/// automation runs per organization, so the line also counts, over the same
+/// organizations, repositories whose last poll failed (no values, no
+/// names): only those still bound, in an organization whose token is still
+/// usable. LIVE when one is configured, DEGRADED when a stored one is
+/// unusable or a poll is failing, DORMANT when all are off.
 fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Caller) -> UaResult<Value> {
     use crate::families::github::credentials::{self, CredentialKind, CredentialSource, CredentialState};
     let gate = "github_token_env, github_webhook_secret_env (default organization); github_credential_set \
@@ -1443,8 +1446,30 @@ fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Call
         });
         lines.push(format!("{} organization(s): {}", orgs.len(), per_kind.collect::<Vec<_>>().join(", ")));
     }
-    let detail = format!("{}; automation serves the default organization only for now", lines.join("; "));
-    let status = if unusable {
+    // Only repositories the poller still polls: bound now, in an
+    // organization whose token is still usable. A row left by a repository
+    // since unbound, or by a token since cleared, is history, not a failure.
+    let mut failing = 0i64;
+    for org in &orgs {
+        if credentials::credential_status(c, cfg, org, CredentialKind::Token)?.state
+            != CredentialState::Configured
+        {
+            continue;
+        }
+        failing += c.query_row(
+            "SELECT count(*) FROM github_poll_repos p WHERE p.org_id = ?1 AND p.last_error IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM project_repo_bindings b WHERE b.org_id = p.org_id AND lower(b.repo) = p.repo)",
+            [org],
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    let detail = format!(
+        "{}; automation runs per organization under its own credentials; {failing} bound repositor{} whose \
+         last poll failed",
+        lines.join("; "),
+        if failing == 1 { "y" } else { "ies" }
+    );
+    let status = if unusable || failing > 0 {
         DEGRADED
     } else if configured {
         LIVE

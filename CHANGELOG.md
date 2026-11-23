@@ -488,6 +488,38 @@ from its commit history.
   operator and gives counts only to anyone else. An upgrade finding a
   legacy row with a NULL name stops with its row ids and the fix instead of
   dropping it.
+- GitHub and CI automation run per organization, each under its own
+  credentials (`docs/github.md#automation-per-organization`). A webhook
+  delivery belongs to every organization whose own webhook secret verifies
+  its signature (constant-time, never logged) and is recorded, ledgered and
+  handled against that organization's bindings and tasks only; when two
+  organizations share a secret it is processed once for each, the default
+  organization first, then by id. A missing or malformed
+  `X-Hub-Signature-256` is refused (401) before the database is touched;
+  secrets are decrypted in one read and the MACs computed after it; a
+  suspended organization's secret is never consulted. A delivery any
+  organization other than the default matched is answered
+  organization-neutrally (`{"ok", "matched", "statuses"}`); with several,
+  any internal failure answers 500, any success 200, else any bad request
+  400, else 409. The poller polls each organization that
+  has a token with that token and skips one without; one organization's
+  failure is recorded per repository (`github_poll_repos.last_error`, a
+  fixed code such as `unauthorized` or `rate_limited`, never library text
+  or a value), counted on the `system_doctor` `github_credentials` line
+  (only repositories still bound in an organization with a usable token)
+  and never stops the others; setting or clearing an organization's token
+  lifts its rate-limit block. CI run lookups and `queue_close_merged` use the
+  task's or caller's organization's token and bindings; an organization
+  without a token is credential-off and the hub's token is never used for
+  it. The GitHub client is built per organization and keeps rate-limit
+  blocks per host and organization. `github.v2.poll_repos` adds
+  `github_poll_repos` keyed `(org_id, repo)` and copies every
+  `github_poll_state` row to the default organization (nothing dropped; the
+  old table stays unread), and `organization.v1.tools.github_poll` adds its
+  triggers. The `ORG-GITHUB-DEFAULT` marker and the `TASK_ORG` constant are
+  gone; `org_guard` admits one `Caller::system_for` site
+  (`github_caller_for`, now crate-private) and refuses a call to
+  `github_caller_for` outside the GitHub family.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -645,6 +677,14 @@ from its commit history.
   `managed_secret_delete`, store the value under a new name and point the
   setting at it. `managed_secret_list` shows such a row without its
   fingerprint, size or key id.
+- `coordination_manage(action="queue_close_merged")` runs in the caller's
+  organization instead of refusing another organization's caller
+  (`org_unsupported`); an organization without a GitHub token gets
+  `github_credential_off`. `github_credential_status` reports
+  `automation_scope: "per_organization"`. GitHub webhook responses and
+  `agent.github.*` events carry `org_id`; for another organization the
+  events' repository, branch and check names are `null`. `poll_once`
+  reports per organization under `orgs` (the flat `repos` list stays).
 - The relay's `request_send` and `send`, and `mcp_gateway` `call` and live
   `list` on a server that injects secrets, refuse another organization's
   caller (`org_unsupported`): they use the default organization's secrets.

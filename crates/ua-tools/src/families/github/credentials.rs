@@ -1,11 +1,10 @@
 //! Per-organization GitHub credentials.
 //!
 //! Each organization's GitHub automation (the webhook, the poller, CI
-//! verification and merged-PR reconciliation) is to run under that
+//! verification and merged-PR reconciliation) runs under that
 //! organization's own credentials, and an organization without one stays
-//! off. This module is the credential layer; the automation paths still run
-//! for the default organization only (`ORG-GITHUB-DEFAULT`) until they
-//! resolve each task's organization and ask [`github_credential_for`].
+//! off. This module is the credential layer every automation path asks
+//! ([`github_credential_for`], [`orgs_holding`]).
 //!
 //! Two credentials per organization, each optional:
 //!
@@ -77,8 +76,9 @@ pub const WEBHOOK_CONSUMER: &str = "github:webhook";
 pub const RESERVED_NAMES: [&str; 2] = [TOKEN_SECRET, WEBHOOK_SECRET];
 /// The consumer kind only these tools write.
 pub const RESERVED_CONSUMER_KIND: &str = "github";
-/// Which organizations the GitHub automation serves today, as reported.
-pub const AUTOMATION_SCOPE: &str = "default_organization_only";
+/// Which organizations the GitHub automation serves, as reported: each
+/// organization under its own credentials.
+pub const AUTOMATION_SCOPE: &str = "per_organization";
 
 /// Which of an organization's GitHub credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -215,6 +215,23 @@ pub fn github_credential_for(
     Ok(Some(GithubCredential { kind, source: CredentialSource::ManagedSecret, secret }))
 }
 
+/// Every organization that may hold a GitHub credential of `kind`, in a
+/// fixed order: the default organization first (its credential is the hub
+/// configuration), then each other active organization (a suspended one
+/// is never served) that stores the managed secret bound to its consumer,
+/// by id. Resolve each with
+/// [`github_credential_for`]; nothing here decrypts.
+pub fn orgs_holding(conn: &Connection, kind: CredentialKind) -> UaResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.org_id FROM managed_secrets m JOIN orgs o ON o.id = m.org_id AND o.status = 'active' \
+         WHERE m.name = ?1 AND m.consumer = ?2 AND m.org_id <> ?3 ORDER BY m.org_id",
+    )?;
+    let others = stmt
+        .query_map([kind.secret_name(), kind.consumer(), DEFAULT_ORG], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(std::iter::once(DEFAULT_ORG.to_string()).chain(others).collect())
+}
+
 /// Whether a credential is usable, without decrypting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -290,9 +307,6 @@ pub fn status_json(conn: &Connection, cfg: &Config, org: &str) -> UaResult<Value
             json!({ "state": s.state, "source": s.source, "set_with": s.set_with }),
         );
     }
-    // The automation paths still serve the default organization only
-    // (ORG-GITHUB-DEFAULT); another organization's credential is held until
-    // they run per organization.
     out.insert("automation_scope".into(), json!(AUTOMATION_SCOPE));
     Ok(Value::Object(out))
 }
@@ -377,6 +391,7 @@ async fn github_credential_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
     // consumed a pass for this exact payload.
     let registry_gated = cfg.approval_tools.iter().any(|t| t == TOOL);
     let hub = ctx.hub.clone();
+    let blocked_org = org.clone();
     let out = ctx
         .hub
         .db()
@@ -415,6 +430,10 @@ async fn github_credential_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
             })))
         })
         .await?;
+    if out.is_ok() && kind == CredentialKind::Token {
+        // A new token has its own rate limit.
+        super::client::clear_blocks(&blocked_org);
+    }
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: TOOL.into(), approval_id })
 }
 
@@ -435,6 +454,7 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
     }
     let kind = a.kind;
     let hub = ctx.hub.clone();
+    let blocked_org = org.clone();
     let out = ctx
         .hub
         .db()
@@ -469,6 +489,10 @@ async fn github_credential_clear(ctx: ToolCtx, a: ClearArgs) -> UaResult<Value> 
             })))
         })
         .await?;
+    if out.is_ok() && kind == CredentialKind::Token {
+        // No token, no block to keep: a token set later starts clean.
+        super::client::clear_blocks(&blocked_org);
+    }
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: TOOL.into(), approval_id })
 }
 

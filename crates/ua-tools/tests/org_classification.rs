@@ -141,6 +141,8 @@ const TENANT: &[&str] = &[
     "tool_calls",
     "web_search_cache",
     "code_symbols",
+    // the GitHub poller's per-organization state: org_id and the triggers from birth
+    "github_poll_repos",
     // inbound deliveries (`ua-ingress`): org_id and the triggers from birth
     "inbound_deliveries",
     // deliverables (`ua-deliverables`): org_id and the triggers from birth

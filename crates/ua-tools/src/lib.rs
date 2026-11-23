@@ -105,6 +105,10 @@ pub fn schema_parts() -> Vec<Part> {
     // the GitHub parts above.
     parts.extend(ua_ingress::inbound::schema_parts());
     parts.push(families::github::INBOUND_COPY.into());
+    // The poller's per-organization state, its rows copied from the
+    // hub-wide table, then its organization triggers.
+    parts.push(families::github::POLL_REPOS_SCHEMA.into());
+    parts.push(families::github::POLL_REPOS_TENANT_PART.into());
     // Then the Slack family's replay keys and delivery ids.
     parts.push(families::slack::INBOUND_COPY.into());
     // Deliverables and their revisions (`ua-deliverables`), born

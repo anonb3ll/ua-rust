@@ -61,10 +61,8 @@ request (one connection pool), not rebuilt per call.
 
 Owner decision (2026-11-23): GitHub automation runs per task organization,
 each organization under its own credentials, and an organization without
-one stays off. The credential layer is in place; the webhook, the poller,
-CI verification and merged-PR reconciliation still serve the default
-organization only (`ORG-GITHUB-DEFAULT` in the source) until they switch to
-it.
+one stays off. The webhook, the poller, CI verification and merged-PR
+reconciliation all do (see [Automation per organization](#automation-per-organization)).
 
 | Organization | Token | Webhook secret |
 |---|---|---|
@@ -310,6 +308,75 @@ a human (`operator_required` otherwise), and each close is a `task_update`
 as that caller. It is
 also how a task blocked at merge time (a claim still live) closes later.
 
+## Automation per organization
+
+Every GitHub path acts for one organization at a time, with that
+organization's own credential and bindings, and never falls back to
+another's:
+
+- **Webhook.** A delivery belongs to the organizations whose own webhook
+  secret verifies its `X-Hub-Signature-256` (the default organization's
+  `github_webhook_secret_env`, every other organization's
+  `github:webhook-secret`), each compared in constant time; the payload's
+  repository never decides. The header must be `sha256=` and 64 hex digits,
+  checked before the database is touched (`bad_signature`, 401). No active
+  organization holds a secret (decided from metadata, nothing decrypted):
+  `not_configured` (503). Each held secret is then decrypted in one read and
+  the MACs computed after it; none verifies: `bad_signature` (401). It is then recorded
+  (replay keys in that organization), ledgered and handled against that
+  organization's bound repositories and tasks only, as the hub identity
+  acting for it. **Multi-match rule:** when two organizations configured the
+  same secret, the delivery belongs to both and is processed once for each,
+  in a fixed order (the default organization first, then by id), each
+  against its own tasks. A stored secret that cannot be used is skipped,
+  never replaced by another's, and its warning is logged at most once per
+  five minutes per organization; a suspended organization's secret is never
+  consulted.
+- **Webhook response.** A delivery only the default organization matched is
+  answered with its result, as before organizations. Any other (one other
+  organization, or several) is answered organization-neutrally:
+  `{"ok": true, "matched": n, "statuses": [...]}`, one HTTP status per
+  matched organization in the fixed order, with no organization id,
+  repository, task id or title; what each did is in its own ledger. When
+  several matched, the status is: 500 when any failed internally (its replay
+  records are released, so GitHub's redelivery is processed for it while
+  the others answer it as a replay; every effect is idempotent); else 200
+  when any succeeded; else 400 when any refused it as a bad request, the
+  same as a single match; else 409 `replayed` (every one had already
+  processed it).
+- **Poller.** Each pass polls every organization that has a token, its bound
+  repositories with its token; an organization without one is skipped and
+  one whose stored token is unusable is reported `unusable`. A repository
+  two organizations bind is polled once per organization, each with its own
+  ETag and open list (`github_poll_repos`). One organization's failure (a
+  refused token, a rate limit) is recorded for its repositories and does not
+  stop the others. `last_error` holds a fixed code, never library error
+  text, a URL or a value: `unauthorized`, `forbidden`, `not_found`,
+  `rate_limited`, `network`, `decode`, `too_large`, `not_configured`,
+  `redirect_<status>` or `http_<status>`. A rate limit blocks only the
+  organization whose token hit it (the block is kept per host and
+  organization, in memory); setting or clearing that organization's token
+  with `github_credential_set`/`github_credential_clear` lifts it, and the
+  default organization's token, which is configuration, starts clean on the
+  restart that changes it. `system_doctor`'s `github_credentials` line
+  counts repositories whose last poll failed, only those still bound in an
+  organization that still holds a usable token, and turns DEGRADED.
+- **CI.** A check's run is looked up with the task's organization's token in
+  that organization's binding. A task in an organization without a token is
+  `unverifiable` (credential off) and nothing is requested; the hub's token
+  is never used for it.
+- **Merged reconciliation.** `queue_close_merged` runs in the caller's
+  organization: its bindings, its tasks, its token (`github_credential_off`
+  when it has none). The webhook and the poller reconcile in the delivery's
+  or the poll's organization. Descendants, protections and events are that
+  organization's.
+- **Events.** `agent.github.*` events carry `org_id`. They stay in the
+  default ledger (`ORG-EVENT-DEFAULT`); for another organization the
+  repository, branch names (`base_ref`, `merge_branch`) and check names are
+  `null` and the originator is `system`. Head and merge commit SHAs, pull
+  request numbers and task ids stay visible there
+  ([organization.md](organization.md)).
+
 ## Polling
 
 With `github_poll_interval_s > 0`, `ua serve` lists each bound repository's
@@ -317,7 +384,12 @@ open pull requests every interval with the previous ETag; an unchanged list
 is a 304 that costs no rate limit. On a change, a PR that left the list is
 looked up and, if merged, runs close-on-merge; a PR with a new head has the
 checks recorded at that head re-verified. Only the first page (the 100
-newest open PRs) is compared. State is in `github_poll_state`.
+newest open PRs) is compared. State is kept per organization and repository
+in `github_poll_repos` (`github.v2.poll_repos` copied every row of the old
+hub-wide `github_poll_state` into it under the default organization, which
+was the only one polled; the old table stays, unread, until a later
+release retires it). Each organization with a token is polled with its own
+token ([Automation per organization](#automation-per-organization)).
 
 ## Policy authorizations
 

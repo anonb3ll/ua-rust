@@ -2,17 +2,48 @@
 //!
 //! In order, before anything is parsed or stored:
 //!
-//! 1. The secret is read from the variable `github_webhook_secret_env` names.
-//!    Without one every delivery is refused (`not_configured`).
-//! 2. `X-Hub-Signature-256` must be `sha256=<hex>` of HMAC-SHA256(secret,
-//!    raw body), compared in constant time (`bad_signature`).
+//! 1. `X-Hub-Signature-256` must be `sha256=` and 64 hex digits
+//!    (`bad_signature` otherwise), checked before the database is touched.
+//! 2. Every organization's webhook secret is gathered: the default
+//!    organization's from the variable `github_webhook_secret_env` names,
+//!    each other active organization's from its own managed secret
+//!    `github:webhook-secret` ([`credentials::github_credential_for`]). When
+//!    no organization holds one (decided from metadata, nothing decrypted)
+//!    every delivery is refused (`not_configured`). A stored secret that
+//!    cannot be used is skipped, never replaced by another organization's.
+//!    The signature must be HMAC-SHA256(secret, raw body) for at least one
+//!    of them, each compared in constant time, outside the database read
+//!    (`bad_signature` when none verifies).
+//!
+//! **Which organization a delivery belongs to.** Exactly the organizations
+//! whose own secret verifies its signature, nothing else: not the
+//! repository in the payload, not a header. Normally that is one. Two
+//! organizations configured with the same secret both verify it, and then
+//! the delivery belongs to each of them (the multi-match rule): it is
+//! processed once per organization, in a fixed order (the default
+//! organization first, then by organization id), each time against that
+//! organization's bound repositories and tasks only, with its own replay
+//! records and its own events. Sharing a secret therefore never lets one
+//! organization act on another's tasks; it only lets one signed delivery
+//! reach both, which is what configuring the same secret asks for.
+//!
+//! **The response.** A delivery only the default organization matched is
+//! answered with its result, as before organizations. Any other is answered
+//! organization-neutrally, `{"ok": true, "matched": n, "statuses": [...]}`
+//! (one HTTP status per matched organization, in the fixed order), with no
+//! organization id, repository or task: those stay in each organization's
+//! own ledger. When several matched: an internal failure in any answers 500
+//! so GitHub redelivers (the others then refuse it as a replay; every
+//! effect is idempotent); else any success answers 200; else any bad
+//! request answers 400, as a single match would; else (every one had
+//! already processed it) 409 `replayed`.
 //! 3. The payload's own timestamps (`pull_request.merged_at` or
 //!    `updated_at`, `check_run.completed_at`, `check_suite.updated_at`,
 //!    `workflow_run.updated_at`, `repository.pushed_at`), when it has one,
 //!    must be no older than `github_webhook_max_age_hours` (default 24;
 //!    `stale`). A signed body captured long ago is not accepted again.
 //! 4. Neither `X-GitHub-Delivery` (a well-formed id) nor the SHA-256 of the
-//!    raw body may have been seen before (`replayed`). The delivery and event
+//!    raw body may have been seen before in that organization (`replayed`). The delivery and event
 //!    headers are not covered by the signature, so a signed body re-sent
 //!    under a fresh delivery id is still a replay. Both are recorded in
 //!    `ua_ingress::inbound` (source `github`, kinds `delivery_id` and
@@ -20,7 +51,8 @@
 //!    transaction, and accepted under this process's claim.
 //!
 //! Then the event is ledgered (`agent.github.webhook.received`) in the same
-//! transaction, and handled only when its repository is bound to a project.
+//! transaction, and handled only when its repository is bound to a project
+//! of that organization.
 //! Afterwards both records are marked `finished`; when handling failed with
 //! an internal error they are released instead, so GitHub's redelivery is
 //! processed. A delivery that was accepted but never finished (the hub
@@ -32,7 +64,7 @@
 //! on and never finished, one `agent.github.webhook.abandoned` event says
 //! how many and which delivery ids.
 //!
-//! Effects, for a bound repository:
+//! Effects, for a repository bound in the organization, on its tasks only:
 //!
 //! - `pull_request` closed with `merged: true`: close the tasks it finishes
 //!   (close-on-merge rules, `task_update` with the merge commit as evidence).
@@ -45,18 +77,22 @@
 //! after the signature: it carries the merge commit and head, so no API call
 //! is needed for these effects.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use hmac::{Hmac, KeyInit, Mac};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::UaError;
 use ua_ingress::inbound;
-use ua_store::{EventInput, ledger};
 
 use super::client::{BoundRepo, full_sha};
-use super::{GITHUB_ACTOR, github_caller, reverify_head};
+use super::credentials::{self, CredentialKind, CredentialState};
+use super::{GITHUB_ACTOR, github_caller_for, reverify_head};
 use crate::Hub;
 use crate::families::continuity::merged::{MergedPr, close_merged};
+use crate::families::tasks::{emit, ledger_text};
 
 /// Delivery ids and body hashes are kept this many days for replay
 /// protection, at most [`KEEP_MAX`] of each.
@@ -127,7 +163,9 @@ impl WebhookError {
     pub fn message(&self) -> String {
         match self {
             WebhookError::NotConfigured => {
-                "no GitHub webhook secret is configured (github_webhook_secret_env)".into()
+                "no GitHub webhook secret is configured (github_webhook_secret_env, or an organization's \
+                 github_credential_set kind webhook_secret)"
+                    .into()
             }
             WebhookError::BadSignature => "missing or invalid X-Hub-Signature-256".into(),
             WebhookError::Replayed => "this delivery id or payload was already processed".into(),
@@ -155,13 +193,7 @@ pub fn signature_for(secret: &[u8], body: &[u8]) -> String {
 
 /// Whether `signature` (`sha256=<hex>`) signs `body` with `secret`.
 pub fn signature_valid(secret: &[u8], body: &[u8], signature: Option<&str>) -> bool {
-    let Some(hex_sig) = signature.map(str::trim).and_then(|s| s.strip_prefix("sha256=")) else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(hex_sig) else { return false };
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else { return false };
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
+    parse_signature(signature).is_some_and(|mac| mac_valid(secret, body, &mac))
 }
 
 /// A payload timestamp: RFC 3339 text or Unix seconds.
@@ -188,20 +220,129 @@ pub(crate) fn payload_time(event: &str, payload: &Value) -> Option<jiff::Timesta
     fields.iter().filter_map(|(obj, key)| ts(&payload[*obj][*key])).max()
 }
 
-fn record_key<'a>(kind: &'a str, key: &'a str) -> inbound::Delivery<'a> {
-    inbound::Delivery { org_id: ua_core::DEFAULT_ORG, source: SOURCE, kind, key }
+fn record_key<'a>(org: &'a str, kind: &'a str, key: &'a str) -> inbound::Delivery<'a> {
+    inbound::Delivery { org_id: org, source: SOURCE, kind, key }
+}
+
+/// The 32-byte MAC an `X-Hub-Signature-256` header carries: exactly
+/// `sha256=` and 64 hex digits (surrounding whitespace allowed). `None` for
+/// anything else, which is refused before any secret is looked up.
+pub(crate) fn parse_signature(signature: Option<&str>) -> Option<[u8; 32]> {
+    let hex_sig = signature?.trim().strip_prefix("sha256=")?;
+    if hex_sig.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex_sig, &mut out).ok()?;
+    Some(out)
+}
+
+/// Whether `mac` is HMAC-SHA256(`secret`, `body`), compared in constant time.
+fn mac_valid(secret: &[u8], body: &[u8], mac: &[u8; 32]) -> bool {
+    let Ok(mut h) = Hmac::<Sha256>::new_from_slice(secret) else { return false };
+    h.update(body);
+    h.verify_slice(mac).is_ok()
+}
+
+/// Seconds between two warnings about one organization's unusable stored
+/// webhook secret: every delivery meets it, and one line per interval says
+/// enough.
+const UNUSABLE_WARN_EVERY_S: i64 = 300;
+
+/// Whether to log, now, that organization `org`'s stored webhook secret is
+/// unusable: once per [`UNUSABLE_WARN_EVERY_S`] per organization.
+fn warn_unusable_now(org: &str) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let now = ua_core::time::now_ms() / 1000;
+    let Ok(mut last) = LAST.get_or_init(Mutex::default).lock() else { return false };
+    if last.get(org).is_some_and(|at| now - at < UNUSABLE_WARN_EVERY_S) {
+        return false;
+    }
+    if last.len() > 1024 {
+        last.retain(|_, at| now - *at < UNUSABLE_WARN_EVERY_S);
+    }
+    last.insert(org.to_string(), now);
+    true
+}
+
+/// The organizations whose own webhook secret signs `body` as `signature`,
+/// in a fixed order (the default organization first, then by id).
+///
+/// In order: the header must be `sha256=<64 hex>` (`BadSignature`, before
+/// the database is touched); some organization must hold a secret by its
+/// metadata alone (`NotConfigured`, nothing decrypted); then each held
+/// secret is decrypted inside one read, and the MACs are computed after the
+/// read returns, each compared in constant time (`BadSignature` when none
+/// verifies). A stored secret that cannot be used is skipped, never
+/// replaced by another organization's, and logged at most once per
+/// [`UNUSABLE_WARN_EVERY_S`] per organization. No secret is ever logged.
+async fn signing_orgs(hub: &Hub, body: &[u8], signature: Option<&str>) -> Result<Vec<String>, WebhookError> {
+    let mac = parse_signature(signature).ok_or(WebhookError::BadSignature)?;
+    let cfg = hub.cfg().clone();
+    let secrets: Option<Vec<(String, SecretString)>> = hub
+        .db()
+        .read_async(move |c| {
+            let orgs = credentials::orgs_holding(c, CredentialKind::WebhookSecret)?;
+            // Metadata only: is any secret held at all?
+            let mut held = Vec::new();
+            for org in orgs {
+                let s = credentials::credential_status(c, &cfg, &org, CredentialKind::WebhookSecret)?;
+                if s.state != CredentialState::Off {
+                    held.push(org);
+                }
+            }
+            if held.is_empty() {
+                return Ok(None);
+            }
+            let mut out = Vec::new();
+            for org in held {
+                match credentials::github_credential_for(c, &cfg, &org, CredentialKind::WebhookSecret) {
+                    Ok(Some(cred)) => out.push((org, cred.secret().clone())),
+                    Ok(None) => {}
+                    Err(e) => {
+                        if warn_unusable_now(&org) {
+                            tracing::warn!(
+                                org = %org,
+                                code = e.code(),
+                                "a stored GitHub webhook secret is unusable; it is skipped"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Some(out))
+        })
+        .await?;
+    let Some(secrets) = secrets else { return Err(WebhookError::NotConfigured) };
+    let matched: Vec<String> = secrets
+        .into_iter()
+        .filter(|(_, secret)| mac_valid(secret.expose_secret().as_bytes(), body, &mac))
+        .map(|(org, _)| org)
+        .collect();
+    if matched.is_empty() {
+        return Err(WebhookError::BadSignature);
+    }
+    Ok(matched)
 }
 
 fn well_formed(s: &str, max: usize, extra: &[char]) -> bool {
     (1..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
 
-/// Check, record and handle one delivery.
+/// One delivery's checked headers and payload.
+struct Parsed {
+    delivery: String,
+    event: String,
+    action: String,
+    repo: String,
+    body_hash: String,
+    payload: Value,
+}
+
+/// Check, record and handle one delivery, once for each organization whose
+/// secret verifies it (see the module documentation).
 pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, WebhookError> {
-    let secret = hub.cfg().github_webhook_secret().ok_or(WebhookError::NotConfigured)?;
-    if !signature_valid(secret.expose_secret().as_bytes(), d.body, d.signature) {
-        return Err(WebhookError::BadSignature);
-    }
+    let orgs = signing_orgs(hub, d.body, d.signature).await?;
     let delivery = d.delivery_id.trim().to_ascii_lowercase();
     if !well_formed(&delivery, 100, &['-']) {
         return Err(WebhookError::BadRequest("X-GitHub-Delivery is missing or malformed".into()));
@@ -224,12 +365,107 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             return Err(WebhookError::Stale);
         }
     }
-    let action = payload["action"].as_str().unwrap_or_default().to_string();
-    let repo = payload["repository"]["full_name"].as_str().unwrap_or_default().to_ascii_lowercase();
-    let body_hash = hex::encode(Sha256::digest(d.body));
+    let p = Parsed {
+        action: payload["action"].as_str().unwrap_or_default().to_string(),
+        repo: payload["repository"]["full_name"].as_str().unwrap_or_default().to_ascii_lowercase(),
+        body_hash: hex::encode(Sha256::digest(d.body)),
+        delivery,
+        event,
+        payload,
+    };
+    if let [org] = orgs.as_slice() {
+        let result = receive_for(hub, org, &p).await;
+        // Only a delivery for the default organization alone answers with
+        // its details; any other organization's stay in its own ledger.
+        return if org == ua_core::DEFAULT_ORG {
+            result
+        } else {
+            match result {
+                Ok(_) => Ok(neutral(&[200])),
+                Err(WebhookError::Internal(m)) => {
+                    tracing::warn!(org = %org, "GitHub webhook handling failed: {m}");
+                    Err(neutral_internal())
+                }
+                Err(e) => Err(e),
+            }
+        };
+    }
+    // The multi-match rule: each organization in turn, independently.
+    let mut statuses = Vec::new();
+    let (mut ok, mut internal, mut bad) = (0, false, None);
+    for org in &orgs {
+        match receive_for(hub, org, &p).await {
+            Ok(_) => {
+                ok += 1;
+                statuses.push(200);
+            }
+            Err(e) => {
+                statuses.push(e.http_status());
+                match e {
+                    WebhookError::Internal(m) => {
+                        tracing::warn!(org = %org, "GitHub webhook handling failed: {m}");
+                        internal = true;
+                    }
+                    WebhookError::BadRequest(m) => {
+                        bad.get_or_insert(m);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    multi_outcome(ok, internal, bad, &statuses)
+}
 
-    let (dl, ev, ac, rp, bh) =
-        (delivery.clone(), event.clone(), action.clone(), repo.clone(), body_hash.clone());
+/// The organization-neutral answer to a delivery that matched another
+/// organization than the default alone: how many matched and each one's
+/// status, never an organization id, a task or a repository.
+fn neutral(statuses: &[u16]) -> Value {
+    json!({ "ok": true, "matched": statuses.len(), "statuses": statuses })
+}
+
+/// An internal failure as the sender sees it when another organization than
+/// the default alone matched: no error text, which could name that
+/// organization's rows. The text is in the hub's log and that ledger.
+fn neutral_internal() -> WebhookError {
+    WebhookError::Internal("processing failed for a matched organization; a redelivery is processed".into())
+}
+
+/// The answer to a delivery several organizations matched (`docs/github.md`,
+/// "Multi-match"): 500 when any organization failed internally (GitHub
+/// redelivers; the others refuse the redelivery as a replay); 200 with
+/// [`neutral`] when any succeeded; otherwise 400 when any refused it as a bad
+/// request (as a single match would), else 409 when every one had already
+/// processed it.
+fn multi_outcome(
+    ok: usize,
+    internal: bool,
+    bad: Option<String>,
+    statuses: &[u16],
+) -> Result<Value, WebhookError> {
+    if internal {
+        return Err(neutral_internal());
+    }
+    if ok > 0 {
+        return Ok(neutral(statuses));
+    }
+    if let Some(m) = bad {
+        return Err(WebhookError::BadRequest(m));
+    }
+    Err(WebhookError::Replayed)
+}
+
+/// Record and handle one delivery for organization `org`, whose secret
+/// verified it: its own replay records, its bindings and tasks, its events.
+async fn receive_for(hub: &Hub, org: &str, p: &Parsed) -> Result<Value, WebhookError> {
+    let (og, dl, ev, ac, rp, bh) = (
+        org.to_string(),
+        p.delivery.clone(),
+        p.event.clone(),
+        p.action.clone(),
+        p.repo.clone(),
+        p.body_hash.clone(),
+    );
     let bound = hub
         .db()
         .write_async(move |tx| {
@@ -238,18 +474,19 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
                 inbound::SweepRules { max_per_kind: Some(KEEP_MAX - 1), abandon_after_s: Some(IN_FLIGHT_S) };
             // One organization per sweep, so every row it abandons belongs to
             // the organization the event below is written under.
-            let swept = inbound::sweep(tx, ua_core::DEFAULT_ORG, SOURCE, now, sweep)?;
-            debug_assert!(swept.abandoned.iter().all(|a| a.org_id == ua_core::DEFAULT_ORG));
+            let swept = inbound::sweep(tx, &og, SOURCE, now, sweep)?;
+            debug_assert!(swept.abandoned.iter().all(|a| a.org_id == og));
             if !swept.abandoned.is_empty() {
-                ledger::append(tx, abandoned_event(&swept.abandoned).by(GITHUB_ACTOR.to_string()))?;
+                let (channel, payload) = abandoned_event(&og, &swept.abandoned);
+                emit(tx, &og, channel, payload, GITHUB_ACTOR)?;
             }
-            let by_id = inbound::record(tx, record_key(KIND_ID, &dl), now, RULES, Some(&ev))?;
+            let by_id = inbound::record(tx, record_key(&og, KIND_ID, &dl), now, RULES, Some(&ev))?;
             if let inbound::Sight::Duplicate { .. } = by_id {
                 return Ok(None);
             }
             // The same signed body under a new delivery id is a replay too.
             // Returning here rolls the delivery id back with the transaction.
-            let by_body = inbound::record(tx, record_key(KIND_BODY, &bh), now, RULES, Some(&dl))?;
+            let by_body = inbound::record(tx, record_key(&og, KIND_BODY, &bh), now, RULES, Some(&dl))?;
             if let inbound::Sight::Duplicate { .. } = by_body {
                 return Err(UaError::conflict_code(REPLAYED_BODY, "this payload was already processed"));
             }
@@ -257,23 +494,21 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             else {
                 return Err(UaError::internal("a recorded delivery came back without a claim"));
             };
-            inbound::accept(tx, record_key(KIND_ID, &dl), &id_claim, now, None)?;
-            inbound::accept(tx, record_key(KIND_BODY, &bh), &body_claim, now, None)?;
-            // ORG-GITHUB-DEFAULT: a delivery runs as the hub and acts on the
-            // default organization's bindings and tasks only.
-            let bound = !rp.is_empty() && BoundRepo::check(tx, crate::families::tasks::TASK_ORG, &rp).is_ok();
-            let mut payload =
-                json!({ "delivery_id": dl, "event": ev, "action": ac, "repo": rp, "bound": bound });
+            inbound::accept(tx, record_key(&og, KIND_ID, &dl), &id_claim, now, None)?;
+            inbound::accept(tx, record_key(&og, KIND_BODY, &bh), &body_claim, now, None)?;
+            // Only this organization's bindings: a repository another
+            // organization binds is not bound here.
+            let bound = !rp.is_empty() && BoundRepo::check(tx, &og, &rp).is_ok();
+            let mut payload = json!({
+                "org_id": og, "delivery_id": dl, "event": ev, "action": ac, "repo": ledger_text(&og, &rp),
+                "bound": bound,
+            });
             if matches!(by_id, inbound::Sight::Redelivered { .. })
                 || matches!(by_body, inbound::Sight::Redelivered { .. })
             {
                 payload["redelivered"] = json!(true);
             }
-            ledger::append(
-                tx,
-                EventInput::new(ua_core::DEFAULT_ORG, "agent.github.webhook.received", payload)
-                    .by(GITHUB_ACTOR.to_string()),
-            )?;
+            emit(tx, &og, "agent.github.webhook.received", payload, GITHUB_ACTOR)?;
             Ok(Some((bound, id_claim, body_claim)))
         })
         .await
@@ -285,14 +520,14 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             }
         })?;
     let Some((bound, id_claim, body_claim)) = bound else { return Err(WebhookError::Replayed) };
-    let result = handle(hub, &event, &action, &repo, bound, &payload, &delivery).await;
+    let result = handle(hub, org, p, bound).await;
     // An internal failure releases both records so GitHub's redelivery of
     // this event is processed (every effect is idempotent); any other
     // outcome finishes them, so a later copy is a replay. Only records still
     // under this delivery's claims are settled: one a redelivery took over
     // meanwhile belongs to that redelivery and is left alone.
     let retry = matches!(result, Err(WebhookError::Internal(_)));
-    let (dl, bh) = (delivery.clone(), body_hash);
+    let (og, dl, bh) = (org.to_string(), p.delivery.clone(), p.body_hash.clone());
     let settled = hub
         .db()
         .write_async(move |tx| {
@@ -300,9 +535,9 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
             let mut not_mine = Vec::new();
             for (kind, key, claim) in [(KIND_BODY, &bh, &body_claim), (KIND_ID, &dl, &id_claim)] {
                 let outcome = if retry {
-                    inbound::release(tx, record_key(kind, key), claim)?
+                    inbound::release(tx, record_key(&og, kind, key), claim)?
                 } else {
-                    inbound::finish(tx, record_key(kind, key), claim, now)?
+                    inbound::finish(tx, record_key(&og, kind, key), claim, now)?
                 };
                 if let inbound::Settle::NotMine { state } = outcome {
                     not_mine.push((kind, state.map(inbound::State::as_str).unwrap_or("gone")));
@@ -315,7 +550,7 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
         Ok(not_mine) => {
             for (kind, state) in not_mine {
                 tracing::info!(
-                    delivery_id = %delivery,
+                    delivery_id = %p.delivery,
                     kind,
                     state,
                     "a GitHub delivery record was taken over or settled by another handler; left as it is"
@@ -336,14 +571,14 @@ const ABANDONED_IDS_MAX: usize = 50;
 /// never finished (the hub stopped, or they passed the in-flight bound).
 /// Each may never have been handled. The count, the count per kind and up
 /// to [`ABANDONED_IDS_MAX`] delivery ids; never a body or a body hash.
-fn abandoned_event(rows: &[inbound::Abandoned]) -> EventInput {
+fn abandoned_event(org: &str, rows: &[inbound::Abandoned]) -> (&'static str, Value) {
     let per_kind = |k: &str| rows.iter().filter(|a| a.kind == k).count();
     let ids: Vec<&str> =
         rows.iter().filter(|a| a.kind == KIND_ID).map(|a| a.key.as_str()).take(ABANDONED_IDS_MAX).collect();
-    EventInput::new(
-        ua_core::DEFAULT_ORG,
+    (
         "agent.github.webhook.abandoned",
         json!({
+            "org_id": org,
             "count": rows.len(),
             "kinds": { KIND_ID: per_kind(KIND_ID), KIND_BODY: per_kind(KIND_BODY) },
             "delivery_ids": ids,
@@ -352,25 +587,18 @@ fn abandoned_event(rows: &[inbound::Abandoned]) -> EventInput {
     )
 }
 
-async fn handle(
-    hub: &Hub,
-    event: &str,
-    action: &str,
-    repo: &str,
-    bound: bool,
-    payload: &Value,
-    delivery: &str,
-) -> Result<Value, WebhookError> {
-    let (event, action, repo) = (event.to_string(), action.to_string(), repo.to_string());
-    let mut out =
-        json!({ "ok": true, "delivery_id": delivery, "event": event, "action": action, "repo": repo });
+async fn handle(hub: &Hub, org: &str, p: &Parsed, bound: bool) -> Result<Value, WebhookError> {
+    let (event, action, repo, payload) = (p.event.clone(), p.action.clone(), p.repo.clone(), &p.payload);
+    let mut out = json!({
+        "ok": true, "org_id": org, "delivery_id": p.delivery, "event": event, "action": action, "repo": repo,
+    });
     if event == "ping" {
         out["handled"] = json!("ping");
         return Ok(out);
     }
     if !bound {
         out["handled"] = json!(false);
-        out["reason"] = json!("repository not bound to any project");
+        out["reason"] = json!("repository not bound to any project of the organization");
         return Ok(out);
     }
     match event.as_str() {
@@ -404,7 +632,7 @@ async fn handle(
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("{repo}#{number}")),
             };
-            let result = close_merged(hub, &github_caller(), vec![merged], false).await?;
+            let result = close_merged(hub, &github_caller_for(org), vec![merged], false).await?;
             out["handled"] = json!("closed_on_merge");
             out["result"] = result;
         }
@@ -418,7 +646,7 @@ async fn handle(
             let Some(head) = head else {
                 return Err(WebhookError::BadRequest(format!("{event} without a full head_sha")));
             };
-            let checks = reverify_head(hub, &repo, &head, "webhook").await?;
+            let checks = reverify_head(hub, org, &repo, &head, "webhook").await?;
             out["handled"] = json!("reverified");
             out["head_sha"] = json!(head);
             out["checks"] = json!(checks);
@@ -427,7 +655,7 @@ async fn handle(
             let head = payload["after"].as_str().and_then(full_sha).filter(|h| h.chars().any(|c| c != '0'));
             match head {
                 Some(head) => {
-                    let checks = reverify_head(hub, &repo, &head, "webhook").await?;
+                    let checks = reverify_head(hub, org, &repo, &head, "webhook").await?;
                     out["handled"] = json!("reverified");
                     out["head_sha"] = json!(head);
                     out["checks"] = json!(checks);

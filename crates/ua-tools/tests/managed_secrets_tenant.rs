@@ -568,7 +568,7 @@ async fn status_and_doctor_report_each_organization_without_values() {
     let c = h.ok(&agent(ORG_C), "github_credential_status", json!({})).await;
     assert_eq!(c["token"]["state"], "off");
     assert_eq!(c["token"]["source"], Value::Null);
-    assert_eq!(c["automation_scope"], "default_organization_only");
+    assert_eq!(c["automation_scope"], "per_organization");
 
     let line = |report: &Value| {
         report["checks"]

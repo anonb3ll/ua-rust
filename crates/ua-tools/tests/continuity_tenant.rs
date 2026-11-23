@@ -797,8 +797,9 @@ async fn deleting_an_organization_b_task_leaves_no_organization_b_hold_visible_t
     assert_eq!(v["holds"], json!([]), "{v}");
 }
 
-/// ORG-GITHUB-DEFAULT: a delivery for a repository both organizations bind
-/// re-verifies only the default organization's checks at the head.
+/// A delivery signed with the default organization's secret, for a
+/// repository both organizations bind, re-verifies only the default
+/// organization's checks at the head.
 #[tokio::test]
 async fn a_webhook_re_verifies_only_default_organization_checks() {
     // A GitHub that knows nothing: every lookup is a 404.

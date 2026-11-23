@@ -19,9 +19,16 @@
 //!   a human's standing-policy authorization to merge one exact head, which
 //!   `git_merge_task` accepts in place of a one-time approval.
 //!
+//! Every path runs per organization: a webhook delivery belongs to the
+//! organizations whose webhook secret verifies it, the poller polls each
+//! organization that has a token with that token, and CI lookups and merged
+//! reconciliation use the task's (or caller's) organization's token and
+//! bindings. Nothing falls back to another organization's credential.
+//!
 //! Every effect is a governed registry call (`task_update`,
 //! `coordination_manage` `task_check_verify`) made as the hub identity
-//! [`GITHUB_ACTOR`], and is ledgered on an `agent.github.*` channel. That
+//! [`GITHUB_ACTOR`] in the organization it acts for ([`github_caller_for`]),
+//! and is ledgered on an `agent.github.*` channel. That
 //! identity holds a narrow grant the registry enforces before anything else
 //! ([`grant_refusal`]): `task_update` closing a task with a merge commit as
 //! evidence, and `coordination_manage(action="task_check_verify")`. Nothing
@@ -33,12 +40,16 @@ pub mod credentials;
 pub mod poll;
 pub mod webhook;
 
+// Its cases sit in their own `#[cfg(test)]` module, which the source guards
+// see as test code; the declaration needs no second one.
+mod org_automation_tests;
+
 use serde_json::{Value, json};
 use ua_core::{Caller, UaResult};
 use ua_store::{Procedure, SchemaPart};
 
 use crate::Hub;
-use crate::families::tasks::emit;
+use crate::families::tasks::{emit, ledger_text};
 use crate::registry::Registry;
 
 pub use poll::{poll_once, spawn_poller};
@@ -145,17 +156,58 @@ ALTER TABLE policy_authorizations ADD COLUMN revoke_reason TEXT;
 ",
 };
 
+/// `github.v2.poll_repos`: the poller's state per organization and
+/// repository (`github_poll_repos`), so a repository two organizations
+/// bind is polled for each with its own ETag and open list. Every row of the
+/// old, hub-wide `github_poll_state` is copied in under the default
+/// organization (the only one that was polled), so nothing is dropped; the
+/// old table stays in the schema, unread and unwritten, until a later
+/// release retires it. It must run after `organization.v1.store`; the
+/// table's organization triggers come from [`POLL_REPOS_TENANT_PART`].
+pub const POLL_REPOS_SCHEMA: SchemaPart = SchemaPart {
+    name: "github.v2.poll_repos",
+    sql: "
+CREATE TABLE IF NOT EXISTS github_poll_repos (
+    org_id TEXT NOT NULL DEFAULT 'default',
+    repo TEXT NOT NULL,
+    etag TEXT,
+    open_json TEXT NOT NULL DEFAULT 'null',
+    polled_at TEXT NOT NULL,
+    changed_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY (org_id, repo)
+);
+INSERT INTO github_poll_repos (org_id, repo, etag, open_json, polled_at, changed_at)
+    SELECT 'default', repo, etag, open_json, polled_at, changed_at FROM github_poll_state
+    WHERE true ON CONFLICT (org_id, repo) DO NOTHING;
+",
+};
+
+/// The organization triggers of `github_poll_repos`.
+pub const POLL_REPOS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.github_poll", &["github_poll_repos"]);
+
 pub fn register(r: &mut Registry) {
     authz::register(r);
     credentials::register(r);
 }
 
-/// The hub identity GitHub effects run as. Its reach is the grant
-/// [`grant_refusal`] enforces. The `operator` profile here only selects the
-/// tool surface; a profile grants no authority, and as a system caller it
-/// holds neither `Operator` nor `LifecycleOperator`.
+/// The hub identity GitHub effects run as, in the default organization.
 pub fn github_caller() -> Caller {
-    Caller { label: GITHUB_ACTOR.into(), profile: ua_core::Profile::Operator, ..Caller::system() }
+    github_caller_for(ua_core::DEFAULT_ORG)
+}
+
+/// The hub identity GitHub effects run as, acting for organization `org`:
+/// a system job working on that organization's rows only. Its reach is the
+/// grant [`grant_refusal`] enforces. The `operator` profile here only
+/// selects the tool surface; a profile grants no authority, and as a system
+/// caller it holds neither `Operator` nor `LifecycleOperator`.
+///
+/// Crate-private, and `org_guard` refuses a call to it outside the GitHub
+/// family: only a delivery verified by `org`'s own secret or a poll with
+/// `org`'s own token acts as it.
+pub(crate) fn github_caller_for(org: &str) -> Caller {
+    Caller { label: GITHUB_ACTOR.into(), profile: ua_core::Profile::Operator, ..Caller::system_for(org) }
 }
 
 /// `task_update` arguments the GitHub identity may pass: a close with evidence.
@@ -198,13 +250,19 @@ pub(crate) fn grant_refusal(caller: &Caller, tool: &str, args: &Value) -> Option
     }
 }
 
-/// Re-verify every check recorded with a CI reference in `repo` at `head`,
-/// through the governed `task_check_verify`. Returns one entry per check.
-///
-/// ORG-GITHUB-DEFAULT: a delivery runs as the hub, so only the default
-/// organization's tasks' checks are re-verified (`TASK_ORG`).
-pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &str) -> UaResult<Vec<Value>> {
-    let (r, h) = (repo.to_ascii_lowercase(), head.to_ascii_lowercase());
+/// Re-verify every check organization `org`'s tasks recorded with a CI
+/// reference in `repo` at `head`, through the governed `task_check_verify`
+/// as [`github_caller_for`] `org` (which looks the run up with `org`'s own
+/// token). Returns one entry per check. Another organization's checks at
+/// the same head are never touched.
+pub(crate) async fn reverify_head(
+    hub: &Hub,
+    org: &str,
+    repo: &str,
+    head: &str,
+    source: &str,
+) -> UaResult<Vec<Value>> {
+    let (r, h, o) = (repo.to_ascii_lowercase(), head.to_ascii_lowercase(), org.to_string());
     let rows: Vec<(i64, String)> = hub
         .db()
         .read_async(move |c| {
@@ -213,7 +271,7 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
                  WHERE k.org_id = ?4 AND lower(k.repo) = ?1 AND lower(k.head_sha) = ?2 AND k.ref_kind = 'ci_run' ORDER BY k.id LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![r, h, REVERIFY_CAP, crate::families::tasks::TASK_ORG], |row| {
+                .query_map(rusqlite::params![r, h, REVERIFY_CAP, o], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -223,7 +281,7 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let caller = github_caller();
+    let caller = github_caller_for(org);
     let mut out = Vec::new();
     for (task_id, name) in rows {
         let args = json!({
@@ -247,19 +305,32 @@ pub(crate) async fn reverify_head(hub: &Hub, repo: &str, head: &str, source: &st
             };
         out.push(entry);
     }
-    let payload = json!({ "repo": repo, "head_sha": head, "source": source, "checks": out });
+    let payload = json!({
+        "org_id": org, "repo": ledger_text(org, repo), "head_sha": head, "source": source,
+        "checks": redacted_checks(org, &out),
+    });
+    let org = org.to_string();
     hub.db()
-        .write_async(move |tx| {
-            emit(
-                tx,
-                crate::families::tasks::TASK_ORG,
-                "agent.github.checks_reverified",
-                payload,
-                GITHUB_ACTOR,
-            )
-        })
+        .write_async(move |tx| emit(tx, &org, "agent.github.checks_reverified", payload, GITHUB_ACTOR))
         .await?;
     Ok(out)
+}
+
+/// The re-verified checks as another organization's event carries them: ids,
+/// grades and verdicts, no check names or error text.
+fn redacted_checks(org: &str, checks: &[Value]) -> Value {
+    if org == ua_core::DEFAULT_ORG {
+        return json!(checks);
+    }
+    json!(
+        checks
+            .iter()
+            .map(|c| json!({
+                "task_id": c["task_id"], "grade": c["grade"], "verdict": c["verdict"],
+                "error": c.get("error").is_some(),
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 #[cfg(test)]

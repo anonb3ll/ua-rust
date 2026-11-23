@@ -971,9 +971,11 @@ async fn start_github() -> (Seen, String) {
     (seen, format!("http://{addr}"))
 }
 
-/// ORG-GITHUB-DEFAULT: merged-PR reconciliation and the poller run as the
-/// hub and touch only the default organization's tasks, even for a
-/// repository both organizations bind and a PR both organizations' tasks link.
+/// Merged-PR reconciliation and the poller run per organization: with only
+/// the default organization holding GitHub credentials, they touch only its
+/// tasks, even for a repository both organizations bind and a PR both
+/// organizations' tasks link. Organization B, with no token, is skipped,
+/// never served with the hub's.
 #[tokio::test]
 async fn github_reconciliation_touches_only_default_organization_tasks() {
     let (seen, base) = start_github().await;
@@ -1011,9 +1013,10 @@ async fn github_reconciliation_touches_only_default_organization_tasks() {
     let tb_own =
         h.add(&b, json!({ "title": "B own", "project": "falcon", "evidence_ref": "owner-b/falcon#6" })).await;
 
-    // Another organization's caller is refused outright.
+    // Another organization's caller reconciles its own organization, which
+    // has no token: credential off, and the hub's token is never used.
     let e = h.coord(&b, "queue_close_merged", json!({})).await.unwrap_err();
-    assert_eq!(reason(&e), "org_unsupported", "{e}");
+    assert_eq!(reason(&e), "github_credential_off", "{e}");
 
     let dry = h.coord(&op, "queue_close_merged", json!({})).await.unwrap();
     let would: Vec<i64> =
