@@ -66,7 +66,11 @@ async fn send_list_and_reply_thread() {
     assert_eq!(sent["to_agent"], "builder-2");
     assert_eq!(sent["hop"], 0);
     assert_eq!(sent["availability"]["availability"], "unknown");
+    assert_eq!(sent["client_message_id"], "m-1");
     let conversation = sent["conversation_id"].as_str().unwrap().to_string();
+    // The hub mints the message id; the client id is only the sender's key.
+    let m1 = sent["message_id"].as_str().unwrap().to_string();
+    assert_ne!(m1, "m-1");
 
     // A retry with the same id returns the saved result and writes nothing.
     let again = send(
@@ -78,18 +82,8 @@ async fn send_list_and_reply_thread() {
     .await;
     assert_eq!(again["duplicate"], true);
     assert_eq!(again["event_ulid"], sent["event_ulid"]);
+    assert_eq!(again["message_id"], m1.as_str());
     assert_eq!(events(&hub, "agent.message."), 1);
-    // Another sender cannot reuse the id.
-    let taken = reg
-        .call(
-            &hub,
-            &c,
-            "message_send",
-            json!({"act": "inform", "to_agent": "builder-2", "body": "x", "message_id": "m-1"}),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(taken.code(), "conflict");
 
     // The recipient sees it, marked untrusted.
     let inbox = call(&reg, &hub, &b, "message_list", json!({"unread_only": true})).await;
@@ -108,26 +102,28 @@ async fn send_list_and_reply_thread() {
     // A third agent cannot read builder-2's mailbox or reply into the thread.
     let err = reg.call(&hub, &c, "message_list", json!({"to_agent": "builder-2"})).await.unwrap_err();
     assert_eq!(err.code(), "invalid_argument");
-    let err = reg
-        .call(
-            &hub,
-            &c,
-            "message_send",
-            json!({"act": "inform", "to_agent": "builder-1", "body": "hi", "reply_to": "m-1"}),
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("not a message you sent or received"), "{err}");
+    for reply_to in ["m-1", m1.as_str()] {
+        let err = reg
+            .call(
+                &hub,
+                &c,
+                "message_send",
+                json!({"act": "inform", "to_agent": "builder-1", "body": "hi", "reply_to": reply_to}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a message you sent or received"), "{err}");
+    }
 
     let waiting = call(&reg, &hub, &a, "message_list", json!({"waiting_on_reply": true})).await;
     assert_eq!(waiting["total"], 1);
 
     // A reply with no address answers the parent's sender in the same conversation.
-    let reply = send(&reg, &hub, &b, json!({"act": "done", "body": "looks good", "reply_to": "m-1"})).await;
+    let reply = send(&reg, &hub, &b, json!({"act": "done", "body": "looks good", "reply_to": m1})).await;
     assert_eq!(reply["to_agent"], "builder-1");
     assert_eq!(reply["conversation_id"], conversation);
     assert_eq!(reply["hop"], 1);
-    assert_eq!(reply["reply_to"], "m-1");
+    assert_eq!(reply["reply_to"], m1.as_str());
 
     let waiting = call(&reg, &hub, &a, "message_list", json!({"waiting_on_reply": true})).await;
     assert_eq!(waiting["total"], 0);
@@ -146,6 +142,80 @@ async fn send_list_and_reply_thread() {
     let count = call(&reg, &hub, &a, "message_list", json!({"count_only": true})).await;
     assert_eq!(count["count"], 2);
     assert!(count["messages"].as_array().unwrap().is_empty());
+}
+
+/// Client message ids are keyed by `(sender, id)`: another sender's id is
+/// not an existence oracle, and each sender's retries stay idempotent.
+#[tokio::test]
+async fn client_message_ids_are_scoped_per_sender() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let (a, c) = (agent("builder-1"), agent("builder-3"));
+    let msg = |id: &str, body: &str| json!({"act": "inform", "to_agent": "builder-2", "body": body, "message_id": id});
+
+    let a1 = send(&reg, &hub, &a, msg("shared-id", "from a")).await;
+    // Another sender's id answers exactly like a fresh one: same shape, no
+    // duplicate, a new message.
+    let c1 = send(&reg, &hub, &c, msg("shared-id", "from c")).await;
+    let fresh = send(&reg, &hub, &c, msg("never-used", "fresh")).await;
+    let shape = |v: &Value| {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        (keys, v["accepted"].clone(), v["duplicate"].clone())
+    };
+    assert_eq!(shape(&c1), shape(&fresh), "{c1} vs {fresh}");
+    assert_eq!(c1["duplicate"], false);
+    assert_ne!(c1["message_id"], a1["message_id"]);
+    assert_eq!(c1["client_message_id"], "shared-id");
+    assert_eq!(events(&hub, "agent.message."), 3);
+
+    // Each sender's retry is idempotent and returns its own message.
+    let a2 = send(&reg, &hub, &a, msg("shared-id", "from a")).await;
+    let c2 = send(&reg, &hub, &c, msg("shared-id", "from c")).await;
+    assert_eq!((a2["duplicate"].clone(), a2["message_id"].clone()), (json!(true), a1["message_id"].clone()));
+    assert_eq!((c2["duplicate"].clone(), c2["message_id"].clone()), (json!(true), c1["message_id"].clone()));
+    assert_eq!(events(&hub, "agent.message."), 3);
+
+    // The recipient sees two distinct messages, each with its sender's key.
+    let b = agent("builder-2");
+    let inbox = call(&reg, &hub, &b, "message_list", json!({})).await;
+    let bodies: Vec<(&str, &str)> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["client_message_id"] == "shared-id")
+        .map(|m| (m["from_agent"].as_str().unwrap(), m["body"].as_str().unwrap()))
+        .collect();
+    assert_eq!(bodies, vec![("builder-1", "from a"), ("builder-3", "from c")]);
+
+    // A sender's own client id resolves to its own message, never another's.
+    let mine = call(&reg, &hub, &c, "message_list", json!({"message_id": "shared-id"})).await;
+    assert_eq!(mine["total"], 1, "{mine}");
+    assert_eq!(mine["messages"][0]["message_id"], c1["message_id"]);
+    let follow =
+        send(&reg, &hub, &c, json!({"act": "inform", "body": "and also", "reply_to": "shared-id"})).await;
+    assert_eq!(follow["reply_to"], c1["message_id"]);
+    assert_eq!(follow["conversation_id"], c1["conversation_id"]);
+    assert_eq!(follow["to_agent"], "builder-2");
+
+    // A send keyed before ids were scoped (hub-wide key, message id = client
+    // id): its sender's retry still finds it; another sender's is fresh.
+    let legacy =
+        json!({"accepted": true, "from_agent": "builder-1", "message_id": "old-1", "to_agent": "builder-2"});
+    hub.db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
+                 VALUES ('message_send:old-1', 'message_send', ?1, '2026-01-01T00:00:00+00:00')",
+                [legacy.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let own = send(&reg, &hub, &a, msg("old-1", "retry")).await;
+    assert_eq!((own["duplicate"].clone(), own["message_id"].clone()), (json!(true), json!("old-1")));
+    let other = send(&reg, &hub, &c, msg("old-1", "mine")).await;
+    assert_eq!(other["duplicate"], false, "{other}");
+    assert_ne!(other["message_id"], "old-1");
 }
 
 #[tokio::test]
@@ -183,6 +253,7 @@ async fn send_cannot_name_a_conversation_it_is_not_in() {
     assert_eq!(foreign.code(), "not_found");
     assert_eq!(missing.code(), "not_found");
     assert_eq!(foreign.to_string(), missing.to_string());
+    assert!(missing.to_string().contains("reply_to"), "the refusal points to reply_to: {missing}");
 
     // A reply with no address: a missing parent and a foreign one answer alike.
     let parent = sent["message_id"].as_str().unwrap().to_string();

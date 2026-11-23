@@ -793,13 +793,29 @@ from its commit history.
   the gated `crew_intervene` opens or joins a session's `crew:<session>`
   thread. `crew_view` no longer returns other agents' private mail: a
   restricted caller sees only the crew's messages and worktree intervention
-  lines it sent or received, and only the session agent gets the drop file's
-  path. `crew_intervene` no longer copies the body anywhere outside the
-  mailbox: the task-note marker records only the time and session, and the
-  worktree `.ua/interventions.jsonl` line carries the parties and
-  `message_id`. `message_send`
+  lines it sent or received (session mail only when it targets the session
+  viewed), and only the session agent gets the drop file's path.
+  `crew_intervene` no longer copies the body or the parties anywhere outside
+  the mailbox: the task-note marker records only the time and session, and
+  the worktree `.ua/interventions.jsonl` line holds only `{ts, session_id,
+  message_id}`. `crew_view` resolves each line's `message_id` against the
+  mailbox under the reader's rule and drops a line that is not a crew
+  intervention into that session, so a planted line shows nothing; the file
+  is never written or read through a symlink. `message_send`
   refuses a client-chosen `message_id` with an external-thread prefix
   (`ts:`).
+- `message_send`: a client-chosen `message_id` is the sender's own
+  idempotency key, keyed by `(sender, id)`, and no longer an existence
+  oracle. Every message now gets a hub-minted `message_id`; the client id is
+  echoed as `client_message_id` (in the send result and in listed rows).
+  The sender's retry with the same id still returns the first result,
+  while another sender's use of the same id answers exactly like a fresh id
+  instead of `conflict`. The sender's own client id also resolves as its
+  `reply_to` and in `message_list(message_id=...)`; a recipient replies and
+  acks with the hub-minted id. A send keyed before this change keeps its
+  old id and its sender's retry still finds it. Hub-node command notices
+  record the hub-minted id. A restricted caller's `conversation not found`
+  now says to omit `conversation_id` or answer with `reply_to`.
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

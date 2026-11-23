@@ -203,7 +203,11 @@ pub struct SendArgs {
     pub conversation_id: Option<String>,
     /// `message_id` of a message you sent or received that this answers.
     pub reply_to: Option<String>,
-    /// Client-chosen id. A retry with the same id returns the first result.
+    /// Client-chosen idempotency key, scoped to the sender: a retry with the
+    /// same id returns the first result, and another sender's use of the same
+    /// id is independent of yours. The message itself gets a hub-minted
+    /// `message_id`; the result echoes yours as `client_message_id`, and your
+    /// own id also works as `reply_to` and as `message_list`'s `message_id`.
     pub message_id: Option<String>,
     /// Hop count, `0..16`. A reply's hop is one past its parent's, never lower.
     pub hop: Option<i64>,
@@ -582,25 +586,48 @@ fn parent(conn: &Connection, message_id: &str) -> UaResult<Option<Parent>> {
         .optional()?)
 }
 
-/// The committed result for `message_id` when `sender` sent it. A receipt held
-/// by another sender is refused, never echoed.
-fn saved_result(conn: &Connection, message_id: &str, sender: &str) -> UaResult<Option<Value>> {
+/// The idempotency key of a client-chosen id, scoped to its sender. Neither a
+/// label nor a client id may contain `/`, so the key is unambiguous, and it
+/// never matches a pre-scoping key (`message_send:<id>`).
+fn client_key(sender: &str, client_id: &str) -> String {
+    format!("{SEND_TOOL}/{sender}/{client_id}")
+}
+
+fn saved_send(conn: &Connection, key: &str) -> UaResult<Option<Value>> {
     let cached: Option<String> = conn
         .query_row(
             "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-            params![format!("{SEND_TOOL}:{message_id}"), SEND_TOOL],
+            params![key, SEND_TOOL],
             |r| r.get(0),
         )
         .optional()?;
-    let Some(text) = cached else { return Ok(None) };
-    let mut saved: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
-    if saved["from_agent"].as_str() != Some(sender) || saved["accepted"] != json!(true) {
-        return Err(UaError::conflict(format!(
-            "message_id {message_id:?} is already used by another message"
-        )));
-    }
-    saved["duplicate"] = json!(true);
-    Ok(Some(saved))
+    Ok(cached.map(|t| serde_json::from_str(&t).unwrap_or_else(|_| json!({}))))
+}
+
+/// The committed result of `sender`'s earlier send under `client_id`, if any.
+/// Client ids are keyed by `(sender, id)`: another sender's use of the same
+/// id is invisible here, so a foreign id answers exactly like a fresh one.
+fn saved_result(conn: &Connection, client_id: &str, sender: &str) -> UaResult<Option<Value>> {
+    // Before ids were scoped, a client id was the message id itself, under a
+    // hub-wide key. The sender's own retry of such a send still finds it.
+    let legacy = || saved_send(conn, &format!("{SEND_TOOL}:{client_id}"));
+    let found = match saved_send(conn, &client_key(sender, client_id))? {
+        Some(v) => Some(v),
+        None => legacy()?.filter(|v| v["from_agent"].as_str() == Some(sender)),
+    };
+    Ok(found.filter(|v| v["accepted"] == json!(true)).map(|mut v| {
+        v["duplicate"] = json!(true);
+        v
+    }))
+}
+
+/// `id` as a message id for `sender`: the hub id of the sender's own send
+/// under client id `id` when there is one, else `id` unchanged. Only the
+/// sender's own keys are consulted, so this reveals nothing about others.
+fn own_message_id(conn: &Connection, sender: &str, id: String) -> UaResult<String> {
+    Ok(saved_send(conn, &client_key(sender, &id))?
+        .and_then(|v| v["message_id"].as_str().map(str::to_string))
+        .unwrap_or(id))
 }
 
 /// The session a reply goes to when the caller names none: the parent's
@@ -625,6 +652,10 @@ fn reply_default_session(
 
 /// Validate `reply_to` and return the parent's conversation. One error covers
 /// "no such message" and "not yours", so a probe learns nothing.
+///
+/// Unlike naming a `conversation_id`, the recipient of session-targeted mail
+/// counts as a party here: answering through `reply_to` is how it joins that
+/// thread (docs/organization.md, The ledger).
 fn check_reply(conn: &Connection, reply_to: Option<&str>, sender: &str) -> UaResult<Option<String>> {
     let Some(reply) = reply_to else { return Ok(None) };
     if is_external_reply(reply) {
@@ -768,7 +799,11 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         }
     }
 
-    let reply = clean(a.reply_to.as_deref());
+    // A sender may thread under its own client id.
+    let reply = match clean(a.reply_to.as_deref()) {
+        Some(r) if !is_external_reply(&r) => Some(own_message_id(tx, &sender, r)?),
+        other => other,
+    };
     // Party-check reply_to before it can default the recipient, so a missing
     // and a foreign parent answer alike.
     let inherited = check_reply(tx, reply.as_deref(), &sender)?;
@@ -835,10 +870,9 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         return Err(UaError::invalid(format!("body exceeds {MAX_BODY_BYTES} bytes")));
     }
 
-    let mid = given_id.unwrap_or_else(new_id);
-    if parent(tx, &mid)?.is_some() {
-        return Err(UaError::conflict(format!("message_id {mid:?} is already used by another message")));
-    }
+    // Always hub-minted: a client id is the sender's idempotency key, never
+    // the message's global id, so it cannot collide with another sender's.
+    let mid = new_id();
     if let Some(cid) = &explicit_conversation
         && !v.unrestricted
         // A gated crew_intervene delivery may open or join the session's
@@ -853,7 +887,10 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     {
         // A restricted caller may name only a conversation it is already in:
         // a new or foreign id answers like a missing one.
-        return Err(UaError::not_found("conversation not found"));
+        return Err(UaError::not_found(
+            "conversation not found; to start one omit conversation_id (the hub mints an id), \
+             or answer a message you received with reply_to",
+        ));
     }
     let conversation = explicit_conversation.or(inherited).unwrap_or_else(new_id);
     let mut hop = requested_hop;
@@ -873,6 +910,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     let event_id = clean(a.event_id.as_deref());
     let mut payload = json!({
         "message_id": mid,
+        "client_message_id": given_id,
         "act": act,
         "conversation_id": conversation,
         "reply_to": reply,
@@ -931,6 +969,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         "accepted": true,
         "duplicate": false,
         "message_id": mid,
+        "client_message_id": given_id,
         "event_ulid": event.ulid,
         "seq": event.seq,
         "act": act,
@@ -970,10 +1009,12 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if !handoff_warnings.is_empty() {
         result["handoff_warnings"] = json!(handoff_warnings);
     }
-    tx.execute(
-        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![format!("{SEND_TOOL}:{mid}"), SEND_TOOL, result.to_string(), ua_core::time::now()],
-    )?;
+    if let Some(client_id) = &given_id {
+        tx.execute(
+            "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![client_key(&sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
+        )?;
+    }
     Ok(result)
 }
 
@@ -1101,6 +1142,8 @@ fn public_row(r: &Row<'_>) -> rusqlite::Result<Value> {
         "channel": channel.unwrap_or_else(|| format!("agent.message.{act}")),
         "created_at": created_at,
         "message_id": r.get::<_, String>("message_id")?,
+        // The sender's own idempotency key, when it chose one.
+        "client_message_id": payload.get("client_message_id").cloned().unwrap_or(Value::Null),
         "act": act,
         "conversation_id": r.get::<_, String>("conversation_id")?,
         "reply_to": r.get::<_, Option<String>>("reply_to")?,
@@ -1278,7 +1321,11 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         party,
         conversation_id: clean(q.conversation_id.as_deref()),
         act,
-        message_id: clean(q.message_id.as_deref()),
+        // The caller's own client id finds the message it keyed.
+        message_id: match clean(q.message_id.as_deref()) {
+            Some(m) => Some(own_message_id(conn, me.as_deref().unwrap_or(&v.local_label), m)?),
+            None => None,
+        },
         after_seq: q.after_seq,
         unread_only: q.unread_only,
         waiting_on_reply: q.waiting_on_reply,
@@ -1485,7 +1532,8 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
 
 /// Send mail as a hub service (`from`, for example `hub-node`), in the
 /// caller's transaction: to one session of `to_agent` when `to_session` is
-/// given, else label mail. `message_id` makes a retry return the first result.
+/// given, else label mail. `message_id` is the service's client id: a retry
+/// under it returns the first result. The result's `message_id` is the hub's.
 pub(crate) fn send_system(
     tx: &mut WriteTx<'_>,
     from: &str,
@@ -1719,7 +1767,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "message_send",
-            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. Of the restricted callers, only crew_intervene may open or join a session's crew:<session> thread.",
+            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction. The hub mints every message_id; a client message_id is the sender's own idempotency key (a retry with it returns the first result, another sender's use of the same id is independent), echoed as client_message_id and usable as the sender's reply_to. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. Of the restricted callers, only crew_intervene may open or join a session's crew:<session> thread.",
             message_send,
         )
         .family("messaging"),

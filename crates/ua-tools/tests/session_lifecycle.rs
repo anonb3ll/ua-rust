@@ -575,10 +575,22 @@ async fn crew_view_shows_a_restricted_caller_only_its_own_mail() {
     assert!(!v.to_string().contains("Secret"), "{v}");
     let mine = e.ok(&b2, "crew_view", json!({ "session_id": steered })).await;
     assert!(mine["interventions_path"].is_string(), "{mine}");
-    // The drop file sits in the workspace, where fs tools reach: it holds the
-    // parties and message id, never the body (that is in the mailbox).
+    // Session mail is its session's, as in the mailbox: viewing another of
+    // its sessions on the same task, the recipient sees only label mail.
+    let elsewhere = e.ok(&b2, "crew_view", json!({ "session_id": owner_session })).await;
+    assert_eq!(elsewhere["message_total"], 1, "{elsewhere}");
+    assert!(!elsewhere.to_string().contains("Secret"), "{elsewhere}");
+    let all = e.ok(&human(), "crew_view", json!({ "session_id": owner_session })).await;
+    assert_eq!(all["message_total"], 2, "{all}");
+    // The drop file sits in the workspace, where fs tools reach: it holds
+    // only a pointer, never the parties or the body (those are in the mailbox).
     let line = std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap();
     assert!(line.contains("message_id") && !line.contains("Secret"), "{line}");
+    assert!(!line.contains("lead-1") && !line.contains("builder-2"), "{line}");
+    let v: Value = serde_json::from_str(line.trim()).unwrap();
+    let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["message_id", "session_id", "ts"], "{line}");
     let notes = e.ok(&outsider, "task_list", json!({ "status": "all" })).await;
     assert!(notes.to_string().contains("[intervention @"), "{notes}");
     assert!(!notes.to_string().contains("Secret"), "{notes}");
@@ -625,4 +637,125 @@ async fn only_crew_intervene_opens_a_crew_thread() {
         approved_call(&e, &lead3, json!({ "session_id": s, "message": "still there?" })).await.unwrap();
     assert!(quiet["message"]["to_session"].is_null(), "delivery fell back to the label: {quiet}");
     assert_eq!(quiet["message"]["conversation_id"], crew.as_str(), "{quiet}");
+}
+
+/// The drop file is in the shared workspace: an outsider reading it learns no
+/// party, and `crew_view` takes its lines only as pointers into the mailbox.
+#[tokio::test]
+async fn the_drop_file_names_no_parties_and_forged_lines_show_nothing() {
+    let e = Env::new();
+    let (b2, lead, outsider) = (agent("builder-2"), agent("lead-1"), agent("builder-3"));
+    let task = e.ok(&b2, "task_add", json!({ "title": "Steered task" })).await["id"].as_i64().unwrap();
+    let wt = e.ws.path().join("wt-drop");
+    std::fs::create_dir_all(&wt).unwrap();
+    let steered = e.start(&b2, json!({ "task_id": task, "worktree_path": wt.to_str().unwrap() })).await;
+    let r = approved_call(&e, &lead, json!({ "session_id": steered, "message": "Secret: rotate now" }))
+        .await
+        .unwrap();
+    let real = r["message"]["message_id"].as_str().unwrap().to_string();
+
+    // An outsider reads the file the way the workspace lets it: no labels.
+    let rel = wt.strip_prefix(e.ws.path()).unwrap().join(".ua/interventions.jsonl");
+    let read = e.ok(&outsider, "fs_read", json!({ "path": rel.to_str().unwrap() })).await;
+    let direct = std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap();
+    for text in [read["content"].as_str().unwrap(), direct.as_str()] {
+        assert!(text.contains(&real), "{text}");
+        for label in ["lead-1", "builder-2", "Secret"] {
+            assert!(!text.contains(label), "{label} in {text}");
+        }
+    }
+
+    // Forged lines: a message that is not a crew intervention into this
+    // session (task mail), an unknown id, and a copy of the real line that
+    // claims other parties. Only the real one shows, with its real parties.
+    let other = e
+        .ok(
+            &lead,
+            "message_send",
+            json!({ "act": "inform", "to_agent": "builder-2", "body": "task mail", "task_id": task }),
+        )
+        .await["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other_session = e.start(&b2, json!({ "external_session_id": "other" })).await;
+    let elsewhere = approved_call(&e, &lead, json!({ "session_id": other_session, "message": "elsewhere" }))
+        .await
+        .unwrap()["message"]["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let forged = [
+        json!({ "ts": "2000-01-01T00:00:00+00:00", "session_id": steered, "message_id": other }),
+        json!({ "ts": "2000-01-01T00:00:00+00:00", "session_id": steered, "message_id": elsewhere }),
+        json!({ "ts": "2000-01-01T00:00:00+00:00", "session_id": steered, "message_id": "01FORGED000000000000000000" }),
+        json!({ "ts": "2000-01-01T00:00:00+00:00", "session_id": steered, "message_id": real,
+                "from_agent": "builder-3", "to_agent": "builder-3" }),
+    ];
+    let mut text = direct.clone();
+    for f in &forged {
+        text.push_str(&format!("{f}\nnot json\n"));
+    }
+    std::fs::write(wt.join(".ua/interventions.jsonl"), text).unwrap();
+
+    for who in [&lead, &b2, &human()] {
+        let v = e.ok(who, "crew_view", json!({ "session_id": steered })).await;
+        let rows = v["worktree_interventions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{v}");
+        assert_eq!(rows[0]["message_id"], real.as_str());
+        assert_eq!(rows[0]["from_agent"], "lead-1");
+        assert_eq!(rows[0]["to_agent"], "builder-2");
+        assert_eq!(rows[0]["to_session"], steered.as_str());
+        assert_eq!(rows[0]["session_id"], steered.as_str());
+    }
+    // The outsider: none, though it planted lines naming itself.
+    let v = e.ok(&outsider, "crew_view", json!({ "session_id": steered })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+    assert!(!v.to_string().contains("Secret"), "{v}");
+}
+
+/// The drop file is never written or read through a link.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_drop_file_is_never_followed_through_a_link() {
+    let e = Env::new();
+    let (b, lead) = (agent("builder-1"), agent("lead-1"));
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("victim.jsonl");
+    std::fs::write(&target, "").unwrap();
+
+    // A symlinked file.
+    let wt = e.ws.path().join("wt-link");
+    std::fs::create_dir_all(wt.join(".ua")).unwrap();
+    std::os::unix::fs::symlink(&target, wt.join(".ua/interventions.jsonl")).unwrap();
+    let s = e.start(&b, json!({ "worktree_path": wt.to_str().unwrap() })).await;
+    let r = approved_call(&e, &lead, json!({ "session_id": s, "message": "hi" })).await.unwrap();
+    assert_eq!(r["worktree_written"], false, "{r}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+    let real1 = r["message"]["message_id"].as_str().unwrap().to_string();
+
+    // A symlinked .ua directory.
+    let wt2 = e.ws.path().join("wt-dirlink");
+    std::fs::create_dir_all(&wt2).unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt2.join(".ua")).unwrap();
+    let s2 = e
+        .start(&b, json!({ "external_session_id": "dirlink", "worktree_path": wt2.to_str().unwrap() }))
+        .await;
+    let r = approved_call(&e, &lead, json!({ "session_id": s2, "message": "hi" })).await.unwrap();
+    assert_eq!(r["worktree_written"], false, "{r}");
+    assert!(!outside.path().join("interventions.jsonl").exists());
+
+    // Reading through a link shows nothing either, even a real pointer.
+    let real2 = r["message"]["message_id"].as_str().unwrap();
+    std::fs::write(&target, format!("{}\n", json!({ "ts": "x", "session_id": s, "message_id": real1 })))
+        .unwrap();
+    std::fs::write(
+        outside.path().join("interventions.jsonl"),
+        format!("{}\n", json!({ "ts": "x", "session_id": s2, "message_id": real2 })),
+    )
+    .unwrap();
+    for sid in [&s, &s2] {
+        let v = e.ok(&lead, "crew_view", json!({ "session_id": sid })).await;
+        assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+    }
 }
