@@ -1604,6 +1604,17 @@ A client-chosen `message_id` that collides with any existing message still
 answers `conflict`, which shows that some message holds that id, never its
 content or parties.
 
+`agent.lifecycle.handoff` carries only the authoritative handoff-note events.
+A hook-reported handoff (`lifecycle_record` with `kind: "handoff"`) goes to
+`agent.lifecycle.handoff_hook`, which its writer and note-reading operators
+can read and nobody else — the session it names does not grant its owner
+access, so one agent cannot place a handoff-shaped row in another agent's
+session view or `session_packet`. Rows that `lifecycle_record` wrote to
+`agent.lifecycle.handoff` before this change stay there (the ledger is
+append-only) and keep that channel's rule. The other lifecycle kinds
+(`tool_start`, `stop` and the rest) are ordinary visible observations: any
+agent may name any session in one, and its `originator` shows who wrote it.
+
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.
 
