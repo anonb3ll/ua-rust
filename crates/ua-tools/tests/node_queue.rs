@@ -504,7 +504,8 @@ async fn a_supervised_command_needs_its_fence_and_notifies_its_owner() {
     let inbox = h.ok(&lead(), "message_list", json!({ "to_agent": "lead-1" })).await;
     let notice = &inbox["messages"][0];
     assert_eq!(notice["from_agent"], "hub-node");
-    assert_eq!(notice["message_id"], format!("node-command-{id}-1-finished"));
+    assert_eq!(notice["client_message_id"], format!("node-command-{id}-1-finished"));
+    assert_eq!(h.scalar("SELECT message_id FROM node_command_notice"), notice["message_id"]);
     assert!(notice["body"].as_str().unwrap().contains("cargo test --all"), "{notice}");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM node_command_notice WHERE sent_at IS NOT NULL"), json!(1));
 }
@@ -631,6 +632,32 @@ async fn follow_ups_reach_a_running_acp_session() {
         )
         .await;
     assert!(e.to_string().contains("acp"), "{e}");
+}
+
+/// A follow-up checks the item's task holder in the task row's own
+/// organization, not the requester's: an item whose task belongs to another
+/// organization and is claimed there is refused, without naming the holder.
+#[tokio::test]
+async fn a_follow_up_checks_the_task_holder_in_the_task_s_organization() {
+    let h = H::new();
+    h.register_default().await;
+    let id = h.queue(json!({ "backend": "acp:claude" })).await;
+    h.claim().await;
+    let ts = ua_core::time::now();
+    h.sql(&format!(
+        "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
+             VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '{ts}');
+         INSERT INTO tasks (id, org_id, title, created_at, updated_at, claimed_by)
+             VALUES (7001, 'org-b', 'B task', '{ts}', '{ts}', 'osprey-holder');
+         UPDATE node_dispatch SET task_id = 7001 WHERE id = '{id}';"
+    ));
+    let ask =
+        json!({ "item_id": id, "mode": "queue", "body": "keep going", "idempotency_key": "queue-org-1" });
+    let e = h.err(&lead(), "node_followup", ask).await;
+    assert_eq!(reason(&e), "task_claimed_elsewhere", "{e}");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals WHERE tool = 'node_followup'"), json!(0));
+    assert!(!e.to_string().contains("osprey-holder"), "{e}");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM node_followups"), json!(0));
 }
 
 #[tokio::test]

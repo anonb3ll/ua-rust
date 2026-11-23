@@ -29,9 +29,9 @@ pub(crate) mod merged;
 mod queue;
 mod workflow;
 
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
-pub(crate) use conversation::{conversation_handoff, conversation_handoffs};
+pub(crate) use conversation::{HANDOFF_KEY_PREFIX, conversation_handoff, conversation_handoffs};
 pub(crate) use handoff::{
     recover_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
     session_handoff_recover, session_handoff_seal, session_handoff_update,
@@ -184,6 +184,96 @@ CREATE TABLE IF NOT EXISTS review_ready_notices (
 );
 CREATE INDEX IF NOT EXISTS idx_review_ready_notices_task ON review_ready_notices(task_id, notified_at);
 ",
+};
+
+/// `organization.v1.tools.continuity`: `org_id` on `task_workflow`,
+/// `task_checks` and `review_ready_notices`, and their generated
+/// `*_org_exists` / `*_org_immutable` triggers. No key rebuild: every key is
+/// led by a hub-global task id (`task_workflow(task_id)`,
+/// `task_checks(task_id, name, head_sha)` and its AUTOINCREMENT `id`,
+/// `review_ready_notices(task_id, head_sha)`), so two organizations can never
+/// collide. The column fills with the default organization here;
+/// [`ORG_SCOPE`] then moves each row to its task's organization. Applied
+/// after the continuity parts and `tasks.v2.org_scope`.
+pub const TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.continuity",
+    &["task_workflow", "task_checks", "review_ready_notices"],
+);
+
+/// The `*_org_immutable` trigger [`ua_store::org::tenant_part`] generates for
+/// `table`, spelled exactly as it does, so a part that must move existing
+/// rows once can drop it and put the same trigger back.
+macro_rules! org_immutable {
+    ($table:literal) => {
+        concat!(
+            "CREATE TRIGGER ",
+            $table,
+            "_org_immutable BEFORE UPDATE OF org_id ON ",
+            $table,
+            " WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id \
+             BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;"
+        )
+    };
+}
+pub(crate) use org_immutable;
+
+/// `continuity.v2.org_scope`: rows written before [`TENANT_PART`] move to
+/// their task's organization (a row whose task is gone stays in the default
+/// organization), indexes led by `org_id` for the stage filter of
+/// `task_list` and the re-verification scan by repository and head, and
+/// triggers that keep every row's `task_id` inside the row's organization
+/// (the foreign key alone would accept another organization's task). The
+/// backfill drops each `*_org_immutable` trigger for its one `UPDATE` and
+/// puts the same trigger back, in this part's transaction.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "continuity.v2.org_scope",
+    sql: concat!(
+        "
+DROP TRIGGER task_workflow_org_immutable;
+UPDATE task_workflow SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = task_workflow.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_workflow.task_id AND t.org_id IS NOT task_workflow.org_id);
+",
+        org_immutable!("task_workflow"),
+        "
+DROP TRIGGER task_checks_org_immutable;
+UPDATE task_checks SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = task_checks.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_checks.task_id AND t.org_id IS NOT task_checks.org_id);
+",
+        org_immutable!("task_checks"),
+        "
+DROP TRIGGER review_ready_notices_org_immutable;
+UPDATE review_ready_notices SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = review_ready_notices.task_id)
+WHERE EXISTS (
+    SELECT 1 FROM tasks t WHERE t.id = review_ready_notices.task_id AND t.org_id IS NOT review_ready_notices.org_id
+);
+",
+        org_immutable!("review_ready_notices"),
+        "
+CREATE INDEX IF NOT EXISTS idx_task_workflow_org_stage ON task_workflow(org_id, stage);
+CREATE INDEX IF NOT EXISTS idx_task_checks_org_repo_head ON task_checks(org_id, lower(repo), lower(head_sha));
+
+CREATE TRIGGER IF NOT EXISTS task_workflow_org_parent BEFORE INSERT ON task_workflow
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_workflow_org_parent_update BEFORE UPDATE OF task_id ON task_workflow
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS task_checks_org_parent BEFORE INSERT ON task_checks
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS task_checks_org_parent_update BEFORE UPDATE OF task_id ON task_checks
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS review_ready_notices_org_parent BEFORE INSERT ON review_ready_notices
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS review_ready_notices_org_parent_update BEFORE UPDATE OF task_id ON review_ready_notices
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+"
+    ),
 };
 
 pub fn schema_parts() -> Vec<SchemaPart> {

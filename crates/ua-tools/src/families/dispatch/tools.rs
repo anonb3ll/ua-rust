@@ -281,13 +281,16 @@ fn resolve_workdir(raw: &str, ua_home: &Path) -> UaResult<PathBuf> {
 }
 
 /// Refuse a task another agent holds, a terminal task, or one with a live run.
+/// `task_id` is a task of organization `org`; another organization's task
+/// answers as a missing one.
 fn check_task_free(
     conn: &rusqlite::Connection,
+    org: &str,
     task_id: i64,
     agent: &str,
     run_id: Option<&str>,
 ) -> UaResult<()> {
-    let task = require_task(conn, task_id)?;
+    let task = require_task(conn, org, task_id)?;
     let status = str_field(&task, "status").unwrap_or_default();
     if crate::families::tasks::is_terminal(status) {
         return Err(UaError::conflict(format!("task_terminal: task {task_id} is {status}")));
@@ -309,6 +312,7 @@ fn check_task_free(
 /// Point the task at the run and claim it for the agent.
 fn bind_task(
     tx: &rusqlite::Connection,
+    org: &str,
     task_id: i64,
     run_id: &str,
     agent: &str,
@@ -317,17 +321,18 @@ fn bind_task(
     tx.execute(
         "UPDATE tasks SET claimed_by = ?2, claimed_at = ?3, lock_expires_at = ?4, current_run_id = ?5, \
          current_run_agent = ?2, status = CASE WHEN status = 'open' THEN 'doing' ELSE status END, updated_at = ?6 \
-         WHERE id = ?1",
-        params![task_id, agent, now(), lease, run_id, next_revision(None)],
+         WHERE id = ?1 AND org_id = ?7",
+        params![task_id, agent, now(), lease, run_id, next_revision(None), org],
     )?;
     Ok(())
 }
 
-/// Attach approval `approval_id` (just consumed) to the run.
-fn link_approval_id(tx: &rusqlite::Connection, approval_id: i64, run_id: &str) -> UaResult<()> {
+/// Attach approval `approval_id` of organization `org` (just consumed) to
+/// the run.
+fn link_approval_id(tx: &rusqlite::Connection, org: &str, approval_id: i64, run_id: &str) -> UaResult<()> {
     let n = tx.execute(
-        "UPDATE approvals SET run_id = ?1 WHERE id = ?2 AND status = 'consumed' AND run_id IS NULL",
-        params![run_id, approval_id],
+        "UPDATE approvals SET run_id = ?1 WHERE org_id = ?3 AND id = ?2 AND status = 'consumed' AND run_id IS NULL",
+        params![run_id, approval_id, org],
     )?;
     expect_one_link(n, run_id)
 }
@@ -480,6 +485,7 @@ fn default_prompt(task_id: i64, task: &Map<String, Value>, notes: &str, run_id: 
 fn stale_pass(
     tx: &rusqlite::Connection,
     cfg: &ua_core::Config,
+    org: &str,
     requester: &str,
     payload: &Value,
 ) -> UaResult<Option<(i64, Vec<String>, String)>> {
@@ -487,11 +493,11 @@ fn stale_pass(
     let cutoff =
         ua_core::time::format_ts(jiff::Timestamp::now().checked_sub(ttl).unwrap_or(jiff::Timestamp::MIN));
     let mut stmt = tx.prepare(
-        "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND requested_by = ?1 \
+        "SELECT id, payload FROM approvals WHERE org_id = ?4 AND tool = 'dispatch_task' AND requested_by = ?1 \
          AND status = 'approved' AND resolved_at >= ?2 ORDER BY id DESC LIMIT ?3",
     )?;
     let rows: Vec<(i64, String)> = stmt
-        .query_map(params![requester, cutoff, STALE_PASS_SCAN], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![requester, cutoff, STALE_PASS_SCAN, org], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (id, text) in rows {
         let Ok(old) = serde_json::from_str::<Value>(&text) else { continue };
@@ -601,6 +607,7 @@ fn node_route(
 fn route_to_node(
     tx: &mut ua_store::WriteTx<'_>,
     hub: &crate::hub::Hub,
+    org: &str,
     actor: &str,
     run_id: &str,
     task_id: i64,
@@ -623,7 +630,7 @@ fn route_to_node(
         None,
     )?;
     n.run_id = Some(run_id.to_string());
-    let queued = node_queue::insert_item(tx, hub, &n, row, actor)?;
+    let queued = node_queue::insert_item(tx, hub, org, &n, row, actor)?;
     let item_id = queued["item_id"].as_str().unwrap_or_default().to_string();
     let evidence = node_queue::evidence_ref(&row.node, &item_id);
     let run = load_run(tx, run_id)?.ok_or_else(|| UaError::internal("routed run vanished"))?;
@@ -708,15 +715,17 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let task = require_task(tx, tid)?;
-            check_task_free(tx, tid, &ag, None)?;
+            crate::families::tasks::require_org(tx, &caller.org_id)?;
+            let task = require_task(tx, &caller.org_id, tid)?;
+            check_task_free(tx, &caller.org_id, tid, &ag, None)?;
             // The one claim gate: a stopped agent or a held task takes no run.
-            governance::check_claim(tx, Some(&ag), Some(tid), false)?;
+            governance::check_claim(tx, &caller.org_id, Some(&ag), Some(tid), false)?;
             // A proposal-spawned task must still match its frozen contract,
             // and its work order is the contract block: notes appended after
             // it never reach a prompt the hub builds.
             let work_order = governance::check_contract(
                 tx,
+                &caller.org_id,
                 tid,
                 str_field(&task, "title").unwrap_or_default(),
                 str_field(&task, "notes").unwrap_or_default(),
@@ -801,7 +810,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             let approval_id = match approvals::gate(tx, hub.cfg(), &caller, "dispatch_task", &payload)? {
                 GateOutcome::Pass { approval_id } => approval_id,
                 GateOutcome::Pending { approval_id } => {
-                    let stale = stale_pass(tx, hub.cfg(), &caller.label, &payload)?;
+                    let stale = stale_pass(tx, hub.cfg(), &caller.org_id, &caller.label, &payload)?;
                     let stale = match stale {
                         Some((old, changed, approved_sha)) => {
                             let r = Refusal::new("dispatch_task", RefusalReason::BindingChanged)
@@ -809,7 +818,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                                 .task(Some(tid))
                                 .hashes(Some(approved_sha), Some(approvals::payload_sha256("dispatch_task", &payload)))
                                 .changed(changed.clone());
-                            approvals::refused(tx, &caller.label, &r, None)?;
+                            approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
                             Some((old, changed))
                         }
                         None => None,
@@ -838,11 +847,11 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     payload["provider_account"].as_str(),
                 ],
             )?;
-            bind_task(tx, tid, &run_id, &ag, &lease_at)?;
-            link_approval_id(tx, approval_id, &run_id)?;
+            bind_task(tx, &caller.org_id, tid, &run_id, &ag, &lease_at)?;
+            link_approval_id(tx, &caller.org_id, approval_id, &run_id)?;
             record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
             if let Some((row, backend, cwd)) = route {
-                let out = route_to_node(tx, &hub, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
+                let out = route_to_node(tx, &hub, &caller.org_id, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
                 return Ok(Gated::Routed(out));
             }
             let program = payload["program"].as_str().map(PathBuf::from);
@@ -1197,6 +1206,7 @@ const RESUME_BOUND_KEYS: [&str; 14] = [
 /// checked against.
 fn check_resume_binding(
     tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
     caller: &str,
     run: &super::Run,
     harness: Option<&(String, ua_core::config::HarnessConfig)>,
@@ -1204,9 +1214,9 @@ fn check_resume_binding(
 ) -> UaResult<Map<String, Value>> {
     let bound: Option<(i64, String)> = tx
         .query_row(
-            "SELECT id, payload FROM approvals WHERE tool = 'dispatch_task' AND run_id = ?1 \
+            "SELECT id, payload FROM approvals WHERE org_id = ?2 AND tool = 'dispatch_task' AND run_id = ?1 \
              AND status = 'consumed' ORDER BY id LIMIT 1",
-            [&run.run_id],
+            params![run.run_id, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1214,7 +1224,7 @@ fn check_resume_binding(
         bound.and_then(|(id, t)| serde_json::from_str::<Value>(&t).ok().map(|v| (id, v)))
     else {
         let r = Refusal::new("dispatch_resume", RefusalReason::NoMatchingApproval).task(Some(run.task_id));
-        approvals::refused(tx, caller, &r, None)?;
+        approvals::refused(tx, org, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!("run {} has no dispatch_task approval to resume under", run.run_id),
@@ -1244,7 +1254,7 @@ fn check_resume_binding(
                 Some(approvals::payload_sha256("dispatch_task", &presented)),
             )
             .changed(changed.iter().map(|k| k.to_string()).collect());
-        approvals::refused(tx, caller, &r, None)?;
+        approvals::refused(tx, org, caller, &r, None)?;
         return Err(UaError::denied(
             "approval_binding_changed",
             format!(
@@ -1311,19 +1321,20 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Some(why) = resume_refusal(&run) {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            let binding = check_resume_binding(tx, &caller.label, &run, h2.as_ref(), w2.as_deref())?;
+            let binding =
+                check_resume_binding(tx, &caller.org_id, &caller.label, &run, h2.as_ref(), w2.as_deref())?;
             // A resume runs what was approved: it is refused, never rerouted,
             // while the harness's provider account cannot take a run.
             if let Some((name, h)) = &h2 {
                 provider_accounts::check_available(tx, name, h)?;
                 provider_accounts::check_billing_env(tx, name, h)?;
             }
-            check_task_free(tx, run.task_id, &run.agent_label, Some(&rid2))
+            check_task_free(tx, &caller.org_id, run.task_id, &run.agent_label, Some(&rid2))
                 .map_err(|e| UaError::conflict(format!("dispatch resume failed: {e}")))?;
             // A resumed attempt is new work: the one claim gate applies, and
             // a proposal-spawned task must still match its frozen contract.
-            governance::check_claim(tx, Some(&run.agent_label), Some(run.task_id), false)?;
-            governance::task_contract(tx, run.task_id)?;
+            governance::check_claim(tx, &caller.org_id, Some(&run.agent_label), Some(run.task_id), false)?;
+            governance::task_contract(tx, &caller.org_id, run.task_id)?;
             // The approver sees what will run, and the attempt it replaces:
             // a pass resumes this attempt only.
             let mut payload = json!({
@@ -1370,8 +1381,8 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             if let Err(why) = transition(tx, &run, edge)? {
                 return Err(UaError::conflict(format!("dispatch resume failed: {why}")));
             }
-            bind_task(tx, run.task_id, &rid2, &run.agent_label, &lease_at)?;
-            link_approval_id(tx, approval_id, &rid2)?;
+            bind_task(tx, &caller.org_id, run.task_id, &rid2, &run.agent_label, &lease_at)?;
+            link_approval_id(tx, &caller.org_id, approval_id, &rid2)?;
             record_transition(
                 tx,
                 &rid2,
@@ -1452,19 +1463,22 @@ fn transitions(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Vec<Value>
         .collect())
 }
 
-fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
+fn build_receipt(conn: &rusqlite::Connection, org: &str, run_id: &str) -> UaResult<Value> {
     let Some(run) = run_object(conn, run_id)? else {
         return Err(UaError::not_found(format!("unknown dispatch run: {run_id}")));
     };
     let get = |k: &str| run.get(k).cloned().unwrap_or(Value::Null);
     let task_id = run.get("task_id").and_then(Value::as_i64).unwrap_or_default();
-    let task_state: Option<String> =
-        conn.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?;
+    let task_state: Option<String> = conn
+        .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, task_id], |r| {
+            r.get(0)
+        })
+        .optional()?;
     let transitions = transitions(conn, run_id)?;
     let approval: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, status FROM approvals WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
-            [run_id],
+            "SELECT id, status FROM approvals WHERE org_id = ?2 AND run_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![run_id, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1537,7 +1551,8 @@ fn build_receipt(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Value> {
 
 async fn delivery_receipt(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     let rid = trimmed("run_id", &a.run_id)?;
-    ctx.hub.db().read_async(move |c| build_receipt(c, &rid)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| build_receipt(c, &org, &rid)).await
 }
 
 const SUMMARY_FIELDS: [&str; 15] = [

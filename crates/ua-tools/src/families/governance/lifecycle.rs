@@ -331,11 +331,15 @@ fn check_transition(label: &str, verb: Verb, state: &str) -> UaResult<()> {
     Ok(())
 }
 
-fn doing_claims(c: &Connection, agent: &str) -> UaResult<Vec<i64>> {
+/// `agent`'s `doing` claims with each task's organization. An agent label
+/// is one hub-wide namespace and an agent belongs to one organization, so
+/// this reads the claims of that one agent wherever its tasks are; each
+/// release acts in its task's own organization.
+fn doing_claims(c: &Connection, agent: &str) -> UaResult<Vec<(i64, String)>> {
     let mut stmt = c.prepare(
-        "SELECT id FROM tasks WHERE claimed_by = ?1 COLLATE NOCASE AND status = 'doing' ORDER BY id",
+        "SELECT id, org_id FROM tasks WHERE claimed_by = ?1 COLLATE NOCASE AND status = 'doing' ORDER BY id",
     )?;
-    let ids = stmt.query_map([agent], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let ids = stmt.query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     Ok(ids)
 }
 
@@ -395,31 +399,33 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
 /// Return `agent`'s `doing` claims to `open` (terminate).
 fn release_claims(tx: &mut WriteTx<'_>, agent: &str, who: &str, reason: &str) -> UaResult<Vec<Value>> {
     let mut out = Vec::new();
-    for id in doing_claims(tx, agent)? {
-        let prev: Option<String> =
-            tx.query_row("SELECT updated_at FROM tasks WHERE id = ?1", [id], |r| r.get(0))?;
+    for (id, org) in doing_claims(tx, agent)? {
+        let prev: Option<String> = tx.query_row(
+            "SELECT updated_at FROM tasks WHERE org_id = ?1 AND id = ?2",
+            params![org, id],
+            |r| r.get(0),
+        )?;
         let n = tx.execute(
             "UPDATE tasks SET status = 'open', claimed_by = NULL, claimed_at = NULL, lock_expires_at = NULL, \
              next_owner = NULL, ownership_generation = ownership_generation + 1, updated_at = ?3 \
-             WHERE id = ?1 AND claimed_by = ?2 COLLATE NOCASE AND status = 'doing'",
-            params![id, agent, crate::families::tasks::next_revision(prev.as_deref())],
+             WHERE id = ?1 AND org_id = ?4 AND claimed_by = ?2 COLLATE NOCASE AND status = 'doing'",
+            params![id, agent, crate::families::tasks::next_revision(prev.as_deref()), org],
         )?;
         if n == 1 {
-            ledger::append(
+            use crate::families::tasks::{emit, ledger_text};
+            emit(
                 tx,
-                EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    "agent.task.claim_released",
-                    json!({
-                        "task_id": id,
-                        "claimant": agent,
-                        "expired": false,
-                        "status_after": "open",
-                        "reason": format!("agent terminated: {reason}"),
-                        "authority": "agent_lifecycle",
-                    }),
-                )
-                .by(who.to_string()),
+                &org,
+                "agent.task.claim_released",
+                json!({
+                    "task_id": id,
+                    "claimant": ledger_text(&org, agent),
+                    "expired": false,
+                    "status_after": "open",
+                    "reason": ledger_text(&org, &format!("agent terminated: {reason}")),
+                    "authority": "agent_lifecycle",
+                }),
+                who,
             )?;
         }
         out.push(json!({
@@ -544,7 +550,7 @@ async fn change(
             if verb == Verb::Retire {
                 let doing = doing_claims(tx, &label)?;
                 if !doing.is_empty() {
-                    let shown: Vec<String> = doing.iter().take(20).map(|t| format!("#{t}")).collect();
+                    let shown: Vec<String> = doing.iter().take(20).map(|(t, _)| format!("#{t}")).collect();
                     return Err(UaError::conflict_code(
                         "agent_has_doing_claims",
                         format!(
@@ -616,7 +622,7 @@ async fn change(
                 if verb == Verb::Terminate {
                     stops.extend(release_claims(tx, &stored, &who, &reason)?);
                 } else {
-                    for id in doing_claims(tx, &stored)? {
+                    for (id, _) in doing_claims(tx, &stored)? {
                         if !run_tasks.contains(&id) {
                             stops.push(json!({
                                 "path": "self-pickup",

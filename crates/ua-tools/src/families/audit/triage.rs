@@ -135,20 +135,22 @@ async fn audit_triage_tasks(ctx: ToolCtx, a: TriageArgs) -> UaResult<Value> {
     let root = report["root"].as_str().unwrap_or(".").to_string();
     let (label, scope) = (root_label(&root), root_key(&root));
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
     let dry_run = a.dry_run;
     let n_groups = groups.len();
     let (created, skipped) = ctx
         .hub
         .db()
         .write_async(move |tx| {
+            crate::families::tasks::require_org(tx, &org)?;
             let mut created = Vec::new();
             let mut skipped = Vec::new();
             for ((key, class), findings) in groups {
                 let mark = marker(&scope, &key, &class);
                 let tracked: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE instr(notes, ?1) > 0 AND archived_at IS NULL AND \
-                     (status NOT IN ('done','cancelled') OR instr(notes, ?2) > 0))",
-                    [&mark, ACCEPTED_RISK_TAG],
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?3 AND instr(notes, ?1) > 0 \
+                     AND archived_at IS NULL AND (status NOT IN ('done','cancelled') OR instr(notes, ?2) > 0))",
+                    [mark.as_str(), ACCEPTED_RISK_TAG, org.as_str()],
                     |r| r.get(0),
                 )?;
                 if tracked {
@@ -180,7 +182,7 @@ async fn audit_triage_tasks(ctx: ToolCtx, a: TriageArgs) -> UaResult<Value> {
                 let id = if dry_run {
                     Value::Null
                 } else {
-                    json!(insert_task(tx, NewTask::simple(title, notes, "med"), &by)?)
+                    json!(insert_task(tx, &org, NewTask::simple(title, notes, "med"), &by)?)
                 };
                 let mut entry = entry;
                 entry["id"] = id;

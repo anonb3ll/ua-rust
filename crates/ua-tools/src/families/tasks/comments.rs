@@ -76,14 +76,16 @@ async fn comment(ctx: ToolCtx, a: CommentArgs) -> UaResult<Value> {
         }
         "list" => {
             let p: ListParams = parse_params("list", a.params)?;
-            ctx.hub.db().read_async(move |c| list(c, p.task_id)).await
+            let org = ctx.caller.org_id.clone();
+            ctx.hub.db().read_async(move |c| list(c, &org, p.task_id)).await
         }
         "get" => {
             let p: GetParams = parse_params("get", a.params)?;
+            let org = ctx.caller.org_id.clone();
             ctx.hub
                 .db()
                 .read_async(move |c| {
-                    let row = get(c, p.comment_id)?
+                    let row = get(c, &org, p.comment_id)?
                         .ok_or_else(|| UaError::not_found(format!("unknown comment: {}", p.comment_id)))?;
                     Ok(json!({ "comment": row }))
                 })
@@ -119,8 +121,10 @@ fn redact_credentials(text: &str) -> (String, bool) {
     (out, found)
 }
 
+/// A comment reply, without its `org_id` (the caller's own).
 fn public(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
     let mut obj = row_object(row)?;
+    obj.remove("org_id");
     for (key, empty) in [("mentions", json!([])), ("refs", json!({}))] {
         let parsed =
             obj.get(key).and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(empty);
@@ -132,20 +136,26 @@ fn public(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
     Ok(obj)
 }
 
-fn get(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(conn.query_row("SELECT * FROM task_comments WHERE id = ?1", [id], public).optional()?)
+/// Comment `id` of organization `org`; another organization's comment
+/// answers as a missing one.
+fn get(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn
+        .query_row("SELECT * FROM task_comments WHERE org_id = ?1 AND id = ?2", params![org, id], public)
+        .optional()?)
 }
 
-fn list(conn: &Connection, task_id: i64) -> UaResult<Value> {
-    if task_object(conn, task_id)?.is_none() {
+fn list(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
+    if task_object(conn, org, task_id)?.is_none() {
         return Err(UaError::not_found(format!("unknown task: {task_id}")));
     }
-    let mut stmt = conn.prepare("SELECT * FROM task_comments WHERE task_id = ?1 ORDER BY id")?;
-    let comments: Vec<Map<String, Value>> = stmt.query_map([task_id], public)?.collect::<Result<_, _>>()?;
+    let mut stmt =
+        conn.prepare("SELECT * FROM task_comments WHERE org_id = ?1 AND task_id = ?2 ORDER BY id")?;
+    let comments: Vec<Map<String, Value>> =
+        stmt.query_map(params![org, task_id], public)?.collect::<Result<_, _>>()?;
     let snap: Option<(i64, String)> = conn
         .query_row(
-            "SELECT revision, updated_at FROM task_comment_threads WHERE task_id = ?1",
-            [task_id],
+            "SELECT revision, updated_at FROM task_comment_threads WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -233,18 +243,21 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
     let refs = check_refs(p.refs)?;
     let task_id = p.task_id;
     let parent = p.parent_comment_id;
+    let org = ctx.caller.org_id.clone();
 
     ctx.hub
         .db()
         .write_async(move |tx| {
-            if task_object(tx, task_id)?.is_none() {
+            require_org(tx, &org)?;
+            if task_object(tx, &org, task_id)?.is_none() {
                 return Err(UaError::not_found(format!("unknown task: {task_id}")));
             }
             if let Some(k) = &key {
                 let prior = tx
                     .query_row(
-                        "SELECT * FROM task_comments WHERE task_id = ?1 AND author = ?2 AND idempotency_key = ?3",
-                        params![task_id, author, k],
+                        "SELECT * FROM task_comments WHERE org_id = ?4 AND task_id = ?1 AND author = ?2 \
+                         AND idempotency_key = ?3",
+                        params![task_id, author, k, org],
                         public,
                     )
                     .optional()?;
@@ -254,7 +267,11 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
             }
             if let Some(pid) = parent {
                 let on: Option<i64> = tx
-                    .query_row("SELECT task_id FROM task_comments WHERE id = ?1", [pid], |r| r.get(0))
+                    .query_row(
+                        "SELECT task_id FROM task_comments WHERE org_id = ?1 AND id = ?2",
+                        params![org, pid],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 if on != Some(task_id) {
                     return Err(UaError::invalid("parent comment is not on this task"));
@@ -262,15 +279,19 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
             }
             let ts = now();
             tx.execute(
-                "INSERT INTO task_comment_threads (task_id, revision, updated_at) VALUES (?1, 1, ?2) \
-                 ON CONFLICT(task_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at",
-                params![task_id, ts],
+                "INSERT INTO task_comment_threads (org_id, task_id, revision, updated_at) VALUES (?3, ?1, 1, ?2) \
+                 ON CONFLICT(task_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at \
+                 WHERE org_id = excluded.org_id",
+                params![task_id, ts, org],
             )?;
-            let revision: i64 =
-                tx.query_row("SELECT revision FROM task_comment_threads WHERE task_id = ?1", [task_id], |r| r.get(0))?;
+            let revision: i64 = tx.query_row(
+                "SELECT revision FROM task_comment_threads WHERE org_id = ?1 AND task_id = ?2",
+                params![org, task_id],
+                |r| r.get(0),
+            )?;
             tx.execute(
-                "INSERT INTO task_comments (task_id, parent_comment_id, author, body, mentions, refs, \
-                 idempotency_key, thread_revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO task_comments (org_id, task_id, parent_comment_id, author, body, mentions, refs, \
+                 idempotency_key, thread_revision, created_at) VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     task_id,
                     parent,
@@ -280,18 +301,21 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
                     Value::Object(refs).to_string(),
                     key,
                     revision,
-                    ts
+                    ts,
+                    org
                 ],
             )?;
             let comment_id = tx.last_insert_rowid();
+            let mentions = if org == ua_core::DEFAULT_ORG { json!(mentions) } else { Value::Null };
             emit(
                 tx,
+                &org,
                 "agent.task.commented",
                 json!({ "comment_id": comment_id, "task_id": task_id, "thread_revision": revision,
                         "mentions": mentions }),
                 &author,
             )?;
-            let mut out = json!({ "comment": get(tx, comment_id)?, "idempotent_replay": false });
+            let mut out = json!({ "comment": get(tx, &org, comment_id)?, "idempotent_replay": false });
             if redacted {
                 out["warning"] = json!(
                     "a hub session credential (uas_...) was redacted from this comment; credentials never belong \

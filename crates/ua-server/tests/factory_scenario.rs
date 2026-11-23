@@ -1745,6 +1745,30 @@ async fn outsider_view(
         "conversation",
         shown(s.act(&me, "conversation_handoffs", json!({ "conversation_id": conversation })).await),
     );
+    // Naming the conversation to join it: a missing id ("before") and a
+    // foreign one ("after") must answer alike.
+    v.surfaces.insert(
+        "conversation-send",
+        shown(
+            s.call(
+                &me,
+                "message_send",
+                json!({ "act": "inform", "to_agent": "builder-2", "body": "let me in",
+                        "conversation_id": conversation, "message_id": format!("probe-{tag}") }),
+            )
+            .await,
+        ),
+    );
+    // The crew view of the owner's session lists only builder-3's own mail.
+    v.surfaces.insert(
+        "crew",
+        match s.call(&me, "crew_view", json!({ "session_id": hidden_session })).await {
+            Ok(c) => {
+                normalized(json!({ "messages": c["messages"], "total": c["message_total"] }), "builder-3")
+            }
+            Err(e) => Value::String(format!("refused: {}", reason(&e))),
+        },
+    );
     v.surfaces
         .insert("packet", shown(s.call(&me, "session_packet", json!({ "task_id": hidden_task })).await));
     v.surfaces
@@ -1819,15 +1843,20 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
         .as_str()
         .unwrap()
         .to_string();
+    // Not yet minted: the outsider's "before" probe names a missing id.
     let conversation = "conv-signing-key";
     let before = outsider_view(s, "before", hidden, &session, conversation).await;
-    s.must(
-        &builder(),
-        "message_send",
-        json!({ "act": "request", "to_agent": "builder-2", "task_id": hidden, "conversation_id": conversation,
-                "body": format!("Private: the old key is in the vault ({}).", MARKERS[0]) }),
-    )
-    .await;
+    let real_conversation = s
+        .must(
+            &builder(),
+            "message_send",
+            json!({ "act": "request", "to_agent": "builder-2", "task_id": hidden,
+                    "body": format!("Private: the old key is in the vault ({}).", MARKERS[0]) }),
+        )
+        .await["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     s.must(
         &builder(),
         "message_send",
@@ -1846,10 +1875,14 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
     s.must_act(
         &reviewer(),
         "conversation_handoff",
-        json!({ "conversation_id": conversation, "task_id": hidden }),
+        json!({ "conversation_id": real_conversation, "task_id": hidden }),
     )
     .await;
-    let after = outsider_view(s, "after", hidden, &session, conversation).await;
+    // Reading its inbox writes the owner's own agent.mailbox.* receipts.
+    s.must_act(&reviewer(), "message_inbox", json!({})).await;
+    // "before" probed a conversation id that does not exist; "after" probes
+    // the real, foreign one. The two must answer alike.
+    let after = outsider_view(s, "after", hidden, &session, &real_conversation).await;
 
     // The owner reads what the outsider must not, so the records are real.
     let owner_mailbox = shown(s.call(&reviewer(), "message_list", json!({})).await).to_string();
@@ -1888,6 +1921,11 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
         4,
         "isolation.same-org-conversation-handoffs",
         unchanged_refusal("conversation", "conversation_handoffs"),
+    );
+    card.check(
+        4,
+        "isolation.same-org-conversation-naming",
+        unchanged_refusal("conversation-send", "message_send(conversation_id)"),
     );
     card.check(
         4,
@@ -1937,6 +1975,17 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
             "The event stream (/api/events/stream, backfilled from the start) uses the same unscoped rule as \
              ledger reads",
             "the mailbox and handoff restriction applied to the event stream",
+        ),
+    );
+    card.check(
+        4,
+        "isolation.same-org-crew-view",
+        compared(
+            "crew",
+            "crew_view(owner's session)",
+            "crew_view on a session lists every message on its task, delegation or crew thread, with bodies, \
+             whoever they are addressed to",
+            "the mailbox restriction applied to crew views",
         ),
     );
     card.check(

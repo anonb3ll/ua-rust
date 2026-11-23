@@ -285,7 +285,7 @@ async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value
         if !Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
-            ua_core::DEFAULT_ORG,
+            &ctx.caller.org_id,
         ) {
             return Err(UaError::denied(
                 "not_lifecycle_operator",
@@ -298,20 +298,29 @@ async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value
     }
     let sb = sandbox(&ctx)?;
     let root = sb.root.clone();
-    let tasks = ctx
+    // The caller's organization's tasks decide staleness. A worktree of
+    // another organization's task is skipped, never judged against a task
+    // the caller cannot see (it would look orphaned and be removed).
+    let org = ctx.caller.org_id.clone();
+    let (tasks, foreign) = ctx
         .hub
         .db()
-        .read_async(|c| {
-            let mut stmt = c.prepare("SELECT id, status, claimed_by, lock_expires_at FROM tasks")?;
+        .read_async(move |c| {
+            let mut stmt =
+                c.prepare("SELECT id, status, claimed_by, lock_expires_at FROM tasks WHERE org_id = ?1")?;
             let rows = stmt
-                .query_map([], |r| {
+                .query_map([&org], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         TaskRow { status: r.get(1)?, claimed_by: r.get(2)?, lock_expires_at: r.get(3)? },
                     ))
                 })?
                 .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
-            Ok(rows)
+            let foreign: std::collections::HashSet<i64> = c
+                .prepare("SELECT id FROM tasks WHERE org_id <> ?1")?
+                .query_map([&org], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok((rows, foreign))
         })
         .await?;
     let cutoff = SystemTime::now()
@@ -332,6 +341,10 @@ async fn cleanup_stale_worktrees(ctx: ToolCtx, a: CleanupArgs) -> UaResult<Value
                 continue;
             }
             let (task_id, stale, reason) = staleness(&item, &tasks, cutoff, live.as_ref());
+            if task_id.is_some_and(|t| foreign.contains(&t)) {
+                skipped.push(json!({ "path": rel, "reason": "other_organization" }));
+                continue;
+            }
             if stale {
                 let modified: jiff::Timestamp = jiff::Timestamp::try_from(last_activity(&item))
                     .unwrap_or_else(|_| jiff::Timestamp::now());

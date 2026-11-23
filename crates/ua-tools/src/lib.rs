@@ -67,6 +67,38 @@ pub fn schema_parts() -> Vec<Part> {
     // The organization key rebuild and triggers of the project repository bindings table.
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_KEYS.into());
     parts.push(families::governance::PROJECT_BINDINGS_TENANT_PART.into());
+    // The organization column and triggers of the notification tables (no
+    // key rebuild: neither family has a key beyond an AUTOINCREMENT id).
+    parts.push(families::notify::TENANT_PART.into());
+    parts.push(families::notify::ORG_INDEXES.into());
+    parts.push(families::zulip::TENANT_PART.into());
+    // The organization key rebuild and triggers of the harness config tables.
+    parts.push(families::harness_config::TENANT_KEYS.into());
+    parts.push(families::harness_config::TENANT_PART.into());
+    // The organization column, triggers, indexes and same-organization rules
+    // of the routine and workflow-run tables (no key rebuild: their keys are
+    // AUTOINCREMENT ids and hub-generated run ids).
+    parts.push(families::routines::TENANT_PART.into());
+    parts.push(families::routines::ORG_SCHEMA.into());
+    parts.push(families::workflows::TENANT_PART.into());
+    parts.push(families::workflows::ORG_SCHEMA.into());
+    // The organization column and triggers of the plans tables (no key
+    // rebuild: a plan id is hub-generated, and the step and checkpoint keys
+    // hang off it), then the organization-led index and same-organization
+    // parent triggers.
+    parts.push(families::plans::TENANT_PART.into());
+    parts.push(families::plans::ORG_SCOPE.into());
+    // The organization column and triggers of the autonomous-cycle tables
+    // (no key rebuild: a cycle id is hub-generated, and the transition and
+    // usage keys are led by it), then the organization-led index and
+    // same-organization parent triggers.
+    parts.push(families::cycles::TENANT_PART.into());
+    parts.push(families::cycles::ORG_SCOPE.into());
+    // The organization column and triggers of the approval queue (no key
+    // rebuild: its only key is an AUTOINCREMENT id), then its
+    // organization-led indexes.
+    parts.push(approvals::TENANT_PART.into());
+    parts.push(approvals::ORG_INDEXES.into());
     parts.push(config_revisions::SCHEMA.into());
     // The inbound-delivery table (`ua-ingress`), then the copy of the GitHub
     // family's delivery rows into it. Both need `organization.v1.store` and
@@ -78,6 +110,46 @@ pub fn schema_parts() -> Vec<Part> {
     // Deliverables and their revisions (`ua-deliverables`), born
     // tenant-scoped: they need `organization.v1.store`.
     parts.extend(families::deliverables::schema_parts());
+    // The organization column and triggers of the core task tables (no key
+    // rebuild: task ids stay hub-global AUTOINCREMENT ids and every child key
+    // is led by one), the organization-led indexes and same-organization
+    // reference triggers, then the rule, on each family already converted,
+    // that its `task_id` points inside its own organization.
+    parts.push(families::tasks::TENANT_PART.into());
+    parts.push(families::tasks::ORG_SCOPE.into());
+    parts.push(families::routines::TASK_ORG_SCHEMA.into());
+    parts.push(families::workflows::TASK_ORG_SCHEMA.into());
+    parts.push(families::cycles::TASK_ORG_SCHEMA.into());
+    parts.push(families::deliverables::TASK_ORG_SCHEMA.into());
+    // The task workflow record, its checks and review notices, then the task
+    // holds and their members: `org_id` (no key rebuild: every key is led by
+    // a hub-global task or hold id), each existing row moved to its task's
+    // organization, organization-led indexes and same-organization triggers.
+    parts.push(families::continuity::TENANT_PART.into());
+    parts.push(families::continuity::ORG_SCOPE.into());
+    parts.push(families::governance::HOLDS_TENANT_PART.into());
+    parts.push(families::governance::HOLDS_ORG_SCOPE.into());
+    // The organization column and triggers of `delegations` (no key rebuild:
+    // its only key is an AUTOINCREMENT id), then each delegation moved to its
+    // task's organization, the organization-led indexes and the rule that a
+    // delegation's task is in its own organization.
+    parts.push(families::delegation::TENANT_PART.into());
+    parts.push(families::delegation::ORG_SCOPE.into());
+    // The organization column and triggers of the goal and work-proposal
+    // tables (no key rebuild: a goal id is an AUTOINCREMENT id, a proposal id
+    // is hub-generated, and the link and item keys are led by a task or
+    // proposal id), then each link moved to its task's organization and each
+    // item to its proposal's, the organization-led indexes and the
+    // same-organization triggers.
+    parts.push(families::tasks::GOALS_TENANT_PART.into());
+    parts.push(families::tasks::GOALS_ORG_SCOPE.into());
+    parts.push(families::governance::PROPOSALS_TENANT_PART.into());
+    parts.push(families::governance::PROPOSALS_ORG_SCOPE.into());
+    // The organization key rebuild and triggers of the managed-secret store
+    // (a secret is keyed by its organization and name), which holds another
+    // organization's GitHub credentials.
+    parts.push(families::managed_secrets::TENANT_KEYS.into());
+    parts.push(families::managed_secrets::TENANT_PART.into());
     parts
 }
 

@@ -66,7 +66,7 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
     if !Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        &ctx.caller.org_id,
     ) {
         return Err(UaError::denied(
             "not_lifecycle_operator",
@@ -77,7 +77,7 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
         ));
     }
     let authority =
-        if Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+        if Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], &ctx.caller.org_id) {
             "human_operator"
         } else {
             "lifecycle_operator"
@@ -89,11 +89,13 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
     };
     let expected_run = a.expected_run_id.map(|r| r.trim().to_string());
     let id = a.task_id;
+    let org = ctx.caller.org_id.clone();
 
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = require_task(tx, id)?;
+            crate::families::tasks::require_org(tx, &org)?;
+            let row = require_task(tx, &org, id)?;
             let status = str_field(&row, "status").unwrap_or("open").to_string();
             let holder = str_field(&row, "claimed_by").map(String::from);
             let claimed_at = str_field(&row, "claimed_at").map(String::from);
@@ -150,8 +152,8 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             let n = tx.execute(
                 "UPDATE tasks SET status = ?2, claimed_by = NULL, claimed_at = NULL, lock_expires_at = NULL, \
                  next_owner = NULL, ownership_generation = ownership_generation + 1, notes = ?3, updated_at = ?4 \
-                 WHERE id = ?1 AND claimed_by = ?5 AND status = ?6",
-                params![id, status_after, notes, next_revision(str_field(&row, "updated_at")), holder, status],
+                 WHERE id = ?1 AND org_id = ?7 AND claimed_by = ?5 AND status = ?6",
+                params![id, status_after, notes, next_revision(str_field(&row, "updated_at")), holder, status, org],
             )?;
             if n != 1 {
                 return Err(UaError::conflict(format!("task {id} changed during the release; refresh and retry")));
@@ -170,8 +172,20 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                 "authority": authority,
                 "at": now(),
             });
-            let event =
-                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.task.claim_released", released.clone()).by(who.clone()))?;
+            // ORG-EVENT-DEFAULT: another organization's labels and reason
+            // stay out of the default ledger (`tasks::emit`).
+            let mut logged = released.clone();
+            let mut by = who.clone();
+            if org != ua_core::DEFAULT_ORG {
+                by = "system".into();
+                for key in ["claimant", "previous_claimant", "reason", "actor"] {
+                    logged[key] = Value::Null;
+                }
+            }
+            let event = ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.task.claim_released", logged).by(by.clone()),
+            )?;
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG,
@@ -183,11 +197,11 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                         "status": status_after,
                     }),
                 )
-                .by(who.clone()),
+                .by(by),
             )?;
             let mut released = released;
             released["event_ulid"] = json!(event.map(|e| e.ulid));
-            Ok(json!({ "task": task_reply(tx, id)?, "released": released }))
+            Ok(json!({ "task": task_reply(tx, &org, id)?, "released": released }))
         })
         .await
 }

@@ -171,13 +171,15 @@ fn task_links(row: &Row, host: &str) -> (PrLinks, PrLinks) {
     (evidence, markers)
 }
 
-/// Unfinished tasks in projects bound to `repo`. Tasks are all in the
-/// default organization, so only its bindings join.
+/// Unfinished tasks in projects bound to `repo`. ORG-GITHUB-DEFAULT:
+/// merged-PR reconciliation runs as the hub, so only the default
+/// organization's tasks and bindings join (`TASK_ORG`).
 fn candidates(conn: &rusqlite::Connection, repo: &str) -> UaResult<Vec<Row>> {
     task_rows(
         conn,
         "SELECT t.* FROM tasks t JOIN project_repo_bindings b ON b.org_id = ?2 AND b.project = t.project \
-         WHERE lower(b.repo) = ?1 AND t.status IN ('open','doing','waiting_review','blocked') ORDER BY t.id",
+         WHERE t.org_id = ?2 AND lower(b.repo) = ?1 AND t.status IN ('open','doing','waiting_review','blocked') \
+         ORDER BY t.id",
         [repo, TASK_ORG],
     )
 }
@@ -233,7 +235,7 @@ fn assess(
         ));
         return Ok(Some(entry));
     }
-    let mut reasons = protection(conn, row, now)?;
+    let mut reasons = protection(conn, TASK_ORG, row, now)?;
     if let (Some(merged), Some(created)) = (
         pr.merged_at.as_deref().and_then(ua_core::time::parse_ts),
         str_field(row, "created_at").and_then(ua_core::time::parse_ts),
@@ -241,7 +243,7 @@ fn assess(
     {
         reasons.push("the pull request merged before the task was created".into());
     }
-    let open_children: Vec<String> = descendants(conn, id)?
+    let open_children: Vec<String> = descendants(conn, TASK_ORG, id)?
         .iter()
         .filter(|c| is_active(c))
         .filter_map(|c| int_field(c, "id").map(|i| format!("#{i}")))
@@ -324,7 +326,7 @@ pub(crate) async fn close_merged(
                         "task_id": m["task_id"], "repo": m["repo"], "pr": m["pr"], "merge_sha": m["merge_sha"],
                         "base_ref": m["base_ref"], "merge_branch": m["merge_branch"],
                     });
-                    emit(tx, OFF_BRANCH_CHANNEL, payload, &by)?;
+                    emit(tx, TASK_ORG, OFF_BRANCH_CHANNEL, payload, &by)?;
                 }
                 Ok(())
             })
@@ -370,11 +372,20 @@ async fn close_one(hub: &Hub, actor: &Caller, m: &Value) -> UaResult<()> {
         "task_id": id, "repo": m["repo"], "pr": m["pr"], "merge_sha": sha, "matched_by": m["matched_by"],
     });
     let by = actor.label.clone();
-    hub.db().write_async(move |tx| emit(tx, CHANNEL, payload, &by)).await
+    hub.db().write_async(move |tx| emit(tx, TASK_ORG, CHANNEL, payload, &by)).await
 }
 
 /// `coordination_manage(action="queue_close_merged")`.
 pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaResult<Value> {
+    // ORG-GITHUB-DEFAULT: this reads and closes only the default
+    // organization's tasks, so another organization's caller is refused
+    // rather than shown them.
+    if ctx.caller.org_id != TASK_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "merged-PR reconciliation covers the default organization's tasks only; nothing was read or changed",
+        ));
+    }
     let dry_run = a.dry_run.unwrap_or(true);
     if !dry_run {
         // Closing other agents' tasks in bulk is an operator act: a lifecycle
@@ -400,6 +411,7 @@ pub(crate) async fn queue_close_merged(ctx: ToolCtx, a: CloseMergedArgs) -> UaRe
         .db()
         .read_async(move |c| {
             let mut out: BTreeSet<(BoundRepo, u64)> = BTreeSet::new();
+            // ORG-GITHUB-DEFAULT: the default organization's bindings only.
             for repo in BoundRepo::all(c, TASK_ORG)? {
                 if only.as_deref().is_some_and(|o| o != repo.as_str()) {
                     continue;

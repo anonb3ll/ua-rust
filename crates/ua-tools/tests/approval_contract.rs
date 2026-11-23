@@ -122,7 +122,13 @@ fn every_secret_bearing_tool_is_marked_and_projected() {
     marked.sort_unstable();
     assert_eq!(
         marked,
-        ["agent_token_issue", "agent_token_rotate", "managed_secret_set", "mcp_server_register"],
+        [
+            "agent_token_issue",
+            "agent_token_rotate",
+            "github_credential_set",
+            "managed_secret_set",
+            "mcp_server_register"
+        ],
         "update this list (and the tool's projection) when a secret argument is added"
     );
 }
@@ -186,7 +192,15 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
         ),
         (
             "families/managed_secrets.rs",
-            (2, vec![("managed_secret_set", json!({})), ("managed_secret_delete", json!({}))]),
+            (
+                2,
+                vec![
+                    ("managed_secret_set", json!({})),
+                    ("managed_secret_delete", json!({})),
+                    ("github_credential_set", json!({})),
+                    ("github_credential_clear", json!({})),
+                ],
+            ),
         ),
         (
             "families/harness_config/mod.rs",

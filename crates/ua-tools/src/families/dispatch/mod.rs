@@ -433,11 +433,16 @@ pub(crate) fn insert_receipt(
 
 /// Task bookkeeping after a run outcome: release the task's run pointer and,
 /// on `finished`, close the task with the evidence.
+///
+/// A runner path (self-report, supervisor, reaper): it acts in the task
+/// row's own organization.
 fn settle_task(tx: &WriteTx<'_>, run: &Run, state: &str, evidence: Option<&str>) -> UaResult<()> {
+    let Some(org) = crate::families::tasks::task_org(tx, run.task_id)? else { return Ok(()) };
     let revision = crate::families::tasks::next_revision(None);
     tx.execute(
-        "UPDATE tasks SET current_run_id = NULL, current_run_agent = NULL WHERE id = ?1 AND current_run_id = ?2",
-        params![run.task_id, run.run_id],
+        "UPDATE tasks SET current_run_id = NULL, current_run_agent = NULL \
+         WHERE id = ?1 AND org_id = ?3 AND current_run_id = ?2",
+        params![run.task_id, run.run_id, org],
     )?;
     if state == "finished" {
         let note = format!(
@@ -450,8 +455,8 @@ fn settle_task(tx: &WriteTx<'_>, run: &Run, state: &str, evidence: Option<&str>)
             "UPDATE tasks SET status = 'done', completed_at = ?2, updated_at = ?2, \
              evidence_ref = COALESCE(evidence_ref, ?3), \
              notes = CASE WHEN notes IS NULL OR notes = '' THEN ?4 ELSE notes || char(10) || ?4 END \
-             WHERE id = ?1 AND status NOT IN ('done','cancelled')",
-            params![run.task_id, revision, evidence, note],
+             WHERE id = ?1 AND org_id = ?5 AND status NOT IN ('done','cancelled')",
+            params![run.task_id, revision, evidence, note, org],
         )?;
     }
     Ok(())

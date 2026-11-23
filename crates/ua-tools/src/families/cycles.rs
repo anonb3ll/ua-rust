@@ -12,6 +12,22 @@
 //!
 //! Tools: `autonomous_cycle_manage(action, params)` and the legacy
 //! `autonomous_cycle_*` aliases, plus `autonomous_cycle_green_path_eligibility`.
+//!
+//! The three tables are tenant data (`org_id`, `organization.v1.tools.cycles`,
+//! `cycles.v2.org_scope`). Every read and write is scoped to the caller's
+//! organization: another organization's cycle answers exactly as a missing
+//! one, and a write for an organization `orgs` does not hold is refused
+//! before anything changes. No key needed a rebuild: a cycle id is a
+//! hub-generated random id, and a transition's `(cycle_id, idempotency_key)`
+//! and a usage row's `(cycle_id, usage_run_id, usage_id)` are led by it. A
+//! transition or usage row always belongs to its cycle's organization (the
+//! `*_org_parent` triggers). Nothing runs a cycle without a caller.
+//!
+//! A cycle may name a task and a delegation. Both are read in the cycle's
+//! organization: another organization's task, or a delegation of another
+//! organization's task, answers as a missing one (`cycles.v3.task_org` also
+//! keeps a cycle's task in its own organization). Attempt-keyed usage and
+//! the green path read the cycle's task in the cycle's organization.
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -23,10 +39,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
-use ua_store::{SchemaPart, WriteTx};
+use ua_store::{Procedure, SchemaPart, WriteTx};
 
 use crate::approvals::{self, GateOutcome};
-use crate::families::plans::{emit, parse_params, row_map, write_identity};
+use crate::families::plans::{emit, ledger_text, parse_params, row_map, write_identity};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -84,6 +100,60 @@ CREATE TABLE IF NOT EXISTS autonomous_cycle_usage (
     created_at TEXT NOT NULL,
     UNIQUE (cycle_id, usage_run_id, usage_id)
 );
+",
+};
+
+/// `organization.v1.tools.cycles`: `org_id` on `autonomous_cycles`,
+/// `autonomous_cycle_transitions` and `autonomous_cycle_usage` (existing rows
+/// backfilled to the default organization) and their generated
+/// `*_org_exists` / `*_org_immutable` triggers. No key needs a rebuild (see
+/// the module docs). Applied after `cycles.v1` and `organization.v1.store`.
+pub const TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.cycles",
+    &["autonomous_cycles", "autonomous_cycle_transitions", "autonomous_cycle_usage"],
+);
+
+/// `cycles.v2.org_scope`: the index the per-organization cycle list uses, and
+/// triggers that keep a transition or usage row in its cycle's organization
+/// (the `cycle_id` foreign key alone would accept a cycle in another
+/// organization). A missing cycle is still the foreign key's error. Applied
+/// after `organization.v1.tools.cycles`.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "cycles.v2.org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_autonomous_cycles_org_state ON autonomous_cycles(org_id, state, updated_at);
+
+CREATE TRIGGER IF NOT EXISTS autonomous_cycle_transitions_org_parent BEFORE INSERT ON autonomous_cycle_transitions
+WHEN EXISTS (SELECT 1 FROM autonomous_cycles WHERE id = NEW.cycle_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS autonomous_cycle_transitions_org_parent_update
+BEFORE UPDATE OF cycle_id ON autonomous_cycle_transitions
+WHEN EXISTS (SELECT 1 FROM autonomous_cycles WHERE id = NEW.cycle_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS autonomous_cycle_usage_org_parent BEFORE INSERT ON autonomous_cycle_usage
+WHEN EXISTS (SELECT 1 FROM autonomous_cycles WHERE id = NEW.cycle_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS autonomous_cycle_usage_org_parent_update
+BEFORE UPDATE OF cycle_id ON autonomous_cycle_usage
+WHEN EXISTS (SELECT 1 FROM autonomous_cycles WHERE id = NEW.cycle_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'cycle belongs to another organization'); END;
+",
+};
+
+/// `cycles.v3.task_org`: a cycle's `task_id` points at a task in the cycle's
+/// own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "cycles.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org BEFORE INSERT ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS autonomous_cycles_task_org_update BEFORE UPDATE OF task_id ON autonomous_cycles
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'an autonomous cycle must point at a task in its own organization'); END;
 ",
 };
 
@@ -180,8 +250,24 @@ fn new_cycle_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
-fn cycle_json(c: &Connection, id: &str) -> UaResult<Option<Map<String, Value>>> {
-    Ok(c.query_row("SELECT * FROM autonomous_cycles WHERE id = ?1", [id], |r| {
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// The `org_exists` triggers fire only on insert, so a write with nothing to
+/// insert (a transition's update, a kill) would otherwise pass.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no autonomous cycle was changed"),
+        ));
+    }
+    Ok(())
+}
+
+/// The cycle `id` of `org`. Another organization's cycle answers exactly as
+/// a missing one.
+fn cycle_json(c: &Connection, org: &str, id: &str) -> UaResult<Option<Map<String, Value>>> {
+    Ok(c.query_row("SELECT * FROM autonomous_cycles WHERE org_id = ?1 AND id = ?2", params![org, id], |r| {
         let mut m = row_map(r)?;
         let caps = m
             .get("allowed_capabilities")
@@ -194,8 +280,8 @@ fn cycle_json(c: &Connection, id: &str) -> UaResult<Option<Map<String, Value>>> 
     .optional()?)
 }
 
-fn require_cycle(c: &Connection, id: &str) -> UaResult<Map<String, Value>> {
-    cycle_json(c, id)?.ok_or_else(|| UaError::not_found(format!("no autonomous cycle with id {id:?}")))
+fn require_cycle(c: &Connection, org: &str, id: &str) -> UaResult<Map<String, Value>> {
+    cycle_json(c, org, id)?.ok_or_else(|| UaError::not_found(format!("no autonomous cycle with id {id:?}")))
 }
 
 fn s<'a>(m: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
@@ -216,32 +302,50 @@ fn allowed_caps(m: &Map<String, Value>) -> Option<Vec<String>> {
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
 }
 
-fn transition_json(c: &Connection, where_sql: &str, p: &[&dyn rusqlite::ToSql]) -> UaResult<Option<Value>> {
+/// One transition of `org` matching `where_sql` (whose own parameters are
+/// `?1`..`?n`; the organization is bound after them).
+fn transition_json(
+    c: &Connection,
+    org: &str,
+    where_sql: &str,
+    p: &[&dyn rusqlite::ToSql],
+) -> UaResult<Option<Value>> {
     let sql = format!(
         "SELECT id, cycle_id, from_state, to_state, idempotency_key, actor, reason, created_at \
-         FROM autonomous_cycle_transitions WHERE {where_sql}"
+         FROM autonomous_cycle_transitions WHERE ({where_sql}) AND org_id = ?{}",
+        p.len() + 1
     );
-    Ok(c.query_row(&sql, p, |r| Ok(Value::Object(row_map(r)?))).optional()?)
+    let mut all: Vec<&dyn rusqlite::ToSql> = p.to_vec();
+    all.push(&org);
+    Ok(c.query_row(&sql, all.as_slice(), |r| Ok(Value::Object(row_map(r)?))).optional()?)
 }
 
+/// Append `agent.cycle.updated` to the default organization's ledger
+/// (`ORG-EVENT-DEFAULT`, through `emit`). For a cycle outside it, the stop
+/// reason (caller-supplied text) is `null`, and the event is attributed to
+/// the caller's own label rather than the agent a system or anonymous caller
+/// claims to act as.
 fn updated_event(
     tx: &mut WriteTx<'_>,
-    by: &str,
+    caller: &Caller,
+    actor: &str,
     cycle: &Map<String, Value>,
     action: &str,
     extra: Value,
 ) -> UaResult<()> {
+    let org = s(cycle, "org_id").unwrap_or(ua_core::DEFAULT_ORG);
     let mut payload = json!({
         "action": action,
         "cycle_id": cycle.get("id"),
         "task_id": cycle.get("task_id"),
         "state": cycle.get("state"),
         "version": cycle.get("version"),
-        "stop_reason": cycle.get("stop_reason"),
+        "stop_reason": s(cycle, "stop_reason").map_or(Value::Null, |r| ledger_text(org, r)),
     });
     if let (Some(p), Value::Object(e)) = (payload.as_object_mut(), extra) {
         p.extend(e);
     }
+    let by = if org == ua_core::DEFAULT_ORG { actor } else { caller.label.as_str() };
     let caller = Caller { label: by.to_string(), ..Caller::system() };
     emit(tx, &caller, "agent.cycle.updated", payload)
 }
@@ -324,24 +428,38 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
         requested.map(|r| serde_json::to_string(&r.into_iter().collect::<Vec<_>>())).transpose()?;
     let id = new_cycle_id();
     let (task_id, plan_id, delegation_id, max_rework) = (a.task_id, a.plan_id, a.delegation_id, a.max_rework);
+    let (caller, org) = (ctx.caller.clone(), ctx.caller.org_id.clone());
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
+            // A task, and the delegation tied to one, is read in the cycle's
+            // organization: another organization's answers as a missing one.
             if let Some(t) = task_id
-                && tx.query_row("SELECT 1 FROM tasks WHERE id = ?1", [t], |_| Ok(())).optional()?.is_none()
+                && tx
+                    .query_row("SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, t], |_| Ok(()))
+                    .optional()?
+                    .is_none()
             {
                 return Err(UaError::not_found(format!("no task with id {t}")));
             }
             if let Some(d) = delegation_id
-                && tx.query_row("SELECT 1 FROM delegations WHERE id = ?1", [d], |_| Ok(())).optional()?.is_none()
+                && tx
+                    .query_row(
+                        "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2",
+                        params![org, d],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_none()
             {
                 return Err(UaError::not_found(format!("no delegation with id {d}")));
             }
             let now = ua_core::time::now();
             tx.execute(
-                "INSERT INTO autonomous_cycles (id, task_id, plan_id, delegation_id, state, max_rework, max_time_s, \
-                 max_tokens, max_retries, max_cost_cents, allowed_capabilities, stop_reason, created_by, created_at, \
-                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                "INSERT INTO autonomous_cycles (org_id, id, task_id, plan_id, delegation_id, state, max_rework, \
+                 max_time_s, max_tokens, max_retries, max_cost_cents, allowed_capabilities, stop_reason, created_by, \
+                 created_at, updated_at) VALUES (?15, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
                 params![
                     id,
                     task_id,
@@ -356,11 +474,12 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
                     caps_json,
                     stop_reason,
                     actor,
-                    now
+                    now,
+                    org
                 ],
             )?;
-            let cycle = require_cycle(tx, &id)?;
-            updated_event(tx, &actor, &cycle, "start", json!({}))?;
+            let cycle = require_cycle(tx, &org, &id)?;
+            updated_event(tx, &caller, &actor, &cycle, "start", json!({}))?;
             Ok(json!({ "cycle": cycle, "created": true }))
         })
         .await
@@ -376,15 +495,16 @@ pub struct GetArgs {
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
-            let cycle = require_cycle(c, &a.cycle_id)?;
+            let cycle = require_cycle(c, &org, &a.cycle_id)?;
             let mut stmt = c.prepare(
                 "SELECT id, cycle_id, from_state, to_state, idempotency_key, actor, reason, created_at \
-                 FROM autonomous_cycle_transitions WHERE cycle_id = ?1 ORDER BY id",
+                 FROM autonomous_cycle_transitions WHERE org_id = ?1 AND cycle_id = ?2 ORDER BY id",
             )?;
-            let rows = stmt.query_map([&a.cycle_id], |r| Ok(Value::Object(row_map(r)?)))?;
+            let rows = stmt.query_map(params![org, a.cycle_id], |r| Ok(Value::Object(row_map(r)?)))?;
             let transitions: Vec<Value> = rows.collect::<Result<_, _>>()?;
             Ok(json!({ "cycle": cycle, "transitions": transitions }))
         })
@@ -412,17 +532,20 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("state must be one of {STATES:?}")));
     }
     let limit = a.limit.clamp(1, 500);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM autonomous_cycles WHERE (?1 IS NULL OR state = ?1) \
-                 ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
+                "SELECT id FROM autonomous_cycles WHERE org_id = ?1 AND (?2 IS NULL OR state = ?2) \
+                 ORDER BY updated_at DESC, rowid DESC LIMIT ?3",
             )?;
             let ids: Vec<String> =
-                stmt.query_map(params![a.state, limit], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            let cycles: Vec<Value> =
-                ids.iter().map(|id| require_cycle(c, id).map(Value::Object)).collect::<UaResult<_>>()?;
+                stmt.query_map(params![org, a.state, limit], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let cycles: Vec<Value> = ids
+                .iter()
+                .map(|id| require_cycle(c, &org, id).map(Value::Object))
+                .collect::<UaResult<_>>()?;
             Ok(json!({ "cycles": cycles }))
         })
         .await
@@ -436,20 +559,22 @@ struct ForTaskParams {
 
 /// The newest cycle governing a task. Excludes only `completed` and
 /// `failed`: a `killed` cycle must stay visible so the kill switch holds.
+/// Only the caller's organization's cycles count.
 async fn get_for_task(ctx: ToolCtx, a: ForTaskParams) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let id: Option<String> = c
                 .query_row(
-                    "SELECT id FROM autonomous_cycles WHERE task_id = ?1 AND state NOT IN ('completed','failed') \
-                     ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-                    [a.task_id],
+                    "SELECT id FROM autonomous_cycles WHERE org_id = ?1 AND task_id = ?2 \
+                     AND state NOT IN ('completed','failed') ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                    params![org, a.task_id],
                     |r| r.get(0),
                 )
                 .optional()?;
             let cycle = match id {
-                Some(id) => Value::Object(require_cycle(c, &id)?),
+                Some(id) => Value::Object(require_cycle(c, &org, &id)?),
                 None => Value::Null,
             };
             Ok(json!({ "cycle": cycle }))
@@ -485,9 +610,15 @@ enum Phase {
     Go(Map<String, Value>),
 }
 
-fn check_live(cycle: &Map<String, Value>, a: &TransitionArgs, key: &str, c: &Connection) -> UaResult<Phase> {
+fn check_live(
+    cycle: &Map<String, Value>,
+    org: &str,
+    a: &TransitionArgs,
+    key: &str,
+    c: &Connection,
+) -> UaResult<Phase> {
     if let Some(existing) =
-        transition_json(c, "cycle_id = ?1 AND idempotency_key = ?2", &[&a.cycle_id, &key])?
+        transition_json(c, org, "cycle_id = ?1 AND idempotency_key = ?2", &[&a.cycle_id, &key])?
     {
         if existing["to_state"] != a.to_state && !(existing["to_state"] == "blocked") {
             return Err(UaError::conflict("idempotency key was already used for another transition"));
@@ -535,15 +666,18 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
         }
     }
 
-    // Phase 1: read and validate without holding the write lock.
+    // Phase 1: read and validate without holding the write lock. An unknown
+    // organization is refused here, before the approval gate writes anything.
     let a = std::sync::Arc::new(a);
-    let (a1, k1) = (a.clone(), key.clone());
+    let org = ctx.caller.org_id.clone();
+    let (a1, k1, o1) = (a.clone(), key.clone(), org.clone());
     let phase = ctx
         .hub
         .db()
         .read_async(move |c| {
-            let cycle = require_cycle(c, &a1.cycle_id)?;
-            check_live(&cycle, &a1, &k1, c)
+            require_org(c, &o1)?;
+            let cycle = require_cycle(c, &o1, &a1.cycle_id)?;
+            check_live(&cycle, &o1, &a1, &k1, c)
         })
         .await?;
     let cycle = match phase {
@@ -563,7 +697,7 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
     if let Some(action @ ("merge" | "external_mutation")) = gate_action {
         let task_id = cycle.get("task_id").and_then(Value::as_i64);
         let mode = if action == "merge" { Mode::Merge } else { Mode::Pr(pr_url.clone()) };
-        let verdict = eligibility(&ctx.hub, task_id, &cycle, mode).await;
+        let verdict = eligibility(&ctx.hub, &org, task_id, &cycle, mode).await;
         if verdict.eligible {
             let tag = if action == "merge" { "[green-path auto-merge]" } else { "[auto-pr]" };
             bypass_reasons = Some((tag.to_string(), verdict.reasons));
@@ -571,7 +705,10 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
         }
     }
     if let Some(action) = gate_action {
+        // The payload binds the cycle's organization, so a pass is never
+        // consumed across organizations.
         let payload = json!({
+            "org_id": org,
             "cycle_id": a.cycle_id,
             "to_state": a.to_state,
             "idempotency_key": key,
@@ -598,11 +735,13 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
 
     // Phase 2: revalidate against a fresh row and apply.
     let a2 = a.clone();
+    let caller = ctx.caller.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let cycle = require_cycle(tx, &a2.cycle_id)?;
-            let cycle = match check_live(&cycle, &a2, &key, tx)? {
+            require_org(tx, &org)?;
+            let cycle = require_cycle(tx, &org, &a2.cycle_id)?;
+            let cycle = match check_live(&cycle, &org, &a2, &key, tx)? {
                 Phase::Done(v) => return Ok(v),
                 Phase::Go(c) => c,
             };
@@ -632,21 +771,21 @@ async fn transition(ctx: ToolCtx, a: TransitionArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             let n = tx.execute(
                 "UPDATE autonomous_cycles SET state = ?1, rework_count = ?2, stop_reason = ?3, pr_url = ?4, \
-                 version = version + 1, updated_at = ?5 WHERE id = ?6 AND version = ?7",
-                params![final_state, rework, stop_reason, pr, now, a2.cycle_id, i(&cycle, "version")],
+                 version = version + 1, updated_at = ?5 WHERE org_id = ?8 AND id = ?6 AND version = ?7",
+                params![final_state, rework, stop_reason, pr, now, a2.cycle_id, i(&cycle, "version"), org],
             )?;
             if n != 1 {
                 return Err(UaError::conflict("cycle changed concurrently; retry with the current version"));
             }
             tx.execute(
-                "INSERT INTO autonomous_cycle_transitions (cycle_id, from_state, to_state, idempotency_key, actor, \
-                 reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![a2.cycle_id, current, final_state, key, actor, final_reason, now],
+                "INSERT INTO autonomous_cycle_transitions (org_id, cycle_id, from_state, to_state, idempotency_key, \
+                 actor, reason, created_at) VALUES (?8, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![a2.cycle_id, current, final_state, key, actor, final_reason, now, org],
             )?;
             let tid = tx.last_insert_rowid();
-            let updated = require_cycle(tx, &a2.cycle_id)?;
-            let transition = transition_json(tx, "id = ?1", &[&tid])?.unwrap_or(Value::Null);
-            updated_event(tx, &actor, &updated, "transition", json!({ "from_state": current }))?;
+            let updated = require_cycle(tx, &org, &a2.cycle_id)?;
+            let transition = transition_json(tx, &org, "id = ?1", &[&tid])?.unwrap_or(Value::Null);
+            updated_event(tx, &caller, &actor, &updated, "transition", json!({ "from_state": current }))?;
             Ok(json!({ "cycle": updated, "transition": transition, "idempotent": false }))
         })
         .await
@@ -673,10 +812,12 @@ async fn kill(ctx: ToolCtx, a: KillArgs) -> UaResult<Value> {
         return Err(UaError::invalid("reason is required to kill a cycle"));
     }
     let actor = actor(&ctx.caller, &a.agent)?;
+    let (caller, org) = (ctx.caller.clone(), ctx.caller.org_id.clone());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let cycle = require_cycle(tx, &a.cycle_id)?;
+            require_org(tx, &org)?;
+            let cycle = require_cycle(tx, &org, &a.cycle_id)?;
             let current = s(&cycle, "state").unwrap_or_default().to_string();
             if TERMINAL.contains(&current.as_str()) {
                 return Err(UaError::conflict(format!(
@@ -688,20 +829,20 @@ async fn kill(ctx: ToolCtx, a: KillArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             let n = tx.execute(
                 "UPDATE autonomous_cycles SET state = 'killed', stop_reason = ?1, version = version + 1, \
-                 updated_at = ?2 WHERE id = ?3 AND version = ?4",
-                params![reason, now, a.cycle_id, i(&cycle, "version")],
+                 updated_at = ?2 WHERE org_id = ?5 AND id = ?3 AND version = ?4",
+                params![reason, now, a.cycle_id, i(&cycle, "version"), org],
             )?;
             if n != 1 {
                 return Err(UaError::conflict("cycle changed concurrently; retry"));
             }
             let key = format!("kill-{}", ulid::Ulid::generate());
             tx.execute(
-                "INSERT INTO autonomous_cycle_transitions (cycle_id, from_state, to_state, idempotency_key, actor, \
-                 reason, created_at) VALUES (?1, ?2, 'killed', ?3, ?4, ?5, ?6)",
-                params![a.cycle_id, current, key, actor, reason, now],
+                "INSERT INTO autonomous_cycle_transitions (org_id, cycle_id, from_state, to_state, idempotency_key, \
+                 actor, reason, created_at) VALUES (?7, ?1, ?2, 'killed', ?3, ?4, ?5, ?6)",
+                params![a.cycle_id, current, key, actor, reason, now, org],
             )?;
-            let updated = require_cycle(tx, &a.cycle_id)?;
-            updated_event(tx, &actor, &updated, "kill", json!({ "killed_from": current }))?;
+            let updated = require_cycle(tx, &org, &a.cycle_id)?;
+            updated_event(tx, &caller, &actor, &updated, "kill", json!({ "killed_from": current }))?;
             Ok(json!({ "cycle": updated, "killed_from": current }))
         })
         .await
@@ -747,10 +888,12 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
         return Err(UaError::invalid("usage_id must be nonempty and at most 128 characters"));
     }
     let verified = matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human);
+    let (caller, org) = (ctx.caller.clone(), ctx.caller.org_id.clone());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let cycle = require_cycle(tx, &a.cycle_id)?;
+            require_org(tx, &org)?;
+            let cycle = require_cycle(tx, &org, &a.cycle_id)?;
             let state = s(&cycle, "state").unwrap_or_default().to_string();
             let terminal = TERMINAL.contains(&state.as_str());
             if let (Some(run_id), Some(usage_id)) = (&a.usage_run_id, &a.usage_id) {
@@ -760,11 +903,15 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
                         "attempt-keyed usage requires an authenticated caller",
                     ));
                 }
-                let task: Option<(Option<String>, Option<String>)> = match cycle.get("task_id").and_then(Value::as_i64) {
+                // The cycle's task, in the cycle's organization.
+                let task_id = cycle.get("task_id").and_then(Value::as_i64);
+                let task: Option<(Option<String>, Option<String>)> = match task_id {
                     Some(t) => tx
-                        .query_row("SELECT claimed_by, current_run_id FROM tasks WHERE id = ?1", [t], |r| {
-                            Ok((r.get(0)?, r.get(1)?))
-                        })
+                        .query_row(
+                            "SELECT claimed_by, current_run_id FROM tasks WHERE org_id = ?1 AND id = ?2",
+                            params![org, t],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
                         .optional()?,
                     None => None,
                 };
@@ -790,9 +937,9 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
                 .to_string();
                 let previous: Option<String> = tx
                     .query_row(
-                        "SELECT payload FROM autonomous_cycle_usage WHERE cycle_id = ?1 AND usage_run_id = ?2 \
-                         AND usage_id = ?3",
-                        params![a.cycle_id, run_id, usage_id],
+                        "SELECT payload FROM autonomous_cycle_usage WHERE org_id = ?4 AND cycle_id = ?1 \
+                         AND usage_run_id = ?2 AND usage_id = ?3",
+                        params![a.cycle_id, run_id, usage_id, org],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -808,9 +955,9 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
                     }));
                 }
                 tx.execute(
-                    "INSERT INTO autonomous_cycle_usage (cycle_id, usage_run_id, usage_id, actor, payload, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![a.cycle_id, run_id, usage_id, actor, payload, ua_core::time::now()],
+                    "INSERT INTO autonomous_cycle_usage (org_id, cycle_id, usage_run_id, usage_id, actor, payload, \
+                     created_at) VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![a.cycle_id, run_id, usage_id, actor, payload, ua_core::time::now(), org],
                 )?;
             } else if terminal {
                 return Err(UaError::conflict(format!("cannot record usage for terminal cycle state {state:?}")));
@@ -859,11 +1006,21 @@ async fn record_usage(ctx: ToolCtx, a: UsageArgs) -> UaResult<Value> {
             tx.execute(
                 "UPDATE autonomous_cycles SET used_time_s = ?1, used_tokens = ?2, used_retries = ?3, \
                  used_cost_cents = ?4, state = ?5, stop_reason = ?6, version = version + 1, updated_at = ?7 \
-                 WHERE id = ?8",
-                params![used_t, used_k, used_r, used_c, new_state, stop_reason, ua_core::time::now(), a.cycle_id],
+                 WHERE org_id = ?9 AND id = ?8",
+                params![
+                    used_t,
+                    used_k,
+                    used_r,
+                    used_c,
+                    new_state,
+                    stop_reason,
+                    ua_core::time::now(),
+                    a.cycle_id,
+                    org
+                ],
             )?;
-            let updated = require_cycle(tx, &a.cycle_id)?;
-            updated_event(tx, &actor, &updated, "usage", json!({ "blocked": new_state == "blocked" }))?;
+            let updated = require_cycle(tx, &org, &a.cycle_id)?;
+            updated_event(tx, &caller, &actor, &updated, "usage", json!({ "blocked": new_state == "blocked" }))?;
             Ok(json!({ "cycle": updated, "blocked": new_state == "blocked", "reason": stop_reason }))
         })
         .await
@@ -972,7 +1129,15 @@ pub(crate) fn validation_env(
 /// touching no red-tier path, and the configured validation command passing
 /// with the HEAD unchanged afterwards. A PR head that cannot be checked
 /// offline (a URL rather than the head commit SHA) is never eligible.
-async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>, mode: Mode) -> Verdict {
+/// `org` is the organization judging: another organization's task answers
+/// as one without a worktree.
+async fn eligibility(
+    hub: &Hub,
+    org: &str,
+    task_id: Option<i64>,
+    cycle: &Map<String, Value>,
+    mode: Mode,
+) -> Verdict {
     let mut reasons = Vec::new();
     let state = s(cycle, "state").unwrap_or_default();
     match &mode {
@@ -1001,12 +1166,15 @@ async fn eligibility(hub: &Hub, task_id: Option<i64>, cycle: &Map<String, Value>
     reasons.push("no stop_reason recorded".into());
 
     let Some(task_id) = task_id else { return no(reasons, "cycle has no task") };
+    let task_org = org.to_string();
     let wt: Option<(Option<String>, Option<String>)> = hub
         .db()
         .read_async(move |c| {
-            Ok(c.query_row("SELECT worktree_path, branch FROM tasks WHERE id = ?1", [task_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            Ok(c.query_row(
+                "SELECT worktree_path, branch FROM tasks WHERE org_id = ?1 AND id = ?2",
+                params![task_org, task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?)
         })
         .await
@@ -1127,15 +1295,17 @@ pub struct EligibilityArgs {
 }
 
 async fn green_path(ctx: ToolCtx, a: EligibilityArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let (task_id, cycle) = match (a.cycle_id, a.task_id, a.cycle) {
         (Some(id), _, None) => {
-            let cycle = ctx.hub.db().read_async(move |c| require_cycle(c, &id)).await?;
+            let o = org.clone();
+            let cycle = ctx.hub.db().read_async(move |c| require_cycle(c, &o, &id)).await?;
             (a.task_id.or_else(|| cycle.get("task_id").and_then(Value::as_i64)), cycle)
         }
         (None, Some(t), Some(cycle)) => (Some(t), cycle),
         _ => return Err(UaError::invalid("pass cycle_id, or task_id with cycle")),
     };
-    let v = eligibility(&ctx.hub, task_id, &cycle, Mode::Merge).await;
+    let v = eligibility(&ctx.hub, &org, task_id, &cycle, Mode::Merge).await;
     Ok(json!({ "eligible": v.eligible, "reasons": v.reasons }))
 }
 

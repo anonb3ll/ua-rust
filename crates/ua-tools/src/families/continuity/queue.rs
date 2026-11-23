@@ -55,8 +55,8 @@ use super::same_label;
 use crate::families::dispatch::live_run_for_task;
 use crate::families::governance;
 use crate::families::tasks::{
-    acting_identity, ancestors, emit, has_marker, int_field, next_revision, require_task, row_object,
-    str_field, subtree_ids,
+    acting_identity, ancestors, emit, has_marker, int_field, next_revision, require_org, require_task,
+    str_field, subtree_ids, task_row,
 };
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
@@ -160,7 +160,7 @@ pub(super) fn queue_writer(ctx: &ToolCtx, actor: Option<&str>, verb: &str) -> Ua
     let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        &ctx.caller.org_id,
     );
     if !maintainer && !QUEUE_WRITER_PROFILES.contains(&ctx.caller.profile) {
         return Err(UaError::denied(
@@ -253,8 +253,9 @@ fn short(row: &Row) -> Value {
     json!({ "task_id": int_field(row, "id"), "title": s(row, "title"), "status": status(row) })
 }
 
-/// Why a task is being worked right now. Empty when nothing is live.
-fn live_reasons(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
+/// Why task `row` of organization `org` is being worked right now. Empty
+/// when nothing is live.
+fn live_reasons(conn: &Connection, org: &str, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
     let id = int_field(row, "id").unwrap_or_default();
     let mut out = Vec::new();
     if status(row) == "doing"
@@ -270,8 +271,9 @@ fn live_reasons(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<
     }
     let delegation: Option<String> = conn
         .query_row(
-            "SELECT status FROM delegations WHERE task_id = ?1 AND status IN ('pending','in_flight') LIMIT 1",
-            [id],
+            "SELECT status FROM delegations WHERE org_id = ?2 AND task_id = ?1 \
+             AND status IN ('pending','in_flight') LIMIT 1",
+            params![id, org],
             |r| r.get(0),
         )
         .optional()?;
@@ -328,40 +330,48 @@ fn gate_reasons(row: &Row) -> Vec<String> {
     out
 }
 
-/// Everything that keeps the sweep from proposing a park.
-pub(super) fn protection(conn: &Connection, row: &Row, now: jiff::Timestamp) -> UaResult<Vec<String>> {
+/// Everything that keeps the sweep from proposing a park of task `row` of
+/// organization `org`.
+pub(super) fn protection(
+    conn: &Connection,
+    org: &str,
+    row: &Row,
+    now: jiff::Timestamp,
+) -> UaResult<Vec<String>> {
     let mut out = gate_reasons(row);
     if s(row, "lane") == Some("tracking") {
         out.push("tracking lane".into());
     }
-    out.extend(live_reasons(conn, row, now)?);
+    out.extend(live_reasons(conn, org, row, now)?);
     Ok(out)
 }
 
+/// Task rows read by `sql`, without `org_id`. The query names the
+/// organization it reads.
 pub(super) fn task_rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> UaResult<Vec<Row>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(p, row_object)?.collect::<Result<_, _>>()?;
+    let rows = stmt.query_map(p, task_row)?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
 /// Every descendant row of `id` (not `id` itself), parents before children.
-pub(super) fn descendants(conn: &Connection, id: i64) -> UaResult<Vec<Row>> {
+pub(super) fn descendants(conn: &Connection, org: &str, id: i64) -> UaResult<Vec<Row>> {
     let mut out = Vec::new();
-    for d in subtree_ids(conn, id)?.into_iter().filter(|d| *d != id) {
-        out.push(require_task(conn, d)?);
+    for d in subtree_ids(conn, org, id)?.into_iter().filter(|d| *d != id) {
+        out.push(require_task(conn, org, d)?);
     }
     Ok(out)
 }
 
 /// Unparked, unarchived active rows with the comment thread's last write.
-fn active_rows(conn: &Connection) -> UaResult<Vec<Row>> {
+fn active_rows(conn: &Connection, org: &str) -> UaResult<Vec<Row>> {
     task_rows(
         conn,
         "SELECT t.*, c.updated_at AS comment_at FROM tasks t \
-         LEFT JOIN task_comment_threads c ON c.task_id = t.id \
-         WHERE t.archived_at IS NULL AND t.parked_at IS NULL \
+         LEFT JOIN task_comment_threads c ON c.task_id = t.id AND c.org_id = t.org_id \
+         WHERE t.org_id = ?1 AND t.archived_at IS NULL AND t.parked_at IS NULL \
          AND t.status IN ('open','doing','waiting_review','blocked') ORDER BY t.id",
-        [],
+        [org],
     )
 }
 
@@ -381,12 +391,12 @@ struct Stale {
 
 /// Active tasks with no touch for `days` days and no live work. Inclusive:
 /// exactly `days` days is stale.
-fn stale_tasks(conn: &Connection, now: jiff::Timestamp, days: i64) -> UaResult<Vec<Stale>> {
+fn stale_tasks(conn: &Connection, org: &str, now: jiff::Timestamp, days: i64) -> UaResult<Vec<Stale>> {
     let cutoff = now.as_second() - days * 86_400;
     let mut out = Vec::new();
-    for row in active_rows(conn)? {
+    for row in active_rows(conn, org)? {
         let Some(touched) = last_touch(&row) else { continue };
-        if touched.as_second() > cutoff || !live_reasons(conn, &row, now)?.is_empty() {
+        if touched.as_second() > cutoff || !live_reasons(conn, org, &row, now)?.is_empty() {
             continue;
         }
         let age = (now.as_second() - touched.as_second()) as f64 / 86_400.0;
@@ -399,6 +409,7 @@ fn stale_tasks(conn: &Connection, now: jiff::Timestamp, days: i64) -> UaResult<V
 /// revision, and record the change on the task's own channel.
 fn write_parking(
     tx: &mut WriteTx<'_>,
+    org: &str,
     row: &Row,
     park: Option<(&str, &str, &str, Option<i64>)>,
 ) -> UaResult<()> {
@@ -408,13 +419,13 @@ fn write_parking(
     let n = match park {
         Some((at, by, reason, into)) => tx.execute(
             "UPDATE tasks SET parked_at = ?1, parked_by = ?2, parked_reason = ?3, folded_into = ?4, updated_at = ?5 \
-             WHERE id = ?6 AND updated_at IS ?7",
-            params![at, by, reason, into, revision, id, prior],
+             WHERE id = ?6 AND org_id = ?8 AND updated_at IS ?7",
+            params![at, by, reason, into, revision, id, prior, org],
         )?,
         None => tx.execute(
             "UPDATE tasks SET parked_at = NULL, parked_by = NULL, parked_reason = NULL, folded_into = NULL, \
-             updated_at = ?1 WHERE id = ?2 AND updated_at IS ?3",
-            params![revision, id, prior],
+             updated_at = ?1 WHERE id = ?2 AND org_id = ?4 AND updated_at IS ?3",
+            params![revision, id, prior, org],
         )?,
     };
     if n != 1 {
@@ -423,6 +434,7 @@ fn write_parking(
     let by = park.map(|p| p.1.to_string()).unwrap_or_default();
     emit(
         tx,
+        org,
         "agent.task.updated",
         json!({ "task_id": id, "fields": PARK_FIELDS, "from_status": status(row), "status": status(row) }),
         if by.is_empty() { "queue" } else { &by },
@@ -430,12 +442,28 @@ fn write_parking(
     Ok(())
 }
 
+/// A queue event's payload for a task of `org`. ORG-EVENT-DEFAULT: another
+/// organization's reason, approval note, approver, gate reasons and actor
+/// are `null` in the default ledger; ids and counts remain.
+fn scrub(org: &str, mut payload: Value) -> Value {
+    if org != ua_core::DEFAULT_ORG {
+        for key in ["reason", "approved_by", "approval_note", "protected", "actor"] {
+            if let Some(v) = payload.get_mut(key) {
+                *v = Value::Null;
+            }
+        }
+    }
+    payload
+}
+
 /// The claim-gate check: why a parked task may not be claimed or dispatched.
-pub(crate) fn parked_block(conn: &Connection, task_id: i64) -> UaResult<Option<String>> {
+pub(crate) fn parked_block(conn: &Connection, org: &str, task_id: i64) -> UaResult<Option<String>> {
     let row: Option<(Option<String>, Option<i64>)> = conn
-        .query_row("SELECT parked_at, folded_into FROM tasks WHERE id = ?1", [task_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT parked_at, folded_into FROM tasks WHERE org_id = ?1 AND id = ?2",
+            params![org, task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     Ok(match row {
         Some((Some(_), Some(root))) => Some(format!(
@@ -470,10 +498,12 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
     let who = writer.who.clone();
     let fold = a.fold_children.unwrap_or(true);
     let (id, dry_run) = (a.task_id, a.dry_run);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = require_task(tx, id)?;
+            require_org(tx, &org)?;
+            let row = require_task(tx, &org, id)?;
             let st = status(&row).to_string();
             if !ACTIVE_STATUSES.contains(&st.as_str()) {
                 return Err(UaError::conflict(format!("task {id} is already {st}; there is nothing to park")));
@@ -487,7 +517,7 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 )));
             }
             let now = jiff::Timestamp::now();
-            let live = live_reasons(tx, &row, now)?;
+            let live = live_reasons(tx, &org, &row, now)?;
             if !live.is_empty() {
                 return Err(UaError::conflict_code(
                     "task_live",
@@ -505,9 +535,9 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 ));
             }
             require_holder(&writer, &row, "park")?;
-            let open: Vec<Row> = descendants(tx, id)?.into_iter().filter(is_active).collect();
+            let open: Vec<Row> = descendants(tx, &org, id)?.into_iter().filter(is_active).collect();
             for child in &open {
-                let child_live = live_reasons(tx, child, now)?;
+                let child_live = live_reasons(tx, &org, child, now)?;
                 if !child_live.is_empty() {
                     return Err(UaError::conflict_code(
                         "task_live",
@@ -540,18 +570,22 @@ pub(crate) async fn queue_park(ctx: ToolCtx, a: ParkArgs) -> UaResult<Value> {
                 (None, None) => reason.clone(),
             };
             if !dry_run {
-                write_parking(tx, &row, Some((&stamp, &who, &recorded, None)))?;
+                write_parking(tx, &org, &row, Some((&stamp, &who, &recorded, None)))?;
                 let child_reason = format!("parent #{id} parked: {recorded}");
                 for child in &open {
-                    write_parking(tx, child, Some((&stamp, &who, &child_reason, Some(id))))?;
+                    write_parking(tx, &org, child, Some((&stamp, &who, &child_reason, Some(id))))?;
                 }
                 emit(
                     tx,
+                    &org,
                     CHANNEL_PARKED,
-                    json!({
-                        "task_id": id, "reason": reason, "approved_by": approver, "approval_note": note,
-                        "protected": gated, "folded": folded, "actor": who,
-                    }),
+                    scrub(
+                        &org,
+                        json!({
+                            "task_id": id, "reason": reason, "approved_by": approver, "approval_note": note,
+                            "protected": gated, "folded": folded, "actor": who,
+                        }),
+                    ),
                     &who,
                 )?;
             }
@@ -577,17 +611,19 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
     let writer = queue_writer(&ctx, a.actor.as_deref(), "folding a task")?;
     let who = writer.who.clone();
     let (id, into, dry_run) = (a.task_id, a.into, a.dry_run);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = require_task(tx, id)?;
-            let root = require_task(tx, into)?;
+            require_org(tx, &org)?;
+            let row = require_task(tx, &org, id)?;
+            let root = require_task(tx, &org, into)?;
             if !is_parked(&root) || int_field(&root, "folded_into").is_some() {
                 return Err(UaError::conflict(format!(
                     "task {into} is not a parked root; fold only into a parked task that is not itself folded"
                 )));
             }
-            if !ancestors(tx, id)?.contains(&into) {
+            if !ancestors(tx, &org, id)?.contains(&into) {
                 return Err(UaError::invalid(format!("task {into} is not an ancestor of task {id}")));
             }
             if !is_active(&row) {
@@ -597,7 +633,7 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
                     if is_parked(&row) { "parked" } else { "not open" }
                 )));
             }
-            let live = live_reasons(tx, &row, jiff::Timestamp::now())?;
+            let live = live_reasons(tx, &org, &row, jiff::Timestamp::now())?;
             if !live.is_empty() {
                 return Err(UaError::conflict_code(
                     "task_live",
@@ -607,11 +643,12 @@ pub(crate) async fn queue_fold(ctx: ToolCtx, a: FoldArgs) -> UaResult<Value> {
             require_holder(&writer, &row, "fold")?;
             if !dry_run {
                 let stamp = ua_core::time::now();
-                write_parking(tx, &row, Some((&stamp, &who, &reason, Some(into))))?;
+                write_parking(tx, &org, &row, Some((&stamp, &who, &reason, Some(into))))?;
                 emit(
                     tx,
+                    &org,
                     CHANNEL_FOLDED,
-                    json!({ "task_id": id, "into": into, "reason": reason, "actor": who }),
+                    scrub(&org, json!({ "task_id": id, "into": into, "reason": reason, "actor": who })),
                     &who,
                 )?;
             }
@@ -628,10 +665,12 @@ pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value>
     let writer = queue_writer(&ctx, a.actor.as_deref(), "unparking a task")?;
     let who = writer.who.clone();
     let (id, dry_run) = (a.task_id, a.dry_run);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = require_task(tx, id)?;
+            require_org(tx, &org)?;
+            let row = require_task(tx, &org, id)?;
             if !is_parked(&row) {
                 return Err(UaError::conflict(format!("task {id} is not parked")));
             }
@@ -640,8 +679,8 @@ pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value>
             if let Some(root) = int_field(&row, "folded_into") {
                 parked_above.push(root);
             }
-            for anc in ancestors(tx, id)? {
-                if is_parked(&require_task(tx, anc)?) {
+            for anc in ancestors(tx, &org, id)? {
+                if is_parked(&require_task(tx, &org, anc)?) {
                     parked_above.push(anc);
                 }
             }
@@ -653,19 +692,20 @@ pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value>
             }
             let mut targets = vec![row];
             targets.extend(
-                descendants(tx, id)?
+                descendants(tx, &org, id)?
                     .into_iter()
                     .filter(|d| is_parked(d) && int_field(d, "folded_into") == Some(id)),
             );
             let restored: Vec<i64> = targets.iter().filter_map(|t| int_field(t, "id")).collect();
             if !dry_run {
                 for t in &targets {
-                    write_parking(tx, t, None)?;
+                    write_parking(tx, &org, t, None)?;
                 }
                 emit(
                     tx,
+                    &org,
                     CHANNEL_UNPARKED,
-                    json!({ "task_id": id, "reason": reason, "restored": restored, "actor": who }),
+                    scrub(&org, json!({ "task_id": id, "reason": reason, "restored": restored, "actor": who })),
                     &who,
                 )?;
             }
@@ -681,11 +721,12 @@ pub(crate) async fn queue_unpark(ctx: ToolCtx, a: UnparkArgs) -> UaResult<Value>
 pub(crate) async fn queue_stale(ctx: ToolCtx, a: StaleArgs) -> UaResult<Value> {
     let days = stale_days(a.stale_days)?;
     let cap = a.limit.unwrap_or(200).clamp(1, 1000) as usize;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let now = jiff::Timestamp::now();
-            let mut items = stale_tasks(c, now, days)?;
+            let mut items = stale_tasks(c, &org, now, days)?;
             items.sort_by_key(|i| i.touched);
             let total = items.len();
             let mut rows = Vec::new();
@@ -697,7 +738,7 @@ pub(crate) async fn queue_stale(ctx: ToolCtx, a: StaleArgs) -> UaResult<Value> {
                     "lane": s(&i.row, "lane"),
                     "last_touched": iso(i.touched),
                     "age_days": i.age_days,
-                    "protected": protection(c, &i.row, now)?,
+                    "protected": protection(c, &org, &i.row, now)?,
                 }));
             }
             Ok(json!({
@@ -715,10 +756,11 @@ pub(crate) async fn queue_stale(ctx: ToolCtx, a: StaleArgs) -> UaResult<Value> {
 /// someone to approve. Writes nothing.
 pub(crate) async fn queue_sweep(ctx: ToolCtx, a: HealthArgs) -> UaResult<Value> {
     let days = stale_days(a.stale_days)?;
-    ctx.hub.db().read_async(move |c| sweep(c, days)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| sweep(c, &org, days)).await
 }
 
-fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
+fn sweep(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
     let now = jiff::Timestamp::now();
     let mut proposals: Vec<Value> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
@@ -727,17 +769,17 @@ fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
     // Open children under a parked root.
     let roots = task_rows(
         c,
-        "SELECT * FROM tasks WHERE parked_at IS NOT NULL AND folded_into IS NULL ORDER BY id",
-        [],
+        "SELECT * FROM tasks WHERE org_id = ?1 AND parked_at IS NOT NULL AND folded_into IS NULL ORDER BY id",
+        [org],
     )?;
     for root in &roots {
         let rid = int_field(root, "id").unwrap_or_default();
-        for child in descendants(c, rid)? {
+        for child in descendants(c, org, rid)? {
             let cid = int_field(&child, "id").unwrap_or_default();
             if !is_active(&child) || proposed.contains(&cid) {
                 continue;
             }
-            let live = live_reasons(c, &child, now)?;
+            let live = live_reasons(c, org, &child, now)?;
             if !live.is_empty() {
                 let mut entry = short(&child);
                 entry["would_be"] = json!("fold");
@@ -758,11 +800,11 @@ fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
 
     // Stale tasks, ancestors first, so a stale child is covered by its stale
     // parent's fold list instead of being proposed on its own.
-    let mut stale = stale_tasks(c, now, days)?;
+    let mut stale = stale_tasks(c, org, now, days)?;
     let mut depth = BTreeMap::new();
     for item in &stale {
         let id = int_field(&item.row, "id").unwrap_or_default();
-        depth.insert(id, ancestors(c, id)?.len());
+        depth.insert(id, ancestors(c, org, id)?.len());
     }
     stale.sort_by_key(|i| {
         let id = int_field(&i.row, "id").unwrap_or_default();
@@ -775,7 +817,7 @@ fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
         if proposed.contains(&id) || covered.contains(&id) {
             continue;
         }
-        let protected = protection(c, row, now)?;
+        let protected = protection(c, org, row, now)?;
         let mut entry = short(row);
         if !protected.is_empty() {
             entry["would_be"] = json!("park");
@@ -784,10 +826,10 @@ fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
             skipped.push(entry);
             continue;
         }
-        let open: Vec<Row> = descendants(c, id)?.into_iter().filter(is_active).collect();
+        let open: Vec<Row> = descendants(c, org, id)?.into_iter().filter(is_active).collect();
         let mut blocking = None;
         for child in &open {
-            let live = live_reasons(c, child, now)?;
+            let live = live_reasons(c, org, child, now)?;
             if !live.is_empty() {
                 blocking = Some((int_field(child, "id").unwrap_or_default(), live));
                 break;
@@ -848,35 +890,36 @@ fn sweep(c: &Connection, days: i64) -> UaResult<Value> {
 /// unjudged review-ready milestone counts. Read only.
 pub(crate) async fn queue_health(ctx: ToolCtx, a: HealthArgs) -> UaResult<Value> {
     let days = stale_days(a.stale_days)?;
-    ctx.hub.db().read_async(move |c| health(c, days)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| health(c, &org, days)).await
 }
 
-fn health(c: &Connection, days: i64) -> UaResult<Value> {
+fn health(c: &Connection, org: &str, days: i64) -> UaResult<Value> {
     let now = jiff::Timestamp::now();
     let mut by_status: BTreeMap<String, i64> = ACTIVE_STATUSES.iter().map(|s| (s.to_string(), 0)).collect();
     let mut stmt = c.prepare(
-        "SELECT status, COUNT(*) FROM tasks WHERE archived_at IS NULL AND parked_at IS NULL \
+        "SELECT status, COUNT(*) FROM tasks WHERE org_id = ?1 AND archived_at IS NULL AND parked_at IS NULL \
          AND status IN ('open','doing','waiting_review','blocked') GROUP BY status",
     )?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+    for row in stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
         let (st, n) = row?;
         by_status.insert(st, n);
     }
     let (parked, folded): (i64, i64) = c.query_row(
         "SELECT COUNT(*), COALESCE(SUM(folded_into IS NOT NULL), 0) FROM tasks \
-         WHERE parked_at IS NOT NULL AND status NOT IN ('done','cancelled')",
-        [],
+         WHERE org_id = ?1 AND parked_at IS NOT NULL AND status NOT IN ('done','cancelled')",
+        [org],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let stale = stale_tasks(c, now, days)?;
+    let stale = stale_tasks(c, org, now, days)?;
     let mut actionable = 0;
     for item in &stale {
-        if protection(c, &item.row, now)?.is_empty() {
+        if protection(c, org, &item.row, now)?.is_empty() {
             actionable += 1;
         }
     }
-    let milestones = milestone_readiness(c)?;
-    let ready_unowned = ready_unowned(c)?;
+    let milestones = milestone_readiness(c, org)?;
+    let ready_unowned = ready_unowned(c, org)?;
     Ok(json!({
         "as_of": iso(now),
         "stale_days": days,
@@ -895,16 +938,16 @@ fn health(c: &Connection, days: i64) -> UaResult<Value> {
 
 /// Unparked active tasks with prerequisites, all closed, and nobody to move
 /// them: no next owner, no claimant, and a lane that names no agent.
-fn ready_unowned(c: &Connection) -> UaResult<i64> {
+fn ready_unowned(c: &Connection, org: &str) -> UaResult<i64> {
     let rows = task_rows(
         c,
-        "SELECT * FROM tasks WHERE archived_at IS NULL AND parked_at IS NULL \
+        "SELECT * FROM tasks WHERE org_id = ?1 AND archived_at IS NULL AND parked_at IS NULL \
          AND status NOT IN ('done','cancelled') \
-         AND EXISTS (SELECT 1 FROM task_dependencies d WHERE d.task_id = tasks.id) \
+         AND EXISTS (SELECT 1 FROM task_dependencies d WHERE d.org_id = ?1 AND d.task_id = tasks.id) \
          AND NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on_task_id \
-             WHERE d.task_id = tasks.id AND p.status NOT IN ('done','cancelled')) \
+             AND p.org_id = ?1 WHERE d.org_id = ?1 AND d.task_id = tasks.id AND p.status NOT IN ('done','cancelled')) \
          AND COALESCE(TRIM(next_owner), '') = '' AND COALESCE(TRIM(claimed_by), '') = ''",
-        [],
+        [org],
     )?;
     Ok(rows.iter().filter(|r| POOL_LANES.contains(&s(r, "lane").unwrap_or("default"))).count() as i64)
 }
@@ -974,12 +1017,12 @@ fn has_verdict(notes: &str) -> bool {
 
 /// Milestones (`[milestone-review]` in the notes) whose gate is satisfied
 /// while the milestone is still open and unjudged. Read only.
-fn milestone_readiness(c: &Connection) -> UaResult<Value> {
+fn milestone_readiness(c: &Connection, org: &str) -> UaResult<Value> {
     let rows = task_rows(
         c,
-        "SELECT * FROM tasks WHERE archived_at IS NULL AND parked_at IS NULL \
+        "SELECT * FROM tasks WHERE org_id = ?2 AND archived_at IS NULL AND parked_at IS NULL \
          AND status NOT IN ('done','cancelled') AND instr(lower(COALESCE(notes, '')), ?1) > 0 ORDER BY id",
-        [MILESTONE_MARKER],
+        [MILESTONE_MARKER, org],
     )?;
     let mut ready = Vec::new();
     let mut unjudged = Vec::new();
@@ -990,8 +1033,9 @@ fn milestone_readiness(c: &Connection) -> UaResult<Value> {
             continue;
         }
         let mut gate = gate_task_ids(notes);
-        let mut stmt = c.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1")?;
-        for dep in stmt.query_map([id], |r| r.get::<_, i64>(0))? {
+        let mut stmt =
+            c.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE org_id = ?1 AND task_id = ?2")?;
+        for dep in stmt.query_map(params![org, id], |r| r.get::<_, i64>(0))? {
             gate.insert(dep?);
         }
         gate.remove(&id);
@@ -1000,8 +1044,11 @@ fn milestone_readiness(c: &Connection) -> UaResult<Value> {
         }
         let mut done = 0usize;
         for g in &gate {
-            let st: Option<String> =
-                c.query_row("SELECT status FROM tasks WHERE id = ?1", [g], |r| r.get(0)).optional()?;
+            let st: Option<String> = c
+                .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, g], |r| {
+                    r.get(0)
+                })
+                .optional()?;
             if st.as_deref() == Some("done") {
                 done += 1;
             }

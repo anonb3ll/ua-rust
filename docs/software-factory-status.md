@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 43 pass, 1 fail, 18 not-built.
+64 checks: 45 pass, 1 fail, 18 not-built.
 
 ### 1. Plan and delegate
 
@@ -171,6 +171,8 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `isolation.same-org-mailbox-direct-read` | pass | |
 | `isolation.same-org-handoff-note` | pass | |
 | `isolation.same-org-conversation-handoffs` | pass | |
+| `isolation.same-org-conversation-naming` | pass | `message_send` naming a missing `conversation_id` before and the real, foreign one after answers the same `not_found`. |
+| `isolation.same-org-crew-view` | pass | `crew_view` on the owner's session lists only the outsider's own mail. |
 | `isolation.same-org-own-inbox` | pass | Control check. |
 | `isolation.same-org-ledger-read` | pass | `event_log_query` and observability: builder-3's view is identical before and after the hidden records exist; message, handoff-note and conversation-handoff rows outside its access are filtered. |
 | `isolation.same-org-stream` | pass | Event stream: builder-3's view is identical before and after the hidden records exist; the backfill applies the same filter as ledger reads. |

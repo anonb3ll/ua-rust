@@ -189,18 +189,29 @@ async fn add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
     let domain = a.domain.as_deref().map(|d| check_slug("domain", d)).transpose()?;
     let lane = a.lane.as_deref().map(|l| check_slug("lane", l)).transpose()?;
     let key = check_idempotency_key(a.idempotency_key.as_deref())?;
+    // Handoff keys are the hub's own: a client key in their form could probe
+    // or squat the task a conversation handoff created.
+    if key.as_deref().is_some_and(|k| k.starts_with(crate::families::continuity::HANDOFF_KEY_PREFIX)) {
+        return Err(UaError::invalid(format!(
+            "idempotency_key must not start with {:?}: that prefix is reserved for conversation handoffs",
+            crate::families::continuity::HANDOFF_KEY_PREFIX
+        )));
+    }
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
 
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             if let Some(k) = &key
-                && let Some(prior) = idempotent_replay(tx, "task_add", k)?
+                && let Some(prior) = idempotent_replay(tx, &org, "task_add", k)?
             {
                 return Ok(prior);
             }
             let id = insert_task(
                 tx,
+                &org,
                 NewTask {
                     title,
                     notes: a.notes,
@@ -217,7 +228,7 @@ async fn add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
             )?;
             let res = json!({ "id": id });
             if let Some(k) = &key {
-                idempotent_record(tx, "task_add", k, &res)?;
+                idempotent_record(tx, &org, "task_add", k, &res)?;
             }
             Ok(res)
         })
@@ -257,15 +268,18 @@ impl NewTask {
     }
 }
 
-/// Insert one task and its `agent.task.created` event in the caller's write
-/// transaction. Returns the new id. Every task creation goes through here.
-pub(crate) fn insert_task(tx: &mut WriteTx<'_>, t: NewTask, by: &str) -> UaResult<i64> {
+/// Insert one task of organization `org` and its `agent.task.created` event
+/// in the caller's write transaction. Returns the new id. Every task
+/// creation goes through here. A parent must be in `org`; an organization
+/// `orgs` does not hold is refused before anything is written.
+pub(crate) fn insert_task(tx: &mut WriteTx<'_>, org: &str, t: NewTask, by: &str) -> UaResult<i64> {
+    require_org(tx, org)?;
     check_title(&t.title)?;
     check_one_of("priority", &t.priority, &PRIORITIES)?;
     let (mut project, mut domain, mut lane, mut untrusted) = (t.project, t.domain, t.lane, t.untrusted);
     if let Some(pid) = t.parent_id {
-        check_nesting(tx, pid, None)?;
-        let parent = require_task(tx, pid)?;
+        check_nesting(tx, org, pid, None)?;
+        let parent = require_task(tx, org, pid)?;
         project = project.or_else(|| str_field(&parent, "project").map(String::from));
         domain = domain.or_else(|| str_field(&parent, "domain").map(String::from));
         lane = lane.or_else(|| str_field(&parent, "lane").map(String::from));
@@ -274,7 +288,8 @@ pub(crate) fn insert_task(tx: &mut WriteTx<'_>, t: NewTask, by: &str) -> UaResul
     let ts = now();
     tx.execute(
         "INSERT INTO tasks (title, notes, priority, parent_id, created_at, updated_at, untrusted, \
-         project, domain, due_at, evidence_ref, lane) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         project, domain, due_at, evidence_ref, lane, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             t.title,
             t.notes,
@@ -287,13 +302,15 @@ pub(crate) fn insert_task(tx: &mut WriteTx<'_>, t: NewTask, by: &str) -> UaResul
             t.due_at,
             t.evidence_ref,
             lane.unwrap_or_else(|| "default".into()),
+            org,
         ],
     )?;
     let id = tx.last_insert_rowid();
     emit(
         tx,
+        org,
         "agent.task.created",
-        json!({ "task_id": id, "title": t.title, "priority": t.priority, "parent_id": t.parent_id }),
+        json!({ "task_id": id, "title": ledger_text(org, &t.title), "priority": t.priority, "parent_id": t.parent_id }),
         by,
     )?;
     Ok(id)
@@ -302,6 +319,19 @@ pub(crate) fn insert_task(tx: &mut WriteTx<'_>, t: NewTask, by: &str) -> UaResul
 // ---------------------------------------------------------------------------
 // task_update
 // ---------------------------------------------------------------------------
+
+/// A client key scoped to the caller: `<label>:<key>`, stored as
+/// `task_update:<label>:<key>` (prefixed with the organization outside the
+/// default one, see [`idem_key`]). `%`, `:` and `/` in the label are
+/// percent-escaped, so the label always ends at the first `:` after the tool
+/// name and two labels never produce the same stored key. Keys stored in the
+/// old unscoped `task_update:<key>` form are not read: nothing else reads
+/// them, and a retry that spans the upgrade only applies the same fields
+/// again (an appended note that is already there is not appended twice).
+fn caller_scoped_key(caller: &ua_core::Caller, key: &str) -> String {
+    let label = caller.label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F");
+    format!("{label}:{key}")
+}
 
 /// True when `note` (all of its stripped lines, in order) already appears in `current`.
 fn note_is_duplicate(current: &str, note: &str) -> bool {
@@ -373,8 +403,12 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             return Err(UaError::invalid(format!("{field} must be at most 500 characters")));
         }
     }
-    let key = check_idempotency_key(a.idempotency_key.as_deref())?;
+    // Stored per caller (`task_update:<label>:<key>`): another caller's use
+    // of the same key, or a squat of a predictable one, is a different row.
+    let key =
+        check_idempotency_key(a.idempotency_key.as_deref())?.map(|k| caller_scoped_key(&ctx.caller, &k));
     let caller = ctx.caller.clone();
+    let org = caller.org_id.clone();
     let cfg = ctx.hub.cfg().clone();
     let identity = if is_verified(&caller) {
         caller.label.clone()
@@ -385,13 +419,26 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            if let Some(k) = &key
-                && let Some(prior) = idempotent_replay(tx, "task_update", k)?
-            {
-                return Ok(prior);
-            }
+            require_org(tx, &org)?;
             let id = a.id;
-            let old = require_task(tx, id)?;
+            // The task is looked up first, in the caller's organization, so a
+            // key never answers for a task the caller cannot see.
+            let old = require_task(tx, &org, id)?;
+            if let Some(k) = &key
+                && let Some(prior) = idempotent_replay(tx, &org, "task_update", k)?
+            {
+                // A replay is only ever this caller's earlier update of this
+                // task; the same key on another task is a client bug, not a
+                // retry, and is refused rather than answered with the
+                // first task's snapshot or silently dropped.
+                if prior.get("id").and_then(Value::as_i64) == Some(id) {
+                    return Ok(prior);
+                }
+                return Err(UaError::conflict_code(
+                    "idempotency_key_reused",
+                    format!("idempotency_key was already used for another task update; task {id} was not changed"),
+                ));
+            }
             let old_status = str_field(&old, "status").unwrap_or("open").to_string();
             let old_project = str_field(&old, "project").unwrap_or("default").to_string();
             let old_lane = str_field(&old, "lane").unwrap_or("default").to_string();
@@ -435,7 +482,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             }
             let quarantined = int_field(&old, "untrusted").unwrap_or(0) != 0;
             let clearing_quarantine = a.untrusted == Some(false) && quarantined;
-            if clearing_quarantine && !Authz::new(&cfg).holds(&caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
+            if clearing_quarantine && !Authz::new(&cfg).holds(&caller, &[Authority::Operator], &org) {
                 return Err(UaError::denied(
                     "untrusted_clear_needs_human",
                     format!("clearing task {id}'s untrusted quarantine needs a verified human"),
@@ -444,7 +491,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             if let Some(pid) = a.parent_id
                 && pid != 0
             {
-                check_nesting(tx, pid, Some(id))?;
+                check_nesting(tx, &org, pid, Some(id))?;
             }
 
             let mut s = Sets { clauses: Vec::new(), values: Vec::new(), changed: Vec::new() };
@@ -473,8 +520,9 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             {
                 let goal_project: Option<String> = tx
                     .query_row(
-                        "SELECT g.project FROM task_goal_links l JOIN goals g ON g.id = l.goal_id WHERE l.task_id = ?1",
-                        [id],
+                        "SELECT g.project FROM task_goal_links l JOIN goals g ON g.id = l.goal_id AND g.org_id = l.org_id \
+                         WHERE l.org_id = ?2 AND l.task_id = ?1",
+                        params![id, org],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -524,7 +572,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                 if st == "done" {
                     let notes_after = a.notes.as_deref().or(str_field(&old, "notes")).unwrap_or_default();
                     if has_marker(notes_after, PROJECT_SPEC_MARKER) {
-                        let r = rollup(tx, id)?;
+                        let r = rollup(tx, &org, id)?;
                         if r["complete"] != json!(true) {
                             let listed: Vec<String> = r["active"]
                                 .as_array()
@@ -565,15 +613,17 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                     let lineage = match a.parent_id {
                         Some(0) => Vec::new(),
                         Some(p) => {
-                            let mut l = ancestors(tx, p)?;
+                            let mut l = ancestors(tx, &org, p)?;
                             l.push(p);
                             l
                         }
-                        None => ancestors(tx, id)?,
+                        None => ancestors(tx, &org, id)?,
                     };
                     for anc in lineage {
                         let st: Option<String> = tx
-                            .query_row("SELECT status FROM tasks WHERE id = ?1", [anc], |r| r.get(0))
+                            .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, anc], |r| {
+                                r.get(0)
+                            })
                             .optional()?;
                         if st.as_deref() == Some("cancelled") {
                             return Err(UaError::invalid(format!("task {id} has cancelled ancestor {anc}")));
@@ -601,9 +651,9 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                     // claim gate applies to the agent that will hold it, and a
                     // proposal-spawned task must still match its contract.
                     let doing_agent = claimed_by.clone().filter(|_| !clear_claim).unwrap_or_else(|| identity.clone());
-                    governance::check_claim(tx, Some(&doing_agent), Some(id), false)?;
+                    governance::check_claim(tx, &org, Some(&doing_agent), Some(id), false)?;
                     let title_after = a.title.as_deref().or(str_field(&old, "title")).unwrap_or_default();
-                    governance::check_contract(tx, id, title_after, &notes_after)?;
+                    governance::check_contract(tx, &org, id, title_after, &notes_after)?;
                 }
             }
             if clear_claim {
@@ -642,33 +692,41 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             s.values.push(text(revision));
             s.clauses.push(format!("updated_at = ?{}", s.values.len()));
             s.values.push(Sql::Integer(id));
-            let sql = format!("UPDATE tasks SET {} WHERE id = ?{}", s.clauses.join(", "), s.values.len());
+            s.values.push(text(org.clone()));
+            let sql = format!(
+                "UPDATE tasks SET {} WHERE id = ?{} AND org_id = ?{}",
+                s.clauses.join(", "),
+                s.values.len() - 1,
+                s.values.len()
+            );
             tx.execute(&sql, params_from_iter(s.values.iter()))?;
 
             let by = identity.clone();
             emit(
                 tx,
+                &org,
                 "agent.task.updated",
                 json!({ "task_id": id, "fields": s.changed, "from_status": old_status, "status": new_status }),
                 &by,
             )?;
             if new_status == "done" && old_status != "done" {
-                emit(tx, "agent.task.completed", json!({ "task_id": id }), &by)?;
+                emit(tx, &org, "agent.task.completed", json!({ "task_id": id }), &by)?;
             }
             if clear_claim && let Some(holder) = &claimed_by {
                 emit(
                     tx,
+                    &org,
                     "agent.task.claim_released",
-                    json!({ "task_id": id, "claimant": holder, "expired": claim_expired }),
+                    json!({ "task_id": id, "claimant": ledger_text(&org, holder), "expired": claim_expired }),
                     &by,
                 )?;
             }
             if clearing_quarantine {
-                emit(tx, "agent.task.untrusted_cleared", json!({ "task_id": id }), &by)?;
+                emit(tx, &org, "agent.task.untrusted_cleared", json!({ "task_id": id }), &by)?;
             }
-            let reply = task_reply(tx, id)?;
+            let reply = task_reply(tx, &org, id)?;
             if let Some(k) = &key {
-                idempotent_record(tx, "task_update", k, &reply)?;
+                idempotent_record(tx, &org, "task_update", k, &reply)?;
             }
             Ok(reply)
         })
@@ -681,16 +739,21 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
 
 async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let subtree = subtree_ids(tx, a.id)?;
+            require_org(tx, &org)?;
+            let subtree = subtree_ids(tx, &org, a.id)?;
             if subtree.is_empty() {
                 return Ok(json!({ "deleted": false, "children_deleted": 0, "worktrees": {} }));
             }
-            let n = tx.execute("DELETE FROM tasks WHERE id = ?1", [a.id])?;
+            if org != ua_core::DEFAULT_ORG {
+                drop_orphaned_task_rows(tx, &org, &subtree)?;
+            }
+            let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
-            emit(tx, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;
+            emit(tx, &org, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;
             Ok(json!({
                 "deleted": n > 0,
                 "children_deleted": if n > 0 { children } else { 0 },
@@ -698,6 +761,53 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             }))
         })
         .await
+}
+
+/// Delete the holds rooted in `subtree` (and their members) and the policy
+/// authorizations naming a task in it, before organization `org`'s
+/// (non-default) task is deleted.
+///
+/// `policy_authorizations` carries no `org_id` yet and no foreign key to
+/// `tasks`: its organization is its task's, and once that task is gone the
+/// lookup falls back to the default organization. Left behind, another
+/// organization's authorization repository, PR and head would show in the
+/// default organization's views. The row is deleted rather than blanked: a
+/// blanked row would still be a default organization row it never created.
+///
+/// Holds carry their organization (`task_holds.org_id`), so a hold of a
+/// deleted task can no longer fall into the default organization; they are
+/// still deleted with their root, in their own organization only, so that
+/// deleting another organization's task leaves the same state as before
+/// holds had the column. The default organization keeps its rows, as before:
+/// its holds may outlive their root.
+fn drop_orphaned_task_rows(tx: &rusqlite::Connection, org: &str, subtree: &[i64]) -> UaResult<()> {
+    let has = |name: &str| -> UaResult<bool> {
+        Ok(tx
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |_| Ok(()))
+            .optional()?
+            .is_some())
+    };
+    let ids = serde_json::to_string(subtree)?;
+    if has("task_holds")? {
+        if has("task_hold_members")? {
+            tx.execute(
+                "DELETE FROM task_hold_members WHERE org_id = ?2 AND hold_id IN \
+                     (SELECT id FROM task_holds WHERE org_id = ?2 AND root_task_id IN (SELECT value FROM json_each(?1)))",
+                params![ids, org],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM task_holds WHERE org_id = ?2 AND root_task_id IN (SELECT value FROM json_each(?1))",
+            params![ids, org],
+        )?;
+    }
+    if has("policy_authorizations")? {
+        tx.execute(
+            "DELETE FROM policy_authorizations WHERE task_id IN (SELECT value FROM json_each(?1))",
+            [&ids],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -735,12 +845,14 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
     let expected_lane = a.expected_lane.as_deref().map(|l| check_slug("expected_lane", l)).transpose()?;
     let worktree_path = opt_trim(a.worktree_path);
     let branch = opt_trim(a.branch);
+    let org = ctx.caller.org_id.clone();
 
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let id = a.id;
-            let row = require_task(tx, id)?;
+            let row = require_task(tx, &org, id)?;
             let status = str_field(&row, "status").unwrap_or("open").to_string();
             let lane = str_field(&row, "lane").unwrap_or("default").to_string();
             let project = str_field(&row, "project").unwrap_or("default").to_string();
@@ -749,9 +861,10 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                     "task {id} is in lane {lane:?}, an umbrella that is never claimable work; move it to a work lane first"
                 )));
             }
-            for anc in ancestors(tx, id)? {
-                let st: Option<String> =
-                    tx.query_row("SELECT status FROM tasks WHERE id = ?1", [anc], |r| r.get(0)).optional()?;
+            for anc in ancestors(tx, &org, id)? {
+                let st: Option<String> = tx
+                    .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, anc], |r| r.get(0))
+                    .optional()?;
                 if st.as_deref() == Some("cancelled") {
                     return Err(UaError::invalid(format!("task {id} has cancelled ancestor {anc}")));
                 }
@@ -775,6 +888,7 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             // its title or notes drifted from the frozen contract.
             governance::check_contract(
                 tx,
+                &org,
                 id,
                 str_field(&row, "title").unwrap_or_default(),
                 str_field(&row, "notes").unwrap_or_default(),
@@ -802,7 +916,7 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             // The one claim gate. A live renewal of the caller's own lease
             // passes a subtree hold (an in-flight run may finish); a lease with
             // no expiry is not a renewal, since it would renew forever.
-            governance::check_claim(tx, Some(&agent), Some(id), renewal && expires.is_some())?;
+            governance::check_claim(tx, &org, Some(&agent), Some(id), renewal && expires.is_some())?;
             let takeover = if !lock_active { holder.clone().filter(|h| h != &agent) } else { None };
 
             let mut notes = str_field(&row, "notes").unwrap_or_default().to_string();
@@ -830,7 +944,7 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                 "UPDATE tasks SET status = 'doing', claimed_by = ?1, claimed_at = ?2, lock_expires_at = ?3, notes = ?4, \
                  updated_at = ?5, next_owner = ?6, waiting_on = ?7, ownership_generation = ?8, \
                  worktree_path = COALESCE(?9, worktree_path), branch = COALESCE(?10, branch) \
-                 WHERE id = ?11 AND status NOT IN ('done', 'cancelled') \
+                 WHERE id = ?11 AND org_id = ?13 AND status NOT IN ('done', 'cancelled') \
                  AND (claimed_by IS NULL OR claimed_by = ?1 OR lock_expires_at <= ?12)",
                 params![
                     agent,
@@ -844,7 +958,8 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
                     worktree_path,
                     branch,
                     id,
-                    ts
+                    ts,
+                    org
                 ],
             )?;
             if n == 0 {
@@ -852,17 +967,18 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             }
             emit(
                 tx,
+                &org,
                 "agent.task.claimed",
                 json!({
                     "task_id": id,
-                    "agent": agent,
+                    "agent": ledger_text(&org, &agent),
                     "lock_expires_at": lock_expires,
                     "renewal": renewal,
-                    "replaced_expired_claim": takeover,
+                    "replaced_expired_claim": ledger_label(&org, takeover.as_deref()),
                 }),
                 &agent,
             )?;
-            let mut reply = task_reply(tx, id)?;
+            let mut reply = task_reply(tx, &org, id)?;
             reply["claimed"] = json!(true);
             reply["renewal"] = json!(renewal);
             Ok(reply)

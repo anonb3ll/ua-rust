@@ -154,30 +154,29 @@ const TENANT: &[&str] = &[
 /// `org_id`), `code_symbols`, the two graph canvas tables,
 /// `web_search_cache` (`web.v2.tenant_keys`, `organization.v1.tools.web`),
 /// the three skill registry tables (`skill_registry.v2.tenant_keys`,
-/// `organization.v1.tools.skills`), and `project_repo_bindings`
+/// `organization.v1.tools.skills`), `project_repo_bindings`
 /// (`governance.v2.project_bindings_tenant_keys`,
-/// `organization.v1.tools.project_bindings`):
-/// `harness_config_bundles` and `harness_config_proposals` carry a nullable
-/// `org_id` and no triggers.
+/// `organization.v1.tools.project_bindings`), `notify_outbox` and
+/// `pending_notifications` (`organization.v1.tools.notify`), `zulip_sends`
+/// (`organization.v1.tools.zulip`), the four harness config tables
+/// (`harness_config.v3.tenant_keys`, `organization.v1.tools.harness_config`),
+/// `routines` and `routine_runs` (`organization.v1.tools.routines`),
+/// `workflow_runs` and `workflow_checkpoints`
+/// (`organization.v1.tools.workflows`), the three plans tables
+/// (`organization.v1.tools.plans`), the three autonomous-cycle tables
+/// (`organization.v1.tools.cycles`), `approvals`
+/// (`organization.v1.tools.approvals`), `tasks`, `task_dependencies`,
+/// `task_comments` and `task_comment_threads` (`organization.v1.tools.tasks`),
+/// and `managed_secrets` (`managed_secrets.v2.tenant_keys`,
+/// `organization.v1.tools.managed_secrets`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
     "agent_tokens",
     "agents",
-    "approvals",
-    "autonomous_cycle_transitions",
-    "autonomous_cycle_usage",
-    "autonomous_cycles",
-    "delegations",
     "dispatch_receipts",
     "dispatch_runs",
-    "goals",
-    "harness_config_bundles",
-    "harness_config_drift",
-    "harness_config_proposals",
-    "harness_config_report_window",
     "idempotency_keys",
-    "managed_secrets",
     "memory",
     "memory_embeddings",
     "memory_versions",
@@ -190,36 +189,14 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "notify_outbox",
-    "pending_notifications",
-    "plan_checkpoints",
-    "plan_steps",
-    "plans",
     "policy_authorizations",
     "relay_messages",
-    "review_ready_notices",
-    "routine_runs",
-    "routines",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",
     "session_wake",
     "session_wake_offers",
-    "task_checks",
-    "task_comment_threads",
-    "task_comments",
-    "task_dependencies",
-    "task_goal_links",
-    "task_hold_members",
-    "task_holds",
-    "task_workflow",
-    "tasks",
     "tool_calls",
-    "work_proposal_items",
-    "work_proposals",
-    "workflow_checkpoints",
-    "workflow_runs",
-    "zulip_sends",
 ];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];
@@ -569,31 +546,31 @@ fn a_stale_entry_fails() {
 #[test]
 fn a_tenant_table_must_leave_the_missing_list_once_it_passes_and_fail_otherwise() {
     let conn = schema();
-    // Give `goals` its tenant shape by hand, as its part will.
+    // Give `nodes` its tenant shape by hand, as its part will.
     conn.execute_batch(
-        "ALTER TABLE goals ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER goals_org_exists BEFORE INSERT ON goals
+        "ALTER TABLE nodes ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
+         CREATE TRIGGER nodes_org_exists BEFORE INSERT ON nodes
          WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
          BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER goals_org_immutable BEFORE UPDATE OF org_id ON goals
+         CREATE TRIGGER nodes_org_immutable BEFORE UPDATE OF org_id ON nodes
          WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
          BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
     )
     .unwrap();
     let found = problems(&conn, &lists());
-    assert_eq!(found, ["goals: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]);
+    assert_eq!(found, ["nodes: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]);
 
-    // Off the list, `goals` passes, and `tasks` (still without org_id) fails.
+    // Off the list, `nodes` passes, and `agents` (still without org_id) fails.
     let shrunk: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| !["goals", "tasks"].contains(t)).collect();
+        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| !["nodes", "agents"].contains(t)).collect();
     let l = Lists { missing: &shrunk, ..lists() };
     let found = problems(&conn, &l);
     assert_eq!(
         found,
         [
-            "tasks: tenant table with no org_id",
-            "tasks: tenant table with no tasks_org_exists trigger",
-            "tasks: tenant table with no tasks_org_immutable trigger",
+            "agents: tenant table with no org_id",
+            "agents: tenant table with no agents_org_exists trigger",
+            "agents: tenant table with no agents_org_immutable trigger",
         ]
     );
 }
@@ -603,14 +580,14 @@ fn only_tenant_tables_may_be_listed_as_missing() {
     let conn = schema();
     // Swap one entry for a hub table, so the list keeps its length.
     let missing: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "goals").chain(["orgs"]).collect();
-    // Give `goals` its tenant shape, so leaving the list is not itself a finding.
+        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "nodes").chain(["orgs"]).collect();
+    // Give `nodes` its tenant shape, so leaving the list is not itself a finding.
     conn.execute_batch(
-        "ALTER TABLE goals ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER goals_org_exists BEFORE INSERT ON goals
+        "ALTER TABLE nodes ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
+         CREATE TRIGGER nodes_org_exists BEFORE INSERT ON nodes
          WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
          BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER goals_org_immutable BEFORE UPDATE OF org_id ON goals
+         CREATE TRIGGER nodes_org_immutable BEFORE UPDATE OF org_id ON nodes
          WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
          BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
     )

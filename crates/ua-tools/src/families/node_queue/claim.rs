@@ -244,7 +244,9 @@ fn claim_once(
     // A paused, terminated or retired owner claims nothing, whatever is
     // queued. Checked after the sweep above, which commits despite the
     // refusal; the queued items stay queued for a resume.
-    if let Some(refused) = governance::claim_block(tx, Some(agent), None, false)? {
+    // No task: only the agent half of the gate runs, so the organization is
+    // not read.
+    if let Some(refused) = governance::claim_block(tx, ua_core::DEFAULT_ORG, Some(agent), None, false)? {
         return Ok(ClaimOutcome { item: None, disposition: None, pending: false, refused: Some(refused) });
     }
 
@@ -334,8 +336,11 @@ fn claim_once(
         }
         // A held task keeps its item queued: skipped now, claimable once the
         // hold is released.
+        // A runner: the item's task is checked in the task row's own
+        // organization.
         if let Some(task_id) = item.task_id
-            && governance::claim_block(tx, None, Some(task_id), false)?.is_some()
+            && let Some(org) = crate::families::tasks::task_org(tx, task_id)?
+            && governance::claim_block(tx, &org, None, Some(task_id), false)?.is_some()
         {
             continue;
         }

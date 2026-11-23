@@ -280,12 +280,15 @@ fn p0_tables_and_harness_config_bundles_enforce_drop_org_scope() {
     let ok = ua_import::import(&db, &f.path, &opts()).unwrap();
     assert!(ok.notes.iter().any(|note| note.contains("--drop-org-scope")));
     assert_eq!(table(&ok, "task_holds").copied, 1);
-    let leaked: Option<String> = db
+    let landed: String = db
         .read(|conn| {
             Ok(conn.query_row("SELECT org_id FROM harness_config_bundles WHERE id = 1", [], |r| r.get(0))?)
         })
         .unwrap();
-    assert_eq!(leaked, None, "harness_config_bundles.org_id must be dropped to NULL");
+    assert_eq!(landed, "default", "harness_config_bundles.org_id is dropped; the bundle lands in default");
+    // A work proposal is imported into the default organization: its source
+    // `org_id` is never copied.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM work_proposals WHERE org_id = 'default'"), 1);
 
     // An all-NULL org_id source imports cleanly without --drop-org-scope.
     let (f_null, c_null) = new_source();
@@ -301,6 +304,41 @@ fn p0_tables_and_harness_config_bundles_enforce_drop_org_scope() {
     let clean = ua_import::import(&db_null, &f_null.path, &Options::default()).unwrap();
     assert!(clean.org_scoped_rows.is_empty());
     assert_eq!(table(&clean, "harness_config_bundles").copied, 1);
+    assert_eq!(n(&db_null, "SELECT COUNT(*) FROM harness_config_bundles WHERE org_id = 'default'"), 1);
+
+    // The same version published in another organization is no collision:
+    // imported bundles land in the default organization.
+    let db_other = target();
+    db_other
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('other', 'other', 'Other', ?1)",
+                [T0],
+            )?;
+            tx.execute(
+                "INSERT INTO harness_config_bundles (id, org_id, version, published_at, published_by, \
+                 bundle_json, active) VALUES (99, 'other', 'v-null', ?1, 'operator', '{}', 1)",
+                [T0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let r_other = ua_import::import(&db_other, &f_null.path, &Options::default()).unwrap();
+    assert_eq!(table(&r_other, "harness_config_bundles").copied, 1);
+    assert_eq!(
+        n(
+            &db_other,
+            "SELECT COUNT(*) FROM harness_config_bundles WHERE version = 'v-null' AND org_id = 'default'"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &db_other,
+            "SELECT COUNT(*) FROM harness_config_bundles WHERE version = 'v-null' AND org_id = 'other'"
+        ),
+        1
+    );
 }
 
 #[tokio::test]

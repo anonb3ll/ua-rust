@@ -865,11 +865,12 @@ fn load_staged(c: &Connection, org: &str, id: &str) -> UaResult<Option<Staged>> 
     .optional()?)
 }
 
-/// What a publish approval shows and binds: the full staged text (at most
-/// 64 KiB), its hash and the review's findings.
-fn staged_payload(s: &Staged) -> Value {
+/// What a publish approval shows and binds: the organization, the full
+/// staged text (at most 64 KiB), its hash and the review's findings.
+fn staged_payload(org: &str, s: &Staged) -> Value {
     json!({
         "action": "publish",
+        "org_id": org,
         "staging_id": s.id,
         "name": s.name,
         "content_hash": s.content_hash,
@@ -958,7 +959,7 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
             }
         };
         let staged = load_staged(tx, org, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
-        let state = approvals::request(tx, &cfg, &caller, GATE, &staged_payload(&staged))?;
+        let state = approvals::request(tx, &cfg, &caller, GATE, &staged_payload(org, &staged))?;
         Ok(json!({
             "ok": false,
             "status": format!("approval_{}", state.status()),
@@ -990,7 +991,7 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             if staged.published_version.is_some() {
                 return Err(UaError::conflict("this staged publish was already used"));
             }
-            if let Some(approval) = gate(tx, ctx, &staged_payload(&staged))? {
+            if let Some(approval) = gate(tx, ctx, &staged_payload(org, &staged))? {
                 return Ok(Err(approval));
             }
             let next: i64 = tx.query_row(
@@ -1073,6 +1074,11 @@ fn get(ctx: &ToolCtx, p: GetParams) -> UaResult<Value> {
 
 fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     let who = operator(ctx, "assigning a skill")?;
+    assign_as(ctx, who, p)
+}
+
+/// `assign` for `who`, an operator of the caller's organization.
+fn assign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
     let name = check_name(p.skill_name.as_deref().or(p.name.as_deref()).unwrap_or_default())?;
     let ttype = check_target_type(p.target_type.as_deref())?;
     let mut target = p.target.trim().to_string();
@@ -1113,8 +1119,11 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
         };
         // The skill rides into the harness of every node of this agent or
         // profile: a human approves the assignment of this content first.
+        // The payload binds the organization, so a pass is never consumed
+        // across organizations.
         let payload = json!({
             "action": "assign",
+            "org_id": org,
             "skill_name": name,
             "target_type": ttype,
             "target": target,
@@ -1158,6 +1167,11 @@ fn assign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
 
 fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
     let who = operator(ctx, "unassigning a skill")?;
+    unassign_as(ctx, who, p)
+}
+
+/// `unassign` for `who`, an operator of the caller's organization.
+fn unassign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
     let name = check_name(p.skill_name.as_deref().or(p.name.as_deref()).unwrap_or_default())?;
     let ttype = check_target_type(p.target_type.as_deref())?;
     let target = p.target.trim().to_string();
@@ -1185,8 +1199,13 @@ fn unassign(ctx: &ToolCtx, p: AssignParams) -> UaResult<Value> {
             }
             // Removing a skill changes what every node of the target is served:
             // a human approves it too.
-            let payload =
-                json!({ "action": "unassign", "skill_name": name, "target_type": ttype, "target": target });
+            let payload = json!({
+                "action": "unassign",
+                "org_id": org,
+                "skill_name": name,
+                "target_type": ttype,
+                "target": target,
+            });
             if let Some(id) = gate(tx, ctx, &payload)? {
                 return Ok(Err(id));
             }
@@ -1424,5 +1443,139 @@ mod tests {
         let fm = frontmatter("---\nname: x\ndescription: Does a thing.\n---\nbody\n").unwrap();
         assert_eq!(fm["description"], "Does a thing.");
         assert!(frontmatter("no front matter").is_none());
+    }
+
+    /// Organization B's write paths (stage, publish, assign, unassign) and the
+    /// organization binding of their approvals. `ua_org::authz` refuses B's
+    /// callers operator authority until memberships exist, so the tool
+    /// entry points cannot reach these paths for B; this test calls the
+    /// functions behind the operator check with an organization-B caller,
+    /// and approves B's requests in SQL (no human can approve outside the
+    /// default organization yet).
+    #[tokio::test]
+    async fn organization_b_writes_and_approvals_bind_its_organization() {
+        use ua_core::{ActorKind, Caller, Profile, identity::Transport};
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = ua_core::Config::for_home(home.path());
+        cfg.human_identities = vec!["operator".into()];
+        cfg.workspace = Some(ws.path().to_path_buf());
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                     ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let dir = ws.path().join("skills").join("review-diff");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: review-diff\ndescription: Check a change for correctness. Use when asked to review a \
+             diff before it lands.\n---\n\n# Check a change\n\nRead the whole diff.\n",
+        )
+        .unwrap();
+        let ctx = |org: &str| ToolCtx {
+            hub: hub.clone(),
+            caller: Caller {
+                label: "ops-bot".into(),
+                kind: ActorKind::Agent,
+                profile: Profile::Developer,
+                enforce_profile: true,
+                session_key: Some("s1".into()),
+                transport: Transport::Mcp,
+                org_id: org.into(),
+            },
+        };
+        let (b, a) = (ctx("org-b"), ctx(ua_core::DEFAULT_ORG));
+        let who = "ops-bot";
+        let approval = |id: i64| -> (String, Value) {
+            hub.db()
+                .read(move |c| {
+                    let (org, payload): (String, String) =
+                        c.query_row("SELECT org_id, payload FROM approvals WHERE id = ?1", [id], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })?;
+                    Ok((org, serde_json::from_str(&payload)?))
+                })
+                .unwrap()
+        };
+        let approve = |id: i64| {
+            hub.db()
+                .write(move |tx| {
+                    tx.execute(
+                        "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2, \
+                         updated_at = ?2 WHERE id = ?1",
+                        params![id, ua_core::time::now()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let parked = |r: UaResult<Value>| match r {
+            Err(UaError::ApprovalRequired { approval_id, .. }) => approval_id,
+            other => panic!("expected an approval: {other:?}"),
+        };
+        let params_of = |target: &str| AssignParams {
+            skill_name: Some("review-diff".into()),
+            name: None,
+            target: target.into(),
+            target_type: None,
+            version: None,
+            author: None,
+        };
+
+        // B stages: the request is B's and its payload binds B.
+        let staged_b = stage(&b, who, Some("review-diff".into()), "skills/review-diff").unwrap();
+        let b_req = staged_b["approval_id"].as_i64().unwrap();
+        let (org, payload) = approval(b_req);
+        assert_eq!((org.as_str(), payload["org_id"].as_str()), ("org-b", Some("org-b")), "{payload}");
+        let b_staging = staged_b["staging_id"].as_str().unwrap().to_string();
+
+        // The default organization stages identical content under the same
+        // label: it never reuses B's unpublished staged row.
+        let staged_a = stage(&a, who, Some("review-diff".into()), "skills/review-diff").unwrap();
+        assert_ne!(staged_a["staging_id"].as_str().unwrap(), b_staging, "{staged_a}");
+        let (org, payload) = approval(staged_a["approval_id"].as_i64().unwrap());
+        assert_eq!((org.as_str(), payload["org_id"].as_str()), ("default", Some("default")), "{payload}");
+
+        // B publishes its approved staged copy.
+        approve(b_req);
+        let published = publish_staged(&b, who, &b_staging).unwrap();
+        assert_eq!(
+            (published["idempotent"].as_bool(), published["skill"]["version"].as_i64()),
+            (Some(false), Some(1))
+        );
+        let versions = |org: &'static str| {
+            hub.db()
+                .read(move |c| {
+                    Ok(c.query_row("SELECT COUNT(*) FROM skill_versions WHERE org_id = ?1", [org], |r| {
+                        r.get::<_, i64>(0)
+                    })?)
+                })
+                .unwrap()
+        };
+        assert_eq!((versions("org-b"), versions("default")), (1, 0));
+
+        // Identical content staged in the default organization after B
+        // published it is not idempotent: B's version is not the default's.
+        let again = stage(&a, who, Some("review-diff".into()), "skills/review-diff").unwrap();
+        assert_ne!(again["idempotent"], true, "{again}");
+        assert_eq!(again["status"], "approval_pending", "{again}");
+
+        // B assigns and unassigns; each approval binds B.
+        let req = parked(assign_as(&b, who.into(), params_of("builder-1")));
+        assert_eq!(approval(req).1["org_id"], "org-b");
+        approve(req);
+        let assigned = assign_as(&b, who.into(), params_of("builder-1")).unwrap();
+        assert_eq!(assigned["assignment"]["pinned_version"], 1, "{assigned}");
+        let req = parked(unassign_as(&b, who.into(), params_of("builder-1")));
+        assert_eq!(approval(req).1["org_id"], "org-b");
+        approve(req);
+        assert_eq!(unassign_as(&b, who.into(), params_of("builder-1")).unwrap()["removed"], true);
     }
 }

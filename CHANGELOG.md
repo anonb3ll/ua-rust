@@ -242,6 +242,252 @@ from its commit history.
   proves another organization's binding of the same project is never read. The
   importer writes imported bindings to `default`. Tool results and event
   payloads keep their shapes.
+- The notification tables carry an organization key: `notify_outbox` and
+  `pending_notifications` (`organization.v1.tools.notify`, with indexes led
+  by `org_id` in `notify.v2.org_indexes`) and `zulip_sends`
+  (`organization.v1.tools.zulip`). No key rebuild: none has a key beyond its
+  AUTOINCREMENT id. Existing rows move to `default`. `notify`,
+  `batch_notify`, `flush_digest` and `notify_delivery_status` read and write
+  only the caller's organization's rows (the digest threshold counts that
+  organization's queue, and a digest never mixes organizations);
+  `review_ready` notices are recorded in their task's organization
+  (`TASK_ORG`). The hub's webhook and Zulip configuration are the default
+  organization's destinations: another organization's notifications stay in
+  its outbox as `not_configured`, and its `zulip_send_message` is refused
+  (`zulip_not_configured`) before anything is recorded. The Zulip duplicate
+  check and `zulip_resolve_send` see only the caller's organization's sends;
+  another organization's send answers as a missing one. An organization
+  `orgs` does not hold is refused before any write. The `observability`
+  webhook health check reads the default organization's last delivery.
+  `review_ready_notices` stays in the tasks family. Results and events in
+  the default organization are unchanged.
+- Harness config bundles, drift proposals, drift reports and report windows
+  (`harness_config_bundles`, `harness_config_proposals`,
+  `harness_config_drift`, `harness_config_report_window`) are
+  organization-scoped. The standalone rebuild `harness_config.v3.tenant_keys`
+  makes the bundle key `UNIQUE(org_id, version)`, makes the proposals'
+  nullable `org_id` `NOT NULL`, and keys report windows by `(org_id, node)`,
+  keeping the bundles' ids and AUTOINCREMENT sequence, indexes, triggers and
+  views, and adding indexes led by `org_id`; `organization.v1.tools.harness_config`
+  adds `org_id` to the drift table and installs the organization triggers on
+  all four. Existing rows, including legacy `NULL` `org_id`s, migrate to
+  `default`. Each organization has its own bundle versions and active bundle:
+  `harness_config_publish`, `harness_config_status` and `node_config`
+  (`get`, `report`, `applied`) use the caller's organization, another
+  organization's bundle or proposal answers as a missing one, and a publish,
+  report or applied call for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes. The importer writes
+  legacy bundles to `default`. Event payloads and tool results keep their
+  shapes.
+- Routines and workflow runs carry an organization key: `routines` and
+  `routine_runs` (`organization.v1.tools.routines`, with indexes led by
+  `org_id` and a same-organization rule between a receipt and its routine in
+  `routines.v2.org_indexes`), and `workflow_runs` and `workflow_checkpoints`
+  (`organization.v1.tools.workflows`, with indexes and a same-organization
+  rule between a checkpoint and its run in `workflows.v2.org_indexes`). No key
+  rebuild: their keys are AUTOINCREMENT ids, hub-generated run ids, and
+  unique pairs led by one of those. Existing rows move to `default`.
+  `routine_add`, `routine_list`, `routine_pause`, `routine_fire`,
+  `workflow_run`, the `langgraph_*` tools and the workflow rows of `run_list`
+  and `run_get` read and write only the caller's organization's rows; another
+  organization's routine or run answers as a missing one, and an organization
+  `orgs` does not hold is refused before any write. The scheduler and the
+  startup reconciliation fire each routine in its own organization, and a
+  routine's workflow run takes the routine's organization. Tasks carry no
+  organization yet (`TASK_ORG`), so a fire of a routine in another
+  organization creates no task and runs no workflow: it is recorded as
+  `skipped` with reason `org_tasks_unavailable`, and `routine_fire` now
+  returns a skipped fire's `reason`. LangGraph runs see only the task
+  organization's tasks. A gated workflow step's approval payload binds
+  `org_id`, so an approval parked before this change is not reused: resuming
+  such a run parks a new one. Results and events in the default organization
+  are otherwise unchanged.
+- Plans, plan steps and plan checkpoints (`plans`, `plan_steps`,
+  `plan_checkpoints`) are organization-scoped: `organization.v1.tools.plans`
+  adds `org_id` and the organization triggers, and `plans.v2.org_scope`
+  adds an index led by `org_id` and triggers that keep a step or checkpoint
+  in its plan's organization. No key rebuild: plan ids are hub-generated,
+  and the step and checkpoint keys hang off them. Existing rows move to
+  `default`. Every `plan_manage` action, the legacy `plan_*` tools and the
+  `plan` kind of `platform_object_get` read and write only the caller's
+  organization's rows; another organization's plan answers as a missing
+  one, and a write for an organization `orgs` does not hold is refused
+  (`unknown_organization`) before anything changes. Plan events stay in the
+  default organization's ledger, with another organization's text and
+  labels left out (`null`): `goal` and `scope` on `agent.plan.created`,
+  `owner` on `agent.plan.step_updated`, `agent` on
+  `agent.plan.step_claimed`, `agent` and `next_owner` on
+  `agent.plan.handoff`, and `reason` on `agent.plan.closed`. The importer writes legacy plans to
+  `default`. Results and events in the default organization are unchanged,
+  except that plan rows now carry `org_id`.
+- Autonomous cycles, their transitions and usage (`autonomous_cycles`,
+  `autonomous_cycle_transitions`, `autonomous_cycle_usage`) are
+  organization-scoped: `organization.v1.tools.cycles` adds `org_id` and the
+  organization triggers, and `cycles.v2.org_scope` adds an index led by
+  `org_id` and triggers that keep a transition or usage row in its cycle's
+  organization. No key rebuild: cycle ids are hub-generated, and the
+  transition and usage keys are led by them. Existing rows move to
+  `default`. Every `autonomous_cycle_manage` action, the legacy
+  `autonomous_cycle_*` tools and `autonomous_cycle_green_path_eligibility`
+  read and write only the caller's organization's rows; another
+  organization's cycle answers as a missing one, and an organization `orgs`
+  does not hold is refused (`unknown_organization`) before anything changes.
+  Tasks carry no organization yet (`TASK_ORG`): only the task organization
+  can bind a cycle to a task or a delegation, and to any other organization
+  a task or delegation id answers as a missing one. A gated transition's
+  approval payload binds `org_id`, so an approval parked before this change
+  is not reused: retrying the transition parks a new one. In
+  `agent.cycle.updated`, a cycle outside the default organization has a
+  `null` `stop_reason` and is attributed to the caller's own label. Results
+  and events in the default organization are unchanged, except that cycle
+  rows now carry `org_id`. `delegations` is not converted: it belongs to the
+  tasks family and converts with `tasks`.
+- The approval queue (`approvals`) is organization-scoped:
+  `organization.v1.tools.approvals` adds `org_id` and the organization
+  triggers, and `approvals.v3.org_indexes` adds indexes led by `org_id`. No
+  key rebuild: the only key is an AUTOINCREMENT id. Existing rows move to
+  `default`. An approval belongs to its requester's organization: the gate
+  (`gate`, `gate_via`, `request`, `peek`, the stale-pass checks) matches a
+  denial, pass or pending request only within the caller's organization, so
+  a pass granted in one organization never satisfies an identical call in
+  another, and an expired pass is expired by its own organization's call.
+  `approval_pending`, `GET /api/approvals` and `/api/approvals/{id}`, the
+  inbox, `platform_object_get`, the session packet, the evidence report and
+  the `approval_queue_age` anomaly show only the reader's organization;
+  `approval_resolve` (and so the UI, HTTP and Slack routes over it) answers
+  another organization's approval exactly as a missing id. Approving, and a
+  human's deny or revoke, also needs `ua_org::authz::require_same_org`, which
+  admits only the default organization until memberships exist; the
+  requester may still deny or revoke its own request. A gate for an
+  organization `orgs` does not hold is refused (`unknown_organization`)
+  before anything changes. Approval events stay in the default
+  organization's ledger with another organization's `requested_by` and
+  `resolved_by` left out (`null`). The importer writes legacy approvals to
+  `default`. Results and events in the default organization are unchanged.
+- The core task tables are organization-scoped:
+  `organization.v1.tools.tasks` adds `org_id` and the organization triggers
+  to `tasks`, `task_dependencies`, `task_comments` and
+  `task_comment_threads` (existing rows move to `default`), and
+  `tasks.v2.org_scope` adds indexes led by `org_id` and same-organization
+  triggers for a task's `parent_id` and `folded_into`, both ends of a
+  dependency, and a comment's task and parent comment. No key rebuild: task
+  ids stay hub-global AUTOINCREMENT ids. `routines.v3.task_org`,
+  `workflows.v3.task_org`, `cycles.v3.task_org` and `deliverables.v2.task_org`
+  keep a routine run's, workflow run's, cycle's and deliverable's `task_id`
+  inside its own organization. Every task, dependency, lineage and comment
+  tool, `project_build`, the queue and workflow-record actions, holds,
+  claims, dispatch, node work, the session packet, agents, capability,
+  policy claims, the evidence report, observability, export,
+  `platform_object_get` and the UI's task page read and write only the
+  caller's organization's tasks; another organization's task answers exactly
+  as a missing one, and a write for an organization `orgs` does not hold is
+  refused (`unknown_organization`) before anything changes. Ranked search
+  (`task_list query=`) filters the organization before the candidate cap.
+  Replies keep their shape: `org_id` is not added to a task or comment.
+  A task-driven lookup (its project's binding, deliverables, review-at-head,
+  `review_ready`) takes the task row's organization. Task events stay in the
+  default organization's ledger; another organization's titles, notes,
+  comment bodies, reasons and caller-supplied labels are `null` in them and
+  the originator is `system`. `task_add`, `task_update` and `delegate`
+  idempotency keys of another organization are stored with its organization
+  prefixed, so a key reused in another organization never replays. The
+  migration manifest (`export_migration_manifest`,
+  `compare_migration_manifests`, and both through `export_data`) is
+  hub-wide and refused to another organization's caller (`org_unsupported`).
+  Deleting another organization's task also deletes the holds rooted in its
+  subtree and the policy authorizations naming it, so none falls into the
+  default organization. `state_sync_verify` counts only the caller's
+  organization's tasks in `task_fts`'s check, a proposal or contract marker
+  on another organization's task fails the contract check without reading
+  the default organization's proposals, and a node follow-up checks the
+  task holder in the task's organization. The importer writes legacy tasks,
+  dependencies, comments and threads to `default`. Results and events in the
+  default organization are unchanged, except for two fixes that apply to
+  every organization: a `task_update` idempotency key is now the caller's
+  (`task_update:<escaped label>:<key>`), is checked only after the task is
+  found, and replays only for the same task (another task is refused
+  `idempotency_key_reused`); and `conversation_handoff` now creates its task
+  itself under `task_add`'s gate, with a key scoped to the organization and
+  actor stored under its own tool name, while `task_add` refuses client keys
+  starting with `conversation-handoff:`.
+- The task workflow and hold tables are organization-scoped:
+  `organization.v1.tools.continuity` adds `org_id` and the organization
+  triggers to `task_workflow`, `task_checks` and `review_ready_notices`,
+  and `organization.v1.tools.holds` to `task_holds` and
+  `task_hold_members`. `continuity.v2.org_scope` and
+  `governance.v3.holds_org_scope` move existing rows to their task's (a
+  hold's root task's, a member's hold's) organization, a row whose task is
+  gone staying in `default`, and add indexes led by `org_id` and
+  same-organization triggers for every row's task, a hold's root and a
+  member's hold. No key rebuild: every key is led by a hub-global task or
+  hold id. The workflow record, checks and their verification, the
+  review-at-head merge gate, `review_ready` and its notices, the session
+  packet's workflow block, deliverables' workflow head, `task_list`'s stage
+  filter and every hold read, write and claim check filter on the
+  organization; a hold's organization is its own column instead of its root
+  task's. The read-time release of `after_active_runs_finish` holds settles
+  only the reader's organization's holds. Head re-verification from the
+  GitHub webhook and poller stays default-only (`ORG-GITHUB-DEFAULT`).
+  Replies keep their shape. The importer writes legacy workflow records,
+  checks, holds and members to `default`. Results and events in the default
+  organization are unchanged.
+- Delegations are organization-scoped: `organization.v1.tools.delegation`
+  adds `org_id` and the organization triggers to `delegations`, and
+  `delegation.v2.org_scope` moves each existing delegation to its task's
+  organization, adds indexes led by `org_id` and the
+  `delegations_org_parent` triggers that keep a delegation's task in its own
+  organization. No key rebuild: a delegation id is a hub-global
+  AUTOINCREMENT id. A delegation and its task are created together in the
+  delegator's organization. Every delegation action and legacy tool, the
+  plans UI, the evidence report, `delegation_stats`, the session packet,
+  `platform_object_get` (which read any organization's delegation before),
+  a cycle's `delegation_id` and the task queue's live-work check read and
+  write only the caller's organization's delegations; another
+  organization's delegation answers exactly as a missing one, including a
+  claim or a fenced transition, and a write for an organization `orgs` does
+  not hold is refused (`unknown_organization`) before anything changes.
+  Replies carry no `org_id`. Delegation events stay in the default
+  organization's ledger; another organization's title, project, lane,
+  agents, deadline, callback, reasons and results are `null` in them and
+  the originator is `system`. The importer writes legacy delegations to
+  `default`.
+- Goals and work proposals are organization-scoped:
+  `organization.v1.tools.goals` adds `org_id` and the organization triggers
+  to `goals` and `task_goal_links`, and `organization.v1.tools.proposals` to
+  `work_proposals` and `work_proposal_items`. Existing goals and proposals
+  move to `default`; `goals.v2.org_scope` moves each link to its task's
+  organization (and deletes a link whose goal is then in another
+  organization) and `governance.v4.proposals_org_scope` each item to its
+  proposal's. Both add indexes led by `org_id` and same-organization
+  triggers for a goal's parent, a link's task and goal, and an item's
+  proposal and spawned task. No key rebuild: a goal id is a hub-global
+  AUTOINCREMENT id and a proposal id is hub-generated. Every `goal_manage`
+  action, the goal-project check of a `task_update` project move,
+  `platform_object_get` (which read any organization's goal before) and
+  every work-proposal action read and write only the caller's
+  organization's rows; another organization's goal or proposal answers
+  exactly as a missing one, and a write for an organization `orgs` does not
+  hold is refused (`unknown_organization`) before anything changes.
+  `goal_manage` still refuses `params.org_id`. Replies carry no `org_id`.
+  Goal and work-proposal events stay in the default organization's ledger;
+  another organization's reasons and proposer are `null` in them and the
+  originator is `system`. The importer writes legacy goals, links,
+  proposals and items to `default` and never copies a source `org_id`.
+- Managed secrets are organization-scoped and each organization can hold
+  its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
+  table around `(org_id, name)` and adds `aad_v` (new writes bind the
+  organization into the associated data; a row stored before decrypts only
+  in the default organization), and `organization.v1.tools.managed_secrets`
+  adds the organization triggers. `github_credential_for(org, kind)`
+  resolves the default organization to the hub's configured token and
+  webhook secret and every other organization to its own reserved managed
+  secrets (`github:token`, `github:webhook-secret`), never another's.
+  `github_credential_set`, `github_credential_clear` and
+  `github_credential_status` act in the caller's organization; a
+  `system_doctor` line names each organization's credential state for a hub
+  operator and gives counts only to anyone else. An upgrade finding a
+  legacy row with a NULL name stops with its row ids and the fix instead of
+  dropping it.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any
@@ -281,6 +527,21 @@ from its commit history.
   Additive: no response or schema changes.
 
 ### Fixed
+
+- Organization hardening of the approval queue (latent: every caller is in
+  the default organization today). Approval events for another
+  organization's approval record the neutral originator `system` instead of
+  the requester's or resolver's label (the payload already left it out),
+  including the relay's `consumed` event. The workflow engine refuses to run
+  a run whose organization differs from its caller's, before taking the
+  lease, so a gated step can no longer check one organization and park in
+  another. `relay_manage status` answers a draft whose approval is in
+  another organization with `approval_status: null` instead of failing the
+  call; `cancel` still fails closed. Isolation tests now cover the session
+  packet's and the evidence report's approval reads. Excluded: a
+  policy-authorization refusal (`github/authz.rs:181`) is still ledgered as
+  a default-organization event and writes the caller's label to the default
+  ledger until `policy_authorizations` carries `org_id`.
 
 - `scripts/vocab-check.sh`: an allowlist entry now silences only the pattern
   class it was written for. A `vocab` entry (the legacy profile names) no
@@ -375,6 +636,62 @@ from its commit history.
 
 ### Behaviour changes
 
+- `managed_secret_set` refuses the names `github:token` and
+  `github:webhook-secret` and consumers of kind `github`
+  (`reserved_secret`). **Upgrade note:** a secret already stored under one
+  of those names (for example the relay's token named by
+  `relay_github_secret`) can no longer be rotated with `managed_secret_set`;
+  it still loads in the default organization, so delete it with
+  `managed_secret_delete`, store the value under a new name and point the
+  setting at it. `managed_secret_list` shows such a row without its
+  fingerprint, size or key id.
+- The relay's `request_send` and `send`, and `mcp_gateway` `call` and live
+  `list` on a server that injects secrets, refuse another organization's
+  caller (`org_unsupported`): they use the default organization's secrets.
+- `skill_registry` approval payloads (publish, assign, unassign) now carry
+  `org_id`, so a pass is never consumed across organizations. An approval
+  parked in the old payload shape no longer matches its call: it can never
+  be consumed, so no migration expires it. **Upgrade note:** deny or revoke
+  pending or approved `skill_registry` approvals at upgrade and retry the
+  call, which parks a new approval in the new shape.
+- A routine outside the default organization now creates its task in its
+  own organization when it fires, instead of being recorded as `skipped`
+  (`org_tasks_unavailable`); its workflow is still recorded as `not_run`
+  until a routine owner can act outside the default organization. Old
+  receipts keep their recorded reason.
+- Merged-PR reconciliation (`queue_close_merged`) and the GitHub webhook,
+  poller and CI lookups stay with the default organization: another
+  organization's caller is refused (`org_unsupported`) by
+  `queue_close_merged`, and the hub's GitHub paths only read and close
+  default-organization tasks (`ORG-GITHUB-DEFAULT`).
+- Work proposals are no longer refused to another organization's caller
+  (`org_unsupported`): it files, reads, lists, withdraws and recovers its own
+  organization's proposals. Deciding also needs the organization half of
+  authority (`ua_org::authz`), which admits only the default organization
+  until memberships exist, so another organization's human is refused
+  (`org_mismatch`) and nothing is written. An approved item's task is
+  created in the proposal's organization, and the contract check on a task
+  (claim, `doing`, dispatch, node work) reads only the task organization's
+  proposals and items: a marker naming another organization's proposal is
+  refused as an unknown item, instead of every marker on another
+  organization's task being refused outright.
+- Policy authorizations carry no organization yet; each is reached only
+  through its task's organization, so another organization's authorization
+  answers as a missing one. Delegation to another organization's agent is
+  still allowed; that agent can never claim it.
+- `observability_manage`'s `delegation_stats` counts only the caller's
+  organization's delegations (it counted every organization's).
+- A `delegate` idempotency key stores its delegating agent's label with
+  `%`, `:` and `/` percent-escaped, as `task_update` keys do, so two agents
+  never share a stored key. Only a label holding `:` changes its stored
+  form; a retry or `lookup` from such a label still finds a receipt stored
+  under the old unescaped form, but only when it is the caller's (its
+  request digest, or its delegation's `from_agent`, names the caller), so a
+  retry across the upgrade creates no second delegation and never replays
+  another agent's receipt.
+- `cleanup_stale_worktrees` judges a worktree only against the caller's
+  organization's tasks and skips (`other_organization`) a worktree of
+  another organization's task.
 - `conversation_handoff` no longer writes the
   `[conversation: <id>] handed off from the agent conversation` line into the
   task's notes and no longer returns `reference`: the link is recorded only
@@ -382,6 +699,12 @@ from its commit history.
   event-visibility rule, and the task's notes and `updated_at` stay
   untouched. `conversation_handoffs` still reports legacy notes-only links
   under `unaudited` and whether the line survives (`note_reference`).
+- `harness_config_publish` and `harness_config_apply` approval payloads now
+  carry `org_id`, the organization the bundle or surface write belongs to, so
+  an approval is never consumed across organizations. Upgrading expires every
+  open (pending, or approved and unused) approval of either tool in the old
+  payload shape: retry a publish, and a node's next drift report parks a new
+  apply approval.
 - `git_merge_task` now enforces the review-at-head gate whenever `"review"` is
   in the task's `expected_checks` (for both policy-authorization and one-time
   approval merges, including `dry_run=true`, and not bypassed by `force=true`).
@@ -643,9 +966,11 @@ from its commit history.
 
 ### Security
 
-- Ledger event visibility: `agent.message.*`, `agent.lifecycle.handoff` and
+- Ledger event visibility: `agent.message.*`, `agent.mailbox.*` (inbox
+  read/ack receipts), `agent.lifecycle.handoff` and
   `agent.conversation.handoff` rows are now visible only to the readers the
-  record concerns — a message's sender and recipient, a handoff note's
+  record concerns — a message's sender and recipient, a receipt's mailbox
+  owner (its writer), a handoff note's
   parties and the session's owner (or a note-reading operator), a
   conversation's participants and the linked task's holders, or a
   mail-unrestricted reader. The rule (`VISIBLE_EVENT`) applies to
@@ -653,8 +978,73 @@ from its commit history.
   `observability_manage` activity and metrics, evidence reports and the
   migration manifest (which keeps a `{ulid, entry_hash, redacted}`
   placeholder per hidden row — chain metadata stays visible as the accepted
-  integrity exception, never the rows' contents). `message_send` can no
-  longer join an existing conversation the sender is not a party to.
+  integrity exception, never the rows' contents, channels or parties).
+  `message_send` accepts an explicit `conversation_id` from a restricted
+  caller only when the sender is already a party; a missing and a foreign id
+  answer the same `not_found`, as do a missing and a foreign `reply_to`
+  parent, so neither tests whether a conversation or message exists. New
+  conversations take a hub-minted id or inherit one through `reply_to`; a
+  mail-unrestricted reader may still start one under a chosen id, and only
+  the gated `crew_intervene` opens or joins a session's `crew:<session>`
+  thread. `crew_view` no longer returns other agents' private mail: a
+  restricted caller sees only the crew's messages and worktree intervention
+  lines it sent or received (session mail only when it targets the session
+  viewed), and only the session agent gets the drop file's path.
+  `crew_intervene` no longer copies the body or the parties anywhere outside
+  the mailbox: the task-note marker records only the time and session, and
+  the worktree `.ua/interventions.jsonl` line holds only `{ts, session_id,
+  message_id}`. `crew_view` resolves each line's `message_id` against the
+  mailbox under the reader's rule and drops a line that is not a crew
+  `request` into that session, so a planted line shows nothing; only the
+  newest 1000 lines are resolved. On unix the file is opened relative to an
+  `O_NOFOLLOW` descriptor of `.ua` with `O_NOFOLLOW` itself, and must be a
+  regular file with one link, so neither a symlink (of the file or of `.ua`,
+  even swapped in between check and open) nor a hard link is written or
+  read; other platforms only check before opening and do not detect hard
+  links. `message_send`
+  refuses a client-chosen `message_id` with an external-thread prefix
+  (`ts:`).
+- `message_send`: a client-chosen `message_id` is the sender's own
+  idempotency key, keyed by `(sender, id)`, and no longer an existence
+  oracle. Every message now gets a hub-minted `message_id`; the client id is
+  echoed as `client_message_id` (in the send result and in listed rows).
+  The sender's retry with the same id still returns the first result,
+  while another sender's use of the same id answers exactly like a fresh id
+  instead of `conflict`. The sender's own client id also resolves as its
+  `reply_to` and in `message_list(message_id=...)`; a recipient replies and
+  acks with the hub-minted id. A send keyed before this change keeps its
+  old id and its sender's retry still finds it. Hub-node command notices
+  record the hub-minted id. A restricted caller's `conversation not found`
+  now says to omit `conversation_id` or answer with `reply_to`.
+  `ua-import` does not carry `idempotency_keys` over, so a client id from
+  imported (or otherwise pre-upgrade, unkeyed) data now produces a new
+  message on reuse instead of `conflict`.
+- `message_list` takes `client_message_id`: only messages whose sender keyed
+  them with that id. A restricted caller still sees only its own mail, so
+  the filter finds nothing it could not already list.
+- `message_send`: an unverified caller (auth enforcement off) may no longer
+  send as a label the hub sends as itself (`system`, `pr-watch`, or any
+  label starting with `hub-`, such as `hub-node`, ignoring case), so it
+  cannot take a hub client id such as `node-command-…` first.
+- `memory_save`: an `idempotency_key` is stored as
+  `memory_save/<caller>/<key>` and looked up only among `memory_save` rows.
+  Another tool's use of the same text (a `message_send` client id, a
+  hub-node `node-command-…` id) is no longer reported as `conflict … already
+  used by message_send`, and a memory key can no longer occupy another
+  tool's key and make its later write fail. A key `memory_save` stored before
+  this change still replays for a retry by the caller that wrote or last
+  updated the note it names; another caller reusing it gets its own save
+  instead of that receipt.
+- `crew_intervene` / `crew_view` drop file: on unix the worktree path is
+  walked from `/` with `O_NOFOLLOW` at every directory, so a symlink swapped
+  in for an ancestor of the worktree after the containment check is refused
+  instead of followed out of the workspace.
+- `lifecycle_record` with `kind: "handoff"` now writes to
+  `agent.lifecycle.handoff_hook` instead of `agent.lifecycle.handoff`, and
+  only its writer and note-reading operators can read it. Before, any agent
+  could name another agent's session and have a handoff row appear in that
+  owner's ledger view and `session_packet` as if it were a handoff-note event
+  (#111).
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

@@ -759,7 +759,9 @@ pub(crate) async fn node_acceptance_start(ctx: ToolCtx, a: NodeArgs) -> UaResult
                     None,
                     None,
                 )?;
-                let queued = insert_item(tx, &hub, &n, &node, &who)?;
+                // An acceptance item binds no task; the organization only
+                // scopes the claim gate's task half, which it skips.
+                let queued = insert_item(tx, &hub, ua_core::DEFAULT_ORG, &n, &node, &who)?;
                 items.push(queued["item_id"].as_str().unwrap_or_default().to_string());
             }
             let ts = now();

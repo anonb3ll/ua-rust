@@ -15,8 +15,8 @@ pieces make this work:
 
 | Tool | Who | What |
 |---|---|---|
-| `managed_secret_set` | A human, or an agent whose identity is in `human_identities` or `lifecycle_operators` | Store a value for one consumer. Returns metadata and a fingerprint, never the value. Replacing an existing value needs a one-time human approval. |
-| `managed_secret_list` | Profiles that see it (not `developer` or `reviewer`) | Name, consumer, fingerprint, size, key id, who set it. |
+| `managed_secret_set` | A verified human of the caller's organization | Store a value for one consumer in the caller's organization. Returns metadata and a fingerprint, never the value. Replacing an existing value needs a one-time human approval. |
+| `managed_secret_list` | Profiles that see it (not `developer` or `reviewer`) | The caller's organization's secrets: name, consumer, fingerprint, size, key id, who set it. |
 | `managed_secret_delete` | As for `set`, plus a one-time human approval | The approval binds the name, consumer and current fingerprint. |
 
 - **Admin is an identity, not a profile.** Who may set, delete, register,
@@ -32,9 +32,25 @@ pieces make this work:
   it, and a gateway write approved earlier no longer applies (see
   [Calling a tool](#calling-a-tool)).
 
+- **Organizations.** A secret belongs to one organization, keyed by
+  `(org_id, name)`; the tools act in the caller's organization and another
+  organization's secret of the same name answers as a missing one. A
+  downstream MCP server's and the relay's secrets are the default
+  organization's (both are hub-scoped). The names `github:token` and
+  `github:webhook-secret` and consumers of kind `github` are an
+  organization's GitHub credentials and are written only by
+  `github_credential_set` and `github_credential_clear`
+  ([github](github.md#credentials-per-organization)); a secret stored
+  under one of those names before (say, the relay's) can no longer be
+  rotated with `managed_secret_set`: delete it and store it under a new
+  name. Because the MCP servers' secrets are the default organization's,
+  another organization's caller is refused (`org_unsupported`) by
+  `mcp_gateway` `call` and live `list` on a server that injects secrets.
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
-  secret's name and consumer as associated data, so a row copied under another
-  name or consumer does not decrypt. The key comes from `managed_secret_key`
+  secret's organization, name and consumer as associated data, so a row
+  copied into another organization or under another name or consumer does
+  not decrypt (a row stored before organizations binds its name and consumer
+  only, and decrypts only in the default organization). The key comes from `managed_secret_key`
   (or `UA_MANAGED_SECRET_KEY`): 32 random bytes as base64 or 64 hex
   characters, for example `openssl rand -base64 32`. It is never stored in
   the database. With no key, `managed_secret_set` is refused; there is no
@@ -50,7 +66,8 @@ pieces make this work:
   encryption key (first 128 bits, hex). Someone who can read metadata or the
   approval queue cannot test a guessed value against it.
 - **What is recorded.** `managed_secret.set` and `managed_secret.deleted`
-  ledger events carry the name and consumer only. `tool_calls` rows never hold
+  ledger events carry the name and consumer only (`null` for another
+  organization's secret, whose events are attributed to `system`). `tool_calls` rows never hold
   arguments. If an operator lists `managed_secret_set` in `approval_tools`, the
   approval binds the name, consumer, fingerprint and size, not the value.
 - **No read path.** No tool returns a value. Only the consumer's own code

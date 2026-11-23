@@ -366,15 +366,16 @@ fn closure_line(notes: &str) -> Option<(&'static str, Option<i64>, String, Strin
 }
 
 /// Move Python-style parked rows to the parking columns. Idempotent: a row
-/// already parked, finished or not archived is left alone.
+/// already parked, finished or not archived is left alone. Imported tasks
+/// are all the default organization's, so only its rows are read.
 fn translate_parked(db: &Db) -> anyhow::Result<usize> {
     db.write(|tx| {
         let rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, notes FROM tasks WHERE archived_at IS NOT NULL AND parked_at IS NULL \
+                "SELECT id, notes FROM tasks WHERE org_id = ?1 AND archived_at IS NOT NULL AND parked_at IS NULL \
                  AND status NOT IN ('done','cancelled') AND notes IS NOT NULL",
             )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+            stmt.query_map([ua_core::DEFAULT_ORG], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
         };
         let mut moved = 0;
         for (id, notes) in rows {
@@ -383,15 +384,17 @@ fn translate_parked(db: &Db) -> anyhow::Result<usize> {
                 continue;
             }
             let root = root.filter(|r| {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [r], |row| {
-                    row.get::<_, bool>(0)
-                })
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?2 AND id = ?1)",
+                    params![r, ua_core::DEFAULT_ORG],
+                    |row| row.get::<_, bool>(0),
+                )
                 .unwrap_or(false)
             });
             moved += tx.execute(
                 "UPDATE tasks SET parked_at = ?1, parked_by = ?2, parked_reason = ?3, folded_into = ?4, \
-                 archived_at = NULL WHERE id = ?5",
-                params![at, by, reason, root, id],
+                 archived_at = NULL WHERE id = ?5 AND org_id = ?6",
+                params![at, by, reason, root, id, ua_core::DEFAULT_ORG],
             )?;
         }
         Ok(moved)
@@ -832,6 +835,9 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
     if let Some(r) = map.rowid_to {
         keys.push(vec![r.to_string()]);
     }
+    // Hub-wide on purpose: the one-active-hold index is keyed by the
+    // hub-global root task id across every organization, so a clash in any
+    // organization would fail the copy.
     let active_hold_probe_sql = (map.kind == Kind::TaskHolds)
         .then_some("SELECT 1 FROM task_holds WHERE root_task_id = ?1 AND status = 'active' LIMIT 1");
     if keys.is_empty() && active_hold_probe_sql.is_none() {

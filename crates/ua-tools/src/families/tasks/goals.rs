@@ -118,41 +118,46 @@ fn author(ctx: &ToolCtx, claimed: Option<&str>) -> UaResult<String> {
 async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
     let action = crate::routes::action_of("goal_manage", Some(&a.action))?;
     let db = ctx.hub.db().clone();
+    // Every goal, link and task a goal action reads or writes is the caller's
+    // organization's: another organization's goal answers as a missing one.
+    // The organization comes from the caller only (`params.org_id` is an
+    // unknown field and refused).
+    let org = ctx.caller.org_id.clone();
     match action {
         "add" => {
             let p: AddParams = parse_params("add", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| add(tx, p, &who)).await
+            db.write_async(move |tx| add(tx, &org, p, &who)).await
         }
         "list" => {
             let p: ProjectParams = parse_params("list", a.params)?;
             db.read_async(move |c| {
-                Ok(json!({ "goals": list(c, p.project.as_deref())?, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
+                Ok(json!({ "goals": list(c, &org, p.project.as_deref())?, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
             })
             .await
         }
         "tree" => {
             let p: ProjectParams = parse_params("tree", a.params)?;
-            db.read_async(move |c| tree(c, p.project.as_deref())).await
+            db.read_async(move |c| tree(c, &org, p.project.as_deref())).await
         }
         "get" => {
             let p: GoalIdParams = parse_params("get", a.params)?;
-            db.read_async(move |c| detail(c, p.goal_id)).await
+            db.read_async(move |c| detail(c, &org, p.goal_id)).await
         }
         "link" => {
             let p: LinkParams = parse_params("link", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| link(tx, p, &who)).await
+            db.write_async(move |tx| link(tx, &org, p, &who)).await
         }
         "unlink" => {
             let p: LinkParams = parse_params("unlink", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| unlink(tx, p, &who)).await
+            db.write_async(move |tx| unlink(tx, &org, p, &who)).await
         }
         "edit" => {
             let p: EditParams = parse_params("edit", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| edit(tx, p, &who)).await
+            db.write_async(move |tx| edit(tx, &org, p, &who)).await
         }
         "close" | "reopen" => {
             let p: StatusParams = parse_params(action, a.params)?;
@@ -166,26 +171,31 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
                 s
             };
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| set_status(tx, p, &status, &who)).await
+            db.write_async(move |tx| set_status(tx, &org, p, &status, &who)).await
         }
         "ancestry" => {
             let p: TaskIdParams = parse_params("ancestry", a.params)?;
-            db.read_async(move |c| why_chain(c, p.task_id)).await
+            db.read_async(move |c| why_chain(c, &org, p.task_id)).await
         }
         other => Err(crate::routes::unhandled("goal_manage", other)),
     }
 }
 
-fn goal(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(conn.query_row("SELECT * FROM goals WHERE id = ?1", [id], row_object).optional()?)
+/// Goal `id` of organization `org`, without its `org_id`, or `None`. Another
+/// organization's goal answers exactly as a missing one.
+fn goal(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn
+        .query_row("SELECT * FROM goals WHERE org_id = ?1 AND id = ?2", params![org, id], task_row)
+        .optional()?)
 }
 
-fn require_goal(conn: &Connection, id: i64) -> UaResult<Map<String, Value>> {
-    goal(conn, id)?.ok_or_else(|| UaError::not_found(format!("unknown goal: {id}")))
+fn require_goal(conn: &Connection, org: &str, id: i64) -> UaResult<Map<String, Value>> {
+    goal(conn, org, id)?.ok_or_else(|| UaError::not_found(format!("unknown goal: {id}")))
 }
 
-/// Root-first goal ids ending at `id`. Cycles and over-deep chains fail closed.
-fn ancestry_ids(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
+/// Root-first goal ids ending at `id`, all of organization `org`. Cycles and
+/// over-deep chains fail closed.
+fn ancestry_ids(conn: &Connection, org: &str, id: i64) -> UaResult<Vec<i64>> {
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut current = Some(id);
@@ -196,7 +206,7 @@ fn ancestry_ids(conn: &Connection, id: i64) -> UaResult<Vec<i64>> {
         if chain.len() >= MAX_GOAL_DEPTH {
             return Err(UaError::invalid(format!("goal ancestry is deeper than {MAX_GOAL_DEPTH}")));
         }
-        let row = require_goal(conn, cur)?;
+        let row = require_goal(conn, org, cur)?;
         chain.push(cur);
         current = int_field(&row, "parent_goal_id");
     }
@@ -233,11 +243,12 @@ fn check_revision(row: &Map<String, Value>, expected: Option<i64>) -> UaResult<(
     Ok(())
 }
 
-fn goal_reply(conn: &Connection, id: i64) -> UaResult<Value> {
-    Ok(json!({ "goal": require_goal(conn, id)?, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
+fn goal_reply(conn: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    Ok(json!({ "goal": require_goal(conn, org, id)?, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
 }
 
-fn add(tx: &mut ua_store::WriteTx<'_>, p: AddParams, who: &str) -> UaResult<Value> {
+fn add(tx: &mut ua_store::WriteTx<'_>, org: &str, p: AddParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
     let title = check_title(&p.title)?;
     let statement = check_statement(p.statement.as_deref().unwrap_or_default())?;
     let project = match p.project.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -245,33 +256,35 @@ fn add(tx: &mut ua_store::WriteTx<'_>, p: AddParams, who: &str) -> UaResult<Valu
         None => "default".to_string(),
     };
     if let Some(pid) = p.parent_goal_id {
-        let parent = goal(tx, pid)?.ok_or_else(|| UaError::invalid(format!("unknown parent goal: {pid}")))?;
+        let parent =
+            goal(tx, org, pid)?.ok_or_else(|| UaError::invalid(format!("unknown parent goal: {pid}")))?;
         if str_field(&parent, "project") != Some(project.as_str()) {
             return Err(UaError::invalid("parent goal must belong to the same project"));
         }
-        if ancestry_ids(tx, pid)?.len() >= MAX_GOAL_DEPTH {
+        if ancestry_ids(tx, org, pid)?.len() >= MAX_GOAL_DEPTH {
             return Err(UaError::invalid(format!("goal ancestry is deeper than {MAX_GOAL_DEPTH}")));
         }
     }
     let ts = now();
     tx.execute(
-        "INSERT INTO goals (title, statement, parent_goal_id, project, status, created_by, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?6)",
-        params![title, statement, p.parent_goal_id, project, who, ts],
+        "INSERT INTO goals (org_id, title, statement, parent_goal_id, project, status, created_by, created_at, \
+         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7)",
+        params![org, title, statement, p.parent_goal_id, project, who, ts],
     )?;
     let id = tx.last_insert_rowid();
-    emit(tx, "agent.goal.created", json!({ "goal_id": id, "parent_goal_id": p.parent_goal_id }), who)?;
-    goal_reply(tx, id)
+    emit(tx, org, "agent.goal.created", json!({ "goal_id": id, "parent_goal_id": p.parent_goal_id }), who)?;
+    goal_reply(tx, org, id)
 }
 
-fn list(conn: &Connection, project: Option<&str>) -> UaResult<Vec<Map<String, Value>>> {
-    let mut stmt = conn.prepare("SELECT * FROM goals WHERE (?1 IS NULL OR project = ?1) ORDER BY id")?;
-    let rows = stmt.query_map([project], row_object)?.collect::<Result<_, _>>()?;
+fn list(conn: &Connection, org: &str, project: Option<&str>) -> UaResult<Vec<Map<String, Value>>> {
+    let mut stmt =
+        conn.prepare("SELECT * FROM goals WHERE org_id = ?1 AND (?2 IS NULL OR project = ?2) ORDER BY id")?;
+    let rows = stmt.query_map(params![org, project], task_row)?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-fn tree(conn: &Connection, project: Option<&str>) -> UaResult<Value> {
-    let goals = list(conn, project)?;
+fn tree(conn: &Connection, org: &str, project: Option<&str>) -> UaResult<Value> {
+    let goals = list(conn, org, project)?;
     let visible: HashSet<i64> = goals.iter().filter_map(|g| int_field(g, "id")).collect();
     let mut by_parent: BTreeMap<Option<i64>, Vec<Map<String, Value>>> = BTreeMap::new();
     for g in &goals {
@@ -306,43 +319,51 @@ fn tree(conn: &Connection, project: Option<&str>) -> UaResult<Value> {
     Ok(json!({ "tree": roots, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
 }
 
-fn detail(conn: &Connection, id: i64) -> UaResult<Value> {
-    let g = require_goal(conn, id)?;
-    let chain: Vec<Map<String, Value>> =
-        ancestry_ids(conn, id)?.into_iter().map(|gid| require_goal(conn, gid)).collect::<UaResult<_>>()?;
+fn detail(conn: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    let g = require_goal(conn, org, id)?;
+    let chain: Vec<Map<String, Value>> = ancestry_ids(conn, org, id)?
+        .into_iter()
+        .map(|gid| require_goal(conn, org, gid))
+        .collect::<UaResult<_>>()?;
     Ok(json!({ "goal": g, "ancestry": chain, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
 }
 
-fn linked_goal(conn: &Connection, task_id: i64) -> UaResult<Option<i64>> {
+/// The goal task `task_id` serves, through organization `org`'s links only.
+fn linked_goal(conn: &Connection, org: &str, task_id: i64) -> UaResult<Option<i64>> {
     Ok(conn
-        .query_row("SELECT goal_id FROM task_goal_links WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .query_row(
+            "SELECT goal_id FROM task_goal_links WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
-fn why_chain(conn: &Connection, task_id: i64) -> UaResult<Value> {
-    let task =
-        task_object(conn, task_id)?.ok_or_else(|| UaError::not_found(format!("unknown task: {task_id}")))?;
+fn why_chain(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
+    let task = task_object(conn, org, task_id)?
+        .ok_or_else(|| UaError::not_found(format!("unknown task: {task_id}")))?;
     let unlinked = json!({ "task_id": task_id, "goal_id": null, "edge": EDGE_ANCESTRY, "chain": [], "meaning": MEANING });
-    let Some(goal_id) = linked_goal(conn, task_id)? else { return Ok(unlinked) };
-    let Some(g) = goal(conn, goal_id)? else { return Ok(unlinked) };
+    let Some(goal_id) = linked_goal(conn, org, task_id)? else { return Ok(unlinked) };
+    let Some(g) = goal(conn, org, goal_id)? else { return Ok(unlinked) };
     if str_field(&g, "project") != str_field(&task, "project") {
         return Ok(unlinked);
     }
-    let d = detail(conn, goal_id)?;
+    let d = detail(conn, org, goal_id)?;
     Ok(
         json!({ "task_id": task_id, "goal_id": goal_id, "edge": EDGE_ANCESTRY, "chain": d["ancestry"], "meaning": MEANING }),
     )
 }
 
-fn link(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Value> {
-    let task = task_object(tx, p.task_id)?
+fn link(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
+    let task = task_object(tx, org, p.task_id)?
         .ok_or_else(|| UaError::not_found(format!("unknown task: {}", p.task_id)))?;
-    let g = require_goal(tx, p.goal_id)?;
+    let g = require_goal(tx, org, p.goal_id)?;
     if str_field(&task, "project") != str_field(&g, "project") {
         return Err(UaError::invalid("task and goal must belong to the same project"));
     }
-    ancestry_ids(tx, p.goal_id)?;
-    if let Some(existing) = linked_goal(tx, p.task_id)? {
+    ancestry_ids(tx, org, p.goal_id)?;
+    if let Some(existing) = linked_goal(tx, org, p.task_id)? {
         if existing != p.goal_id {
             return Err(UaError::invalid(format!(
                 "task {} already serves goal {existing}; goal_task is single-valued",
@@ -351,25 +372,26 @@ fn link(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Va
         }
     } else {
         tx.execute(
-            "INSERT INTO task_goal_links (task_id, goal_id, linked_by, linked_at) VALUES (?1, ?2, ?3, ?4)",
-            params![p.task_id, p.goal_id, who, now()],
+            "INSERT INTO task_goal_links (org_id, task_id, goal_id, linked_by, linked_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org, p.task_id, p.goal_id, who, now()],
         )?;
-        emit(tx, "agent.goal.linked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
+        emit(tx, org, "agent.goal.linked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     }
     Ok(json!({
         "task_id": p.task_id,
         "goal_id": p.goal_id,
         "edge": EDGE_TASK,
-        "why_chain": why_chain(tx, p.task_id)?,
+        "why_chain": why_chain(tx, org, p.task_id)?,
     }))
 }
 
-fn unlink(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<Value> {
-    if task_object(tx, p.task_id)?.is_none() {
+fn unlink(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
+    if task_object(tx, org, p.task_id)?.is_none() {
         return Err(UaError::not_found(format!("unknown task: {}", p.task_id)));
     }
-    require_goal(tx, p.goal_id)?;
-    match linked_goal(tx, p.task_id)? {
+    require_goal(tx, org, p.goal_id)?;
+    match linked_goal(tx, org, p.task_id)? {
         None => return Err(UaError::invalid(format!("task {} serves no goal", p.task_id))),
         Some(g) if g != p.goal_id => {
             return Err(UaError::invalid(format!(
@@ -379,23 +401,24 @@ fn unlink(tx: &mut ua_store::WriteTx<'_>, p: LinkParams, who: &str) -> UaResult<
         }
         Some(_) => {}
     }
-    tx.execute("DELETE FROM task_goal_links WHERE task_id = ?1", [p.task_id])?;
-    emit(tx, "agent.goal.unlinked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
+    tx.execute("DELETE FROM task_goal_links WHERE org_id = ?1 AND task_id = ?2", params![org, p.task_id])?;
+    emit(tx, org, "agent.goal.unlinked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     Ok(json!({ "task_id": p.task_id, "goal_id": p.goal_id, "edge": EDGE_TASK, "unlinked": true }))
 }
 
-fn edit(tx: &mut ua_store::WriteTx<'_>, p: EditParams, who: &str) -> UaResult<Value> {
+fn edit(tx: &mut ua_store::WriteTx<'_>, org: &str, p: EditParams, who: &str) -> UaResult<Value> {
+    require_org(tx, org)?;
     if p.title.is_none() && p.statement.is_none() {
         return Err(UaError::invalid("pass title, statement or both"));
     }
     let title = p.title.as_deref().map(check_title).transpose()?;
     let statement = p.statement.as_deref().map(check_statement).transpose()?;
-    let row = require_goal(tx, p.goal_id)?;
+    let row = require_goal(tx, org, p.goal_id)?;
     check_revision(&row, p.expected_revision)?;
     tx.execute(
         "UPDATE goals SET title = COALESCE(?1, title), statement = COALESCE(?2, statement), updated_at = ?3, \
-         revision = revision + 1 WHERE id = ?4",
-        params![title, statement, now(), p.goal_id],
+         revision = revision + 1 WHERE org_id = ?5 AND id = ?4",
+        params![title, statement, now(), p.goal_id, org],
     )?;
     let mut fields = Vec::new();
     if title.is_some() {
@@ -404,32 +427,40 @@ fn edit(tx: &mut ua_store::WriteTx<'_>, p: EditParams, who: &str) -> UaResult<Va
     if statement.is_some() {
         fields.push("statement");
     }
-    emit(tx, "agent.goal.updated", json!({ "goal_id": p.goal_id, "fields": fields }), who)?;
-    goal_reply(tx, p.goal_id)
+    emit(tx, org, "agent.goal.updated", json!({ "goal_id": p.goal_id, "fields": fields }), who)?;
+    goal_reply(tx, org, p.goal_id)
 }
 
-fn set_status(tx: &mut ua_store::WriteTx<'_>, p: StatusParams, status: &str, who: &str) -> UaResult<Value> {
+fn set_status(
+    tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
+    p: StatusParams,
+    status: &str,
+    who: &str,
+) -> UaResult<Value> {
     debug_assert!(GOAL_STATUSES.contains(&status));
+    require_org(tx, org)?;
     let reason = p.reason.as_deref().unwrap_or_default().trim().to_string();
     if reason.chars().count() > 4000 {
         return Err(UaError::invalid("reason must be at most 4000 characters"));
     }
-    let row = require_goal(tx, p.goal_id)?;
+    let row = require_goal(tx, org, p.goal_id)?;
     check_revision(&row, p.expected_revision)?;
     let current = str_field(&row, "status").unwrap_or("open").to_string();
     if current == status || (CLOSED.contains(&status) && CLOSED.contains(&current.as_str())) {
         return Err(UaError::conflict(format!("goal {} is already {current}", p.goal_id)));
     }
     tx.execute(
-        "UPDATE goals SET status = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3",
-        params![status, now(), p.goal_id],
+        "UPDATE goals SET status = ?1, updated_at = ?2, revision = revision + 1 WHERE org_id = ?4 AND id = ?3",
+        params![status, now(), p.goal_id, org],
     )?;
     let channel = if status == "open" { "agent.goal.reopened" } else { "agent.goal.closed" };
     emit(
         tx,
+        org,
         channel,
-        json!({ "goal_id": p.goal_id, "from": current, "status": status, "reason": reason }),
+        json!({ "goal_id": p.goal_id, "from": current, "status": status, "reason": ledger_text(org, &reason) }),
         who,
     )?;
-    goal_reply(tx, p.goal_id)
+    goal_reply(tx, org, p.goal_id)
 }

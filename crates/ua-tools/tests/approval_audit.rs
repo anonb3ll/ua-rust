@@ -63,7 +63,7 @@ fn events(hub: &Hub, channel: &str) -> Vec<Value> {
 }
 
 fn stored_sha(hub: &Hub, id: i64) -> String {
-    let row = hub.db().read(|c| approvals::get(c, id)).unwrap();
+    let row = hub.db().read(|c| approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap();
     approvals::payload_sha256(&row.tool, &row.payload)
 }
 
@@ -85,7 +85,7 @@ async fn request_decision_and_use_carry_one_payload_hash() {
         assert!(!e.to_string().contains("hash me"), "{what} carries the payload: {e}");
     }
     // The resolved event records when the pass expires.
-    let row = hub.db().read(|c| approvals::get(c, id)).unwrap();
+    let row = hub.db().read(|c| approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap();
     let at = |s: &str| ua_core::time::parse_ts(s).unwrap();
     let expires = at(resolved[0]["expires_at"].as_str().expect("expires_at on an approval"));
     let ttl = (hub.cfg().approval_pass_ttl_hours * 3600.0) as i64;
@@ -166,7 +166,7 @@ async fn a_refusal_survives_the_handler_that_rolls_back() {
         })
         .unwrap_err();
     assert_eq!(err.reason_code(), Some("approval_denied"));
-    let row = hub.db().read(|c| approvals::get(c, id)).unwrap();
+    let row = hub.db().read(|c| approvals::get(c, ua_core::DEFAULT_ORG, id)).unwrap();
     assert_ne!(row.reason.as_deref(), Some("rolled-back"), "the handler's own write rolled back");
     let refused = events(&hub, approvals::REFUSED);
     assert_eq!(refused.len(), 1, "{refused:?}");

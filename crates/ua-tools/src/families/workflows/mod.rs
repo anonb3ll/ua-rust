@@ -30,6 +30,14 @@
 //! could not do directly. Every step outcome is checkpointed; a run stopped by
 //! a failure or an approval continues with `workflow_run(name, run_id=...,
 //! resume=true)` from the first step that has not completed.
+//!
+//! Both tables are tenant data (`org_id`, `organization.v1.tools.workflows`,
+//! `workflows.v2.org_indexes`). A run belongs to the organization of the
+//! caller that started it, or for a routine's fire to the routine's; every
+//! checkpoint takes its run's organization. A run of another organization
+//! answers as a missing one, a caller whose organization `orgs` does not hold
+//! is refused before a run is recorded, and a gated step's approval payload
+//! binds the run's organization.
 
 pub(crate) mod engine;
 mod langgraph;
@@ -38,7 +46,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
 pub(crate) use engine::{Report, check_inputs, load_definition as load, registry as step_registry};
 
@@ -88,6 +96,52 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoints (
     UNIQUE (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_run ON workflow_checkpoints(run_id, seq);
+",
+};
+
+/// `organization.v1.tools.workflows`: `org_id` on `workflow_runs` and
+/// `workflow_checkpoints` (existing rows backfilled to the default
+/// organization) and their generated `*_org_exists` / `*_org_immutable`
+/// triggers. No key rebuild: a run's key is a ULID the hub generates (never
+/// client text), and a checkpoint's `UNIQUE (run_id, seq)` is led by it, so
+/// two organizations can never collide. Applied after `workflows.v1` and
+/// `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.workflows", &["workflow_runs", "workflow_checkpoints"]);
+
+/// `workflows.v2.org_indexes`: the indexes the per-organization reads use,
+/// and the same-organization rule between a checkpoint and its run. Applied
+/// after [`TENANT_PART`], which adds the column.
+pub const ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "workflows.v2.org_indexes",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_org_created ON workflow_runs(org_id, created_at, run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_org ON workflow_checkpoints(org_id, id);
+
+CREATE TRIGGER IF NOT EXISTS workflow_checkpoints_same_org
+BEFORE INSERT ON workflow_checkpoints
+WHEN NEW.org_id IS NOT (SELECT org_id FROM workflow_runs WHERE run_id = NEW.run_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow checkpoint must be in its run''s organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS workflow_checkpoints_same_org_update
+BEFORE UPDATE OF run_id ON workflow_checkpoints
+WHEN NEW.org_id IS NOT (SELECT org_id FROM workflow_runs WHERE run_id = NEW.run_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow checkpoint must be in its run''s organization'); END;
+",
+};
+
+/// `workflows.v3.task_org`: a workflow run's `task_id` points at a task in
+/// the run's own organization. `task_id` carries no foreign key, so a missing
+/// task passes as before. Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "workflows.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS workflow_runs_task_org BEFORE INSERT ON workflow_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow run must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS workflow_runs_task_org_update BEFORE UPDATE OF task_id ON workflow_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a workflow run must point at a task in its own organization'); END;
 ",
 };
 
@@ -190,23 +244,24 @@ async fn workflow_run(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             let inputs = a.inputs.unwrap_or_default();
             engine::check_inputs(&def, &inputs)?;
             let run_id = engine::new_run_id();
-            engine::create_run(&ctx.hub, &ctx.caller, &run_id, "workflow", &def, &inputs, None).await?;
+            let org = ctx.caller.org_id.clone();
+            engine::create_run(&ctx.hub, &ctx.caller, &org, &run_id, "workflow", &def, &inputs, None).await?;
             let rid = run_id.clone();
             let run = ctx
                 .hub
                 .db()
-                .read_async(move |c| engine::load_run(c, &rid))
+                .read_async(move |c| engine::load_run(c, &org, &rid))
                 .await?
                 .ok_or_else(|| UaError::internal("run vanished after insert"))?;
             let report = engine::execute(&ctx.hub, &ctx.caller, &run, &def).await?;
             Ok(report_json(&def.name, &report, false))
         }
         (Some(run_id), true) => {
-            let rid = run_id.clone();
+            let (rid, org) = (run_id.clone(), ctx.caller.org_id.clone());
             let run = ctx
                 .hub
                 .db()
-                .read_async(move |c| engine::load_run(c, &rid))
+                .read_async(move |c| engine::load_run(c, &org, &rid))
                 .await?
                 .ok_or_else(|| UaError::not_found(format!("no workflow run {run_id:?}")))?;
             if run.kind != "workflow" || run.name != def.name {
@@ -233,24 +288,29 @@ async fn workflow_run(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     }
 }
 
-/// Start and execute a new run of the reviewed workflow `name` as `caller`
-/// (routines use this to run as their owner).
+/// Start and execute a new run of the reviewed workflow `name` as `caller`,
+/// recorded in organization `org` (routines use this to run as their owner,
+/// in the routine's organization).
 pub(crate) async fn run_as(
     hub: &crate::hub::Hub,
     caller: &ua_core::Caller,
+    org: &str,
     name: &str,
     inputs: Map<String, Value>,
 ) -> UaResult<Report> {
+    // Fail closed before anything is recorded: the run's steps gate in the
+    // caller's organization (see `engine::require_caller_in_run_org`).
+    engine::require_caller_in_run_org(caller, org)?;
     let cfg = hub.cfg().clone();
     let n = name.to_string();
     let def = blocking(move || engine::load_definition(&cfg, &n)).await?;
     engine::check_inputs(&def, &inputs)?;
     let run_id = engine::new_run_id();
-    engine::create_run(hub, caller, &run_id, "workflow", &def, &inputs, None).await?;
-    let rid = run_id.clone();
+    engine::create_run(hub, caller, org, &run_id, "workflow", &def, &inputs, None).await?;
+    let (rid, org) = (run_id.clone(), org.to_string());
     let run = hub
         .db()
-        .read_async(move |c| engine::load_run(c, &rid))
+        .read_async(move |c| engine::load_run(c, &org, &rid))
         .await?
         .ok_or_else(|| UaError::internal("run vanished after insert"))?;
     engine::execute(hub, caller, &run, &def).await

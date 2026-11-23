@@ -179,6 +179,72 @@ async fn idempotent_save_replays_the_receipt() {
     assert_eq!(t.list_ids(json!({})).await.len(), 1);
 }
 
+/// Memory keys are the caller's own: another caller's key is fresh, another
+/// tool's use of the same text is invisible, and a key `memory_save` wrote
+/// before keys were scoped still replays for a retry.
+#[tokio::test]
+async fn idempotency_keys_are_scoped_to_memory_save_and_the_caller() {
+    let t = T::new(hub());
+    let (b1, b2) = (agent("builder-1"), agent("builder-2"));
+    let a = t.ok(&b1, "memory_save", json!({ "content": "mine", "idempotency_key": "k-1" })).await;
+    let b = t.ok(&b2, "memory_save", json!({ "content": "theirs", "idempotency_key": "k-1" })).await;
+    assert_ne!(a["id"], b["id"], "another caller's key is fresh");
+    let again = t.ok(&b1, "memory_save", json!({ "content": "mine", "idempotency_key": "k-1" })).await;
+    assert_eq!(again["id"], a["id"]);
+
+    // Rows another tool wrote under the raw text, and a pre-upgrade memory row.
+    let pre = t.ok(&b1, "memory_save", json!({ "content": "pre-upgrade" })).await;
+    let receipt = json!({ "id": pre["id"], "created": true });
+    t.hub
+        .db()
+        .write(move |tx| {
+            for (key, tool, result) in [
+                ("message_send/builder-3/m-1", "message_send", json!({ "accepted": true })),
+                ("message_send:m-2", "message_send", json!({ "accepted": true })),
+                ("delegate:builder-3:d-1", "delegate", json!({})),
+                ("old-raw", "memory_save", receipt.clone()),
+            ] {
+                tx.execute(
+                    "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
+                     VALUES (?1, ?2, ?3, '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![key, tool, result.to_string()],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let fresh =
+        t.ok(&b2, "memory_save", json!({ "content": "fresh", "idempotency_key": "never-used" })).await;
+    for key in ["message_send/builder-3/m-1", "message_send:m-2", "delegate:builder-3:d-1"] {
+        let v = t
+            .ok(&b2, "memory_save", json!({ "content": format!("probe {key}"), "idempotency_key": key }))
+            .await;
+        let mut ks: Vec<&String> = v.as_object().unwrap().keys().collect();
+        let mut fk: Vec<&String> = fresh.as_object().unwrap().keys().collect();
+        ks.sort();
+        fk.sort();
+        assert_eq!(ks, fk, "{key}: {v} vs {fresh}");
+        assert_ne!(v["id"], fresh["id"]);
+    }
+    let retry =
+        t.ok(&b1, "memory_save", json!({ "content": "pre-upgrade", "idempotency_key": "old-raw" })).await;
+    assert_eq!(retry["id"], pre["id"], "a pre-upgrade key still replays: {retry}");
+
+    // The raw key was hub-wide; another caller reusing it gets its own save,
+    // not builder-1's receipt with its content silently dropped.
+    let other =
+        t.ok(&b2, "memory_save", json!({ "content": "someone else", "idempotency_key": "old-raw" })).await;
+    assert_ne!(other["id"], pre["id"], "another caller's pre-upgrade key is fresh: {other}");
+    let kept = t.ok(&b2, "memory_get", json!({ "id": other["id"] })).await;
+    assert!(kept.to_string().contains("someone else"), "{kept}");
+    let other_again =
+        t.ok(&b2, "memory_save", json!({ "content": "someone else", "idempotency_key": "old-raw" })).await;
+    assert_eq!(other_again["id"], other["id"], "and its retry replays under its own key");
+    let owner_again =
+        t.ok(&b1, "memory_save", json!({ "content": "pre-upgrade", "idempotency_key": "old-raw" })).await;
+    assert_eq!(owner_again["id"], pre["id"], "the writer still replays the raw key");
+}
+
 #[tokio::test]
 async fn search_ranks_lexically_and_filters() {
     let t = T::new(hub());

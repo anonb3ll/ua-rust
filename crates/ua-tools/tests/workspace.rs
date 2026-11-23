@@ -552,7 +552,7 @@ async fn git_merge_task_parks_for_approval_then_merges() {
     assert_eq!((r["tool"].as_str(), r["task_id"].as_i64()), (Some("git_merge_task"), Some(task_id)), "{r}");
     assert_eq!(r["changed_fields"], json!(["head"]), "{r}");
     assert!(!r.to_string().contains(&head), "no payload content: {r}");
-    let row = env.hub.db().read(move |c| ua_tools::approvals::get(c, first)).unwrap();
+    let row = env.hub.db().read(move |c| ua_tools::approvals::get(c, ua_core::DEFAULT_ORG, first)).unwrap();
     assert_eq!(row.status, "approved", "the stale pass is not spent");
 
     // A human approves the new head: that merge runs.

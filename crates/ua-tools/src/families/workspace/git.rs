@@ -419,7 +419,7 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
     ctx.hub
         .db()
         .write_async(move |tx| {
-            continuity::require_review_at_head(tx, task_id, &head)?;
+            continuity::require_review_at_head(tx, &caller.org_id, task_id, &head)?;
             let cfg = hub.cfg();
             match approvals::gate(tx, cfg, &caller, MERGE_TOOL, &payload)? {
                 GateOutcome::Pass { .. } => Ok(Ok(())),
@@ -428,7 +428,7 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
                     format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
                 ))),
                 GateOutcome::Pending { approval_id } => {
-                    let stale = approvals::stale_pass(tx, cfg, &caller.label, MERGE_TOOL, &payload, &["task_id"])?;
+                    let stale = approvals::stale_pass(tx, cfg, &caller.org_id, &caller.label, MERGE_TOOL, &payload, &["task_id"])?;
                     let Some(stale) = stale else {
                         return Ok(Err(UaError::ApprovalRequired { tool: MERGE_TOOL.into(), approval_id }));
                     };
@@ -439,7 +439,7 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
                         .task(Some(task_id))
                         .hashes(Some(stale.approved_sha256), Some(approvals::payload_sha256(MERGE_TOOL, &payload)))
                         .changed(changed.clone());
-                    approvals::refused(tx, &caller.label, &r, None)?;
+                    approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
                     Ok(Err(UaError::denied(
                         "approval_binding_changed",
                         format!(
@@ -458,16 +458,19 @@ async fn one_time_approval(ctx: &ToolCtx, task_id: i64, head: &str, payload: Val
 async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
     let sb = sandbox(&ctx)?;
     let id = a.task_id;
+    let org = ctx.caller.org_id.clone();
+    let org1 = org.clone();
     let row = ctx
         .hub
         .db()
         .read_async(move |c| {
             Ok(c.query_row(
-                // Tasks are all in the default organization, so only its
-                // bindings join.
+                // The task is the caller's organization's; only the binding
+                // of the task row's own organization joins.
                 "SELECT t.title, t.status, t.branch, t.worktree_path, b.repo FROM tasks t \
-                 LEFT JOIN project_repo_bindings b ON b.org_id = ?2 AND b.project = t.project WHERE t.id = ?1",
-                rusqlite::params![id, crate::families::tasks::TASK_ORG],
+                 LEFT JOIN project_repo_bindings b ON b.org_id = t.org_id AND b.project = t.project \
+                 WHERE t.id = ?1 AND t.org_id = ?2",
+                rusqlite::params![id, org1],
                 |r| {
                     Ok(TaskRow {
                         title: r.get(0)?,
@@ -487,11 +490,12 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         && a.force
     {
         let who = ctx.caller.label.clone();
+        let org2 = org.clone();
         return Err(ctx
             .hub
             .db()
             .write_async(move |tx| {
-                let row = authz::row(tx, auth_id)?;
+                let row = authz::row(tx, &org2, auth_id)?;
                 let err = UaError::denied(
                     "policy_authorization_force",
                     "force=true is refused under a policy authorization: it covers a clean merge only; ask for a \
@@ -593,11 +597,12 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         let (repo, h, who, cfg) =
             (row.repo.clone(), head.clone(), ctx.caller.label.clone(), ctx.hub.cfg().clone());
         let (dry, in_flight, status) = (a.dry_run, a.allow_in_flight, row.status.clone());
+        let org3 = org.clone();
         let stamp = ctx
             .hub
             .db()
             .write_async(move |tx| {
-                let auth = authz::covering(tx, &cfg, auth_id, id, repo.as_deref(), &h, &who)?;
+                let auth = authz::covering(tx, &cfg, &org3, auth_id, id, repo.as_deref(), &h, &who)?;
                 if in_flight && status != "done" && !authz::allows_in_flight(&auth) {
                     let err = UaError::denied(
                         "policy_authorization_mismatch",
@@ -608,8 +613,8 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
                     );
                     return Err(authz::refuse_mode(tx, &who, auth_id, id, Some(&auth), "in_flight", err));
                 }
-                continuity::require_review_at_head(tx, id, &h)?;
-                if dry { Ok(None) } else { authz::consume(tx, &auth, auth_id, id, &h, &who).map(Some) }
+                continuity::require_review_at_head(tx, &org3, id, &h)?;
+                if dry { Ok(None) } else { authz::consume(tx, &org3, &auth, auth_id, id, &h, &who).map(Some) }
             })
             .await?;
         spent = stamp.map(|s| (auth_id, s));
@@ -625,11 +630,12 @@ async fn git_merge_task(ctx: ToolCtx, a: MergeArgs) -> UaResult<Value> {
         Ok(c) => c,
         Err(e) => {
             if let Some((auth_id, stamp)) = spent {
-                let (h, who, why) = (head.clone(), ctx.caller.label.clone(), e.to_string());
+                let (h, who, why, org4) =
+                    (head.clone(), ctx.caller.label.clone(), e.to_string(), org.clone());
                 let restored = ctx
                     .hub
                     .db()
-                    .write_async(move |tx| authz::restore(tx, auth_id, &h, &who, &stamp, &why))
+                    .write_async(move |tx| authz::restore(tx, &org4, auth_id, &h, &who, &stamp, &why))
                     .await;
                 if let Err(re) = restored {
                     tracing::warn!(auth_id, error = %re, "could not restore a policy authorization after a failed merge");

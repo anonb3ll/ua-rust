@@ -50,6 +50,8 @@
 4 isolation.same-org-mailbox-direct-read pass
 4 isolation.same-org-handoff-note pass
 4 isolation.same-org-conversation-handoffs pass
+4 isolation.same-org-conversation-naming pass
+4 isolation.same-org-crew-view pass
 4 isolation.same-org-own-inbox pass
 4 isolation.same-org-ledger-read pass
 4 isolation.same-org-stream pass

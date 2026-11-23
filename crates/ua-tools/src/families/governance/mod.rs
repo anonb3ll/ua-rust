@@ -41,12 +41,14 @@ pub(crate) use bindings::{
 pub use bindings::{check_default_branch, normalize_repo};
 pub(crate) use block::{Blocked, check_claim, claim_block};
 pub(crate) use claim_release::task_claim_release;
+pub use holds::{HOLDS_ORG_SCOPE, HOLDS_TENANT_PART};
 pub(crate) use holds::{task_hold, task_hold_get, task_holds};
 pub use lifecycle::is_retired;
 pub(crate) use lifecycle::{
     agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate, agent_unretire,
     stopped,
 };
+pub use proposals::{PROPOSALS_ORG_SCOPE, PROPOSALS_TENANT_PART};
 pub(crate) use proposals::{
     check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
     work_proposal_list, work_proposal_recover, work_proposal_withdraw,

@@ -40,7 +40,7 @@
 
 pub(crate) mod acceptance;
 mod claim;
-mod command;
+pub(crate) mod command;
 pub mod credentials;
 mod receipt;
 mod relay;
@@ -903,19 +903,27 @@ pub(crate) fn gate_payload(n: &NewItem, caller: &str) -> Value {
 
 /// Insert a validated item (the caller has gated it). Returns the enqueue
 /// result. A wait is recorded when the node is not live.
+///
+/// `org` is the enqueuer's organization: a bound task is looked up in it, so
+/// an item's task is always one the enqueuer can see, and the runner paths
+/// read that task by its hub-global id afterwards.
 pub(crate) fn insert_item(
     tx: &mut WriteTx<'_>,
     hub: &Hub,
+    org: &str,
     n: &NewItem,
     node: &NodeRow,
     created_by: &str,
 ) -> UaResult<Value> {
     // The one claim gate, again at the enqueue itself (every path queues here).
-    governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+    governance::check_claim(tx, org, Some(&node.agent), n.task_id, false)?;
     acceptance::require_accepted(tx, hub.cfg(), node, &n.backend)?;
     if let Some(t) = n.task_id {
-        let exists: Option<String> =
-            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [t], |r| r.get(0)).optional()?;
+        let exists: Option<String> = tx
+            .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, t], |r| {
+                r.get(0)
+            })
+            .optional()?;
         match exists.as_deref() {
             None => return Err(UaError::not_found(format!("task {t} does not exist"))),
             Some("done" | "cancelled") => {
@@ -925,7 +933,7 @@ pub(crate) fn insert_item(
         }
         // Node work bound to a proposal-spawned task (node_dispatch, a
         // command, node-routed dispatch) fails closed on a drifted contract.
-        governance::task_contract(tx, t)?;
+        governance::task_contract(tx, org, t)?;
     }
     let id = new_item_id();
     let ts = now();
@@ -1042,9 +1050,9 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
             let node = accepting_node(tx, hub2.cfg(), &n)?;
             // Before the approval gate, so stopped, held or drifted work never
             // consumes one.
-            governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+            governance::check_claim(tx, &caller.org_id, Some(&node.agent), n.task_id, false)?;
             if let Some(t) = n.task_id {
-                governance::task_contract(tx, t)?;
+                governance::task_contract(tx, &caller.org_id, t)?;
             }
             match approvals::gate(tx, hub2.cfg(), &caller, "node_dispatch", &gate_payload(&n, &who))? {
                 GateOutcome::Pass { .. } => {}
@@ -1056,7 +1064,7 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
                     ));
                 }
             }
-            insert_item(tx, &hub2, &n, &node, &who).map(Ok)
+            insert_item(tx, &hub2, &caller.org_id, &n, &node, &who).map(Ok)
         })
         .await?;
     match out {

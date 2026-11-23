@@ -19,6 +19,10 @@
 //! Reads never write. A lapsed lease or a stale session heartbeat reports
 //! `abandoned` on read; the stored row is left for the reapers.
 //!
+//! Workflow runs are tenant data: only the caller's organization's are read
+//! (`organization.v1.tools.workflows`); another organization's run answers as
+//! a missing one.
+//!
 //! Visibility follows the stores' own tools: dispatch, session and workflow
 //! runs are visible to whoever may call these tools (as with
 //! `dispatch_delivery_receipts_list`, `session_list` and
@@ -105,10 +109,12 @@ pub struct GetArgs {
     pub kinds: Option<Vec<String>>,
 }
 
-/// Who is reading, for node-item visibility.
+/// Who is reading, for node-item visibility and the workflow runs'
+/// organization.
 struct Viewer {
     who: Option<String>,
     maintainer: bool,
+    org: String,
 }
 
 impl Viewer {
@@ -120,7 +126,7 @@ impl Viewer {
                 &[Authority::Operator, Authority::LifecycleOperator],
                 ua_core::DEFAULT_ORG,
             );
-        Self { who, maintainer }
+        Self { who, maintainer, org: caller.org_id.clone() }
     }
 }
 
@@ -287,8 +293,10 @@ fn session_rows(c: &Connection, f: &Filter<'_>, stale_before: &str) -> UaResult<
 
 // --- workflows -----------------------------------------------------------------
 
-fn workflow_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "owner", "created_at", "run_id");
+fn workflow_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "owner", "created_at", "run_id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT run_id, kind, name, task_id, owner, status, next_step, error, lease_expires_at, created_at, \
@@ -536,7 +544,7 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
         rows.extend(session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?);
     }
     if has("workflow") {
-        rows.extend(workflow_rows(c, &f, &now)?);
+        rows.extend(workflow_rows(c, &f, &viewer.org, &now)?);
     }
     if has("node") {
         rows.extend(node_rows(c, &f, viewer, &now)?);
@@ -582,7 +590,7 @@ fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaRes
         rows = session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?;
     }
     if rows.is_empty() && has("workflow") {
-        rows = workflow_rows(c, &f, &now)?;
+        rows = workflow_rows(c, &f, &viewer.org, &now)?;
     }
     if rows.is_empty() && has("node") {
         rows = node_rows(c, &f, viewer, &now)?;

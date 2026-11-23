@@ -62,7 +62,9 @@ use ua_core::{UaError, UaResult};
 use super::{bounded, now_micros, same_label};
 use crate::ci::{CiRun, Verdict};
 use crate::families::governance;
-use crate::families::tasks::{TASK_ORG, acting_identity, emit, require_task, str_field};
+use crate::families::tasks::{
+    acting_identity, emit, ledger_text, require_org, require_task, str_field, task_org,
+};
 use crate::registry::ToolCtx;
 use ua_org::authz::{Authority, Authz};
 
@@ -294,7 +296,7 @@ pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str
     let allowed = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        TASK_ORG,
+        &ctx.caller.org_id,
     ) || same_label(str_field(task, "claimed_by"), who)
         || same_label(str_field(task, "next_owner"), who);
     if allowed {
@@ -310,19 +312,24 @@ pub(crate) fn require_writer(ctx: &ToolCtx, task: &Map<String, Value>, who: &str
     }
 }
 
-/// The repository the task's project is bound to. Tasks carry no `org_id`
-/// yet and are all in the default organization, so its binding decides.
-pub(crate) fn task_repo(conn: &Connection, task: &Map<String, Value>) -> UaResult<Option<String>> {
+/// The repository the task's project is bound to in the task's organization
+/// `org` (another organization's binding of the same project never answers).
+pub(crate) fn task_repo(conn: &Connection, org: &str, task: &Map<String, Value>) -> UaResult<Option<String>> {
     match str_field(task, "project") {
-        Some(project) => governance::bound_repo(conn, TASK_ORG, project),
+        Some(project) => governance::bound_repo(conn, org, project),
         None => Ok(None),
     }
 }
 
-/// The CI job `expected_checks` binds check `name` to, if any.
-fn expected_job(conn: &Connection, task_id: i64, name: &str) -> UaResult<Option<String>> {
+/// The CI job `expected_checks` binds check `name` to, if any, on task
+/// `task_id` of organization `org`.
+fn expected_job(conn: &Connection, org: &str, task_id: i64, name: &str) -> UaResult<Option<String>> {
     let raw: Option<String> = conn
-        .query_row("SELECT expected_jobs_json FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .query_row(
+            "SELECT expected_jobs_json FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(job_map(raw).remove(name))
 }
@@ -445,9 +452,10 @@ fn json_list(raw: Option<String>) -> Vec<String> {
     raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default()
 }
 
-/// The full workflow view of a task, checks graded at `head` (default: the
-/// capsule's head).
-pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaResult<Value> {
+/// The full workflow view of task `task_id` of organization `org`, checks
+/// graded at `head` (default: the capsule's head). Another organization's
+/// record and checks are never read.
+pub(crate) fn view(conn: &Connection, org: &str, task_id: i64, head: Option<&str>) -> UaResult<Value> {
     type RecordRow = (
         Option<String>,
         Option<String>,
@@ -463,8 +471,8 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
     let record: Option<RecordRow> = conn
         .query_row(
             "SELECT stage, goal, done_json, focus, head_sha, expected_json, revision, updated_by, updated_at, \
-             expected_jobs_json FROM task_workflow WHERE task_id = ?1",
-            [task_id],
+             expected_jobs_json FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -501,10 +509,11 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
     }
     let judged = head.map(str::to_string).or(capsule_head);
     let mut stmt = conn.prepare(&format!(
-        "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 ORDER BY recorded_at DESC, id DESC LIMIT ?2"
+        "SELECT {CHECK_COLUMNS} FROM task_checks WHERE org_id = ?1 AND task_id = ?2 \
+         ORDER BY recorded_at DESC, id DESC LIMIT ?3"
     ))?;
     let rows: Vec<CheckRow> =
-        stmt.query_map(params![task_id, CHECKS_PER_TASK], check_row)?.collect::<Result<_, _>>()?;
+        stmt.query_map(params![org, task_id, CHECKS_PER_TASK], check_row)?.collect::<Result<_, _>>()?;
     let (checks, summary) = graded(rows, judged.as_deref(), &expected);
     out["expected_checks"] = json!(expected);
     out["expected_jobs"] = json!(jobs);
@@ -520,9 +529,9 @@ pub(crate) fn view(conn: &Connection, task_id: i64, head: Option<&str>) -> UaRes
 }
 
 /// The compact block `session_packet` carries as `workflow`; `None` when the
-/// task has no record and no checks.
-pub(crate) fn packet_section(conn: &Connection, task_id: Option<i64>) -> Option<Value> {
-    let v = view(conn, task_id?, None).ok()?;
+/// task has no record and no checks in the reader's organization `org`.
+pub(crate) fn packet_section(conn: &Connection, org: &str, task_id: Option<i64>) -> Option<Value> {
+    let v = view(conn, org, task_id?, None).ok()?;
     if v["revision"] == 0 && v["checks"].as_array().is_none_or(Vec::is_empty) {
         return None;
     }
@@ -554,11 +563,12 @@ fn positive(id: i64) -> UaResult<i64> {
 pub(crate) async fn task_workflow_get(ctx: ToolCtx, a: WorkflowGetArgs) -> UaResult<Value> {
     let id = positive(a.task_id)?;
     let head = a.head_sha.as_deref().map(|h| sha(h, "head_sha")).transpose()?;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
-            require_task(c, id)?;
-            view(c, id, head.as_deref())
+            require_task(c, &org, id)?;
+            view(c, &org, id, head.as_deref())
         })
         .await
 }
@@ -659,10 +669,16 @@ pub(crate) fn write_capsule(
     fields: Vec<(&'static str, Sql)>,
     expected_revision: Option<i64>,
 ) -> UaResult<Value> {
-    let task = require_task(tx, id)?;
+    let org = ctx.caller.org_id.as_str();
+    require_org(tx, org)?;
+    let task = require_task(tx, org, id)?;
     require_writer(ctx, &task, who, id)?;
     let revision: Option<i64> = tx
-        .query_row("SELECT revision FROM task_workflow WHERE task_id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT revision FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, id],
+            |r| r.get(0),
+        )
         .optional()?;
     let current = revision.unwrap_or(0);
     if let Some(exp) = expected_revision
@@ -675,8 +691,9 @@ pub(crate) fn write_capsule(
     let now = now_micros();
     if revision.is_none() {
         tx.execute(
-            "INSERT INTO task_workflow (task_id, revision, updated_by, updated_at) VALUES (?1, 0, ?2, ?3)",
-            params![id, who, now],
+            "INSERT INTO task_workflow (org_id, task_id, revision, updated_by, updated_at) \
+             VALUES (?1, ?2, 0, ?3, ?4)",
+            params![org, id, who, now],
         )?;
     }
     let names: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
@@ -686,36 +703,47 @@ pub(crate) fn write_capsule(
     values.push(Sql::Text(who.to_string()));
     values.push(Sql::Text(now));
     values.push(Sql::Integer(id));
+    values.push(Sql::Text(org.to_string()));
     let n = values.len();
     tx.execute(
         &format!(
             "UPDATE task_workflow SET {}, revision = revision + 1, updated_by = ?{}, updated_at = ?{} \
-             WHERE task_id = ?{n}",
+             WHERE task_id = ?{} AND org_id = ?{n}",
             assignments.join(", "),
+            n - 3,
             n - 2,
             n - 1
         ),
         params_from_iter(values.iter()),
     )?;
     let stage = names.contains(&"stage").then(|| {
-        tx.query_row("SELECT stage FROM task_workflow WHERE task_id = ?1", [id], |r| r.get::<_, String>(0))
-            .ok()
+        tx.query_row(
+            "SELECT stage FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
     });
     let mut sorted = names.clone();
     sorted.sort_unstable();
     emit(
         tx,
+        org,
         CHANNEL,
         json!({ "kind": "capsule", "task_id": id, "stage": stage.flatten(), "fields": sorted, "revision": current + 1 }),
         who,
     )?;
-    view(tx, id, None)
+    view(tx, org, id, None)
 }
 
-/// The head the task's capsule names, if any.
-pub(crate) fn capsule_head(conn: &Connection, task_id: i64) -> UaResult<Option<String>> {
+/// The head the capsule of task `task_id` of organization `org` names, if any.
+pub(crate) fn capsule_head(conn: &Connection, org: &str, task_id: i64) -> UaResult<Option<String>> {
     Ok(conn
-        .query_row("SELECT head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .query_row(
+            "SELECT head_sha FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
+            |r| r.get(0),
+        )
         .optional()?
         .flatten())
 }
@@ -727,9 +755,16 @@ pub(crate) fn capsule_head(conn: &Connection, task_id: i64) -> UaResult<Option<S
 /// "mismatch"`) `review` check (`grade` `attested` or `verified`) recorded at
 /// the exact 40-hex `head`. When the task has a commit deliverable revision
 /// matching `head`, refuses a self-review (`recorded_by == producer`).
-pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str) -> UaResult<()> {
+///
+/// `org` is the task's organization: its workflow record, its checks and its
+/// deliverables (which decide the producer) are read there.
+pub(crate) fn require_review_at_head(conn: &Connection, org: &str, task_id: i64, head: &str) -> UaResult<()> {
     let expected_raw: Option<String> = conn
-        .query_row("SELECT expected_json FROM task_workflow WHERE task_id = ?1", [task_id], |r| r.get(0))
+        .query_row(
+            "SELECT expected_json FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+            params![org, task_id],
+            |r| r.get(0),
+        )
         .optional()?;
     let expected = json_list(expected_raw);
     if !expected.iter().any(|n| n == "review") {
@@ -741,18 +776,19 @@ pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str
     let row: Option<CheckRow> = conn
         .query_row(
             &format!(
-                "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = 'review' AND head_sha = ?2"
+                "SELECT {CHECK_COLUMNS} FROM task_checks WHERE org_id = ?1 AND task_id = ?2 AND name = 'review' \
+                 AND head_sha = ?3"
             ),
-            params![task_id, head],
+            params![org, task_id, head],
             check_row,
         )
         .optional()?;
     let Some(row) = row else {
         let stale: Option<String> = conn
             .query_row(
-                "SELECT head_sha FROM task_checks WHERE task_id = ?1 AND name = 'review' \
+                "SELECT head_sha FROM task_checks WHERE org_id = ?1 AND task_id = ?2 AND name = 'review' \
                  ORDER BY recorded_at DESC, id DESC LIMIT 1",
-                [task_id],
+                params![org, task_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -786,7 +822,7 @@ pub(crate) fn require_review_at_head(conn: &Connection, task_id: i64, head: &str
             format!("task {task_id}'s review at head {short} has unaccepted grade {:?}", row.grade),
         ));
     }
-    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, TASK_ORG, task_id, &head)?
+    if let Some(rev) = ua_deliverables::commit_revision_for_task(conn, org, task_id, &head)?
         && same_label(Some(&rev.producer), &row.recorded_by)
     {
         return Err(UaError::denied(
@@ -821,15 +857,17 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
     let verify = a.verify.unwrap_or(true);
 
     let (ctx2, who2, name2, head2) = (ctx.clone(), who.clone(), name.clone(), head.clone());
+    let org = ctx.caller.org_id.clone();
     let has_repo = ctx
         .hub
         .db()
         .write_async(move |tx| {
-            let task = require_task(tx, id)?;
+            require_org(tx, &org)?;
+            let task = require_task(tx, &org, id)?;
             require_writer(&ctx2, &task, &who2, id)?;
             let (kind, run, repo, job) = match parsed {
                 Some(p) => {
-                    let bound = task_repo(tx, &task)?;
+                    let bound = task_repo(tx, &org, &task)?;
                     let repo = match (p.repo, bound) {
                         (Some(given), Some(bound)) if !given.eq_ignore_ascii_case(&bound) => {
                             return Err(UaError::denied(
@@ -843,7 +881,7 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
                         (_, Some(bound)) => Some(bound),
                         (given, None) => given,
                     };
-                    let job = match (p.job, expected_job(tx, id, &name2)?) {
+                    let job = match (p.job, expected_job(tx, &org, id, &name2)?) {
                         (Some(given), Some(want)) if given != want => {
                             return Err(UaError::denied(
                                 "job_mismatch",
@@ -860,20 +898,30 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
                 None => (None, None, None, None),
             };
             let has_repo = repo.is_some();
-            tx.execute(
-                "INSERT INTO task_checks (task_id, name, head_sha, outcome, grade, ref_kind, ref, repo, ref_job, \
-                 detail, verification_json, recorded_by, recorded_at, verified_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'attested', ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, NULL) \
+            let n = tx.execute(
+                "INSERT INTO task_checks (org_id, task_id, name, head_sha, outcome, grade, ref_kind, ref, repo, \
+                 ref_job, detail, verification_json, recorded_by, recorded_at, verified_at) \
+                 VALUES (?12, ?1, ?2, ?3, ?4, 'attested', ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, NULL) \
                  ON CONFLICT (task_id, name, head_sha) DO UPDATE SET outcome = excluded.outcome, \
                  grade = excluded.grade, ref_kind = excluded.ref_kind, ref = excluded.ref, repo = excluded.repo, \
                  ref_job = excluded.ref_job, detail = excluded.detail, verification_json = NULL, \
-                 recorded_by = excluded.recorded_by, recorded_at = excluded.recorded_at, verified_at = NULL",
-                params![id, name2, head2, outcome, kind, run, repo, job, detail, who2, now_micros()],
+                 recorded_by = excluded.recorded_by, recorded_at = excluded.recorded_at, verified_at = NULL \
+                 WHERE task_checks.org_id = excluded.org_id",
+                params![id, name2, head2, outcome, kind, run, repo, job, detail, who2, now_micros(), org],
             )?;
+            // The upsert's organization guard skips the update and changes
+            // nothing: never report that as a recorded check.
+            if n != 1 {
+                return Err(UaError::conflict(format!(
+                    "check {name2:?} on task {id} at {head2} was not recorded; retry"
+                )));
+            }
             emit(
                 tx,
+                &org,
                 CHANNEL,
-                json!({ "kind": "check", "task_id": id, "name": name2, "head_sha": head2, "outcome": outcome, "grade": ATTESTED }),
+                json!({ "kind": "check", "task_id": id, "name": ledger_text(&org, &name2), "head_sha": head2,
+                        "outcome": outcome, "grade": ATTESTED }),
                 &who2,
             )?;
             Ok(has_repo)
@@ -882,7 +930,8 @@ pub(crate) async fn task_check_record(ctx: ToolCtx, a: CheckRecordArgs) -> UaRes
     if verify && has_repo {
         return verify_stored(&ctx, id, &name, &head, &who).await;
     }
-    ctx.hub.db().read_async(move |c| view(c, id, Some(&head))).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| view(c, &org, id, Some(&head))).await
 }
 
 /// `coordination_manage(action="task_check_verify")`.
@@ -900,21 +949,25 @@ pub(crate) async fn task_check_verify(ctx: ToolCtx, a: CheckVerifyArgs) -> UaRes
 /// row's `recorded_at`, so a re-record meanwhile is not overwritten.
 async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str) -> UaResult<Value> {
     let (n, h) = (name.to_string(), head.to_string());
+    let org = ctx.caller.org_id.clone();
+    let org2 = org.clone();
     let (row, bound, want_job) = ctx
         .hub
         .db()
         .read_async(move |c| {
-            let task = require_task(c, id)?;
+            require_org(c, &org2)?;
+            let task = require_task(c, &org2, id)?;
             let row = c
                 .query_row(
                     &format!(
-                        "SELECT {CHECK_COLUMNS} FROM task_checks WHERE task_id = ?1 AND name = ?2 AND head_sha = ?3"
+                        "SELECT {CHECK_COLUMNS} FROM task_checks WHERE org_id = ?1 AND task_id = ?2 AND name = ?3 \
+                         AND head_sha = ?4"
                     ),
-                    params![id, n, h],
+                    params![org2, id, n, h],
                     check_row,
                 )
                 .optional()?;
-            Ok((row, task_repo(c, &task)?, expected_job(c, id, &n)?))
+            Ok((row, task_repo(c, &org2, &task)?, expected_job(c, &org2, id, &n)?))
         })
         .await?;
     let row = row.ok_or_else(|| {
@@ -1006,27 +1059,29 @@ async fn verify_stored(ctx: &ToolCtx, id: i64, name: &str, head: &str, who: &str
             let verified_at = (grade == VERIFIED).then(now_micros);
             let updated = tx.execute(
                 "UPDATE task_checks SET grade = ?1, verification_json = ?2, verified_at = ?3 \
-                 WHERE id = ?4 AND recorded_at = ?5",
+                 WHERE org_id = ?6 AND id = ?4 AND recorded_at = ?5",
                 params![
                     grade,
                     verification.as_ref().map(Value::to_string),
                     verified_at,
                     row.id,
-                    row.recorded_at
+                    row.recorded_at,
+                    org
                 ],
             )?;
             if updated == 1 {
                 emit(
                     tx,
+                    &org,
                     CHANNEL,
                     json!({
-                        "kind": "verify", "task_id": id, "name": n, "head_sha": h, "grade": grade,
+                        "kind": "verify", "task_id": id, "name": ledger_text(&org, &n), "head_sha": h, "grade": grade,
                         "verdict": verification.as_ref().map(|v| v["verdict"].clone()),
                     }),
                     &who,
                 )?;
             }
-            view(tx, id, Some(&h))
+            view(tx, &org, id, Some(&h))
         })
         .await?;
     if grade == VERIFIED {
@@ -1050,14 +1105,20 @@ const REVIEW_READY_GAP_S: i64 = 600;
 /// at most one notice per [`REVIEW_READY_GAP_S`] seconds; a head that becomes
 /// ready inside the gap is ledgered as `review_ready_suppressed` and not sent.
 /// Best effort: a failure is logged, never returned to the writer.
+///
+/// A job with no caller: it acts in the task row's own organization, and the
+/// notice goes to that organization's outbox.
 pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
     let claimed = hub
         .db()
         .write_async(move |tx| {
+            let Some(org) = task_org(tx, task_id)? else { return Ok(None) };
             let row: Option<(Option<String>, Option<String>)> = tx
-                .query_row("SELECT stage, head_sha FROM task_workflow WHERE task_id = ?1", [task_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+                .query_row(
+                    "SELECT stage, head_sha FROM task_workflow WHERE org_id = ?1 AND task_id = ?2",
+                    params![org, task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()?;
             let Some((Some(stage), Some(head))) = row else { return Ok(None) };
             if stage != "review" || !is_full_sha(&head) {
@@ -1065,8 +1126,8 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
             }
             let sent: bool = tx
                 .query_row(
-                    "SELECT 1 FROM review_ready_notices WHERE task_id = ?1 AND head_sha = ?2",
-                    params![task_id, head],
+                    "SELECT 1 FROM review_ready_notices WHERE org_id = ?1 AND task_id = ?2 AND head_sha = ?3",
+                    params![org, task_id, head],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -1074,7 +1135,7 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
             if sent {
                 return Ok(None);
             }
-            let v = view(tx, task_id, None)?;
+            let v = view(tx, &org, task_id, None)?;
             let expected: Vec<String> = json_list(Some(v["expected_checks"].to_string()));
             let checks = v["checks"].as_array().cloned().unwrap_or_default();
             let verified = |name: &str| checks.iter().any(|c| c["name"] == name && c["grade"] == VERIFIED);
@@ -1087,8 +1148,9 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
             );
             let recent: bool = tx
                 .query_row(
-                    "SELECT 1 FROM review_ready_notices WHERE task_id = ?1 AND notified_at > ?2 LIMIT 1",
-                    params![task_id, since],
+                    "SELECT 1 FROM review_ready_notices WHERE org_id = ?1 AND task_id = ?2 AND notified_at > ?3 \
+                     LIMIT 1",
+                    params![org, task_id, since],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -1096,6 +1158,7 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
             if recent {
                 emit(
                     tx,
+                    &org,
                     CHANNEL,
                     json!({ "kind": "review_ready_suppressed", "task_id": task_id, "head_sha": head,
                             "reason": "rate limited: one notice per task per 10 minutes" }),
@@ -1104,26 +1167,30 @@ pub(crate) async fn review_ready(hub: &crate::Hub, task_id: i64) {
                 return Ok(None);
             }
             tx.execute(
-                "INSERT INTO review_ready_notices (task_id, head_sha, notified_at) VALUES (?1, ?2, ?3)",
-                params![task_id, head, ua_core::time::format_ts(now)],
+                "INSERT INTO review_ready_notices (org_id, task_id, head_sha, notified_at) VALUES (?1, ?2, ?3, ?4)",
+                params![org, task_id, head, ua_core::time::format_ts(now)],
             )?;
             tx.execute(
-                "UPDATE task_workflow SET review_notified_head = ?1 WHERE task_id = ?2",
-                params![head, task_id],
+                "UPDATE task_workflow SET review_notified_head = ?1 WHERE org_id = ?2 AND task_id = ?3",
+                params![head, org, task_id],
             )?;
+            let checks = if org == ua_core::DEFAULT_ORG { json!(expected) } else { Value::Null };
             emit(
                 tx,
+                &org,
                 CHANNEL,
-                json!({ "kind": "review_ready", "task_id": task_id, "head_sha": head, "checks": expected }),
+                json!({ "kind": "review_ready", "task_id": task_id, "head_sha": head, "checks": checks }),
                 REVIEW_READY_AGENT,
             )?;
-            Ok(Some(review_ready_message(task_id, &head, &expected)))
+            Ok(Some((org, review_ready_message(task_id, &head, &expected))))
         })
         .await;
     match claimed {
-        Ok(Some(message)) => {
+        Ok(Some((org, message))) => {
+            // The notification is in its task's organization.
             if let Err(e) =
-                crate::families::notify::send_event(hub, "review_ready", REVIEW_READY_AGENT, &message).await
+                crate::families::notify::send_event(hub, &org, "review_ready", REVIEW_READY_AGENT, &message)
+                    .await
             {
                 tracing::warn!(task_id, error = %e, "review_ready notification failed");
             }

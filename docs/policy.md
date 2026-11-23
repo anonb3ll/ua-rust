@@ -234,8 +234,29 @@ The event names what was refused without carrying it: `tool`,
 `task_id`, `approved_payload_sha256`, `presented_payload_sha256`,
 `changed_fields` (the top-level field names that differ, never their
 values), `approval_status`, `expired_at`, `detail` and `via`. It never
-holds payload content. Its organization is the organization of the
-approval row, which is the default organization.
+holds payload content. Every event is still written to the default
+organization's ledger (`ORG-EVENT-DEFAULT`); when the approval belongs to
+another organization, `requested_by` is `null` there and the event's
+`originator` is `system`, never the requester's label. The same holds for
+the `requested`, `resolved` and `consumed` events: another organization's
+requester or resolver label is in neither the payload nor the originator.
+
+## The approval queue and organizations
+
+An approval belongs to its requester's organization (the gate caller's
+`org_id`), and the queue is scoped to it (`docs/organization.md`, the
+approvals family). A gate matches a denial, pass or pending request only
+within the caller's organization, so a pass granted in one organization
+never satisfies an identical call (same tool, payload and requester label)
+in another, and expiry runs per organization. `approval_pending`, the
+approval detail and list routes, the Control Center inbox, the session
+packet, the evidence report, `platform_object_get` and the anomaly check
+show only the reader's organization's approvals. `approval_resolve`, on
+every transport (MCP, HTTP, UI, CLI, Slack), answers another
+organization's approval exactly as a missing id. Approving needs a human in
+the approval's organization; until memberships exist `ua_org::authz` admits
+only the default organization's humans (`org_mismatch` otherwise), and the
+requester may still deny or revoke its own request in its organization.
 
 A refusal is often decided inside the refused call's write transaction,
 which then fails and rolls back. The event is appended with
