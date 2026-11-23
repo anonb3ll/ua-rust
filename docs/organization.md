@@ -1357,8 +1357,18 @@ channel, parties, task and payload never leak. The chain itself still does:
 sequence numbers, `prev_hash`/`entry_hash` links, the chain head
 (`head_ulid`/`head_hash`), verified totals such as `total_verified`, and the
 migration manifest's `{ulid, entry_hash, redacted: true}` placeholder for each
-hidden row. That metadata proves the ledger is intact and reveals that some
-rows exist, never what they say or whose they are.
+hidden row. That metadata proves the ledger is intact and reveals that a row
+exists and roughly when it was written — placeholder and chain-head ULIDs
+encode millisecond creation time, and a hidden row's `seq` position bounds how
+many rows surround it — so its timing can be correlated with a known author's
+other visible activity. It never reveals the row's content, channel or
+parties.
+
+One grant widens a restricted row beyond its parties: an
+`agent.conversation.handoff` row is also visible to the linked task's
+holders (`tasks.claimed_by` or `next_owner`), because a task that was handed
+a conversation needs the link — `conversation_id`, `task_id`, `created`,
+`by` — to reach it.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.

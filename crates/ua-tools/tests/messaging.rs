@@ -149,61 +149,61 @@ async fn send_list_and_reply_thread() {
 }
 
 #[tokio::test]
-async fn send_cannot_join_an_existing_conversation() {
+async fn send_cannot_name_a_conversation_it_is_not_in() {
     let (hub, reg) = (hub(), builtin_registry());
     let (a, b, c) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
-    send(
-        &reg,
-        &hub,
-        &a,
-        json!({"act": "request", "to_agent": "builder-2", "body": "private thread",
-               "conversation_id": "conv-private"}),
-    )
-    .await;
 
-    // An outsider cannot join it by naming its id: same answer as a missing one.
-    let err = reg
+    // A restricted caller starts a conversation by minting an id.
+    let sent =
+        send(&reg, &hub, &a, json!({"act": "request", "to_agent": "builder-2", "body": "private thread"}))
+            .await;
+    let conv = sent["conversation_id"].as_str().unwrap().to_string();
+
+    // A foreign id and a missing one answer alike.
+    let foreign = reg
         .call(
             &hub,
             &c,
             "message_send",
             json!({"act": "inform", "to_agent": "builder-2", "body": "let me in",
-                   "conversation_id": "conv-private"}),
+                   "conversation_id": conv}),
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "not_found");
-    assert!(err.to_string().contains("conversation not found"), "{err}");
+    let missing = reg
+        .call(
+            &hub,
+            &c,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "new?",
+                   "conversation_id": "conv-absent"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), "not_found");
+    assert_eq!(missing.code(), "not_found");
+    assert_eq!(foreign.to_string(), missing.to_string());
 
-    // A mail-unrestricted reader and a party can.
-    let board = Caller::local("local", Transport::Stdio);
-    let joined = send(
-        &reg,
-        &hub,
-        &board,
-        json!({"act": "inform", "to_agent": "builder-2", "body": "reviewing",
-               "conversation_id": "conv-private"}),
-    )
-    .await;
-    assert_eq!(joined["conversation_id"], "conv-private");
+    // A party continues its own conversation by id.
     let reply = send(
         &reg,
         &hub,
         &b,
-        json!({"act": "inform", "to_agent": "builder-1", "body": "on it", "conversation_id": "conv-private"}),
+        json!({"act": "inform", "to_agent": "builder-1", "body": "on it", "conversation_id": conv}),
     )
     .await;
-    assert_eq!(reply["conversation_id"], "conv-private");
+    assert_eq!(reply["conversation_id"], conv);
 
-    // A brand-new conversation id is still allowed for anyone.
-    let fresh = send(
+    // An unrestricted caller may start a conversation under a chosen id.
+    let board = Caller::local("local", Transport::Stdio);
+    let named = send(
         &reg,
         &hub,
-        &c,
-        json!({"act": "inform", "to_agent": "builder-2", "body": "new thread", "conversation_id": "conv-new"}),
+        &board,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "named", "conversation_id": "conv-named"}),
     )
     .await;
-    assert_eq!(fresh["conversation_id"], "conv-new");
+    assert_eq!(named["conversation_id"], "conv-named");
 }
 
 #[tokio::test]

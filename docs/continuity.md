@@ -172,6 +172,11 @@ the registry as `task_add`, so the caller's profile, the policy file and the
 approval gate apply as they do to a direct call. Creating is idempotent per
 conversation, title, project and priority.
 
+The ledger event is also readable by the linked task's holders — its
+`claimed_by` or `next_owner` — because a task that was handed a conversation
+needs the link (`conversation_id`, `task_id`, `created`, `by`) to reach it;
+the row stays invisible to everyone else outside the conversation.
+
 `conversation_handoffs` has the same caller rule (a verified caller that can
 see the conversation; anyone else reads `not_found`), and is also open to a
 caller with no verified identity, for whom conversations are a message board

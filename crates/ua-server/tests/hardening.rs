@@ -132,18 +132,16 @@ async fn streams_hide_committed_handoff_rows_from_outsiders() {
     // Committed rows before the streams open: a private message and a
     // conversation handoff agent-a is a party to, plus a sealed handoff note
     // that is builder-1's alone.
-    call(
-        &builder,
-        "message_send",
-        json!({ "act": "request", "to_agent": "agent-a", "body": "plan", "conversation_id": "conv-live" }),
-    )
-    .await;
+    let conv =
+        call(&builder, "message_send", json!({ "act": "request", "to_agent": "agent-a", "body": "plan" }))
+            .await["conversation_id"]
+            .clone();
     let task = call(&builder, "task_add", json!({ "title": "handed off" })).await["id"].clone();
     call(
         &builder,
         "coordination_manage",
         json!({ "action": "conversation_handoff",
-                "params": { "conversation_id": "conv-live", "task_id": task } }),
+                "params": { "conversation_id": conv, "task_id": task } }),
     )
     .await;
     let sid = call(&builder, "session_start", json!({ "kind": "interactive" })).await["session_id"].clone();
@@ -201,6 +199,50 @@ async fn streams_hide_committed_handoff_rows_from_outsiders() {
     assert!(!sse_ids(&text_a).contains(&note_seq), "participant stream: {text_a}");
     assert!(!sse_ids(&text_c).contains(&conv_seq), "outsider stream: {text_c}");
     assert!(!sse_ids(&text_c).contains(&note_seq), "outsider stream: {text_c}");
+
+    // Rows committed while the streams are open follow the same rule: open
+    // live streams first, then write one restricted row on each handoff
+    // channel agent-a is a party to.
+    let live_open = |token: &str| get("/api/events/stream", None, Some(token));
+    let live_a = hub.send(live_open(AGENT_A)).await;
+    let live_c = hub.send(live_open(AGENT_C)).await;
+    assert_eq!(live_a.status(), StatusCode::OK);
+    assert_eq!(live_c.status(), StatusCode::OK);
+
+    let agent_a = agent("agent-a");
+    let sid2 = call(&agent_a, "session_start", json!({ "kind": "interactive" })).await["session_id"].clone();
+    let note2 = call(
+        &agent_a,
+        "coordination_manage",
+        json!({ "action": "session_handoff_propose",
+                "params": { "session_id": sid2, "done": ["a"], "next_steps": ["b"] } }),
+    )
+    .await;
+    call(
+        &agent_a,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note2["id"] } }),
+    )
+    .await;
+    let task2 = call(&builder, "task_add", json!({ "title": "handed off live" })).await["id"].clone();
+    call(
+        &builder,
+        "coordination_manage",
+        json!({ "action": "conversation_handoff",
+                "params": { "conversation_id": conv, "task_id": task2 } }),
+    )
+    .await;
+    let live_note_seq = last_of("agent.lifecycle.handoff");
+    let live_conv_seq = last_of("agent.conversation.handoff");
+    assert!(live_note_seq > note_seq && live_conv_seq > conv_seq, "live rows were not appended");
+    let sentinel2 = append(&hub, "test.keep", 1);
+
+    let live_text_a = read_sse(live_a, |t| t.contains(&format!("id: {sentinel2}\n"))).await;
+    let live_text_c = read_sse(live_c, |t| t.contains(&format!("id: {sentinel2}\n"))).await;
+    assert!(sse_ids(&live_text_a).contains(&live_note_seq), "participant stream: {live_text_a}");
+    assert!(sse_ids(&live_text_a).contains(&live_conv_seq), "participant stream: {live_text_a}");
+    assert!(!sse_ids(&live_text_c).contains(&live_note_seq), "outsider stream: {live_text_c}");
+    assert!(!sse_ids(&live_text_c).contains(&live_conv_seq), "outsider stream: {live_text_c}");
 }
 
 #[tokio::test]

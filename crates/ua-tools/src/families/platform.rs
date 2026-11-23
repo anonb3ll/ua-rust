@@ -466,12 +466,19 @@ pub fn may_read(caller: &Caller, tool: &str) -> bool {
 /// that tool, evaluated as the caller with no arguments. The refusal codes are
 /// the ones a direct call of `tool` would get. A tool the policy or
 /// `approval_tools` sends through the approval gate cannot be read around it.
-/// A refusal is recorded as a gateway decision on `platform_object_get`.
-pub async fn check_read(hub: &Hub, caller: &Caller, kind: &str, tool: &'static str) -> UaResult<()> {
+/// A refusal is recorded as a gateway decision on the calling tool's name
+/// (`recorded_tool`, `platform_object_get` for the kind reader).
+pub async fn check_read(
+    hub: &Hub,
+    caller: &Caller,
+    kind: &str,
+    tool: &'static str,
+    recorded_tool: &'static str,
+) -> UaResult<()> {
     match read_gate(hub, caller, kind, tool).await {
         Ok(()) => Ok(()),
         Err((err, rule)) => {
-            record_decision_rule(hub, caller, "platform_object_get", &err, &rule).await;
+            record_decision_rule(hub, caller, recorded_tool, &err, &rule).await;
             Err(err)
         }
     }
@@ -718,7 +725,7 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
     if !t.served {
         return Err(UaError::not_found(format!("object kind {kind:?} is not served by this hub")));
     }
-    check_read(hub, caller, kind, t.profile_tool).await?;
+    check_read(hub, caller, kind, t.profile_tool, "platform_object_get").await?;
     let id = id.map(str::to_string).filter(|i| !i.is_empty());
     if t.collection {
         if id.is_some() {

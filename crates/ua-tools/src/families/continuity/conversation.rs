@@ -165,6 +165,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 &ctx.caller,
                 "conversation handoff",
                 "task_update",
+                "conversation_handoff",
             )
             .await?;
             let exists: bool = ctx

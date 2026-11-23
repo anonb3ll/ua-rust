@@ -315,15 +315,15 @@ async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
     let task = call(&reg, &hub, &owner, "task_add", json!({ "title": "review" })).await["id"].clone();
 
     // One row on each restricted channel, all originated by builder-1.
-    call(
+    let conv = call(
         &reg,
         &hub,
         &owner,
         "message_send",
-        json!({ "act": "request", "to_agent": peer.label, "body": "private", "conversation_id": "conv-1",
-                "task_id": task }),
+        json!({ "act": "request", "to_agent": peer.label, "body": "private", "task_id": task }),
     )
-    .await;
+    .await["conversation_id"]
+        .clone();
     let sid = call(&reg, &hub, &owner, "session_start", json!({ "kind": "interactive", "task_id": task }))
         .await["session_id"]
         .clone();
@@ -349,7 +349,7 @@ async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
         &hub,
         &owner,
         "coordination_manage",
-        json!({ "action": "conversation_handoff", "params": { "conversation_id": "conv-1", "task_id": task } }),
+        json!({ "action": "conversation_handoff", "params": { "conversation_id": conv, "task_id": task } }),
     )
     .await;
 
@@ -372,11 +372,28 @@ async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
     for k in restricted {
         assert!(kinds(&own).iter().any(|x| x == k), "{k} missing for the party: {own}");
     }
-    let own_metrics = call(&reg, &hub, &owner, "observability_manage", metrics).await;
+    let own_metrics = call(&reg, &hub, &owner, "observability_manage", metrics.clone()).await;
     let own_b1 = &own_metrics["events_last_7_days"]["builder-1"];
     for k in restricted {
         assert!(own_b1[k].as_i64().unwrap_or(0) >= 1, "{k} missing for the party: {own_b1}");
     }
+
+    // The message recipient is not the originator: it still sees the message
+    // row it received, and the conversation-handoff link it is a party to,
+    // but not builder-1's private handoff note.
+    let peer_view = json!({ "action": "activity", "params": { "agent": "builder-1" } });
+    let seen = call(&reg, &hub, &peer, "observability_manage", peer_view).await;
+    let seen_kinds = kinds(&seen);
+    assert!(seen_kinds.iter().any(|k| k == "message"), "recipient misses its mail: {seen}");
+    assert!(
+        seen_kinds.iter().any(|k| k == "conversation"),
+        "recipient misses the link it is a party to: {seen}"
+    );
+    assert!(seen_kinds.iter().all(|k| k != "lifecycle"), "recipient sees builder-1's private note: {seen}");
+    let peer_metrics = call(&reg, &hub, &peer, "observability_manage", metrics).await;
+    let peer_b1 = &peer_metrics["events_last_7_days"]["builder-1"];
+    assert!(peer_b1["message"].as_i64().unwrap_or(0) >= 1, "{peer_b1}");
+    assert!(peer_b1["lifecycle"].as_i64().unwrap_or(0) == 0, "{peer_b1}");
 }
 
 #[tokio::test]

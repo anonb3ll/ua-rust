@@ -56,7 +56,7 @@ const EXPERIENCE_LIMIT: usize = 3;
 const EXPERIENCE_SUMMARY_LIMIT: usize = 240;
 
 const MAX_BODY_CHARS: usize = 2000;
-const CREW_CONVERSATION_PREFIX: &str = "crew:";
+pub(crate) const CREW_CONVERSATION_PREFIX: &str = "crew:";
 const INTERVENTION_RELPATH: &str = ".ua/interventions.jsonl";
 
 const MAX_CANDIDATES: usize = 8;
@@ -430,10 +430,12 @@ fn event_rows(
     }
     let prefix = channel_prefix.unwrap_or("");
     let sql = format!(
-        "SELECT seq, ulid, channel, originator, created_at, json_extract(payload, '$.kind'), \
-         json_extract(payload, '$.tool') FROM event_log \
-         WHERE (episode_id = ?1 OR json_extract(payload, '$.session_id') = ?1 \
-                OR json_extract(payload, '$.task_id') = ?2) \
+        "SELECT seq, ulid, channel, originator, created_at, \
+         json_extract(CASE WHEN json_valid(payload) THEN payload END, '$.kind'), \
+         json_extract(CASE WHEN json_valid(payload) THEN payload END, '$.tool') FROM event_log \
+         WHERE (episode_id = ?1 OR (json_valid(payload) AND \
+                (json_extract(payload, '$.session_id') = ?1 \
+                OR json_extract(payload, '$.task_id') = ?2))) \
          AND substr(channel, 1, length(?3)) = ?3 AND ({VISIBLE_EVENT}) ORDER BY seq DESC LIMIT ?"
     );
     let session = session_id.unwrap_or("");

@@ -643,9 +643,11 @@ from its commit history.
 
 ### Security
 
-- Ledger event visibility: `agent.message.*`, `agent.lifecycle.handoff` and
+- Ledger event visibility: `agent.message.*`, `agent.mailbox.*` (inbox
+  read/ack receipts), `agent.lifecycle.handoff` and
   `agent.conversation.handoff` rows are now visible only to the readers the
-  record concerns — a message's sender and recipient, a handoff note's
+  record concerns — a message's sender and recipient, a receipt's mailbox
+  owner (its writer), a handoff note's
   parties and the session's owner (or a note-reading operator), a
   conversation's participants and the linked task's holders, or a
   mail-unrestricted reader. The rule (`VISIBLE_EVENT`) applies to
@@ -653,8 +655,13 @@ from its commit history.
   `observability_manage` activity and metrics, evidence reports and the
   migration manifest (which keeps a `{ulid, entry_hash, redacted}`
   placeholder per hidden row — chain metadata stays visible as the accepted
-  integrity exception, never the rows' contents). `message_send` can no
-  longer join an existing conversation the sender is not a party to.
+  integrity exception, never the rows' contents, channels or parties).
+  `message_send` accepts an explicit `conversation_id` from a restricted
+  caller only when the sender is already a party (or it is the addressed
+  session's `crew:<session>` thread); a missing and a foreign id answer the
+  same `not_found`, so the call is no existence test. New conversations take
+  a hub-minted id or inherit one through `reply_to`; a mail-unrestricted
+  reader may still start one under a chosen id.
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

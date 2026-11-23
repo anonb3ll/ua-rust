@@ -1818,15 +1818,20 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
         .as_str()
         .unwrap()
         .to_string();
+    // Not yet minted: the outsider's "before" probe names a missing id.
     let conversation = "conv-signing-key";
     let before = outsider_view(s, "before", hidden, &session, conversation).await;
-    s.must(
-        &builder(),
-        "message_send",
-        json!({ "act": "request", "to_agent": "builder-2", "task_id": hidden, "conversation_id": conversation,
-                "body": format!("Private: the old key is in the vault ({}).", MARKERS[0]) }),
-    )
-    .await;
+    let real_conversation = s
+        .must(
+            &builder(),
+            "message_send",
+            json!({ "act": "request", "to_agent": "builder-2", "task_id": hidden,
+                    "body": format!("Private: the old key is in the vault ({}).", MARKERS[0]) }),
+        )
+        .await["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     s.must(
         &builder(),
         "message_send",
@@ -1845,10 +1850,14 @@ async fn check_isolation(s: &Scenario, card: &mut Card) {
     s.must_act(
         &reviewer(),
         "conversation_handoff",
-        json!({ "conversation_id": conversation, "task_id": hidden }),
+        json!({ "conversation_id": real_conversation, "task_id": hidden }),
     )
     .await;
-    let after = outsider_view(s, "after", hidden, &session, conversation).await;
+    // Reading its inbox writes the owner's own agent.mailbox.* receipts.
+    s.must_act(&reviewer(), "message_inbox", json!({})).await;
+    // "before" probed a conversation id that does not exist; "after" probes
+    // the real, foreign one. The two must answer alike.
+    let after = outsider_view(s, "after", hidden, &session, &real_conversation).await;
 
     // The owner reads what the outsider must not, so the records are real.
     let owner_mailbox = shown(s.call(&reviewer(), "message_list", json!({})).await).to_string();

@@ -22,14 +22,20 @@ use crate::registry::{Registry, ToolCtx, tool};
 /// Largest page `event_log_query` returns.
 pub const MAX_LIMIT: usize = 1000;
 
-// Three channel groups hide their rows from readers outside the record:
+// Four channel groups hide their rows from readers outside the record:
 // `agent.message.*` follows the mailbox index (a label-only ledger read
 // cannot receive mail addressed to a specific session),
 // `agent.lifecycle.handoff` follows the handoff note's parties and the
-// session owner, and `agent.conversation.handoff` follows the
-// conversation's participants. Placeholder order matches `bindings()`.
+// session owner, `agent.conversation.handoff` follows the conversation's
+// participants and the linked task's holders, and `agent.mailbox.*`
+// (read/ack receipts) is the mailbox owner's own telemetry, unrestricted
+// readers only. The chain-metadata exception still shows an outsider that a
+// hidden row exists and when — placeholder and chain-head ULIDs encode
+// millisecond creation time and `seq` bounds its neighbours — never its
+// content, channel or parties. Placeholder order matches `bindings()`.
 pub(super) const VISIBLE_EVENT: &str = "(
     (channel NOT GLOB 'agent.message.*'
+        AND channel NOT GLOB 'agent.mailbox.*'
         AND channel <> 'agent.lifecycle.handoff'
         AND channel <> 'agent.conversation.handoff')
     OR (channel GLOB 'agent.message.*' AND org_id = ? AND (? OR EXISTS (
@@ -56,8 +62,10 @@ pub(super) const VISIBLE_EVENT: &str = "(
           WHERE t.id = json_extract(event_log.payload, '$.task_id')
             AND ? IN (t.claimed_by, t.next_owner)
     )))
+    OR (channel GLOB 'agent.mailbox.*' AND org_id = ? AND ?)
     -- The writer of a restricted row sees its own write; lifecycle_record
-    -- rows carry no note or session to join against.
+    -- rows carry no note or session to join against, and read/ack receipts
+    -- are written by the mailbox owner.
     OR (org_id = ? AND event_log.originator = ?)
 )";
 
@@ -90,7 +98,7 @@ impl EventReader {
         }
     }
 
-    pub(super) fn bindings(&self) -> [&dyn ToSql; 15] {
+    pub(super) fn bindings(&self) -> [&dyn ToSql; 17] {
         [
             &DEFAULT_ORG,
             &self.unrestricted,
@@ -106,6 +114,8 @@ impl EventReader {
             &self.party,
             &self.party,
             &DEFAULT_ORG,
+            &self.unrestricted,
+            &DEFAULT_ORG,
             &self.party,
         ]
     }
@@ -117,6 +127,7 @@ impl EventReader {
     /// Rows on these channels need a persisted index to authorize a live row.
     pub fn needs_visibility_check(event: &Event) -> bool {
         event.channel.starts_with("agent.message.")
+            || event.channel.starts_with("agent.mailbox.")
             || event.channel == "agent.lifecycle.handoff"
             || event.channel == "agent.conversation.handoff"
     }

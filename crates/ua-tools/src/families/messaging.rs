@@ -191,7 +191,10 @@ pub struct SendArgs {
     /// Sender label for an unverified caller. A verified caller always sends as itself.
     pub from_agent: Option<String>,
     /// Conversation id (1-200 letters, digits, `.`, `_`, `:` or `-`). A reply
-    /// without one joins its parent's conversation; otherwise a new id is minted.
+    /// without one joins its parent's conversation; otherwise a new id is
+    /// minted. A caller may name only a conversation it is already in —
+    /// naming a new or foreign id reads `not_found`; unrestricted readers
+    /// may start a conversation under a chosen id.
     pub conversation_id: Option<String>,
     /// `message_id` of a message you sent or received that this answers.
     pub reply_to: Option<String>,
@@ -823,20 +826,20 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     let inherited = check_reply(tx, reply.as_deref(), &sender)?;
     if let Some(cid) = &explicit_conversation
         && !v.unrestricted
-        && tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1)",
-            [cid],
-            |r| r.get::<_, bool>(0),
-        )?
+        // Naming the session's canonical crew conversation while addressing
+        // that session is the deterministic convention, not a chosen id.
+        && !target.as_deref().is_some_and(|t| {
+            *cid == format!("{}{t}", super::sessions_lifecycle::CREW_CONVERSATION_PREFIX)
+        })
         && !tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
-             AND (sender = ?2 OR recipient = ?2))",
+             AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
             params![cid, sender],
             |r| r.get::<_, bool>(0),
         )?
     {
-        // Joining an existing conversation needs to be a party to it;
-        // "missing" and "not yours" read alike.
+        // A restricted caller may name only a conversation it is already in:
+        // a new or foreign id answers like a missing one.
         return Err(UaError::not_found("conversation not found"));
     }
     let conversation = explicit_conversation.or(inherited).unwrap_or_else(new_id);
@@ -1686,7 +1689,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "message_send",
-            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents.",
+            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one.",
             message_send,
         )
         .family("messaging"),
