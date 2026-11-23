@@ -81,7 +81,19 @@ pub struct EventReader {
     unrestricted: bool,
     note_reader: bool,
     party: Option<String>,
+    /// The caller's organization: the only one whose `tool_calls` it reads.
+    org: String,
+    /// The caller's verified label, in any organization: whose calls a
+    /// restricted reader counts, inside [`EventReader::org`] only.
+    own: Option<String>,
 }
+
+/// The `tool_calls` rows a reader counts, as a SQL condition with three `?`
+/// placeholders bound by [`EventReader::call_bindings`]: the reader's own
+/// organization only, and in it every caller's calls for an unrestricted
+/// reader, else only the reader's own (an unverified restricted reader
+/// counts none).
+pub(super) const CALL_SCOPE: &str = "(org_id = ? AND (? OR caller = ?))";
 
 impl EventReader {
     pub fn new(cfg: &Config, caller: &Caller) -> Self {
@@ -100,6 +112,8 @@ impl EventReader {
             unrestricted,
             note_reader,
             party: verified(caller).filter(|_| caller.org_id == DEFAULT_ORG).map(str::to_owned),
+            org: caller.org_id.clone(),
+            own: verified(caller).map(str::to_owned),
         }
     }
 
@@ -109,9 +123,22 @@ impl EventReader {
         self.unrestricted
     }
 
-    /// The caller's verified label in the default organization.
-    pub(super) fn party(&self) -> Option<&str> {
-        self.party.as_deref()
+    /// The bindings of [`CALL_SCOPE`]: the reader's organization, whether it
+    /// counts every caller, and its own verified label. A `tool_calls` reader
+    /// never counts another organization's calls, unrestricted or not.
+    pub(super) fn call_bindings(&self) -> [&dyn ToSql; 3] {
+        [&self.org, &self.unrestricted, &self.own]
+    }
+
+    /// Whether the reader counts `label`'s calls (inside its own
+    /// organization, see [`CALL_SCOPE`]).
+    pub(super) fn counts_calls_of(&self, label: &str) -> bool {
+        self.unrestricted || self.own.as_deref() == Some(label)
+    }
+
+    /// The reader's organization.
+    pub(super) fn org(&self) -> &str {
+        &self.org
     }
 
     pub(super) fn bindings(&self) -> [&dyn ToSql; 19] {
