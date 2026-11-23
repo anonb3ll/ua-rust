@@ -40,7 +40,7 @@
 
 pub(crate) mod acceptance;
 mod claim;
-mod command;
+pub(crate) mod command;
 pub mod credentials;
 mod receipt;
 mod relay;

@@ -504,7 +504,8 @@ async fn a_supervised_command_needs_its_fence_and_notifies_its_owner() {
     let inbox = h.ok(&lead(), "message_list", json!({ "to_agent": "lead-1" })).await;
     let notice = &inbox["messages"][0];
     assert_eq!(notice["from_agent"], "hub-node");
-    assert_eq!(notice["message_id"], format!("node-command-{id}-1-finished"));
+    assert_eq!(notice["client_message_id"], format!("node-command-{id}-1-finished"));
+    assert_eq!(h.scalar("SELECT message_id FROM node_command_notice"), notice["message_id"]);
     assert!(notice["body"].as_str().unwrap().contains("cargo test --all"), "{notice}");
     assert_eq!(h.scalar("SELECT COUNT(*) FROM node_command_notice WHERE sent_at IS NOT NULL"), json!(1));
 }

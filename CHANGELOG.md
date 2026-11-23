@@ -877,13 +877,51 @@ from its commit history.
   the gated `crew_intervene` opens or joins a session's `crew:<session>`
   thread. `crew_view` no longer returns other agents' private mail: a
   restricted caller sees only the crew's messages and worktree intervention
-  lines it sent or received, and only the session agent gets the drop file's
-  path. `crew_intervene` no longer copies the body anywhere outside the
-  mailbox: the task-note marker records only the time and session, and the
-  worktree `.ua/interventions.jsonl` line carries the parties and
-  `message_id`. `message_send`
+  lines it sent or received (session mail only when it targets the session
+  viewed), and only the session agent gets the drop file's path.
+  `crew_intervene` no longer copies the body or the parties anywhere outside
+  the mailbox: the task-note marker records only the time and session, and
+  the worktree `.ua/interventions.jsonl` line holds only `{ts, session_id,
+  message_id}`. `crew_view` resolves each line's `message_id` against the
+  mailbox under the reader's rule and drops a line that is not a crew
+  `request` into that session, so a planted line shows nothing; only the
+  newest 1000 lines are resolved. On unix the file is opened relative to an
+  `O_NOFOLLOW` descriptor of `.ua` with `O_NOFOLLOW` itself, and must be a
+  regular file with one link, so neither a symlink (of the file or of `.ua`,
+  even swapped in between check and open) nor a hard link is written or
+  read; other platforms only check before opening and do not detect hard
+  links. `message_send`
   refuses a client-chosen `message_id` with an external-thread prefix
   (`ts:`).
+- `message_send`: a client-chosen `message_id` is the sender's own
+  idempotency key, keyed by `(sender, id)`, and no longer an existence
+  oracle. Every message now gets a hub-minted `message_id`; the client id is
+  echoed as `client_message_id` (in the send result and in listed rows).
+  The sender's retry with the same id still returns the first result,
+  while another sender's use of the same id answers exactly like a fresh id
+  instead of `conflict`. The sender's own client id also resolves as its
+  `reply_to` and in `message_list(message_id=...)`; a recipient replies and
+  acks with the hub-minted id. A send keyed before this change keeps its
+  old id and its sender's retry still finds it. Hub-node command notices
+  record the hub-minted id. A restricted caller's `conversation not found`
+  now says to omit `conversation_id` or answer with `reply_to`.
+  `ua-import` does not carry `idempotency_keys` over, so a client id from
+  imported (or otherwise pre-upgrade, unkeyed) data now produces a new
+  message on reuse instead of `conflict`.
+- `message_list` takes `client_message_id`: only messages whose sender keyed
+  them with that id. A restricted caller still sees only its own mail, so
+  the filter finds nothing it could not already list.
+- `message_send`: an unverified caller (auth enforcement off) may no longer
+  send as a label the hub sends as itself (`hub-node`, `system`,
+  `pr-watch`, ignoring case), so it cannot take a hub client id such as
+  `node-command-…` first.
+- `memory_save`: an `idempotency_key` is stored as
+  `memory_save/<caller>/<key>` and looked up only among `memory_save` rows.
+  Another tool's use of the same text (a `message_send` client id, a
+  hub-node `node-command-…` id) is no longer reported as `conflict … already
+  used by message_send`, and a memory key can no longer occupy another
+  tool's key and make its later write fail. A key `memory_save` stored before
+  this change still replays for a retry.
 - `lifecycle_record` with `kind: "handoff"` now writes to
   `agent.lifecycle.handoff_hook` instead of `agent.lifecycle.handoff`, and
   only its writer and note-reading operators can read it. Before, any agent
