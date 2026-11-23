@@ -358,6 +358,7 @@ async fn revoke(ctx: ToolCtx, a: RevokeArgs) -> UaResult<Value> {
 /// `task_id` in `repo` for `caller`. Returns the row. A refusal is ledgered
 /// (`agent.approval.refused`, kept even when the caller's transaction then
 /// rolls back) before its error is returned.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn covering(
     tx: &mut WriteTx<'_>,
     cfg: &Config,
