@@ -326,17 +326,25 @@ fn similar_notes(
 ///
 /// `idempotency_keys` is still a hub-wide table (its `(org_id, principal,
 /// key)` rebuild is a later change), so another organization's key is
-/// prefixed with its organization, in the form the task family's `idem_key`
-/// uses (`org:<org>/…`): the same label and key in two organizations are two
-/// rows, and neither replays the other's receipt. The default organization
-/// keeps the `memory_save/<label>/<key>` form.
+/// prefixed with its organization (`org:<org>/…`), escaped the same way as
+/// the label: the organization part ends at the first `/`, so no
+/// organization id, label and key can spell another organization's key. The
+/// same label and key in two organizations are two rows, and neither replays
+/// the other's receipt. The default organization keeps the
+/// `memory_save/<label>/<key>` form byte for byte, so pre-upgrade scoped
+/// receipts still replay.
 fn scoped_key(caller: &Caller, key: &str) -> String {
-    let label = caller.label.replace('%', "%25").replace('/', "%2F");
+    let label = key_part(&caller.label);
     if caller.org_id == ua_core::DEFAULT_ORG {
         format!("{SAVE_TOOL}/{label}/{key}")
     } else {
-        format!("org:{}/{SAVE_TOOL}/{label}/{key}", caller.org_id)
+        format!("org:{}/{SAVE_TOOL}/{label}/{key}", key_part(&caller.org_id))
     }
+}
+
+/// One `/`-delimited part of a stored key: `%` and `/` escaped.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F")
 }
 
 const SAVE_TOOL: &str = "memory_save";
@@ -383,6 +391,19 @@ fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResul
     let Some(key) = &p.idempotency_key else { return Ok(None) };
     let Some(raw) = saved_receipt(tx, caller, key)? else { return Ok(None) };
     let cached: Value = serde_json::from_str(&raw).map_err(|e| UaError::internal(e.to_string()))?;
+    // A receipt names a note of the caller's organization, or it is not
+    // returned: notes are never hard-deleted, so a receipt whose note this
+    // organization cannot see was written by another one, and returning it
+    // would hand over that note's id and revision. The refusal names neither.
+    if let Some(id) = cached.get("id").and_then(Value::as_str)
+        && note::fetch(tx, &caller.org_id, id)?.is_none()
+    {
+        return Err(UaError::conflict_code(
+            "idempotency_key_conflict",
+            "this idempotency_key is already recorded for a save this caller cannot replay; \
+             nothing was written. Retry with a new idempotency_key",
+        ));
+    }
     // The receipt is returned only if this caller could make the save now.
     let check_id = p.id.clone().or_else(|| cached.get("id").and_then(Value::as_str).map(str::to_string));
     let mut replay_tags = p.tags.clone().unwrap_or_default();

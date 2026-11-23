@@ -13,7 +13,10 @@
 //! so concurrent exports never overwrite each other. Writes are recorded on
 //! `agent.export.written`. The manifest applies the ledger's event visibility
 //! to message, session-handoff and conversation-handoff event rows, which
-//! carry only their id and stored hash when restricted.
+//! carry only their id and stored hash when restricted. A file export is
+//! refused (`org_unsupported`) outside the default organization, whose
+//! workspace the file would land in; an inline export works for every
+//! organization.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -97,6 +100,12 @@ fn create_exclusive(dir: &Path, stem: &str, ext: &str, data: &[u8]) -> UaResult<
 }
 
 /// Return the export inline or write it to the workspace.
+///
+/// A file lands in the hub's shared workspace root, which belongs to the
+/// default organization, so another organization's caller is refused a file
+/// (`org_unsupported`, nothing written or ledgered) and asked for an inline
+/// export instead; its export is never silently switched to inline, so the
+/// reply's shape always matches the request.
 async fn deliver(
     ctx: &ToolCtx,
     name: &'static str,
@@ -105,6 +114,14 @@ async fn deliver(
     rows: usize,
     to_file: bool,
 ) -> UaResult<Value> {
+    let org = ctx.caller.org_id.as_str();
+    if to_file && org != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "a file export is written to the hub's shared workspace and is available to the default \
+             organization only; nothing was written. Pass write_to_vault=false for an inline export",
+        ));
+    }
     let cap = if to_file { FILE_MAX_BYTES } else { INLINE_MAX_BYTES };
     if content.len() > cap {
         return Err(UaError::invalid(format!(
@@ -126,7 +143,10 @@ async fn deliver(
         Ok(file.strip_prefix(&root).unwrap_or(&file).to_string_lossy().into_owned())
     })
     .await?;
-    let (by, rel) = (ctx.caller.label.clone(), path.clone());
+    // ORG-EVENT-DEFAULT: only a default-organization file export reaches
+    // here; the originator rule matches the other families' anyway.
+    let by = if org == ua_core::DEFAULT_ORG { ctx.caller.label.clone() } else { "system".to_string() };
+    let rel = path.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -1688,7 +1708,8 @@ pub fn register(r: &mut Registry) {
             "export_tasks",
             "Export tasks as csv (RFC 4180), json or markdown. status is one status or all; project restricts \
              to one stream. write_to_vault (default true) writes exports/tasks-<UTC>.<ext> in the workspace and \
-             returns {path, rows, bytes}; false returns {content, rows}. Inline cap 2 MB; file cap 32 MB.",
+             returns {path, rows, bytes} (default organization only); false returns {content, rows}. Inline cap 2 MB; \
+             file cap 32 MB.",
             export_tasks,
         )
         .family("export"),
@@ -1698,7 +1719,8 @@ pub fn register(r: &mut Registry) {
             "export_memory",
             "Export memory notes as jsonl or json. Index notes are excluded; superseded notes are included and \
              flagged. Optional tag and since (ISO date) filters. write_to_vault (default true) writes a file under \
-             exports/ in the workspace; false returns it inline. Inline cap 2 MB; file cap 32 MB.",
+             exports/ in the workspace (default organization only); false returns it inline. Inline cap 2 MB; file \
+             cap 32 MB.",
             export_memory,
         )
         .family("export"),
@@ -1708,7 +1730,8 @@ pub fn register(r: &mut Registry) {
             "export_journal",
             "Export vault journal lines (`- **HH:MM** [Agent] text #tags`) from Logs/YYYY-MM-DD.md and every \
              Logs/<machine>/ folder as jsonl, each row tagged with machine. Optional agent and since filters. \
-             write_to_vault (default true) writes a file under exports/ in the workspace. Needs UA_VAULT_PATH.",
+             write_to_vault (default true) writes a file under exports/ in the workspace (default organization \
+             only). Needs UA_VAULT_PATH.",
             export_journal,
         )
         .family("export"),

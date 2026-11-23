@@ -282,6 +282,7 @@ async fn a_legacy_database_upgrades_every_note_into_the_default_organization() {
                     "memory_org_exists",
                     "memory_org_immutable",
                     "memory_org_superseded_by",
+                    "memory_org_superseded_by_insert",
                     "memory_versions_capture",
                     "memory_versions_org_exists",
                     "memory_versions_org_immutable",
@@ -303,6 +304,17 @@ async fn a_legacy_database_upgrades_every_note_into_the_default_organization() {
                     |r| r.get(0),
                 )?;
                 assert!(capture.contains("INSERT INTO memory_versions (org_id,"), "{capture}");
+                for (name, head) in [
+                    ("memory_org_superseded_by", "BEFORE UPDATE OF superseded_by ON memory"),
+                    ("memory_org_superseded_by_insert", "BEFORE INSERT ON memory"),
+                ] {
+                    let sql: String = c.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                        [name],
+                        |r| r.get(0),
+                    )?;
+                    assert!(sql.contains(head) && sql.contains("id = NEW.superseded_by"), "{name}: {sql}");
+                }
                 for ix in ["idx_memory_org_updated", "idx_memory_embeddings_org_model"] {
                     let n: i64 = c.query_row(
                         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
@@ -385,6 +397,10 @@ async fn versions_vectors_and_pointers_follow_their_note() {
              VALUES ('default', '{nb}', 'm', 1, x'00', 's', 'x')"
         ),
         format!("UPDATE memory SET superseded_by = '{nb}' WHERE id = '{na}'"),
+        format!(
+            "INSERT INTO memory (org_id, id, content, superseded_by, created_at, updated_at) \
+             VALUES ('default', 'pointer00001', 'x', '{nb}', 'x', 'x')"
+        ),
         format!("UPDATE memory SET org_id = '{ORG_B}' WHERE id = '{na}'"),
         format!(
             "INSERT INTO memory (org_id, id, content, created_at, updated_at) \
@@ -571,6 +587,97 @@ async fn the_same_idempotency_key_in_two_organizations_is_two_saves() {
     );
 }
 
+/// An organization id is escaped in the stored key the way the label is, so
+/// no organization id, label and key spell another organization's key: org
+/// `x/memory_save/y` with label `L` and key `k` and org `x` with label `y`
+/// and key `memory_save/L/k` are two saves.
+#[tokio::test]
+async fn an_organization_id_with_a_slash_cannot_spell_another_organizations_key() {
+    let h = H::new();
+    let (slashed, plain) = ("x/memory_save/y", "x");
+    add_org(h.hub.db(), slashed);
+    add_org(h.hub.db(), plain);
+    let in_plain = agent_named("y", plain);
+    let in_slashed = agent_named("L", slashed);
+    let r1 = h
+        .ok(
+            &in_plain,
+            "memory_save",
+            json!({ "content": "fake-plain-not-real", "idempotency_key": "memory_save/L/k" }),
+        )
+        .await;
+    let r2 = h
+        .ok(&in_slashed, "memory_save", json!({ "content": "fake-slashed-not-real", "idempotency_key": "k" }))
+        .await;
+    assert_ne!(r1["id"], r2["id"], "a second save, not the other organization's receipt");
+    assert_ne!(r1["revision"], r2["revision"]);
+    assert_eq!(h.count("SELECT COUNT(*) FROM memory WHERE org_id = 'x/memory_save/y'"), 1);
+    assert_eq!(
+        h.count(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE key IN \
+             ('org:x/memory_save/y/memory_save/L/k', 'org:x%2Fmemory_save%2Fy/memory_save/L/k')"
+        ),
+        2
+    );
+}
+
+/// A scoped receipt whose note the caller's organization cannot see is never
+/// returned (a hand-written row stands in for a key collision): the save is
+/// refused, names neither the note nor its revision, and writes nothing.
+#[tokio::test]
+async fn a_receipt_naming_another_organizations_note_is_never_replayed() {
+    let h = H::new();
+    let a = agent(DEFAULT_ORG);
+    let ra = h
+        .ok(&a, "memory_save", json!({ "content": "fake-a-receipt-not-real", "idempotency_key": "ka" }))
+        .await;
+    let id = ra["id"].as_str().unwrap().to_string();
+    let rev = ra["revision"].as_str().unwrap_or("no-revision").to_string();
+    h.sql(
+        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
+         SELECT 'org:org-b/memory_save/builder-1/kb', tool, result_json, created_at FROM idempotency_keys \
+         WHERE key = 'memory_save/builder-1/ka'",
+    )
+    .unwrap();
+    let before = (h.snapshot(), h.events());
+    let e = h
+        .call(&agent(ORG_B), "memory_save", json!({ "content": "fake-b-not-real", "idempotency_key": "kb" }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "idempotency_key_conflict", "{e}");
+    assert!(!e.to_string().contains(&id) && !e.to_string().contains(&rev), "{e}");
+    assert_eq!((h.snapshot(), h.events()), before);
+    // The default organization still replays its own receipt.
+    assert_eq!(
+        h.ok(&a, "memory_save", json!({ "content": "fake-a-receipt-not-real", "idempotency_key": "ka" }))
+            .await,
+        ra
+    );
+}
+
+// --- exports -----------------------------------------------------------------------------------
+
+/// A file export lands in the hub's shared workspace, so another
+/// organization is refused one (nothing written, nothing ledgered) and keeps
+/// the inline export.
+#[tokio::test]
+async fn another_organization_is_refused_a_file_export() {
+    let h = H::new();
+    let b = human(ORG_B);
+    h.save(&b, json!({ "content": B_BODY, "title": B_TITLE })).await;
+    let events = h.events();
+    for tool in ["export_memory", "export_tasks"] {
+        for args in [json!({}), json!({ "write_to_vault": true })] {
+            let e = h.call(&b, tool, args.clone()).await.unwrap_err();
+            assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e}");
+        }
+        let inline = h.ok(&b, tool, json!({ "write_to_vault": false })).await;
+        assert!(inline.get("content").is_some(), "{tool}: {inline}");
+    }
+    assert_eq!(h.events(), events, "no agent.export.written event");
+    assert!(!h.hub.cfg().workspace_root().join("exports").exists(), "no file in the shared workspace");
+}
+
 // --- unknown organization ----------------------------------------------------------------------
 
 #[tokio::test]
@@ -592,6 +699,27 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     // Reads find nothing and write nothing.
     assert_eq!(h.ok(&ghost, "memory_list", json!({})).await["items"], json!([]));
     assert_eq!(h.ok(&ghost, "memory_search", json!({ "query": "fake" })).await["results"], json!([]));
+    assert_eq!((h.snapshot(), h.events()), before);
+}
+
+/// A suspended organization's caller changes no note.
+#[tokio::test]
+async fn a_suspended_organization_is_refused_before_any_write() {
+    let h = H::new();
+    let b = agent(ORG_B);
+    let nb = h.save(&b, json!({ "content": "fake-suspended-not-real" })).await;
+    h.sql(&format!("UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_B}'")).unwrap();
+    let before = (h.snapshot(), h.events());
+    for (tool, args) in [
+        ("memory_save", json!({ "content": "x" })),
+        ("memory_save", json!({ "id": nb, "content": "x" })),
+        ("memory_delete", json!({ "id": nb })),
+        ("memory_restore", json!({ "id": nb })),
+        ("memory_feedback", json!({ "id": nb, "signal": "helpful" })),
+    ] {
+        let e = h.call(&b, tool, args.clone()).await.unwrap_err();
+        assert_eq!(reason(&e), "organization_suspended", "{tool}({args}): {e}");
+    }
     assert_eq!((h.snapshot(), h.events()), before);
 }
 

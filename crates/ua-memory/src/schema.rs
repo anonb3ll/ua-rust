@@ -147,7 +147,8 @@ pub const TENANT_PART: Procedure =
 /// history row names its note's organization (the `memory_versions.v1`
 /// trigger leaves `org_id` to its default, which would file another
 /// organization's history under the default one), triggers that keep a
-/// version, a vector and a supersede pointer in their note's organization,
+/// version, a vector and a supersede pointer (set by an update, or already
+/// set on an insert) in their note's organization,
 /// and indexes led by `org_id` for the listing and the vector scan.
 ///
 /// Every row is in the default organization when this part runs (the tenant
@@ -192,6 +193,10 @@ WHEN EXISTS (SELECT 1 FROM memory WHERE id = NEW.note_id AND org_id IS NOT NEW.o
 BEGIN SELECT RAISE(ABORT, 'memory note belongs to another organization'); END;
 
 CREATE TRIGGER IF NOT EXISTS memory_org_superseded_by BEFORE UPDATE OF superseded_by ON memory
+WHEN NEW.superseded_by IS NOT NULL
+ AND EXISTS (SELECT 1 FROM memory WHERE id = NEW.superseded_by AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'memory note belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS memory_org_superseded_by_insert BEFORE INSERT ON memory
 WHEN NEW.superseded_by IS NOT NULL
  AND EXISTS (SELECT 1 FROM memory WHERE id = NEW.superseded_by AND org_id IS NOT NEW.org_id)
 BEGIN SELECT RAISE(ABORT, 'memory note belongs to another organization'); END;

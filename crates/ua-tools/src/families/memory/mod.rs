@@ -457,3 +457,53 @@ fn register_maintenance(r: &mut Registry) {
         .read_only(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Hub;
+    use crate::families::{plans, tasks};
+
+    /// `ua-memory` keeps its own copy of the ORG-EVENT-DEFAULT rule (it cannot
+    /// call this crate); it must answer exactly as the plan and task
+    /// families do, for the default organization and another one.
+    #[test]
+    fn memory_ledger_rule_matches_the_plan_and_task_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::in_memory(ua_core::Config::for_home(dir.path())).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-drift', 'org-drift', 'Org drift', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        for org in [ua_core::DEFAULT_ORG, "org-drift"] {
+            for text in ["fake-title-not-real", ""] {
+                assert_eq!(ua_memory::ledger_text(org, json!(text)), plans::ledger_text(org, text), "{org}");
+            }
+            for label in [Some("fake-agent-not-real"), None] {
+                assert_eq!(ua_memory::ledger_label(org, label), plans::ledger_label(org, label), "{org}");
+            }
+            let by = "fake-agent-not-real";
+            let written: Option<String> = hub
+                .db()
+                .write(|tx| {
+                    tasks::emit(tx, org, "agent.task.updated", json!({ "id": 1 }), by)?;
+                    Ok(tx.query_row(
+                        "SELECT originator FROM event_log ORDER BY seq DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(written.as_deref(), Some(ua_memory::ledger_originator(org, by)), "{org}");
+            let want = if org == ua_core::DEFAULT_ORG { by } else { "system" };
+            assert_eq!(written.as_deref(), Some(want), "{org}");
+        }
+    }
+}

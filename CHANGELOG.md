@@ -485,11 +485,17 @@ from its commit history.
   `vault_ingest`, `state_sync_verify` and `system_doctor` read and write
   only the caller's organization's notes; another organization's note
   answers as a missing one, and a write for an unknown organization is
-  refused (`unknown_organization`). `memory_promote` is refused outside the
-  default organization (`org_unsupported`). Another organization's save
-  keys are stored as `org:<org>/memory_save/<label>/<key>`. Memory events
-  stay in the default ledger with another organization's titles, tags,
-  revisions and labels `null` and the originator `system`. The importer
+  refused (`unknown_organization`), as is one for a suspended organization
+  (`organization_suspended`). `memory_promote`, and a file export
+  (`write_to_vault`) of tasks, notes or the journal, are refused outside the
+  default organization (`org_unsupported`); an inline export still works.
+  Another organization's save keys are stored as
+  `org:<org>/memory_save/<label>/<key>` with the organization and label
+  escaped, and a receipt naming a note the caller cannot see is refused
+  (`idempotency_key_conflict`), never replayed. Memory events and
+  `state_sync_verify`'s resync event stay in the default ledger with
+  another organization's titles, tags, revisions and labels `null` and the
+  originator `system`. The importer
   writes legacy notes and versions to `default`. Accepted leak candidate:
   bm25 corpus statistics over the one `memory_fts` index span every
   organization.

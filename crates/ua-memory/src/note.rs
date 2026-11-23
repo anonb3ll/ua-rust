@@ -560,18 +560,25 @@ pub(crate) fn superseded_notes(conn: &Connection, org: &str, id: &str) -> UaResu
     Ok(stmt.query_map(params![id, org], |r| r.get(0))?.collect::<Result<_, _>>()?)
 }
 
-/// Refuse an organization `orgs` does not hold, before anything is written.
-/// The `org_exists` triggers fire only on insert, so a write with nothing to
-/// insert (an update, a soft delete) would otherwise pass.
+/// Refuse an organization `orgs` does not hold, or holds as suspended,
+/// before anything is written. The `org_exists` triggers fire only on
+/// insert and do not read the status, so a write with nothing to insert (an
+/// update, a soft delete) or a suspended organization's insert would
+/// otherwise pass.
 pub(crate) fn require_org(conn: &Connection, org: &str) -> UaResult<()> {
-    let known = conn.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
-    if !known {
-        return Err(UaError::denied(
+    let status: Option<String> =
+        conn.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
             "unknown_organization",
             format!("unknown organization {org:?}; no memory note was changed"),
-        ));
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no memory note was changed"),
+        )),
     }
-    Ok(())
 }
 
 // ── ledger ─────────────────────────────────────────────────────────────────
@@ -586,21 +593,30 @@ pub(crate) fn require_org(conn: &Connection, org: &str) -> UaResult<()> {
 /// neutral `system`, never the acting agent. Every `agent.memory.*` channel
 /// is an ordinary visible one (`VISIBLE_EVENT` restricts none of them).
 pub(crate) fn emit(tx: &mut WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
-    let by = if org == ua_core::DEFAULT_ORG { by } else { "system" };
+    let by = ledger_originator(org, by);
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
     Ok(())
+}
+
+/// The originator of a memory event: the acting label in the default
+/// organization, the neutral `system` for another one's (see [`emit`]).
+/// The same rule as `ua_tools::families::tasks::emit`; `ua-tools` tests that
+/// the two never drift.
+pub fn ledger_originator<'a>(org: &str, by: &'a str) -> &'a str {
+    if org == ua_core::DEFAULT_ORG { by } else { "system" }
 }
 
 /// A value for a memory event's payload: kept for the default organization,
 /// `null` for another one's (whose event is written to the default
 /// organization's ledger), so the payload keeps its shape. The same rule as
-/// `ua_tools::families::plans::ledger_text`, which this crate cannot call.
-pub(crate) fn ledger_text(org: &str, v: Value) -> Value {
+/// `ua_tools::families::plans::ledger_text`, which this crate cannot call;
+/// `ua-tools` tests that the two never drift.
+pub fn ledger_text(org: &str, v: Value) -> Value {
     if org == ua_core::DEFAULT_ORG { v } else { Value::Null }
 }
 
 /// An optional label (an author, an actor) under the [`ledger_text`] rule.
-pub(crate) fn ledger_label(org: &str, label: Option<&str>) -> Value {
+pub fn ledger_label(org: &str, label: Option<&str>) -> Value {
     match label {
         Some(l) => ledger_text(org, json!(l)),
         None => Value::Null,

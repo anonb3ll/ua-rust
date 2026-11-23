@@ -708,13 +708,22 @@ here for memory columns, owners and defaults.
   `system_doctor`'s note and vector counts. The UI and the compatibility
   API reach memory only through these tools. Another organization's note
   answers exactly as a missing one; a write for an organization `orgs` does
-  not hold is refused (`unknown_organization`) before anything changes.
+  not hold is refused (`unknown_organization`), and one for a suspended
+  organization (`organization_suspended`), before anything changes.
   `memory_promote` copies a note into the hub-wide vault, so another
-  organization's caller is refused (`org_unsupported`). A save's
-  idempotency key is stored as `org:<org>/memory_save/<label>/<key>` in
-  another organization (the default keeps `memory_save/<label>/<key>`), and
-  a pre-upgrade raw key replays only in the default organization. Memory
-  events are `ORG-EVENT-DEFAULT` sites: for another organization the title,
+  organization's caller is refused (`org_unsupported`). A file export
+  (`export_memory`, `export_tasks`, `export_journal` with
+  `write_to_vault`, the default) lands in the hub's shared workspace, so it
+  is refused outside the default organization (`org_unsupported`, nothing
+  written or ledgered); `write_to_vault=false` returns the export inline.
+  A save's idempotency key is stored as `org:<org>/memory_save/<label>/<key>`
+  in another organization, with `%` and `/` escaped in both the
+  organization and the label (the default keeps `memory_save/<label>/<key>`
+  byte for byte), a receipt whose note the caller's organization cannot see
+  is refused (`idempotency_key_conflict`) rather than replayed, and a
+  pre-upgrade raw key replays only in the default organization. Memory
+  events and `state_sync_verify`'s `agent.state.resynced` are
+  `ORG-EVENT-DEFAULT` sites: for another organization the title,
   tags, revision hash, author, owner and actor are `null` and the
   originator is `system`; ids, modes, signals and timestamps remain. The
   importer writes legacy notes and versions to `default` and never copies a

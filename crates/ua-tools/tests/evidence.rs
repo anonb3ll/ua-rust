@@ -616,6 +616,44 @@ async fn state_sync_verify_detects_and_repairs_drift() {
     assert_eq!(after["drift_details"]["dangling_references"], 1);
     let hits = call(&reg, &hub, &who, "task_list", json!({ "status": "all", "query": "unindexed" })).await;
     assert!(hits.to_string().contains("unindexed"), "{hits}");
+    assert_eq!(resync_originators(&hub), ["builder-1"], "the default organization's caller");
+}
+
+fn resync_originators(hub: &Hub) -> Vec<String> {
+    hub.db()
+        .read(|c| {
+            Ok(c.prepare(
+                "SELECT originator FROM event_log WHERE channel = 'agent.state.resynced' ORDER BY seq",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+/// ORG-EVENT-DEFAULT: another organization's resync is ledgered in the
+/// default organization, so its originator is `system`, not the caller.
+#[tokio::test]
+async fn another_organizations_resync_is_ledgered_as_system() {
+    let hub = hub();
+    let reg = builtin_registry();
+    exec(
+        &hub,
+        "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+         VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+    );
+    let who = Caller { org_id: "org-b".into(), ..agent("kestrel-fake-b") };
+    let now = ua_core::time::now();
+    exec(
+        &hub,
+        &format!(
+            "DROP TRIGGER task_fts_ai;
+             INSERT INTO tasks (org_id, title, created_at, updated_at) VALUES ('org-b', 'unindexed', '{now}', '{now}');"
+        ),
+    );
+    let drift = call(&reg, &hub, &who, "state_sync_verify", json!({})).await;
+    assert_eq!(drift["resynced"], true, "{drift}");
+    assert_eq!(resync_originators(&hub), ["system"]);
 }
 
 #[tokio::test]

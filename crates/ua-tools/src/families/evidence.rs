@@ -791,21 +791,21 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
     let mut resynced = false;
     if !drifted.is_empty() {
         let names = drifted.clone();
-        let by = ctx.caller.label.clone();
+        let (org, by) = (ctx.caller.org_id.clone(), ctx.caller.label.clone());
         ctx.hub
             .db()
             .write_async(move |tx| {
                 for n in &names {
                     tx.execute(&format!("INSERT INTO \"{n}\"(\"{n}\") VALUES ('rebuild')"), [])?;
                 }
-                ledger::append(
+                // ORG-EVENT-DEFAULT: written to the default organization's
+                // ledger, so another organization's caller is `system`.
+                crate::families::tasks::emit(
                     tx,
-                    EventInput::new(
-                        ua_core::DEFAULT_ORG,
-                        "agent.state.resynced",
-                        json!({ "fts_indexes": names }),
-                    )
-                    .by(by),
+                    &org,
+                    "agent.state.resynced",
+                    json!({ "fts_indexes": names }),
+                    &by,
                 )?;
                 Ok(())
             })
