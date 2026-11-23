@@ -1589,20 +1589,47 @@ hub-minted id or inherit one through `reply_to`. The one exception is
 `crew_intervene`, which after its own profile check and approval gate may
 open or join the session's `crew:<session>` thread; a direct `message_send`
 naming that id is refused like any other. `crew_view` applies the mailbox
-rule to its messages and its `worktree_interventions` audit lines: a
-restricted caller sees only those it sent or received, and only the session
-agent and unrestricted readers get the drop file's `interventions_path`.
-The body lives only in the mailbox: the worktree's
-`.ua/interventions.jsonl` line (readable through the workspace's fs tools)
-carries the parties and `message_id`, and the task-note marker
-(`[intervention @ <time>] session=<sid>`, readable by every caller) only
-shows that the session was steered and when — that existence and timing are
-the residual, like the chain metadata above. The recipient of session-targeted mail (including the
-session owner in its `crew:<session>` thread) is not a party for naming the
-conversation or reading its handoff links; it answers through `reply_to`.
-A client-chosen `message_id` that collides with any existing message still
-answers `conflict`, which shows that some message holds that id, never its
-content or parties.
+rule to its messages and its `worktree_interventions`: a restricted caller
+sees only mail it sent, label mail it received, and session mail addressed
+to the session it is viewing; only the session agent and unrestricted
+readers get the drop file's `interventions_path`. The worktree's
+`.ua/interventions.jsonl` sits in the shared workspace, readable through the
+fs tools, so each line holds only `{ts, session_id, message_id}`: no
+parties, task or body. `crew_view` treats a line as a pointer, joins its
+`message_id` to the mailbox index under the reader's rule, and drops any
+line that does not name a crew `request` into that session, so a line
+planted by anyone with workspace write access shows nothing. Only the newest
+1000 lines are resolved. The drop file
+and the task-note marker (`[intervention @ <time>] session=<sid>`, readable
+by every caller) show only that the session was steered and when; that
+existence and timing are the residual, like the chain metadata above. The
+file is opened without following links on unix: the worktree and its `.ua`
+are opened as directories with `O_NOFOLLOW`, the file is opened relative to
+the `.ua` descriptor with `O_NOFOLLOW`, and it must be a regular file with a
+single link, so a symlinked file or `.ua` (even one swapped in after a check)
+and a hard link to a file elsewhere are refused. Other platforms check only
+before opening: a swap in between, and a hard link, are not caught.
+
+The recipient of session-targeted mail (including the session owner in its
+`crew:<session>` thread) is not a party for naming the conversation or
+reading its handoff links; it answers through `reply_to`, which does count
+it as a party.
+
+A client-chosen `message_id` is the sender's own idempotency key, keyed by
+`(sender, id)`; the message itself always gets a hub-minted `message_id`,
+and the client id is echoed as `client_message_id`. The sender's retry with
+the same id returns the first result; another sender's use of the same id
+is independent and answers exactly like a fresh id, so the id reveals
+nothing about other senders' messages. The sender's own client id also
+resolves as its `reply_to` and in `message_list(message_id=...)`.
+`message_list(client_message_id=...)` filters by a sender's key for any
+reader, under the same reader rule, so a restricted caller finds only its
+own mail. No other tool sees a send's key: `memory_save` stores its keys as
+`memory_save/<caller>/<key>` and reads only its own rows, so a memory key
+spelling a send's key is a fresh key, never `conflict`, and never occupies
+the send's row. An unverified caller may not send as a label the hub sends
+as itself (`hub-node`, `system`, `pr-watch`), so it cannot take a hub client
+id first.
 
 `agent.lifecycle.handoff` carries only the authoritative handoff-note events.
 A hook-reported handoff (`lifecycle_record` with `kind: "handoff"`) goes to

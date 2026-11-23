@@ -409,7 +409,7 @@ Inventory of the paths that read the table today, and the rule for each:
 | `memory_get`, `note_links`, versions | by id, unscoped | Scoped; linked ids, `supersedes`, `superseded_by` and `contradicts` show only visible notes |
 | `memory_save` update / append / overwrite, `linked_note` for `supersedes`/`contradicts` | by id | Scoped; a hidden target is `not_found` |
 | `memory_save` `similar_notes` / `check_only` | unscoped similarity | Only visible notes are compared or returned |
-| `memory_save` idempotency replay | key looked up globally | The key is rebuilt as `(org_id, principal, key)` (organization doc), so it is scoped by organization **and** principal; a replay by another principal is a fresh call, and the "already used" and "is deleted" errors appear only to the key's own principal |
+| `memory_save` idempotency replay | key stored as `memory_save/<caller>/<key>` and read only from `memory_save` rows (a pre-upgrade raw `memory_save` key still replays) | The key is rebuilt as `(org_id, principal, key)` (organization doc), so it is scoped by organization **and** principal; a replay by another principal is a fresh call, and the "already used" and "is deleted" errors appear only to the key's own principal |
 | `memory_delete`, `memory_restore`, `memory_feedback` | by id | Scoped |
 | `memory_prune_candidates`, `recall_maintenance` (`live_notes`) | unfiltered | Scoped to the caller |
 | `memory_promote` | copies any note to the shared vault | Only in `'default'` (the vault is hub-scoped) and only `org`-visible notes |

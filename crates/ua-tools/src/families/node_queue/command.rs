@@ -229,11 +229,14 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
         })?;
         let send = |to_session: Option<&str>| {
             hub.db().write(|tx| {
-                messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                let sent =
+                    messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                // `mid` is hub-node's client id; the message's own id is the hub's.
+                let message_id = sent["message_id"].as_str().unwrap_or(&mid).to_string();
                 tx.execute(
                     "UPDATE node_command_notice SET sent_at = ?4, message_id = ?5, last_error = NULL \
                      WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3",
-                    params![item_id, attempt, terminal, now(), mid],
+                    params![item_id, attempt, terminal, now(), message_id],
                 )?;
                 Ok(())
             })
