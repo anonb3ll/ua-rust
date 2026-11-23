@@ -1785,7 +1785,7 @@ mod tests {
         c.execute_batch(
             "INSERT INTO schema_parts (name, checksum, applied_at)
              VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT);
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT, org_id TEXT NOT NULL DEFAULT 'default');
              CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
              -- The columns VISIBLE_EVENT joins on, minimal versions of the
              -- real tables.
