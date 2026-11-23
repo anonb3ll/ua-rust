@@ -146,10 +146,12 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_action_tool ON tool_calls(action_tool,
 
 /// `organization.v1.tools.tool_calls`: `org_id` on `tool_calls` and the
 /// generated `tool_calls_org_exists` / `tool_calls_org_immutable` triggers.
-/// Every existing row takes the default organization: every caller the hub
-/// authenticated was a default-organization caller, so that is where the
-/// recorded calls were made. Nothing is dropped. No key rebuild: the only
-/// key is an AUTOINCREMENT id.
+/// Every existing row takes the default organization. Before this part the
+/// only caller outside it could be #121's `github` system caller (on a hub
+/// with a second organization added by hand); its rows, if any, hold only
+/// a tool name, the `github` label, timing and outcome, and stay in
+/// `default`. Nothing is dropped. No key rebuild: the only key is an
+/// AUTOINCREMENT id.
 pub const TOOL_CALLS_TENANT_PART: ua_store::Procedure =
     ua_store::org::tenant_part("organization.v1.tools.tool_calls", &["tool_calls"]);
 

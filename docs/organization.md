@@ -699,8 +699,9 @@ here for memory columns, owners and defaults.
   their shape (no `org_id`). The importer has no mapping for the table.
 - Tool-call telemetry: `organization.v1.tools.tool_calls` gives
   `tool_calls` its `org_id` and triggers (every existing row is the default
-  organization's: every caller the hub authenticated was a
-  default-organization caller), and `core.v5.tool_calls_org_scope` adds two
+  organization's; the only earlier caller outside it could be #121's
+  `github` system caller on a hub with a hand-added organization, whose
+  rows hold only a tool name, the `github` label, timing and outcome), and `core.v5.tool_calls_org_scope` adds two
   indexes led by `org_id`. Nothing is dropped; no rebuild (AUTOINCREMENT
   key). The registry records the caller's organization on every row, in
   the statement it already ran (no extra query per call; an unknown

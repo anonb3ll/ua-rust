@@ -400,14 +400,14 @@ fn the_triggers_refuse_a_cross_organization_task_and_an_unknown_organization() {
                 "INSERT INTO policy_authorizations (org_id, repo, head_sha, task_id, policy_ref, authorized_by, \
                  created_at, expires_at) VALUES ('{UNKNOWN}', 'r', '{HEAD_A}', 999, 'p', 'o', 'x', 'x')"
             ),
-            "",
+            "unknown organization",
         ),
         (
             format!(
                 "INSERT INTO tool_calls (org_id, tool, caller, profile, transport, started_at, duration_ms, \
                  outcome) VALUES ('{UNKNOWN}', 't', 'c', 'developer', 'mcp', 'x', 1, 'ok')"
             ),
-            "",
+            "unknown organization",
         ),
     ] {
         let e = h.sql(&sql).unwrap_err();
@@ -581,6 +581,12 @@ async fn policy_authorizations_are_isolated_per_organization() {
         assert_eq!(p["approved_payload_sha256"].is_string(), id == auth_a, "{id}: {p}");
     }
     // The full check (`covering`), when git is here to reach it.
+    // CI always has git, so there the full check must run rather than be
+    // skipped silently.
+    assert!(
+        git_head.is_some() || std::env::var_os("CI").is_none(),
+        "CI must have git for the covering check"
+    );
     if git_head.is_some() {
         h.sql(&format!("UPDATE tasks SET status = 'done', branch = 'task-7' WHERE id = {ta}")).unwrap();
         let dry = |id: i64| json!({ "task_id": ta, "policy_authorization_id": id, "dry_run": true });
