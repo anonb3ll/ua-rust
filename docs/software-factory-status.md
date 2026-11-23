@@ -98,7 +98,7 @@ from it and may lag behind it.
 
 ## Current scorecard
 
-62 checks: 37 pass, 7 fail, 18 not-built.
+64 checks: 44 pass, 2 fail, 18 not-built.
 
 ### 1. Plan and delegate
 
@@ -171,13 +171,15 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `isolation.same-org-mailbox-direct-read` | pass | |
 | `isolation.same-org-handoff-note` | pass | |
 | `isolation.same-org-conversation-handoffs` | pass | |
+| `isolation.same-org-conversation-naming` | pass | `message_send` naming a missing `conversation_id` before and the real, foreign one after answers the same `not_found`. |
+| `isolation.same-org-crew-view` | pass | `crew_view` on the owner's session lists only the outsider's own mail. |
 | `isolation.same-org-own-inbox` | pass | Control check. |
-| `isolation.same-org-ledger-read` | fail | Scored: the mailbox and handoff restriction applied to ledger reads. Ledger reads (`event_log_query`) are not scoped per caller: message and handoff events are returned to every caller whose profile allows ledger reads. |
-| `isolation.same-org-stream` | fail | Scored: the same restriction applied to the event stream. The event stream uses the same unscoped rule as ledger reads. |
-| `isolation.same-org-handoffs-in-retrieval` | fail | Scored: the same restriction applied to resume packets. `session_packet` for a task includes the latest typed handoff on it, and the task's recent events, whoever they are addressed to. |
-| `isolation.same-org-evidence` | fail | Scored: the same restriction applied to evidence reports. `evidence_report` on a task lists the ledger events of messages and handoffs on it, with sender and time, to callers who cannot read them. |
-| `isolation.same-org-exports` | fail | Scored: the same restriction applied to exports. The manifest export is refused by the developer profile, so it is out of reach rather than shown clean; the tasks export changes because `conversation_handoff` writes a line naming the conversation into the task's notes. |
-| `isolation.same-org-retrieval-and-explanations` | fail | Scored: the same restriction applied to retrieval and its explanations. Memory search is unchanged; ranked task search returns the task with the line `conversation_handoff` writes into its notes. |
+| `isolation.same-org-ledger-read` | pass | `event_log_query` and observability: builder-3's view is identical before and after the hidden records exist; message, handoff-note and conversation-handoff rows outside its access are filtered. |
+| `isolation.same-org-stream` | pass | Event stream: builder-3's view is identical before and after the hidden records exist; the backfill applies the same filter as ledger reads. |
+| `isolation.same-org-handoffs-in-retrieval` | pass | `session_packet(task_id)`: builder-3's view is identical before and after the hidden records exist. |
+| `isolation.same-org-evidence` | fail | Scored: the same restriction applied to evidence reports. The hidden events no longer appear, but the record's `tool_calls` window still counts the governed calls the participants made while writing them (counts only, no payloads). Chain metadata — the manifest's `{ulid, entry_hash, redacted}` placeholders, the chain head and `total_verified` — stays visible as the accepted integrity exception. |
+| `isolation.same-org-exports` | pass | Export: builder-3's view is identical before and after the hidden records exist. Chain metadata stays visible as the accepted integrity exception: the manifest's `{ulid, entry_hash, redacted}` placeholders for hidden rows, the chain head and `total_verified`. |
+| `isolation.same-org-retrieval-and-explanations` | pass | `memory_search` and ranked `task_list`: builder-3's view is identical before and after the hidden records exist. |
 
 ### 5. Verify independently
 
@@ -197,7 +199,7 @@ back; see [policy](policy.md#approvals-in-the-audit-record).
 | `verify.authenticity-against-trusted-key` | not-built | Exports carry no signature or signed checkpoint. |
 | `verify.asserted-evidence-labelled` | pass | |
 | `verify.unavailable-and-unhashed-evidence-reported` | not-built | No bundle verifier reports unavailable evidence or unhashed legacy rows. |
-| `verify.private-content-kept-out` | pass | The migration manifest gives the auditor IDs and stored hashes for message rows outside its mailbox. |
+| `verify.private-content-kept-out` | pass | The migration manifest gives the auditor only the ID and stored hash (a `redacted` placeholder) for rows outside its event visibility — messages, handoff notes and conversation-handoff links. |
 | `verify.unauthorized-caller-refused-export` | pass | Refused by the developer profile; the gate is the coordinator profile, not an auditor grant. |
 | `verify.auditor-authorization` | not-built | No auditor role or grant exists: any coordinator-profile agent may export the whole hub. |
 

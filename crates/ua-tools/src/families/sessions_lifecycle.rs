@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -36,6 +36,7 @@ use ua_store::{EventInput, ledger};
 
 use super::agents::verified;
 use super::audit::rules::redact_secrets;
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::injection::{injection_regex, mark_untrusted};
 use super::messaging::may_read_all_mail;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
@@ -55,7 +56,7 @@ const EXPERIENCE_LIMIT: usize = 3;
 const EXPERIENCE_SUMMARY_LIMIT: usize = 240;
 
 const MAX_BODY_CHARS: usize = 2000;
-const CREW_CONVERSATION_PREFIX: &str = "crew:";
+pub(crate) const CREW_CONVERSATION_PREFIX: &str = "crew:";
 const INTERVENTION_RELPATH: &str = ".ua/interventions.jsonl";
 
 const MAX_CANDIDATES: usize = 8;
@@ -281,8 +282,10 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
     // A packet may describe another agent's session. Only the caller's own
     // session can admit handoffs addressed to that session.
     let own_session = session.as_ref().filter(|s| s["agent"].as_str() == who).and(sid_str.as_deref());
-    let recent_events = event_rows(conn, sid_str.as_deref(), task_id, None, EVENT_LIMIT);
-    let lifecycle = event_rows(conn, sid_str.as_deref(), task_id, Some("agent.lifecycle."), LIFECYCLE_LIMIT);
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    let recent_events = event_rows(conn, &reader, sid_str.as_deref(), task_id, None, EVENT_LIMIT);
+    let lifecycle =
+        event_rows(conn, &reader, sid_str.as_deref(), task_id, Some("agent.lifecycle."), LIFECYCLE_LIMIT);
 
     let memory = task
         .as_ref()
@@ -413,9 +416,11 @@ fn query_rows<P: rusqlite::Params>(
     stmt.query_map(p, f).map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
 }
 
-/// Recent ledger events for a session or task, newest first, without payloads.
+/// Recent ledger events for a session or task, newest first, without
+/// payloads; private-record rows are limited to the caller's visibility.
 fn event_rows(
     conn: &Connection,
+    reader: &EventReader,
     session_id: Option<&str>,
     task_id: Option<i64>,
     channel_prefix: Option<&str>,
@@ -425,22 +430,29 @@ fn event_rows(
         return Vec::new();
     }
     let prefix = channel_prefix.unwrap_or("");
-    query_rows(
-        conn,
-        "SELECT seq, ulid, channel, originator, created_at, json_extract(payload, '$.kind'), \
-         json_extract(payload, '$.tool') FROM event_log \
-         WHERE (episode_id = ?1 OR json_extract(payload, '$.session_id') = ?1 \
-                OR json_extract(payload, '$.task_id') = ?2) \
-         AND substr(channel, 1, length(?3)) = ?3 ORDER BY seq DESC LIMIT ?4",
-        params![session_id.unwrap_or(""), task_id.unwrap_or(-1), prefix, limit as i64],
-        |r| {
-            Ok(json!({
-                "seq": r.get::<_, i64>(0)?, "ulid": r.get::<_, String>(1)?, "channel": r.get::<_, String>(2)?,
-                "originator": r.get::<_, Option<String>>(3)?, "created_at": r.get::<_, String>(4)?,
-                "kind": r.get::<_, Option<String>>(5)?, "tool": r.get::<_, Option<String>>(6)?,
-            }))
-        },
-    )
+    let sql = format!(
+        "SELECT seq, ulid, channel, originator, created_at, \
+         json_extract(CASE WHEN json_valid(payload) THEN payload END, '$.kind'), \
+         json_extract(CASE WHEN json_valid(payload) THEN payload END, '$.tool') FROM event_log \
+         WHERE (episode_id = ?1 OR (json_valid(payload) AND \
+                (json_extract(payload, '$.session_id') = ?1 \
+                OR json_extract(payload, '$.task_id') = ?2))) \
+         AND substr(channel, 1, length(?3)) = ?3 AND ({VISIBLE_EVENT}) ORDER BY seq DESC LIMIT ?"
+    );
+    let session = session_id.unwrap_or("");
+    let task = task_id.unwrap_or(-1);
+    let limit = limit as i64;
+    let bindings = [&session as &dyn rusqlite::ToSql, &task, &prefix]
+        .into_iter()
+        .chain(reader.bindings())
+        .chain([&limit as &dyn rusqlite::ToSql]);
+    query_rows(conn, &sql, params_from_iter(bindings), |r| {
+        Ok(json!({
+            "seq": r.get::<_, i64>(0)?, "ulid": r.get::<_, String>(1)?, "channel": r.get::<_, String>(2)?,
+            "originator": r.get::<_, Option<String>>(3)?, "created_at": r.get::<_, String>(4)?,
+            "kind": r.get::<_, Option<String>>(5)?, "tool": r.get::<_, Option<String>>(6)?,
+        }))
+    })
 }
 
 /// Keep the packet under [`PACKET_BYTE_LIMIT`] by trimming list sections from
@@ -1010,16 +1022,22 @@ fn intervention_path(ctx: &ToolCtx, worktree: Option<&str>) -> Option<PathBuf> {
     Some(real.join(INTERVENTION_RELPATH))
 }
 
-fn read_interventions(path: Option<&Path>, limit: usize) -> Vec<Value> {
+/// The newest `limit` intervention lines; for a restricted reader (`party`),
+/// only those it sent or received, as in its own mailbox.
+fn read_interventions(path: Option<&Path>, limit: usize, party: Option<&str>) -> Vec<Value> {
     let Some(path) = path.filter(|p| p.is_file()) else { return Vec::new() };
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(limit)..]
-        .iter()
+    // Filter first, then window, so other agents' lines never crowd out the
+    // reader's own.
+    let mut rows: Vec<Value> = text
+        .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(Value::is_object)
-        .collect()
+        .filter(|v| party.is_none_or(|p| v["from_agent"] == p || v["to_agent"] == p))
+        .collect();
+    rows.drain(..rows.len().saturating_sub(limit));
+    rows
 }
 
 async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
@@ -1029,6 +1047,12 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
     }
     let cap = a.limit.unwrap_or(50).clamp(1, 200);
     let sid2 = sid.clone();
+    // A verified caller without the mail-unrestricted grant sees only the
+    // crew's messages it sent or received, as in its own mailbox.
+    let party = verified(&ctx.caller)
+        .filter(|_| !super::messaging::may_read_all_mail(ctx.hub.cfg(), &ctx.caller))
+        .map(str::to_string);
+    let party_q = party.clone();
     let (session, mut messages) = ctx
         .hub
         .db()
@@ -1040,9 +1064,16 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
                  i.sender, i.recipient, i.task_id, i.delegation_id, i.target_session, i.sender_session, \
                  i.read_at, i.acked_at, e.payload \
                  FROM message_index i LEFT JOIN event_log e ON e.ulid = i.event_ulid \
-                 WHERE i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
-                 OR (?3 IS NOT NULL AND i.delegation_id = ?3) ORDER BY i.event_seq DESC LIMIT ?4",
-                params![crew_conversation_id(&sid2), session["task_id"].as_i64(), session["delegation_id"].as_i64(), cap],
+                 WHERE (i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
+                 OR (?3 IS NOT NULL AND i.delegation_id = ?3)) \
+                 AND (?5 IS NULL OR i.sender = ?5 OR i.recipient = ?5) ORDER BY i.event_seq DESC LIMIT ?4",
+                params![
+                    crew_conversation_id(&sid2),
+                    session["task_id"].as_i64(),
+                    session["delegation_id"].as_i64(),
+                    cap,
+                    party_q
+                ],
                 |r| {
                     let payload: Option<String> = r.get(15)?;
                     let payload: Value = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or(Value::Null);
@@ -1074,8 +1105,13 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         "conversation_id": crew_conversation_id(&sid),
         "messages": messages,
         "message_total": total,
-        "interventions_path": drop_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "worktree_interventions": read_interventions(drop_path.as_deref(), cap as usize),
+        // The drop file's location is the session agent's and unrestricted
+        // readers' business only.
+        "interventions_path": drop_path
+            .as_ref()
+            .filter(|_| party.is_none() || party.as_deref() == session["agent"].as_str())
+            .map(|p| p.to_string_lossy().into_owned()),
+        "worktree_interventions": read_interventions(drop_path.as_deref(), cap as usize, party.as_deref()),
     }))
 }
 
@@ -1151,17 +1187,22 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
     }
     // Delivery goes through the messaging family's own tool, so its identity,
     // duplicate and loop guards apply unchanged.
-    let message = registry().call(&ctx.hub, &ctx.caller, "message_send", Value::Object(args)).await?;
+    // Bound as a crew delivery, the send may open or join crew:<sid> even
+    // when the session has gone quiet and delivery falls back to its label.
+    let message = super::messaging::as_crew_delivery(
+        sid.clone(),
+        registry().call(&ctx.hub, &ctx.caller, "message_send", Value::Object(args)),
+    )
+    .await?;
     let duplicate = message["duplicate"] == json!(true);
 
     let task_id = session["task_id"].as_i64();
     let mut note_recorded = false;
     if let Some(t) = task_id {
-        let marker = format!(
-            "[intervention @ {}] session={sid} from {sender}: {}",
-            ua_core::time::now(),
-            truncate(&text, 500)
-        );
+        // Task notes are readable by every caller: the marker records only
+        // that the session was steered and when. Sender, message and body
+        // stay with the mailbox rule.
+        let marker = format!("[intervention @ {}] session={sid}", ua_core::time::now());
         let mut upd = json!({ "id": t, "append_note": marker });
         if let Some(n) = &named {
             upd["actor"] = json!(n);
@@ -1175,7 +1216,7 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
         let line = json!({
             "ts": ua_core::time::now(), "session_id": sid, "from_agent": sender, "to_agent": recipient,
             "to_session": sid, "message_id": message["message_id"], "task_id": task_id,
-            "delegation_id": session["delegation_id"], "body": text,
+            "delegation_id": session["delegation_id"],
         });
         let path = path.clone();
         worktree_written = blocking(move || {
@@ -1241,7 +1282,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "crew_intervene",
-            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task and appends an audit line to the session worktree's .ua/interventions.jsonl (inside the workspace only). Always approval-gated.",
+            "Send a typed intervention (a `request`) into an active session. It is addressed to that one session, not to the agent label; an ended session is refused. Delivery goes through message_send, so its guards apply (message cap, duplicate suppression, no self-send). Caller identity comes from the verified session, never from `from_agent`. Credentials in the text are redacted. Also notes the task (time and session only) and appends an audit line (parties and message_id, never the body) to the session worktree's .ua/interventions.jsonl (inside the workspace only). Always approval-gated.",
             crew_intervene,
         )
         .family("sessions")

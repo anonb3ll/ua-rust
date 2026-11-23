@@ -149,6 +149,113 @@ async fn send_list_and_reply_thread() {
 }
 
 #[tokio::test]
+async fn send_cannot_name_a_conversation_it_is_not_in() {
+    let (hub, reg) = (hub(), builtin_registry());
+    let (a, b, c) = (agent("builder-1"), agent("builder-2"), agent("builder-3"));
+
+    // A restricted caller starts a conversation by minting an id.
+    let sent =
+        send(&reg, &hub, &a, json!({"act": "request", "to_agent": "builder-2", "body": "private thread"}))
+            .await;
+    let conv = sent["conversation_id"].as_str().unwrap().to_string();
+
+    // A foreign id and a missing one answer alike.
+    let foreign = reg
+        .call(
+            &hub,
+            &c,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "let me in",
+                   "conversation_id": conv}),
+        )
+        .await
+        .unwrap_err();
+    let missing = reg
+        .call(
+            &hub,
+            &c,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "new?",
+                   "conversation_id": "conv-absent"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), "not_found");
+    assert_eq!(missing.code(), "not_found");
+    assert_eq!(foreign.to_string(), missing.to_string());
+
+    // A reply with no address: a missing parent and a foreign one answer alike.
+    let parent = sent["message_id"].as_str().unwrap().to_string();
+    let mut answers = Vec::new();
+    for reply_to in [parent.as_str(), "msg-absent"] {
+        let e = reg
+            .call(&hub, &c, "message_send", json!({"act": "inform", "body": "re", "reply_to": reply_to}))
+            .await
+            .unwrap_err();
+        answers.push((e.code().to_string(), e.to_string().replace(reply_to, "<id>")));
+    }
+    assert_eq!(answers[0], answers[1]);
+
+    // A legacy hub row whose id carries the external prefix is never chained
+    // from: a non-party's reply_to it gets no hop from it.
+    let legacy =
+        send(&reg, &hub, &a, json!({"act": "inform", "to_agent": "builder-2", "body": "old", "hop": 2}))
+            .await;
+    let legacy_id = legacy["message_id"].as_str().unwrap().to_string();
+    hub.db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE message_index SET message_id = 'ts:legacy' WHERE message_id = ?1",
+                [&legacy_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let ext = send(
+        &reg,
+        &hub,
+        &c,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "a reply to an external thread",
+               "reply_to": "ts:legacy"}),
+    )
+    .await;
+    assert_eq!(ext["hop"], 0, "{ext}");
+
+    // An external-thread prefix is not a message id a client may choose.
+    let err = reg
+        .call(
+            &hub,
+            &a,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "x", "message_id": "ts:123"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_argument");
+
+    // A party continues its own conversation by id.
+    let reply = send(
+        &reg,
+        &hub,
+        &b,
+        json!({"act": "inform", "to_agent": "builder-1", "body": "on it", "conversation_id": conv}),
+    )
+    .await;
+    assert_eq!(reply["conversation_id"], conv);
+
+    // An unrestricted caller may start a conversation under a chosen id.
+    let board = Caller::local("local", Transport::Stdio);
+    let named = send(
+        &reg,
+        &hub,
+        &board,
+        json!({"act": "inform", "to_agent": "builder-2", "body": "named", "conversation_id": "conv-named"}),
+    )
+    .await;
+    assert_eq!(named["conversation_id"], "conv-named");
+}
+
+#[tokio::test]
 async fn send_validation() {
     let (hub, reg) = (hub(), builtin_registry());
     let a = agent("builder-1");

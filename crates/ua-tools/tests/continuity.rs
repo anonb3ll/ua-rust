@@ -601,27 +601,31 @@ async fn only_the_receiver_acknowledges_an_assigned_note() {
 #[tokio::test]
 async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
     let h = H::new();
-    h.ok(
-        &builder(),
-        "message_send",
-        json!({ "act": "request", "to_agent": "builder-2", "body": "the secret plan", "conversation_id": "conv-1" }),
-    )
-    .await;
+    let conv = h
+        .ok(
+            &builder(),
+            "message_send",
+            json!({ "act": "request", "to_agent": "builder-2", "body": "the secret plan" }),
+        )
+        .await["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conv1 = conv.as_str();
 
     // Someone outside the conversation sees nothing.
     let outsider = caller("builder-3", ActorKind::Agent, Profile::Developer);
-    let e = h
-        .act_err(&outsider, "conversation_handoff", json!({ "conversation_id": "conv-1", "title": "x" }))
-        .await;
+    let e =
+        h.act_err(&outsider, "conversation_handoff", json!({ "conversation_id": conv1, "title": "x" })).await;
     assert_eq!(e.code(), "not_found");
-    let e = h.act_err(&outsider, "conversation_handoffs", json!({ "conversation_id": "conv-1" })).await;
+    let e = h.act_err(&outsider, "conversation_handoffs", json!({ "conversation_id": conv1 })).await;
     assert_eq!(e.code(), "not_found", "missing and not yours read alike");
 
     let created = h
         .act_ok(
             &other(),
             "conversation_handoff",
-            json!({ "conversation_id": "conv-1", "title": "Plan it", "priority": "high" }),
+            json!({ "conversation_id": conv1, "title": "Plan it", "priority": "high" }),
         )
         .await;
     let t = created["task_id"].as_i64().unwrap();
@@ -629,51 +633,99 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
     let task = h.ok(&other(), "task_list", json!({ "status": "all" })).await;
     let row = task["tasks"].as_array().unwrap().iter().find(|r| r["id"] == t).unwrap().clone();
     assert_eq!(row["priority"], "high");
-    assert!(row["notes"].as_str().unwrap().contains("[conversation: conv-1]"));
-    assert!(!row["notes"].as_str().unwrap().contains("secret plan"), "the transcript is never copied");
+    assert!(
+        !row["notes"].as_str().unwrap_or("").contains("[conversation:"),
+        "the conversation id never reaches the task"
+    );
+    assert!(!row["notes"].as_str().unwrap_or("").contains("secret plan"), "the transcript is never copied");
 
     // A repeat returns the same task.
     let again = h
         .act_ok(
             &other(),
             "conversation_handoff",
-            json!({ "conversation_id": "conv-1", "title": "Plan it", "priority": "high" }),
+            json!({ "conversation_id": conv1, "title": "Plan it", "priority": "high" }),
         )
         .await;
     assert_eq!((again["task_id"].as_i64(), again["created"].as_bool()), (Some(t), Some(false)));
 
-    // Link an existing task, twice: one note line.
+    // Link an existing task, twice: the task's notes and updated_at never
+    // move, and the second link records no new event.
     let existing = h.task("Existing work", None).await;
+    let before: (Option<String>, String) = {
+        let id = existing;
+        h.hub
+            .db()
+            .read(move |c| {
+                Ok(c.query_row("SELECT notes, updated_at FROM tasks WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?)
+            })
+            .unwrap()
+    };
     for _ in 0..2 {
         let linked = h
             .act_ok(
                 &builder(),
                 "conversation_handoff",
-                json!({ "conversation_id": "conv-1", "task_id": existing }),
+                json!({ "conversation_id": conv1, "task_id": existing }),
             )
             .await;
         assert_eq!(linked["created"], false);
+        assert!(linked.get("reference").is_none(), "{linked}");
     }
-    let notes: String = {
+    let after: (Option<String>, String) = {
         let id = existing;
         h.hub
             .db()
-            .read(move |c| Ok(c.query_row("SELECT notes FROM tasks WHERE id = ?1", [id], |r| r.get(0))?))
+            .read(move |c| {
+                Ok(c.query_row("SELECT notes, updated_at FROM tasks WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?)
+            })
             .unwrap()
     };
-    assert_eq!(notes.matches("[conversation: conv-1]").count(), 1);
+    assert_eq!(after, before, "linking touches neither notes nor updated_at");
 
-    let listed = h.act_ok(&builder(), "conversation_handoffs", json!({ "conversation_id": "conv-1" })).await;
+    let listed = h.act_ok(&builder(), "conversation_handoffs", json!({ "conversation_id": conv1 })).await;
     let ids: Vec<i64> =
         listed["handoffs"].as_array().unwrap().iter().map(|r| r["task_id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![t, existing]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-2");
+    for row in listed["handoffs"].as_array().unwrap() {
+        assert_eq!(row["note_reference"], false, "{row}");
+    }
     assert_eq!(h.events("agent.conversation.handoff"), 2, "one event per participant and task");
+
+    // A profile without task_update cannot link. An allow-list profile is
+    // refused the consolidated action before the handler's own check.
+    let e = h
+        .act_err(
+            &researcher(),
+            "conversation_handoff",
+            json!({ "conversation_id": conv1, "task_id": existing }),
+        )
+        .await;
+    assert_eq!(reason(&e), "action_denied", "{e:?}");
+    // The refusal is recorded on the tool called and its routed action.
+    let recorded: (String, String) = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT json_extract(payload, '$.tool'), json_extract(payload, '$.action_tool') FROM event_log \
+                 WHERE channel = 'agent.gateway.decision' AND originator = 'research-1' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(recorded, ("coordination_manage".into(), "coordination_manage:conversation_handoff".into()));
 
     // Validation.
     for bad in [
-        json!({ "conversation_id": "conv-1" }),
-        json!({ "conversation_id": "conv-1", "title": "a", "task_id": existing }),
+        json!({ "conversation_id": conv1 }),
+        json!({ "conversation_id": conv1, "title": "a", "task_id": existing }),
         json!({ "conversation_id": "bad]id", "title": "a" }),
     ] {
         assert_eq!(h.act_err(&builder(), "conversation_handoff", bad).await.code(), "invalid_argument");
@@ -1135,24 +1187,24 @@ async fn only_the_owner_receiver_or_an_operator_recovers_a_handoff_note() {
 #[tokio::test]
 async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_links() {
     let h = H::new();
-    h.ok(
-        &builder(),
-        "message_send",
-        json!({ "act": "request", "to_agent": "builder-2", "body": "hi", "conversation_id": "conv-9" }),
-    )
-    .await;
-    let params = json!({ "conversation_id": "conv-9" });
+    let conv = h
+        .ok(&builder(), "message_send", json!({ "act": "request", "to_agent": "builder-2", "body": "hi" }))
+        .await["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let params = json!({ "conversation_id": conv });
     // A caller with no verified identity (auth enforcement off) reads every
     // conversation, like every mailbox. Handing off is a write: it cannot.
     let board = h.act_ok(&unverified(), "conversation_handoffs", params.clone()).await;
     assert_eq!(board["handoffs"], json!([]));
     let e = h
-        .act_err(&unverified(), "conversation_handoff", json!({ "conversation_id": "conv-9", "title": "No" }))
+        .act_err(&unverified(), "conversation_handoff", json!({ "conversation_id": conv, "title": "No" }))
         .await;
     assert_eq!(reason(&e), "identity_required", "{e:?}");
 
     let real = h
-        .act_ok(&builder(), "conversation_handoff", json!({ "conversation_id": "conv-9", "title": "Real" }))
+        .act_ok(&builder(), "conversation_handoff", json!({ "conversation_id": conv, "title": "Real" }))
         .await["task_id"]
         .as_i64()
         .unwrap();
@@ -1161,7 +1213,8 @@ async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_l
     h.ok(
         &outsider(),
         "task_update",
-        json!({ "id": forged, "append_note": "[conversation: conv-9] handed off from the agent conversation" }),
+        json!({ "id": forged,
+                "append_note": format!("[conversation: {conv}] handed off from the agent conversation") }),
     )
     .await;
 
@@ -1172,7 +1225,7 @@ async fn conversation_handoffs_scope_a_verified_viewer_and_count_only_ledgered_l
     assert_eq!(ids("handoffs"), vec![real]);
     assert_eq!(ids("unaudited"), vec![forged]);
     assert_eq!(listed["handoffs"][0]["by"], "builder-1");
-    assert_eq!(listed["handoffs"][0]["note_reference"], true);
+    assert_eq!(listed["handoffs"][0]["note_reference"], false, "the audited link writes no notes line");
     // A human sees every conversation; a coordinator-profile agent, like an
     // outsider, sees none (a profile grants nothing).
     h.act_ok(&human(), "conversation_handoffs", params.clone()).await;

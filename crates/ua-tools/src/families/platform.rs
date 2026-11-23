@@ -20,7 +20,7 @@
 //!
 //! An `sdk.` evidence event's payload is client-written: its read carries a
 //! `trust` label marking it untrusted.
-//! Message events use the same mailbox visibility as the ledger query.
+//! Restricted event rows use the same visibility as the ledger query.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
-use super::events::{EventReader, VISIBLE_MESSAGE};
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::injection;
 use super::memory::mark_untrusted;
@@ -41,7 +41,7 @@ use super::runs;
 use crate::approvals;
 use crate::hub::Hub;
 use crate::policy::{self, Verdict};
-use crate::registry::{Registry, ToolCtx, record_decision_rule, tool};
+use crate::registry::{Registry, ToolCtx, record_decision_routed, tool};
 
 /// Bumped when a manifest field changes meaning or disappears.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
@@ -466,12 +466,22 @@ pub fn may_read(caller: &Caller, tool: &str) -> bool {
 /// that tool, evaluated as the caller with no arguments. The refusal codes are
 /// the ones a direct call of `tool` would get. A tool the policy or
 /// `approval_tools` sends through the approval gate cannot be read around it.
-/// A refusal is recorded as a gateway decision on `platform_object_get`.
-pub async fn check_read(hub: &Hub, caller: &Caller, kind: &str, tool: &'static str) -> UaResult<()> {
+/// A refusal is recorded as a gateway decision on the tool called
+/// (`recorded_tool`, `platform_object_get` for the kind reader) and, for a
+/// consolidated tool's action, the action it ran (`action_tool`, as the
+/// registry records it).
+pub async fn check_read(
+    hub: &Hub,
+    caller: &Caller,
+    kind: &str,
+    tool: &'static str,
+    recorded_tool: &'static str,
+    action_tool: Option<&str>,
+) -> UaResult<()> {
     match read_gate(hub, caller, kind, tool).await {
         Ok(()) => Ok(()),
         Err((err, rule)) => {
-            record_decision_rule(hub, caller, "platform_object_get", &err, &rule).await;
+            record_decision_routed(hub, caller, recorded_tool, action_tool, &err, &rule).await;
             Err(err)
         }
     }
@@ -642,7 +652,7 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             let reader = EventReader::new(hub.cfg(), caller);
             let sql = format!(
                 "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
-                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_MESSAGE})"
+                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_EVENT})"
             );
             let bindings = std::iter::once(&id as &dyn ToSql).chain(reader.bindings());
             let row = c.query_row(&sql, params_from_iter(bindings), row_map).optional()?;
@@ -725,7 +735,7 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
     if !t.served {
         return Err(UaError::not_found(format!("object kind {kind:?} is not served by this hub")));
     }
-    check_read(hub, caller, kind, t.profile_tool).await?;
+    check_read(hub, caller, kind, t.profile_tool, "platform_object_get", None).await?;
     let id = id.map(str::to_string).filter(|i| !i.is_empty());
     if t.collection {
         if id.is_some() {

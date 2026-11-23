@@ -11,8 +11,9 @@
 //! new file under `exports/` in the caller's workspace (capped at 32 MB). The
 //! file name carries a UTC timestamp and a counter, and is created exclusively
 //! so concurrent exports never overwrite each other. Writes are recorded on
-//! `agent.export.written`. The manifest applies mailbox visibility to message
-//! event rows, which carry only their id and stored hash when restricted.
+//! `agent.export.written`. The manifest applies the ledger's event visibility
+//! to message, session-handoff and conversation-handoff event rows, which
+//! carry only their id and stored hash when restricted.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -32,7 +33,7 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::events::{EventReader, VISIBLE_MESSAGE};
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::harness_config::render::py_dumps;
 use super::injection::mark_untrusted;
@@ -875,7 +876,7 @@ fn write_manifest(
             }
             let columns = MANIFEST_EVENT_COLUMNS.join(", ");
             let sql = format!(
-                "SELECT {columns}, ({VISIBLE_MESSAGE}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
+                "SELECT {columns}, ({VISIBLE_EVENT}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
             );
             let bindings = reader.bindings().into_iter().chain([&since as &dyn ToSql]);
             let mut stmt = tx.prepare(&sql)?;
@@ -1703,8 +1704,10 @@ pub fn register(r: &mut Registry) {
              and chain_error report where and why the chain broke (omitted on healthy logs). The summary has \
              no anchor: compare against an earlier \
              manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
-             client evidence (sdk. channels) carrying a trust label. Restricted message rows contain \
-             only their ULID, stored entry hash, and a redacted flag. Row comparisons compare the \
+             client evidence (sdk. channels) carrying a trust label. Restricted message, session-handoff and \
+             conversation-handoff rows contain \
+             only their ULID, stored entry hash, and a redacted flag — the accepted integrity exception \
+             that keeps the chain checkable without revealing the rows. Row comparisons compare the \
              listed views. The listing and cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \
@@ -1760,8 +1763,13 @@ mod tests {
         c.execute_batch(
             "INSERT INTO schema_parts (name, checksum, applied_at)
              VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);
-             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);",
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT);
+             CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
+             -- The columns VISIBLE_EVENT joins on, minimal versions of the
+             -- real tables.
+             CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY, agent TEXT,
+                 assigned_to TEXT, delivered_to TEXT);
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT);",
         )
         .unwrap();
         c

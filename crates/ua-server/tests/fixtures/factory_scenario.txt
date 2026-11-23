@@ -50,13 +50,15 @@
 4 isolation.same-org-mailbox-direct-read pass
 4 isolation.same-org-handoff-note pass
 4 isolation.same-org-conversation-handoffs pass
+4 isolation.same-org-conversation-naming pass
+4 isolation.same-org-crew-view pass
 4 isolation.same-org-own-inbox pass
-4 isolation.same-org-ledger-read fail
-4 isolation.same-org-stream fail
-4 isolation.same-org-handoffs-in-retrieval fail
+4 isolation.same-org-ledger-read pass
+4 isolation.same-org-stream pass
+4 isolation.same-org-handoffs-in-retrieval pass
 4 isolation.same-org-evidence fail
-4 isolation.same-org-exports fail
-4 isolation.same-org-retrieval-and-explanations fail
+4 isolation.same-org-exports pass
+4 isolation.same-org-retrieval-and-explanations pass
 
 5 verify.trace-artifact-to-task pass
 5 verify.trace-artifact-to-handoff fail
