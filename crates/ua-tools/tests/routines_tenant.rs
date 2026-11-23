@@ -31,8 +31,13 @@ const TABLES: [&str; 4] = ["routines", "routine_runs", "workflow_runs", "workflo
 /// A workflow every organization can run: one read-only step.
 const VET: &str = "inputs: [command]\nsteps:\n  - name: vet\n    tool: run_cmd_check\n    args: { command: \"{{ inputs.command }}\" }\n";
 
+/// The parts before this family's conversion: without its parts, and
+/// without the later `*.task_org` parts, whose triggers read its `org_id`.
 fn old_parts() -> Vec<ua_store::Part> {
-    ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
+    ua_tools::schema_parts()
+        .into_iter()
+        .filter(|p| !PARTS.contains(&p.name) && !p.name.ends_with(".task_org"))
+        .collect()
 }
 
 fn add_org(hub: &Hub, id: &str) {
@@ -364,19 +369,21 @@ async fn organization_b_writes_land_in_organization_b() {
         .await;
     assert_eq!(h.text(&format!("SELECT org_id FROM routines WHERE id = {id}")).as_deref(), Some(ORG_B));
 
-    // Tasks are the default organization's only (ORG-TASK-DEFAULT): B's fire
-    // creates none and runs no workflow; its receipt is B's.
+    // B's fire creates its task in B; its workflow does not run (a
+    // routine's owner caller is built only in the default organization), and
+    // its receipt is B's.
     let fired =
         h.ok(&b, "routine_fire", json!({ "routine_id": id, "idempotency_key": "b-private-key" })).await;
-    assert_eq!(fired["status"], "skipped", "{fired}");
-    assert_eq!(fired["reason"], routines::SKIP_ORG_TASKS);
-    assert!(fired.get("workflow").is_none(), "{fired}");
-    assert_eq!(h.count("SELECT COUNT(*) FROM tasks"), tasks_before);
+    assert_eq!(fired["status"], "created", "{fired}");
+    assert_eq!(fired["workflow"]["status"], "not_run", "{fired}");
+    let task = fired["task_id"].as_i64().unwrap_or_else(|| panic!("{fired}"));
+    assert_eq!(h.count("SELECT COUNT(*) FROM tasks"), tasks_before + 1);
+    assert_eq!(h.text(&format!("SELECT org_id FROM tasks WHERE id = {task}")).as_deref(), Some(ORG_B));
     assert_eq!(h.count("SELECT COUNT(*) FROM workflow_runs"), 0);
     assert_eq!(
         h.text(&format!("SELECT org_id || ':' || status FROM routine_runs WHERE routine_id = {id}"))
             .as_deref(),
-        Some("org-b:skipped")
+        Some("org-b:created")
     );
     // The replay is B's own receipt.
     let replay =
@@ -412,9 +419,8 @@ async fn the_scheduler_fires_each_routine_in_its_own_organization() {
     let rb = h.add_routine(&lead(ORG_B), cron("B sweep")).await;
 
     let out = routines::tick(&h.hub, ts("2026-01-01T10:20:10Z"), true).await.unwrap();
-    assert_eq!(out["created"], 1, "{out}");
-    assert_eq!(out["skipped"], 1, "{out}");
-    assert_eq!(out["skip_reasons"][routines::SKIP_ORG_TASKS], 1, "{out}");
+    assert_eq!(out["created"], 2, "{out}");
+    assert_eq!(out["skipped"], 0, "{out}");
 
     // A's fire: a task and a workflow run, both attributed to A's organization.
     let receipt = |id: i64| {
@@ -433,8 +439,11 @@ async fn the_scheduler_fires_each_routine_in_its_own_organization() {
             .as_deref(),
         Some("default:done")
     );
-    // B's fire is recorded in B, with no task and no workflow run.
-    assert_eq!(receipt(rb), "org-b|skipped||");
+    // B's fire is recorded in B, with a task in B and no workflow run.
+    let b_fire = receipt(rb);
+    let parts: Vec<&str> = b_fire.split('|').collect();
+    assert_eq!((parts[0], parts[1], parts[3]), (ORG_B, "created", ""), "{b_fire}");
+    assert_eq!(h.text(&format!("SELECT org_id FROM tasks WHERE id = {}", parts[2])).as_deref(), Some(ORG_B));
     assert_eq!(h.count("SELECT COUNT(*) FROM workflow_runs"), 1);
     // Each routine's cursor moved; neither was fired twice.
     let again = routines::tick(&h.hub, ts("2026-01-01T10:20:40Z"), true).await.unwrap();
@@ -443,8 +452,8 @@ async fn the_scheduler_fires_each_routine_in_its_own_organization() {
 
 /// A fire a stopped hub left behind in organization B is never run under a
 /// default-organization caller: reconciliation marks it `not_run`. The row
-/// is seeded by SQL, as no tool makes a created fire outside the task
-/// organization.
+/// is seeded by SQL, as a tool-made fire outside the default organization
+/// records its workflow as `not_run` at once.
 #[tokio::test]
 async fn reconciliation_never_runs_another_organizations_fire_as_the_default() {
     let h = H::new();
@@ -545,8 +554,8 @@ async fn langgraph_runs_see_only_the_task_organizations_tasks() {
     assert_eq!(payload["org_id"], DEFAULT_ORG, "{payload}");
     assert_eq!(payload["run_id"], out["run_id"]);
 
-    // Organization B sees no tasks (they are the default organization's,
-    // ORG-TASK-DEFAULT), so a run on one answers as for a missing task.
+    // Organization B does not see the default organization's task, so a run
+    // on it answers as for a missing task.
     let b = agent("builder-1", ORG_B);
     let runs_before = h.count("SELECT COUNT(*) FROM workflow_runs");
     let e = h.err(&b, "langgraph_progress_note", json!({ "task_id": task, "output_digest": digest })).await;
