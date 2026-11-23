@@ -642,25 +642,75 @@ fn fts_indexes(c: &Connection) -> UaResult<Vec<FtsIndex>> {
     Ok(out)
 }
 
-fn fts_check(c: &Connection, ix: &FtsIndex) -> UaResult<Value> {
-    let count = |sql: String| -> UaResult<i64> { Ok(c.query_row(&sql, [], |r| r.get(0))?) };
+/// One index's sync state, as `org` sees it. When the mirrored table carries
+/// `org_id` (`tasks`), the counts cover only `org`'s rows, so another
+/// organization's caller learns nothing about the hub's other rows. An index
+/// row whose table row is gone has no organization left: it is counted (and
+/// so repaired) only for the default organization.
+fn fts_check(c: &Connection, ix: &FtsIndex, org: &str) -> UaResult<Value> {
+    let count = |sql: String, scoped: bool| -> UaResult<i64> {
+        Ok(if scoped {
+            c.query_row(&sql, [org], |r| r.get(0))?
+        } else {
+            c.query_row(&sql, [], |r| r.get(0))?
+        })
+    };
     let (n, t, k) = (&ix.name, &ix.content, &ix.rowid);
-    let base = count(format!("SELECT COUNT(*) FROM \"{t}\""))?;
-    let indexed = count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""))?;
-    let orphans = count(format!(
-        "SELECT COUNT(*) FROM \"{n}_docsize\" d WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
-    ))?;
-    let missing = count(format!(
-        "SELECT COUNT(*) FROM \"{t}\" b WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
-    ))?;
+    let tenant: bool = c.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = 'org_id')"),
+        [],
+        |r| r.get(0),
+    )?;
+    let (base, indexed, missing) = if tenant {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\" WHERE org_id = ?1"), true)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                     WHERE EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id AND b.org_id = ?1)"
+                ),
+                true,
+            )?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b WHERE b.org_id = ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                true,
+            )?,
+        )
+    } else {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\""), false)?,
+            count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""), false)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b \
+                     WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                false,
+            )?,
+        )
+    };
+    let orphans = if tenant && org != ua_core::DEFAULT_ORG {
+        0
+    } else {
+        count(
+            format!(
+                "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                 WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
+            ),
+            false,
+        )?
+    };
     Ok(json!({
         "index": n,
         "table": t,
         "table_rows": base,
-        "indexed_rows": indexed,
+        "indexed_rows": indexed + if tenant { orphans } else { 0 },
         "missing_from_index": missing,
         "orphaned_in_index": orphans,
-        "in_sync": missing == 0 && orphans == 0 && base == indexed,
+        "in_sync": missing == 0 && orphans == 0 && (tenant || base == indexed),
     }))
 }
 
@@ -693,7 +743,8 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
         .hub
         .db()
         .read_async(move |c| {
-            let fts: Vec<Value> = fts_indexes(c)?.iter().map(|ix| fts_check(c, ix)).collect::<UaResult<_>>()?;
+            let fts: Vec<Value> =
+                fts_indexes(c)?.iter().map(|ix| fts_check(c, ix, &org)).collect::<UaResult<_>>()?;
             let counts: (i64, i64) = (
                 c.query_row(
                     "SELECT COUNT(*) FROM memory WHERE id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",

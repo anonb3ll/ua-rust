@@ -391,8 +391,25 @@ from its commit history.
   the originator is `system`. `task_add`, `task_update` and `delegate`
   idempotency keys of another organization are stored with its organization
   prefixed, so a key reused in another organization never replays. The
-  importer writes legacy tasks, dependencies, comments and threads to
-  `default`. Results and events in the default organization are unchanged.
+  migration manifest (`export_migration_manifest`,
+  `compare_migration_manifests`, and both through `export_data`) is
+  hub-wide and refused to another organization's caller (`org_unsupported`).
+  Deleting another organization's task also deletes the holds rooted in its
+  subtree and the policy authorizations naming it, so none falls into the
+  default organization. `state_sync_verify` counts only the caller's
+  organization's tasks in `task_fts`'s check, a proposal or contract marker
+  on another organization's task fails the contract check without reading
+  the default organization's proposals, and a node follow-up checks the
+  task holder in the task's organization. The importer writes legacy tasks,
+  dependencies, comments and threads to `default`. Results and events in the
+  default organization are unchanged, except for two fixes that apply to
+  every organization: a `task_update` idempotency key is now the caller's
+  (`task_update:<escaped label>:<key>`), is checked only after the task is
+  found, and replays only for the same task (another task is refused
+  `idempotency_key_reused`); and `conversation_handoff` now creates its task
+  itself under `task_add`'s gate, with a key scoped to the organization and
+  actor stored under its own tool name, while `task_add` refuses client keys
+  starting with `conversation-handoff:`.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

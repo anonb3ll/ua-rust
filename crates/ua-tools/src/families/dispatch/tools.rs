@@ -725,6 +725,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             // it never reach a prompt the hub builds.
             let work_order = governance::check_contract(
                 tx,
+                &caller.org_id,
                 tid,
                 str_field(&task, "title").unwrap_or_default(),
                 str_field(&task, "notes").unwrap_or_default(),

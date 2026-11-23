@@ -277,6 +277,12 @@ fn row_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 
 /// One task row. There is no single-task read tool yet, so this is a
 /// read-only query gated on the caller's `task_list` access.
+/// The columns the detail page reads ([`detail_of`]); `org_id` is never
+/// one of them.
+const DETAIL_COLUMNS: &str = "id, title, notes, status, priority, project, domain, lane, claimed_by, \
+     lock_expires_at, parent_id, created_at, updated_at, completed_at, due_at, evidence_ref, branch, \
+     worktree_path, next_owner, waiting_on, untrusted";
+
 async fn load_task(ui: &Ui, id: i64) -> UaResult<Option<Value>> {
     if !ui.may("task_list") {
         return Err(UaError::denied(
@@ -293,7 +299,7 @@ async fn load_task(ui: &Ui, id: i64) -> UaResult<Option<Value>> {
         .read_async(move |c| {
             use rusqlite::OptionalExtension;
             Ok(c.query_row(
-                "SELECT * FROM tasks WHERE org_id = ?1 AND id = ?2",
+                &format!("SELECT {DETAIL_COLUMNS} FROM tasks WHERE org_id = ?1 AND id = ?2"),
                 rusqlite::params![org, id],
                 row_value,
             )

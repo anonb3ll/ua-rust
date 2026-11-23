@@ -189,6 +189,14 @@ async fn add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
     let domain = a.domain.as_deref().map(|d| check_slug("domain", d)).transpose()?;
     let lane = a.lane.as_deref().map(|l| check_slug("lane", l)).transpose()?;
     let key = check_idempotency_key(a.idempotency_key.as_deref())?;
+    // Handoff keys are the hub's own: a client key in their form could probe
+    // or squat the task a conversation handoff created.
+    if key.as_deref().is_some_and(|k| k.starts_with(crate::families::continuity::HANDOFF_KEY_PREFIX)) {
+        return Err(UaError::invalid(format!(
+            "idempotency_key must not start with {:?}: that prefix is reserved for conversation handoffs",
+            crate::families::continuity::HANDOFF_KEY_PREFIX
+        )));
+    }
     let by = ctx.caller.label.clone();
     let org = ctx.caller.org_id.clone();
 
@@ -312,6 +320,19 @@ pub(crate) fn insert_task(tx: &mut WriteTx<'_>, org: &str, t: NewTask, by: &str)
 // task_update
 // ---------------------------------------------------------------------------
 
+/// A client key scoped to the caller: `<label>:<key>`, stored as
+/// `task_update:<label>:<key>` (prefixed with the organization outside the
+/// default one, see [`idem_key`]). `%`, `:` and `/` in the label are
+/// percent-escaped, so the label always ends at the first `:` after the tool
+/// name and two labels never produce the same stored key. Keys stored in the
+/// old unscoped `task_update:<key>` form are not read: nothing else reads
+/// them, and a retry that spans the upgrade only applies the same fields
+/// again (an appended note that is already there is not appended twice).
+fn caller_scoped_key(caller: &ua_core::Caller, key: &str) -> String {
+    let label = caller.label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F");
+    format!("{label}:{key}")
+}
+
 /// True when `note` (all of its stripped lines, in order) already appears in `current`.
 fn note_is_duplicate(current: &str, note: &str) -> bool {
     let existing: Vec<&str> = current.lines().map(str::trim).collect();
@@ -382,7 +403,10 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             return Err(UaError::invalid(format!("{field} must be at most 500 characters")));
         }
     }
-    let key = check_idempotency_key(a.idempotency_key.as_deref())?;
+    // Stored per caller (`task_update:<label>:<key>`): another caller's use
+    // of the same key, or a squat of a predictable one, is a different row.
+    let key =
+        check_idempotency_key(a.idempotency_key.as_deref())?.map(|k| caller_scoped_key(&ctx.caller, &k));
     let caller = ctx.caller.clone();
     let org = caller.org_id.clone();
     let cfg = ctx.hub.cfg().clone();
@@ -396,13 +420,25 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
+            let id = a.id;
+            // The task is looked up first, in the caller's organization, so a
+            // key never answers for a task the caller cannot see.
+            let old = require_task(tx, &org, id)?;
             if let Some(k) = &key
                 && let Some(prior) = idempotent_replay(tx, &org, "task_update", k)?
             {
-                return Ok(prior);
+                // A replay is only ever this caller's earlier update of this
+                // task; the same key on another task is a client bug, not a
+                // retry, and is refused rather than answered with the
+                // first task's snapshot or silently dropped.
+                if prior.get("id").and_then(Value::as_i64) == Some(id) {
+                    return Ok(prior);
+                }
+                return Err(UaError::conflict_code(
+                    "idempotency_key_reused",
+                    format!("idempotency_key was already used for another task update; task {id} was not changed"),
+                ));
             }
-            let id = a.id;
-            let old = require_task(tx, &org, id)?;
             let old_status = str_field(&old, "status").unwrap_or("open").to_string();
             let old_project = str_field(&old, "project").unwrap_or("default").to_string();
             let old_lane = str_field(&old, "lane").unwrap_or("default").to_string();
@@ -616,7 +652,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                     let doing_agent = claimed_by.clone().filter(|_| !clear_claim).unwrap_or_else(|| identity.clone());
                     governance::check_claim(tx, &org, Some(&doing_agent), Some(id), false)?;
                     let title_after = a.title.as_deref().or(str_field(&old, "title")).unwrap_or_default();
-                    governance::check_contract(tx, id, title_after, &notes_after)?;
+                    governance::check_contract(tx, &org, id, title_after, &notes_after)?;
                 }
             }
             if clear_claim {
@@ -711,6 +747,9 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             if subtree.is_empty() {
                 return Ok(json!({ "deleted": false, "children_deleted": 0, "worktrees": {} }));
             }
+            if org != ua_core::DEFAULT_ORG {
+                drop_orphaned_task_rows(tx, &subtree)?;
+            }
             let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
             emit(tx, &org, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;
@@ -721,6 +760,48 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             }))
         })
         .await
+}
+
+/// Delete the holds rooted in `subtree` (and their members) and the policy
+/// authorizations naming a task in it, before a non-default organization's
+/// task is deleted.
+///
+/// `task_holds` and `policy_authorizations` carry no `org_id` yet and no
+/// foreign key to `tasks`: their organization is their task's, and once that
+/// task is gone the lookup falls back to the default organization. Left
+/// behind, another organization's hold reason, labels and authorization
+/// repository, PR and head would show in the default organization's views,
+/// and the default organization could release that hold. The rows are
+/// deleted rather than blanked: a blanked row would still be a default
+/// organization row (listed, counted, releasable) that it never created,
+/// and with its task gone nothing can act on it any more. The default
+/// organization keeps its rows, as before: its holds may outlive their root,
+/// and nothing changes organization when they do.
+fn drop_orphaned_task_rows(tx: &rusqlite::Connection, subtree: &[i64]) -> UaResult<()> {
+    let has = |name: &str| -> UaResult<bool> {
+        Ok(tx
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |_| Ok(()))
+            .optional()?
+            .is_some())
+    };
+    let ids = serde_json::to_string(subtree)?;
+    if has("task_holds")? {
+        if has("task_hold_members")? {
+            tx.execute(
+                "DELETE FROM task_hold_members WHERE hold_id IN \
+                     (SELECT id FROM task_holds WHERE root_task_id IN (SELECT value FROM json_each(?1)))",
+                [&ids],
+            )?;
+        }
+        tx.execute("DELETE FROM task_holds WHERE root_task_id IN (SELECT value FROM json_each(?1))", [&ids])?;
+    }
+    if has("policy_authorizations")? {
+        tx.execute(
+            "DELETE FROM policy_authorizations WHERE task_id IN (SELECT value FROM json_each(?1))",
+            [&ids],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +882,7 @@ async fn claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
             // its title or notes drifted from the frozen contract.
             governance::check_contract(
                 tx,
+                &org,
                 id,
                 str_field(&row, "title").unwrap_or_default(),
                 str_field(&row, "notes").unwrap_or_default(),

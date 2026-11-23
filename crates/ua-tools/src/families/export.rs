@@ -1000,7 +1000,24 @@ fn parse_cursor(raw: Option<&str>) -> UaResult<Option<String>> {
         .map_err(|_| UaError::invalid(format!("events_since_ulid must be a ulid, got {raw:?}")))
 }
 
+/// The migration manifest is a hub-wide snapshot (every organization's
+/// tasks and notes, the whole event-log summary), so only the default
+/// organization, which operates the hub, may build or compare one. Another
+/// organization's caller is refused before anything is read.
+fn manifest_org_guard(ctx: &ToolCtx, what: &str) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "{what} covers the whole hub and is available to the default organization only; nothing was read"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "the migration manifest")?;
     let source_host = source_host_label(ctx.hub.cfg());
     let since = parse_cursor(a.events_since_ulid.as_deref())?;
     let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
@@ -1529,6 +1546,7 @@ fn missing_parents(side: &str, tasks: &BTreeMap<String, &Map<String, Value>>, co
 }
 
 async fn compare_migration_manifests(ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "comparing migration manifests")?;
     let left = side_manifest(&ctx, "left", a.left, a.left_path).await?;
     let right = side_manifest(&ctx, "right", a.right, a.right_path).await?;
     compare_manifests(&left, &right)

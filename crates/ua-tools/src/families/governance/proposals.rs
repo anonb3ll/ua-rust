@@ -880,7 +880,7 @@ pub(crate) fn task_contract(c: &Connection, org: &str, task_id: i64) -> UaResult
         )
         .optional()?;
     match row {
-        Some((title, notes)) => check_contract(c, task_id, &title, notes.as_deref().unwrap_or("")),
+        Some((title, notes)) => check_contract(c, org, task_id, &title, notes.as_deref().unwrap_or("")),
         None => Ok(None),
     }
 }
@@ -889,8 +889,15 @@ pub(crate) fn task_contract(c: &Connection, org: &str, task_id: i64) -> UaResult
 /// contract. A task with neither a proposal nor a contract marker passes
 /// (`None`). For a task that matches, returns its contract block: the
 /// approved work order, without anything appended after [`CONTRACT_END`].
+///
+/// Work proposals carry no organization yet and every proposal's task is a
+/// default-organization task, so for a task of organization `org` outside
+/// the default one nothing is looked up: no marker passes, and any proposal
+/// or contract marker is refused with one generic mismatch, never the
+/// default organization's proposal items.
 pub(crate) fn check_contract(
     c: &Connection,
+    org: &str,
     task_id: i64,
     title: &str,
     notes: &str,
@@ -901,6 +908,15 @@ pub(crate) fn check_contract(
     let proposals: BTreeSet<(String, String)> =
         prx.captures_iter(notes).map(|m| (m[1].to_string(), m[2].to_string())).collect();
     let contracts: Vec<String> = crx.captures_iter(notes).map(|m| m[1].to_string()).collect();
+    if org != ua_core::DEFAULT_ORG {
+        if proposals.is_empty() && contracts.is_empty() {
+            return Ok(None);
+        }
+        return Err(mismatch(format!(
+            "task {task_id} carries a work-proposal contract marker, which no task outside the default \
+             organization can hold; the claim is refused"
+        )));
+    }
     if proposals.is_empty() && contracts.is_empty() {
         // A task an approval spawned must keep its markers: rewriting the
         // notes away does not take it out of its contract.

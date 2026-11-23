@@ -31,7 +31,7 @@ mod workflow;
 
 use ua_store::SchemaPart;
 
-pub(crate) use conversation::{conversation_handoff, conversation_handoffs};
+pub(crate) use conversation::{HANDOFF_KEY_PREFIX, conversation_handoff, conversation_handoffs};
 pub(crate) use handoff::{
     recover_note, session_handoff_ack, session_handoff_discard, session_handoff_propose,
     session_handoff_recover, session_handoff_seal, session_handoff_update,

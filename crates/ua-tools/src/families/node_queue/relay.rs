@@ -456,20 +456,27 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                         format!("{who:?} did not request {id}; only its requester or an operator sends follow-ups"),
                     ));
                 }
-                if let Some(t) = item.task_id {
+                // The item's task is checked in the task row's own
+                // organization, as the runner paths do: the requester's
+                // organization may not be the task's.
+                if let Some(t) = item.task_id
+                    && let Some(org) = crate::families::tasks::task_org(tx, t)?
+                {
                     let holder: Option<Option<String>> = tx
                         .query_row(
                             "SELECT claimed_by FROM tasks WHERE org_id = ?1 AND id = ?2",
-                            rusqlite::params![caller.org_id, t],
+                            rusqlite::params![org, t],
                             |r| r.get(0),
                         )
                         .optional()?;
                     if let Some(Some(h)) = holder
                         && h != who
                     {
+                        // Another organization's claimant is not named.
+                        let by = if org == caller.org_id { format!("{h:?}") } else { "another agent".into() };
                         return Err(UaError::denied(
                             "task_claimed_elsewhere",
-                            format!("task {t} is claimed by {h:?}"),
+                            format!("task {t} is claimed by {by}"),
                         ));
                     }
                 }

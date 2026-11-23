@@ -400,8 +400,10 @@ here for memory columns, owners and defaults.
   every task tool, the queue and workflow-record actions, claims and their
   release, holds, dispatch, node work, the relay, the session packet,
   agents, capability, policy claims, the evidence report, observability,
-  export, `platform_object_get` and the UI read and write only the caller's
-  organization's tasks; a job with no caller (dispatch outcomes, node
+  the task, memory and journal exports, `platform_object_get`,
+  `state_sync_verify`'s `task_fts` counts and the UI read and write only the
+  caller's organization's tasks (the follow-up relay checks a node item's
+  task holder in the task row's organization); a job with no caller (dispatch outcomes, node
   runners, `review_ready`) uses the task row's organization. Another
   organization's task, dependency, comment, hold, delegation or policy
   authorization answers exactly as a missing one, and a write for an
@@ -422,12 +424,41 @@ here for memory columns, owners and defaults.
     organizations bind only touches default-organization tasks; another
     organization's caller is refused `queue_close_merged`
     (`org_unsupported`). (c) A delegation to another organization's agent
-    is still allowed; delegations (like holds and policy authorizations,
-    which carry no `org_id` yet) are reached only through their task's
-    organization. (d) Task replies carry no `org_id`.
+    is still allowed, but it can never be claimed: the delegate looks the
+    task up in its own organization and finds none, so it fails closed.
+    Delegations (like holds and policy authorizations, which carry no
+    `org_id` yet) are reached only through their task's organization.
+    (d) Task replies carry no `org_id`.
+  - The migration manifest (`export_migration_manifest`,
+    `compare_migration_manifests`, and both through `export_data`) is a
+    hub-wide snapshot: every organization's tasks and notes and the whole
+    event-log summary. Only the default organization, which operates the
+    hub, may build or compare one; another organization's caller is
+    refused (`org_unsupported`) before anything is read.
+  - `task_update` idempotency keys are the caller's: stored as
+    `task_update:<label>:<key>` (organization-prefixed outside the
+    default), with `%`, `:` and `/` in the label percent-escaped so two
+    labels never share a stored key. The task is looked up first, and a
+    stored reply is replayed only for the same task; the same key on
+    another task is refused (`idempotency_key_reused`). Old
+    `task_update:<key>` rows are not read.
+  - A conversation handoff's task is created by the handoff itself, under
+    `task_add`'s gate, with a key derived from the organization, actor,
+    conversation, title, project and priority and stored under its own tool
+    name (`conversation_handoff`). `task_add` refuses client keys starting
+    with `conversation-handoff:`.
+  - Deleting another organization's task deletes, in the same transaction,
+    the holds rooted in its subtree (and their members) and the policy
+    authorizations naming a task in it: with no `org_id` and no foreign key
+    to `tasks`, they would otherwise fall into the default organization.
+    They are deleted, not blanked, because a blanked row would still be a
+    default-organization row it never created. The default organization's
+    holds and authorizations outlive their task, as before.
   - Work proposals carry no organization yet, so their actions are refused
     to another organization's caller (`org_unsupported`) and a proposal's
-    task is always a default-organization task. Goals are not converted;
+    task is always a default-organization task. A proposal or contract
+    marker on another organization's task fails the contract check with one
+    generic mismatch, without reading the default organization's proposals. Goals are not converted;
     a goal action looks the task it names up in the caller's organization.
   - Events stay in the default organization's ledger (`ORG-EVENT-DEFAULT`):
     for another organization's task its titles, notes, comment bodies,
@@ -437,9 +468,10 @@ here for memory columns, owners and defaults.
     one organization sees reveal how many tasks the hub holds overall.
     bm25's term statistics (document frequencies, average length) come
     from the whole `task_fts` index, so another organization's tasks can
-    shift a score's value, never which rows match or are returned. A hold,
-    delegation or policy authorization whose task was deleted has no
-    organization left and stays the default organization's.
+    shift a score's value, never which rows match or are returned. A
+    delegation whose task was deleted has no organization left and stays
+    the default organization's, as does a default-organization hold or
+    policy authorization.
   - The importer writes legacy tasks, dependencies, comments and threads to
     `default`. A routine fire in another organization now creates its task
     there. `crates/ua-tools/tests/tasks_tenant.rs` holds the upgrade and the

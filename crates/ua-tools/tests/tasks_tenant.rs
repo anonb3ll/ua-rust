@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, identity::Transport};
-use ua_tools::families::github::poll_once;
+use ua_tools::families::github::{WebhookDelivery, poll_once, receive, signature_for};
 use ua_tools::{Hub, Registry, builtin_registry};
 
 const ORG_B: &str = "org-b";
@@ -45,6 +45,7 @@ const B_REASON: &str = "Osprey parked pending counsel";
 const B_AGENT: &str = "kestrel-nightshift";
 const B_MENTION: &str = "osprey-counsel";
 const B_CHECK: &str = "falcon-secret-check";
+const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
 fn old_parts() -> Vec<ua_store::Part> {
     ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
@@ -506,6 +507,22 @@ async fn each_organization_sees_only_its_own_tasks_through_every_tool() {
         assert_eq!(child["lineage"], json!([mine.task]), "{org}");
         h.ok(me, "project_build", json!({ "parent_task_id": mine.task })).await;
     }
+    // The migration manifest is hub-wide: only the default organization may
+    // build or compare one, directly or through export_data.
+    let lead_b = Caller { profile: Profile::Coordinator, ..agent_named("lead-1", ORG_B) };
+    for (tool, args) in [
+        ("export_migration_manifest", json!({})),
+        ("export_data", json!({ "action": "manifest" })),
+        ("compare_migration_manifests", json!({ "left": {}, "right": {} })),
+        ("export_data", json!({ "action": "compare", "params": { "left": {}, "right": {} } })),
+    ] {
+        let e = h.err(&lead_b, tool, args.clone()).await;
+        assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e}");
+    }
+    let lead_a = Caller { profile: Profile::Coordinator, ..agent_named("lead-1", DEFAULT_ORG) };
+    let m = h.ok(&lead_a, "export_migration_manifest", json!({})).await;
+    assert!(m["manifest"]["tasks"].as_array().is_some_and(|t| !t.is_empty()), "{m}");
+
     // Every row stayed in its organization.
     assert_eq!(h.count("SELECT COUNT(*) FROM tasks WHERE org_id = 'org-b'"), 3);
     assert_eq!(h.count("SELECT COUNT(*) FROM task_dependencies WHERE org_id = 'org-b'"), 1);
@@ -628,6 +645,149 @@ async fn an_idempotency_key_never_replays_across_organizations() {
     let ub = h.ok(&b, "task_update", json!({ "id": tb, "append_note": "b", "idempotency_key": "upd" })).await;
     assert_eq!((ua["id"].as_i64(), ub["id"].as_i64()), (Some(ta), Some(tb)), "{ua} / {ub}");
     assert_eq!(h.count("SELECT COUNT(*) FROM tasks WHERE org_id = 'org-b' AND notes = 'b'"), 1);
+}
+
+/// Task-update keys are the caller's own and bound to one task: another
+/// caller's use of the same key, or a squat of a predictable one, neither
+/// replays the first reply nor drops the update, and labels that differ
+/// never share a stored key.
+#[tokio::test]
+async fn a_task_update_key_is_scoped_to_its_caller_and_its_task() {
+    let h = H::new();
+    let one = agent_named("builder-1", DEFAULT_ORG);
+    let two = agent_named("builder-2", DEFAULT_ORG);
+    let t1 = h.add(&one, json!({ "title": "first" })).await;
+    let t2 = h.add(&one, json!({ "title": "second" })).await;
+
+    let first =
+        h.ok(&one, "task_update", json!({ "id": t1, "append_note": "one", "idempotency_key": "k" })).await;
+    // Another caller, same key and task: its own update runs.
+    let second =
+        h.ok(&two, "task_update", json!({ "id": t1, "append_note": "two", "idempotency_key": "k" })).await;
+    assert!(second["notes"].as_str().unwrap().contains("two"), "{second}");
+    assert_ne!(second, first);
+    // The first caller's retry replays its own reply.
+    let again =
+        h.ok(&one, "task_update", json!({ "id": t1, "append_note": "one", "idempotency_key": "k" })).await;
+    assert_eq!(again, first);
+    // The same caller's key on another task is refused, and changes nothing.
+    let before = h.snapshot();
+    let e = h.err(&one, "task_update", json!({ "id": t2, "priority": "high", "idempotency_key": "k" })).await;
+    assert_eq!(reason(&e), "idempotency_key_reused", "{e}");
+    assert_eq!(h.snapshot(), before);
+
+    // A squatted predictable key does not block another caller.
+    h.ok(&two, "task_update", json!({ "id": t2, "priority": "low", "idempotency_key": "deploy-1" })).await;
+    let mine = h
+        .ok(&one, "task_update", json!({ "id": t1, "priority": "high", "idempotency_key": "deploy-1" }))
+        .await;
+    assert_eq!((mine["id"].as_i64(), mine["priority"].as_str()), (Some(t1), Some("high")), "{mine}");
+
+    // `x:y` with key `z` and `x` with key `y:z` are different stored keys.
+    let xy = agent_named("x:y", DEFAULT_ORG);
+    let x = agent_named("x", DEFAULT_ORG);
+    h.ok(&xy, "task_update", json!({ "id": t1, "priority": "low", "idempotency_key": "z" })).await;
+    let v = h.ok(&x, "task_update", json!({ "id": t2, "priority": "high", "idempotency_key": "y:z" })).await;
+    assert_eq!((v["id"].as_i64(), v["priority"].as_str()), (Some(t2), Some("high")), "{v}");
+    // The scoped form is what is stored.
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'task_update:builder-2:k'"), 1);
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'task_update:x%3Ay:z'"), 1);
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key = 'task_update:k'"), 0);
+}
+
+/// Deleting another organization's task deletes the holds rooted in its
+/// subtree and the policy authorizations naming it, so none falls into the
+/// default organization once its task is gone. The default organization's
+/// rows outlive their task, as before.
+#[tokio::test]
+async fn deleting_an_organization_b_task_takes_its_holds_and_authorizations_with_it() {
+    let h = H::new();
+    let op = Caller {
+        kind: ActorKind::Human,
+        profile: Profile::Coordinator,
+        ..agent_named("operator", DEFAULT_ORG)
+    };
+    let a = agent(DEFAULT_ORG);
+    let b = agent(ORG_B);
+    let root = h.add(&b, json!({ "title": B_TITLE })).await;
+    let child = h.add(&b, json!({ "title": "B child", "parent_id": root })).await;
+    h.coord(&b, "task_hold", json!({ "root_task_id": root, "reason": B_REASON })).await.unwrap();
+    // A nested hold, rooted inside the subtree.
+    h.coord(&b, "task_hold", json!({ "root_task_id": child, "reason": B_REASON })).await.unwrap();
+    let ta = h.add(&a, json!({ "title": "A held" })).await;
+    h.coord(&a, "task_hold", json!({ "root_task_id": ta, "reason": "A reason" })).await.unwrap();
+    // No caller outside the default organization can record one yet.
+    let sha = "d".repeat(40);
+    h.sql(&format!(
+        "INSERT INTO policy_authorizations (repo, pr, head_sha, task_id, policy_ref, authorized_by, created_at, expires_at)
+         VALUES ('owner-b/falcon', 3, '{sha}', {child}, 'osprey-policy', 'operator', 'x', '2999-01-01T00:00:00Z'),
+                ('owner-a/repo', 4, '{sha}', {ta}, 'a-policy', 'operator', 'x', '2999-01-01T00:00:00Z');"
+    ))
+    .unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM task_hold_members"), 4);
+
+    h.ok(&b, "task_delete", json!({ "id": root })).await;
+    h.ok(&a, "task_delete", json!({ "id": ta })).await;
+
+    assert_eq!(
+        h.count(&format!("SELECT COUNT(*) FROM task_holds WHERE root_task_id IN ({root}, {child})")),
+        0
+    );
+    // The default organization's hold row outlives its root (its members
+    // go with their tasks, as before).
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM task_holds WHERE root_task_id = {ta}")), 1);
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM policy_authorizations WHERE task_id = {ta}")), 1);
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM policy_authorizations WHERE task_id = {child}")), 0);
+    // The default organization's rows stay, and show only its own.
+    let holds = h.coord(&op, "task_holds", json!({ "status": "all" })).await.unwrap();
+    let roots: Vec<i64> =
+        holds["holds"].as_array().unwrap().iter().map(|x| x["root_task_id"].as_i64().unwrap()).collect();
+    assert_eq!(roots, [ta], "{holds}");
+    assert!(!holds.to_string().contains(B_REASON), "{holds}");
+    let auths = h.ok(&op, "policy_authorization_list", json!({ "include_inactive": true })).await;
+    let tasks: Vec<i64> =
+        auths["authorizations"].as_array().unwrap().iter().map(|x| x["task_id"].as_i64().unwrap()).collect();
+    assert_eq!(tasks, [ta], "{auths}");
+    assert!(!auths.to_string().contains("owner-b/falcon"), "{auths}");
+}
+
+/// `state_sync_verify` counts only the caller's organization's tasks in
+/// `task_fts`'s sync check.
+#[tokio::test]
+async fn state_sync_verify_counts_only_the_callers_tasks() {
+    let h = H::new();
+    let a = agent(DEFAULT_ORG);
+    let b = agent(ORG_B);
+    for i in 0..3 {
+        h.add(&a, json!({ "title": format!("A {i}") })).await;
+    }
+    h.add(&b, json!({ "title": "B only" })).await;
+    for (me, n) in [(&b, 1), (&a, 3)] {
+        let v = h.ok(me, "state_sync_verify", json!({})).await;
+        assert_eq!(v["task_db_count"], n, "{v}");
+        let fts = v["checks"]["fts"].as_array().unwrap().iter().find(|f| f["index"] == "task_fts").unwrap();
+        assert_eq!((fts["table_rows"].as_i64(), fts["indexed_rows"].as_i64()), (Some(n), Some(n)), "{fts}");
+        assert_eq!(fts["in_sync"], true, "{fts}");
+    }
+}
+
+/// A proposal or contract marker on another organization's task fails
+/// closed with one generic mismatch: the default organization's work
+/// proposals are never looked up for it.
+#[tokio::test]
+async fn an_organization_b_contract_marker_is_refused_without_a_lookup() {
+    let h = H::new();
+    let b = agent(ORG_B);
+    for notes in ["[proposal: wp_0123456789ab#0]", "[contract: deadbeef]"] {
+        let t = h.add(&b, json!({ "title": "B marked", "notes": notes })).await;
+        let e = h.err(&b, "task_claim", json!({ "id": t })).await;
+        assert_eq!(reason(&e), "contract_mismatch", "{e}");
+        assert!(e.to_string().contains("outside the default organization"), "{e}");
+        assert!(!e.to_string().contains("wp_"), "{e}");
+    }
+    // An unmarked task claims as before.
+    let t = h.add(&b, json!({ "title": "B plain" })).await;
+    h.ok(&b, "task_claim", json!({ "id": t })).await;
 }
 
 // --- the ledger --------------------------------------------------------------------------------
@@ -795,8 +955,9 @@ async fn start_github() -> (Seen, String) {
 /// repository both organizations bind and a PR both organizations' tasks link.
 #[tokio::test]
 async fn github_reconciliation_touches_only_default_organization_tasks() {
-    let (_seen, base) = start_github().await;
+    let (seen, base) = start_github().await;
     let h = H::with(|cfg| {
+        cfg.github_webhook_secret_value = Some(WEBHOOK_SECRET.to_string().into());
         cfg.fetch_allow_loopback = true;
         cfg.github_api_url = base;
         cfg.github_token_value = Some("test-token".to_string().into());
@@ -813,9 +974,11 @@ async fn github_reconciliation_touches_only_default_organization_tasks() {
         json!({ "action": "project_repo_bind", "params": { "project": "web", "repo": "shared/repo" } }),
     )
     .await;
+    // Organization B binds the shared repository and one of its own.
     h.sql(
         "INSERT INTO project_repo_bindings (org_id, project, repo, default_branch, bound_by, bound_at)
-         VALUES ('org-b', 'web', 'shared/repo', 'main', 'operator', 'x')",
+         VALUES ('org-b', 'web', 'shared/repo', 'main', 'operator', 'x'),
+                ('org-b', 'falcon', 'owner-b/falcon', 'main', 'operator', 'x')",
     )
     .unwrap();
     let a = agent(DEFAULT_ORG);
@@ -824,6 +987,8 @@ async fn github_reconciliation_touches_only_default_organization_tasks() {
         h.add(&a, json!({ "title": "A ships", "project": "web", "evidence_ref": "shared/repo#5" })).await;
     let tb =
         h.add(&b, json!({ "title": "B ships", "project": "web", "evidence_ref": "shared/repo#5" })).await;
+    let tb_own =
+        h.add(&b, json!({ "title": "B own", "project": "falcon", "evidence_ref": "owner-b/falcon#6" })).await;
 
     // Another organization's caller is refused outright.
     let e = h.coord(&b, "queue_close_merged", json!({})).await.unwrap_err();
@@ -839,10 +1004,46 @@ async fn github_reconciliation_touches_only_default_organization_tasks() {
     assert_eq!(closed, [ta], "{out}");
     assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {ta}")).as_deref(), Some("done"));
     assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {tb}")).as_deref(), Some("open"));
-    // The poller lists only the default organization's bound repositories.
+    // The poller lists only the default organization's bound repositories:
+    // organization B's own repository is never requested.
     let polled = poll_once(&h.hub).await.unwrap();
     let repos: Vec<&str> =
         polled["repos"].as_array().unwrap().iter().map(|r| r["repo"].as_str().unwrap()).collect();
     assert_eq!(repos, ["shared/repo"], "{polled}");
-    assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {tb}")).as_deref(), Some("open"));
+    assert!(seen.lock().unwrap().iter().all(|p| !p.contains("owner-b")), "{:?}", seen.lock().unwrap());
+    assert!(seen.lock().unwrap().iter().any(|p| p.contains("shared/repo")), "the poll did run");
+    for t in [tb, tb_own] {
+        assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {t}")).as_deref(), Some("open"));
+    }
+
+    // A signed delivery for a merged PR on the repository both organizations
+    // bind closes the default organization's task, never organization B's.
+    let ta2 =
+        h.add(&a, json!({ "title": "A ships 2", "project": "web", "evidence_ref": "shared/repo#8" })).await;
+    let tb2 =
+        h.add(&b, json!({ "title": "B ships 2", "project": "web", "evidence_ref": "shared/repo#8" })).await;
+    let payload = json!({
+        "action": "closed",
+        "number": 8,
+        "pull_request": {
+            "number": 8, "merged": true, "merged_at": ua_core::time::now(), "updated_at": ua_core::time::now(),
+            "merge_commit_sha": "e".repeat(40), "html_url": "https://github.com/shared/repo/pull/8",
+            "head": { "ref": "feature-8", "sha": "f".repeat(40) },
+            "base": { "ref": "main", "repo": { "full_name": "shared/repo", "default_branch": "main" } },
+        },
+        "repository": { "full_name": "shared/repo", "default_branch": "main" },
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let sig = signature_for(WEBHOOK_SECRET.as_bytes(), &body);
+    let out = receive(
+        &h.hub,
+        WebhookDelivery { event: "pull_request", delivery_id: "merge-8", signature: Some(&sig), body: &body },
+    )
+    .await
+    .unwrap();
+    let closed: Vec<i64> =
+        out["result"]["closed"].as_array().unwrap().iter().map(|c| c["task_id"].as_i64().unwrap()).collect();
+    assert_eq!(closed, [ta2], "{out}");
+    assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {ta2}")).as_deref(), Some("done"));
+    assert_eq!(h.text(&format!("SELECT status FROM tasks WHERE id = {tb2}")).as_deref(), Some("open"));
 }
