@@ -197,9 +197,11 @@ pub(crate) fn parse_params<T: DeserializeOwned>(
 pub(crate) fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
     // ORG-EVENT-DEFAULT: use the row's organization once callers can resolve
     // to other organizations and org_guard allows it. The cycles and
-    // delegation families share this function; the `agent.plan.*` callers
-    // pass another organization's free text and labels through `ledger_text`
-    // or `ledger_label`, so only ids, counts and statuses reach this ledger.
+    // delegation families share this function; the `agent.plan.*` and
+    // `agent.cycle.*` callers pass another organization's free text and
+    // labels through `ledger_text` or `ledger_label`, so only ids, counts and
+    // statuses reach this ledger. Delegations are still all in the task
+    // organization (`ORG-TASK-DEFAULT`).
     ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(caller.label.clone()))?;
     Ok(())
 }
@@ -233,8 +235,9 @@ fn require_org(c: &Connection, org: &str) -> UaResult<()> {
 /// Free text (a goal, a scope, a close reason) for a plan event's payload.
 /// Plan events are still written to the default organization's ledger
 /// (`ORG-EVENT-DEFAULT`), so another organization's text is left out (`null`)
-/// rather than recorded there; the payload keeps its shape.
-fn ledger_text(org: &str, text: &str) -> Value {
+/// rather than recorded there; the payload keeps its shape. The cycles family
+/// uses it for the same reason.
+pub(crate) fn ledger_text(org: &str, text: &str) -> Value {
     if org == ua_core::DEFAULT_ORG { json!(text) } else { Value::Null }
 }
 

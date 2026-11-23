@@ -87,3 +87,5 @@ organization.v1.tools.workflows
 workflows.v2.org_indexes
 organization.v1.tools.plans
 plans.v2.org_scope
+organization.v1.tools.cycles
+cycles.v2.org_scope
