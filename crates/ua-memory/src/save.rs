@@ -319,6 +319,11 @@ const SAVE_TOOL: &str = "memory_save";
 /// else a pre-upgrade raw key that `memory_save` itself wrote. Only
 /// `memory_save` rows are read, so another tool's use of the same text is
 /// invisible and the key answers like a fresh one.
+///
+/// A raw key was hub-wide, so its receipt replays only for the caller that
+/// wrote or last updated the note it names; for anyone else the key is fresh
+/// and the save goes ahead under that caller's scoped key, rather than being
+/// silently answered with another caller's receipt.
 fn saved_receipt(tx: &WriteTx<'_>, caller: &Caller, key: &str) -> UaResult<Option<String>> {
     let read = |k: &str| -> UaResult<Option<String>> {
         Ok(tx
@@ -329,10 +334,19 @@ fn saved_receipt(tx: &WriteTx<'_>, caller: &Caller, key: &str) -> UaResult<Optio
             )
             .optional()?)
     };
-    match read(&scoped_key(caller, key))? {
-        Some(raw) => Ok(Some(raw)),
-        None => read(key),
+    if let Some(raw) = read(&scoped_key(caller, key))? {
+        return Ok(Some(raw));
     }
+    let Some(raw) = read(key)? else { return Ok(None) };
+    let id = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string));
+    let Some(id) = id else { return Ok(None) };
+    let mine = note::fetch(tx, &id)?.is_some_and(|n| {
+        let me = Some(caller.label.as_str());
+        n.author.as_deref() == me || n.updated_by.as_deref() == me
+    });
+    Ok(mine.then_some(raw))
 }
 
 fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResult<Option<Value>> {

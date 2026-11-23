@@ -598,9 +598,16 @@ fn parent(conn: &Connection, message_id: &str) -> UaResult<Option<Parent>> {
 pub(crate) const RESERVED_SENDERS: [&str; 3] =
     [crate::families::node_queue::command::NOTICE_SENDER, "system", "pr-watch"];
 
+/// Every label starting with this prefix is reserved for the hub's own
+/// senders, so a later hub sender (`hub-github`, say) is covered before it ships.
+pub(crate) const RESERVED_SENDER_PREFIX: &str = "hub-";
+
 /// `label`, unless it is a reserved hub sender (compared ignoring ASCII case).
 fn unreserved(label: String) -> UaResult<String> {
-    if RESERVED_SENDERS.iter().any(|r| r.eq_ignore_ascii_case(&label)) {
+    let lower = label.to_ascii_lowercase();
+    if RESERVED_SENDERS.iter().any(|r| r.eq_ignore_ascii_case(&label))
+        || lower.starts_with(RESERVED_SENDER_PREFIX)
+    {
         return Err(UaError::denied(
             "reserved_sender",
             format!("from_agent {label:?} is reserved for the hub's own messages; send as your own label"),
