@@ -283,6 +283,9 @@ pub(crate) async fn run_as(
     name: &str,
     inputs: Map<String, Value>,
 ) -> UaResult<Report> {
+    // Fail closed before anything is recorded: the run's steps gate in the
+    // caller's organization (see `engine::require_caller_in_run_org`).
+    engine::require_caller_in_run_org(caller, org)?;
     let cfg = hub.cfg().clone();
     let n = name.to_string();
     let def = blocking(move || engine::load_definition(&cfg, &n)).await?;

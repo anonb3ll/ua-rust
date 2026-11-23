@@ -156,8 +156,12 @@ here for memory columns, owners and defaults.
   registry skills in a node's harness bundle use the caller's organization;
   a write for an organization `orgs` does not hold is refused before anything
   is read or written. Operator actions still need `ua_org::authz`, which
-  admits only the default organization until memberships exist. The importer
-  writes legacy skill versions and assignments to `default`.
+  admits only the default organization until memberships exist. The publish,
+  assign and unassign approval payloads bind `org_id`, so a pass is never
+  consumed across organizations; approvals parked in the earlier payload
+  shape no longer match and should be denied at upgrade (no migration
+  expires them: they can never be consumed). The importer writes legacy
+  skill versions and assignments to `default`.
 - The governance family applies the standalone procedure
   `governance.v2.project_bindings_tenant_keys` to rebuild
   `project_repo_bindings` around `(org_id, project)` and migrate existing
@@ -356,8 +360,22 @@ here for memory columns, owners and defaults.
   `agent.approval.*` events are `ORG-EVENT-DEFAULT` sites; for an approval
   outside the default organization `requested_by` and `resolved_by` are
   `null` in their payloads (the other fields are ids, tool names, hashes and
-  enumerated codes). A policy-authorization refusal stays a default
-  organization event until `policy_authorizations` converts. The importer
+  enumerated codes), and the event's `originator` column is the neutral
+  `system`, never the requester's or resolver's label. A workflow run is
+  executed only by a caller of the run's own organization: a gated step's
+  payload binds the run's `org_id` while the gate parks in the caller's, so
+  a mismatch is refused (an internal error) before the run's lease is taken
+  or anything is parked, rather than rebuilding the caller (`org_guard`
+  forbids that). The relay's `status` reports a draft whose approval is in
+  another organization with `approval_status: null`; its `cancel` still
+  fails closed (`not found`), so a draft is never marked cancelled while
+  its approval stays live where the caller cannot withdraw it. Skill
+  registry approvals (publish, assign, unassign) bind `org_id`. A
+  policy-authorization refusal stays a default organization event until
+  `policy_authorizations` converts, and is an excluded site: its
+  `refuse` (`crates/ua-tools/src/families/github/authz.rs:181`) ledgers the
+  refusal as a default-organization one, so its payload and `originator`
+  carry the caller's label whatever the caller's organization. The importer
   writes legacy approvals to `default`. `crates/ua-tools/tests/approvals_tenant.rs`
   holds the upgrade and the isolation tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
@@ -1612,6 +1630,17 @@ spelling a send's key is a fresh key, never `conflict`, and never occupies
 the send's row. An unverified caller may not send as a label the hub sends
 as itself (`hub-node`, `system`, `pr-watch`), so it cannot take a hub client
 id first.
+
+`agent.lifecycle.handoff` carries only the authoritative handoff-note events.
+A hook-reported handoff (`lifecycle_record` with `kind: "handoff"`) goes to
+`agent.lifecycle.handoff_hook`, which its writer and note-reading operators
+can read and nobody else — the session it names does not grant its owner
+access, so one agent cannot place a handoff-shaped row in another agent's
+session view or `session_packet`. Rows that `lifecycle_record` wrote to
+`agent.lifecycle.handoff` before this change stay there (the ledger is
+append-only) and keep that channel's rule. The other lifecycle kinds
+(`tool_start`, `stop` and the rest) are ordinary visible observations: any
+agent may name any session in one, and its `originator` shows who wrote it.
 
 The Python verifier cannot check `hash_v = 2` rows. That is acceptable because
 the Python hub is frozen and never reads a `ua-rust` ledger.
