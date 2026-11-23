@@ -196,6 +196,18 @@ async fn send_cannot_name_a_conversation_it_is_not_in() {
     }
     assert_eq!(answers[0], answers[1]);
 
+    // An external-thread prefix is not a message id a client may choose.
+    let err = reg
+        .call(
+            &hub,
+            &a,
+            "message_send",
+            json!({"act": "inform", "to_agent": "builder-2", "body": "x", "message_id": "ts:123"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_argument");
+
     // A party continues its own conversation by id.
     let reply = send(
         &reg,

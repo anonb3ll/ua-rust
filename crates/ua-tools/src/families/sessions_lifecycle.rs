@@ -1021,7 +1021,9 @@ fn intervention_path(ctx: &ToolCtx, worktree: Option<&str>) -> Option<PathBuf> {
     Some(real.join(INTERVENTION_RELPATH))
 }
 
-fn read_interventions(path: Option<&Path>, limit: usize) -> Vec<Value> {
+/// The newest `limit` intervention lines; for a restricted reader (`party`),
+/// only those it sent or received, as in its own mailbox.
+fn read_interventions(path: Option<&Path>, limit: usize, party: Option<&str>) -> Vec<Value> {
     let Some(path) = path.filter(|p| p.is_file()) else { return Vec::new() };
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let text = String::from_utf8_lossy(&bytes);
@@ -1030,6 +1032,7 @@ fn read_interventions(path: Option<&Path>, limit: usize) -> Vec<Value> {
         .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(Value::is_object)
+        .filter(|v| party.is_none_or(|p| v["from_agent"] == p || v["to_agent"] == p))
         .collect()
 }
 
@@ -1045,6 +1048,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
     let party = verified(&ctx.caller)
         .filter(|_| !super::messaging::may_read_all_mail(ctx.hub.cfg(), &ctx.caller))
         .map(str::to_string);
+    let party_q = party.clone();
     let (session, mut messages) = ctx
         .hub
         .db()
@@ -1064,7 +1068,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
                     session["task_id"].as_i64(),
                     session["delegation_id"].as_i64(),
                     cap,
-                    party
+                    party_q
                 ],
                 |r| {
                     let payload: Option<String> = r.get(15)?;
@@ -1098,7 +1102,7 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         "messages": messages,
         "message_total": total,
         "interventions_path": drop_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "worktree_interventions": read_interventions(drop_path.as_deref(), cap as usize),
+        "worktree_interventions": read_interventions(drop_path.as_deref(), cap as usize, party.as_deref()),
     }))
 }
 
@@ -1186,10 +1190,12 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
     let task_id = session["task_id"].as_i64();
     let mut note_recorded = false;
     if let Some(t) = task_id {
+        // Task notes are readable by every caller: the marker names the
+        // message, never its body, which stays with the mailbox rule.
         let marker = format!(
-            "[intervention @ {}] session={sid} from {sender}: {}",
+            "[intervention @ {}] session={sid} from {sender}: message {}",
             ua_core::time::now(),
-            truncate(&text, 500)
+            message["message_id"].as_str().unwrap_or("?")
         );
         let mut upd = json!({ "id": t, "append_note": marker });
         if let Some(n) = &named {

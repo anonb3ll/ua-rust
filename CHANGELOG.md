@@ -770,7 +770,11 @@ from its commit history.
   mail-unrestricted reader may still start one under a chosen id, and only
   the gated `crew_intervene` opens or joins a session's `crew:<session>`
   thread. `crew_view` no longer returns other agents' private mail: a
-  restricted caller sees only the crew's messages it sent or received.
+  restricted caller sees only the crew's messages and worktree intervention
+  lines it sent or received. The task-note marker `crew_intervene` writes
+  now names the message id instead of quoting the body. `message_send`
+  refuses a client-chosen `message_id` with an external-thread prefix
+  (`ts:`).
 - `ua_ingress`: the relaxed outbound policies (`github.enterprise`,
   `notify.webhook`, `obsidian.local_rest`) can no longer be obtained by
   name or from the public policy list, and build only clients pinned to one

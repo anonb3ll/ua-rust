@@ -1532,7 +1532,15 @@ hub-minted id or inherit one through `reply_to`. The one exception is
 `crew_intervene`, which after its own profile check and approval gate may
 open or join the session's `crew:<session>` thread; a direct `message_send`
 naming that id is refused like any other. `crew_view` applies the mailbox
-rule: a restricted caller sees only the crew's messages it sent or received.
+rule to its messages and its `worktree_interventions` audit lines: a
+restricted caller sees only those it sent or received. The intervention's
+task-note marker names the message id and sender, never the body. One copy
+of the body stays outside the rule: `crew_intervene` appends it to the
+session's own `<worktree>/.ua/interventions.jsonl` so the agent working
+there receives it, and that file is readable by whoever can read the
+worktree on disk. The recipient of session-targeted mail (including the
+session owner in its `crew:<session>` thread) is not a party for naming the
+conversation or reading its handoff links; it answers through `reply_to`.
 A client-chosen `message_id` that collides with any existing message still
 answers `conflict`, which shows that some message holds that id, never its
 content or parties.

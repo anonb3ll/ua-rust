@@ -91,6 +91,11 @@ const MAX_LIST_LIMIT: i64 = 200;
 const MAX_ID_LEN: usize = 200;
 /// A `reply_to` in these namespaces points outside the hub and is not checked.
 const EXTERNAL_REPLY_PREFIXES: [&str; 1] = ["ts:"];
+
+/// A `reply_to` naming an external thread, never a hub message.
+fn is_external_reply(id: &str) -> bool {
+    EXTERNAL_REPLY_PREFIXES.iter().any(|p| id.starts_with(p))
+}
 const SEND_TOOL: &str = "message_send";
 
 const HANDOFF_FIELDS: [&str; 7] =
@@ -622,7 +627,7 @@ fn reply_default_session(
 /// "no such message" and "not yours", so a probe learns nothing.
 fn check_reply(conn: &Connection, reply_to: Option<&str>, sender: &str) -> UaResult<Option<String>> {
     let Some(reply) = reply_to else { return Ok(None) };
-    if EXTERNAL_REPLY_PREFIXES.iter().any(|p| reply.starts_with(p)) {
+    if is_external_reply(reply) {
         return Ok(None);
     }
     match parent(conn, reply)? {
@@ -750,6 +755,12 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         if !is_id_safe(m) {
             return Err(UaError::invalid("message_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
         }
+        if is_external_reply(m) {
+            return Err(UaError::invalid(format!(
+                "message_id may not start with {}: that prefix names an external thread",
+                EXTERNAL_REPLY_PREFIXES.join(" or ")
+            )));
+        }
         // A retry returns its saved result before anything that can change
         // after the first attempt (the target session may have ended since).
         if let Some(saved) = saved_result(tx, m, &sender)? {
@@ -763,8 +774,10 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     let inherited = check_reply(tx, reply.as_deref(), &sender)?;
     let mut to_agent = clean(a.to_agent.as_deref());
     let mut target = clean(a.to_session.as_deref());
+    // An external reply_to skips the party check, so it never looks up a
+    // hub message to default the session or the recipient.
     if target.is_none()
-        && let Some(r) = &reply
+        && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
     {
         target = reply_default_session(tx, r, &sender, to_agent.as_deref())?;
     }
@@ -799,7 +812,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         }
     }
     if to_agent.is_none()
-        && let Some(r) = &reply
+        && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
         && let Some(p) = parent(tx, r)?
     {
         // A reply with no address answers the other party of its parent.
@@ -1704,7 +1717,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "message_send",
-            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. crew_intervene alone may open or join a session's crew:<session> thread.",
+            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. Of the restricted callers, only crew_intervene may open or join a session's crew:<session> thread.",
             message_send,
         )
         .family("messaging"),

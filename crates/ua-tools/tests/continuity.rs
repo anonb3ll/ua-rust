@@ -707,6 +707,20 @@ async fn a_conversation_is_handed_off_to_a_task_without_copying_it() {
         )
         .await;
     assert_eq!(reason(&e), "action_denied", "{e:?}");
+    // The refusal is recorded on the tool called and its routed action.
+    let recorded: (String, String) = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT json_extract(payload, '$.tool'), json_extract(payload, '$.action_tool') FROM event_log \
+                 WHERE channel = 'agent.gateway.decision' AND originator = 'research-1' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(recorded, ("coordination_manage".into(), "coordination_manage:conversation_handoff".into()));
 
     // Validation.
     for bad in [

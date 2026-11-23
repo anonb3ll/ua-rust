@@ -555,6 +555,26 @@ async fn crew_view_shows_a_restricted_caller_only_its_own_mail() {
     // A mail-unrestricted reader sees everything.
     let all = e.ok(&human(), "crew_view", json!({ "session_id": owner_session })).await;
     assert_eq!(all["message_total"], 1, "{all}");
+
+    // An intervention into a session with a worktree: its audit copy follows
+    // the same rule, and the task's notes name the message, not its body.
+    let wt = e.ws.path().join("wt-private");
+    std::fs::create_dir_all(&wt).unwrap();
+    let steered = e.start(&b2, json!({ "task_id": task, "worktree_path": wt.to_str().unwrap() })).await;
+    let lead = agent("lead-1");
+    approved_call(&e, &lead, json!({ "session_id": steered, "message": "Secret: rotate now" }))
+        .await
+        .unwrap();
+    for who in [&lead, &b2] {
+        let v = e.ok(who, "crew_view", json!({ "session_id": steered })).await;
+        assert_eq!(v["worktree_interventions"].as_array().unwrap().len(), 1, "{v}");
+    }
+    let v = e.ok(&outsider, "crew_view", json!({ "session_id": steered })).await;
+    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
+    assert!(!v.to_string().contains("Secret"), "{v}");
+    let notes = e.ok(&outsider, "task_list", json!({ "status": "all" })).await;
+    assert!(notes.to_string().contains("[intervention @"), "{notes}");
+    assert!(!notes.to_string().contains("Secret"), "{notes}");
 }
 
 #[tokio::test]
@@ -591,7 +611,11 @@ async fn only_crew_intervene_opens_a_crew_thread() {
             Ok(())
         })
         .unwrap();
+    // A fresh intervener, not yet a party to the thread, so only the crew
+    // grant can let it in.
+    let lead3 = agent("lead-3");
     let quiet =
-        approved_call(&e, &lead, json!({ "session_id": s, "message": "still there?" })).await.unwrap();
+        approved_call(&e, &lead3, json!({ "session_id": s, "message": "still there?" })).await.unwrap();
+    assert!(quiet["message"]["to_session"].is_null(), "delivery fell back to the label: {quiet}");
     assert_eq!(quiet["message"]["conversation_id"], crew.as_str(), "{quiet}");
 }
