@@ -748,7 +748,7 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
                 return Ok(json!({ "deleted": false, "children_deleted": 0, "worktrees": {} }));
             }
             if org != ua_core::DEFAULT_ORG {
-                drop_orphaned_task_rows(tx, &subtree)?;
+                drop_orphaned_task_rows(tx, &org, &subtree)?;
             }
             let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
@@ -763,21 +763,23 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
 }
 
 /// Delete the holds rooted in `subtree` (and their members) and the policy
-/// authorizations naming a task in it, before a non-default organization's
-/// task is deleted.
+/// authorizations naming a task in it, before organization `org`'s
+/// (non-default) task is deleted.
 ///
-/// `task_holds` and `policy_authorizations` carry no `org_id` yet and no
-/// foreign key to `tasks`: their organization is their task's, and once that
-/// task is gone the lookup falls back to the default organization. Left
-/// behind, another organization's hold reason, labels and authorization
-/// repository, PR and head would show in the default organization's views,
-/// and the default organization could release that hold. The rows are
-/// deleted rather than blanked: a blanked row would still be a default
-/// organization row (listed, counted, releasable) that it never created,
-/// and with its task gone nothing can act on it any more. The default
-/// organization keeps its rows, as before: its holds may outlive their root,
-/// and nothing changes organization when they do.
-fn drop_orphaned_task_rows(tx: &rusqlite::Connection, subtree: &[i64]) -> UaResult<()> {
+/// `policy_authorizations` carries no `org_id` yet and no foreign key to
+/// `tasks`: its organization is its task's, and once that task is gone the
+/// lookup falls back to the default organization. Left behind, another
+/// organization's authorization repository, PR and head would show in the
+/// default organization's views. The row is deleted rather than blanked: a
+/// blanked row would still be a default organization row it never created.
+///
+/// Holds carry their organization (`task_holds.org_id`), so a hold of a
+/// deleted task can no longer fall into the default organization; they are
+/// still deleted with their root, in their own organization only, so that
+/// deleting another organization's task leaves the same state as before
+/// holds had the column. The default organization keeps its rows, as before:
+/// its holds may outlive their root.
+fn drop_orphaned_task_rows(tx: &rusqlite::Connection, org: &str, subtree: &[i64]) -> UaResult<()> {
     let has = |name: &str| -> UaResult<bool> {
         Ok(tx
             .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |_| Ok(()))
@@ -788,12 +790,15 @@ fn drop_orphaned_task_rows(tx: &rusqlite::Connection, subtree: &[i64]) -> UaResu
     if has("task_holds")? {
         if has("task_hold_members")? {
             tx.execute(
-                "DELETE FROM task_hold_members WHERE hold_id IN \
-                     (SELECT id FROM task_holds WHERE root_task_id IN (SELECT value FROM json_each(?1)))",
-                [&ids],
+                "DELETE FROM task_hold_members WHERE org_id = ?2 AND hold_id IN \
+                     (SELECT id FROM task_holds WHERE org_id = ?2 AND root_task_id IN (SELECT value FROM json_each(?1)))",
+                params![ids, org],
             )?;
         }
-        tx.execute("DELETE FROM task_holds WHERE root_task_id IN (SELECT value FROM json_each(?1))", [&ids])?;
+        tx.execute(
+            "DELETE FROM task_holds WHERE org_id = ?2 AND root_task_id IN (SELECT value FROM json_each(?1))",
+            params![ids, org],
+        )?;
     }
     if has("policy_authorizations")? {
         tx.execute(

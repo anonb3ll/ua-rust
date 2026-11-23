@@ -41,6 +41,7 @@ pub(crate) use bindings::{
 pub use bindings::{check_default_branch, normalize_repo};
 pub(crate) use block::{Blocked, check_claim, claim_block};
 pub(crate) use claim_release::task_claim_release;
+pub use holds::{HOLDS_ORG_SCOPE, HOLDS_TENANT_PART};
 pub(crate) use holds::{task_hold, task_hold_get, task_holds};
 pub use lifecycle::is_retired;
 pub(crate) use lifecycle::{
