@@ -37,6 +37,7 @@ pub(crate) enum Kind {
     /// Remote nodes: owner, version, timestamps and retirement move across,
     /// host facts do not. ua-rust stores only facts it bounded on write, so
     /// `facts_json` starts empty and the node's next registration fills it.
+    /// Legacy nodes are imported into the default organization.
     Nodes,
     /// Tasks: `current_run_id` and `current_run_agent` are cleared to NULL
     /// because `dispatch_runs` are not imported. Legacy tasks are imported
@@ -99,6 +100,7 @@ impl Kind {
                 | Kind::Goals
                 | Kind::WorkProposals
                 | Kind::Memory
+                | Kind::Nodes
                 | Kind::MessageIndex
                 | Kind::MessageReads
         )

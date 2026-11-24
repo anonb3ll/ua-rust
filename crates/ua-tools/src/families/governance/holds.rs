@@ -189,9 +189,11 @@ fn live_run_task_ids(c: &Connection, h: &Hold) -> UaResult<Vec<i64>> {
            AND t.lock_expires_at IS NOT NULL AND t.lock_expires_at > ?2
          UNION
          SELECT d.task_id FROM dispatch_runs d JOIN task_hold_members m ON m.task_id = d.task_id
+           AND d.org_id = m.org_id
          WHERE m.org_id = ?3 AND m.hold_id = ?1 AND d.state IN ('claimed','launched','running')
          UNION
          SELECT n.task_id FROM node_dispatch n JOIN task_hold_members m ON m.task_id = n.task_id
+           AND n.org_id = m.org_id
          WHERE m.org_id = ?3 AND m.hold_id = ?1 AND n.status IN ('queued','claimed')
          ORDER BY 1",
     )?;
@@ -534,7 +536,7 @@ fn restore_in_tx(
             continue;
         }
         let run = match &m.cancelled_run_id {
-            Some(r) => load_run(tx, r)?,
+            Some(r) => load_run(tx, &h.org, r)?,
             None => None,
         };
         if run.as_ref().is_some_and(|r| states::is_live(&r.state)) {
@@ -763,19 +765,20 @@ async fn request_cancels(
             let mut items = Vec::new();
             for m in &live {
                 let mut stmt = c.prepare(
-                    "SELECT run_id, agent_label FROM dispatch_runs WHERE task_id = ?1 \
+                    "SELECT run_id, agent_label FROM dispatch_runs WHERE org_id = ?2 AND task_id = ?1 \
                      AND state IN ('claimed','launched','running') AND termination_outcome IS NULL",
                 )?;
-                for r in
-                    stmt.query_map([m.task_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                {
+                for r in stmt.query_map(params![m.task_id, org1], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })? {
                     let (run_id, agent) = r?;
                     runs.push((run_id, m.task_id, agent));
                 }
                 for item in node_queue::items_where(
                     c,
-                    "task_id = ?1 AND status IN ('queued','claimed') AND run_id IS NULL ORDER BY created_at",
-                    [m.task_id],
+                    "org_id = ?2 AND task_id = ?1 AND status IN ('queued','claimed') AND run_id IS NULL \
+                     ORDER BY created_at",
+                    params![m.task_id, org1],
                 )? {
                     items.push((item, m.claimed_by.clone()));
                 }
@@ -795,7 +798,8 @@ async fn request_cancels(
             }));
             continue;
         }
-        let mut row = stop_runs(&ctx.hub, who, vec![(run_id.clone(), task_id)], &why).await.remove(0);
+        let mut row =
+            stop_runs(&ctx.hub, who, vec![(run_id.clone(), task_id, org.to_string())], &why).await.remove(0);
         if matches!(row["control"].as_str(), Some("confirmed" | "requested")) {
             flagged.push((run_id, agent, task_id));
         }
@@ -820,7 +824,7 @@ async fn request_cancels(
                     v["control"] = json!("refused");
                     v["detail"] = json!("stopping another identity's node item is an operator action");
                 } else {
-                    let res = node_queue::cancel_item(tx, &item.id, &who2, &why2)?;
+                    let res = node_queue::cancel_item(tx, &item.org_id, &item.id, &who2, &why2)?;
                     v["control"] =
                         json!(if res["changed"] == json!(true) { "requested" } else { "unchanged" });
                     v["detail"] = json!(if item.status == "queued" {

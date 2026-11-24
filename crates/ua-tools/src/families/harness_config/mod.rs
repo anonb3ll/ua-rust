@@ -525,20 +525,34 @@ fn settle(tx: &mut WriteTx<'_>, hub: &Hub, org: &str, node: &str, agent: &str, b
 /// Close a node's open proposals when it is reassigned or forgotten, so its
 /// pending approvals never apply under another owner.
 ///
-/// ORG-NODE-HUB: deliberately not scoped to one organization. Node names are
-/// one hub-wide namespace (`docs/organization.md`, "Global keys and table
-/// rebuilds") and nodes carry no `org_id` yet; a reassigned or forgotten
-/// node's open proposals are closed in every organization, which only ever
-/// takes a pass away. When nodes gain `org_id`, scope this to the node's.
-pub(crate) fn close_for_node(tx: &mut WriteTx<'_>, node: &str, reason: &str, by: &str) -> UaResult<()> {
+/// `org` is the node's organization (`nodes.org_id`): a node belongs to the
+/// organization that registered it, and its proposals were made by its
+/// agent's calls in that organization, so only that organization's are
+/// closed. (Before nodes carried `org_id` this spanned every organization.)
+pub(crate) fn close_for_node(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    node: &str,
+    reason: &str,
+    by: &str,
+) -> UaResult<()> {
     let now = ua_core::time::now();
     let n = tx.execute(
         "UPDATE harness_config_proposals SET status = 'closed', updated_at = ?2, resolved_at = ?2, \
-         resolved_by = ?3 WHERE node = ?1 AND status = 'pending'",
-        params![node, now, by],
+         resolved_by = ?3 WHERE org_id = ?4 AND node = ?1 AND status = 'pending'",
+        params![node, now, by, org],
     )?;
     if n > 0 {
-        record(tx, "harness_config_closed", json!({ "node": node, "reason": reason, "proposals": n }), by)?;
+        // ORG-EVENT-DEFAULT: another organization's node name stays out of
+        // the default ledger.
+        let node_ref = super::plans::ledger_text(org, node);
+        let by = if org == ua_core::DEFAULT_ORG { by } else { "system" };
+        record(
+            tx,
+            "harness_config_closed",
+            json!({ "node": node_ref, "reason": reason, "proposals": n }),
+            by,
+        )?;
     }
     Ok(())
 }
@@ -600,7 +614,7 @@ fn no_bundle() -> Value {
 }
 
 fn get_payload(c: &Connection, hub: &Hub, org: &str, agent: &str, node: &str) -> UaResult<Value> {
-    let row = owned_node(c, node, agent)?;
+    let row = owned_node(c, org, node, agent)?;
     let Some(active) = active(c, org)? else { return Ok(no_bundle()) };
     let (bundle, assigned) = effective(c, hub, org, agent, &active.bundle)?;
     let rendered = render_all(&bundle)?;
@@ -662,7 +676,7 @@ fn plan_report(
     a: &NodeConfigArgs,
 ) -> UaResult<ReportPlan> {
     require_org(c, org)?;
-    let node = owned_node(c, &a.node, agent)?.node;
+    let node = owned_node(c, org, &a.node, agent)?.node;
     let Some(active) = active(c, org)? else {
         return Err(UaError::not_found("no active harness config bundle"));
     };
@@ -780,7 +794,7 @@ fn commit_report(tx: &mut WriteTx<'_>, hub: &Hub, caller: &Caller, plan: ReportP
     let agent = caller.label.as_str();
     let org = caller.org_id.as_str();
     require_org(tx, org)?;
-    let node = owned_node(tx, &plan.node, agent)?.node;
+    let node = owned_node(tx, org, &plan.node, agent)?.node;
     if active(tx, org)?.map(|a| a.version).as_deref() != Some(plan.version.as_str()) {
         return Err(state_changed());
     }
@@ -946,7 +960,7 @@ fn plan_applied(
         return Err(UaError::invalid("desired_hash must be sha256 hex"));
     }
     require_org(c, org)?;
-    let node = owned_node(c, &a.node, agent)?.node;
+    let node = owned_node(c, org, &a.node, agent)?.node;
     let Some(active) = active(c, org)? else {
         return Err(UaError::not_found("no active harness config bundle"));
     };
@@ -1009,7 +1023,7 @@ fn commit_applied(
     let agent = caller.label.as_str();
     let org = caller.org_id.as_str();
     require_org(tx, org)?;
-    owned_node(tx, &p.node, agent)?;
+    owned_node(tx, org, &p.node, agent)?;
     if active(tx, org)?.map(|a| a.version).as_deref() != Some(p.version.as_str())
         || last_applied(tx, org, &p.node, agent, &p.surface)?.map(|l| l.0) != p.base
     {
@@ -1267,7 +1281,7 @@ async fn status(ctx: ToolCtx, _a: StatusArgs) -> UaResult<Value> {
                 }
             };
             let filter = "org_id = ?2 \
-                 AND (?1 IS NULL OR (agent = ?1 AND node IN (SELECT node FROM nodes WHERE agent = ?1)))";
+                 AND (?1 IS NULL OR (agent = ?1 AND node IN (SELECT node FROM nodes WHERE agent = ?1 AND org_id = ?2)))";
             let pending: i64 = c.query_row(
                 &format!(
                     "SELECT COUNT(*) FROM harness_config_proposals WHERE status = 'pending' AND {filter}"

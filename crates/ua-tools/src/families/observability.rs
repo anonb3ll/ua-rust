@@ -996,7 +996,7 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
         last_delivery,
         quick_check,
-        fleet: nodes::fleet(c, Timestamp::now()).map_err(|e| e.to_string()),
+        fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
     })
 }
 
@@ -1647,7 +1647,7 @@ fn human_age(secs: i64) -> String {
 /// Registered remote nodes: LIVE when every node in service is live,
 /// DEGRADED naming the ones that are not, DORMANT when none is registered.
 /// Retired nodes are not hosts; they are named once and never change the status.
-fn fleet_nodes_check(facts: &DbFacts) -> Value {
+fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     let gate = "node_register / node_heartbeat (POST /api/node/*)";
     let fleet = match &facts.fleet {
         Ok(f) => f,
@@ -1694,6 +1694,13 @@ fn fleet_nodes_check(facts: &DbFacts) -> Value {
             fleet.retired.join(", ")
         ));
     }
+    let blocked = if require_acceptance { fleet.other_org_unaccepted } else { 0 };
+    if blocked > 0 {
+        parts.push(format!(
+            "{blocked} other-organization node(s) in service take no real work: node_require_acceptance is on \
+             and device acceptance runs only for the default organization's nodes"
+        ));
+    }
     let mut row = finding("fleet_nodes", status, parts.join("; "), gate);
     row["hosts"] = fleet
         .active
@@ -1702,6 +1709,22 @@ fn fleet_nodes_check(facts: &DbFacts) -> Value {
         .collect();
     if !fleet.retired.is_empty() {
         row["retired"] = json!(fleet.retired);
+    }
+    // A hub-wide view lists only the default organization's nodes; the
+    // other organizations' are counts, never names or hosts.
+    if fleet.other_org_active + fleet.other_org_retired > 0 {
+        row["other_org_nodes"] =
+            json!({ "active": fleet.other_org_active, "retired": fleet.other_org_retired });
+    }
+    // Device acceptance runs only for default nodes, so with acceptance
+    // required another organization's node takes no real work.
+    if blocked > 0 {
+        row["other_org_nodes_not_accepted"] = json!(blocked);
+    }
+    // Another organization's command notices are kept, never sent (the
+    // mailbox has no organization yet); the owner reads node_command_status.
+    if fleet.other_org_unsent_notices > 0 {
+        row["other_org_unsent_command_notices"] = json!(fleet.other_org_unsent_notices);
     }
     row
 }
@@ -1744,7 +1767,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         slack_check(cfg),
         github,
         policy_check(cfg),
-        fleet_nodes_check(&facts),
+        fleet_nodes_check(&facts, cfg.node_require_acceptance),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
     let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]

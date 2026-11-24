@@ -439,7 +439,15 @@ fn release_claims(tx: &mut WriteTx<'_>, agent: &str, who: &str, reason: &str) ->
 }
 
 /// Cancel `agent`'s node items: claimed ones always (the node stops them on
-/// its next heartbeat), queued ones too when `queued` is set.
+/// its next heartbeat), queued ones too when `queued` is set. An agent-wide
+/// lifecycle action: each item is cancelled in its own organization.
+///
+/// The stop list (the answer and `lifecycle.stops_requested`) keeps another
+/// organization's item and run ids on purpose: they are hub-generated, the
+/// same ids `node_queue::ledger_payload` keeps for another organization's
+/// events, and the operator needs them to follow the stop. Nothing else of
+/// such a row is copied: the details are fixed texts and reason codes from
+/// the cancel path, never its node name, prompt or reason.
 fn stop_node_items(tx: &mut WriteTx<'_>, agent: &str, who: &str, queued: bool) -> UaResult<Vec<Value>> {
     let filter = if queued {
         "agent = ?1 COLLATE NOCASE AND status IN ('queued','claimed') AND run_id IS NULL ORDER BY created_at"
@@ -448,7 +456,7 @@ fn stop_node_items(tx: &mut WriteTx<'_>, agent: &str, who: &str, queued: bool) -
     };
     let mut out = Vec::new();
     for item in node_queue::items_where(tx, filter, [agent])? {
-        let res = node_queue::cancel_item(tx, &item.id, who, "agent lifecycle stop")?;
+        let res = node_queue::cancel_item(tx, &item.org_id, &item.id, who, "agent lifecycle stop")?;
         out.push(json!({
             "path": "node",
             "ref": item.id,
@@ -460,20 +468,29 @@ fn stop_node_items(tx: &mut WriteTx<'_>, agent: &str, who: &str, queued: bool) -
     Ok(out)
 }
 
-fn live_runs(c: &Connection, agent: &str) -> UaResult<Vec<(String, i64)>> {
+/// `agent`'s live runs in every organization, each with its organization
+/// (an agent-wide lifecycle action, like the task claims above).
+fn live_runs(c: &Connection, agent: &str) -> UaResult<Vec<(String, i64, String)>> {
     let mut stmt = c.prepare(
-        "SELECT run_id, task_id FROM dispatch_runs WHERE agent_label = ?1 COLLATE NOCASE \
+        "SELECT run_id, task_id, org_id FROM dispatch_runs WHERE agent_label = ?1 COLLATE NOCASE \
          AND state IN ('claimed','launched','running') AND termination_outcome IS NULL ORDER BY created_at",
     )?;
-    let rows = stmt.query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let rows =
+        stmt.query_map([agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-/// Cancel each run through the `dispatch_cancel` path, reporting what happened.
-pub(crate) async fn stop_runs(hub: &Hub, who: &str, runs: Vec<(String, i64)>, reason: &str) -> Vec<Value> {
+/// Cancel each run `(run_id, task_id, org)` through the `dispatch_cancel`
+/// path, in the run's organization, reporting what happened.
+pub(crate) async fn stop_runs(
+    hub: &Hub,
+    who: &str,
+    runs: Vec<(String, i64, String)>,
+    reason: &str,
+) -> Vec<Value> {
     let mut out = Vec::new();
-    for (run_id, task_id) in runs {
-        let res = dispatch::cancel_run(hub, who.to_string(), run_id.clone(), reason.to_string()).await;
+    for (run_id, task_id, org) in runs {
+        let res = dispatch::cancel_run(hub, org, who.to_string(), run_id.clone(), reason.to_string()).await;
         let (control, detail) = match res {
             Ok(v) if v["ok"] == json!(false) => ("unchanged", v["reason"].as_str().unwrap_or("").to_string()),
             Ok(v) if v["cessation"] == json!("confirmed") => {
@@ -491,7 +508,7 @@ struct Changed {
     state: Value,
     changed: bool,
     stops: Vec<Value>,
-    runs: Vec<(String, i64)>,
+    runs: Vec<(String, i64, String)>,
     revoked: Option<Value>,
 }
 
@@ -618,7 +635,7 @@ async fn change(
             if target != "active" {
                 runs = live_runs(tx, &stored)?;
                 stops.extend(stop_node_items(tx, &stored, &who, verb != Verb::Pause)?);
-                let run_tasks: Vec<i64> = runs.iter().map(|(_, t)| *t).collect();
+                let run_tasks: Vec<i64> = runs.iter().map(|(_, t, _)| *t).collect();
                 if verb == Verb::Terminate {
                     stops.extend(release_claims(tx, &stored, &who, &reason)?);
                 } else {

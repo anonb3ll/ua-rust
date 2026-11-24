@@ -7,11 +7,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_store::WriteTx;
 
 use super::{
-    CHANNEL, Item, check_item_id, clip, device_agent, evidence_ref, load_item, now, owned_node, record,
-    run_gate, verified_caller,
+    CHANNEL, Dedupe, Item, check_item_id, clip, device_agent, emit, evidence_ref, load_item, now, owned_node,
+    record, require_org, run_gate, verified_caller,
 };
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
@@ -45,9 +45,10 @@ fn redact(v: &Value) -> Value {
     }
 }
 
-/// The item `id` of `node`, which must be claimed for live traffic.
-fn live_item(c: &Connection, node: &str, id: &str, what: &str) -> UaResult<Item> {
-    let Some(item) = load_item(c, id)?.filter(|i| i.node == node) else {
+/// The item `id` of `node` in organization `org`, which must be claimed for
+/// live traffic.
+fn live_item(c: &Connection, org: &str, node: &str, id: &str, what: &str) -> UaResult<Item> {
+    let Some(item) = load_item(c, org, id)?.filter(|i| i.node == node) else {
         return Err(UaError::not_found(format!("item {id} is not queued for node {node:?}")));
     };
     if item.status != "claimed" {
@@ -61,16 +62,22 @@ fn live_item(c: &Connection, node: &str, id: &str, what: &str) -> UaResult<Item>
 
 // --- events ---------------------------------------------------------------------
 
+/// `event` is the ledger id of the recorded `turn_end` / `turn_aborted`
+/// event. Another organization's summary is deduplicated by it (with the
+/// item id and attempt) rather than by the node's name and its own turn id:
+/// so a resent turn end, which is recorded again, gets a second summary
+/// there, as it gets a second `acp_event`.
 fn turn_summary(
     tx: &mut WriteTx<'_>,
     item: &Item,
     agent: &str,
-    kind: &str,
-    turn: &str,
+    (kind, turn, event): (&str, &str, &str),
     ev: &Value,
 ) -> UaResult<()> {
     let Some(task_id) = item.task_id else { return Ok(()) };
     // Counts over this turn's recorded events.
+    // Another organization's ACP events keep no turn in the default ledger
+    // (`ledger_payload`), so its summary counts nothing.
     let rows: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT payload FROM event_log WHERE channel = ?1 AND json_extract(payload, '$.kind') = 'acp_event' \
@@ -111,25 +118,32 @@ fn turn_summary(
         payload["abort_reason"] =
             ev.get("reason").or_else(|| ev["data"].get("reason")).cloned().unwrap_or(Value::Null);
     }
-    ledger::append(
+    emit(
         tx,
-        EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload)
-            .by(agent.to_string())
-            .dedupe(format!("turn_summary:{}:{}:{turn}", item.node, item.id)),
+        &item.org_id,
+        CHANNEL,
+        payload,
+        agent,
+        Some(Dedupe {
+            named: format!("turn_summary:{}:{}:{turn}", item.node, item.id),
+            hub: format!("turn_summary:{}:{}:{event}", item.id, item.attempts),
+        }),
     )?;
     Ok(())
 }
 
 fn record_events(
     tx: &mut WriteTx<'_>,
+    org: &str,
     agent: &str,
     node: &str,
     id: &str,
     events: &[Value],
 ) -> UaResult<Value> {
-    let row = owned_node(tx, node, agent)?;
+    require_org(tx, org)?;
+    let row = owned_node(tx, org, node, agent)?;
     let node = row.node;
-    let mut item = live_item(tx, &node, id, "ACP events are accepted")?;
+    let mut item = live_item(tx, org, &node, id, "ACP events are accepted")?;
     let (mut recorded, mut dropped) = (0, 0);
     let mut kinds = Vec::new();
     for ev in events {
@@ -166,7 +180,7 @@ fn record_events(
             "plan": redact(m.get("plan").unwrap_or(&Value::Null)),
             "device_agent": agent,
         });
-        record(tx, "acp_event", payload, agent)?;
+        let event = record(tx, org, "acp_event", payload, agent)?.unwrap_or_default();
         recorded += 1;
         kinds.push(kind.clone());
         match kind.as_str() {
@@ -176,18 +190,18 @@ fn record_events(
                 {
                     tx.execute(
                         "UPDATE node_dispatch SET session_id = ?2, updated_at = ?3 \
-                         WHERE id = ?1 AND session_id IS NULL AND status = 'claimed'",
-                        params![id, s, now()],
+                         WHERE id = ?1 AND org_id = ?4 AND session_id IS NULL AND status = 'claimed'",
+                        params![id, s, now(), org],
                     )?;
                     item.session_id = Some(s.clone());
                 }
             }
             "followup_delivered" | "followup_dropped" => {
-                apply_followup_event(tx, id, &kind, &data, agent)?;
+                apply_followup_event(tx, org, id, &kind, &data, agent)?;
             }
             "turn_end" | "turn_aborted" => {
                 if let Some(t) = &turn {
-                    turn_summary(tx, &item, agent, &kind, t, ev)?;
+                    turn_summary(tx, &item, agent, (&kind, t, &event), ev)?;
                 }
             }
             _ => {}
@@ -215,7 +229,8 @@ async fn node_events(ctx: ToolCtx, a: EventsArgs) -> UaResult<Value> {
     if a.events.len() > MAX_EVENTS {
         return Err(UaError::invalid(format!("events exceeds {MAX_EVENTS} per call")));
     }
-    ctx.hub.db().write_async(move |tx| record_events(tx, &agent, &a.node, &id, &a.events)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| record_events(tx, &org, &agent, &a.node, &id, &a.events)).await
 }
 
 // --- follow-ups -----------------------------------------------------------------
@@ -226,6 +241,7 @@ fn valid_followup_id(id: &str) -> bool {
 
 fn apply_followup_event(
     tx: &mut WriteTx<'_>,
+    org: &str,
     item_id: &str,
     kind: &str,
     data: &Value,
@@ -238,25 +254,27 @@ fn apply_followup_event(
     let n = if kind == "followup_delivered" {
         tx.execute(
             "UPDATE node_followups SET status = 'delivered', delivered_at = ?3, turn_id = ?4, path = ?5, updated_at = ?3 \
-             WHERE id = ?1 AND item_id = ?2 AND status IN ('queued','claimed')",
+             WHERE id = ?1 AND item_id = ?2 AND org_id = ?6 AND status IN ('queued','claimed')",
             params![
                 fid,
                 item_id,
                 ts,
                 data.get("turn_id").and_then(Value::as_str).map(|s| clip(s, 40)),
                 data.get("path").and_then(Value::as_str).map(|s| clip(s, 40)),
+                org,
             ],
         )?
     } else {
         tx.execute(
             "UPDATE node_followups SET status = 'dropped', reason = ?3, updated_at = ?4 \
-             WHERE id = ?1 AND item_id = ?2 AND status IN ('queued','claimed')",
-            params![fid, item_id, data.get("reason").and_then(Value::as_str).map(|s| clip(s, 200)), ts],
+             WHERE id = ?1 AND item_id = ?2 AND org_id = ?5 AND status IN ('queued','claimed')",
+            params![fid, item_id, data.get("reason").and_then(Value::as_str).map(|s| clip(s, 200)), ts, org],
         )?
     };
     if n == 1 && kind == "followup_dropped" {
         record(
             tx,
+            org,
             "followup_dropped",
             json!({ "item_id": item_id, "followup_id": fid, "by": "node" }),
             agent,
@@ -267,22 +285,31 @@ fn apply_followup_event(
 
 /// Drop every open follow-up of an item that ended. A claimed one was
 /// handed to the node but never confirmed.
-pub(crate) fn drop_open_followups(tx: &mut WriteTx<'_>, item_id: &str, reason: &str) -> UaResult<()> {
+///
+/// `org` is the item's organization.
+pub(crate) fn drop_open_followups(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    item_id: &str,
+    reason: &str,
+) -> UaResult<()> {
     let open: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
-            "SELECT id, status FROM node_followups WHERE item_id = ?1 AND status IN ('queued','claimed') ORDER BY seq",
+            "SELECT id, status FROM node_followups WHERE item_id = ?1 AND org_id = ?2 \
+             AND status IN ('queued','claimed') ORDER BY seq",
         )?;
-        stmt.query_map([item_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        stmt.query_map([item_id, org], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
     };
     let ts = now();
     for (fid, status) in open {
         let why = if status == "claimed" { "delivery_unconfirmed" } else { reason };
         tx.execute(
-            "UPDATE node_followups SET status = 'dropped', reason = ?2, updated_at = ?3 WHERE id = ?1",
-            params![fid, why, ts],
+            "UPDATE node_followups SET status = 'dropped', reason = ?2, updated_at = ?3 WHERE id = ?1 AND org_id = ?4",
+            params![fid, why, ts, org],
         )?;
         record(
             tx,
+            org,
             "followup_dropped",
             json!({ "item_id": item_id, "followup_id": fid, "reason": why }),
             "node-queue",
@@ -291,13 +318,13 @@ pub(crate) fn drop_open_followups(tx: &mut WriteTx<'_>, item_id: &str, reason: &
     Ok(())
 }
 
-pub(crate) fn followups_of(c: &Connection, item_id: &str) -> UaResult<Value> {
+pub(crate) fn followups_of(c: &Connection, org: &str, item_id: &str) -> UaResult<Value> {
     let mut stmt = c.prepare(
         "SELECT id, seq, mode, status, created_by, created_at, delivered_at, reason, operator_authored, approval \
-         FROM node_followups WHERE item_id = ?1 ORDER BY seq",
+         FROM node_followups WHERE item_id = ?1 AND org_id = ?2 ORDER BY seq",
     )?;
     let rows = stmt
-        .query_map([item_id], |r| {
+        .query_map([item_id, org], |r| {
             Ok(json!({
                 "followup_id": r.get::<_, String>(0)?,
                 "seq": r.get::<_, i64>(1)?,
@@ -333,25 +360,27 @@ async fn node_followups(ctx: ToolCtx, a: PollArgs) -> UaResult<Value> {
     if a.ack.len() > MAX_ACKS || a.ack.iter().any(|f| !valid_followup_id(f)) {
         return Err(UaError::invalid(format!("ack must be at most {MAX_ACKS} follow-up ids (nf- + 16 hex)")));
     }
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = owned_node(tx, &a.node, &agent)?;
-            live_item(tx, &row.node, &id, "follow-ups are served")?;
+            require_org(tx, &org)?;
+            let row = owned_node(tx, &org, &a.node, &agent)?;
+            live_item(tx, &org, &row.node, &id, "follow-ups are served")?;
             let ts = now();
             for f in &a.ack {
                 tx.execute(
                     "UPDATE node_followups SET status = 'claimed', claimed_at = ?3, updated_at = ?3 \
-                     WHERE id = ?1 AND item_id = ?2 AND status = 'queued'",
-                    params![f, id, ts],
+                     WHERE id = ?1 AND item_id = ?2 AND org_id = ?4 AND status = 'queued'",
+                    params![f, id, ts, org],
                 )?;
             }
             let mut stmt = tx.prepare(
-                "SELECT id, seq, mode, body FROM node_followups WHERE item_id = ?1 AND status = 'queued' \
-                 ORDER BY seq LIMIT ?2",
+                "SELECT id, seq, mode, body FROM node_followups WHERE item_id = ?1 AND org_id = ?3 \
+                 AND status = 'queued' ORDER BY seq LIMIT ?2",
             )?;
             let rows = stmt
-                .query_map(params![id, FOLLOWUP_BATCH], |r| {
+                .query_map(params![id, FOLLOWUP_BATCH, org], |r| {
                     Ok(json!({
                         "id": r.get::<_, String>(0)?,
                         "seq": r.get::<_, i64>(1)?,
@@ -394,7 +423,7 @@ fn followup_admission(c: &Connection, item: &Item, mode: &str) -> UaResult<()> {
     if mode == "steer" && item.status != "claimed" {
         return Err(UaError::conflict("steer needs a running session; use mode=queue"));
     }
-    let node = super::load_node(c, &item.node)?;
+    let node = super::load_node(c, &item.org_id, &item.node)?;
     if !node.as_ref().is_some_and(|n| n.has_feature("acp_followups")) {
         return Err(UaError::conflict_code(
             "node_feature_missing",
@@ -402,8 +431,8 @@ fn followup_admission(c: &Connection, item: &Item, mode: &str) -> UaResult<()> {
         ));
     }
     let open: i64 = c.query_row(
-        "SELECT COUNT(*) FROM node_followups WHERE item_id = ?1 AND status IN ('queued','claimed')",
-        [&item.id],
+        "SELECT COUNT(*) FROM node_followups WHERE item_id = ?1 AND org_id = ?2 AND status IN ('queued','claimed')",
+        params![item.id, item.org_id],
         |r| r.get(0),
     )?;
     if open >= FOLLOWUP_OPEN_MAX {
@@ -446,7 +475,9 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let Some(item) = load_item(tx, &id)? else {
+            require_org(tx, &caller.org_id)?;
+            let org = caller.org_id.clone();
+            let Some(item) = load_item(tx, &org, &id)? else {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !operator {
@@ -456,12 +487,9 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                         format!("{who:?} did not request {id}; only its requester or an operator sends follow-ups"),
                     ));
                 }
-                // The item's task is checked in the task row's own
-                // organization, as the runner paths do: the requester's
-                // organization may not be the task's.
-                if let Some(t) = item.task_id
-                    && let Some(org) = crate::families::tasks::task_org(tx, t)?
-                {
+                // The item's task is the item's organization's, the
+                // caller's (`node_dispatch_org_parent`).
+                if let Some(t) = item.task_id {
                     let holder: Option<Option<String>> = tx
                         .query_row(
                             "SELECT claimed_by FROM tasks WHERE org_id = ?1 AND id = ?2",
@@ -472,11 +500,9 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                     if let Some(Some(h)) = holder
                         && h != who
                     {
-                        // Another organization's claimant is not named.
-                        let by = if org == caller.org_id { format!("{h:?}") } else { "another agent".into() };
                         return Err(UaError::denied(
                             "task_claimed_elsewhere",
-                            format!("task {t} is claimed by {by}"),
+                            format!("task {t} is claimed by {h:?}"),
                         ));
                     }
                 }
@@ -484,8 +510,8 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
             let existing: Option<FollowupRow> = tx
                 .query_row(
                     "SELECT id, created_by, mode, body, seq, status, created_at, operator_authored, approval \
-                     FROM node_followups WHERE item_id = ?1 AND idempotency_key = ?2",
-                    params![id, key],
+                     FROM node_followups WHERE item_id = ?1 AND idempotency_key = ?2 AND org_id = ?3",
+                    params![id, key, org],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
                 )
                 .optional()?;
@@ -528,21 +554,24 @@ async fn node_followup(ctx: ToolCtx, a: FollowupArgs) -> UaResult<Value> {
                     }
                 }
             };
+            // `seq` and the idempotency key are keyed by the hub-generated
+            // item id, so they are already per organization.
             let seq: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM node_followups WHERE item_id = ?1",
-                [&id],
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM node_followups WHERE item_id = ?1 AND org_id = ?2",
+                params![id, org],
                 |r| r.get(0),
             )?;
             let fid = format!("nf-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
             let ts = now();
             tx.execute(
                 "INSERT INTO node_followups (id, item_id, seq, mode, body, idempotency_key, status, created_by, \
-                 created_at, operator_authored, approval, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?8)",
-                params![fid, id, seq, mode, body, key, who, ts, operator, approval],
+                 created_at, operator_authored, approval, updated_at, org_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?8, ?11)",
+                params![fid, id, seq, mode, body, key, who, ts, operator, approval, org],
             )?;
             record(
                 tx,
+                &org,
                 "followup_queued",
                 json!({
                     "node": item.node, "item_id": id, "followup_id": fid, "seq": seq, "mode": mode,
@@ -620,8 +649,9 @@ async fn node_permission(ctx: ToolCtx, a: PermissionArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = owned_node(tx, &node, &agent)?;
-            let Some(item) = load_item(tx, &id)?.filter(|i| i.node == row.node) else {
+            require_org(tx, &caller.org_id)?;
+            let row = owned_node(tx, &caller.org_id, &node, &agent)?;
+            let Some(item) = load_item(tx, &caller.org_id, &id)?.filter(|i| i.node == row.node) else {
                 return Err(UaError::not_found(format!("item {id} is not queued for node {:?}", row.node)));
             };
             if let Some(why) = permission_block(tx, &item)? {
@@ -644,7 +674,7 @@ async fn node_permission(ctx: ToolCtx, a: PermissionArgs) -> UaResult<Value> {
                     let mut ev = base.clone();
                     ev["approval_id"] = json!(approval_id);
                     ev["decision"] = json!("approved");
-                    record(tx, "acp_permission", ev, &agent)?;
+                    record(tx, &caller.org_id, "acp_permission", ev, &agent)?;
                     Ok(json!({
                         "status": "approved",
                         "approval_id": approval_id,
@@ -656,7 +686,7 @@ async fn node_permission(ctx: ToolCtx, a: PermissionArgs) -> UaResult<Value> {
                     let mut ev = base.clone();
                     ev["approval_id"] = json!(approval_id);
                     ev["decision"] = json!("denied");
-                    record(tx, "acp_permission", ev, &agent)?;
+                    record(tx, &caller.org_id, "acp_permission", ev, &agent)?;
                     Ok(json!({ "status": "denied", "approval_id": approval_id, "reason": reason }))
                 }
             }

@@ -266,7 +266,7 @@ fn live_reasons(conn: &Connection, org: &str, row: &Row, now: jiff::Timestamp) -
     }
     if s(row, "current_run_id").is_some() {
         out.push("open run".into());
-    } else if live_run_for_task(conn, id)?.is_some() {
+    } else if live_run_for_task(conn, org, id)?.is_some() {
         out.push("live dispatch run".into());
     }
     let delegation: Option<String> = conn
@@ -282,8 +282,9 @@ fn live_reasons(conn: &Connection, org: &str, row: &Row, now: jiff::Timestamp) -
     }
     let node: Option<String> = conn
         .query_row(
-            "SELECT status FROM node_dispatch WHERE task_id = ?1 AND status IN ('queued','claimed') LIMIT 1",
-            [id],
+            "SELECT status FROM node_dispatch WHERE org_id = ?2 AND task_id = ?1 \
+             AND status IN ('queued','claimed') LIMIT 1",
+            params![id, org],
             |r| r.get(0),
         )
         .optional()?;
