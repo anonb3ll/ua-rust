@@ -50,7 +50,6 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
@@ -350,20 +349,30 @@ pub(crate) fn emit(
     channel: &str,
     payload: Value,
     by: &str,
-    dedupe: Option<String>,
+    dedupe: Option<Dedupe>,
 ) -> UaResult<Option<String>> {
     let default = org == ua_core::DEFAULT_ORG;
     let by = if default { by } else { "system" };
     let mut ev =
         EventInput::new(ua_core::DEFAULT_ORG, channel, ledger_payload(org, payload)).by(by.to_string());
     if let Some(d) = dedupe {
-        // A dedupe key can name a node or a node-chosen turn id: another
-        // organization's is stored only as its digest (still unique, since
-        // every one names a hub-generated item id).
-        ev =
-            ev.dedupe(if default { d } else { format!("org:{}", hex::encode(Sha256::digest(d.as_bytes()))) });
+        ev = ev.dedupe(if default { d.named } else { format!("org:{}", d.hub) });
     }
     Ok(ledger::append(tx, ev)?.map(|e| e.ulid))
+}
+
+/// A ledger dedupe key for [`emit`], in two forms.
+///
+/// `named` is the default organization's key, stored as it is: it may name
+/// a node or a node-chosen turn id. `hub` is built from hub-generated ids
+/// only (the event kind, an item id, an attempt, a ledger event id) and is
+/// stored as `org:<hub>` for any other organization, so its key carries
+/// neither a node name nor a digest a reader could test a guessed name
+/// against. Every `hub` form names a hub-generated item id, so it stays
+/// unique hub-wide.
+pub(crate) struct Dedupe {
+    pub named: String,
+    pub hub: String,
 }
 
 /// Refuse an organization `orgs` does not hold, or holds as suspended,

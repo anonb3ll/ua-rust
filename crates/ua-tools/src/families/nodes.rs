@@ -45,6 +45,13 @@
 //! Retiring, reassigning and forgetting are refused while the node still has
 //! queued or claimed work. The sources of such work are listed in
 //! [`RETIRE_BLOCKERS`].
+//!
+//! Organizations: every operator action works in the caller's organization,
+//! and a node is reassigned only to an agent not known to work in another
+//! one. Since node names are one hub namespace, a default-organization
+//! lifecycle operator can recover a name any organization holds with
+//! `node_retire` / `node_forget` `any_org=true` (hub recovery), acting in the
+//! node's own organization and answering without its fields.
 
 use std::collections::BTreeSet;
 
@@ -803,7 +810,17 @@ pub(crate) struct FleetNode {
 pub(crate) struct Fleet {
     pub active: Vec<FleetNode>,
     pub retired: Vec<String>,
-    pub other_org_nodes: i64,
+    /// Other organizations' nodes in service.
+    pub other_org_active: i64,
+    /// Other organizations' retired node rows.
+    pub other_org_retired: i64,
+    /// Other organizations' nodes in service without a passed device
+    /// acceptance (which only a default node can run): none of them takes
+    /// real work while `node_require_acceptance` is on.
+    pub other_org_unaccepted: i64,
+    /// Other organizations' command notices recorded but never sent (the
+    /// mailbox has no `org_id`, so they stay unsent by design).
+    pub other_org_unsent_notices: i64,
 }
 
 /// The fleet as organization `org` sees it. The hub-wide operator views (the
@@ -832,8 +849,26 @@ pub(crate) fn fleet(c: &Connection, org: &str, now: Timestamp) -> UaResult<Fleet
             out.active.push(FleetNode { node, status, last_heartbeat: last });
         }
     }
-    out.other_org_nodes =
-        c.query_row("SELECT COUNT(*) FROM nodes WHERE org_id <> ?1", [org], |r| r.get(0))?;
+    (out.other_org_active, out.other_org_retired) = c.query_row(
+        "SELECT COUNT(*) FILTER (WHERE retired_at IS NULL), COUNT(*) FILTER (WHERE retired_at IS NOT NULL) \
+         FROM nodes WHERE org_id <> ?1",
+        [org],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    // The `acceptance::accepted` rule, in SQL.
+    out.other_org_unaccepted = c.query_row(
+        "SELECT COUNT(*) FROM nodes n WHERE n.org_id <> ?1 AND n.retired_at IS NULL AND NOT EXISTS \
+         (SELECT 1 FROM node_acceptance a WHERE a.org_id = n.org_id AND a.node = n.node \
+          AND a.state = 'accepted' AND a.agent = n.agent AND a.attested_by IS NOT NULL \
+          AND a.attestation_ref IS NOT NULL)",
+        [org],
+        |r| r.get(0),
+    )?;
+    out.other_org_unsent_notices = c.query_row(
+        "SELECT COUNT(*) FROM node_command_notice WHERE org_id <> ?1 AND sent_at IS NULL",
+        [org],
+        |r| r.get(0),
+    )?;
     Ok(out)
 }
 
@@ -886,6 +921,11 @@ pub struct RetireArgs {
     /// Why, 1-500 characters. Required; recorded on the ledger (and, for a
     /// retirement, on the row).
     pub reason: Option<String>,
+    /// Hub recovery, `node_retire` and `node_forget` only, for the default
+    /// organization's lifecycle operators: act on the node of whichever
+    /// organization holds the name, in that organization. Default false (the
+    /// caller's own organization only).
+    pub any_org: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1282,12 +1322,87 @@ fn set_retired(
     }))
 }
 
+/// Whether an operator action asked for hub recovery (`any_org`): the
+/// caller must be a lifecycle operator of the default organization, the
+/// hub-level authority ([`lifecycle_operator`] checks it over
+/// [`ua_core::DEFAULT_ORG`], which no other organization's caller holds).
+fn hub_recovery(ctx: &ToolCtx, any_org: Option<bool>, verb: &str) -> UaResult<bool> {
+    if any_org != Some(true) {
+        return Ok(false);
+    }
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::LifecycleOperator], ua_core::DEFAULT_ORG) {
+        return Err(UaError::denied(
+            "not_lifecycle_operator",
+            format!(
+                "hub recovery ({verb} with any_org) is for the default organization's lifecycle operators only"
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// The organization an operator action works in: the caller's own, or under
+/// hub recovery the one holding `name` (the caller's own when none does, so
+/// a missing node answers as it always has).
+fn action_org(tx: &WriteTx<'_>, caller_org: &str, name: &str, hub: bool) -> UaResult<String> {
+    if !hub {
+        return Ok(caller_org.to_string());
+    }
+    let held: Option<String> =
+        tx.query_row("SELECT org_id FROM nodes WHERE node = ?1", [name], |r| r.get(0)).optional()?;
+    Ok(held.unwrap_or_else(|| caller_org.to_string()))
+}
+
+/// A hub-recovery answer about another organization's node: the name the
+/// operator gave, what changed, the event and the organization, but none of
+/// the node's own fields (agent, retirement history).
+fn recovery_answer(out: Value, org: &str) -> Value {
+    let mut kept: Map<String, Value> = out
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| {
+                    matches!(k.as_str(), "node" | "retired" | "changed" | "forgotten" | "event_ulid")
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    kept.insert("org_id".into(), json!(org));
+    kept.insert("hub_recovery".into(), json!(true));
+    Value::Object(kept)
+}
+
+/// Run an operator action on `name` in [`action_org`], shaping another
+/// organization's answer with [`recovery_answer`]. The ledger entry is the
+/// action's own `emit` in the node's organization, so another
+/// organization's node gets the neutral originator and only its ids.
+async fn operator_action<F>(ctx: &ToolCtx, name: String, hub: bool, act: F) -> UaResult<Value>
+where
+    F: FnOnce(&mut WriteTx<'_>, &str) -> UaResult<Value> + Send + 'static,
+{
+    let caller_org = ctx.caller.org_id.clone();
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            let org = action_org(tx, &caller_org, &name, hub)?;
+            let out = act(tx, &org)?;
+            Ok(if org == caller_org { out } else { recovery_answer(out, &org) })
+        })
+        .await
+}
+
 async fn change_retirement(ctx: ToolCtx, a: RetireArgs, retire: bool) -> UaResult<Value> {
-    let who = lifecycle_operator(&ctx, if retire { "retire" } else { "un-retire" })?;
+    let verb = if retire { "retire" } else { "un-retire" };
+    let who = lifecycle_operator(&ctx, verb)?;
+    if !retire && a.any_org == Some(true) {
+        return Err(UaError::invalid("any_org applies to node_retire and node_forget only"));
+    }
+    let hub = hub_recovery(&ctx, a.any_org, verb)?;
     let name = validate_node_name(&a.node)?;
     let reason = retire_reason(a.reason.as_deref())?;
-    let org = ctx.caller.org_id.clone();
-    ctx.hub.db().write_async(move |tx| set_retired(tx, &org, &name, &who, &reason, retire)).await
+    let n = name.clone();
+    operator_action(&ctx, name, hub, move |tx, org| set_retired(tx, org, &n, &who, &reason, retire)).await
 }
 
 /// `coordination_manage(action="node_retire")`.
@@ -1315,6 +1430,12 @@ fn reassign(
     };
     if from == to {
         return Ok(json!({ "node": name, "agent": to, "changed": false }));
+    }
+    if agent_orgs(tx, to)?.iter().any(|o| o != org) {
+        return Err(UaError::denied(
+            "agent_org_mismatch",
+            format!("agent {to:?} works in another organization; a node is reassigned only within its own"),
+        ));
     }
     refuse_open_work(tx, org, name, "reassigning")?;
     let now = ua_core::time::now();
@@ -1353,6 +1474,22 @@ fn reassign(
         "retired": retired_at.is_some(),
         "event_ulid": event,
     }))
+}
+
+/// The organizations `agent` is known to work in. The `agents` table has
+/// no `org_id` yet, so this reads the organization-keyed rows that name an
+/// agent: the nodes it owns, the node work queued for it and its dispatch
+/// runs. An agent with none of those (a label that never registered a node
+/// or ran work) has no known organization, and a reassignment to it is not
+/// refused on this ground: that is the limit until agents carry `org_id`.
+fn agent_orgs(c: &Connection, agent: &str) -> UaResult<BTreeSet<String>> {
+    let mut stmt = c.prepare(
+        "SELECT org_id FROM nodes WHERE agent = ?1 COLLATE NOCASE \
+         UNION SELECT org_id FROM node_dispatch WHERE agent = ?1 COLLATE NOCASE \
+         UNION SELECT org_id FROM dispatch_runs WHERE agent_label = ?1 COLLATE NOCASE",
+    )?;
+    let orgs = stmt.query_map([agent], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(orgs)
 }
 
 fn forget(tx: &mut WriteTx<'_>, org: &str, name: &str, who: &str, reason: &str) -> UaResult<Value> {
@@ -1408,10 +1545,11 @@ pub(crate) async fn node_reassign(ctx: ToolCtx, a: ReassignArgs) -> UaResult<Val
 /// so its name can be registered afresh.
 pub(crate) async fn node_forget(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value> {
     let who = lifecycle_operator(&ctx, "forget")?;
+    let hub = hub_recovery(&ctx, a.any_org, "forget")?;
     let name = validate_node_name(&a.node)?;
     let reason = retire_reason(a.reason.as_deref())?;
-    let org = ctx.caller.org_id.clone();
-    ctx.hub.db().write_async(move |tx| forget(tx, &org, &name, &who, &reason)).await
+    let n = name.clone();
+    operator_action(&ctx, name, hub, move |tx, org| forget(tx, org, &n, &who, &reason)).await
 }
 
 pub fn register(r: &mut Registry) {

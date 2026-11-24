@@ -10,8 +10,8 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{
-    CHANNEL, Item, check_item_id, clip, device_agent, emit, evidence_ref, load_item, now, owned_node, record,
-    require_org, run_gate, verified_caller,
+    CHANNEL, Dedupe, Item, check_item_id, clip, device_agent, emit, evidence_ref, load_item, now, owned_node,
+    record, require_org, run_gate, verified_caller,
 };
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
@@ -62,12 +62,16 @@ fn live_item(c: &Connection, org: &str, node: &str, id: &str, what: &str) -> UaR
 
 // --- events ---------------------------------------------------------------------
 
+/// `event` is the ledger id of the recorded `turn_end` / `turn_aborted`
+/// event. Another organization's summary is deduplicated by it (with the
+/// item id and attempt) rather than by the node's name and its own turn id:
+/// so a resent turn end, which is recorded again, gets a second summary
+/// there, as it gets a second `acp_event`.
 fn turn_summary(
     tx: &mut WriteTx<'_>,
     item: &Item,
     agent: &str,
-    kind: &str,
-    turn: &str,
+    (kind, turn, event): (&str, &str, &str),
     ev: &Value,
 ) -> UaResult<()> {
     let Some(task_id) = item.task_id else { return Ok(()) };
@@ -120,7 +124,10 @@ fn turn_summary(
         CHANNEL,
         payload,
         agent,
-        Some(format!("turn_summary:{}:{}:{turn}", item.node, item.id)),
+        Some(Dedupe {
+            named: format!("turn_summary:{}:{}:{turn}", item.node, item.id),
+            hub: format!("turn_summary:{}:{}:{event}", item.id, item.attempts),
+        }),
     )?;
     Ok(())
 }
@@ -173,7 +180,7 @@ fn record_events(
             "plan": redact(m.get("plan").unwrap_or(&Value::Null)),
             "device_agent": agent,
         });
-        record(tx, org, "acp_event", payload, agent)?;
+        let event = record(tx, org, "acp_event", payload, agent)?.unwrap_or_default();
         recorded += 1;
         kinds.push(kind.clone());
         match kind.as_str() {
@@ -194,7 +201,7 @@ fn record_events(
             }
             "turn_end" | "turn_aborted" => {
                 if let Some(t) = &turn {
-                    turn_summary(tx, &item, agent, &kind, t, ev)?;
+                    turn_summary(tx, &item, agent, (&kind, t, &event), ev)?;
                 }
             }
             _ => {}

@@ -441,6 +441,13 @@ fn release_claims(tx: &mut WriteTx<'_>, agent: &str, who: &str, reason: &str) ->
 /// Cancel `agent`'s node items: claimed ones always (the node stops them on
 /// its next heartbeat), queued ones too when `queued` is set. An agent-wide
 /// lifecycle action: each item is cancelled in its own organization.
+///
+/// The stop list (the answer and `lifecycle.stops_requested`) keeps another
+/// organization's item and run ids on purpose: they are hub-generated, the
+/// same ids `node_queue::ledger_payload` keeps for another organization's
+/// events, and the operator needs them to follow the stop. Nothing else of
+/// such a row is copied: the details are fixed texts and reason codes from
+/// the cancel path, never its node name, prompt or reason.
 fn stop_node_items(tx: &mut WriteTx<'_>, agent: &str, who: &str, queued: bool) -> UaResult<Vec<Value>> {
     let filter = if queued {
         "agent = ?1 COLLATE NOCASE AND status IN ('queued','claimed') AND run_id IS NULL ORDER BY created_at"

@@ -520,9 +520,16 @@ from its commit history.
   (`org_unsupported`, or the notice kept unsent) until their own tables
   carry an organization. Node and dispatch events from another organization
   keep only ids, states and counts, under the `system` originator, with
-  hashed dedupe keys. A reassigned or forgotten node closes only its own
-  organization's harness-config proposals. The importer writes legacy nodes
-  to `default`.
+  dedupe keys built from hub-generated ids only (no node name or digest of
+  one). A reassigned or forgotten node closes only its own organization's
+  harness-config proposals, and `node_reassign` refuses a `to_agent` known
+  to work in another organization (`agent_org_mismatch`). A default
+  lifecycle operator recovers a name another organization holds with
+  `node_retire` and `node_forget` `any_org=true`, acting in that node's
+  organization. The doctor's fleet row splits other organizations' nodes
+  into active and retired, and counts those that take no work under
+  `node_require_acceptance` and their unsent command notices. The importer
+  writes legacy nodes to `default`.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the

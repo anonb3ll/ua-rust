@@ -797,9 +797,33 @@ here for memory columns, owners and defaults.
   token's organization (`Caller.org_id`), so a token of organization B never
   reaches a default node even under the same label. Hub-wide operator views
   stay default-organization only, plus counts: `system_doctor`'s fleet row
-  names only the default organization's nodes and adds `other_org_nodes`,
-  and a provider account's recent runs list only the default
-  organization's and add `other_org_runs`.
+  names only the default organization's nodes and adds `other_org_nodes`
+  (`{active, retired}`), `other_org_nodes_not_accepted` (nodes in service
+  that take no real work while `node_require_acceptance` is on, named in
+  the row's detail) and `other_org_unsent_command_notices`, and a provider
+  account's recent runs list only the default organization's and add
+  `other_org_runs`.
+  **Hub recovery.** Node names are one hub namespace, so a name another
+  organization registered (by mistake, or to squat it) would otherwise be
+  stuck: its lifecycle operators are not admitted yet, and every operator
+  action is scoped to the caller's organization. A default-organization
+  lifecycle operator (`Authz` over `default`, which no other
+  organization's caller holds) passes `any_org=true` to `node_retire` and
+  `node_forget`: the node of whichever organization holds the name is
+  retired, then forgotten, in that organization, through the ordinary
+  retire and forget code (open work still refuses it, and a suspended
+  organization's node is refused until it is active again). The ledger
+  entry is that code's `node_queue::emit` in the node's organization, so
+  another organization's node gets the `system` originator and only its
+  ids, and the answer carries only `{node, org_id, changed, retired or
+  forgotten, event_ulid, hub_recovery}`, none of the node's agent or
+  history. `node_unretire` and `node_reassign` take no `any_org`, and
+  without it every operator action stays in the caller's organization.
+  `node_reassign` keeps a node in its organization: it refuses a
+  `to_agent` known to work in another one (`agent_org_mismatch`). The
+  `agents` table has no `org_id` yet, so "known" means the agent owns a
+  node, has node work or has a dispatch run there; a label with none of
+  those is not refused on this ground until agents carry an organization.
   **Parts.** `organization.v1.tools.dispatch` gives `dispatch_runs` and
   `dispatch_receipts` `org_id` and the organization triggers;
   `dispatch.v4.org_scope` adds `idx_dispatch_runs_org_created`,
@@ -869,7 +893,9 @@ here for memory columns, owners and defaults.
   another organization's nodes therefore take no real work until acceptance
   carries its own evidence store. Idle-session wakes (`session_wake`,
   `session_wake_offers`, no `org_id`) run only through default nodes
-  (`node_wake*` refuse another organization's token). Command notices go
+  (`node_wake*` refuse another organization's token, and
+  `session_wake_opt_in`, `_grant`, `_decline` and `_status` refuse another
+  organization's caller, `org_unsupported`). Command notices go
   through the mailbox (`message_index`, no `org_id`), so another
   organization's notice stays recorded on its `node_command_notice` row,
   unsent; its owner reads the outcome with `node_command_status`.
@@ -878,8 +904,14 @@ here for memory columns, owners and defaults.
   organization the payload keeps only ids, states, attempts, fences,
   backends and counts (no node name, host fact, agent, actor, path, prompt,
   command, reason, note or output), the originator is `system`, and a
-  dedupe key (which can name a node or a turn) is stored as
-  `org:<sha256>`. Both channels are ordinary visible ones (`VISIBLE_EVENT`
+  dedupe key is built from hub-generated ids only and stored as
+  `org:<kind>:<item id>:<attempt or ledger event id>` (the default
+  organization's key, which can name a node or a turn, is unchanged). An
+  unkeyed digest of the named key would let a ledger reader test a guessed
+  node name, so neither the name nor a digest of it is stored; there is no
+  hub secret to key one with. Another organization's turn summary is
+  therefore deduplicated per recorded turn end rather than per node turn
+  id. Both channels are ordinary visible ones (`VISIBLE_EVENT`
   restricts neither), which is why the payload is reduced. The provider
   account health keeps another organization's run id and quota line out of
   its row and its events. The importer writes legacy nodes to `default`.
@@ -1474,7 +1506,7 @@ global key in the tree is classified:
 | `skill_assignments UNIQUE(skill_name, target_type, target)` | **Rebuild** | Becomes `UNIQUE(org_id, skill_name, target_type, target)`, rebuilt in `skill_registry.v2.tenant_keys` together with `skill_versions`. |
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`, rebuilt in the standalone procedure `harness_config.v3.tenant_keys`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`, rebuilt in `harness_config.v3.tenant_keys`; the key stays a hub-global random id. |
-| `harness_config_report_window.node` | **Rebuild** | Key becomes `(org_id, node)`, rebuilt in `harness_config.v3.tenant_keys`, so the rate-limit upsert never updates another organization's window (node names are hub-wide, but a node can be reassigned to another organization's agent). |
+| `harness_config_report_window.node` | **Rebuild** | Key becomes `(org_id, node)`, rebuilt in `harness_config.v3.tenant_keys`, so the rate-limit upsert never updates another organization's window (node names are hub-wide: a name one organization forgets, including by hub recovery, can be registered again by another, which must not inherit the old window; `node_reassign` keeps a node in its organization). |
 | `idempotency_keys.key` | **Rebuild** | Until the rebuild, another organization's `task_add`, `task_update` and `delegate` keys are stored as `org:<org>/<tool>:<key>` (the default keeps `<tool>:<key>`), so no reuse replays across organizations. Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
 | `node_dispatch` unique index on `launch_key` | **Rebuild** | Becomes `UNIQUE (org_id, launch_key)`, in the standalone procedure `node_queue.v2.tenant_keys`, which also makes `node_dispatch.org_id` `NOT NULL` and keeps ids and rowids. |
 | `node_dispatch.id`, `node_command.item_id`, `node_command_notice (item_id, attempt, terminal)`, `node_followups.id`, `node_followups (item_id, idempotency_key)`, `(item_id, seq)`, `node_acceptance.node` | Global, safe | Item and follow-up ids are hub-generated, the other keys are led by one or by a hub-namespace node name; no rebuild. The `*_org_parent` triggers keep every reference in one organization. |

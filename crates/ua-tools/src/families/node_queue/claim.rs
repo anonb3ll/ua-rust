@@ -16,8 +16,8 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{
-    CHANNEL, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip, command,
-    credentials, device_agent, emit, evidence_ref, items_where, load_item, now, owned_node, record,
+    CHANNEL, Dedupe, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip,
+    command, credentials, device_agent, emit, evidence_ref, items_where, load_item, now, owned_node, record,
     renew_run, require_org, run_gate, run_running, sweep_tx,
 };
 use crate::families::{governance, nodes};
@@ -507,7 +507,10 @@ pub(crate) fn on_heartbeat(
             CHANNEL,
             json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }),
             agent,
-            Some(format!("cancel_relayed:{}:{}", item.id, item.attempts)),
+            Some(Dedupe {
+                named: format!("cancel_relayed:{}:{}", item.id, item.attempts),
+                hub: format!("cancel_relayed:{}:{}", item.id, item.attempts),
+            }),
         )?;
     }
     Ok(cancel.into_iter().map(|i| i.id).collect())

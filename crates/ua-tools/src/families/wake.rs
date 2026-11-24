@@ -67,7 +67,10 @@ use ua_org::authz::{Authority, Authz};
 /// their events name nodes and sessions in the default organization's
 /// ledger, so wakes run only through the default organization's nodes: a
 /// node token of another organization is refused (`org_unsupported`), and
-/// its nodes are never chosen as a wake node.
+/// its nodes are never chosen as a wake node. The session side
+/// (`session_wake_opt_in`, `_grant`, `_decline`, `_status`) is refused the
+/// same way, so another organization's caller neither reads nor writes the
+/// default organization's wake rows.
 const WAKE_ORG: &str = ua_core::DEFAULT_ORG;
 
 fn wake_org(caller: &Caller) -> UaResult<()> {
@@ -1168,6 +1171,7 @@ fn verified_identity(caller: &Caller, verb: &str) -> UaResult<String> {
 }
 
 pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let who = verified_identity(&ctx.caller, "session_wake_opt_in")?;
     let sid = check_session_id(&a.session_id)?;
     let wake = a.wake.unwrap_or(true);
@@ -1240,6 +1244,7 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
 }
 
 pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let Some(actor) = verified(&ctx.caller).filter(|_| ctx.caller.is_human()).map(str::to_string) else {
         return Err(UaError::denied(
             "human_required",
@@ -1294,6 +1299,7 @@ pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<V
 }
 
 pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let actor = verified_identity(&ctx.caller, "session_wake_decline")?;
     let sid = check_session_id(&a.session_id)?;
     let reason = a
@@ -1396,6 +1402,7 @@ fn state_json(r: &Row<'_>) -> rusqlite::Result<Value> {
 }
 
 pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let who = verified_identity(&ctx.caller, "session_wake_status")?;
     let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,

@@ -163,10 +163,15 @@ struct H {
 
 impl H {
     fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(dir.path().join("home"));
         cfg.human_identities = vec!["operator".into()];
         cfg.session_credentials_enabled = true;
+        tweak(&mut cfg);
         let hub = Hub::in_memory(cfg).unwrap();
         add_org(hub.db(), ORG_B, "active");
         Self { hub, reg: builtin_registry(), _dir: dir }
@@ -555,7 +560,7 @@ async fn each_organization_sees_only_its_own_nodes_work_and_runs() {
     let row = doctor["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "fleet_nodes").unwrap();
     assert!(row["detail"].as_str().unwrap().contains(NODE_A), "{row}");
     assert!(!row.to_string().contains(NODE_B), "{row}");
-    assert_eq!(row["other_org_nodes"], 1, "{row}");
+    assert_eq!(row["other_org_nodes"], json!({ "active": 1, "retired": 0 }), "{row}");
 }
 
 #[tokio::test]
@@ -992,4 +997,271 @@ fn every_insert_into_a_node_or_dispatch_table_names_org_id() {
         }
     }
     assert!(seen >= 9, "the guard found {seen} inserts");
+}
+
+/// The `operator` human, but authenticated in organization B: the same
+/// label, so only the organization keeps it from the hub-level authority.
+fn operator_b() -> Caller {
+    Caller {
+        profile: Profile::Operator,
+        enforce_profile: false,
+        ..caller("operator", ActorKind::Human, ORG_B)
+    }
+}
+
+const B_REASON: &str = "osprey-reason-not-real";
+
+#[tokio::test]
+async fn a_default_operator_recovers_a_name_another_organization_holds() {
+    let h = H::new();
+    // Organization B squats the name the default organization needs.
+    h.register(&device_b(), NODE_B, ROOT_B).await;
+    let e = h
+        .call(&device_a(), "node_register", json!({ "node": NODE_B, "facts": facts(ROOT_A) }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "node_owned_elsewhere", "{e:?}");
+    let ledger_before = h.ledger().len();
+
+    // Without any_org every operator action stays in the caller's
+    // organization: B's node answers as missing.
+    for action in ["node_retire", "node_forget"] {
+        let e = h.manage(&human(), action, json!({ "node": NODE_B, "reason": B_REASON })).await.unwrap_err();
+        assert_eq!(e.code(), "not_found", "{action}: {e:?}");
+    }
+    // An organization-B caller, even under the operator's label, cannot use
+    // the hub path; nor can the node's own agent.
+    for who in [operator_b(), device_b(), lead_b()] {
+        for action in ["node_retire", "node_forget"] {
+            let e = h
+                .manage(&who, action, json!({ "node": NODE_B, "reason": B_REASON, "any_org": true }))
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&e), "not_lifecycle_operator", "{}: {action}: {e:?}", who.label);
+        }
+    }
+    // A default caller that is no lifecycle operator cannot either.
+    let e = h
+        .manage(&lead_a(), "node_retire", json!({ "node": NODE_B, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "not_lifecycle_operator", "{e:?}");
+    // Un-retire takes no any_org.
+    let e = h
+        .manage(&human(), "node_unretire", json!({ "node": NODE_B, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument", "{e:?}");
+    assert_eq!(h.ledger().len(), ledger_before, "a refusal writes nothing");
+    assert_eq!(
+        h.text(&format!(
+            "SELECT org_id || ':' || COALESCE(retired_at, 'active') FROM nodes WHERE node = '{NODE_B}'"
+        )),
+        format!("{ORG_B}:active")
+    );
+
+    // The default lifecycle operator retires, then forgets, B's node in B.
+    let retired = h
+        .manage(&human(), "node_retire", json!({ "node": NODE_B, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap();
+    let keys: Vec<&str> = retired.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["changed", "event_ulid", "hub_recovery", "node", "org_id", "retired"], "{retired}");
+    assert_eq!(retired["org_id"], ORG_B);
+    assert_eq!(retired["changed"], true);
+    assert_eq!(
+        h.text(&format!("SELECT org_id FROM nodes WHERE node = '{NODE_B}' AND retired_at IS NOT NULL")),
+        ORG_B,
+        "retired in its own organization"
+    );
+    // Again: unchanged, and still none of B's row (its retirement reason).
+    let again = h
+        .manage(&human(), "node_retire", json!({ "node": NODE_B, "reason": "fake second", "any_org": true }))
+        .await
+        .unwrap();
+    assert_eq!(again["changed"], false);
+    assert!(!again.to_string().contains(B_REASON), "{again}");
+    let forgot = h
+        .manage(&human(), "node_forget", json!({ "node": NODE_B, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap();
+    assert_eq!(forgot["forgotten"], true, "{forgot}");
+    assert_eq!(forgot["org_id"], ORG_B);
+    assert!(!forgot.to_string().contains(B_DEVICE), "the node's agent stays out: {forgot}");
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM nodes WHERE node = '{NODE_B}'")), 0);
+
+    // The default organization can now register the name.
+    h.register(&device_a(), NODE_B, ROOT_A).await;
+    assert_eq!(h.text(&format!("SELECT org_id FROM nodes WHERE node = '{NODE_B}'")), DEFAULT_ORG);
+
+    // The recovery's ledger entries are B's: the neutral originator and ids
+    // only, none of B's node, agent, reason or the acting operator.
+    let ledger = h.ledger();
+    let recovery: Vec<_> =
+        ledger.iter().filter(|(c, ..)| c == "agent.node.retire" || c == "agent.node.forget").collect();
+    assert_eq!(recovery.len(), 2, "{recovery:?}");
+    for (channel, originator, dedupe, payload) in recovery {
+        assert_eq!(originator.as_deref(), Some("system"), "{channel}");
+        assert_eq!(dedupe, &None);
+        let v: Value = serde_json::from_str(payload).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["kind"], "{channel}: {payload}");
+        for secret in [NODE_B, B_DEVICE, B_REASON, ROOT_B, "operator"] {
+            assert!(!payload.contains(secret), "{secret} reached the default ledger: {payload}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_node_is_reassigned_only_within_its_organization() {
+    let h = H::new();
+    h.fleet().await;
+    // B's agent works in B (it owns B's node): A's node is not moved to it.
+    let e = h
+        .manage(&human(), "node_reassign", json!({ "node": NODE_A, "to_agent": B_DEVICE, "reason": "fake" }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "agent_org_mismatch", "{e:?}");
+    // Known through its node work too, whatever the case of the label.
+    let lead_item = h.queue(&lead_b(), NODE_B, B_PROMPT, json!({})).await;
+    assert!(!lead_item.is_empty());
+    let ledger_before = h.ledger().len();
+    let e = h
+        .manage(
+            &human(),
+            "node_reassign",
+            json!({ "node": NODE_A, "to_agent": B_DEVICE.to_uppercase(), "reason": "fake" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "agent_org_mismatch", "{e:?}");
+    assert_eq!(h.text(&format!("SELECT agent FROM nodes WHERE node = '{NODE_A}'")), "builder-1");
+    assert_eq!(h.ledger().len(), ledger_before);
+    // A default agent, or a label with no known organization (the documented
+    // limit), is accepted.
+    let moved = h
+        .manage(&human(), "node_reassign", json!({ "node": NODE_A, "to_agent": "lead-1", "reason": "fake" }))
+        .await
+        .unwrap();
+    assert_eq!(moved["changed"], true, "{moved}");
+    let moved = h
+        .manage(
+            &human(),
+            "node_reassign",
+            json!({ "node": NODE_A, "to_agent": "fresh-label-not-real", "reason": "fake" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved["agent"], "fresh-label-not-real", "{moved}");
+}
+
+#[tokio::test]
+async fn another_organizations_dedupe_keys_carry_only_hub_ids() {
+    use sha2::{Digest, Sha256};
+    let h = H::new();
+    h.fleet().await;
+    let mut items = Vec::new();
+    for (lead, device, node) in [(lead_a(), device_a(), NODE_A), (lead_b(), device_b(), NODE_B)] {
+        let tid =
+            h.ok(&lead, "task_add", json!({ "title": "fake dedupe task" })).await["id"].as_i64().unwrap();
+        let item =
+            h.queue(&lead, node, "fake prompt", json!({ "backend": "acp:claude", "task_id": tid })).await;
+        h.ok(&device, "node_claim", json!({ "node": node })).await;
+        let events = json!({ "node": node, "item_id": item, "events": [
+            { "kind": "turn_end", "turn_id": "t1" },
+        ] });
+        h.ok(&device, "node_events", events).await;
+        h.manage(&lead, "node_item_cancel", json!({ "item_id": item, "reason": "fake" })).await.unwrap();
+        h.ok(&device, "node_heartbeat", json!({ "node": node, "running": item })).await;
+        items.push(item);
+    }
+    let keys: Vec<String> = h.ledger().into_iter().filter_map(|(_, _, d, _)| d).collect();
+    let (a, b) = (&items[0], &items[1]);
+    // The default organization's keys are unchanged.
+    assert!(keys.contains(&format!("turn_summary:{NODE_A}:{a}:t1")), "{keys:?}");
+    assert!(keys.contains(&format!("cancel_relayed:{a}:1")), "{keys:?}");
+    // B's keys are built from hub ids alone.
+    let b_keys: Vec<&String> = keys.iter().filter(|k| k.contains(b.as_str())).collect();
+    assert_eq!(b_keys.len(), 2, "{keys:?}");
+    assert!(b_keys.iter().any(|k| k.starts_with(&format!("org:turn_summary:{b}:1:"))), "{b_keys:?}");
+    assert!(b_keys.contains(&&format!("org:cancel_relayed:{b}:1")), "{b_keys:?}");
+    // No key anywhere names B's node or is a digest of a key that does.
+    let named = [format!("turn_summary:{NODE_B}:{b}:t1"), NODE_B.to_string()];
+    let digests: Vec<String> = named.iter().map(|n| hex::encode(Sha256::digest(n.as_bytes()))).collect();
+    for k in &keys {
+        assert!(!k.contains(NODE_B), "{k}");
+        for d in &digests {
+            assert!(!k.contains(d.as_str()), "{k} is a digest of a named key");
+        }
+        if k.starts_with("org:") {
+            assert!(!k.chars().skip(4).all(|c| c.is_ascii_hexdigit()), "an unkeyed digest: {k}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_wakes_refuse_another_organizations_caller() {
+    let h = H::new();
+    h.fleet().await;
+    let before = h.count("SELECT COUNT(*) FROM session_wake");
+    for who in [device_b(), operator_b()] {
+        for (action, params) in [
+            ("session_wake_opt_in", json!({ "session_id": "fake-session-1", "node": NODE_B })),
+            ("session_wake_grant", json!({ "session_id": "fake-session-1" })),
+            ("session_wake_decline", json!({ "session_id": "fake-session-1", "reason": "fake" })),
+            ("session_wake_status", json!({ "session_id": "fake-session-1" })),
+        ] {
+            let e = h.manage(&who, action, params).await.unwrap_err();
+            assert_eq!(reason(&e), "org_unsupported", "{}: {action}: {e:?}", who.label);
+        }
+    }
+    assert_eq!(h.count("SELECT COUNT(*) FROM session_wake"), before);
+    // The default organization's callers pass the gate (to the missing
+    // session).
+    let e = h
+        .manage(&human(), "session_wake_status", json!({ "session_id": "fake-session-1" }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "not_found", "{e:?}");
+}
+
+fn fleet_row(doctor: &Value) -> Value {
+    doctor["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "fleet_nodes").cloned().unwrap()
+}
+
+#[tokio::test]
+async fn the_doctor_counts_other_organizations_blocked_nodes_and_unsent_notices() {
+    let h = H::with(|cfg| cfg.node_require_acceptance = true);
+    h.fleet().await;
+    h.register(&caller("osprey-second-device", ActorKind::Agent, ORG_B), "falcon-node-c", ROOT_B).await;
+    let row = fleet_row(&h.ok(&human(), "system_doctor", json!({})).await);
+    assert_eq!(row["other_org_nodes"], json!({ "active": 2, "retired": 0 }), "{row}");
+    assert_eq!(row["other_org_nodes_not_accepted"], 2, "{row}");
+    assert!(
+        row["detail"].as_str().unwrap().contains("2 other-organization node(s) in service take no real work")
+    );
+    assert!(!row.to_string().contains(NODE_B) && !row.to_string().contains("falcon-node-c"), "{row}");
+    assert!(row.get("other_org_unsent_command_notices").is_none(), "{row}");
+
+    // One retired by hub recovery; an unsent B command notice.
+    h.manage(&human(), "node_retire", json!({ "node": "falcon-node-c", "reason": "fake", "any_org": true }))
+        .await
+        .unwrap();
+    h.sql(&format!(
+        "INSERT INTO node_command_notice (item_id, attempt, terminal, owner_agent, body, created_at, org_id) \
+         VALUES ('{MISSING_ITEM}', 1, 'finished', '{B_LEAD}', 'fake', '2026-01-01T00:00:00+00:00', '{ORG_B}')"
+    ))
+    .unwrap();
+    let row = fleet_row(&h.ok(&human(), "system_doctor", json!({})).await);
+    assert_eq!(row["other_org_nodes"], json!({ "active": 1, "retired": 1 }), "{row}");
+    assert_eq!(row["other_org_nodes_not_accepted"], 1, "{row}");
+    assert_eq!(row["other_org_unsent_command_notices"], 1, "{row}");
+
+    // Without required acceptance, nothing is reported blocked.
+    let h = H::new();
+    h.fleet().await;
+    let row = fleet_row(&h.ok(&human(), "system_doctor", json!({})).await);
+    assert_eq!(row["other_org_nodes"], json!({ "active": 1, "retired": 0 }), "{row}");
+    assert!(row.get("other_org_nodes_not_accepted").is_none(), "{row}");
+    assert!(!row["detail"].as_str().unwrap().contains("take no real work"), "{row}");
 }
