@@ -162,7 +162,7 @@ const PAYLOAD_OF_M: &str = "COALESCE(m.org_payload, e.payload)";
 /// before anything is written. The `org_exists` triggers fire only on
 /// insert, so a write with nothing to insert (a read mark, an ack) would
 /// otherwise pass.
-fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+pub(super) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
     let status: Option<String> =
         c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
     match status.as_deref() {
@@ -183,7 +183,7 @@ fn require_org(c: &Connection, org: &str) -> UaResult<()> {
 /// another organization therefore cannot name one of its own
 /// (`from_session`, `session_id`); it reads and acks its mailbox as its
 /// label. Refused before anything is read or written.
-fn require_default_sessions(org: &str, field: &str) -> UaResult<()> {
+pub(super) fn require_default_sessions(org: &str, field: &str) -> UaResult<()> {
     if org != ua_core::DEFAULT_ORG {
         return Err(UaError::denied(
             "org_unsupported",
@@ -196,8 +196,10 @@ fn require_default_sessions(org: &str, field: &str) -> UaResult<()> {
     Ok(())
 }
 
-/// The refusal of a message to another organization. A message belongs to
-/// its sender's organization and is never delivered across one: fail closed.
+/// The refusal of a message addressed to a session from outside the default
+/// organization: every session is the default organization's
+/// (`require_default_sessions`), and a message is never delivered across an
+/// organization. Fail closed.
 fn cross_org_recipient(what: &str) -> UaError {
     UaError::denied(
         "cross_org_recipient",
@@ -208,21 +210,6 @@ fn cross_org_recipient(what: &str) -> UaError {
     )
 }
 
-/// Whether `label` is an agent of the default organization as far as the
-/// hub can tell today: a registered agent, or one with any session. Neither
-/// `agents` nor `agent_sessions` carries an organization yet, and every row
-/// in them is the default organization's (agent labels are one hub-wide,
-/// case-insensitive namespace), so a sender in another organization may not
-/// address such a label.
-fn default_org_agent(c: &Connection, label: &str) -> UaResult<bool> {
-    Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents WHERE label = ?1 COLLATE NOCASE) \
-         OR EXISTS(SELECT 1 FROM agent_sessions WHERE agent = ?1 COLLATE NOCASE)",
-        [label],
-        |r| r.get(0),
-    )?)
-}
-
 /// The ledger payload of a message of organization `org`.
 ///
 /// ORG-EVENT-DEFAULT: the event is written to the default organization's
@@ -230,8 +217,9 @@ fn default_org_agent(c: &Connection, label: &str) -> UaResult<bool> {
 /// keeps the payload's shape but carries only hub-minted ids, the act,
 /// counts and flags: the body, the typed handoff, every label, the
 /// conversation id (an unrestricted sender may choose it), `reply_to` and
-/// `event_id` (client text) and the client message id are `null`. The full
-/// payload is kept on the message's own index row (`org_payload`).
+/// `event_id` (client text), the client message id, and the `task_id` and
+/// `delegation_id` (unchecked integers the sender chooses) are `null`. The
+/// full payload is kept on the message's own index row (`org_payload`).
 fn ledger_payload(org: &str, full: &Value) -> Value {
     if org == ua_core::DEFAULT_ORG {
         return full.clone();
@@ -250,8 +238,8 @@ fn ledger_payload(org: &str, full: &Value) -> Value {
         "from_session": label("from_session"),
         "hop": full["hop"],
         "body": text("body"),
-        "task_id": full["task_id"],
-        "delegation_id": full["delegation_id"],
+        "task_id": Value::Null,
+        "delegation_id": Value::Null,
         "event_id": text("event_id"),
         "expects_reply": full["expects_reply"],
         "sender_verified": full["sender_verified"],
@@ -793,10 +781,12 @@ fn unreserved(label: String) -> UaResult<String> {
 /// (`org:<org>/message_send/<sender>/<id>`) and can never replay, probe or
 /// occupy the default organization's, or a third's. Each part has `%` and
 /// `/` escaped, so an organization id containing `/` cannot spell another
-/// organization's prefix. The default organization keeps
-/// `message_send/<sender>/<id>` byte for byte (a valid label and client id
-/// contain neither character), so its earlier receipts still replay; no
-/// form ever matches a pre-scoping key (`message_send:<id>`).
+/// organization's prefix. The default organization's key is
+/// `message_send/<sender>/<id>`, escaped the same way: byte for byte the
+/// earlier key, so its receipts still replay, for every sender and client id
+/// without `%` or `/` (a client id and a validated label never have one; a
+/// verified identity's label with one gets a new key). No form ever matches
+/// a pre-scoping key (`message_send:<id>`).
 fn client_key(org: &str, sender: &str, client_id: &str) -> String {
     let (sender, client_id) = (key_part(sender), key_part(client_id));
     if org == ua_core::DEFAULT_ORG {
@@ -1119,15 +1109,15 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if sender == recipient {
         return Err(UaError::invalid("from_agent and to_agent must differ"));
     }
-    // A message is its sender's organization's. Outside the default
-    // organization, a label the hub knows as an agent is the default
-    // organization's (`default_org_agent`): refused, never delivered there.
-    // Inside it, mail to any label stays in the default organization, where
-    // no other organization's reader can see it.
+    // A message is its sender's organization's: mail to a label is stored
+    // in the sender's organization and read only there, whatever else the
+    // label is. `agents` and `agent_sessions` carry no organization yet and
+    // any organization can write them (a heartbeat, `session_start`), so
+    // outside the default organization they say nothing about the label:
+    // the reply never consults them, and is the same whether or not the
+    // label is registered.
     let (availability, delivery_warning) = if org == ua_core::DEFAULT_ORG {
         agents::availability(tx, &recipient)?
-    } else if default_org_agent(tx, &recipient)? {
-        return Err(cross_org_recipient(&format!("to_agent {recipient:?}")));
     } else {
         // Nothing records another organization's liveness yet.
         (json!({ "agent": recipient, "availability": "unknown", "reason": "no_liveness_record" }), None)
@@ -1938,11 +1928,24 @@ async fn message_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     let v = Viewer::of(&ctx);
     let caller = v.identity.clone();
     // A session_id counts as that session's heartbeat, which needs the writer;
-    // the mailbox itself is only read.
+    // the mailbox itself is only read. An unknown or suspended organization
+    // is refused before either.
     let mut out = if clean(a.session_id.as_deref()).is_some() {
-        ctx.hub.db().write_async(move |tx| list_messages(tx, &v, a, false)).await?
+        ctx.hub
+            .db()
+            .write_async(move |tx| {
+                require_org(tx, &v.org)?;
+                list_messages(tx, &v, a, false)
+            })
+            .await?
     } else {
-        ctx.hub.db().read_async(move |c| list_messages(c, &v, a, false)).await?
+        ctx.hub
+            .db()
+            .read_async(move |c| {
+                require_org(c, &v.org)?;
+                list_messages(c, &v, a, false)
+            })
+            .await?
     };
     mark_untrusted(&mut out, caller.as_deref());
     Ok(out)

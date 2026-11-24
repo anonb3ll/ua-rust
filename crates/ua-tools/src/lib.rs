@@ -17,6 +17,9 @@
 //!    require_approval, failing closed when the file cannot be loaded,
 //! 4. for always-gated (prod) tools, refuses anonymous network callers and
 //!    revoked or unscoped agents before any approval pass is looked at,
+//!    then runs the tool's own pre-gate, if it has one: a refusal decided on
+//!    the caller alone (`crew_intervene` outside the default organization),
+//!    which parks no approval and is recorded as the call's failure,
 //! 5. evaluates the approval gate: a matching one-time approval is consumed,
 //!    a denial is returned, otherwise a pending approval is parked,
 //! 6. validates and deserializes the arguments (unknown fields are refused),

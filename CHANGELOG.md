@@ -574,14 +574,23 @@ from its commit history.
   write (send, list, inbox, ack, replies, conversations, `crew_view`,
   `session_packet`, wakes, the ledger visibility rule) is scoped, and
   another organization's message, conversation and client id answer as
-  missing ones. A send into another organization is refused
-  (`cross_org_recipient`); outside the default organization a registered
-  label or a session counts as the default organization's until agents
-  carry one. Another organization's message events carry no body, label or
-  client text (the message is kept on its own row) and use the `system`
-  originator; its client ids are stored as
-  `org:<org>/message_send/<sender>/<id>` with `%` and `/` escaped. Unknown
-  or suspended organizations are refused before any write. The relay stays
+  missing ones. Mail to a label is stored in the sender's organization and
+  read only there; registering the label anywhere (a heartbeat,
+  `session_start`) never stops it or changes the send's reply. Sessions
+  stay the default organization's: outside it a send to a session is
+  refused (`cross_org_recipient`), and `crew_view` and `crew_intervene`
+  refuse the caller (`org_unsupported`), `crew_intervene` in a new registry
+  pre-gate that runs before the approval gate, so no approval is parked.
+  Another organization's message events carry no body, label, client text,
+  `task_id` or `delegation_id` (the message is kept on its own row) and use
+  the `system` originator; its conversation handoff events record a
+  per-organization digest instead of the conversation id and actor, in the
+  payload and the dedupe key, and `conversation_handoffs` matches only the
+  reader's organization's digest (the default organization's events and keys
+  are unchanged). Its client ids are stored as
+  `org:<org>/message_send/<sender>/<id>` with `%` and `/` escaped (the
+  default key is unchanged for labels and ids without either). Unknown or
+  suspended organizations are refused before any read or write. The relay stays
   default-only for check, draft and send; its status and cancel answer
   another organization's draft as a missing one.
 - An insert guard beside the classification test: it fails when an

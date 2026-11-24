@@ -26,6 +26,11 @@ const ORG_B: &str = "org-b";
 /// idempotency key.
 const ORG_SLASH: &str = "org-b/message_send";
 const SUSPENDED: &str = "org-suspended";
+/// A third organization.
+const ORG_C: &str = "org-c";
+/// Organization-B labels another organization also registers.
+const BOB_B: &str = "bob-b";
+const CAROL_B: &str = "carol-b";
 const UNKNOWN: &str = "missing-org";
 const PARTS: [&str; 4] = [
     "organization.v1.tools.messaging",
@@ -47,6 +52,8 @@ const B_READER: &str = "b-reader-not-real";
 const B_BODY: &str = "osprey-body-not-real";
 const B_DONE: &str = "kestrel-done-not-real";
 const B_CLIENT_ID: &str = "falcon-client-id";
+/// An unchecked delegation id organization B's sender names.
+const B_DELEGATION: i64 = 4_242_424;
 /// A label used in both organizations.
 const SHARED: &str = "shared-label";
 
@@ -199,16 +206,17 @@ impl H {
             .read(|c| {
                 let mut stmt = c.prepare(
                     "SELECT channel, COALESCE(originator, ''), payload, COALESCE(episode_id, ''), \
-                     COALESCE(causal_parent_id, '') FROM event_log ORDER BY seq",
+                     COALESCE(causal_parent_id, ''), COALESCE(dedupe_key, '') FROM event_log ORDER BY seq",
                 )?;
                 let rows = stmt.query_map([], |r| {
                     Ok(format!(
-                        "{} {} {} {} {}",
+                        "{} {} {} {} {} {}",
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?
                     ))
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?.join("\n"))
@@ -520,6 +528,7 @@ async fn seed(h: &H) -> Mail {
         .send(
             &b_sender,
             json!({ "act": "handoff", "to_agent": B_READER, "body": B_BODY, "task_id": task_b,
+                    "delegation_id": B_DELEGATION,
                     "handoff": { "done": [B_DONE], "next_action": "go", "evidence": [{"kind": "task", "ref": "2"}] } }),
         )
         .await;
@@ -797,16 +806,57 @@ async fn crew_view_shows_only_the_readers_organizations_mail() {
     assert_no_b(&v.to_string(), "the default crew view");
     assert_eq!(v["message_total"], 3, "{v}");
 
-    let v = h.ok(&op_b, "crew_view", json!({ "session_id": sid })).await;
-    assert_eq!(v["message_total"], 0, "{v}");
-    assert_eq!(v["worktree_interventions"], json!([]), "{v}");
-    assert!(!v.to_string().contains(A_BODY), "{v}");
+    // Every session is the default organization's: organization B's
+    // callers can neither view nor steer one, and are refused before
+    // anything is read, approved or written.
+    let before = (h.snapshot(), h.event_count(), approvals(&h), wt_lines(&wt));
+    for who in [&op_b, &agent(B_READER, ORG_B)] {
+        for sid in [sid.as_str(), "no-such-session"] {
+            let e = h.call(who, "crew_view", json!({ "session_id": sid })).await.unwrap_err();
+            assert_eq!(reason(&e), "org_unsupported", "{e:?}");
+            assert!(!e.to_string().contains(A_READER) && !e.to_string().contains("wt"), "{e:?}");
+            let e = h
+                .call(who, "crew_intervene", json!({ "session_id": sid, "message": B_BODY }))
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&e), "org_unsupported", "{e:?}");
+        }
+    }
+    assert_eq!(
+        (h.snapshot(), h.event_count(), approvals(&h), wt_lines(&wt)),
+        before,
+        "nothing written, no approval parked, no drop-file line"
+    );
+}
+
+/// Every approval row, as text.
+fn approvals(h: &H) -> String {
+    h.hub
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare("SELECT id, org_id, tool, status FROM approvals ORDER BY id")?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!(
+                    "{}|{}|{}|{}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?
+                ))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?.join("\n"))
+        })
+        .unwrap()
+}
+
+fn wt_lines(wt: &Path) -> String {
+    std::fs::read_to_string(wt.join(".ua/interventions.jsonl")).unwrap_or_default()
 }
 
 // --- sending ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_send_to_another_organization_is_refused_with_nothing_written() {
+async fn a_send_to_a_session_from_another_organization_is_refused_with_nothing_written() {
     let h = H::new();
     let a_reader = agent(A_READER, DEFAULT_ORG);
     // A registered default-organization agent with a live session.
@@ -820,9 +870,6 @@ async fn a_send_to_another_organization_is_refused_with_nothing_written() {
 
     for who in [&b_sender, &op_b] {
         for args in [
-            json!({ "act": "inform", "to_agent": A_READER, "body": B_BODY }),
-            json!({ "act": "inform", "to_agent": "A-READER", "body": B_BODY }),
-            json!({ "act": "inform", "to_agent": "a-heartbeat", "body": B_BODY }),
             json!({ "act": "inform", "to_session": sid, "body": B_BODY }),
             json!({ "act": "inform", "to_session": "no-such-session", "body": B_BODY }),
             json!({ "act": "inform", "to_agent": A_READER, "to_session": sid, "body": B_BODY, "message_id": "k-1" }),
@@ -851,16 +898,82 @@ async fn a_send_to_another_organization_is_refused_with_nothing_written() {
         }
     }
     assert_eq!((h.snapshot(), h.event_count()), before, "a refused send writes nothing");
-    // crew_intervene delivers through message_send (refused above for any
-    // session); before that it is approval-gated in organization B's own
-    // queue. Either way its message tables and drop file stay untouched.
+    // crew_intervene is refused before its approval gate (crew_view's test
+    // checks no approval is parked), so nothing reaches the drop file.
     let e = h.call(&op_b, "crew_intervene", json!({ "session_id": sid, "message": B_BODY })).await;
-    assert!(e.is_err(), "{e:?}");
+    assert_eq!(reason(&e.unwrap_err()), "org_unsupported");
     assert_eq!(h.snapshot(), before.0);
     assert!(!wt_written(&h), "no drop-file line");
 
-    // Mail inside organization B still flows.
-    h.send(&b_sender, json!({ "act": "inform", "to_agent": B_READER, "body": B_BODY })).await;
+    // Mail inside organization B still flows, to any label: one the default
+    // organization registered too is organization B's mailbox there.
+    for to in [B_READER, A_READER, "A-READER", "a-heartbeat"] {
+        h.send(&b_sender, json!({ "act": "inform", "to_agent": to, "body": B_BODY })).await;
+    }
+    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'default'"), 0);
+    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b'"), 4);
+    let inbox = h.ok(&a_reader, "message_list", json!({})).await;
+    assert_eq!(inbox["total"], 0, "the default organization's reader gets none of it: {inbox}");
+    assert_no_b(&h.ledger_text(), "the ledger");
+}
+
+/// Agents and sessions carry no organization yet, and any organization can
+/// write them, so whether a label is registered never decides whether
+/// another organization's mail reaches it, nor changes the send's reply.
+#[tokio::test]
+async fn registering_a_label_elsewhere_never_stops_or_changes_an_organizations_mail() {
+    let h = H::new();
+    add_org(h.hub.db(), ORG_C, "active");
+    let b_sender = agent(B_SENDER, ORG_B);
+    // A send's reply with its minted ids masked.
+    let masked = |v: &Value| {
+        let mut v = v.clone();
+        for k in ["message_id", "event_ulid", "seq", "conversation_id"] {
+            assert!(!v[k].is_null(), "{k} in {v}");
+            v[k] = json!("<minted>");
+        }
+        v.to_string()
+    };
+    let send = |to: &'static str| {
+        let b_sender = b_sender.clone();
+        let h = &h;
+        async move {
+            h.send(&b_sender, json!({ "act": "request", "to_agent": to, "body": B_BODY, "task_id": 5 })).await
+        }
+    };
+
+    let fresh_bob = masked(&send(BOB_B).await);
+    let fresh_carol = masked(&send(CAROL_B).await);
+    // A third organization heartbeats `bob-b`; the default organization
+    // starts a session as `carol-b`.
+    h.ok(&agent(BOB_B, ORG_C), "agent_heartbeat", json!({})).await;
+    h.ok(&agent(CAROL_B, DEFAULT_ORG), "session_start", json!({ "kind": "interactive" })).await;
+    assert_eq!(masked(&send(BOB_B).await), fresh_bob, "the reply is the same once the label is registered");
+    assert_eq!(
+        masked(&send(CAROL_B).await),
+        fresh_carol,
+        "the reply is the same once the label has a session"
+    );
+
+    // Organization B's own agent starts a session: its peers' mail still
+    // reaches it, and it reads it as its label.
+    let bob = agent(BOB_B, ORG_B);
+    h.ok(&bob, "session_start", json!({ "kind": "interactive" })).await;
+    send(BOB_B).await;
+    let inbox = h.coord(&bob, "message_inbox", json!({})).await.unwrap();
+    assert_eq!(bodies(&inbox), [B_BODY, B_BODY, B_BODY], "{inbox}");
+    // The other organizations' `bob-b` and `carol-b` read none of it.
+    for who in [agent(BOB_B, ORG_C), agent(BOB_B, DEFAULT_ORG), agent(CAROL_B, DEFAULT_ORG)] {
+        let v = h.ok(&who, "message_list", json!({})).await;
+        assert_eq!(v["total"], 0, "{}: {v}", who.org_id);
+    }
+    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id <> 'org-b'"), 0);
+    for needle in [BOB_B, CAROL_B, B_BODY] {
+        let ledger = h.ledger_text();
+        let messages =
+            ledger.lines().filter(|l| l.starts_with("agent.message.")).collect::<Vec<_>>().join("\n");
+        assert!(!messages.contains(needle), "a message event leaks {needle:?}: {messages}");
+    }
 }
 
 #[tokio::test]
@@ -888,6 +1001,21 @@ async fn an_unknown_or_suspended_organization_is_refused_before_any_write() {
             .await
             .unwrap_err();
         assert_eq!(reason(&e), want, "{org}: {e:?}");
+        // Reads too: the mailbox, a conversation's handoffs, a handoff.
+        for args in [json!({}), json!({ "session_id": "s-1" })] {
+            let e = h.call(&who, "message_list", args.clone()).await.unwrap_err();
+            assert_eq!(reason(&e), want, "{org} message_list({args}): {e:?}");
+        }
+        for (action, params) in [
+            ("conversation_handoffs", json!({ "conversation_id": sent["conversation_id"] })),
+            ("conversation_handoff", json!({ "conversation_id": sent["conversation_id"], "title": "t" })),
+        ] {
+            let e = h.coord(&who, action, params).await.unwrap_err();
+            assert_eq!(reason(&e), want, "{org} {action}: {e:?}");
+        }
+        // crew_view refuses every session outside the default organization.
+        let e = h.call(&who, "crew_view", json!({ "session_id": "s-1" })).await.unwrap_err();
+        assert_eq!(reason(&e), "org_unsupported", "{org}: {e:?}");
     }
     assert_eq!((h.snapshot(), h.event_count()), before, "nothing changed");
 }
@@ -1061,6 +1189,237 @@ async fn relay_status_and_cancel_answer_another_organizations_draft_as_missing()
         assert_eq!(reason(&e), "org_unsupported", "{action}: {e:?}");
     }
     assert_no_b(&h.ledger_text(), "the ledger");
+}
+
+// --- ledger events -----------------------------------------------------------------------------
+
+/// Another organization's message event carries no `task_id` or
+/// `delegation_id` (unchecked integers its sender chooses); its own row
+/// keeps them. The default organization's events are unchanged.
+#[tokio::test]
+async fn another_organizations_message_event_carries_no_task_or_delegation_id() {
+    let h = H::new();
+    let m = seed(&h).await;
+    let event_of = "FROM event_log e JOIN message_index i ON i.event_ulid = e.ulid";
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) {event_of} WHERE i.org_id = 'org-b' \
+             AND (json_extract(e.payload, '$.task_id') IS NOT NULL \
+                  OR json_extract(e.payload, '$.delegation_id') IS NOT NULL)"
+        )),
+        0
+    );
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) {event_of} WHERE i.org_id = 'org-b' \
+             AND json_type(e.payload, '$.task_id') = 'null' AND json_type(e.payload, '$.delegation_id') = 'null'"
+        )),
+        3,
+        "the payload keeps its shape"
+    );
+    assert_eq!(
+        h.count(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b' \
+             AND json_extract(org_payload, '$.task_id') IS NOT NULL AND task_id IS NOT NULL"
+        ),
+        3
+    );
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b' \
+             AND json_extract(org_payload, '$.delegation_id') = {B_DELEGATION} AND delegation_id = {B_DELEGATION}"
+        )),
+        1
+    );
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) {event_of} WHERE i.org_id = 'default' AND json_extract(e.payload, '$.task_id') = {}",
+            m.task_a
+        )),
+        2,
+        "the default organization's events keep their task id"
+    );
+    assert!(!h.ledger_text().contains(&B_DELEGATION.to_string()));
+    // Organization B's reader still sees both on its mail.
+    let b_list = h.ok(&agent(B_READER, ORG_B), "message_list", json!({})).await;
+    let rows = b_list["messages"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["task_id"].is_i64()), "{b_list}");
+    assert!(rows.iter().any(|r| r["delegation_id"] == B_DELEGATION), "{b_list}");
+}
+
+/// A conversation handoff's event is written to the default ledger: another
+/// organization's records neither its conversation id nor its actor (in the
+/// payload or the dedupe key), and only that organization lists it. The
+/// default organization's events and keys are byte for byte as before.
+#[tokio::test]
+async fn another_organizations_conversation_handoff_keeps_its_conversation_out_of_the_ledger() {
+    let h = H::new();
+    let m = seed(&h).await;
+    let (a_sender, b_reader) = (agent(A_SENDER, DEFAULT_ORG), agent(B_READER, ORG_B));
+    let op_a = human("operator", DEFAULT_ORG);
+    let b_conv = m.b["conversation_id"].as_str().unwrap().to_string();
+    let a_conv = m.a["conversation_id"].as_str().unwrap().to_string();
+
+    let created = h
+        .coord(
+            &b_reader,
+            "conversation_handoff",
+            json!({ "conversation_id": b_conv, "title": "Osprey follow-up" }),
+        )
+        .await
+        .unwrap();
+    let created_id = created["task_id"].as_i64().unwrap();
+    for _ in 0..2 {
+        h.coord(&b_reader, "conversation_handoff", json!({ "conversation_id": b_conv, "task_id": m.task_b }))
+            .await
+            .unwrap();
+    }
+    // Relinking appends nothing; the created task's event is not repeated.
+    h.coord(&b_reader, "conversation_handoff", json!({ "conversation_id": b_conv, "task_id": created_id }))
+        .await
+        .unwrap();
+    let events = |org_b: bool| -> Vec<(String, String)> {
+        let cond = if org_b { "LIKE 'org/%'" } else { "NOT LIKE 'org/%'" };
+        let sql = format!(
+            "SELECT json_extract(payload, '$.conversation_id'), dedupe_key FROM event_log \
+             WHERE channel = 'agent.conversation.handoff' AND json_extract(payload, '$.conversation_id') {cond} \
+             ORDER BY seq"
+        );
+        h.hub
+            .db()
+            .read(move |c| {
+                let mut stmt = c.prepare(&sql)?;
+                Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+            })
+            .unwrap()
+    };
+    let b_events = events(true);
+    assert_eq!(b_events.len(), 2, "{b_events:?}");
+    assert_eq!(b_events[0].0, b_events[1].0, "one conversation, one digest");
+    for (conv, key) in &b_events {
+        assert_eq!(conv.len(), "org/".len() + 40, "{conv}");
+        assert!(key.starts_with("conversation-handoff:org/"), "{key}");
+        assert!(!key.contains(&b_conv) && !key.contains(B_READER), "{key}");
+    }
+    assert!(b_events[0].1.ends_with(":created") && !b_events[1].1.ends_with(":created"), "{b_events:?}");
+    let ledger = h.ledger_text();
+    assert!(!ledger.contains(&b_conv), "the ledger leaks organization B's conversation id: {ledger}");
+    assert_no_b(&ledger, "the ledger");
+
+    // Organization B lists its handoffs.
+    let listed =
+        h.coord(&b_reader, "conversation_handoffs", json!({ "conversation_id": b_conv })).await.unwrap();
+    let mut ids: Vec<i64> =
+        listed["handoffs"].as_array().unwrap().iter().map(|t| t["task_id"].as_i64().unwrap()).collect();
+    ids.sort_unstable();
+    let mut want = vec![m.task_b, created_id];
+    want.sort_unstable();
+    assert_eq!(ids, want, "{listed}");
+    assert!(listed["handoffs"].as_array().unwrap().iter().all(|t| t["by"].is_null()), "{listed}");
+
+    // A default operator reusing the leaked id opens its own conversation
+    // and reads none of organization B's handoff rows.
+    h.send(
+        &op_a,
+        json!({ "act": "inform", "to_agent": A_READER, "body": "reuse", "conversation_id": b_conv }),
+    )
+    .await;
+    let v = h.coord(&op_a, "conversation_handoffs", json!({ "conversation_id": b_conv })).await.unwrap();
+    assert_eq!((v["handoffs"].clone(), v["unaudited"].clone()), (json!([]), json!([])), "{v}");
+
+    // The default organization's events and keys are unchanged.
+    h.coord(&a_sender, "conversation_handoff", json!({ "conversation_id": a_conv, "task_id": m.task_a }))
+        .await
+        .unwrap();
+    let a_created = h
+        .coord(
+            &a_sender,
+            "conversation_handoff",
+            json!({ "conversation_id": a_conv, "title": "Heron follow-up" }),
+        )
+        .await
+        .unwrap();
+    let a_task = a_created["task_id"].as_i64().unwrap();
+    assert_eq!(
+        events(false),
+        [
+            (a_conv.clone(), format!("conversation-handoff:{a_conv}:{}:{A_SENDER}", m.task_a)),
+            (a_conv.clone(), format!("conversation-handoff:{a_conv}:{a_task}:{A_SENDER}:created")),
+        ]
+    );
+    let v = h.coord(&a_sender, "conversation_handoffs", json!({ "conversation_id": a_conv })).await.unwrap();
+    assert_eq!(v["handoffs"].as_array().map(Vec::len), Some(2), "{v}");
+    assert_eq!(v["handoffs"][0]["by"], A_SENDER, "{v}");
+}
+
+/// A legacy draft linked to another organization's approval (the
+/// same-organization trigger fires only on insert or update, so the
+/// migration keeps such a link) reports no approval and cannot be cancelled:
+/// the cancel fails closed, and neither row changes.
+#[test]
+fn a_legacy_draft_linked_to_another_organizations_approval_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.human_identities = vec!["operator".into()];
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &old_parts()).unwrap();
+        add_org(&db, ORG_B, "active");
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO approvals (id, org_id, tool, payload, requested_by, status, created_at, updated_at)
+                     VALUES (9, 'org-b', 'relay_manage', '{}', 'relay-b', 'pending', 'x', 'x');
+                 INSERT INTO relay_messages (id, channel, target, text, text_sha256, chars, bytes, verdict,
+                     findings, status, approval_id, requested_by, created_at, updated_at)
+                 VALUES (8, 'github', 'owner/repo#3', 'hello', 'h', 5, 5, 'pass', '{}', 'pending_approval', 9,
+                         'operator', 'x', 'x');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let hub = Hub::open(cfg).unwrap();
+    let rows = |hub: &Hub| -> String {
+        hub.db()
+            .read(|c| {
+                let draft: String = c.query_row(
+                    "SELECT org_id || '|' || status || '|' || approval_id || '|' || COALESCE(text, '') \
+                     FROM relay_messages WHERE id = 8",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let approval: String = c.query_row(
+                    "SELECT org_id || '|' || status || '|' || payload FROM approvals WHERE id = 9",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(format!("{draft} {approval}"))
+            })
+            .unwrap()
+    };
+    let before = rows(&hub);
+    assert_eq!(before, "default|pending_approval|9|hello org-b|pending|{}", "the link is kept");
+    let reg = builtin_registry();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let op = human("operator", DEFAULT_ORG);
+        let relay = |action: &str| json!({ "action": action, "params": { "draft_id": 8 } });
+        let st = reg.call(&hub, &op, "relay_manage", relay("status")).await.unwrap();
+        assert_eq!(
+            (st["approval_status"].clone(), st["resolved_by"].clone()),
+            (Value::Null, Value::Null),
+            "{st}"
+        );
+        let e = reg.call(&hub, &op, "relay_manage", relay("cancel")).await.unwrap_err();
+        assert_eq!(reason(&e), "not_found", "{e:?}");
+        // Organization B cannot reach the draft through its approval either.
+        let b = human("operator", ORG_B);
+        let e = reg
+            .call(&hub, &b, "relay_manage", json!({ "action": "status", "params": { "approval_id": 9 } }))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&e), "not_found", "{e:?}");
+    });
+    assert_eq!(rows(&hub), before, "neither the draft nor the approval changed");
 }
 
 // --- the insert guard --------------------------------------------------------------------------

@@ -1176,7 +1176,17 @@ fn drop_message_ids(path: Option<&Path>) -> Vec<String> {
         .collect()
 }
 
+/// Every session is the default organization's until agents carry an
+/// organization (`messaging::require_default_sessions`): another
+/// organization's caller can neither view nor steer one, and is refused
+/// before anything is read, approved or written. Also `crew_intervene`'s
+/// registry pre-gate, so no approval is parked for such a call.
+fn crew_default_org(caller: &ua_core::Caller, _args: &Value) -> UaResult<()> {
+    super::messaging::require_default_sessions(&caller.org_id, "session_id")
+}
+
 async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
+    crew_default_org(&ctx.caller, &Value::Null)?;
     let sid = a.session_id.trim().to_string();
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
@@ -1192,7 +1202,14 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         .map(str::to_string);
     let party_q = party.clone();
     let org_q = org.clone();
-    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &org, &sid2)).await?;
+    let session = ctx
+        .hub
+        .db()
+        .read_async(move |conn| {
+            super::messaging::require_org(conn, &org)?;
+            needs_session(conn, &org, &sid2)
+        })
+        .await?;
     let drop_path = intervention_path(&ctx, session["worktree_path"].as_str());
     let drop_path2 = drop_path.clone();
     let drop_ids = blocking(move || Ok(drop_message_ids(drop_path2.as_deref()))).await?;
@@ -1303,6 +1320,8 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
+    // Checked again here, though the registry's pre-gate already refused it.
+    crew_default_org(&ctx.caller, &Value::Null)?;
     // The reviewer profile may watch a crew but not steer it. The profile table
     // does not list this tool, so the tool enforces it itself.
     if ctx.caller.profile == ua_core::Profile::Reviewer {
@@ -1326,7 +1345,14 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
 
     let sid2 = sid.clone();
     let org = ctx.caller.org_id.clone();
-    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &org, &sid2)).await?;
+    let session = ctx
+        .hub
+        .db()
+        .read_async(move |conn| {
+            super::messaging::require_org(conn, &org)?;
+            needs_session(conn, &org, &sid2)
+        })
+        .await?;
     let recipient = session["agent"].as_str().unwrap_or("").trim().to_string();
     if recipient.is_empty() {
         return Err(UaError::invalid(format!("session {sid} has no agent")));
@@ -1461,7 +1487,8 @@ pub fn register(r: &mut Registry) {
             crew_intervene,
         )
         .family("sessions")
-        .always_gated(),
+        .always_gated()
+        .pre_gate(crew_default_org),
     );
 }
 

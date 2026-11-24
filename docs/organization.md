@@ -803,37 +803,63 @@ here for memory columns, owners and defaults.
     gates and the ledger's mailbox visibility rule (`VISIBLE_EVENT`) read
     and write only that organization's rows. Another organization's
     message, `reply_to`, conversation id and client id answer exactly as
-    missing ones.
-  - **Cross-organization sends are refused** (`cross_org_recipient`),
-    fail closed, before anything is read or written: a message is never
-    delivered into another organization. `agents` and `agent_sessions`
-    carry no organization yet, and every row in them is the default
-    organization's, so a sender in another organization may address only
-    a label the hub has never registered (no `agents` row, no session,
-    compared without case) and never a session (`to_session`). Its own
-    session cannot be named either (`from_session`, `session_id`:
-    `org_unsupported`). A default-organization sender may address any
-    label; that mail stays in the default organization, where no other
-    organization reads it. Both rules lift when the agents family converts
-    and a label's organization is recorded. Accepted residual: the refusal
-    tells another organization's sender that a label is registered, which
-    the hub-wide label namespace already implies.
+    missing ones. Every reader and writer (`message_list`,
+    `conversation_handoff(s)` and `crew_view` included) refuses an unknown
+    or suspended organization first.
+  - **Mail to a label stays in its sender's organization.** A message
+    to `to_agent` is stored in the sender's organization and read only
+    there, whatever the label is elsewhere: the same label in two
+    organizations is two mailboxes. `agents` and `agent_sessions` carry no
+    organization yet, and any organization can write them (a heartbeat,
+    `session_start`), so outside the default organization the send never
+    consults them. Registering a label, in any organization, neither stops
+    another organization's mail to it nor changes the send's reply, which
+    is byte for byte the same whether the label is registered or not
+    (`availability` is always `unknown`, `no_liveness_record`).
+  - **Sessions are the default organization's.** Outside it, a send to a
+    session is refused (`cross_org_recipient`, before the session is
+    looked up, so a missing session answers alike), and a caller cannot
+    name a session of its own (`from_session`, `session_id`:
+    `org_unsupported`). `crew_view` and `crew_intervene` refuse another
+    organization's caller (`org_unsupported`) before anything is read;
+    `crew_intervene` does so in the registry's pre-gate, before its
+    approval gate, so no approval is parked. Both rules lift when the
+    agents family converts and a session's organization is recorded.
   - **Events.** Message and mailbox events are `ORG-EVENT-DEFAULT` sites.
     Another organization's `agent.message.*` event keeps the payload's
-    shape with only hub-minted ids, the act, the hop, ids of tasks and
-    delegations and flags: body, typed handoff, every label, the
-    conversation id, `reply_to`, `event_id` and the client id are `null`;
-    the originator is `system`, and it has no episode or causal parent.
+    shape with only hub-minted ids, the act, the hop and flags: body,
+    typed handoff, every label, the conversation id, `reply_to`,
+    `event_id`, the client id, `task_id` and `delegation_id` (unchecked
+    integers the sender chooses) are `null`; the originator is `system`,
+    and it has no episode or causal parent.
     The message itself is kept on its index row (`org_payload`), which only
     its organization reads; a default-organization row leaves it `NULL`
     and reads its event as before. Another organization's
     `agent.mailbox.read` / `.acked` names no mailbox or client id and uses
-    `system`.
+    `system`. Another organization's `agent.conversation.handoff` names no
+    actor (`by` is `null`, the originator `system`) and records its
+    conversation as `org/<digest of (organization, conversation id)>`,
+    with the dedupe key `conversation-handoff:org/<digest of
+    (organization, conversation id, task, actor)>`; `conversation_handoffs`
+    matches that organization's digest only, so a default reader who
+    reuses a leaked conversation id finds none of its rows. The digest is
+    not keyed: whoever knows both the organization id and the
+    conversation id can recompute it. The default organization's events
+    and keys are unchanged (`conversation_id` itself,
+    `conversation-handoff:<cid>:<task>:<actor>[:created]`), so they still
+    deduplicate. Accepted edge of `VISIBLE_EVENT`: a writer sees its own
+    rows by originator, so a default-organization reader whose verified
+    label is `system` matches every redacted event another organization
+    wrote with the `system` originator. Those rows carry no content; no
+    agent should be issued the label `system`.
   - **Client ids.** The send's idempotency key is
-    `message_send/<sender>/<id>` in the default organization (unchanged)
-    and `org:<org>/message_send/<sender>/<id>` elsewhere, each part with
-    `%` and `/` escaped, so an organization id containing `/` cannot spell
-    another's prefix. A pre-scoping `message_send:<id>` key replays only in
+    `message_send/<sender>/<id>` in the default organization and
+    `org:<org>/message_send/<sender>/<id>` elsewhere, each part with `%`
+    and `/` escaped, so an organization id containing `/` cannot spell
+    another's prefix. The default key is byte for byte the earlier one
+    only for a sender and client id without `%` or `/` (every validated
+    label and client id); a verified identity whose label has one gets a
+    new key, and its earlier receipts no longer replay. A pre-scoping `message_send:<id>` key replays only in
     the default organization. A receipt naming another organization's
     message is never replayed: the send is refused (`conflict`) and names
     neither.
@@ -850,8 +876,12 @@ here for memory columns, owners and defaults.
     or error text and use `system`.
   - The importer writes legacy messages and receipts to `default`.
     `crates/ua-tools/tests/messaging_tenant.rs` holds the upgrade, the
-    isolation through every reading tool, the cross-organization refusal,
-    the relay parity and the idempotency tests.
+    isolation through every reading tool, the session refusals, mail to a
+    label registered elsewhere, the ledger redaction (message and
+    conversation-handoff events, dedupe keys included), a legacy draft
+    linked to another organization's approval (its status reports no
+    approval; its cancel fails closed), the relay parity and the
+    idempotency tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
