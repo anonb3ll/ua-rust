@@ -29,8 +29,12 @@ const AGENT: &str = "builder-1";
 const B_AGENT: &str = "kestrel-nightshift-7781";
 const TOOL: &str = "task_add";
 
+/// The parts a hub had before the approvals conversion: every part up to the
+/// first of [`PARTS`]. Later parts (the relay's `relay_messages_org_approval`
+/// trigger reads `approvals.org_id`) never ran on such a hub, and a later
+/// table rebuild re-checks every trigger, so they are left out too.
 fn old_parts() -> Vec<ua_store::Part> {
-    ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
+    ua_tools::schema_parts().into_iter().take_while(|p| !PARTS.contains(&p.name)).collect()
 }
 
 fn cfg(home: &std::path::Path) -> Config {

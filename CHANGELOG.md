@@ -595,6 +595,35 @@ from its commit history.
   cooldowns count only the reader's organization's calls, keeping the
   own-calls rule inside it. Another organization's authorization events
   carry no repository or policy reference.
+- Messages and relay drafts are organization-scoped:
+  `organization.v1.tools.messaging` and `organization.v1.tools.relay` add
+  `org_id` and the organization triggers to `message_index`,
+  `message_reads` and `relay_messages`; every existing row is the default
+  organization's and nothing is dropped. `messaging.v2.org_scope` and
+  `relay.v2.org_scope` add org-led indexes and same-organization triggers
+  for a read receipt, a reply and a draft's approval. Every mailbox read and
+  write (send, list, inbox, ack, replies, conversations, `crew_view`,
+  `session_packet`, wakes, the ledger visibility rule) is scoped, and
+  another organization's message, conversation and client id answer as
+  missing ones. Mail to a label is stored in the sender's organization and
+  read only there; registering the label anywhere (a heartbeat,
+  `session_start`) never stops it or changes the send's reply. Sessions
+  stay the default organization's: outside it a send to a session is
+  refused (`cross_org_recipient`), and `crew_view` and `crew_intervene`
+  refuse the caller (`org_unsupported`), `crew_intervene` in a new registry
+  pre-gate that runs before the approval gate, so no approval is parked.
+  Another organization's message events carry no body, label, client text,
+  `task_id` or `delegation_id` (the message is kept on its own row) and use
+  the `system` originator; its conversation handoff events record a
+  per-organization digest instead of the conversation id and actor, in the
+  payload and the dedupe key, and `conversation_handoffs` matches only the
+  reader's organization's digest (the default organization's events and keys
+  are unchanged). Its client ids are stored as
+  `org:<org>/message_send/<sender>/<id>` with `%` and `/` escaped (the
+  default key is unchanged for labels and ids without either). Unknown or
+  suspended organizations are refused before any read or write. The relay stays
+  default-only for check, draft and send; its status and cancel answer
+  another organization's draft as a missing one.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

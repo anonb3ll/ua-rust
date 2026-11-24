@@ -26,8 +26,12 @@ pub(crate) enum Kind {
     /// Hashes only, and only in the scheme ua-rust verifies (hex SHA-256).
     Tokens,
     /// `event_seq` may be NULL in older Python rows; it is filled from the
-    /// imported ledger by `event_ulid`.
+    /// imported ledger by `event_ulid`. Legacy messages are imported into the
+    /// default organization (a source `org_id` is never copied).
     MessageIndex,
+    /// Legacy mailbox read receipts are imported into the default
+    /// organization, with their messages.
+    MessageReads,
     /// The hash-chained event ledger, copied byte-exactly.
     Ledger,
     /// Remote nodes: owner, version, timestamps and retirement move across,
@@ -97,6 +101,8 @@ impl Kind {
                 | Kind::WorkProposals
                 | Kind::Memory
                 | Kind::Nodes
+                | Kind::MessageIndex
+                | Kind::MessageReads
         )
     }
 }
@@ -201,6 +207,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { kind: Kind::MessageIndex, ..plain("message_index") },
     TableMap {
         refs: &[Ref { col: "message_id", table: "message_index", key: "message_id" }],
+        kind: Kind::MessageReads,
         ..plain("message_reads")
     },
 ];

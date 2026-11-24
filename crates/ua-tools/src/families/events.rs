@@ -44,6 +44,7 @@ pub(super) const VISIBLE_EVENT: &str = "(
         AND channel <> 'agent.conversation.handoff')
     OR (channel GLOB 'agent.message.*' AND org_id = ? AND (? OR EXISTS (
         SELECT 1 FROM message_index i WHERE i.event_ulid = event_log.ulid
+          AND i.org_id = event_log.org_id
           AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
     )))
     OR (channel = 'agent.lifecycle.handoff' AND org_id = ? AND json_valid(event_log.payload) AND (
@@ -60,6 +61,7 @@ pub(super) const VISIBLE_EVENT: &str = "(
         ? OR EXISTS (
         SELECT 1 FROM message_index i
           WHERE i.conversation_id = json_extract(event_log.payload, '$.conversation_id')
+            AND i.org_id = event_log.org_id
             AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
     ) OR EXISTS (
         SELECT 1 FROM tasks t

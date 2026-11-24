@@ -174,18 +174,16 @@ const TENANT: &[&str] = &[
 /// (`organization.v1.tools.policy_authorizations`), `tool_calls`
 /// (`organization.v1.tools.tool_calls`), `memory`, `memory_versions`
 /// and `memory_embeddings` (`organization.v1.memory`, `memory.v2.org_scope`),
-/// the seven node tables (`node_queue.v2.tenant_keys`,
-/// `organization.v1.tools.nodes`) and `dispatch_runs` and
-/// `dispatch_receipts` (`organization.v1.tools.dispatch`).
+/// `message_index` and `message_reads` (`organization.v1.tools.messaging`),
+/// `relay_messages` (`organization.v1.tools.relay`), the seven node tables
+/// (`node_queue.v2.tenant_keys`, `organization.v1.tools.nodes`) and
+/// `dispatch_runs` and `dispatch_receipts` (`organization.v1.tools.dispatch`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
     "agent_tokens",
     "agents",
     "idempotency_keys",
-    "message_index",
-    "message_reads",
-    "relay_messages",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",
@@ -540,23 +538,29 @@ fn a_stale_entry_fails() {
 #[test]
 fn a_tenant_table_must_leave_the_missing_list_once_it_passes_and_fail_otherwise() {
     let conn = schema();
-    // Give `relay_messages` its tenant shape by hand, as its part will.
+    // Give `idempotency_keys` its tenant shape by hand, as its part will.
     conn.execute_batch(
-        "ALTER TABLE relay_messages ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER relay_messages_org_exists BEFORE INSERT ON relay_messages
+        "ALTER TABLE idempotency_keys ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
+         CREATE TRIGGER idempotency_keys_org_exists BEFORE INSERT ON idempotency_keys
          WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
          BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER relay_messages_org_immutable BEFORE UPDATE OF org_id ON relay_messages
+         CREATE TRIGGER idempotency_keys_org_immutable BEFORE UPDATE OF org_id ON idempotency_keys
          WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
          BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
     )
     .unwrap();
     let found = problems(&conn, &lists());
-    assert_eq!(found, ["relay_messages: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]);
+    assert_eq!(
+        found,
+        ["idempotency_keys: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]
+    );
 
-    // Off the list, `relay_messages` passes, and `agents` (still without org_id) fails.
-    let shrunk: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| !["relay_messages", "agents"].contains(t)).collect();
+    // Off the list, `idempotency_keys` passes, and `agents` (still without org_id) fails.
+    let shrunk: Vec<&str> = TENANT_MISSING_ORG_ID
+        .iter()
+        .copied()
+        .filter(|t| !["idempotency_keys", "agents"].contains(t))
+        .collect();
     let l = Lists { missing: &shrunk, ..lists() };
     let found = problems(&conn, &l);
     assert_eq!(
@@ -574,14 +578,14 @@ fn only_tenant_tables_may_be_listed_as_missing() {
     let conn = schema();
     // Swap one entry for a hub table, so the list keeps its length.
     let missing: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "relay_messages").chain(["orgs"]).collect();
-    // Give `relay_messages` its tenant shape, so leaving the list is not itself a finding.
+        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "idempotency_keys").chain(["orgs"]).collect();
+    // Give `idempotency_keys` its tenant shape, so leaving the list is not itself a finding.
     conn.execute_batch(
-        "ALTER TABLE relay_messages ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER relay_messages_org_exists BEFORE INSERT ON relay_messages
+        "ALTER TABLE idempotency_keys ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
+         CREATE TRIGGER idempotency_keys_org_exists BEFORE INSERT ON idempotency_keys
          WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
          BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER relay_messages_org_immutable BEFORE UPDATE OF org_id ON relay_messages
+         CREATE TRIGGER idempotency_keys_org_immutable BEFORE UPDATE OF org_id ON idempotency_keys
          WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
          BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
     )

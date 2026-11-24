@@ -17,6 +17,9 @@
 //!    require_approval, failing closed when the file cannot be loaded,
 //! 4. for always-gated (prod) tools, refuses anonymous network callers and
 //!    revoked or unscoped agents before any approval pass is looked at,
+//!    then runs the tool's own pre-gate, if it has one: a refusal decided on
+//!    the caller alone (`crew_intervene` outside the default organization),
+//!    which parks no approval and is recorded as the call's failure,
 //! 5. evaluates the approval gate: a matching one-time approval is consumed,
 //!    a denial is returned, otherwise a pending approval is parked,
 //! 6. validates and deserializes the arguments (unknown fields are refused),
@@ -172,6 +175,17 @@ pub fn schema_parts() -> Vec<Part> {
     // organization, the same-organization triggers and the org-led indexes.
     parts.push(families::memory::TENANT_PART.into());
     parts.push(families::memory::ORG_SCOPE.into());
+    // The organization column and triggers of the mailbox tables and the
+    // relay's drafts (no key rebuild: message ids and event ulids are
+    // hub-minted, receipts are keyed by them, and drafts by an
+    // AUTOINCREMENT id; every existing row is the default organization's),
+    // then the organization-led indexes, another organization's message
+    // payload column, and the rules that a receipt, a reply and a draft's
+    // approval stay in their own organization. After the approvals parts.
+    parts.push(families::messaging::TENANT_PART.into());
+    parts.push(families::messaging::ORG_SCOPE.into());
+    parts.push(families::relay::TENANT_PART.into());
+    parts.push(families::relay::ORG_SCOPE.into());
     // The organization column and triggers of the dispatch runs and their
     // receipts (no key rebuild: a run id is hub-generated, a receipt's key an
     // AUTOINCREMENT id), then the organization-led indexes and the rule that
