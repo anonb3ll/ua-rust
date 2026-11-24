@@ -549,7 +549,13 @@ from its commit history.
   names it. The writers keep the organization prefix in the key text, byte
   for byte as before, as defence in depth and so a retry in flight across
   the upgrade still replays. `lifecycle_record`'s keys, which carried no
-  organization, are now the caller's organization's.
+  organization, are now the caller's organization's. The one exception to
+  the replay: a pre-upgrade `lifecycle_record` key of another organization
+  carried no prefix, so it lands in `default`; that organization's retry
+  across the upgrade records a second capture, and a default caller who
+  sends the same session, kind and key gets the old receipt (its event id
+  and the caller-supplied values), as anyone on the hub could before.
+  Stored keys are kept indefinitely; there is no retention sweep yet.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the

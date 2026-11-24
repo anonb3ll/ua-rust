@@ -87,7 +87,7 @@ pub const TENANT_PART: Procedure = ua_store::org::tenant_part("organization.v1.t
 /// `orgs` holds, or more than one, and pre-scoping raw `memory_save` keys
 /// that happened to start with `org:`. No writer builds such a key in the
 /// default organization, so none of them replays to anyone; they are kept,
-/// not dropped, and age out with the table.
+/// not dropped, and kept indefinitely (no sweep deletes stored keys).
 pub(crate) fn unplaced_rows(c: &Connection) -> rusqlite::Result<i64> {
     c.query_row(
         "SELECT COUNT(*) FROM idempotency_keys WHERE org_id = 'default' AND substr(key, 1, 4) = 'org:'",

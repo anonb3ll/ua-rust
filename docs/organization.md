@@ -1078,11 +1078,17 @@ here for memory columns, owners and defaults.
   when both the column and the key text name the caller's organization; the
   column alone separates two organizations whose prefixes spell the same
   text. `lifecycle_record`'s key carried no organization and is now the
-  caller's organization's. **Principals.** The `principal` column the
+  caller's organization's; its pre-upgrade rows, prefixless in every
+  organization, land in `default` (see CHANGELOG for the retry exception).
+  No sweep deletes stored keys: the table, and the doctor's unplaced count,
+  only grow. **Principals.** The `principal` column the
   earlier plan named is not added: the principal is already in the key text
   of every per-caller writer (`task_update` and `delegate` the escaped
   label, `memory_save` and `message_send` the escaped label or sender,
-  `lifecycle_record` the session). `task_add` keys stay organization-wide,
+  `lifecycle_record` the session id, which the caller supplies and which is
+  not checked against the caller, so two agents of one organization that
+  send the same session, kind and key share one receipt, as before).
+  `task_add` keys stay organization-wide,
   as before, so two callers in one organization sharing a `task_add` key
   share its receipt, and the conversation handoff's key is derived from
   its actor. `crates/ua-tools/tests/idempotency_tenant.rs` holds the
