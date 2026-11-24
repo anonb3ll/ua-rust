@@ -56,7 +56,7 @@ use serde_json::{Map, Value, json};
 use ua_core::time::parse_ts;
 use ua_core::{ActorKind, Caller, UaError, UaResult};
 use ua_org::authz::{Authority, Authz};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{SchemaPart, WriteTx};
 
 use super::agents::{STATUS_THRESHOLDS, validate_label, verified};
 use crate::registry::{Registry, ToolCtx, tool};
@@ -134,8 +134,9 @@ const HUB_FEATURES: [&str; 4] = [
     super::wake::LIVE_SESSIONS_FEATURE,
 ];
 
-/// Lists the ids of queued or claimed work items assigned to a node.
-pub(crate) type OpenWork = fn(&Connection, &str) -> UaResult<Vec<String>>;
+/// Lists the ids of queued or claimed work items assigned to a node of an
+/// organization (`(conn, org, node)`).
+pub(crate) type OpenWork = fn(&Connection, &str, &str) -> UaResult<Vec<String>>;
 
 /// Every source of node work that must be settled before a node is retired.
 /// Retiring is refused (conflict) while any of them reports an item, so no
@@ -780,9 +781,10 @@ fn moved_acceptance_facts(old: &Map<String, Value>, new: &Map<String, Value>) ->
         .collect()
 }
 
-fn read_nodes(c: &Connection, now: Timestamp) -> UaResult<Vec<Value>> {
-    let mut stmt = c.prepare("SELECT * FROM nodes ORDER BY node")?;
-    let rows = stmt.query_map([], |r| node_json(r, now))?;
+/// Every node of organization `org`.
+fn read_nodes(c: &Connection, org: &str, now: Timestamp) -> UaResult<Vec<Value>> {
+    let mut stmt = c.prepare("SELECT * FROM nodes WHERE org_id = ?1 ORDER BY node")?;
+    let rows = stmt.query_map([org], |r| node_json(r, now))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -795,17 +797,24 @@ pub(crate) struct FleetNode {
     pub last_heartbeat: Option<String>,
 }
 
-/// Every registered node: those in service, and the names of retired ones.
+/// Every node of one organization: those in service, and the names of
+/// retired ones; and how many nodes other organizations hold (a count only).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Fleet {
     pub active: Vec<FleetNode>,
     pub retired: Vec<String>,
+    pub other_org_nodes: i64,
 }
 
-pub(crate) fn fleet(c: &Connection, now: Timestamp) -> UaResult<Fleet> {
-    let mut stmt =
-        c.prepare("SELECT node, last_heartbeat, heartbeat_floor, retired_at FROM nodes ORDER BY node")?;
-    let rows = stmt.query_map([], |r| {
+/// The fleet as organization `org` sees it. The hub-wide operator views (the
+/// doctor's fleet row) pass the default organization: another
+/// organization's node names, hosts and liveness never appear there, only
+/// how many nodes the other organizations hold.
+pub(crate) fn fleet(c: &Connection, org: &str, now: Timestamp) -> UaResult<Fleet> {
+    let mut stmt = c.prepare(
+        "SELECT node, last_heartbeat, heartbeat_floor, retired_at FROM nodes WHERE org_id = ?1 ORDER BY node",
+    )?;
+    let rows = stmt.query_map([org], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -823,6 +832,8 @@ pub(crate) fn fleet(c: &Connection, now: Timestamp) -> UaResult<Fleet> {
             out.active.push(FleetNode { node, status, last_heartbeat: last });
         }
     }
+    out.other_org_nodes =
+        c.query_row("SELECT COUNT(*) FROM nodes WHERE org_id <> ?1", [org], |r| r.get(0))?;
     Ok(out)
 }
 
@@ -890,6 +901,9 @@ pub struct ReassignArgs {
 
 // --- tools ----------------------------------------------------------------------
 
+/// `agent, retired_at, version, facts_json, org_id` of a registered node.
+type RegisteredRow = (String, Option<String>, Option<String>, String, String);
+
 fn bounded_version(v: Option<String>) -> UaResult<Option<String>> {
     match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
@@ -907,22 +921,35 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
         None => (Map::new(), Vec::new()),
     };
     let cap = i64::from(ctx.hub.cfg().node_max_per_agent);
+    // The node belongs to the registering caller's organization, for good
+    // (`nodes_org_immutable`).
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let existing: Option<(String, Option<String>, Option<String>, String)> = tx
+            super::node_queue::require_org(tx, &org)?;
+            let existing: Option<RegisteredRow> = tx
                 .query_row(
-                    "SELECT agent, retired_at, version, facts_json FROM nodes WHERE node = ?1",
+                    "SELECT agent, retired_at, version, facts_json, org_id FROM nodes WHERE node = ?1",
                     [&name],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            if let Some((owner, retired_at, _, _)) = &existing {
+            if let Some((owner, retired_at, _, _, node_org)) = &existing {
+                // Node names are one hub namespace (like agent labels):
+                // another organization's node is refused as bound to a
+                // different agent, before its retirement is revealed.
+                if *node_org != org {
+                    return Err(UaError::denied(
+                        "node_owned_elsewhere",
+                        format!("node {name:?} is bound to a different agent"),
+                    ));
+                }
                 check_owner(owner, retired_at.is_some(), &name, &agent)?;
             } else {
                 let held: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM nodes WHERE agent = ?1 AND retired_at IS NULL",
-                    [&agent],
+                    "SELECT COUNT(*) FROM nodes WHERE agent = ?1 AND org_id = ?2 AND retired_at IS NULL",
+                    params![agent, org],
                     |r| r.get(0),
                 )?;
                 if held >= cap {
@@ -940,30 +967,33 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
             let new_identity = identity_facts(version.as_deref(), &facts);
             let changed: Vec<String> = match &existing {
                 None => new_identity.keys().cloned().collect(),
-                Some((_, _, old_version, old_facts)) => {
+                Some((_, _, old_version, old_facts, _)) => {
                     let old = identity_facts(old_version.as_deref(), &load_facts(old_facts));
                     new_identity.iter().filter(|(k, v)| old.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect()
                 }
             };
             // A device acceptance vouched for the code and harnesses the node
             // had: a registration that changes them ends it.
-            if let Some((_, _, _, old_facts)) = &existing {
+            if let Some((_, _, _, old_facts, _)) = &existing {
                 let moved = moved_acceptance_facts(&load_facts(old_facts), &facts);
                 if !moved.is_empty() {
                     let why = format!("node_changed ({})", moved.join(", "));
-                    super::node_queue::acceptance::void_tx(tx, &name, &why, false)?;
+                    super::node_queue::acceptance::void_tx(tx, &org, &name, &why, false)?;
                 }
             }
             let now = ua_core::time::now();
             let facts_json = Value::Object(facts.clone()).to_string();
             // A registration is a fresh beat, so the fence set by retire or
             // un-retire is no longer needed.
+            // The conflict branch is reached only for the caller's own
+            // organization's row (checked above); it never changes `org_id`.
             tx.execute(
-                "INSERT INTO nodes (node, agent, facts_json, version, registered_at, last_heartbeat, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5) \
+                "INSERT INTO nodes (node, agent, facts_json, version, registered_at, last_heartbeat, updated_at, \
+                 org_id) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5, ?6) \
                  ON CONFLICT(node) DO UPDATE SET facts_json = excluded.facts_json, version = excluded.version, \
-                 last_heartbeat = excluded.last_heartbeat, heartbeat_floor = NULL, updated_at = excluded.updated_at",
-                params![name, agent, facts_json, version, now],
+                 last_heartbeat = excluded.last_heartbeat, heartbeat_floor = NULL, updated_at = excluded.updated_at \
+                 WHERE nodes.org_id = excluded.org_id",
+                params![name, agent, facts_json, version, now, org],
             )?;
             let first = existing.is_none();
             // An identical re-registration (a node restarting) is not news.
@@ -984,7 +1014,7 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
                         _ => v.clone(),
                     };
                 }
-                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.node.register", payload).by(agent.clone()))?;
+                super::node_queue::emit(tx, &org, "agent.node.register", payload, &agent, None)?;
             }
             Ok(json!({
                 "node": name,
@@ -1012,13 +1042,19 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
         Some(_) => return Err(UaError::invalid("running must be an item id or null")),
     };
     let progress = a.progress.as_ref().and_then(Value::as_str).map(str::to_string);
+    // The node token's organization: another organization's node answers as
+    // unregistered.
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            super::node_queue::require_org(tx, &org)?;
             let row: Option<(String, Option<String>, String)> = tx
-                .query_row("SELECT agent, retired_at, facts_json FROM nodes WHERE node = ?1", [&name], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
+                .query_row(
+                    "SELECT agent, retired_at, facts_json FROM nodes WHERE node = ?1 AND org_id = ?2",
+                    params![name, org],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
                 .optional()?;
             let Some((owner, retired_at, stored)) = row else {
                 return Err(UaError::not_found(format!("node {name:?} is not registered")));
@@ -1033,20 +1069,26 @@ async fn node_heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
                 let moved = moved_acceptance_facts(&old, &facts);
                 if !moved.is_empty() {
                     let why = format!("node_changed ({})", moved.join(", "));
-                    super::node_queue::acceptance::void_tx(tx, &name, &why, false)?;
+                    super::node_queue::acceptance::void_tx(tx, &org, &name, &why, false)?;
                 }
                 tx.execute(
-                    "UPDATE nodes SET facts_json = ?2 WHERE node = ?1",
-                    params![name, Value::Object(facts).to_string()],
+                    "UPDATE nodes SET facts_json = ?2 WHERE node = ?1 AND org_id = ?3",
+                    params![name, Value::Object(facts).to_string(), org],
                 )?;
             }
             // Liveness itself is not ledgered.
             tx.execute(
-                "UPDATE nodes SET last_heartbeat = ?2, updated_at = ?2 WHERE node = ?1",
-                params![name, now],
+                "UPDATE nodes SET last_heartbeat = ?2, updated_at = ?2 WHERE node = ?1 AND org_id = ?3",
+                params![name, now, org],
             )?;
-            let cancel =
-                super::node_queue::on_heartbeat(tx, &name, &agent, running.as_deref(), progress.as_deref())?;
+            let cancel = super::node_queue::on_heartbeat(
+                tx,
+                &org,
+                &name,
+                &agent,
+                running.as_deref(),
+                progress.as_deref(),
+            )?;
             Ok(json!({ "node": name, "as_of": now, "cancel": cancel, "dropped_fact_keys": dropped }))
         })
         .await
@@ -1058,12 +1100,14 @@ async fn node_list(ctx: ToolCtx, _a: NodeListArgs) -> UaResult<Value> {
     let viewer = verified(&ctx.caller).map(str::to_string);
     let operator =
         Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::LifecycleOperator], ua_core::DEFAULT_ORG);
+    // Only the caller's organization's nodes, whoever asks.
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let now = Timestamp::now();
             let (retired, nodes): (Vec<Value>, Vec<Value>) =
-                read_nodes(c, now)?.into_iter().partition(|n| n["status"] == "retired");
+                read_nodes(c, &org, now)?.into_iter().partition(|n| n["status"] == "retired");
             let nodes: Vec<Value> = nodes
                 .into_iter()
                 .map(|n| {
@@ -1134,10 +1178,10 @@ fn retire_reason(raw: Option<&str>) -> UaResult<String> {
 /// A conflict while any [`RETIRE_BLOCKERS`] probe reports queued or claimed
 /// work for `name`, so no work is stranded by `doing` (retiring, reassigning
 /// or forgetting the node).
-fn refuse_open_work(tx: &mut WriteTx<'_>, name: &str, doing: &str) -> UaResult<()> {
+fn refuse_open_work(tx: &mut WriteTx<'_>, org: &str, name: &str, doing: &str) -> UaResult<()> {
     let mut open: Vec<String> = Vec::new();
     for probe in RETIRE_BLOCKERS {
-        open.extend(probe(tx, name)?);
+        open.extend(probe(tx, org, name)?);
     }
     if open.is_empty() {
         return Ok(());
@@ -1152,14 +1196,29 @@ fn refuse_open_work(tx: &mut WriteTx<'_>, name: &str, doing: &str) -> UaResult<(
 /// `agent, last_heartbeat, retired_at, retired_by, retired_reason`.
 type RetireRow = (String, Option<String>, Option<String>, Option<String>, Option<String>);
 
-fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire: bool) -> UaResult<Value> {
-    let row: Option<RetireRow> = tx
+/// The node `name` of organization `org` for an operator action; another
+/// organization's node answers as unregistered.
+fn retire_row(tx: &WriteTx<'_>, org: &str, name: &str) -> UaResult<Option<RetireRow>> {
+    Ok(tx
         .query_row(
-            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes WHERE node = ?1",
-            [name],
+            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes \
+             WHERE node = ?1 AND org_id = ?2",
+            params![name, org],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
-        .optional()?;
+        .optional()?)
+}
+
+fn set_retired(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    name: &str,
+    who: &str,
+    reason: &str,
+    retire: bool,
+) -> UaResult<Value> {
+    super::node_queue::require_org(tx, org)?;
+    let row = retire_row(tx, org, name)?;
     let Some((agent, last_heartbeat, retired_at, retired_by, retired_reason)) = row else {
         return Err(UaError::not_found(format!("node {name:?} is not registered")));
     };
@@ -1174,7 +1233,7 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
         }));
     }
     if retire {
-        refuse_open_work(tx, name, "retiring")?;
+        refuse_open_work(tx, org, name, "retiring")?;
     }
     let now = ua_core::time::now();
     // Either way the stored beat becomes the fence: it predates the refusal,
@@ -1182,36 +1241,35 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
     if retire {
         tx.execute(
             "UPDATE nodes SET retired_at = ?2, retired_by = ?3, retired_reason = ?4, \
-             heartbeat_floor = last_heartbeat, updated_at = ?2 WHERE node = ?1",
-            params![name, now, who, reason],
+             heartbeat_floor = last_heartbeat, updated_at = ?2 WHERE node = ?1 AND org_id = ?5",
+            params![name, now, who, reason, org],
         )?;
     } else {
         tx.execute(
             "UPDATE nodes SET retired_at = NULL, retired_by = NULL, retired_reason = NULL, \
-             heartbeat_floor = last_heartbeat, updated_at = ?2 WHERE node = ?1",
-            params![name, now],
+             heartbeat_floor = last_heartbeat, updated_at = ?2 WHERE node = ?1 AND org_id = ?3",
+            params![name, now, org],
         )?;
     }
     let kind = if retire { "retire" } else { "unretire" };
     if retire {
-        super::node_queue::acceptance::void_tx(tx, name, "node_retired", false)?;
+        super::node_queue::acceptance::void_tx(tx, org, name, "node_retired", false)?;
     }
-    let event = ledger::append(
+    let event = super::node_queue::emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            format!("agent.node.{kind}"),
-            json!({
-                "kind": kind,
-                "node": name,
-                "agent": agent,
-                "actor": who,
-                "reason": reason,
-                "last_heartbeat": last_heartbeat,
-                "at": now,
-            }),
-        )
-        .by(who.to_string()),
+        org,
+        &format!("agent.node.{kind}"),
+        json!({
+            "kind": kind,
+            "node": name,
+            "agent": agent,
+            "actor": who,
+            "reason": reason,
+            "last_heartbeat": last_heartbeat,
+            "at": now,
+        }),
+        who,
+        None,
     )?;
     Ok(json!({
         "node": name,
@@ -1220,7 +1278,7 @@ fn set_retired(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str, retire
         "retired_at": retire.then_some(&now),
         "retired_by": retire.then_some(who),
         "retired_reason": retire.then_some(reason),
-        "event_ulid": event.map(|e| e.ulid),
+        "event_ulid": event,
     }))
 }
 
@@ -1228,7 +1286,8 @@ async fn change_retirement(ctx: ToolCtx, a: RetireArgs, retire: bool) -> UaResul
     let who = lifecycle_operator(&ctx, if retire { "retire" } else { "un-retire" })?;
     let name = validate_node_name(&a.node)?;
     let reason = retire_reason(a.reason.as_deref())?;
-    ctx.hub.db().write_async(move |tx| set_retired(tx, &name, &who, &reason, retire)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| set_retired(tx, &org, &name, &who, &reason, retire)).await
 }
 
 /// `coordination_manage(action="node_retire")`.
@@ -1241,48 +1300,50 @@ pub(crate) async fn node_unretire(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value
     change_retirement(ctx, a, false).await
 }
 
-fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str) -> UaResult<Value> {
-    let row: Option<RetireRow> = tx
-        .query_row(
-            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes WHERE node = ?1",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()?;
+fn reassign(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    name: &str,
+    to: &str,
+    who: &str,
+    reason: &str,
+) -> UaResult<Value> {
+    super::node_queue::require_org(tx, org)?;
+    let row = retire_row(tx, org, name)?;
     let Some((from, last_heartbeat, retired_at, _, _)) = row else {
         return Err(UaError::not_found(format!("node {name:?} is not registered")));
     };
     if from == to {
         return Ok(json!({ "node": name, "agent": to, "changed": false }));
     }
-    refuse_open_work(tx, name, "reassigning")?;
+    refuse_open_work(tx, org, name, "reassigning")?;
     let now = ua_core::time::now();
     // The stored beat was the previous owner's: the new owner's node is not
-    // live until it registers or beats itself.
+    // live until it registers or beats itself. The node stays in its
+    // organization.
     tx.execute(
-        "UPDATE nodes SET agent = ?2, heartbeat_floor = last_heartbeat, updated_at = ?3 WHERE node = ?1",
-        params![name, to, now],
+        "UPDATE nodes SET agent = ?2, heartbeat_floor = last_heartbeat, updated_at = ?3 WHERE node = ?1 AND org_id = ?4",
+        params![name, to, now, org],
     )?;
-    super::node_queue::acceptance::void_tx(tx, name, "node_reassigned", false)?;
-    super::harness_config::close_for_node(tx, name, "node_reassigned", who)?;
-    let event = ledger::append(
+    super::node_queue::acceptance::void_tx(tx, org, name, "node_reassigned", false)?;
+    super::harness_config::close_for_node(tx, org, name, "node_reassigned", who)?;
+    let event = super::node_queue::emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            "agent.node.reassign",
-            json!({
-                "kind": "reassign",
-                "node": name,
-                "from_agent": from,
-                "to_agent": to,
-                "actor": who,
-                "reason": reason,
-                "retired": retired_at.is_some(),
-                "last_heartbeat": last_heartbeat,
-                "at": now,
-            }),
-        )
-        .by(who.to_string()),
+        org,
+        "agent.node.reassign",
+        json!({
+            "kind": "reassign",
+            "node": name,
+            "from_agent": from,
+            "to_agent": to,
+            "actor": who,
+            "reason": reason,
+            "retired": retired_at.is_some(),
+            "last_heartbeat": last_heartbeat,
+            "at": now,
+        }),
+        who,
+        None,
     )?;
     Ok(json!({
         "node": name,
@@ -1290,18 +1351,13 @@ fn reassign(tx: &mut WriteTx<'_>, name: &str, to: &str, who: &str, reason: &str)
         "previous_agent": from,
         "changed": true,
         "retired": retired_at.is_some(),
-        "event_ulid": event.map(|e| e.ulid),
+        "event_ulid": event,
     }))
 }
 
-fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult<Value> {
-    let row: Option<RetireRow> = tx
-        .query_row(
-            "SELECT agent, last_heartbeat, retired_at, retired_by, retired_reason FROM nodes WHERE node = ?1",
-            [name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .optional()?;
+fn forget(tx: &mut WriteTx<'_>, org: &str, name: &str, who: &str, reason: &str) -> UaResult<Value> {
+    super::node_queue::require_org(tx, org)?;
+    let row = retire_row(tx, org, name)?;
     let Some((agent, last_heartbeat, retired_at, retired_by, retired_reason)) = row else {
         return Err(UaError::not_found(format!("node {name:?} is not registered")));
     };
@@ -1310,32 +1366,31 @@ fn forget(tx: &mut WriteTx<'_>, name: &str, who: &str, reason: &str) -> UaResult
             "node {name:?} is in service; retire it (coordination_manage node_retire) before forgetting it"
         )));
     }
-    refuse_open_work(tx, name, "forgetting")?;
-    super::node_queue::acceptance::void_tx(tx, name, "node_forgotten", true)?;
-    super::harness_config::close_for_node(tx, name, "node_forgotten", who)?;
-    tx.execute("DELETE FROM nodes WHERE node = ?1", [name])?;
+    refuse_open_work(tx, org, name, "forgetting")?;
+    super::node_queue::acceptance::void_tx(tx, org, name, "node_forgotten", true)?;
+    super::harness_config::close_for_node(tx, org, name, "node_forgotten", who)?;
+    tx.execute("DELETE FROM nodes WHERE node = ?1 AND org_id = ?2", [name, org])?;
     let now = ua_core::time::now();
-    let event = ledger::append(
+    let event = super::node_queue::emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            "agent.node.forget",
-            json!({
-                "kind": "forget",
-                "node": name,
-                "agent": agent,
-                "actor": who,
-                "reason": reason,
-                "retired_at": retired_at,
-                "retired_by": retired_by,
-                "retired_reason": retired_reason,
-                "last_heartbeat": last_heartbeat,
-                "at": now,
-            }),
-        )
-        .by(who.to_string()),
+        org,
+        "agent.node.forget",
+        json!({
+            "kind": "forget",
+            "node": name,
+            "agent": agent,
+            "actor": who,
+            "reason": reason,
+            "retired_at": retired_at,
+            "retired_by": retired_by,
+            "retired_reason": retired_reason,
+            "last_heartbeat": last_heartbeat,
+            "at": now,
+        }),
+        who,
+        None,
     )?;
-    Ok(json!({ "node": name, "agent": agent, "forgotten": true, "event_ulid": event.map(|e| e.ulid) }))
+    Ok(json!({ "node": name, "agent": agent, "forgotten": true, "event_ulid": event }))
 }
 
 /// `coordination_manage(action="node_reassign")`: move a node name to
@@ -1345,7 +1400,8 @@ pub(crate) async fn node_reassign(ctx: ToolCtx, a: ReassignArgs) -> UaResult<Val
     let name = validate_node_name(&a.node)?;
     let to = validate_label(Some(&a.to_agent), "to_agent")?;
     let reason = retire_reason(a.reason.as_deref())?;
-    ctx.hub.db().write_async(move |tx| reassign(tx, &name, &to, &who, &reason)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| reassign(tx, &org, &name, &to, &who, &reason)).await
 }
 
 /// `coordination_manage(action="node_forget")`: delete a retired node's row
@@ -1354,7 +1410,8 @@ pub(crate) async fn node_forget(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value> 
     let who = lifecycle_operator(&ctx, "forget")?;
     let name = validate_node_name(&a.node)?;
     let reason = retire_reason(a.reason.as_deref())?;
-    ctx.hub.db().write_async(move |tx| forget(tx, &name, &who, &reason)).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| forget(tx, &org, &name, &who, &reason)).await
 }
 
 pub fn register(r: &mut Registry) {

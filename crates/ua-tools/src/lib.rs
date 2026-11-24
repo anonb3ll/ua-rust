@@ -172,6 +172,19 @@ pub fn schema_parts() -> Vec<Part> {
     // organization, the same-organization triggers and the org-led indexes.
     parts.push(families::memory::TENANT_PART.into());
     parts.push(families::memory::ORG_SCOPE.into());
+    // The organization column and triggers of the dispatch runs and their
+    // receipts (no key rebuild: a run id is hub-generated, a receipt's key an
+    // AUTOINCREMENT id), then the organization-led indexes and the rule that
+    // a run's task, and a receipt's run, is in its own organization. Then the
+    // node work queue's launch keys rebuilt per organization, the
+    // organization column and triggers of the node tables, and their
+    // organization-led indexes and same-organization reference triggers.
+    // Every existing row lands in the default organization.
+    parts.push(families::node_queue::DISPATCH_TENANT_PART.into());
+    parts.push(families::node_queue::DISPATCH_ORG_SCOPE.into());
+    parts.push(families::node_queue::TENANT_KEYS.into());
+    parts.push(families::node_queue::TENANT_PART.into());
+    parts.push(families::node_queue::ORG_SCOPE.into());
     parts
 }
 

@@ -648,9 +648,18 @@ async fn a_follow_up_checks_the_task_holder_in_the_task_s_organization() {
         "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
              VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '{ts}');
          INSERT INTO tasks (id, org_id, title, created_at, updated_at, claimed_by)
-             VALUES (7001, 'org-b', 'B task', '{ts}', '{ts}', 'osprey-holder');
-         UPDATE node_dispatch SET task_id = 7001 WHERE id = '{id}';"
+             VALUES (7001, 'org-b', 'B task', '{ts}', '{ts}', 'osprey-holder'),
+                    (7002, 'default', 'A task', '{ts}', '{ts}', 'other-holder');"
     ));
+    // An item's task is always in the item's organization: pointing it at
+    // another organization's task is refused (`node_dispatch_org_parent_update`).
+    let move_sql = format!("UPDATE node_dispatch SET task_id = 7001 WHERE id = '{id}'");
+    let moved = h.hub.db().write(move |tx| {
+        tx.execute_batch(&move_sql)?;
+        Ok(())
+    });
+    assert!(moved.unwrap_err().to_string().contains("another organization"));
+    h.sql(&format!("UPDATE node_dispatch SET task_id = 7002 WHERE id = '{id}'"));
     let ask =
         json!({ "item_id": id, "mode": "queue", "body": "keep going", "idempotency_key": "queue-org-1" });
     let e = h.err(&lead(), "node_followup", ask).await;

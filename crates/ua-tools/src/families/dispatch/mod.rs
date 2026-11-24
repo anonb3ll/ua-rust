@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_org::authz::{Authority, Authz};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{SchemaPart, WriteTx};
 
 pub use reaper::{reap_expired_leases, spawn_reaper, startup_sweep};
 pub(crate) use tools::cancel_run;
@@ -162,6 +162,8 @@ pub fn register(r: &mut Registry) {
 #[derive(Debug, Clone)]
 pub(crate) struct Run {
     pub run_id: String,
+    /// The run's organization: its task's, the dispatcher's.
+    pub org_id: String,
     pub task_id: i64,
     pub agent_label: String,
     pub harness: Option<String>,
@@ -183,7 +185,7 @@ pub(crate) struct Run {
 
 const RUN_COLUMNS: &str = "run_id, task_id, agent_label, harness, state, fence, attempt, termination_outcome, \
                            pid, evidence_ref, failure_reason, lease_expires_at, workdir, prompt, pgid, \
-                           pid_start_time, supervisor_pid, supervisor_start_time";
+                           pid_start_time, supervisor_pid, supervisor_start_time, org_id";
 
 fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -205,36 +207,43 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         pid_start_time: r.get(15)?,
         supervisor_pid: r.get(16)?,
         supervisor_start_time: r.get(17)?,
+        org_id: r.get(18)?,
     })
 }
 
-pub(crate) fn load_run(conn: &Connection, run_id: &str) -> UaResult<Option<Run>> {
+/// The run `run_id` of organization `org`. Another organization's run
+/// answers exactly like a missing one.
+pub(crate) fn load_run(conn: &Connection, org: &str, run_id: &str) -> UaResult<Option<Run>> {
     Ok(conn
         .query_row(
-            &format!("SELECT {RUN_COLUMNS} FROM dispatch_runs WHERE run_id = ?1"),
-            [run_id],
+            &format!("SELECT {RUN_COLUMNS} FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2"),
+            params![run_id, org],
             run_from_row,
         )
         .optional()?)
 }
 
+/// Runs matching `filter` in every organization: hub jobs only (the reaper,
+/// the startup sweep), which act on each run in its own organization.
 pub(crate) fn runs_where(conn: &Connection, filter: &str) -> UaResult<Vec<Run>> {
     let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM dispatch_runs WHERE {filter}"))?;
     let rows = stmt.query_map([], run_from_row)?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
-/// The run row as a JSON object, without the prompt text.
-pub(crate) fn run_object(conn: &Connection, run_id: &str) -> UaResult<Option<Map<String, Value>>> {
+/// The run row of organization `org` as a JSON object, without the prompt
+/// text or the organization.
+pub(crate) fn run_object(conn: &Connection, org: &str, run_id: &str) -> UaResult<Option<Map<String, Value>>> {
     let row = conn
         .query_row(
-            "SELECT * FROM dispatch_runs WHERE run_id = ?1",
-            [run_id],
+            "SELECT * FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2",
+            params![run_id, org],
             crate::families::tasks::row_object,
         )
         .optional()?;
     Ok(row.map(|mut m| {
         m.remove("prompt");
+        m.remove("org_id");
         if let Some(Value::String(u)) = m.get("usage").cloned() {
             m.insert("usage".into(), serde_json::from_str(&u).unwrap_or(Value::String(u)));
         }
@@ -242,14 +251,16 @@ pub(crate) fn run_object(conn: &Connection, run_id: &str) -> UaResult<Option<Map
     }))
 }
 
-/// The run that holds `task_id`'s live slot, if any.
-pub(crate) fn live_run_for_task(conn: &Connection, task_id: i64) -> UaResult<Option<String>> {
+/// The run that holds `task_id`'s live slot, if any. `org` is the task's
+/// organization (a task's runs are all its own, `dispatch_runs_org_parent`).
+pub(crate) fn live_run_for_task(conn: &Connection, org: &str, task_id: i64) -> UaResult<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT run_id FROM dispatch_runs WHERE task_id = ?1 AND (state IN ('claimed','launched','running') \
+            "SELECT run_id FROM dispatch_runs WHERE org_id = ?2 AND task_id = ?1 \
+             AND (state IN ('claimed','launched','running') \
              OR (state = 'cancelled' AND (termination_outcome IS NULL OR termination_outcome != 'confirmed'))) \
              ORDER BY created_at DESC LIMIT 1",
-            [task_id],
+            params![task_id, org],
             |r| r.get(0),
         )
         .optional()?)
@@ -347,9 +358,12 @@ pub(crate) fn transition(tx: &WriteTx<'_>, run: &Run, edge: Edge) -> UaResult<Re
         sets.push(format!("{col} = ?"));
         values.push(v);
     }
-    let mut sql =
-        format!("UPDATE dispatch_runs SET {} WHERE run_id = ? AND state = ? AND fence = ?", sets.join(", "));
+    let mut sql = format!(
+        "UPDATE dispatch_runs SET {} WHERE run_id = ? AND org_id = ? AND state = ? AND fence = ?",
+        sets.join(", ")
+    );
     values.push(run.run_id.clone().into());
+    values.push(run.org_id.clone().into());
     values.push(run.state.clone().into());
     values.push(run.fence.into());
     match &run.termination_outcome {
@@ -365,14 +379,20 @@ pub(crate) fn transition(tx: &WriteTx<'_>, run: &Run, edge: Edge) -> UaResult<Re
 
 /// Append an `agent.dispatch.transition` event for the run as it now is.
 /// `label` is the state shown in the event (`resumed`, `cancel_requested`, ...).
+///
+/// `org` is the run's organization. Another organization's event keeps only
+/// ids, states, fences and counts, under the `system` originator
+/// (`node_queue::emit`): no agent, harness, actor, failure reason or
+/// evidence reference (which can name a node).
 pub(crate) fn record_transition(
     tx: &mut WriteTx<'_>,
+    org: &str,
     run_id: &str,
     label: &str,
     actor: &str,
     extra: Value,
 ) -> UaResult<Option<String>> {
-    let Some(run) = load_run(tx, run_id)? else { return Ok(None) };
+    let Some(run) = load_run(tx, org, run_id)? else { return Ok(None) };
     let mut payload = json!({
         "actor": actor,
         "run_id": run.run_id,
@@ -392,27 +412,27 @@ pub(crate) fn record_transition(
     if let (Some(o), Value::Object(e)) = (payload.as_object_mut(), extra) {
         o.extend(e);
     }
-    let ev = ledger::append(
-        tx,
-        EventInput::new(ua_core::DEFAULT_ORG, CHANNEL_TRANSITION, payload).by(actor.to_string()),
-    )?;
-    Ok(ev.map(|e| e.ulid))
+    super::node_queue::emit(tx, org, CHANNEL_TRANSITION, payload, actor, None)
 }
 
 /// Store a receipt for the run's current (just written) outcome.
+///
+/// `org` is the run's organization, and the receipt's.
 pub(crate) fn insert_receipt(
     tx: &WriteTx<'_>,
+    org: &str,
     run_id: &str,
     source: &str,
     reported_by: &str,
     event_ulid: Option<&str>,
 ) -> UaResult<()> {
     // The hash covers the receipt's own fields (sorted keys), so a stored
-    // receipt can be re-checked against the row and its ledger event.
+    // receipt can be re-checked against the row and its ledger event. The
+    // organization is not one of them, so the hash form is unchanged.
     let mut body = tx.query_row(
         "SELECT run_id, fence, task_id, agent_label, state, evidence_ref, failure_reason, exit_code, \
-         termination_outcome FROM dispatch_runs WHERE run_id = ?1",
-        [run_id],
+         termination_outcome FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2",
+        params![run_id, org],
         crate::families::tasks::row_object,
     )?;
     let created_at = now();
@@ -422,11 +442,11 @@ pub(crate) fn insert_receipt(
     body.insert("created_at".into(), json!(created_at));
     let hash = hex::encode(Sha256::digest(ua_core::canonical::to_string(&Value::Object(body)).as_bytes()));
     tx.execute(
-        "INSERT INTO dispatch_receipts (run_id, fence, task_id, agent_label, state, source, reported_by, \
+        "INSERT INTO dispatch_receipts (org_id, run_id, fence, task_id, agent_label, state, source, reported_by, \
          evidence_ref, failure_reason, exit_code, termination_outcome, event_ulid, receipt_hash, created_at) \
-         SELECT run_id, fence, task_id, agent_label, state, ?2, ?3, evidence_ref, failure_reason, exit_code, \
-         termination_outcome, ?4, ?5, ?6 FROM dispatch_runs WHERE run_id = ?1",
-        params![run_id, source, reported_by, event_ulid, hash, created_at],
+         SELECT org_id, run_id, fence, task_id, agent_label, state, ?2, ?3, evidence_ref, failure_reason, exit_code, \
+         termination_outcome, ?4, ?5, ?6 FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?7",
+        params![run_id, source, reported_by, event_ulid, hash, created_at, org],
     )?;
     Ok(())
 }
@@ -434,10 +454,10 @@ pub(crate) fn insert_receipt(
 /// Task bookkeeping after a run outcome: release the task's run pointer and,
 /// on `finished`, close the task with the evidence.
 ///
-/// A runner path (self-report, supervisor, reaper): it acts in the task
-/// row's own organization.
+/// A runner path (self-report, supervisor, reaper): it acts in the run's
+/// organization, which is its task's (`dispatch_runs_org_parent`).
 fn settle_task(tx: &WriteTx<'_>, run: &Run, state: &str, evidence: Option<&str>) -> UaResult<()> {
-    let Some(org) = crate::families::tasks::task_org(tx, run.task_id)? else { return Ok(()) };
+    let org = run.org_id.as_str();
     let revision = crate::families::tasks::next_revision(None);
     tx.execute(
         "UPDATE tasks SET current_run_id = NULL, current_run_agent = NULL \
@@ -474,6 +494,9 @@ pub(crate) struct ExitInfo {
 
 /// One outcome report (self-report, supervisor, reaper).
 pub(crate) struct Outcome<'a> {
+    /// The run's organization: the reporter's, or for a hub path the run
+    /// row's.
+    pub org: &'a str,
     pub run_id: &'a str,
     /// The reporter's fence; `None` accepts the run's current fence.
     pub fence: Option<i64>,
@@ -494,7 +517,7 @@ pub(crate) struct Outcome<'a> {
 /// `already_terminal`, `cancellation_in_progress`, `superseded_run`,
 /// `invalid_transition` or `state_race`.
 pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<Value> {
-    let Some(run) = load_run(tx, o.run_id)? else {
+    let Some(run) = load_run(tx, o.org, o.run_id)? else {
         return Ok(refusal("unknown_run", o.run_id, json!({ "state": o.state })));
     };
     if let Some(f) = o.fence
@@ -512,7 +535,7 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
             json!({ "state": run.state, "termination_outcome": run.termination_outcome }),
         ));
     }
-    if let Some(live) = live_run_for_task(tx, run.task_id)?
+    if let Some(live) = live_run_for_task(tx, o.org, run.task_id)?
         && live != run.run_id
     {
         return Ok(refusal("superseded_run", o.run_id, json!({ "state": run.state, "live_run_id": live })));
@@ -541,11 +564,12 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
     if let Err(reason) = transition(tx, &run, edge)? {
         return Ok(refusal(reason, o.run_id, json!({ "state": run.state })));
     }
-    let ulid = record_transition(tx, o.run_id, o.state, o.actor, json!({ "source": o.source }))?;
-    insert_receipt(tx, o.run_id, o.source, o.actor, ulid.as_deref())?;
+    let ulid = record_transition(tx, o.org, o.run_id, o.state, o.actor, json!({ "source": o.source }))?;
+    insert_receipt(tx, o.org, o.run_id, o.source, o.actor, ulid.as_deref())?;
     settle_task(tx, &run, o.state, o.evidence.as_deref())?;
     super::provider_accounts::observe_outcome(
         tx,
+        o.org,
         o.run_id,
         o.state,
         class.as_deref(),
@@ -565,11 +589,17 @@ pub(crate) fn record_outcome(tx: &mut WriteTx<'_>, o: Outcome<'_>) -> UaResult<V
 
 /// Write a child's exit information. Not a state change: it lands whatever
 /// state the run reached, as long as the fence still matches.
-pub(crate) fn record_exit(tx: &WriteTx<'_>, run_id: &str, fence: i64, exit: &ExitInfo) -> UaResult<()> {
+pub(crate) fn record_exit(
+    tx: &WriteTx<'_>,
+    org: &str,
+    run_id: &str,
+    fence: i64,
+    exit: &ExitInfo,
+) -> UaResult<()> {
     tx.execute(
         "UPDATE dispatch_runs SET exit_code = ?3, exit_signal = ?4, timed_out = ?5, output_bytes = ?6, \
          output_truncated = ?7, ended_at = COALESCE(ended_at, ?8), updated_at = ?8 \
-         WHERE run_id = ?1 AND fence = ?2",
+         WHERE run_id = ?1 AND fence = ?2 AND org_id = ?9",
         params![
             run_id,
             fence,
@@ -578,7 +608,8 @@ pub(crate) fn record_exit(tx: &WriteTx<'_>, run_id: &str, fence: i64, exit: &Exi
             exit.timed_out,
             exit.output_bytes,
             exit.output_truncated,
-            now()
+            now(),
+            org
         ],
     )?;
     Ok(())
@@ -587,8 +618,10 @@ pub(crate) fn record_exit(tx: &WriteTx<'_>, run_id: &str, fence: i64, exit: &Exi
 /// Commit a cancellation outcome. `cessation` is `confirmed` or `unknown`;
 /// `termination` is the raw result of the stop attempt. A run already
 /// cancelled with confirmed cessation is reported as `already_finalized`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_cancellation(
     tx: &mut WriteTx<'_>,
+    org: &str,
     run_id: &str,
     actor: &str,
     source: &str,
@@ -596,7 +629,7 @@ pub(crate) fn finalize_cancellation(
     termination: &str,
     cessation: &'static str,
 ) -> UaResult<Value> {
-    let Some(run) = load_run(tx, run_id)? else { return Ok(refusal("unknown_run", run_id, json!({}))) };
+    let Some(run) = load_run(tx, org, run_id)? else { return Ok(refusal("unknown_run", run_id, json!({}))) };
     if run.state == "cancelled" && run.termination_outcome.as_deref() == Some("confirmed") {
         return Ok(json!({
             "ok": true, "run_id": run_id, "state": "cancelled", "termination": termination,
@@ -616,12 +649,13 @@ pub(crate) fn finalize_cancellation(
     }
     let ulid = record_transition(
         tx,
+        org,
         run_id,
         "cancelled",
         actor,
         json!({ "termination": termination, "source": source }),
     )?;
-    insert_receipt(tx, run_id, source, actor, ulid.as_deref())?;
+    insert_receipt(tx, org, run_id, source, actor, ulid.as_deref())?;
     settle_task(tx, &run, "cancelled", None)?;
     Ok(json!({
         "ok": true, "run_id": run_id, "state": "cancelled", "termination": termination, "cessation": cessation,

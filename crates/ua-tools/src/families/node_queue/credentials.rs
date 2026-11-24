@@ -50,7 +50,9 @@ use ua_core::time::{format_ts, parse_ts};
 use ua_core::{Profile, UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
-use super::{LEASE_GRACE_S, check_item_id, device_agent, load_item, load_node, owned_node, run_gate};
+use super::{
+    LEASE_GRACE_S, check_item_id, device_agent, load_item, load_node, owned_node, require_org, run_gate,
+};
 use crate::families::{governance, nodes};
 use crate::grant::SessionGrant;
 use crate::hub::Hub;
@@ -181,13 +183,19 @@ fn revoke_where(
     Ok(ids)
 }
 
-/// Revoke the credentials of item `item_id` (receipt, cancel, lease expiry).
+/// Revoke the credentials of item `item_id` of organization `org` (receipt,
+/// cancel, lease expiry). Only the default organization's items hold
+/// credentials ([`mint_tx`]), so another organization's item has none.
 pub(crate) fn revoke_for_item(
     tx: &mut WriteTx<'_>,
+    org: &str,
     item_id: &str,
     reason: &str,
     actor: &str,
 ) -> UaResult<Vec<String>> {
+    if org != ua_core::DEFAULT_ORG {
+        return Ok(Vec::new());
+    }
     revoke_where(tx, "item_id = ?1", &[&item_id], reason, Some(actor))
 }
 
@@ -311,16 +319,33 @@ fn conflict(code: &str, msg: impl Into<String>) -> UaError {
     UaError::conflict_code(code, msg)
 }
 
+/// Mint a credential for the node token of organization `org`.
+///
+/// A session credential authenticates as its subject in the default
+/// organization (`session_credentials` carries no `org_id` yet, and the
+/// HTTP adapter's credential caller is a default-organization caller), so
+/// one is minted only for the default organization's items: another
+/// organization's node is refused (`org_unsupported`) before anything is
+/// read, rather than handed a credential that would act in the wrong
+/// organization.
 fn mint_tx(
     tx: &mut WriteTx<'_>,
     hub: &Hub,
+    org: &str,
     agent: &str,
     node: &str,
     item_id: &str,
     attempt: i64,
 ) -> UaResult<Value> {
+    require_org(tx, org)?;
+    if org != ua_core::DEFAULT_ORG {
+        return Err(refuse(
+            "org_unsupported",
+            "session credentials are issued only in the default organization until they carry one",
+        ));
+    }
     // Ownership: another label's node, or a retired node, is a binding failure.
-    let row = owned_node(tx, node, agent).map_err(|e| match e {
+    let row = owned_node(tx, org, node, agent).map_err(|e| match e {
         UaError::NotFound(m) => conflict("node_binding", m),
         UaError::Denied { reason, .. } => refuse("node_binding", reason),
         other => other,
@@ -329,7 +354,7 @@ fn mint_tx(
     if !row.has_feature(FEATURE) {
         return Err(conflict("node_feature_missing", format!("node {node:?} did not advertise {FEATURE}")));
     }
-    let Some(item) = load_item(tx, item_id)?.filter(|i| i.node == node) else {
+    let Some(item) = load_item(tx, org, item_id)?.filter(|i| i.node == node) else {
         return Err(conflict("item_not_found", format!("item {item_id} is not queued for node {node:?}")));
     };
     if !item.is_acp() {
@@ -381,10 +406,9 @@ fn mint_tx(
     if hub.cfg().is_human(&subject) {
         return Err(refuse("human_subject", "a session credential is never minted for a human identity"));
     }
-    // A runner path: the item's task is read in the task row's own
-    // organization (the enqueuer's, `insert_item`).
+    // The item's task is the item's organization's (`insert_item`, and the
+    // `node_dispatch_org_parent` trigger).
     if let Some(task_id) = item.task_id {
-        let org = crate::families::tasks::task_org(tx, task_id)?.unwrap_or_default();
         let status: Option<String> = tx
             .query_row(
                 "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
@@ -484,7 +508,9 @@ async fn node_session_credential(ctx: ToolCtx, a: MintArgs) -> UaResult<Value> {
     };
     let hub = ctx.hub.clone();
     let subject = format!("item:{item_id}");
-    let out = ctx.hub.db().write_async(move |tx| mint_tx(tx, &hub, &agent, &node, &item_id, attempt)).await;
+    let org = ctx.caller.org_id.clone();
+    let out =
+        ctx.hub.db().write_async(move |tx| mint_tx(tx, &hub, &org, &agent, &node, &item_id, attempt)).await;
     if let Err(e) = &out
         && let Some(code) = e.reason_code()
     {
@@ -573,7 +599,9 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     if parse_ts(&idle).is_none_or(|i| now >= i) {
         return Ok(Decision::Lapse("idle_expired", id));
     }
-    let item = load_item(c, &item_id)?;
+    // Only the default organization's items hold credentials (`mint_tx`).
+    let org = ua_core::DEFAULT_ORG;
+    let item = load_item(c, org, &item_id)?;
     let Some(item) = item.filter(|i| i.status == "claimed" && i.node == node && i.attempts == attempt) else {
         return Ok(Decision::Refuse("item_not_live", Some(id)));
     };
@@ -582,7 +610,6 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     }
     // The bound task, read live: closed by any path, it ends access.
     if let Some(t) = task_id {
-        let org = crate::families::tasks::task_org(c, t)?.unwrap_or_default();
         let status: Option<String> = c
             .query_row(
                 "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
@@ -596,7 +623,7 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
             _ => {}
         }
     }
-    let node_row = load_node(c, &node)?;
+    let node_row = load_node(c, org, &node)?;
     if node_row.as_ref().is_none_or(|n| n.agent != agent || n.retired || !n.liveness().live) {
         return Ok(Decision::Refuse("node_stale", Some(id)));
     }

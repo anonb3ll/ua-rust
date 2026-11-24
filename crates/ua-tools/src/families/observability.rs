@@ -996,7 +996,7 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
         last_delivery,
         quick_check,
-        fleet: nodes::fleet(c, Timestamp::now()).map_err(|e| e.to_string()),
+        fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
     })
 }
 
@@ -1702,6 +1702,11 @@ fn fleet_nodes_check(facts: &DbFacts) -> Value {
         .collect();
     if !fleet.retired.is_empty() {
         row["retired"] = json!(fleet.retired);
+    }
+    // A hub-wide view lists only the default organization's nodes; the
+    // other organizations' are a count, never names or hosts.
+    if fleet.other_org_nodes > 0 {
+        row["other_org_nodes"] = json!(fleet.other_org_nodes);
     }
     row
 }

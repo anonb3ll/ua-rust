@@ -15,6 +15,7 @@ use super::{
     run_object, states, transition,
 };
 use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
+use crate::families::node_queue::require_org;
 use crate::families::tasks::{check_slug, next_revision, require_task, row_object, str_field, ts_le};
 use crate::families::{governance, node_queue, provider_accounts};
 use crate::hub::Hub;
@@ -242,11 +243,13 @@ fn trimmed(field: &str, v: &str) -> UaResult<String> {
     Ok(t.to_string())
 }
 
+/// The caller's organization's run `run_id`; another organization's answers
+/// exactly like an unknown one.
 async fn require_run(ctx: &ToolCtx, run_id: &str) -> UaResult<super::Run> {
-    let rid = run_id.to_string();
+    let (rid, org) = (run_id.to_string(), ctx.caller.org_id.clone());
     ctx.hub
         .db()
-        .read_async(move |c| load_run(c, &rid))
+        .read_async(move |c| load_run(c, &org, &rid))
         .await?
         .ok_or_else(|| UaError::not_found(format!("unknown dispatch run: {run_id}")))
 }
@@ -301,7 +304,7 @@ fn check_task_free(
     {
         return Err(UaError::conflict(format!("task_claimed: task {task_id} is claimed by {holder:?}")));
     }
-    if let Some(live) = live_run_for_task(conn, task_id)?
+    if let Some(live) = live_run_for_task(conn, org, task_id)?
         && Some(live.as_str()) != run_id
     {
         return Err(UaError::conflict(format!("already_claimed: run {live} holds task {task_id}")));
@@ -438,7 +441,7 @@ const STALE_PASS_SCAN: i64 = 50;
 /// the call that consumes it: derived from a random per-database salt, the
 /// task, how many runs it has had, and the agent. Another run of the task in
 /// between changes it, which the approval binding then reports.
-fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResult<String> {
+fn derive_run_id(tx: &rusqlite::Connection, org: &str, task_id: i64, agent: &str) -> UaResult<String> {
     let salt: Option<String> = tx
         .query_row("SELECT value FROM dispatch_meta WHERE key = 'run_id_salt'", [], |r| r.get(0))
         .optional()?;
@@ -450,8 +453,12 @@ fn derive_run_id(tx: &rusqlite::Connection, task_id: i64, agent: &str) -> UaResu
             s
         }
     };
-    let prior: i64 =
-        tx.query_row("SELECT COUNT(*) FROM dispatch_runs WHERE task_id = ?1", [task_id], |r| r.get(0))?;
+    // A task's runs are all its own organization's (`dispatch_runs_org_parent`).
+    let prior: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM dispatch_runs WHERE org_id = ?2 AND task_id = ?1",
+        params![task_id, org],
+        |r| r.get(0),
+    )?;
     let h = sha256_hex(&format!("{salt}:{task_id}:{prior}:{agent}"));
     Ok(format!("run-{task_id}-{}", &h[..8]))
 }
@@ -533,20 +540,22 @@ enum Gated {
     },
 }
 
-/// The node a run is routed to: registered, in service, owned by the run's
-/// agent and advertising the backend; the backend, and the working
-/// directory on the node (the task's worktree when it lies under one of the
-/// node's roots, else the node's first existing root).
+/// The node a run is routed to: registered in the dispatcher's organization
+/// `org` (another organization's node answers as unregistered), in service,
+/// owned by the run's agent and advertising the backend; the backend, and
+/// the working directory on the node (the task's worktree when it lies
+/// under one of the node's roots, else the node's first existing root).
 fn node_route(
     tx: &rusqlite::Connection,
     cfg: &ua_core::Config,
+    org: &str,
     node: &str,
     agent: &str,
     backend: Option<&str>,
     task: &Map<String, Value>,
 ) -> UaResult<(node_queue::NodeRow, String, String)> {
     let name = super::super::nodes::validate_node_name(node)?;
-    let Some(row) = node_queue::load_node(tx, &name)? else {
+    let Some(row) = node_queue::load_node(tx, org, &name)? else {
         return Err(UaError::not_found(format!("node {name:?} is not registered")));
     };
     if row.agent != agent {
@@ -598,7 +607,7 @@ fn node_route(
             )
         })?;
     let probe = node_queue::validate_new(&name, &backend, "probe", &cwd, None, None, None, None, None, None)?;
-    node_queue::accepting_node(tx, cfg, &probe)?;
+    node_queue::accepting_node(tx, cfg, org, &probe)?;
     Ok((row, backend, cwd))
 }
 
@@ -633,13 +642,14 @@ fn route_to_node(
     let queued = node_queue::insert_item(tx, hub, org, &n, row, actor)?;
     let item_id = queued["item_id"].as_str().unwrap_or_default().to_string();
     let evidence = node_queue::evidence_ref(&row.node, &item_id);
-    let run = load_run(tx, run_id)?.ok_or_else(|| UaError::internal("routed run vanished"))?;
+    let run = load_run(tx, org, run_id)?.ok_or_else(|| UaError::internal("routed run vanished"))?;
     let edge = Edge::to("launched").set("evidence_ref", evidence.clone());
     if let Err(why) = transition(tx, &run, edge)? {
         return Err(UaError::conflict(format!("run {run_id} could not be routed: {why}")));
     }
     record_transition(
         tx,
+        org,
         run_id,
         "launched",
         actor,
@@ -715,7 +725,7 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            crate::families::tasks::require_org(tx, &caller.org_id)?;
+            require_org(tx, &caller.org_id)?;
             let task = require_task(tx, &caller.org_id, tid)?;
             check_task_free(tx, &caller.org_id, tid, &ag, None)?;
             // The one claim gate: a stopped agent or a held task takes no run.
@@ -757,9 +767,9 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             };
             let route = match &node {
                 None => None,
-                Some(n) => Some(node_route(tx, hub.cfg(), n, &ag, a.backend.as_deref(), &task)?),
+                Some(n) => Some(node_route(tx, hub.cfg(), &caller.org_id, n, &ag, a.backend.as_deref(), &task)?),
             };
-            let run_id = derive_run_id(tx, tid, &ag)?;
+            let run_id = derive_run_id(tx, &caller.org_id, tid, &ag)?;
             let (prompt, source) = match &a.prompt {
                 Some(p) => (p.clone(), "args"),
                 None => match &route {
@@ -831,8 +841,8 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
             tx.execute(
                 "INSERT INTO dispatch_runs (run_id, task_id, agent_label, harness, state, actor, lease_owner, \
                  lease_expires_at, attempt, fence, workdir, prompt, prompt_sha256, created_at, updated_at, \
-                 provider_account) \
-                 VALUES (?1, ?2, ?3, ?4, 'claimed', ?5, ?5, ?6, 1, 1, ?7, ?8, ?9, ?10, ?10, ?11)",
+                 provider_account, org_id) \
+                 VALUES (?1, ?2, ?3, ?4, 'claimed', ?5, ?5, ?6, 1, 1, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
                 params![
                     run_id,
                     tid,
@@ -845,11 +855,19 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
                     prompt_sha,
                     ts,
                     payload["provider_account"].as_str(),
+                    caller.org_id,
                 ],
             )?;
             bind_task(tx, &caller.org_id, tid, &run_id, &ag, &lease_at)?;
             link_approval_id(tx, &caller.org_id, approval_id, &run_id)?;
-            record_transition(tx, &run_id, "claimed", &caller.label, json!({ "approval_id": approval_id }))?;
+            record_transition(
+                tx,
+                &caller.org_id,
+                &run_id,
+                "claimed",
+                &caller.label,
+                json!({ "approval_id": approval_id }),
+            )?;
             if let Some((row, backend, cwd)) = route {
                 let out = route_to_node(tx, &hub, &caller.org_id, &caller.label, &run_id, tid, &row, &backend, &cwd, &prompt, node_timeout)?;
                 return Ok(Gated::Routed(out));
@@ -889,9 +907,18 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
     };
 
     let mut out = match harness {
-        None => executor::launch_stub(&ctx.hub, run_id.clone(), ctx.caller.label.clone()).await?,
+        None => {
+            executor::launch_stub(
+                &ctx.hub,
+                ctx.caller.org_id.clone(),
+                run_id.clone(),
+                ctx.caller.label.clone(),
+            )
+            .await?
+        }
         Some((harness_name, h)) => {
             let spec = LaunchSpec {
+                org: ctx.caller.org_id.clone(),
                 run_id: run_id.clone(),
                 task_id: tid,
                 agent: agent.clone(),
@@ -959,14 +986,16 @@ async fn report_self(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
         .filter(|r| !r.is_empty())
         .or_else(|| (state != "finished").then(|| format!("self_report:{state}")));
     let identity = ctx.caller.label.clone();
-    let (rid2, id2, ev2) = (rid.clone(), identity.clone(), evidence.clone());
+    let (rid2, id2, ev2, org) = (rid.clone(), identity.clone(), evidence.clone(), ctx.caller.org_id.clone());
     let outcome = ctx
         .hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             record_outcome(
                 tx,
                 Outcome {
+                    org: &org,
                     run_id: &rid2,
                     fence: a.fence,
                     state,
@@ -1002,19 +1031,27 @@ async fn cancel(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
     check_agent_or_operator(ctx.hub.cfg(), &ctx.caller, "dispatch_cancel", &run.agent_label)?;
     let reason =
         a.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or("client cancelled".into());
-    cancel_run(&ctx.hub, ctx.caller.label.clone(), rid, reason).await
+    cancel_run(&ctx.hub, ctx.caller.org_id.clone(), ctx.caller.label.clone(), rid, reason).await
 }
 
-/// Cancel one run as `actor`: record the intent, stop the process (or ask
-/// the node to), and commit the outcome. The caller has checked authority.
-/// A refusal is an `{ok: false, reason}` reply, not an error.
-pub(crate) async fn cancel_run(hub: &Hub, actor: String, rid: String, reason: String) -> UaResult<Value> {
+/// Cancel one run of organization `org` as `actor`: record the intent, stop
+/// the process (or ask the node to), and commit the outcome. The caller has
+/// checked authority. A refusal is an `{ok: false, reason}` reply, not an
+/// error; another organization's run answers as unknown.
+pub(crate) async fn cancel_run(
+    hub: &Hub,
+    org: String,
+    actor: String,
+    rid: String,
+    reason: String,
+) -> UaResult<Value> {
     // 1. Record the intent (state unchanged) as a compare-and-swap.
-    let (rid2, actor2, reason2) = (rid.clone(), actor.clone(), reason.clone());
+    let (rid2, actor2, reason2, org2) = (rid.clone(), actor.clone(), reason.clone(), org.clone());
     let intent = hub
         .db()
         .write_async(move |tx| {
-            let Some(run) = load_run(tx, &rid2)? else {
+            require_org(tx, &org2)?;
+            let Some(run) = load_run(tx, &org2, &rid2)? else {
                 return Ok(Err(refusal("unknown_run", &rid2, json!({}))));
             };
             if !states::is_live(&run.state) {
@@ -1040,6 +1077,7 @@ pub(crate) async fn cancel_run(hub: &Hub, actor: String, rid: String, reason: St
             }
             record_transition(
                 tx,
+                &org2,
                 &rid2,
                 "cancel_requested",
                 &actor2,
@@ -1055,17 +1093,19 @@ pub(crate) async fn cancel_run(hub: &Hub, actor: String, rid: String, reason: St
     // 2. Stop the process (re-read: a launch may have recorded a pid since).
     // A node-routed run is stopped by its node: cessation is confirmed only
     // by the node's receipt, unless the item was never claimed.
-    let rid3 = rid.clone();
+    let (rid3, org3) = (rid.clone(), org.clone());
     let fresh = hub
         .db()
-        .read_async(move |c| load_run(c, &rid3))
+        .read_async(move |c| load_run(c, &org3, &rid3))
         .await?
         .ok_or_else(|| UaError::not_found(format!("unknown dispatch run: {rid}")))?;
     let termination = match fresh.evidence_ref.clone().filter(|e| e.starts_with("node:")) {
         Some(ev) => {
-            let by = actor.clone();
+            let (by, org4) = (actor.clone(), org.clone());
             hub.db()
-                .write_async(move |tx| Ok(node_queue::cancel_for_run(tx, &ev, &by)?.unwrap_or("unknown")))
+                .write_async(move |tx| {
+                    Ok(node_queue::cancel_for_run(tx, &org4, &ev, &by)?.unwrap_or("unknown"))
+                })
                 .await?
         }
         None => blocking(move || Ok(executor::terminate(&fresh))).await?,
@@ -1077,7 +1117,7 @@ pub(crate) async fn cancel_run(hub: &Hub, actor: String, rid: String, reason: St
     let mut out = hub
         .db()
         .write_async(move |tx| {
-            finalize_cancellation(tx, &rid, &actor, "cancel", &reason, termination, cessation)
+            finalize_cancellation(tx, &org, &rid, &actor, "cancel", &reason, termination, cessation)
         })
         .await?;
     if let Some(o) = out.as_object_mut() {
@@ -1103,12 +1143,21 @@ async fn retry_cancellation(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     }
     let termination = blocking(move || Ok(executor::terminate(&run))).await?;
     let cessation = classify_termination(termination);
-    let actor = ctx.caller.label.clone();
+    let (actor, org) = (ctx.caller.label.clone(), ctx.caller.org_id.clone());
     let res = ctx
         .hub
         .db()
         .write_async(move |tx| {
-            finalize_cancellation(tx, &rid, &actor, "operator", "retry_cancellation", termination, cessation)
+            finalize_cancellation(
+                tx,
+                &org,
+                &rid,
+                &actor,
+                "operator",
+                "retry_cancellation",
+                termination,
+                cessation,
+            )
         })
         .await?;
     if res["ok"] != json!(true) {
@@ -1131,13 +1180,22 @@ async fn confirm_cancellation(ctx: ToolCtx, a: ConfirmArgs) -> UaResult<Value> {
     }
     let note =
         a.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or("operator_confirmed".into());
-    let actor = ctx.caller.label.clone();
+    let (actor, org) = (ctx.caller.label.clone(), ctx.caller.org_id.clone());
     let res = ctx
         .hub
         .db()
         .write_async(move |tx| {
             let reason = format!("operator_override:{note}");
-            finalize_cancellation(tx, &rid, &actor, "operator", &reason, "operator_confirmed", "confirmed")
+            finalize_cancellation(
+                tx,
+                &org,
+                &rid,
+                &actor,
+                "operator",
+                &reason,
+                "operator_confirmed",
+                "confirmed",
+            )
         })
         .await?;
     if res["ok"] != json!(true) {
@@ -1315,7 +1373,8 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            let Some(run) = load_run(tx, &rid2)? else {
+            require_org(tx, &caller.org_id)?;
+            let Some(run) = load_run(tx, &caller.org_id, &rid2)? else {
                 return Err(UaError::not_found(format!("unknown dispatch run: {rid2}")));
             };
             if let Some(why) = resume_refusal(&run) {
@@ -1385,6 +1444,7 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
             link_approval_id(tx, &caller.org_id, approval_id, &rid2)?;
             record_transition(
                 tx,
+                &caller.org_id,
                 &rid2,
                 "resumed",
                 &actor2,
@@ -1408,9 +1468,12 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
     };
 
     let mut out = match harness {
-        None => executor::launch_stub(&ctx.hub, rid.clone(), actor.clone()).await?,
+        None => {
+            executor::launch_stub(&ctx.hub, ctx.caller.org_id.clone(), rid.clone(), actor.clone()).await?
+        }
         Some((harness_name, h)) => {
             let spec = LaunchSpec {
+                org: ctx.caller.org_id.clone(),
                 run_id: rid.clone(),
                 task_id: run.task_id,
                 agent: run.agent_label.clone(),
@@ -1464,7 +1527,7 @@ fn transitions(conn: &rusqlite::Connection, run_id: &str) -> UaResult<Vec<Value>
 }
 
 fn build_receipt(conn: &rusqlite::Connection, org: &str, run_id: &str) -> UaResult<Value> {
-    let Some(run) = run_object(conn, run_id)? else {
+    let Some(run) = run_object(conn, org, run_id)? else {
         return Err(UaError::not_found(format!("unknown dispatch run: {run_id}")));
     };
     let get = |k: &str| run.get(k).cloned().unwrap_or(Value::Null);
@@ -1499,10 +1562,16 @@ fn build_receipt(conn: &rusqlite::Connection, org: &str, run_id: &str) -> UaResu
         None if claimed => "unlinked".into(),
         None => "not_requested".into(),
     };
-    let mut receipts_stmt = conn.prepare("SELECT * FROM dispatch_receipts WHERE run_id = ?1 ORDER BY id")?;
+    let mut receipts_stmt =
+        conn.prepare("SELECT * FROM dispatch_receipts WHERE run_id = ?1 AND org_id = ?2 ORDER BY id")?;
     let receipts: Vec<Value> = receipts_stmt
-        .query_map([run_id], row_object)?
-        .map(|r| r.map(Value::Object))
+        .query_map(params![run_id, org], row_object)?
+        .map(|r| {
+            r.map(|mut m| {
+                m.remove("org_id");
+                Value::Object(m)
+            })
+        })
         .collect::<Result<_, _>>()?;
     let attempt = run.get("attempt").and_then(Value::as_i64).unwrap_or(1);
     Ok(json!({
@@ -1580,15 +1649,17 @@ async fn receipts_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("state must be one of {:?}", states::ALL)));
     }
     let limit = a.limit.unwrap_or(20).clamp(1, 200);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT * FROM dispatch_runs WHERE (?1 IS NULL OR task_id = ?1) AND (?2 IS NULL OR state = ?2) \
-                 ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+                "SELECT * FROM dispatch_runs WHERE org_id = ?4 AND (?1 IS NULL OR task_id = ?1) \
+                 AND (?2 IS NULL OR state = ?2) ORDER BY created_at DESC, rowid DESC LIMIT ?3",
             )?;
-            let rows: Vec<Map<String, Value>> =
-                stmt.query_map(params![a.task_id, a.state, limit], row_object)?.collect::<Result<_, _>>()?;
+            let rows: Vec<Map<String, Value>> = stmt
+                .query_map(params![a.task_id, a.state, limit, org], row_object)?
+                .collect::<Result<_, _>>()?;
             let receipts: Vec<Value> = rows
                 .into_iter()
                 .map(|row| {

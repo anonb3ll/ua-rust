@@ -499,6 +499,30 @@ from its commit history.
   writes legacy notes and versions to `default`. Accepted leak candidate:
   bm25 corpus statistics over the one `memory_fts` index span every
   organization.
+- Nodes, node work and dispatch runs are organization-scoped
+  (`docs/organization.md`, the nodes family). A node belongs to the
+  organization that registered it; work, commands, claims and follow-ups
+  belong to their creator's organization and may target only that
+  organization's nodes, and another organization's node, item or run
+  answers exactly like a missing one. A node token claims, heartbeats and
+  reports only its own organization's work. `organization.v1.tools.dispatch`
+  and `dispatch.v4.org_scope` give `dispatch_runs` and `dispatch_receipts`
+  `org_id`, triggers and same-organization rules; the standalone
+  `node_queue.v2.tenant_keys` rebuilds `node_dispatch` with a `NOT NULL`
+  `org_id` and launch keys unique per organization (ids and rowids kept);
+  `organization.v1.tools.nodes` and `node_queue.v2.org_scope` give the
+  seven node tables `org_id`, triggers, org-led indexes and
+  same-organization reference triggers. Every existing row lands in
+  `default`; none is dropped. Hub-wide views (`system_doctor`'s fleet row,
+  a provider account's recent runs) list the default organization's nodes
+  and runs and count the rest. Session credentials, device acceptance,
+  idle-session wakes and command notices stay default-organization only
+  (`org_unsupported`, or the notice kept unsent) until their own tables
+  carry an organization. Node and dispatch events from another organization
+  keep only ids, states and counts, under the `system` originator, with
+  hashed dedupe keys. A reassigned or forgotten node closes only its own
+  organization's harness-config proposals. The importer writes legacy nodes
+  to `default`.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the

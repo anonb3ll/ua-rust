@@ -236,7 +236,8 @@ fn health(cfg: &Config) -> Value {
 
 /// What dispatching work to `agent` needs besides tools, as
 /// `{gate, action, detail}` entries; empty when nothing is missing.
-fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Value>> {
+/// `org` is the reader's organization: only its nodes count as an executor.
+fn missing_config(c: &Connection, cfg: &Config, org: &str, agent: &str) -> UaResult<Vec<Value>> {
     let mut missing = Vec::new();
     let token: Option<i64> = c
         .query_row(
@@ -257,12 +258,12 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
     if cfg.harnesses.is_empty() {
         let now = jiff::Timestamp::now();
         let mut stmt = c.prepare(
-            "SELECT last_heartbeat, heartbeat_floor FROM nodes WHERE agent = ?1 AND retired_at IS NULL",
+            "SELECT last_heartbeat, heartbeat_floor FROM nodes WHERE agent = ?1 AND org_id = ?2 AND retired_at IS NULL",
         )?;
         let mut live = false;
-        for row in
-            stmt.query_map([agent], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?
-        {
+        for row in stmt.query_map([agent, org], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+        })? {
             let (last, floor) = row?;
             if super::nodes::liveness(last.as_deref(), floor.as_deref(), false, now).live {
                 live = true;
@@ -351,7 +352,7 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
                 None => None,
                 Some((t, l)) => {
                     let mut m = check(c, &hub, crate::builtin_registry_shared(), &org, t, &l)?;
-                    let missing = missing_config(c, hub.cfg(), &l)?;
+                    let missing = missing_config(c, hub.cfg(), &org, &l)?;
                     m["ready"] = json!(m["capable"] == json!(true) && missing.is_empty());
                     m["missing_config"] = json!(missing);
                     Some(m)

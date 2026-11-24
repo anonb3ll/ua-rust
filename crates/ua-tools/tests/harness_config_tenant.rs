@@ -409,9 +409,11 @@ fn caller(label: &str, kind: ActorKind, org: &str) -> Caller {
     }
 }
 
-/// The node's agent. The same label in both organizations owns the same
-/// node, so only the organization filter tells their rows apart (labels are
-/// one hub namespace in practice; this isolates the `org_id` scoping).
+/// The node's agent. The same label in both organizations, so only the
+/// organization filter tells their rows apart (labels are one hub namespace
+/// in practice; this isolates the `org_id` scoping). A node belongs to the
+/// organization that registered it (`organization.v1.tools.nodes`), so each
+/// organization registers its own node ([`NODE`], [`NODE_B`]).
 fn device(org: &str) -> Caller {
     caller("builder-1", ActorKind::Agent, org)
 }
@@ -433,6 +435,9 @@ fn human() -> Caller {
 }
 
 const NODE: &str = "node-a";
+/// Organization B's node: node names are one hub namespace, so B cannot hold
+/// a node named [`NODE`] too.
+const NODE_B: &str = "node-b";
 
 fn reason(e: &UaError) -> String {
     e.reason_code().map(str::to_string).unwrap_or_else(|| e.code().to_string())
@@ -579,12 +584,13 @@ async fn each_organization_serves_and_reads_only_its_own_bundle_and_proposals() 
     assert_eq!(reason(&e), "version_published", "{e:?}");
 
     h.register(&device(DEFAULT_ORG), NODE).await;
+    h.register(&device(ORG_B), NODE_B).await;
     let (a, b) = (device(DEFAULT_ORG), device(ORG_B));
 
     // Each organization's node is served its own organization's bundle.
     let got_a = h.config(&a, NODE, json!({})).await.unwrap();
     assert_eq!(got_a["rendered"]["claude"]["content"], "default rules\n", "{got_a}");
-    let got_b = h.config(&b, NODE, json!({})).await.unwrap();
+    let got_b = h.config(&b, NODE_B, json!({})).await.unwrap();
     assert_eq!(got_b["rendered"]["claude"]["content"], "org b rules\n", "{got_b}");
     let status_a = h.ok(&a, "harness_config_status", json!({})).await;
     assert_eq!(status_a["active"]["bundle"]["rules"]["claude"], "default rules\n", "{status_a}");
@@ -596,7 +602,7 @@ async fn each_organization_serves_and_reads_only_its_own_bundle_and_proposals() 
     let status_b = h.ok(&b, "harness_config_status", json!({})).await;
     assert_eq!(status_b["pending_proposals"], 0, "{status_b}");
     assert_eq!(status_b["recent_proposals"], json!([]), "{status_b}");
-    let r_b = h.report(&b, NODE, &got_b, "claude").await;
+    let r_b = h.report(&b, NODE_B, &got_b, "claude").await;
     assert_ne!(r_a["proposals"][0]["proposal_id"], r_b["proposals"][0]["proposal_id"]);
     let status_a = h.ok(&a, "harness_config_status", json!({})).await;
     assert_eq!(status_a["pending_proposals"], 1, "{status_a}");
@@ -608,8 +614,8 @@ async fn each_organization_serves_and_reads_only_its_own_bundle_and_proposals() 
         status_b["recent_proposals"].as_array().unwrap().iter().map(|p| &p["id"]).collect();
     assert_eq!(ids, [&r_b["proposals"][0]["proposal_id"]]);
 
-    // One proposal, drift row and report window per organization for the
-    // same node.
+    // One proposal, drift row and report window per organization, each for
+    // its own node.
     for t in ["harness_config_proposals", "harness_config_drift", "harness_config_report_window"] {
         for org in [DEFAULT_ORG, ORG_B] {
             assert_eq!(h.scalar(&format!("SELECT COUNT(*) FROM {t} WHERE org_id = '{org}'")), 1, "{t} {org}");
@@ -619,7 +625,7 @@ async fn each_organization_serves_and_reads_only_its_own_bundle_and_proposals() 
     // Each approval binds its own organization; approving A's grants B nothing.
     let a_id = r_a["proposals"][0]["approval_id"].as_i64().unwrap();
     h.approve(a_id).await;
-    let got_b = h.config(&b, NODE, json!({})).await.unwrap();
+    let got_b = h.config(&b, NODE_B, json!({})).await.unwrap();
     assert_eq!(got_b["apply_grants"], json!([]), "{got_b}");
     let got_a = h.config(&a, NODE, json!({})).await.unwrap();
     assert_eq!(got_a["apply_grants"].as_array().unwrap().len(), 1, "{got_a}");
@@ -647,15 +653,17 @@ async fn each_organization_serves_and_reads_only_its_own_bundle_and_proposals() 
 #[tokio::test]
 async fn an_apply_approval_is_never_consumed_across_organizations() {
     let h = H::new();
-    // Identical bundles: the same node, surface, path, version and hash in
-    // both organizations. Only `org_id` tells the two approvals apart.
+    // Identical bundles: the same agent, surface, path, version and hash in
+    // both organizations (each on its own node: node names are one hub
+    // namespace).
     let bundle = json!({ "version": "v1", "rules": { "claude": "same rules\n" } });
     h.publish_default(bundle.clone()).await;
     h.seed_bundle(ORG_B, bundle);
     h.register(&device(DEFAULT_ORG), NODE).await;
+    h.register(&device(ORG_B), NODE_B).await;
     let (a, b) = (device(DEFAULT_ORG), device(ORG_B));
     let got_a = h.config(&a, NODE, json!({})).await.unwrap();
-    let got_b = h.config(&b, NODE, json!({})).await.unwrap();
+    let got_b = h.config(&b, NODE_B, json!({})).await.unwrap();
     let hash = got_a["rendered"]["claude"]["hash"].clone();
     assert_eq!(got_b["rendered"]["claude"]["hash"], hash);
 
@@ -664,17 +672,17 @@ async fn an_apply_approval_is_never_consumed_across_organizations() {
     // one (on a surface neither reported).
     let r_a = h.report(&a, NODE, &got_a, "claude").await;
     let a_id = r_a["proposals"][0]["approval_id"].as_i64().unwrap();
-    let e = h.config(&b, NODE, applied.clone()).await.unwrap_err();
+    let e = h.config(&b, NODE_B, applied.clone()).await.unwrap_err();
     let agents_hash = got_b["rendered"]["agents"]["hash"].clone();
     let missing = h
-        .config(&b, NODE, json!({ "action": "applied", "surface": "agents", "desired_hash": agents_hash }))
+        .config(&b, NODE_B, json!({ "action": "applied", "surface": "agents", "desired_hash": agents_hash }))
         .await
         .unwrap_err();
     assert_eq!(e.code(), missing.code());
     assert_eq!(e.to_string(), missing.to_string());
     assert_eq!(e.code(), "not_found", "{e:?}");
 
-    let r_b = h.report(&b, NODE, &got_b, "claude").await;
+    let r_b = h.report(&b, NODE_B, &got_b, "claude").await;
     let b_id = r_b["proposals"][0]["approval_id"].as_i64().unwrap();
     assert_ne!(a_id, b_id, "each organization parks its own approval");
     // Identical observations in two organizations are two drift rows.
@@ -693,7 +701,7 @@ async fn an_apply_approval_is_never_consumed_across_organizations() {
 
     // Approving A's pass does not let B apply: B parks on its own approval.
     h.approve(a_id).await;
-    let e = h.config(&b, NODE, applied.clone()).await.unwrap_err();
+    let e = h.config(&b, NODE_B, applied.clone()).await.unwrap_err();
     assert!(matches!(e, UaError::ApprovalRequired { approval_id, .. } if approval_id == b_id), "{e:?}");
     assert_eq!(h.text(&format!("SELECT status FROM approvals WHERE id = {a_id}")), "approved");
     // A still holds and consumes its own pass.
@@ -702,7 +710,7 @@ async fn an_apply_approval_is_never_consumed_across_organizations() {
 
     // What A applied is not B's base: B's re-report binds the same change
     // (from nothing) and reuses its approval.
-    let again = h.report(&b, NODE, &got_b, "claude").await;
+    let again = h.report(&b, NODE_B, &got_b, "claude").await;
     assert_eq!(again["proposals"][0]["approval_id"], b_id, "{again}");
     assert_eq!(payload(b_id)["change_summary"]["base"], "none");
 }
@@ -829,9 +837,10 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(reason(&e), "unknown_organization", "{e:?}");
     assert_eq!(h.counts(), before);
 
-    // Reads in an unknown organization see nothing.
-    let got = h.config(&ghost, NODE, json!({})).await.unwrap();
-    assert_eq!(got["bundle"], Value::Null);
+    // Reads in an unknown organization see nothing: the default
+    // organization's node answers as unregistered there.
+    let e = h.config(&ghost, NODE, json!({})).await.unwrap_err();
+    assert_eq!(e.code(), "not_found", "{e:?}");
     let status = h.ok(&ghost, "harness_config_status", json!({})).await;
     assert_eq!(status["active"], Value::Null);
     assert_eq!(status["pending_proposals"], 0);

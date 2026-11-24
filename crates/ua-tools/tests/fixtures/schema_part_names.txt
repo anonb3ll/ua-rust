@@ -117,3 +117,8 @@ organization.v1.tools.tool_calls
 core.v5.tool_calls_org_scope
 organization.v1.memory
 memory.v2.org_scope
+organization.v1.tools.dispatch
+dispatch.v4.org_scope
+node_queue.v2.tenant_keys
+organization.v1.tools.nodes
+node_queue.v2.org_scope

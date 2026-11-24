@@ -192,8 +192,10 @@ fn lapsed(lease: Option<&str>, now: &str) -> bool {
 
 // --- dispatch ----------------------------------------------------------------
 
-fn dispatch_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "agent_label", "created_at", "run_id");
+fn dispatch_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "agent_label", "created_at", "run_id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT run_id, task_id, delegation_id, agent_label, harness, state, lease_expires_at, attempt, fence, \
@@ -337,10 +339,13 @@ fn workflow_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResu
 
 fn node_rows(c: &Connection, f: &Filter<'_>, viewer: &Viewer, now: &str) -> UaResult<Vec<Value>> {
     let (mut w, mut binds) = clauses(f, "agent", "created_at", "id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(viewer.org.clone()));
     if !viewer.maintainer {
         let Some(who) = viewer.who.as_deref() else { return Ok(Vec::new()) };
         w.push(
-            "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ?))"
+            "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ? \
+             AND org_id = node_dispatch.org_id))"
                 .into(),
         );
         for _ in 0..3 {
@@ -430,7 +435,9 @@ fn evidence_refs(ulids: &[String]) -> Value {
 }
 
 /// Fill `links.evidence` (and a session's `links.dispatch_run`) for a page.
-fn attach_links(c: &Connection, rows: &mut [Value]) -> UaResult<()> {
+/// `org` is the reader's organization: a session links only to its node
+/// items in it.
+fn attach_links(c: &Connection, org: &str, rows: &mut [Value]) -> UaResult<()> {
     let ids_of = |rows: &[Value], kind: &str| -> Vec<String> {
         rows.iter()
             .filter(|r| r["kind"] == kind)
@@ -450,9 +457,11 @@ fn attach_links(c: &Connection, rows: &mut [Value]) -> UaResult<()> {
     for chunk in external.chunks(CHUNK) {
         let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT id, run_id, session_id FROM node_dispatch WHERE session_id IN ({marks}) ORDER BY created_at, id"
+            "SELECT id, run_id, session_id FROM node_dispatch WHERE org_id = ? AND session_id IN ({marks}) \
+             ORDER BY created_at, id"
         );
-        let binds = chunk.iter().map(|s| SqlValue::Text(s.clone())).collect();
+        let mut binds = vec![SqlValue::Text(org.to_string())];
+        binds.extend(chunk.iter().map(|s| SqlValue::Text(s.clone())));
         for (id, run, session) in query_rows(c, &sql, binds, |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
         })? {
@@ -538,7 +547,7 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
     let has = |k: &str| kinds.iter().any(|w| w == k);
     let mut rows = Vec::new();
     if has("dispatch") {
-        rows.extend(dispatch_rows(c, &f, &now)?);
+        rows.extend(dispatch_rows(c, &f, &viewer.org, &now)?);
     }
     if has("session") {
         rows.extend(session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?);
@@ -560,7 +569,7 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
     });
     let truncated = rows.len() as i64 > cap;
     rows.truncate(cap as usize);
-    attach_links(c, &mut rows)?;
+    attach_links(c, &viewer.org, &mut rows)?;
     let next = if truncated { rows.last().map(cursor_of) } else { None };
     Ok(json!({
         "runs": rows,
@@ -584,7 +593,7 @@ fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaRes
     let has = |k: &str| kinds.iter().any(|w| w == k);
     let mut rows = Vec::new();
     if has("dispatch") {
-        rows = dispatch_rows(c, &f, &now)?;
+        rows = dispatch_rows(c, &f, &viewer.org, &now)?;
     }
     if rows.is_empty() && has("session") {
         rows = session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?;
@@ -595,7 +604,7 @@ fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaRes
     if rows.is_empty() && has("node") {
         rows = node_rows(c, &f, viewer, &now)?;
     }
-    attach_links(c, &mut rows)?;
+    attach_links(c, &viewer.org, &mut rows)?;
     Ok(rows.into_iter().next())
 }
 

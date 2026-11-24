@@ -48,9 +48,9 @@ const B_CHECK: &str = "falcon-secret-check";
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
 /// Parts registered after this family's, which need its `org_id` columns
-/// (the continuity, holds, delegation, goal, proposal and policy
-/// authorization families').
-const LATER: [&str; 12] = [
+/// (the continuity, holds, delegation, goal, proposal, policy
+/// authorization, dispatch and node queue families').
+const LATER: [&str; 14] = [
     "organization.v1.tools.continuity",
     "continuity.v2.org_scope",
     "organization.v1.tools.holds",
@@ -63,6 +63,8 @@ const LATER: [&str; 12] = [
     "governance.v4.proposals_org_scope",
     "organization.v1.tools.policy_authorizations",
     "github.v3.policy_authorizations_org_scope",
+    "dispatch.v4.org_scope",
+    "node_queue.v2.org_scope",
 ];
 
 fn old_parts() -> Vec<ua_store::Part> {

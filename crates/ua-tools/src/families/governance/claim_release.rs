@@ -133,7 +133,7 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                 }
                 _ => {}
             }
-            if let Some(live) = live_run_for_task(tx, id)? {
+            if let Some(live) = live_run_for_task(tx, &org, id)? {
                 return Err(UaError::conflict(format!(
                     "task {id} has a live dispatch run {live:?}; releasing the claim would not stop it. Cancel it \
                      first (dispatch_cancel) and retry once its termination is confirmed"

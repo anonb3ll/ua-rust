@@ -62,6 +62,25 @@ use super::{governance, node_queue, nodes};
 use crate::registry::{Registry, ToolCtx, tool};
 use ua_org::authz::{Authority, Authz};
 
+/// The organization whose nodes deliver idle-session wakes. The wake
+/// tables (`session_wake`, `session_wake_offers`) carry no `org_id` yet and
+/// their events name nodes and sessions in the default organization's
+/// ledger, so wakes run only through the default organization's nodes: a
+/// node token of another organization is refused (`org_unsupported`), and
+/// its nodes are never chosen as a wake node.
+const WAKE_ORG: &str = ua_core::DEFAULT_ORG;
+
+fn wake_org(caller: &Caller) -> UaResult<()> {
+    if caller.org_id == WAKE_ORG {
+        Ok(())
+    } else {
+        Err(UaError::denied(
+            "org_unsupported",
+            "idle-session wakes run only through the default organization's nodes",
+        ))
+    }
+}
+
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "wake.v1",
     sql: "
@@ -301,8 +320,8 @@ fn wake_node(c: &Connection, row: &WakeRow) -> UaResult<Option<String>> {
     if let Some(named) = &row.node {
         let owned = c
             .query_row(
-                "SELECT 1 FROM nodes WHERE node = ?1 AND agent = ?2 AND retired_at IS NULL",
-                params![named, row.agent],
+                "SELECT 1 FROM nodes WHERE node = ?1 AND agent = ?2 AND org_id = ?3 AND retired_at IS NULL",
+                params![named, row.agent, WAKE_ORG],
                 |_| Ok(()),
             )
             .optional()?
@@ -314,10 +333,11 @@ fn wake_node(c: &Connection, row: &WakeRow) -> UaResult<Option<String>> {
     if key.is_empty() {
         return Ok(None);
     }
-    let mut stmt =
-        c.prepare("SELECT node FROM nodes WHERE agent = ?1 AND retired_at IS NULL ORDER BY node")?;
+    let mut stmt = c.prepare(
+        "SELECT node FROM nodes WHERE agent = ?1 AND org_id = ?2 AND retired_at IS NULL ORDER BY node",
+    )?;
     let same_short: Vec<String> = stmt
-        .query_map([&row.agent], |r| r.get::<_, String>(0))?
+        .query_map([row.agent.as_str(), WAKE_ORG], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|n| host_key(n) == key)
@@ -559,7 +579,7 @@ fn poll_pending(c: &Connection, node: &str, agent: &str, now: f64) -> UaResult<b
 /// Sessions whose wake node is `node` that are due a wake now, marked
 /// offered.
 fn due_wakes(tx: &mut WriteTx<'_>, node: &str, identity: &str, now: f64) -> UaResult<Vec<Value>> {
-    let name = node_queue::owned_node(tx, node, identity)?.node;
+    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
     let mut out = Vec::new();
     for row in candidates(tx, &name, identity)? {
         if out.len() >= MAX_OFFERS {
@@ -700,7 +720,7 @@ fn node_row(c: &Connection, session_id: &str, node: &str, agent: &str) -> UaResu
 }
 
 fn check_offer(tx: &mut WriteTx<'_>, node: &str, identity: &str, a: &CheckArgs, now: f64) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, node, identity)?.node;
+    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
     let sid = check_session_id(&a.session_id)?;
     let seq = check_seq(a.seq)?;
     let expires_at = check_stamp(a.expires_at, "expires_at")?;
@@ -764,7 +784,7 @@ fn record_receipt(
     a: &ReceiptArgs,
     now: f64,
 ) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, node, identity)?.node;
+    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
     let outcome = a.outcome.trim().to_string();
     if !OUTCOMES.contains(&outcome.as_str()) {
         return Err(UaError::invalid(format!("outcome must be one of {}", OUTCOMES.join(", "))));
@@ -900,7 +920,7 @@ fn record_receipt(
 type LiveRow = (String, String, String, Option<String>, Option<String>);
 
 fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[String]) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, node, identity)?.node;
+    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
     let rows: Vec<LiveRow> = {
         let mut stmt = tx.prepare(
             "SELECT s.id, s.agent, s.status, s.exit_status, s.external_session_id \
@@ -1040,6 +1060,7 @@ pub struct ReceiptArgs {
 }
 
 async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let agent = node_queue::device_agent(&ctx.caller)?;
     if a.offer_version != Some(3) {
         return Err(UaError::invalid("idle wakes require offer_version=3"));
@@ -1052,7 +1073,8 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
     };
     // Only the node's own agent holds a poll (and a slot) open.
     let (n, ag) = (node.clone(), agent.clone());
-    let node = ctx.hub.db().read_async(move |c| Ok(node_queue::owned_node(c, &n, &ag)?.node)).await?;
+    let node =
+        ctx.hub.db().read_async(move |c| Ok(node_queue::owned_node(c, WAKE_ORG, &n, &ag)?.node)).await?;
     let _slot = PollSlot::take(&ctx.hub, &node)?;
     if let Some(live) = a.live_sessions {
         if live.len() > MAX_LIVE_SESSIONS
@@ -1084,11 +1106,13 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
 }
 
 async fn node_wake_check(ctx: ToolCtx, a: CheckArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let agent = node_queue::device_agent(&ctx.caller)?;
     ctx.hub.db().write_async(move |tx| check_offer(tx, &a.node.clone(), &agent, &a, now_f())).await
 }
 
 async fn node_wake_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
+    wake_org(&ctx.caller)?;
     let agent = node_queue::device_agent(&ctx.caller)?;
     ctx.hub.db().write_async(move |tx| record_receipt(tx, &a.node.clone(), &agent, &a, now_f())).await
 }
@@ -1166,7 +1190,7 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
             }
             // A named wake node must be one of the session's own agent's.
             if let Some(n) = &node {
-                node_queue::owned_node(tx, n, &who)?;
+                node_queue::owned_node(tx, WAKE_ORG, n, &who)?;
             }
             let before: Option<(i64, Option<String>)> = tx
                 .query_row("SELECT opted_in, node FROM session_wake WHERE session_id = ?1", [&sid], |r| {

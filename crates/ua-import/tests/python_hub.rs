@@ -561,6 +561,8 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE facts_json = '{}'"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'old-box' AND retired_by = 'operator'"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
+    // Legacy nodes land in the default organization.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE org_id <> 'default'"), 0);
     assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = 'default'"), 1);
 
