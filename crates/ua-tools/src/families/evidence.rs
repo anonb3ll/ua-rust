@@ -736,7 +736,10 @@ fn fts_check(c: &Connection, ix: &FtsIndex, org: &str) -> UaResult<Value> {
     }))
 }
 
-fn dangling(c: &Connection) -> UaResult<Value> {
+/// Dangling references. The memory supersede count covers only organization
+/// `org`'s notes, and a pointer counts as dangling when no note of that
+/// organization holds the id it names.
+fn dangling(c: &Connection, org: &str) -> UaResult<Value> {
     let mut by_ref: BTreeMap<String, i64> = BTreeMap::new();
     {
         let mut stmt = c.prepare("PRAGMA foreign_key_check")?;
@@ -747,9 +750,10 @@ fn dangling(c: &Connection) -> UaResult<Value> {
         }
     }
     let superseded: i64 = c.query_row(
-        "SELECT COUNT(*) FROM memory m WHERE m.superseded_by IS NOT NULL AND m.superseded_by != '' \
-         AND NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = m.superseded_by)",
-        [],
+        "SELECT COUNT(*) FROM memory m WHERE m.org_id = ?1 AND m.superseded_by IS NOT NULL \
+         AND m.superseded_by != '' \
+         AND NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = m.superseded_by AND s.org_id = m.org_id)",
+        [org],
         |r| r.get(0),
     )?;
     if superseded > 0 {
@@ -769,13 +773,14 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
                 fts_indexes(c)?.iter().map(|ix| fts_check(c, ix, &org)).collect::<UaResult<_>>()?;
             let counts: (i64, i64) = (
                 c.query_row(
-                    "SELECT COUNT(*) FROM memory WHERE id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",
-                    [],
+                    "SELECT COUNT(*) FROM memory WHERE org_id = ?1 \
+                     AND id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",
+                    [&org],
                     |r| r.get(0),
                 )?,
                 c.query_row("SELECT COUNT(*) FROM tasks WHERE org_id = ?1", [&org], |r| r.get(0))?,
             );
-            Ok((fts, dangling(c)?, chain_integrity(c)?, counts))
+            Ok((fts, dangling(c, &org)?, chain_integrity(c)?, counts))
         })
         .await?;
     let drifted: Vec<String> = fts
@@ -786,21 +791,21 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
     let mut resynced = false;
     if !drifted.is_empty() {
         let names = drifted.clone();
-        let by = ctx.caller.label.clone();
+        let (org, by) = (ctx.caller.org_id.clone(), ctx.caller.label.clone());
         ctx.hub
             .db()
             .write_async(move |tx| {
                 for n in &names {
                     tx.execute(&format!("INSERT INTO \"{n}\"(\"{n}\") VALUES ('rebuild')"), [])?;
                 }
-                ledger::append(
+                // ORG-EVENT-DEFAULT: written to the default organization's
+                // ledger, so another organization's caller is `system`.
+                crate::families::tasks::emit(
                     tx,
-                    EventInput::new(
-                        ua_core::DEFAULT_ORG,
-                        "agent.state.resynced",
-                        json!({ "fts_indexes": names }),
-                    )
-                    .by(by),
+                    &org,
+                    "agent.state.resynced",
+                    json!({ "fts_indexes": names }),
+                    &by,
                 )?;
                 Ok(())
             })

@@ -171,8 +171,9 @@ const TENANT: &[&str] = &[
 /// `task_comments` and `task_comment_threads` (`organization.v1.tools.tasks`),
 /// `managed_secrets` (`managed_secrets.v2.tenant_keys`,
 /// `organization.v1.tools.managed_secrets`), `policy_authorizations`
-/// (`organization.v1.tools.policy_authorizations`) and `tool_calls`
-/// (`organization.v1.tools.tool_calls`).
+/// (`organization.v1.tools.policy_authorizations`), `tool_calls`
+/// (`organization.v1.tools.tool_calls`), and `memory`, `memory_versions`
+/// and `memory_embeddings` (`organization.v1.memory`, `memory.v2.org_scope`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -181,9 +182,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "idempotency_keys",
-    "memory",
-    "memory_embeddings",
-    "memory_versions",
     "message_index",
     "message_reads",
     "node_acceptance",
@@ -798,6 +796,36 @@ fn insert_findings(origin: &str, text: &str, keyed: &BTreeSet<&str>) -> (Vec<Str
     (out, seen)
 }
 
+/// Released, checksum-locked parts whose SQL creates a trigger that inserts
+/// into a tenant table without naming `org_id`, and that a later part drops
+/// and recreates naming it. The released text cannot change (`ua-store`
+/// refuses an edited part), so it is excused here by its exact text, in its
+/// own file only; the trigger scan below still checks the live trigger, which
+/// is the one that runs. Each entry must still be found, so none goes stale.
+///
+/// - `memory_versions.v1`'s `memory_versions_capture`, recreated by
+///   `memory.v2.org_scope` with `OLD.org_id`.
+fn released_superseded() -> [(&'static str, &'static str); 1] {
+    [("crates/ua-memory/src/schema.rs", ua_memory::VERSIONS_SCHEMA.sql)]
+}
+
+/// `src` with each excused released text in it blanked (newlines kept, so
+/// line numbers hold), and how many were blanked.
+fn without_released_superseded(path: &str, src: &str) -> (String, usize) {
+    let mut out = src.to_string();
+    let mut hits = 0;
+    for (file, sql) in released_superseded() {
+        if path.ends_with(file)
+            && let Some(at) = out.find(sql)
+        {
+            let blank: String = sql.chars().map(|c| if c == '\n' { c } else { ' ' }).collect();
+            out.replace_range(at..at + sql.len(), &blank);
+            hits += 1;
+        }
+    }
+    (out, hits)
+}
+
 #[test]
 fn every_insert_into_a_keyed_tenant_table_names_org_id() {
     let keyed = keyed_tenant_tables();
@@ -806,8 +834,12 @@ fn every_insert_into_a_keyed_tenant_table_names_org_id() {
     let mut seen = 0;
     let files = support::sources();
     assert!(files.len() > 100, "found only {} source files", files.len());
+    let mut excused = 0;
     for (path, src) in &files {
-        let (f, n) = insert_findings(&path.display().to_string(), &support::without_tests_raw(src), &keyed);
+        let path = path.display().to_string();
+        let (text, hits) = without_released_superseded(&path, &support::without_tests_raw(src));
+        excused += hits;
+        let (f, n) = insert_findings(&path, &text, &keyed);
         found.extend(f);
         seen += n;
     }
@@ -827,6 +859,11 @@ fn every_insert_into_a_keyed_tenant_table_names_org_id() {
         seen += n;
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+    assert_eq!(
+        excused,
+        released_superseded().len(),
+        "an excused released part was not found; drop its entry"
+    );
     // The scan sees the inserts it is meant to: the code family's, the
     // inbound table's and its two copies (GitHub, Slack).
     assert!(seen >= 5, "saw only {seen} inserts into keyed tenant tables");

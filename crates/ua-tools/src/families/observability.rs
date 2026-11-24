@@ -954,7 +954,10 @@ struct DbFacts {
     fleet: Result<nodes::Fleet, String>,
 }
 
-fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
+/// Database facts for `system_doctor`. The memory counts are organization
+/// `org`'s (the caller's), so another organization learns nothing of the
+/// hub's other notes.
+fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
     let schema_compat = ua_store::backup::check_schema_compatibility(
         c,
         &crate::schema_parts(),
@@ -981,8 +984,15 @@ fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
         freelist: pragma_i64(c, "freelist_count")?,
         schema_compat,
         chain: ledger::verify(c)?,
-        notes: count("SELECT COUNT(*) FROM memory")?,
-        embedded: count("SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id")?,
+        notes: c.query_row("SELECT COUNT(*) FROM memory WHERE org_id = ?1", [org], |r| r.get(0)).unwrap_or(0),
+        embedded: c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
+                 WHERE e.org_id = ?1",
+                [org],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
         active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
         last_delivery,
         quick_check,
@@ -1707,7 +1717,8 @@ fn host_name() -> Option<String> {
 async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
     let deep = a.refresh;
-    let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
+    let org = ctx.caller.org_id.clone();
+    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
     let github = {
         let (cfg, caller) = (ctx.hub.cfg().clone(), ctx.caller.clone());
         ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller)).await?

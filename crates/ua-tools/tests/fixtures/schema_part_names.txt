@@ -115,3 +115,5 @@ organization.v1.tools.policy_authorizations
 github.v3.policy_authorizations_org_scope
 organization.v1.tools.tool_calls
 core.v5.tool_calls_org_scope
+organization.v1.memory
+memory.v2.org_scope

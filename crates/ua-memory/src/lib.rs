@@ -41,7 +41,13 @@ pub use embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
 pub use note::{Filter, mark_untrusted};
-pub use schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA, schema_parts};
+/// The ORG-EVENT-DEFAULT rule for memory events, exposed so `ua-tools` can
+/// test it against its own copy; not an API for other callers.
+#[doc(hidden)]
+pub use note::{ledger_label, ledger_originator, ledger_text};
+pub use schema::{
+    EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA, org_parts, schema_parts,
+};
 
 use ua_core::{UaError, UaResult};
 

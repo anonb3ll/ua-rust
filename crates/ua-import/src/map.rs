@@ -69,6 +69,9 @@ pub(crate) enum Kind {
     /// Legacy work proposals and their items are imported into the default
     /// organization (a source `org_id` is never copied).
     WorkProposals,
+    /// Legacy memory notes and their versions are imported into the default
+    /// organization (a source `org_id` is never copied).
+    Memory,
 }
 
 impl Kind {
@@ -91,6 +94,7 @@ impl Kind {
                 | Kind::Delegations
                 | Kind::Goals
                 | Kind::WorkProposals
+                | Kind::Memory
         )
     }
 }
@@ -176,8 +180,12 @@ pub(crate) const MAPS: &[TableMap] = &[
         ..plain("task_hold_members")
     },
     TableMap { kind: Kind::ProjectRepoBindings, ..plain("project_repo_bindings") },
-    TableMap { rowid_to: Some("seq"), ..plain("memory") },
-    TableMap { refs: &[Ref { col: "note_id", table: "memory", key: "id" }], ..plain("memory_versions") },
+    TableMap { rowid_to: Some("seq"), kind: Kind::Memory, ..plain("memory") },
+    TableMap {
+        refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
+        kind: Kind::Memory,
+        ..plain("memory_versions")
+    },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
     TableMap { kind: Kind::Nodes, ..plain("nodes") },
     // Skill versions are immutable (insert only) and keep their ids; drift

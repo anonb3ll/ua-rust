@@ -166,6 +166,12 @@ pub fn schema_parts() -> Vec<Part> {
     // default organization's), then its organization-led indexes.
     parts.push(families::core_schema::TOOL_CALLS_TENANT_PART.into());
     parts.push(families::core_schema::TOOL_CALLS_ORG_SCOPE.into());
+    // The organization column and triggers of the memory tables (no key
+    // rebuild: a note id is hub-generated and the version and vector keys are
+    // led by it), then the version-capture trigger that names its note's
+    // organization, the same-organization triggers and the org-led indexes.
+    parts.push(families::memory::TENANT_PART.into());
+    parts.push(families::memory::ORG_SCOPE.into());
     parts
 }
 

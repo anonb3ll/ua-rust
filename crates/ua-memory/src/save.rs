@@ -4,12 +4,12 @@
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use ua_core::{Caller, Config, UaError, UaResult};
-use ua_store::{Db, EventInput, WriteTx, ledger};
+use ua_store::{Db, WriteTx};
 
 use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for};
 use super::note::{
-    self, Eligibility, Note, assert_privileged, embed_text, json_opt, json_text, linked_note, text_sha,
-    write_author,
+    self, Eligibility, Note, assert_privileged, embed_text, emit, json_opt, json_text, ledger_label,
+    ledger_text, linked_note, text_sha, write_author,
 };
 use super::rank;
 use crate::blocking;
@@ -212,8 +212,10 @@ struct Outcome {
     embed_after: Option<(String, Option<String>, String)>,
 }
 
-/// Create a note (no `id`) or update one, as `caller`. Returns `{id, created,
-/// revision}` (and `similar` on create), or `{similar}` for `check_only`.
+/// Create a note (no `id`) or update one, as `caller`, in the caller's
+/// organization. Returns `{id, created, revision}` (and `similar` on create),
+/// or `{similar}` for `check_only`. Only the caller's organization's notes
+/// are read, updated, superseded, contradicted or reported as similar.
 ///
 /// With an available embedder, a new note is embedded before the write so
 /// its vector commits with it; an updated note is re-embedded after the
@@ -236,14 +238,15 @@ pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> U
             }
         }
         if let Some(v) = create_vec.clone() {
-            let (m, content) = (model.clone(), p.content.clone());
-            similar = db.read_async(move |c| similar_notes(c, &m, &v, &content)).await?;
+            let (m, content, org) = (model.clone(), p.content.clone(), caller.org_id.clone());
+            similar = db.read_async(move |c| similar_notes(c, &org, &m, &v, &content)).await?;
         }
     }
     if p.check_only {
         return Ok(json!({ "similar": similar }));
     }
 
+    let org = caller.org_id.clone();
     let caller = caller.clone();
     let m = model.clone();
     let creating = p.id.is_none();
@@ -265,10 +268,10 @@ pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> U
             Ok(v) => {
                 let res = db
                     .write_async(move |tx| {
-                        if let Some(n) = note::fetch(tx, &id)?
+                        if let Some(n) = note::fetch(tx, &org, &id)?
                             && text_sha(&embed_text(n.title.as_deref(), &n.content)) == sha
                         {
-                            embed::store_vector(tx, &id, &model, &v, &sha)?;
+                            embed::store_vector(tx, &org, &id, &model, &v, &sha)?;
                         }
                         Ok(())
                     })
@@ -285,13 +288,25 @@ pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> U
     Ok(result)
 }
 
-/// Live notes at least [`rank::DEDUP_THRESHOLD`] similar to a new note's vector.
-fn similar_notes(conn: &rusqlite::Connection, model: &str, v: &[f32], content: &str) -> UaResult<Vec<Value>> {
-    let elig = Eligibility { include_expired: true, now: ua_core::time::now(), ..Default::default() };
+/// Organization `org`'s live notes at least [`rank::DEDUP_THRESHOLD`]
+/// similar to a new note's vector.
+fn similar_notes(
+    conn: &rusqlite::Connection,
+    org: &str,
+    model: &str,
+    v: &[f32],
+    content: &str,
+) -> UaResult<Vec<Value>> {
+    let elig = Eligibility {
+        org: org.to_string(),
+        include_expired: true,
+        now: ua_core::time::now(),
+        ..Default::default()
+    };
     let hits = BruteForceIndex.nearest(conn, model, v, &elig.filter(), rank::DEDUP_THRESHOLD, 10)?;
     let mut out = Vec::new();
     for (id, sim) in hits {
-        if let Some(n) = note::fetch(conn, &id)? {
+        if let Some(n) = note::fetch(conn, org, &id)? {
             out.push(json!({
                 "id": id,
                 "title": n.title,
@@ -308,9 +323,28 @@ fn similar_notes(conn: &rusqlite::Connection, model: &str, v: &[f32], content: &
 /// (a `message_send` client id, say) or another caller's. `%` and `/` in the
 /// label are escaped, so the caller part always ends at the first `/` after
 /// the prefix and two callers' keys never meet.
+///
+/// `idempotency_keys` is still a hub-wide table (its `(org_id, principal,
+/// key)` rebuild is a later change), so another organization's key is
+/// prefixed with its organization (`org:<org>/…`), escaped the same way as
+/// the label: the organization part ends at the first `/`, so no
+/// organization id, label and key can spell another organization's key. The
+/// same label and key in two organizations are two rows, and neither replays
+/// the other's receipt. The default organization keeps the
+/// `memory_save/<label>/<key>` form byte for byte, so pre-upgrade scoped
+/// receipts still replay.
 fn scoped_key(caller: &Caller, key: &str) -> String {
-    let label = caller.label.replace('%', "%25").replace('/', "%2F");
-    format!("{SAVE_TOOL}/{label}/{key}")
+    let label = key_part(&caller.label);
+    if caller.org_id == ua_core::DEFAULT_ORG {
+        format!("{SAVE_TOOL}/{label}/{key}")
+    } else {
+        format!("org:{}/{SAVE_TOOL}/{label}/{key}", key_part(&caller.org_id))
+    }
+}
+
+/// One `/`-delimited part of a stored key: `%` and `/` escaped.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F")
 }
 
 const SAVE_TOOL: &str = "memory_save";
@@ -337,12 +371,16 @@ fn saved_receipt(tx: &WriteTx<'_>, caller: &Caller, key: &str) -> UaResult<Optio
     if let Some(raw) = read(&scoped_key(caller, key))? {
         return Ok(Some(raw));
     }
+    // Every pre-upgrade key was the default organization's.
+    if caller.org_id != ua_core::DEFAULT_ORG {
+        return Ok(None);
+    }
     let Some(raw) = read(key)? else { return Ok(None) };
     let id = serde_json::from_str::<Value>(&raw)
         .ok()
         .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string));
     let Some(id) = id else { return Ok(None) };
-    let mine = note::fetch(tx, &id)?.is_some_and(|n| {
+    let mine = note::fetch(tx, &caller.org_id, &id)?.is_some_and(|n| {
         let me = Some(caller.label.as_str());
         n.author.as_deref() == me || n.updated_by.as_deref() == me
     });
@@ -353,11 +391,24 @@ fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResul
     let Some(key) = &p.idempotency_key else { return Ok(None) };
     let Some(raw) = saved_receipt(tx, caller, key)? else { return Ok(None) };
     let cached: Value = serde_json::from_str(&raw).map_err(|e| UaError::internal(e.to_string()))?;
+    // A receipt names a note of the caller's organization, or it is not
+    // returned: notes are never hard-deleted, so a receipt whose note this
+    // organization cannot see was written by another one, and returning it
+    // would hand over that note's id and revision. The refusal names neither.
+    if let Some(id) = cached.get("id").and_then(Value::as_str)
+        && note::fetch(tx, &caller.org_id, id)?.is_none()
+    {
+        return Err(UaError::conflict_code(
+            "idempotency_key_conflict",
+            "this idempotency_key is already recorded for a save this caller cannot replay; \
+             nothing was written. Retry with a new idempotency_key",
+        ));
+    }
     // The receipt is returned only if this caller could make the save now.
     let check_id = p.id.clone().or_else(|| cached.get("id").and_then(Value::as_str).map(str::to_string));
     let mut replay_tags = p.tags.clone().unwrap_or_default();
     if let Some(id) = check_id
-        && let Some(n) = note::fetch(tx, &id)?
+        && let Some(n) = note::fetch(tx, &caller.org_id, &id)?
     {
         if n.is_deleted() {
             return Err(UaError::invalid(format!(
@@ -389,6 +440,7 @@ fn write(
     p: Prepared,
     vector: Option<(String, Vec<f32>)>,
 ) -> UaResult<Outcome> {
+    note::require_org(tx, &caller.org_id)?;
     if let Some(cached) = idempotent_replay(tx, caller, &p)? {
         return Ok(Outcome { result: cached, embed_after: None });
     }
@@ -400,7 +452,8 @@ fn write(
 }
 
 fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str) -> UaResult<Outcome> {
-    let old = note::fetch(tx, id)?.ok_or_else(|| {
+    let org = caller.org_id.as_str();
+    let old = note::fetch(tx, org, id)?.ok_or_else(|| {
         UaError::not_found(format!("no memory note with id {id:?}; omit id to create a new note"))
     })?;
     if let Some(expected) = &p.expected_revision {
@@ -491,7 +544,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
             if linked == id {
                 return Err(UaError::invalid("a note cannot contradict itself"));
             }
-            linked_note(tx, linked, "contradicts")?;
+            linked_note(tx, org, linked, "contradicts")?;
         }
     }
     let final_contradicts = p.contradicts.clone().unwrap_or_else(|| old.contradicts.clone());
@@ -508,7 +561,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
     tx.execute(
         "UPDATE memory SET content = ?1, title = ?2, tags = ?3, updated_at = ?4, updated_by = ?5, salience = ?6, \
          confidence = ?7, expires_at = ?8, epistemic = ?9, evidence = ?10, valid_from = ?11, contradicts = ?12 \
-         WHERE id = ?13",
+         WHERE id = ?13 AND org_id = ?14",
         params![
             final_content,
             final_title,
@@ -522,27 +575,26 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
             json_opt(&final_evidence),
             final_valid_from,
             json_opt(&final_contradicts),
-            id
+            id,
+            org
         ],
     )?;
-    let saved = note::require(tx, id)?;
+    let saved = note::require(tx, org, id)?;
     let revision = saved.revision();
-    ledger::append(
+    emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            "agent.memory.saved",
-            json!({
-                "id": id,
-                "created": false,
-                "mode": if p.append { "append" } else { "replace" },
-                "author": author,
-                "title": saved.title,
-                "tags": saved.tags,
-                "revision": revision,
-            }),
-        )
-        .by(caller.label.clone()),
+        org,
+        "agent.memory.saved",
+        json!({
+            "id": id,
+            "created": false,
+            "mode": if p.append { "append" } else { "replace" },
+            "author": ledger_label(org, author),
+            "title": ledger_text(org, json!(saved.title)),
+            "tags": ledger_text(org, json!(saved.tags)),
+            "revision": ledger_text(org, json!(revision)),
+        }),
+        &caller.label,
     )?;
     let result = json!({ "id": id, "created": false, "revision": revision });
     record_idempotency(tx, caller, &p, &result)?;
@@ -595,18 +647,19 @@ fn create(
     vector: Option<(String, Vec<f32>)>,
     ts: &str,
 ) -> UaResult<Outcome> {
+    let org = caller.org_id.as_str();
     let author = p.author.as_deref();
     if p.epistemic.as_deref() == Some("inferred") && p.evidence.is_empty() {
         return Err(UaError::invalid("an inferred note must carry evidence refs"));
     }
     let contradicts = p.contradicts.clone().unwrap_or_default();
     for linked in &contradicts {
-        linked_note(tx, linked, "contradicts")?;
+        linked_note(tx, org, linked, "contradicts")?;
     }
     let target = match &p.supersedes {
         None => None,
         Some(sid) => {
-            let target = linked_note(tx, sid, "supersedes")?;
+            let target = linked_note(tx, org, sid, "supersedes")?;
             if let Some(by) = &target.superseded_by {
                 return Err(UaError::invalid(format!(
                     "memory note {sid:?} is already superseded by {by:?}; supersede that note instead"
@@ -641,9 +694,9 @@ fn create(
         .or_else(|| (p.epistemic.is_some() || !p.evidence.is_empty()).then(|| ts.to_string()));
     let host = note::source_host(tx, caller);
     tx.execute(
-        "INSERT INTO memory (id, title, content, tags, author, updated_by, created_at, updated_at, salience, \
-         confidence, source_host, expires_at, epistemic, evidence, valid_from, contradicts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO memory (org_id, id, title, content, tags, author, updated_by, created_at, updated_at, \
+         salience, confidence, source_host, expires_at, epistemic, evidence, valid_from, contradicts) \
+         VALUES (?15, ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             p.title,
@@ -658,7 +711,8 @@ fn create(
             p.epistemic,
             json_opt(&p.evidence),
             valid_from,
-            json_opt(&contradicts)
+            json_opt(&contradicts),
+            org
         ],
     )?;
 
@@ -667,8 +721,9 @@ fn create(
         // memory_restore reverses the pointer.
         let valid_to = supersede_valid_to(target, valid_from.as_deref(), ts)?;
         let n = tx.execute(
-            "UPDATE memory SET superseded_by = ?1, valid_to = ?2 WHERE id = ?3 AND superseded_by IS NULL",
-            params![id, valid_to, target.id],
+            "UPDATE memory SET superseded_by = ?1, valid_to = ?2 \
+             WHERE id = ?3 AND org_id = ?4 AND superseded_by IS NULL",
+            params![id, valid_to, target.id, org],
         )?;
         if n != 1 {
             return Err(UaError::conflict(format!(
@@ -676,41 +731,42 @@ fn create(
                 target.id
             )));
         }
-        ledger::append(
+        emit(
             tx,
-            EventInput::new(
-                ua_core::DEFAULT_ORG,
-                "agent.memory.superseded",
-                json!({ "id": target.id, "superseded_by": id, "valid_to": valid_to, "actor": author }),
-            )
-            .by(caller.label.clone()),
+            org,
+            "agent.memory.superseded",
+            json!({
+                "id": target.id,
+                "superseded_by": id,
+                "valid_to": valid_to,
+                "actor": ledger_label(org, author),
+            }),
+            &caller.label,
         )?;
     }
 
     if let Some((model, v)) = vector {
         let sha = text_sha(&embed_text(p.title.as_deref(), &p.content));
-        embed::store_vector(tx, &id, &model, &v, &sha)?;
+        embed::store_vector(tx, org, &id, &model, &v, &sha)?;
     }
 
-    let saved = note::require(tx, &id)?;
+    let saved = note::require(tx, org, &id)?;
     let revision = saved.revision();
-    ledger::append(
+    emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            "agent.memory.saved",
-            json!({
-                "id": id,
-                "created": true,
-                "mode": "create",
-                "author": author,
-                "title": saved.title,
-                "tags": saved.tags,
-                "revision": revision,
-                "supersedes": p.supersedes,
-            }),
-        )
-        .by(caller.label.clone()),
+        org,
+        "agent.memory.saved",
+        json!({
+            "id": id,
+            "created": true,
+            "mode": "create",
+            "author": ledger_label(org, author),
+            "title": ledger_text(org, json!(saved.title)),
+            "tags": ledger_text(org, json!(saved.tags)),
+            "revision": ledger_text(org, json!(revision)),
+            "supersedes": p.supersedes,
+        }),
+        &caller.label,
     )?;
     let mut result = json!({ "id": id, "created": true, "similar": [], "revision": revision });
     if let Some(sid) = &p.supersedes {

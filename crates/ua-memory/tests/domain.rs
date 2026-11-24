@@ -10,8 +10,10 @@ use ua_memory::{lifecycle, save, search};
 use ua_store::{Db, ledger};
 
 fn db() -> Db {
-    let mut parts = vec![ledger::SCHEMA, ledger::META_SCHEMA];
-    parts.extend(ua_memory::schema_parts());
+    let mut parts: Vec<ua_store::Part> = ua_store::schema::parts(&[ledger::SCHEMA, ledger::META_SCHEMA]);
+    parts.push(ua_store::org::STORE_PART.into());
+    parts.extend(ua_memory::schema_parts().into_iter().map(ua_store::Part::from));
+    parts.extend(ua_memory::org_parts());
     Db::open_in_memory(&parts).unwrap()
 }
 
@@ -58,14 +60,19 @@ async fn save_search_get_delete_restore_without_a_registry() {
     let id = saved["id"].as_str().unwrap().to_string();
     assert!(saved["revision"].as_str().unwrap().starts_with("sha256:"));
 
-    let hits = search::search(&db, &cfg, SearchRequest { query: "wombat".into(), ..Default::default() })
-        .await
-        .unwrap();
+    let hits = search::search(
+        &db,
+        &cfg,
+        ua_core::DEFAULT_ORG,
+        SearchRequest { query: "wombat".into(), ..Default::default() },
+    )
+    .await
+    .unwrap();
     assert_eq!(hits["retrieval"]["mode"], json!("lexical_fallback"));
     assert_eq!(hits["results"][0]["id"], json!(id));
     assert_eq!(hits["results"][0]["trust"]["level"], json!("untrusted"));
 
-    let note = search::get(&db, get_req(&id)).await.unwrap();
+    let note = search::get(&db, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap();
     assert_eq!(note["author"], json!("builder-1"));
     assert_eq!(note["access_count"], json!(1), "the search counted one access");
 
@@ -77,9 +84,14 @@ async fn save_search_get_delete_restore_without_a_registry() {
     );
     let deleted = lifecycle::delete(&db, &a, id.clone()).await.unwrap();
     assert_eq!(deleted, json!({ "deleted": true }));
-    let gone = search::search(&db, &cfg, SearchRequest { query: "wombat".into(), ..Default::default() })
-        .await
-        .unwrap();
+    let gone = search::search(
+        &db,
+        &cfg,
+        ua_core::DEFAULT_ORG,
+        SearchRequest { query: "wombat".into(), ..Default::default() },
+    )
+    .await
+    .unwrap();
     assert_eq!(gone["results"], json!([]));
     let restored = lifecycle::restore(&db, &cfg, &a, id.clone()).await.unwrap();
     assert_eq!(restored["restored"], json!(true));
@@ -137,5 +149,8 @@ async fn a_legacy_human_delete_is_restored_only_by_a_human() {
     legacy_delete(id.clone(), "builder-1");
     let restored = lifecycle::restore(&db, &cfg, &owner, id.clone()).await.unwrap();
     assert_eq!(restored["restored"], json!(true));
-    assert_eq!(search::get(&db, get_req(&id)).await.unwrap()["content"], json!("Legacy note."));
+    assert_eq!(
+        search::get(&db, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap()["content"],
+        json!("Legacy note.")
+    );
 }

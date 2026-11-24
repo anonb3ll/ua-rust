@@ -719,12 +719,14 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             decode(&mut s, &["meta"]);
             Value::Object(s)
         }),
-        "memory_note" => one_row(
+        // A note of the reader's organization, without `org_id`.
+        "memory_note" => org_row(
             c,
             "SELECT id, title, content, tags, author, updated_by, created_at, updated_at, salience, confidence, \
              source_host, superseded_by, expires_at, epistemic, evidence, valid_from, valid_to FROM memory \
-             WHERE id = ?1",
+             WHERE id = ?1 AND org_id = ?2",
             id,
+            &caller.org_id,
         )?
         .map(|mut m| {
             decode(&mut m, &["tags"]);
