@@ -77,6 +77,59 @@ CREATE TABLE IF NOT EXISTS message_reads (
 ",
 };
 
+/// `organization.v1.tools.messaging`: `org_id` on `message_index` and
+/// `message_reads` and the generated `*_org_exists` / `*_org_immutable`
+/// triggers. Every existing row takes the default organization: every sender
+/// the hub has served was a default-organization caller, so that is where
+/// each message was sent, and a read receipt follows its message. Nothing is
+/// moved or dropped. No key rebuild: a message id and an event ulid are
+/// hub-minted, the receipt key is led by the message id, and a sender's
+/// client message id lives in `idempotency_keys`, prefixed per organization
+/// (see [`client_key`]).
+pub const TENANT_PART: ua_store::Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.messaging", &["message_index", "message_reads"]);
+
+/// `messaging.v2.org_scope`: the full payload of a message outside the
+/// default organization (`org_payload`), indexes led by `org_id` for the
+/// mailbox reads, and triggers that keep a read receipt with its message's
+/// organization and a reply with its parent's.
+///
+/// A message's ledger event is still written to the default organization's
+/// ledger (`ORG-EVENT-DEFAULT`), so another organization's event carries no
+/// body, label or client text; the message itself is kept on its index row,
+/// which only that organization reads. A default-organization row leaves
+/// `org_payload` NULL and reads its event, as before.
+///
+/// A message's `task_id` and `delegation_id` get no trigger: they were never
+/// checked (a missing id is accepted), every reader filters on the message's
+/// own organization, and a trigger would answer another organization's id
+/// differently from a missing one.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "messaging.v2.org_scope",
+    sql: "
+ALTER TABLE message_index ADD COLUMN org_payload TEXT;
+CREATE INDEX IF NOT EXISTS idx_message_index_org_recipient_seq ON message_index(org_id, recipient, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_sender_seq ON message_index(org_id, sender, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_conversation ON message_index(org_id, conversation_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_task ON message_index(org_id, task_id) WHERE task_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS message_reads_org_parent BEFORE INSERT ON message_reads
+WHEN EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.message_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'message belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_reads_org_parent_update BEFORE UPDATE OF message_id ON message_reads
+WHEN EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.message_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'message belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_index_org_reply BEFORE INSERT ON message_index
+WHEN NEW.reply_to IS NOT NULL
+ AND EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.reply_to AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'reply_to belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_index_org_reply_update BEFORE UPDATE OF reply_to ON message_index
+WHEN NEW.reply_to IS NOT NULL
+ AND EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.reply_to AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'reply_to belongs to another organization'); END;
+",
+};
+
 /// Speech acts, sorted.
 const ACTS: [&str; 5] = ["done", "handoff", "inform", "query", "request"];
 /// Hop must be in `0..MAX_HOPS`.
@@ -97,6 +150,113 @@ fn is_external_reply(id: &str) -> bool {
     EXTERNAL_REPLY_PREFIXES.iter().any(|p| id.starts_with(p))
 }
 const SEND_TOOL: &str = "message_send";
+
+/// A message's payload as SQL over `message_index i` joined to its event
+/// `e`: the row's own `org_payload` (another organization's message, whose
+/// ledger event carries no content), else the event's payload.
+pub(super) const MESSAGE_PAYLOAD: &str = "COALESCE(i.org_payload, e.payload)";
+/// [`MESSAGE_PAYLOAD`] over `message_index m`.
+const PAYLOAD_OF_M: &str = "COALESCE(m.org_payload, e.payload)";
+
+/// Refuse an organization that `orgs` does not hold, or holds suspended,
+/// before anything is written. The `org_exists` triggers fire only on
+/// insert, so a write with nothing to insert (a read mark, an ack) would
+/// otherwise pass.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no message was sent or changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no message was sent or changed"),
+        )),
+    }
+}
+
+/// Agent sessions carry no organization yet: until the agents family
+/// converts, every session is the default organization's. A caller in
+/// another organization therefore cannot name one of its own
+/// (`from_session`, `session_id`); it reads and acks its mailbox as its
+/// label. Refused before anything is read or written.
+fn require_default_sessions(org: &str, field: &str) -> UaResult<()> {
+    if org != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "{field}: agent sessions belong to the default organization until agents carry one; \
+                 read and send as your label. Nothing was read or changed"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The refusal of a message to another organization. A message belongs to
+/// its sender's organization and is never delivered across one: fail closed.
+fn cross_org_recipient(what: &str) -> UaError {
+    UaError::denied(
+        "cross_org_recipient",
+        format!(
+            "{what} belongs to another organization; a message is delivered only inside its sender's \
+             organization. Nothing was sent"
+        ),
+    )
+}
+
+/// Whether `label` is an agent of the default organization as far as the
+/// hub can tell today: a registered agent, or one with any session. Neither
+/// `agents` nor `agent_sessions` carries an organization yet, and every row
+/// in them is the default organization's (agent labels are one hub-wide,
+/// case-insensitive namespace), so a sender in another organization may not
+/// address such a label.
+fn default_org_agent(c: &Connection, label: &str) -> UaResult<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE label = ?1 COLLATE NOCASE) \
+         OR EXISTS(SELECT 1 FROM agent_sessions WHERE agent = ?1 COLLATE NOCASE)",
+        [label],
+        |r| r.get(0),
+    )?)
+}
+
+/// The ledger payload of a message of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the event is written to the default organization's
+/// ledger until `org_guard` admits another, so another organization's event
+/// keeps the payload's shape but carries only hub-minted ids, the act,
+/// counts and flags: the body, the typed handoff, every label, the
+/// conversation id (an unrestricted sender may choose it), `reply_to` and
+/// `event_id` (client text) and the client message id are `null`. The full
+/// payload is kept on the message's own index row (`org_payload`).
+fn ledger_payload(org: &str, full: &Value) -> Value {
+    if org == ua_core::DEFAULT_ORG {
+        return full.clone();
+    }
+    let text = |k: &str| full[k].as_str().map_or(Value::Null, |t| super::plans::ledger_text(org, t));
+    let label = |k: &str| super::plans::ledger_label(org, full[k].as_str());
+    json!({
+        "message_id": full["message_id"],
+        "client_message_id": text("client_message_id"),
+        "act": full["act"],
+        "conversation_id": text("conversation_id"),
+        "reply_to": text("reply_to"),
+        "from_agent": label("from_agent"),
+        "to_agent": label("to_agent"),
+        "to_session": label("to_session"),
+        "from_session": label("from_session"),
+        "hop": full["hop"],
+        "body": text("body"),
+        "task_id": full["task_id"],
+        "delegation_id": full["delegation_id"],
+        "event_id": text("event_id"),
+        "expects_reply": full["expects_reply"],
+        "sender_verified": full["sender_verified"],
+    })
+}
 
 const HANDOFF_FIELDS: [&str; 7] =
     ["done", "next_action", "why", "open_questions", "evidence", "reviewed_head_sha", "repo"];
@@ -355,6 +515,8 @@ struct Viewer {
     own_local: Option<String>,
     /// Human identities: messages to or from them are exempt from loop guards.
     humans: Vec<String>,
+    /// The caller's organization: the only one whose mail it sends or reads.
+    org: String,
 }
 
 impl Viewer {
@@ -373,6 +535,7 @@ impl Viewer {
             own_local,
             local_label: ctx.caller.label.clone(),
             humans: cfg.human_identities.clone(),
+            org: ctx.caller.org_id.clone(),
         }
     }
 }
@@ -581,12 +744,20 @@ struct Parent {
     sender_session: Option<String>,
 }
 
-fn parent(conn: &Connection, message_id: &str) -> UaResult<Option<Parent>> {
+fn parent(conn: &Connection, org: &str, message_id: &str) -> UaResult<Option<Parent>> {
     Ok(conn
         .query_row(
-            "SELECT sender, recipient, conversation_id, sender_session FROM message_index WHERE message_id = ?1",
-            [message_id],
-            |r| Ok(Parent { sender: r.get(0)?, recipient: r.get(1)?, conversation_id: r.get(2)?, sender_session: r.get(3)? }),
+            "SELECT sender, recipient, conversation_id, sender_session FROM message_index \
+             WHERE org_id = ?2 AND message_id = ?1",
+            params![message_id, org],
+            |r| {
+                Ok(Parent {
+                    sender: r.get(0)?,
+                    recipient: r.get(1)?,
+                    conversation_id: r.get(2)?,
+                    sender_session: r.get(3)?,
+                })
+            },
         )
         .optional()?)
 }
@@ -616,11 +787,28 @@ fn unreserved(label: String) -> UaResult<String> {
     Ok(label)
 }
 
-/// The idempotency key of a client-chosen id, scoped to its sender. Neither a
-/// label nor a client id may contain `/`, so the key is unambiguous, and it
-/// never matches a pre-scoping key (`message_send:<id>`).
-fn client_key(sender: &str, client_id: &str) -> String {
-    format!("{SEND_TOOL}/{sender}/{client_id}")
+/// The idempotency key of a client-chosen id, scoped to its organization
+/// and its sender. `idempotency_keys` is still a hub-wide table, so another
+/// organization's key is prefixed with its organization
+/// (`org:<org>/message_send/<sender>/<id>`) and can never replay, probe or
+/// occupy the default organization's, or a third's. Each part has `%` and
+/// `/` escaped, so an organization id containing `/` cannot spell another
+/// organization's prefix. The default organization keeps
+/// `message_send/<sender>/<id>` byte for byte (a valid label and client id
+/// contain neither character), so its earlier receipts still replay; no
+/// form ever matches a pre-scoping key (`message_send:<id>`).
+fn client_key(org: &str, sender: &str, client_id: &str) -> String {
+    let (sender, client_id) = (key_part(sender), key_part(client_id));
+    if org == ua_core::DEFAULT_ORG {
+        format!("{SEND_TOOL}/{sender}/{client_id}")
+    } else {
+        format!("org:{}/{SEND_TOOL}/{sender}/{client_id}", key_part(org))
+    }
+}
+
+/// One `/`-delimited part of a stored key: `%` and `/` escaped.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F")
 }
 
 fn saved_send(conn: &Connection, key: &str) -> UaResult<Option<Value>> {
@@ -635,27 +823,46 @@ fn saved_send(conn: &Connection, key: &str) -> UaResult<Option<Value>> {
 }
 
 /// The committed result of `sender`'s earlier send under `client_id`, if any.
-/// Client ids are keyed by `(sender, id)`: another sender's use of the same
-/// id is invisible here, so a foreign id answers exactly like a fresh one.
-fn saved_result(conn: &Connection, client_id: &str, sender: &str) -> UaResult<Option<Value>> {
+/// Client ids are keyed by `(organization, sender, id)`: another sender's or
+/// another organization's use of the same id is invisible here, so a foreign
+/// id answers exactly like a fresh one.
+///
+/// A receipt is replayed only when the message it names is not another
+/// organization's. The key's organization prefix already rules that out;
+/// this is the backstop, and it fails closed with a refusal that names
+/// nothing, never with the other organization's result.
+fn saved_result(conn: &Connection, org: &str, client_id: &str, sender: &str) -> UaResult<Option<Value>> {
     // Before ids were scoped, a client id was the message id itself, under a
     // hub-wide key. The sender's own retry of such a send still finds it.
+    // Every such key was the default organization's.
     let legacy = || saved_send(conn, &format!("{SEND_TOOL}:{client_id}"));
-    let found = match saved_send(conn, &client_key(sender, client_id))? {
+    let found = match saved_send(conn, &client_key(org, sender, client_id))? {
         Some(v) => Some(v),
-        None => legacy()?.filter(|v| v["from_agent"].as_str() == Some(sender)),
+        None if org == ua_core::DEFAULT_ORG => legacy()?.filter(|v| v["from_agent"].as_str() == Some(sender)),
+        None => None,
     };
-    Ok(found.filter(|v| v["accepted"] == json!(true)).map(|mut v| {
-        v["duplicate"] = json!(true);
-        v
-    }))
+    let Some(found) = found.filter(|v| v["accepted"] == json!(true)) else { return Ok(None) };
+    if let Some(mid) = found["message_id"].as_str()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE message_id = ?1 AND org_id <> ?2)",
+            params![mid, org],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Err(UaError::conflict(
+            "message_id is already used as a client id and cannot be replayed here; choose another message_id",
+        ));
+    }
+    let mut v = found;
+    v["duplicate"] = json!(true);
+    Ok(Some(v))
 }
 
 /// `id` as a message id for `sender`: the hub id of the sender's own send
 /// under client id `id` when there is one, else `id` unchanged. Only the
 /// sender's own keys are consulted, so this reveals nothing about others.
-fn own_message_id(conn: &Connection, sender: &str, id: String) -> UaResult<String> {
-    Ok(saved_send(conn, &client_key(sender, &id))?
+fn own_message_id(conn: &Connection, org: &str, sender: &str, id: String) -> UaResult<String> {
+    Ok(saved_send(conn, &client_key(org, sender, &id))?
         .and_then(|v| v["message_id"].as_str().map(str::to_string))
         .unwrap_or(id))
 }
@@ -665,11 +872,12 @@ fn own_message_id(conn: &Connection, sender: &str, id: String) -> UaResult<Strin
 /// sender and that session is still open and live.
 fn reply_default_session(
     conn: &Connection,
+    org: &str,
     reply_to: &str,
     sender: &str,
     to_agent: Option<&str>,
 ) -> UaResult<Option<String>> {
-    let Some(p) = parent(conn, reply_to)? else { return Ok(None) };
+    let Some(p) = parent(conn, org, reply_to)? else { return Ok(None) };
     let Some(session) = p.sender_session else { return Ok(None) };
     if p.recipient != sender || to_agent.is_some_and(|t| t != p.sender) {
         return Ok(None);
@@ -686,12 +894,18 @@ fn reply_default_session(
 /// Unlike naming a `conversation_id`, the recipient of session-targeted mail
 /// counts as a party here: answering through `reply_to` is how it joins that
 /// thread (docs/organization.md, The ledger).
-fn check_reply(conn: &Connection, reply_to: Option<&str>, sender: &str) -> UaResult<Option<String>> {
+fn check_reply(
+    conn: &Connection,
+    org: &str,
+    reply_to: Option<&str>,
+    sender: &str,
+) -> UaResult<Option<String>> {
     let Some(reply) = reply_to else { return Ok(None) };
     if is_external_reply(reply) {
         return Ok(None);
     }
-    match parent(conn, reply)? {
+    // Another organization's message answers exactly as a missing one.
+    match parent(conn, org, reply)? {
         Some(p) if p.sender == sender || p.recipient == sender => Ok(Some(p.conversation_id)),
         _ => Err(UaError::invalid(format!(
             "reply_to {reply:?} is not a message you sent or received; reply_to must name an existing message you were party to"
@@ -708,12 +922,16 @@ struct ChainRow {
     body: Option<String>,
 }
 
-fn chain_row(conn: &Connection, message_id: &str) -> UaResult<Option<ChainRow>> {
+fn chain_row(conn: &Connection, org: &str, message_id: &str) -> UaResult<Option<ChainRow>> {
     Ok(conn
         .query_row(
-            "SELECT m.sender, m.recipient, m.reply_to, json_extract(e.payload, '$.hop'), json_extract(e.payload, '$.body') \
-             FROM message_index m LEFT JOIN event_log e ON e.ulid = m.event_ulid WHERE m.message_id = ?1",
-            [message_id],
+            &format!(
+                "SELECT m.sender, m.recipient, m.reply_to, json_extract({p}, '$.hop'), json_extract({p}, '$.body') \
+                 FROM message_index m LEFT JOIN event_log e ON e.ulid = m.event_ulid \
+                 WHERE m.org_id = ?2 AND m.message_id = ?1",
+                p = PAYLOAD_OF_M
+            ),
+            params![message_id, org],
             |r| {
                 Ok(ChainRow {
                     sender: r.get(0)?,
@@ -728,9 +946,9 @@ fn chain_row(conn: &Connection, message_id: &str) -> UaResult<Option<ChainRow>> 
 }
 
 /// A reply's hop: one past its parent's, or the requested hop when higher.
-fn reply_hop(conn: &Connection, reply_to: Option<&str>, requested: i64) -> UaResult<i64> {
+fn reply_hop(conn: &Connection, org: &str, reply_to: Option<&str>, requested: i64) -> UaResult<i64> {
     let Some(reply) = reply_to else { return Ok(requested) };
-    Ok(match chain_row(conn, reply)? {
+    Ok(match chain_row(conn, org, reply)? {
         Some(p) => requested.max(p.hop.unwrap_or(0) + 1),
         None => requested,
     })
@@ -740,6 +958,7 @@ fn reply_hop(conn: &Connection, reply_to: Option<&str>, requested: i64) -> UaRes
 /// warn on the last one allowed.
 fn check_pair_streak(
     conn: &Connection,
+    org: &str,
     reply_to: Option<&str>,
     sender: &str,
     recipient: &str,
@@ -757,7 +976,7 @@ fn check_pair_streak(
         if streak >= PAIR_STREAK_MAX {
             break;
         }
-        let Some(row) = chain_row(conn, &id)? else { break };
+        let Some(row) = chain_row(conn, org, &id)? else { break };
         if !same_pair(&row.sender, &row.recipient) || row.sender == speaker {
             break;
         }
@@ -780,6 +999,9 @@ fn check_pair_streak(
 }
 
 fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> UaResult<Value> {
+    let org = v.org.as_str();
+    // An unknown or suspended organization is refused before anything else.
+    require_org(tx, org)?;
     let act = a.act.trim().to_string();
     if !ACTS.contains(&act.as_str()) {
         return Err(UaError::invalid(format!("act must be one of {}", ACTS.join(", "))));
@@ -804,10 +1026,20 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
             "from_agent",
         )?)?,
     };
+    let sender_session = clean(a.from_session.as_deref());
+    if sender_session.is_some() {
+        require_default_sessions(org, "from_session")?;
+    }
+    // Every session is the default organization's (see
+    // `require_default_sessions`): one is never another organization's
+    // recipient. Refused before the session is looked up, so the answer is
+    // the same whether it exists or not.
+    if org != ua_core::DEFAULT_ORG && clean(a.to_session.as_deref()).is_some() {
+        return Err(cross_org_recipient("to_session"));
+    }
     agents::reap(tx)?;
     // The sender's own session is checked and heartbeated first, so a session
     // that only retries a committed send stays live.
-    let sender_session = clean(a.from_session.as_deref());
     if let Some(s) = &sender_session {
         agents::own_session(tx, s, &sender, true)?;
     }
@@ -824,19 +1056,19 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         }
         // A retry returns its saved result before anything that can change
         // after the first attempt (the target session may have ended since).
-        if let Some(saved) = saved_result(tx, m, &sender)? {
+        if let Some(saved) = saved_result(tx, org, m, &sender)? {
             return Ok(saved);
         }
     }
 
     // A sender may thread under its own client id.
     let reply = match clean(a.reply_to.as_deref()) {
-        Some(r) if !is_external_reply(&r) => Some(own_message_id(tx, &sender, r)?),
+        Some(r) if !is_external_reply(&r) => Some(own_message_id(tx, org, &sender, r)?),
         other => other,
     };
     // Party-check reply_to before it can default the recipient, so a missing
     // and a foreign parent answer alike.
-    let inherited = check_reply(tx, reply.as_deref(), &sender)?;
+    let inherited = check_reply(tx, org, reply.as_deref(), &sender)?;
     let mut to_agent = clean(a.to_agent.as_deref());
     let mut target = clean(a.to_session.as_deref());
     // An external reply_to skips the party check, so it never looks up a
@@ -844,7 +1076,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if target.is_none()
         && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
     {
-        target = reply_default_session(tx, r, &sender, to_agent.as_deref())?;
+        target = reply_default_session(tx, org, r, &sender, to_agent.as_deref())?;
     }
     let mut target_live: Option<bool> = None;
     let mut fallback: Option<Value> = None;
@@ -878,7 +1110,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     }
     if to_agent.is_none()
         && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
-        && let Some(p) = parent(tx, r)?
+        && let Some(p) = parent(tx, org, r)?
     {
         // A reply with no address answers the other party of its parent.
         to_agent = Some(if p.sender == sender { p.recipient } else { p.sender });
@@ -887,7 +1119,19 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if sender == recipient {
         return Err(UaError::invalid("from_agent and to_agent must differ"));
     }
-    let (availability, delivery_warning) = agents::availability(tx, &recipient)?;
+    // A message is its sender's organization's. Outside the default
+    // organization, a label the hub knows as an agent is the default
+    // organization's (`default_org_agent`): refused, never delivered there.
+    // Inside it, mail to any label stays in the default organization, where
+    // no other organization's reader can see it.
+    let (availability, delivery_warning) = if org == ua_core::DEFAULT_ORG {
+        agents::availability(tx, &recipient)?
+    } else if default_org_agent(tx, &recipient)? {
+        return Err(cross_org_recipient(&format!("to_agent {recipient:?}")));
+    } else {
+        // Nothing records another organization's liveness yet.
+        (json!({ "agent": recipient, "availability": "unknown", "reason": "no_liveness_record" }), None)
+    };
 
     let requested_hop = a.hop.unwrap_or(0);
     if !(0..MAX_HOPS).contains(&requested_hop) {
@@ -909,9 +1153,9 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         // crew thread; a direct message_send never gets this grant.
         && !crew.is_some_and(|s| *cid == format!("{}{s}", super::sessions_lifecycle::CREW_CONVERSATION_PREFIX))
         && !tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?3 AND conversation_id = ?1 \
              AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
-            params![cid, sender],
+            params![cid, sender, org],
             |r| r.get::<_, bool>(0),
         )?
     {
@@ -929,13 +1173,13 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if !(human(&sender) || human(&recipient)) {
         // An external reply_to names no hub message to chain from.
         let chained = reply.as_deref().filter(|r| !is_external_reply(r));
-        hop = reply_hop(tx, chained, hop)?;
+        hop = reply_hop(tx, org, chained, hop)?;
         if hop >= MAX_HOPS {
             return Err(UaError::invalid(format!(
                 "reply chain reached hop {hop} (limit {MAX_HOPS}); stop replying here, or send without reply_to if this is new work"
             )));
         }
-        loop_warning = check_pair_streak(tx, chained, &sender, &recipient, &body)?;
+        loop_warning = check_pair_streak(tx, org, chained, &sender, &recipient, &body)?;
     }
     let event_id = clean(a.event_id.as_deref());
     let mut payload = json!({
@@ -961,23 +1205,29 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if let Some(h) = &typed {
         payload["handoff"] = h.clone();
     }
+    let default = org == ua_core::DEFAULT_ORG;
+    // ORG-EVENT-DEFAULT: another organization's message event carries no
+    // content (`ledger_payload`), the neutral originator, and no
+    // conversation or parent pointer; the message is kept on its own row.
     let event = ledger::append(
         tx,
         EventInput {
             channel: format!("agent.message.{act}"),
-            payload,
-            originator: Some(sender.clone()),
-            episode_id: Some(conversation.clone()),
-            causal_parent_id: reply.clone().or_else(|| event_id.clone()),
+            payload: ledger_payload(org, &payload),
+            originator: Some(crate::approvals::ledger_originator(org, &sender)),
+            episode_id: default.then(|| conversation.clone()),
+            causal_parent_id: if default { reply.clone().or_else(|| event_id.clone()) } else { None },
             dedupe_key: None,
             org_id: ua_core::DEFAULT_ORG.into(),
         },
     )?
     .ok_or_else(|| UaError::internal("message event was not appended"))?;
+    let org_payload = (!default).then(|| payload.to_string());
     tx.execute(
-        "INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, reply_to, expects_reply, \
-         task_id, delegation_id, event_ulid, event_seq, created_at, target_session, sender_session) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO message_index (org_id, message_id, recipient, sender, act, conversation_id, reply_to, \
+         expects_reply, task_id, delegation_id, event_ulid, event_seq, created_at, target_session, sender_session, \
+         org_payload) \
+         VALUES (?15, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16)",
         params![
             mid,
             recipient,
@@ -992,7 +1242,9 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
             event.seq,
             event.created_at,
             target,
-            sender_session
+            sender_session,
+            org,
+            org_payload
         ],
     )?;
     let mut result = json!({
@@ -1042,7 +1294,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     if let Some(client_id) = &given_id {
         tx.execute(
             "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![client_key(&sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
+            params![client_key(org, &sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
         )?;
     }
     Ok(result)
@@ -1051,24 +1303,29 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
 // --- list -----------------------------------------------------------------------
 
 /// A reply counts as an answer only when it goes from the message's recipient
-/// back to its sender.
-const ANSWERED_BY: &str = "(SELECT a.message_id FROM message_index a WHERE a.reply_to = i.message_id \
+/// back to its sender, in the message's own organization.
+const ANSWERED_BY: &str = "(SELECT a.message_id FROM message_index a WHERE a.org_id = i.org_id \
+                           AND a.reply_to = i.message_id \
                            AND a.sender = i.recipient AND a.recipient = i.sender ORDER BY a.event_seq LIMIT 1)";
-const ANSWERED_AT: &str = "(SELECT a.created_at FROM message_index a WHERE a.reply_to = i.message_id \
+const ANSWERED_AT: &str = "(SELECT a.created_at FROM message_index a WHERE a.org_id = i.org_id \
+                           AND a.reply_to = i.message_id \
                            AND a.sender = i.recipient AND a.recipient = i.sender ORDER BY a.event_seq LIMIT 1)";
 /// Label mail plus mail to the given session, unread by both the label and
-/// the session. Binds `(session_id, agent, session_id)`.
+/// the session, in one organization. Binds `(session_id, agent, session_id,
+/// org)`.
 const UNREAD_SQL: &str = "SELECT COUNT(*) FROM message_index i \
                           LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
-                          WHERE i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
+                          WHERE i.org_id = ?4 AND i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
                           AND (i.target_session IS NULL OR i.target_session = ?3)";
 
-fn unread_count(conn: &Connection, agent: &str, session: Option<&str>) -> UaResult<i64> {
-    Ok(conn.query_row(UNREAD_SQL, params![session, agent, session], |r| r.get(0))?)
+fn unread_count(conn: &Connection, org: &str, agent: &str, session: Option<&str>) -> UaResult<i64> {
+    Ok(conn.query_row(UNREAD_SQL, params![session, agent, session, org], |r| r.get(0))?)
 }
 
 #[derive(Debug, Default)]
 struct Filters {
+    /// The reader's organization: every row is filtered on it.
+    org: String,
     recipient: Option<String>,
     sender: Option<String>,
     party: Option<String>,
@@ -1089,8 +1346,9 @@ impl Filters {
     /// The WHERE clause and its arguments, after the receipt-join session.
     fn sql(&self) -> (String, Vec<SqlValue>) {
         let text = |s: &str| SqlValue::Text(s.to_string());
-        let mut clauses: Vec<String> = vec!["1=1".into()];
-        let mut args: Vec<SqlValue> = vec![self.session_id.as_deref().map_or(SqlValue::Null, text)];
+        let mut clauses: Vec<String> = vec!["i.org_id = ?".into()];
+        let mut args: Vec<SqlValue> =
+            vec![self.session_id.as_deref().map_or(SqlValue::Null, text), text(&self.org)];
         for (column, value) in [
             ("i.recipient", &self.recipient),
             ("i.sender", &self.sender),
@@ -1104,7 +1362,7 @@ impl Filters {
             }
         }
         if let Some(c) = &self.client_message_id {
-            clauses.push("json_extract(e.payload, '$.client_message_id') = ?".into());
+            clauses.push(format!("json_extract({MESSAGE_PAYLOAD}, '$.client_message_id') = ?"));
             args.push(text(c));
         }
         if let Some(p) = &self.party {
@@ -1223,7 +1481,7 @@ fn query_rows(conn: &Connection, f: &Filters, limit: i64) -> UaResult<Vec<Value>
     args.push(SqlValue::Integer(limit.clamp(1, MAX_LIST_LIMIT)));
     let sql = format!(
         "SELECT i.*, COALESCE(i.read_at, r.read_at) AS eff_read_at, COALESCE(i.acked_at, r.acked_at) AS eff_acked_at, \
-         e.channel AS channel, e.payload AS payload, {ANSWERED_BY} AS answered_by, {ANSWERED_AT} AS answered_at \
+         e.channel AS channel, {MESSAGE_PAYLOAD} AS payload, {ANSWERED_BY} AS answered_by, {ANSWERED_AT} AS answered_at \
          {FROM_INDEX}{filter} ORDER BY i.event_seq {order} LIMIT ?"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1246,6 +1504,7 @@ fn count_rows(conn: &Connection, f: &Filters) -> UaResult<i64> {
 /// mail to the session is marked on its row, label mail gets a receipt.
 fn mark_read(
     conn: &Connection,
+    org: &str,
     owner: &str,
     ids: &[String],
     session: Option<&str>,
@@ -1255,20 +1514,20 @@ fn mark_read(
     for id in ids {
         total += match session {
             None => conn.execute(
-                "UPDATE message_index SET read_at = ?1 WHERE message_id = ?2 AND recipient = ?3 \
+                "UPDATE message_index SET read_at = ?1 WHERE org_id = ?4 AND message_id = ?2 AND recipient = ?3 \
                  AND read_at IS NULL AND target_session IS NULL",
-                params![stamp, id, owner],
+                params![stamp, id, owner, org],
             )?,
             Some(s) => {
                 conn.execute(
-                    "UPDATE message_index SET read_at = ?1 WHERE message_id = ?2 AND recipient = ?3 \
+                    "UPDATE message_index SET read_at = ?1 WHERE org_id = ?5 AND message_id = ?2 AND recipient = ?3 \
                      AND read_at IS NULL AND target_session = ?4",
-                    params![stamp, id, owner, s],
+                    params![stamp, id, owner, s, org],
                 )? + conn.execute(
-                    "INSERT OR IGNORE INTO message_reads (message_id, session_id, read_at) \
-                     SELECT message_id, ?1, ?2 FROM message_index WHERE message_id = ?3 AND recipient = ?4 \
-                     AND read_at IS NULL AND target_session IS NULL",
-                    params![s, stamp, id, owner],
+                    "INSERT OR IGNORE INTO message_reads (org_id, message_id, session_id, read_at) \
+                     SELECT org_id, message_id, ?1, ?2 FROM message_index WHERE org_id = ?5 AND message_id = ?3 \
+                     AND recipient = ?4 AND read_at IS NULL AND target_session IS NULL",
+                    params![s, stamp, id, owner, org],
                 )?
             }
         };
@@ -1324,6 +1583,9 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     // unverified caller's configured label.
     let own_inbox = (q.unread_only || mark) && recipient.is_none() && sender.is_none();
     let sid = clean(q.session_id.as_deref());
+    if sid.is_some() {
+        require_default_sessions(&v.org, "session_id")?;
+    }
     let mut mailbox = me.clone().or_else(|| recipient.clone());
     if mailbox.is_none() && (own_inbox || mark || sid.is_some()) {
         mailbox = Some(v.local_label.clone());
@@ -1351,6 +1613,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         .filter(|m| recipient.is_none() || recipient.as_ref() == Some(*m))
         .map(|m| (m.clone(), sid.clone()));
     let filters = Filters {
+        org: v.org.clone(),
         recipient,
         sender,
         party,
@@ -1358,7 +1621,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         act,
         // The caller's own client id finds the message it keyed.
         message_id: match clean(q.message_id.as_deref()) {
-            Some(m) => Some(own_message_id(conn, me.as_deref().unwrap_or(&v.local_label), m)?),
+            Some(m) => Some(own_message_id(conn, &v.org, me.as_deref().unwrap_or(&v.local_label), m)?),
             None => None,
         },
         client_message_id: clean(q.client_message_id.as_deref()),
@@ -1383,7 +1646,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
                 .filter_map(|r| r["message_id"].as_str().map(str::to_string))
                 .collect();
             if !own.is_empty() {
-                let (n, stamp) = mark_read(conn, owner, &own, sid.as_deref())?;
+                let (n, stamp) = mark_read(conn, &v.org, owner, &own, sid.as_deref())?;
                 marked = n;
                 for row in rows.iter_mut() {
                     if row["message_id"].as_str().is_some_and(|id| own.iter().any(|o| o == id)) {
@@ -1410,7 +1673,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         out
     };
     if let Some(owner) = &mailbox {
-        result["unread"] = json!(unread_count(conn, owner, sid.as_deref())?);
+        result["unread"] = json!(unread_count(conn, &v.org, owner, sid.as_deref())?);
     }
     if let Some(s) = sid {
         result["session_id"] = json!(s);
@@ -1438,6 +1701,8 @@ fn mark_untrusted(result: &mut Value, caller: Option<&str>) {
 // --- ack ------------------------------------------------------------------------
 
 fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
+    let org = v.org.as_str();
+    require_org(tx, org)?;
     let mid = clean(a.message_id.as_deref());
     let (seq_cursor, id_cursor) = match a.through {
         Some(Through::Seq(n)) if n < 0 => return Err(UaError::invalid("through must be a non-negative seq")),
@@ -1469,15 +1734,18 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
     };
     let sid = clean(a.session_id.as_deref());
     if let Some(s) = &sid {
+        require_default_sessions(org, "session_id")?;
         agents::own_session(tx, s, &mailbox, false)?;
     }
-    let in_reach = "recipient = ?1 AND message_id = ?2 AND (target_session IS NULL OR target_session = ?3)";
+    // Another organization's message answers exactly as a missing one.
+    let in_reach = "org_id = ?4 AND recipient = ?1 AND message_id = ?2 \
+                    AND (target_session IS NULL OR target_session = ?3)";
     let mut through_seq = seq_cursor;
     if let Some(m) = &mid {
         let found = tx
             .query_row(
                 &format!("SELECT 1 FROM message_index WHERE {in_reach}"),
-                params![mailbox, m, sid],
+                params![mailbox, m, sid, org],
                 |_| Ok(()),
             )
             .optional()?;
@@ -1490,7 +1758,7 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
         let seq: Option<i64> = tx
             .query_row(
                 &format!("SELECT event_seq FROM message_index WHERE {in_reach}"),
-                params![mailbox, c, sid],
+                params![mailbox, c, sid, org],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1512,12 +1780,12 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
         None => ("target_session IS NULL", vec![]),
         Some(s) => ("target_session = ?", vec![text(s)]),
     };
-    let mut args = vec![text(&stamp), text(&stamp), text(&mailbox), key.clone()];
+    let mut args = vec![text(&stamp), text(&stamp), text(org), text(&mailbox), key.clone()];
     args.append(&mut scope_args);
     let mut acked = tx.execute(
         &format!(
             "UPDATE message_index SET acked_at = COALESCE(acked_at, ?), read_at = COALESCE(read_at, ?) \
-             WHERE recipient = ? AND {pick} AND acked_at IS NULL AND {scope}"
+             WHERE org_id = ? AND recipient = ? AND {pick} AND acked_at IS NULL AND {scope}"
         ),
         params_from_iter(args),
     )?;
@@ -1527,32 +1795,32 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
             let mut stmt = tx.prepare(&format!(
                 "SELECT i.message_id FROM message_index i \
                  LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ? \
-                 WHERE i.recipient = ? AND i.target_session IS NULL AND i.acked_at IS NULL \
+                 WHERE i.org_id = ? AND i.recipient = ? AND i.target_session IS NULL AND i.acked_at IS NULL \
                  AND r.acked_at IS NULL AND i.{pick}"
             ))?;
-            stmt.query_map(params_from_iter([text(s), text(&mailbox), key]), |r| r.get(0))?
+            stmt.query_map(params_from_iter([text(s), text(org), text(&mailbox), key]), |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
         for id in &pending {
             tx.execute(
-                "INSERT INTO message_reads (message_id, session_id, read_at, acked_at) VALUES (?1, ?2, ?3, ?3) \
+                "INSERT INTO message_reads (org_id, message_id, session_id, read_at, acked_at) \
+                 VALUES (?4, ?1, ?2, ?3, ?3) \
                  ON CONFLICT(message_id, session_id) DO UPDATE SET acked_at = excluded.acked_at",
-                params![id, s, stamp],
+                params![id, s, stamp, org],
             )?;
         }
         acked += pending.len();
     }
     if acked > 0 {
-        ledger::append(
+        mailbox_event(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG,
-                "agent.mailbox.acked",
-                json!({ "mailbox": mailbox, "session_id": sid, "message_id": mid, "through_seq": through_seq, "count": acked }),
-            )
-            .by(mailbox.clone()),
+            org,
+            "agent.mailbox.acked",
+            &mailbox,
+            json!({ "session_id": sid, "message_id": mid, "through_seq": through_seq, "count": acked }),
         )?;
     }
-    let unread = unread_count(tx, &mailbox, sid.as_deref())?;
+    let unread = unread_count(tx, org, &mailbox, sid.as_deref())?;
     Ok(json!({
         "acked": acked,
         "mailbox": mailbox,
@@ -1562,6 +1830,38 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
         "session_id": sid,
         "unread": unread,
     }))
+}
+
+/// Append a mailbox receipt event (`agent.mailbox.read` / `.acked`) about
+/// `mailbox` in organization `org`, with `payload`'s fields after the
+/// mailbox.
+///
+/// ORG-EVENT-DEFAULT: the event is written to the default organization's
+/// ledger, so another organization's receipt names no mailbox and no
+/// client-chosen message id (`plans::ledger_label` / `ledger_text`), and its
+/// originator is the neutral `system`.
+fn mailbox_event(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    mailbox: &str,
+    payload: Value,
+) -> UaResult<()> {
+    let mut p = json!({ "mailbox": super::plans::ledger_label(org, Some(mailbox)) });
+    if let (Some(out), Value::Object(fields)) = (p.as_object_mut(), payload) {
+        out.extend(fields);
+    }
+    if org != ua_core::DEFAULT_ORG
+        && let Some(m) = p.get("message_id").and_then(Value::as_str).map(str::to_string)
+    {
+        p["message_id"] = super::plans::ledger_text(org, &m);
+    }
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, channel, p)
+            .by(crate::approvals::ledger_originator(org, mailbox)),
+    )?;
+    Ok(())
 }
 
 // --- tools ----------------------------------------------------------------------
@@ -1579,12 +1879,15 @@ pub(crate) fn send_system(
     body: &str,
     task_id: Option<i64>,
 ) -> UaResult<Value> {
+    // The hub's own senders (node notices) serve the default organization,
+    // as every session they notify is its.
     let v = Viewer {
         identity: Some(from.to_string()),
         unrestricted: true,
         own_local: None,
         local_label: from.to_string(),
         humans: Vec::new(),
+        org: ua_core::DEFAULT_ORG.into(),
     };
     send(
         tx,
@@ -1660,26 +1963,26 @@ async fn message_inbox(ctx: ToolCtx, a: InboxArgs) -> UaResult<Value> {
         after_seq: a.after_seq,
         ..ListArgs::default()
     };
-    let mut out =
-        ctx.hub
-            .db()
-            .write_async(move |tx| {
-                let out = list_messages(tx, &v, q, true)?;
-                let marked = out["marked_read"].as_u64().unwrap_or(0);
-                if marked > 0 {
-                    let mailbox = out["mailbox"].as_str().unwrap_or(&v.local_label).to_string();
-                    ledger::append(
+    let mut out = ctx
+        .hub
+        .db()
+        .write_async(move |tx| {
+            require_org(tx, &v.org)?;
+            let out = list_messages(tx, &v, q, true)?;
+            let marked = out["marked_read"].as_u64().unwrap_or(0);
+            if marked > 0 {
+                let mailbox = out["mailbox"].as_str().unwrap_or(&v.local_label).to_string();
+                mailbox_event(
                     tx,
-                    EventInput::new(ua_core::DEFAULT_ORG,
-                        "agent.mailbox.read",
-                        json!({ "mailbox": mailbox, "session_id": out.get("session_id"), "count": marked }),
-                    )
-                    .by(mailbox.clone()),
+                    &v.org,
+                    "agent.mailbox.read",
+                    &mailbox,
+                    json!({ "session_id": out.get("session_id"), "count": marked }),
                 )?;
-                }
-                Ok(out)
-            })
-            .await?;
+            }
+            Ok(out)
+        })
+        .await?;
     mark_untrusted(&mut out, caller.as_deref());
     Ok(out)
 }

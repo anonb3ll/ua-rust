@@ -172,6 +172,17 @@ pub fn schema_parts() -> Vec<Part> {
     // organization, the same-organization triggers and the org-led indexes.
     parts.push(families::memory::TENANT_PART.into());
     parts.push(families::memory::ORG_SCOPE.into());
+    // The organization column and triggers of the mailbox tables and the
+    // relay's drafts (no key rebuild: message ids and event ulids are
+    // hub-minted, receipts are keyed by them, and drafts by an
+    // AUTOINCREMENT id; every existing row is the default organization's),
+    // then the organization-led indexes, another organization's message
+    // payload column, and the rules that a receipt, a reply and a draft's
+    // approval stay in their own organization. After the approvals parts.
+    parts.push(families::messaging::TENANT_PART.into());
+    parts.push(families::messaging::ORG_SCOPE.into());
+    parts.push(families::relay::TENANT_PART.into());
+    parts.push(families::relay::ORG_SCOPE.into());
     parts
 }
 

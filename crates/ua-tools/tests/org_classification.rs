@@ -172,8 +172,10 @@ const TENANT: &[&str] = &[
 /// `managed_secrets` (`managed_secrets.v2.tenant_keys`,
 /// `organization.v1.tools.managed_secrets`), `policy_authorizations`
 /// (`organization.v1.tools.policy_authorizations`), `tool_calls`
-/// (`organization.v1.tools.tool_calls`), and `memory`, `memory_versions`
-/// and `memory_embeddings` (`organization.v1.memory`, `memory.v2.org_scope`).
+/// (`organization.v1.tools.tool_calls`), `memory`, `memory_versions` and
+/// `memory_embeddings` (`organization.v1.memory`, `memory.v2.org_scope`),
+/// `message_index` and `message_reads` (`organization.v1.tools.messaging`)
+/// and `relay_messages` (`organization.v1.tools.relay`).
 const TENANT_MISSING_ORG_ID: &[&str] = &[
     "agent_lifecycle",
     "agent_sessions",
@@ -182,8 +184,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "dispatch_receipts",
     "dispatch_runs",
     "idempotency_keys",
-    "message_index",
-    "message_reads",
     "node_acceptance",
     "node_claim_ops",
     "node_command",
@@ -191,7 +191,6 @@ const TENANT_MISSING_ORG_ID: &[&str] = &[
     "node_dispatch",
     "node_followups",
     "nodes",
-    "relay_messages",
     "session_credentials",
     "session_handoff_notes",
     "session_profiles",

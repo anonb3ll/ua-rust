@@ -1812,6 +1812,7 @@ mod tests {
                 ledger::META_SCHEMA.into(),
                 ua_store::org::STORE_PART.into(),
                 super::super::messaging::SCHEMA.into(),
+                super::super::messaging::TENANT_PART.into(),
             ],
         )
         .unwrap();

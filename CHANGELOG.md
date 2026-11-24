@@ -564,6 +564,26 @@ from its commit history.
   cooldowns count only the reader's organization's calls, keeping the
   own-calls rule inside it. Another organization's authorization events
   carry no repository or policy reference.
+- Messages and relay drafts are organization-scoped:
+  `organization.v1.tools.messaging` and `organization.v1.tools.relay` add
+  `org_id` and the organization triggers to `message_index`,
+  `message_reads` and `relay_messages`; every existing row is the default
+  organization's and nothing is dropped. `messaging.v2.org_scope` and
+  `relay.v2.org_scope` add org-led indexes and same-organization triggers
+  for a read receipt, a reply and a draft's approval. Every mailbox read and
+  write (send, list, inbox, ack, replies, conversations, `crew_view`,
+  `session_packet`, wakes, the ledger visibility rule) is scoped, and
+  another organization's message, conversation and client id answer as
+  missing ones. A send into another organization is refused
+  (`cross_org_recipient`); outside the default organization a registered
+  label or a session counts as the default organization's until agents
+  carry one. Another organization's message events carry no body, label or
+  client text (the message is kept on its own row) and use the `system`
+  originator; its client ids are stored as
+  `org:<org>/message_send/<sender>/<id>` with `%` and `/` escaped. Unknown
+  or suspended organizations are refused before any write. The relay stays
+  default-only for check, draft and send; its status and cancel answer
+  another organization's draft as a missing one.
 - An insert guard beside the classification test: it fails when an
   `INSERT` (any conflict form, upserts and `REPLACE` included) into a tenant
   table that carries its organization key does not name `org_id`, in any

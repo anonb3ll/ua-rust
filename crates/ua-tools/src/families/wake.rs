@@ -365,6 +365,10 @@ fn invalidate_offers(tx: &WriteTx<'_>, session_id: &str, now: f64) -> UaResult<(
 }
 
 // --- mailbox reads ----------------------------------------------------------------
+//
+// A wake is for an agent session, and every session is the default
+// organization's until agents carry one, so these reads count only the
+// default organization's mail (`i.org_id = ?`, bound to `DEFAULT_ORG`).
 
 /// Did the session (or its label) read any of its mail after `since`?
 fn read_since(c: &Connection, agent: &str, session_id: &str, since: f64) -> UaResult<bool> {
@@ -372,9 +376,9 @@ fn read_since(c: &Connection, agent: &str, session_id: &str, since: f64) -> UaRe
         .query_row(
             "SELECT 1 FROM message_index i \
              LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
-             WHERE i.recipient = ?2 AND (i.target_session IS NULL OR i.target_session = ?1) \
+             WHERE i.org_id = ?4 AND i.recipient = ?2 AND (i.target_session IS NULL OR i.target_session = ?1) \
              AND COALESCE(i.read_at, r.read_at) > ?3 LIMIT 1",
-            params![session_id, agent, iso(since)],
+            params![session_id, agent, iso(since), ua_core::DEFAULT_ORG],
             |r| r.get(0),
         )
         .optional()?;
@@ -395,11 +399,11 @@ fn trigger(c: &Connection, agent: &str, session_id: &str, after: i64, through: i
         &format!(
             "SELECT COUNT(*), MAX(i.event_seq), MIN(i.created_at), MAX(i.created_at) FROM message_index i \
              LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
-             WHERE i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
+             WHERE i.org_id = ?5 AND i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
              AND (i.target_session IS NULL OR i.target_session = ?1) \
              AND (i.act IN ({acts}) OR i.expects_reply = 1) AND i.event_seq > ?3 AND i.event_seq <= ?4"
         ),
-        params![session_id, agent, after, through],
+        params![session_id, agent, after, through, ua_core::DEFAULT_ORG],
         |r| {
             Ok(Trigger {
                 n: r.get(0)?,
@@ -416,9 +420,9 @@ fn unread(c: &Connection, agent: &str, session_id: &str) -> UaResult<i64> {
     Ok(c.query_row(
         "SELECT COUNT(*) FROM message_index i \
          LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
-         WHERE i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
+         WHERE i.org_id = ?3 AND i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
          AND (i.target_session IS NULL OR i.target_session = ?1)",
-        params![session_id, agent],
+        params![session_id, agent, ua_core::DEFAULT_ORG],
         |r| r.get(0),
     )?)
 }

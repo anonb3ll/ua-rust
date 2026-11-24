@@ -112,17 +112,20 @@ fn reader(ctx: &ToolCtx, verb: &str) -> UaResult<Option<String>> {
     governance::verified_actor(&ctx.caller, verb).map(Some)
 }
 
-fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
+/// Whether conversation `cid` has a message in organization `org` the
+/// viewer may see. Another organization's conversation answers exactly as a
+/// missing one, for every reader.
+fn visible(conn: &Connection, org: &str, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
     let found: bool = match viewer {
         None => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1)",
-            [cid],
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?2 AND conversation_id = ?1)",
+            params![cid, org],
             |r| r.get(0),
         )?,
         Some(me) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?3 AND conversation_id = ?1 \
              AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
-            params![cid, me],
+            params![cid, me, org],
             |r| r.get(0),
         )?,
     };
@@ -168,8 +171,8 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
         return Err(UaError::invalid("pass exactly one of task_id (link) or title (create)"));
     }
     let viewer = (!unrestricted(&ctx)).then(|| actor.clone());
-    let c2 = cid.clone();
-    if !ctx.hub.db().read_async(move |c| visible(c, &c2, viewer.as_deref())).await? {
+    let (c2, org) = (cid.clone(), ctx.caller.org_id.clone());
+    if !ctx.hub.db().read_async(move |c| visible(c, &org, &c2, viewer.as_deref())).await? {
         return Err(UaError::not_found("conversation not found"));
     }
 
@@ -309,7 +312,7 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
     ctx.hub
         .db()
         .read_async(move |c| {
-            if !visible(c, &cid, viewer.as_deref())? {
+            if !visible(c, &org, &cid, viewer.as_deref())? {
                 return Err(UaError::not_found("conversation not found"));
             }
             let mut stmt = c.prepare(

@@ -365,10 +365,11 @@ here for memory columns, owners and defaults.
   payload binds the run's `org_id` while the gate parks in the caller's, so
   a mismatch is refused (an internal error) before the run's lease is taken
   or anything is parked, rather than rebuilding the caller (`org_guard`
-  forbids that). The relay's `status` reports a draft whose approval is in
-  another organization with `approval_status: null`; its `cancel` still
-  fails closed (`not found`), so a draft is never marked cancelled while
-  its approval stays live where the caller cannot withdraw it. Skill
+  forbids that). A relay draft and its approval are in one organization
+  since `relay_messages` converted (the mailbox and relay below), so a
+  draft's `status` and `cancel` always see its own approval; a `cancel`
+  whose approval is nonetheless missing fails closed (`not found`), so a
+  draft is never marked cancelled while its approval stays live. Skill
   registry approvals (publish, assign, unassign) bind `org_id`. A
   policy-authorization refusal is ledgered under the authorization's
   organization (the caller's) since `policy_authorizations` converted (the
@@ -777,6 +778,80 @@ here for memory columns, owners and defaults.
   state (vectors are read per organization), so it leaks nothing.
   `crates/ua-tools/tests/memory_tenant.rs` holds the upgrade, isolation,
   semantic-search, idempotency, unknown-organization and ledger tests.
+- The mailbox and the relay: `organization.v1.tools.messaging` gives
+  `message_index` and `message_reads` their `org_id` and triggers, and
+  `organization.v1.tools.relay` gives `relay_messages` its own. Every
+  existing row is the default organization's (every sender, reader and
+  requester the hub served was a default-organization caller); nothing is
+  moved, rewritten or dropped. No rebuild: message ids and event ulids are
+  hub-minted, a receipt is keyed by its message id, and a draft by an
+  AUTOINCREMENT id. `messaging.v2.org_scope` adds indexes led by `org_id`,
+  the `message_reads_org_parent` triggers (a receipt is in its message's
+  organization), the `message_index_org_reply` triggers (a reply is in its
+  parent's organization; an external `ts:` reply names no row), and
+  `org_payload`, below. `relay.v2.org_scope` adds indexes and the
+  `relay_messages_org_approval` triggers (a draft's approval is in the
+  draft's organization). A message's `task_id` and `delegation_id` get no
+  trigger: they were never checked, every reader filters on the message's
+  organization, and a trigger would answer another organization's id
+  differently from a missing one.
+  - **A message is its sender's organization's.** `message_send`,
+    `message_list`, `message_inbox`, `message_ack`, the reply, hop and
+    short-reply chain checks, `waiting_on_reply`, the conversation-id party
+    check, `conversation_handoff(s)`, `crew_view` (its messages and the
+    drop file's pointers), `session_packet`'s prior handoff, the wake
+    gates and the ledger's mailbox visibility rule (`VISIBLE_EVENT`) read
+    and write only that organization's rows. Another organization's
+    message, `reply_to`, conversation id and client id answer exactly as
+    missing ones.
+  - **Cross-organization sends are refused** (`cross_org_recipient`),
+    fail closed, before anything is read or written: a message is never
+    delivered into another organization. `agents` and `agent_sessions`
+    carry no organization yet, and every row in them is the default
+    organization's, so a sender in another organization may address only
+    a label the hub has never registered (no `agents` row, no session,
+    compared without case) and never a session (`to_session`). Its own
+    session cannot be named either (`from_session`, `session_id`:
+    `org_unsupported`). A default-organization sender may address any
+    label; that mail stays in the default organization, where no other
+    organization reads it. Both rules lift when the agents family converts
+    and a label's organization is recorded. Accepted residual: the refusal
+    tells another organization's sender that a label is registered, which
+    the hub-wide label namespace already implies.
+  - **Events.** Message and mailbox events are `ORG-EVENT-DEFAULT` sites.
+    Another organization's `agent.message.*` event keeps the payload's
+    shape with only hub-minted ids, the act, the hop, ids of tasks and
+    delegations and flags: body, typed handoff, every label, the
+    conversation id, `reply_to`, `event_id` and the client id are `null`;
+    the originator is `system`, and it has no episode or causal parent.
+    The message itself is kept on its index row (`org_payload`), which only
+    its organization reads; a default-organization row leaves it `NULL`
+    and reads its event as before. Another organization's
+    `agent.mailbox.read` / `.acked` names no mailbox or client id and uses
+    `system`.
+  - **Client ids.** The send's idempotency key is
+    `message_send/<sender>/<id>` in the default organization (unchanged)
+    and `org:<org>/message_send/<sender>/<id>` elsewhere, each part with
+    `%` and `/` escaped, so an organization id containing `/` cannot spell
+    another's prefix. A pre-scoping `message_send:<id>` key replays only in
+    the default organization. A receipt naming another organization's
+    message is never replayed: the send is refused (`conflict`) and names
+    neither.
+  - **Unknown or suspended** organizations are refused
+    (`unknown_organization`, `organization_suspended`) before any send,
+    read mark or ack, and before a relay `cancel` or `resolve`.
+  - **The relay** stays the default organization's: it posts with the
+    hub's credential to the hub's repository allowlist under the hub's
+    gates, so `check`, `draft`, `request_send` and `send` refuse another
+    organization (`org_unsupported`). `status` (by draft or approval id),
+    `list`, `cancel` and `resolve` read only the caller's organization's
+    drafts, so another organization's draft answers exactly as a missing
+    one. Another organization's relay event would carry no target, reason
+    or error text and use `system`.
+  - The importer writes legacy messages and receipts to `default`.
+    `crates/ua-tools/tests/messaging_tenant.rs` holds the upgrade, the
+    isolation through every reading tool, the cross-organization refusal,
+    the relay parity and the idempotency tests.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -1372,6 +1447,7 @@ global key in the tree is classified:
 | `plans.id`, `plan_steps (plan_id, step_idx)`, `plan_checkpoints (plan_id, seq)` | Global, safe | A plan id is hub-generated (random, never caller-chosen), and the step and checkpoint keys hang off it, so no rebuild (`organization.v1.tools.plans`, `plans.v2.org_scope`). The `*_org_parent` triggers keep steps and checkpoints in their plan's organization. |
 | `approvals.id`; the gate's `(tool, payload, requested_by)` match | No key | AUTOINCREMENT id only, so no rebuild (`organization.v1.tools.approvals`, `approvals.v3.org_indexes`). The gate's match is a query key and filters on `org_id`. |
 | `tasks.id`, `task_dependencies.id`, `task_comments.id`, `task_comment_threads.task_id` | Global, safe | AUTOINCREMENT ids (and a thread keyed by its task's), never client text, so no rebuild (`organization.v1.tools.tasks`, `tasks.v2.org_scope`); the `*_org_parent` triggers keep every reference in one organization. The client-chosen comment idempotency key is unique per `(task_id, author, key)`, led by the hub-global task id. Accepted residual: the id gaps one organization sees reveal the hub's total task volume. |
+| `message_index.message_id`, `message_index.event_ulid`, `message_reads (message_id, session_id)`, `relay_messages.id` | Global, safe | Hub-minted message ids and event ulids, receipts keyed by them, and AUTOINCREMENT draft ids, never client text, so no rebuild (`organization.v1.tools.messaging`, `messaging.v2.org_scope`; `organization.v1.tools.relay`, `relay.v2.org_scope`). A sender's client message id is an `idempotency_keys` row, prefixed with its organization outside the default one. |
 | `policy_authorizations.id`, `tool_calls.id` | No key | AUTOINCREMENT ids only, so no rebuild (`organization.v1.tools.policy_authorizations`, `github.v3.policy_authorizations_org_scope`; `organization.v1.tools.tool_calls`, `core.v5.tool_calls_org_scope`). The authorization lookups (by head, task, repository) and the telemetry counts (by caller, tool, window) are query keys and filter on `org_id`. |
 | `review_ready_notices (task_id, head_sha)` | Global, safe | Task ids are hub-global, so two organizations cannot collide; the table converts with the tasks family. |
 | `autonomous_cycles.id`, `autonomous_cycle_transitions (cycle_id, idempotency_key)`, `autonomous_cycle_usage (cycle_id, usage_run_id, usage_id)` | Global, safe | A cycle id is hub-generated (random, never caller-chosen), and the transition and usage keys are led by it, so the caller-chosen idempotency and usage keys cannot collide across organizations; no rebuild (`organization.v1.tools.cycles`, `cycles.v2.org_scope`). The `*_org_parent` triggers keep transitions and usage in their cycle's organization. |
@@ -1904,7 +1980,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: people and teams | `org_memberships`, `offices`, `teams`, `team_members`, `team_specs`, `reporting`, `org_proposals` | Per organization |
 | Tenant: memory | `memory`, `memory_versions`, `memory_embeddings` (`organization.v1.memory` and `memory.v2.org_scope`: every note read and write, search legs scoped inside the ranked query, versions and vectors in their note's organization), and from `docs/memory.md`: `memory_chunks`, `memory_entities`, `memory_links`, `memory_consolidations`, `memory_consolidation_sources`, `memory_invalidations`, `memory_feedback_events` | `org_id` plus a visibility tier, enforced in the search SQL — see `docs/memory.md`; each new table gets the generated `org_exists` / `org_immutable` triggers |
 | Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` (`organization.v1.tools.policy_authorizations` and `github.v3.policy_authorizations_org_scope`: the task's organization; every read, check, spend and revoke is scoped) | `org_id`, routing `team_id`, required authority |
-| Tenant: messages | `message_index`, `message_reads`, `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages`, `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
+| Tenant: messages | `message_index`, `message_reads` (`organization.v1.tools.messaging` and `messaging.v2.org_scope`: the sender's organization; every send, read, mark, ack, reply and conversation check is scoped, and a send into another organization is refused), `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages` (`organization.v1.tools.relay` and `relay.v2.org_scope`: drafting and sending stay default-only; status, list, cancel and resolve are scoped), `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
 | Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls` (`organization.v1.tools.tool_calls` and `core.v5.tool_calls_org_scope`: the caller's organization; every telemetry reader and policy count is scoped), `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`; a GitHub delivery's replay keys are recorded in each organization whose secret verified it), `github_poll_repos` (`github.v2.poll_repos` creates it keyed `(org_id, repo)` and copies `github_poll_state`'s rows to the default organization, `organization.v1.tools.github_poll` adds the triggers) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there. Accepted leak: bm25's corpus statistics span every organization |
@@ -2023,7 +2099,7 @@ reading its handoff links; it answers through `reply_to`, which does count
 it as a party.
 
 A client-chosen `message_id` is the sender's own idempotency key, keyed by
-`(sender, id)`; the message itself always gets a hub-minted `message_id`,
+`(organization, sender, id)`; the message itself always gets a hub-minted `message_id`,
 and the client id is echoed as `client_message_id`. The sender's retry with
 the same id returns the first result; another sender's use of the same id
 is independent and answers exactly like a fresh id, so the id reveals
