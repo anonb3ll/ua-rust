@@ -1824,8 +1824,8 @@ mod tests {
              -- The columns VISIBLE_EVENT joins on, minimal versions of the
              -- real tables.
              CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY, agent TEXT,
-                 assigned_to TEXT, delivered_to TEXT);
-             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT);",
+                 assigned_to TEXT, delivered_to TEXT, org_id TEXT NOT NULL DEFAULT 'default');
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT, org_id TEXT NOT NULL DEFAULT 'default');",
         )
         .unwrap();
         c

@@ -619,7 +619,7 @@ impl Registry {
         // A policy overlay may lower an agent's profile below its default.
         let caller = match &loaded {
             Some(Ok(p)) if caller.enforce_profile && caller.kind != ActorKind::Human => {
-                let code_default = crate::sessions::default_profile(hub, &caller.label);
+                let code_default = crate::sessions::default_profile(hub, &caller.org_id, &caller.label);
                 match policy::overlay_profile(p, &caller.label, code_default, self.tools.keys().copied()) {
                     Some(overlay) if caller.profile.rank() > overlay.rank() => {
                         Caller { profile: overlay, ..caller.clone() }

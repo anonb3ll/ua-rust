@@ -60,21 +60,24 @@ pub fn required_tools(notes: &str) -> BTreeSet<String> {
     out
 }
 
-/// Whether `label` is an identity this hub knows: a registered agent, an
-/// issued token, a configured profile, or a human.
-fn known_label(c: &Connection, cfg: &Config, label: &str) -> UaResult<bool> {
-    if cfg.is_human(label) || cfg.profiles.contains_key(label) {
+/// Whether `label` is an identity organization `org` knows: a registered
+/// agent or an issued token there, or (in the default organization, whose
+/// configuration the hub's is) a configured profile or a human. Another
+/// organization's agent is not known here, exactly as an unknown label.
+fn known_label(c: &Connection, cfg: &Config, org: &str, label: &str) -> UaResult<bool> {
+    if org == ua_core::DEFAULT_ORG && (cfg.is_human(label) || cfg.profiles.contains_key(label)) {
         return Ok(true);
     }
-    let known: Option<i64> =
-        c.query_row("SELECT known FROM agents WHERE label = ?1", [label], |r| r.get(0)).optional()?;
+    let known: Option<i64> = c
+        .query_row("SELECT known FROM agents WHERE org_id = ?1 AND label = ?2", [org, label], |r| r.get(0))
+        .optional()?;
     if known == Some(1) {
         return Ok(true);
     }
     let token: Option<i64> = c
         .query_row(
-            "SELECT 1 FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' LIMIT 1",
-            [label],
+            "SELECT 1 FROM agent_tokens WHERE org_id = ?1 AND agent_label = ?2 AND status = 'active' LIMIT 1",
+            [org, label],
             |r| r.get(0),
         )
         .optional()?;
@@ -93,7 +96,7 @@ fn allowed_tools(reg: &Registry, profile: Profile) -> Option<BTreeSet<String>> {
 /// organization's task answers as a missing one.
 fn check(c: &Connection, hub: &Hub, reg: &Registry, org: &str, task_id: i64, agent: &str) -> UaResult<Value> {
     let agent = agent.trim();
-    if agent.is_empty() || !known_label(c, hub.cfg(), agent)? {
+    if agent.is_empty() || !known_label(c, hub.cfg(), org, agent)? {
         return Err(UaError::invalid(format!("agent_label {agent:?} is not a known agent")));
     }
     let notes: Option<Option<String>> = c
@@ -107,7 +110,7 @@ fn check(c: &Connection, hub: &Hub, reg: &Registry, org: &str, task_id: i64, age
     let required = required_tools(notes.as_deref().unwrap_or(""));
     let registered: BTreeSet<String> = reg.all().map(|t| t.name.to_string()).collect();
     let unknown: Vec<&String> = required.iter().filter(|t| !registered.contains(*t)).collect();
-    let profile = crate::sessions::default_profile(hub, agent);
+    let profile = crate::sessions::default_profile(hub, org, agent);
     let allowed = allowed_tools(reg, profile);
     let missing: Vec<&String> = match &allowed {
         None => Vec::new(),
@@ -241,14 +244,16 @@ fn missing_config(c: &Connection, cfg: &Config, org: &str, agent: &str) -> UaRes
     let mut missing = Vec::new();
     let token: Option<i64> = c
         .query_row(
-            "SELECT 1 FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' \
+            "SELECT 1 FROM agent_tokens WHERE org_id = ?3 AND agent_label = ?1 AND status = 'active' \
              AND (expires_at IS NULL OR expires_at > ?2) LIMIT 1",
-            rusqlite::params![agent, ua_core::time::now()],
+            rusqlite::params![agent, ua_core::time::now(), org],
             |r| r.get(0),
         )
         .optional()?;
-    let static_token = cfg.static_tokens().iter().any(|(l, _)| l == agent);
-    if token.is_none() && !static_token && !cfg.profiles.contains_key(agent) {
+    // Static tokens and configured profiles are the default organization's.
+    let configured = org == ua_core::DEFAULT_ORG
+        && (cfg.static_tokens().iter().any(|(l, _)| l == agent) || cfg.profiles.contains_key(agent));
+    if token.is_none() && !configured {
         missing.push(json!({
             "gate": "agent_identity",
             "action": format!("issue {agent} a token (`ua token issue` or agent_token_issue) or give it a profile in [profiles]"),

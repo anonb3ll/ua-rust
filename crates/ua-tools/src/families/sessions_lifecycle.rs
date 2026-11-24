@@ -81,15 +81,17 @@ fn safe_text(s: &str, max: usize) -> String {
 
 // --- session rows ----------------------------------------------------------------------
 
-/// Session `id`; its task's title is read in the reader's organization `org`
-/// (another organization's task shows no title).
+/// Session `id` of the reader's organization `org` (another organization's
+/// session answers exactly as a missing one); its task's title is read in
+/// that organization too.
 fn load_session(conn: &Connection, org: &str, id: &str) -> UaResult<Option<Value>> {
     Ok(conn
         .query_row(
             "SELECT s.id, s.agent, s.kind, s.status, s.task_id, s.delegation_id, s.worktree_path, s.branch, \
              s.host, s.started_at, s.ended_at, s.last_heartbeat_at, s.exit_status, s.summary, \
              s.external_session_id, s.model, t.title \
-             FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id AND t.org_id = ?2 WHERE s.id = ?1",
+             FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id AND t.org_id = ?2 \
+             WHERE s.id = ?1 AND s.org_id = ?2",
             params![id, org],
             |r| {
                 Ok(json!({
@@ -300,9 +302,9 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         Some(t) => query_rows(
             conn,
             "SELECT id, agent, status, summary, ended_at FROM agent_sessions \
-             WHERE task_id = ?1 AND id != ?2 AND status IN ('completed','failed','abandoned') \
+             WHERE org_id = ?4 AND task_id = ?1 AND id != ?2 AND status IN ('completed','failed','abandoned') \
              AND summary IS NOT NULL AND summary != '' ORDER BY ended_at DESC LIMIT ?3",
-            params![t, sid_str.as_deref().unwrap_or(""), EXPERIENCE_LIMIT as i64],
+            params![t, sid_str.as_deref().unwrap_or(""), EXPERIENCE_LIMIT as i64, ctx.caller.org_id],
             |r| {
                 let id: String = r.get(0)?;
                 let mut row = json!({
@@ -872,6 +874,16 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
     if inbox.is_empty() {
         return Err(UaError::invalid("no vault inbox directory is configured"));
     }
+    // The proposal lands in the hub-scoped vault, which belongs to the
+    // default organization: another organization may preview (dry_run) but
+    // never write one. Refused before anything is read or written.
+    if !dry_run && ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "a learning proposal is written to the hub's vault, which belongs to the default organization; \
+             nothing was written. Pass dry_run=true to preview it",
+        ));
+    }
     let vault_root = vault.as_ref().ok().map(|v| v.root.clone());
     let rel = proposal_relpath(&inbox, &sid);
     let (rel2, inbox2, sid2) = (rel.clone(), inbox.clone(), sid.clone());
@@ -1032,8 +1044,14 @@ fn crew_conversation_id(session_id: &str) -> String {
 /// The session's `.ua/interventions.jsonl`, when its worktree is an existing
 /// directory inside the workspace or a read root. A session row names its own
 /// worktree, so anything outside those roots is never written or read; the
-/// file itself is opened only through [`open_drop`].
+/// file itself is opened only through [`open_drop`]. The workspace and read
+/// roots are the hub's, shared and the default organization's, so another
+/// organization's caller (whose sessions are its own) neither writes nor
+/// reads a drop file there: `None`.
 fn intervention_path(ctx: &ToolCtx, worktree: Option<&str>) -> Option<PathBuf> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return None;
+    }
     let raw = worktree.map(str::trim).filter(|w| !w.is_empty())?;
     let real = Path::new(raw).canonicalize().ok().filter(|p| p.is_dir())?;
     let cfg = ctx.hub.cfg();
@@ -1176,17 +1194,10 @@ fn drop_message_ids(path: Option<&Path>) -> Vec<String> {
         .collect()
 }
 
-/// Every session is the default organization's until agents carry an
-/// organization (`messaging::require_default_sessions`): another
-/// organization's caller can neither view nor steer one, and is refused
-/// before anything is read, approved or written. Also `crew_intervene`'s
-/// registry pre-gate, so no approval is parked for such a call.
-fn crew_default_org(caller: &ua_core::Caller, _args: &Value) -> UaResult<()> {
-    super::messaging::require_default_sessions(&caller.org_id, "session_id")
-}
-
 async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
-    crew_default_org(&ctx.caller, &Value::Null)?;
+    // A session is its agent's organization's: `needs_session` reads only the
+    // caller's organization, so another organization's session answers
+    // exactly as a missing one.
     let sid = a.session_id.trim().to_string();
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
@@ -1320,8 +1331,6 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
-    // Checked again here, though the registry's pre-gate already refused it.
-    crew_default_org(&ctx.caller, &Value::Null)?;
     // The reviewer profile may watch a crew but not steer it. The profile table
     // does not list this tool, so the tool enforces it itself.
     if ctx.caller.profile == ua_core::Profile::Reviewer {
@@ -1487,8 +1496,7 @@ pub fn register(r: &mut Registry) {
             crew_intervene,
         )
         .family("sessions")
-        .always_gated()
-        .pre_gate(crew_default_org),
+        .always_gated(),
     );
 }
 

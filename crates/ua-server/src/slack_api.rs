@@ -270,14 +270,9 @@ async fn execute(
     response_url: Option<url::Url>,
 ) {
     let command = parsed["command"].as_str().unwrap_or_default().to_string();
-    let id = AuthIdentity {
-        label: identity.clone(),
-        // `slack_identities` maps only to `human_identities` (checked at load
-        // and again on every lookup).
-        kind: ActorKind::Human,
-        verified: true,
-        grant: None,
-    };
+    // `slack_identities` maps only to `human_identities` (checked at load
+    // and again on every lookup), the default organization's.
+    let id = AuthIdentity::in_default(identity.clone(), ActorKind::Human, true);
     let caller = caller_for(&state, &id, None, Transport::Slack);
     let (tool, outcome) = match slack::command_call(&parsed, &d.delivery_id) {
         Ok(Some(call)) => {

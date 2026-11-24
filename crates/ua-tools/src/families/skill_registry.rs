@@ -1253,7 +1253,9 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
     let profile = match p.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => Some(profile_target(raw)?),
         None if label.is_empty() => None,
-        None => Some(crate::sessions::default_profile(&ctx.hub, &label).as_str().to_string()),
+        None => {
+            Some(crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, &label).as_str().to_string())
+        }
     };
     let skills = ctx.hub.db().read(|c| resolve(c, &ctx.caller.org_id, &label, profile.as_deref()))?;
     let skills: Vec<Value> = skills
@@ -1309,7 +1311,9 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     let label = p.agent_label.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let profile = match (p.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()), &label) {
         (Some(raw), _) => Some(profile_target(raw)?),
-        (None, Some(l)) => Some(crate::sessions::default_profile(&ctx.hub, l).as_str().to_string()),
+        (None, Some(l)) => {
+            Some(crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, l).as_str().to_string())
+        }
         (None, None) => None,
     };
     // The registry side: every skill's latest version, and with an agent the

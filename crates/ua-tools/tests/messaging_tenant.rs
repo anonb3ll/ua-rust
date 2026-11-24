@@ -806,27 +806,25 @@ async fn crew_view_shows_only_the_readers_organizations_mail() {
     assert_no_b(&v.to_string(), "the default crew view");
     assert_eq!(v["message_total"], 3, "{v}");
 
-    // Every session is the default organization's: organization B's
-    // callers can neither view nor steer one, and are refused before
-    // anything is read, approved or written.
-    let before = (h.snapshot(), h.event_count(), approvals(&h), wt_lines(&wt));
+    // A session is its agent's organization's: organization B's callers
+    // view the default organization's session exactly as a missing one.
+    let before = (h.snapshot(), approvals(&h), wt_lines(&wt));
     for who in [&op_b, &agent(B_READER, ORG_B)] {
-        for sid in [sid.as_str(), "no-such-session"] {
-            let e = h.call(who, "crew_view", json!({ "session_id": sid })).await.unwrap_err();
-            assert_eq!(reason(&e), "org_unsupported", "{e:?}");
-            assert!(!e.to_string().contains(A_READER) && !e.to_string().contains("wt"), "{e:?}");
-            let e = h
-                .call(who, "crew_intervene", json!({ "session_id": sid, "message": B_BODY }))
-                .await
-                .unwrap_err();
-            assert_eq!(reason(&e), "org_unsupported", "{e:?}");
-        }
+        let got = h.call(who, "crew_view", json!({ "session_id": sid })).await;
+        let missing = h.call(who, "crew_view", json!({ "session_id": "no-such-session" })).await;
+        same_as_missing(&got, &sid, &missing, "no-such-session");
+        let e = got.unwrap_err();
+        assert!(!e.to_string().contains(A_READER) && !e.to_string().contains("wt"), "{e:?}");
     }
-    assert_eq!(
-        (h.snapshot(), h.event_count(), approvals(&h), wt_lines(&wt)),
-        before,
-        "nothing written, no approval parked, no drop-file line"
-    );
+    // Steering is always approval-gated: organization B's request parks in
+    // organization B (no one there can approve it yet), and nothing reaches
+    // the default organization's session, mailbox or drop file.
+    let e =
+        h.call(&op_b, "crew_intervene", json!({ "session_id": sid, "message": B_BODY })).await.unwrap_err();
+    assert_eq!(reason(&e), "approval_required", "{e:?}");
+    let parked = approvals(&h);
+    assert!(parked.lines().last().is_some_and(|l| l.contains("|org-b|crew_intervene|pending")), "{parked}");
+    assert_eq!((h.snapshot(), wt_lines(&wt)), (before.0, before.2), "no mail and no drop-file line");
 }
 
 /// Every approval row, as text.
@@ -856,7 +854,7 @@ fn wt_lines(wt: &Path) -> String {
 // --- sending ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_send_to_a_session_from_another_organization_is_refused_with_nothing_written() {
+async fn a_session_is_addressed_only_inside_its_own_organization() {
     let h = H::new();
     let a_reader = agent(A_READER, DEFAULT_ORG);
     // A registered default-organization agent with a live session.
@@ -868,42 +866,74 @@ async fn a_send_to_a_session_from_another_organization_is_refused_with_nothing_w
     let (b_sender, op_b) = (agent(B_SENDER, ORG_B), human("b-operator", ORG_B));
     let before = (h.snapshot(), h.event_count());
 
+    // The default organization's session answers organization B exactly as
+    // a missing one, as a recipient, as the sender's own session and as a
+    // mailbox session, and nothing is written.
     for who in [&b_sender, &op_b] {
-        for args in [
-            json!({ "act": "inform", "to_session": sid, "body": B_BODY }),
-            json!({ "act": "inform", "to_session": "no-such-session", "body": B_BODY }),
-            json!({ "act": "inform", "to_agent": A_READER, "to_session": sid, "body": B_BODY, "message_id": "k-1" }),
-        ] {
-            let e = h.call(who, "message_send", args.clone()).await.unwrap_err();
-            assert_eq!(reason(&e), "cross_org_recipient", "{args}: {e:?}");
-        }
-        // A session of its own cannot be named either: every session is the
-        // default organization's.
         for (tool, args) in [
+            ("message_send", json!({ "act": "inform", "to_session": "SID", "body": B_BODY })),
             (
                 "message_send",
-                json!({ "act": "inform", "to_agent": B_READER, "body": "x", "from_session": sid }),
+                json!({ "act": "inform", "to_agent": A_READER, "to_session": "SID", "body": B_BODY, "message_id": "k-1" }),
             ),
-            ("message_list", json!({ "session_id": sid })),
+            (
+                "message_send",
+                json!({ "act": "inform", "to_agent": B_READER, "body": "x", "from_session": "SID" }),
+            ),
+            ("message_list", json!({ "session_id": "SID" })),
         ] {
-            let e = h.call(who, tool, args.clone()).await.unwrap_err();
-            assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e:?}");
+            let with =
+                |id: &str| serde_json::from_str::<Value>(&args.to_string().replace("SID", id)).unwrap();
+            let got = h.call(who, tool, with(&sid)).await;
+            let missing = h.call(who, tool, with("no-such-session")).await;
+            same_as_missing(&got, &sid, &missing, "no-such-session");
         }
         for (action, params) in [
-            ("message_inbox", json!({ "session_id": sid })),
-            ("message_ack", json!({ "through": 5, "session_id": sid })),
+            ("message_inbox", json!({ "session_id": "SID" })),
+            ("message_ack", json!({ "through": 5, "session_id": "SID" })),
         ] {
-            let e = h.coord(who, action, params.clone()).await.unwrap_err();
-            assert_eq!(reason(&e), "org_unsupported", "{action}({params}): {e:?}");
+            let with =
+                |id: &str| serde_json::from_str::<Value>(&params.to_string().replace("SID", id)).unwrap();
+            let got = h.coord(who, action, with(&sid)).await;
+            let missing = h.coord(who, action, with("no-such-session")).await;
+            same_as_missing(&got, &sid, &missing, "no-such-session");
         }
     }
     assert_eq!((h.snapshot(), h.event_count()), before, "a refused send writes nothing");
-    // crew_intervene is refused before its approval gate (crew_view's test
-    // checks no approval is parked), so nothing reaches the drop file.
-    let e = h.call(&op_b, "crew_intervene", json!({ "session_id": sid, "message": B_BODY })).await;
-    assert_eq!(reason(&e.unwrap_err()), "org_unsupported");
-    assert_eq!(h.snapshot(), before.0);
     assert!(!wt_written(&h), "no drop-file line");
+
+    // Inside organization B its own sessions work: a send into one, from one,
+    // and the mailbox read through one.
+    let b_reader = agent(B_READER, ORG_B);
+    let b_sid = h.ok(&b_reader, "session_start", json!({ "kind": "interactive" })).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b_send_sid = h.ok(&b_sender, "session_start", json!({ "kind": "interactive" })).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sent = h
+        .send(
+            &b_sender,
+            json!({ "act": "request", "to_session": b_sid, "from_session": b_send_sid, "body": B_BODY }),
+        )
+        .await;
+    assert_eq!(sent["to_session"], json!(b_sid), "{sent}");
+    let inbox = h.coord(&b_reader, "message_inbox", json!({ "session_id": b_sid })).await.unwrap();
+    assert_eq!(bodies(&inbox), [B_BODY], "{inbox}");
+    // The default organization's reader cannot address B's session either.
+    let got =
+        h.call(&a_reader, "message_send", json!({ "act": "inform", "to_session": b_sid, "body": "x" })).await;
+    let missing = h
+        .call(
+            &a_reader,
+            "message_send",
+            json!({ "act": "inform", "to_session": "no-such-session", "body": "x" }),
+        )
+        .await;
+    same_as_missing(&got, &b_sid, &missing, "no-such-session");
+    let b_mail_before = h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b'");
 
     // Mail inside organization B still flows, to any label: one the default
     // organization registered too is organization B's mailbox there.
@@ -911,15 +941,17 @@ async fn a_send_to_a_session_from_another_organization_is_refused_with_nothing_w
         h.send(&b_sender, json!({ "act": "inform", "to_agent": to, "body": B_BODY })).await;
     }
     assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'default'"), 0);
-    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b'"), 4);
+    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE org_id = 'org-b'"), b_mail_before + 4);
     let inbox = h.ok(&a_reader, "message_list", json!({})).await;
     assert_eq!(inbox["total"], 0, "the default organization's reader gets none of it: {inbox}");
     assert_no_b(&h.ledger_text(), "the ledger");
 }
 
-/// Agents and sessions carry no organization yet, and any organization can
-/// write them, so whether a label is registered never decides whether
-/// another organization's mail reaches it, nor changes the send's reply.
+/// Whether a label is registered in another organization never decides
+/// whether an organization's mail reaches it, nor changes the send's reply:
+/// a send reads only its own organization's agents and sessions. The label
+/// namespace is one, so the other organization's registration does keep
+/// organization B's agent from registering that label.
 #[tokio::test]
 async fn registering_a_label_elsewhere_never_stops_or_changes_an_organizations_mail() {
     let h = H::new();
@@ -955,10 +987,13 @@ async fn registering_a_label_elsewhere_never_stops_or_changes_an_organizations_m
         "the reply is the same once the label has a session"
     );
 
-    // Organization B's own agent starts a session: its peers' mail still
-    // reaches it, and it reads it as its label.
+    // Organization B's own `bob-b` cannot register the label organization C
+    // holds (the refusal says only that it is taken), but its peers' mail
+    // still reaches it, and it reads it as its label.
     let bob = agent(BOB_B, ORG_B);
-    h.ok(&bob, "session_start", json!({ "kind": "interactive" })).await;
+    let e = h.call(&bob, "session_start", json!({ "kind": "interactive" })).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_label_taken", "{e:?}");
+    assert!(!e.to_string().contains(ORG_C), "{e:?}");
     send(BOB_B).await;
     let inbox = h.coord(&bob, "message_inbox", json!({})).await.unwrap();
     assert_eq!(bodies(&inbox), [B_BODY, B_BODY, B_BODY], "{inbox}");
@@ -1013,9 +1048,9 @@ async fn an_unknown_or_suspended_organization_is_refused_before_any_write() {
             let e = h.coord(&who, action, params).await.unwrap_err();
             assert_eq!(reason(&e), want, "{org} {action}: {e:?}");
         }
-        // crew_view refuses every session outside the default organization.
+        // crew_view refuses the organization before it reads a session.
         let e = h.call(&who, "crew_view", json!({ "session_id": "s-1" })).await.unwrap_err();
-        assert_eq!(reason(&e), "org_unsupported", "{org}: {e:?}");
+        assert_eq!(reason(&e), want, "{org}: {e:?}");
     }
     assert_eq!((h.snapshot(), h.event_count()), before, "nothing changed");
 }

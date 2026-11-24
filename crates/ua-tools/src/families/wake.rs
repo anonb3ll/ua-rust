@@ -55,34 +55,21 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Caller, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{SchemaPart, WriteTx};
 
 use super::agents::verified;
 use super::{governance, node_queue, nodes};
 use crate::registry::{Registry, ToolCtx, tool};
 use ua_org::authz::{Authority, Authz};
 
-/// The organization whose nodes deliver idle-session wakes. The wake
-/// tables (`session_wake`, `session_wake_offers`) carry no `org_id` yet and
-/// their events name nodes and sessions in the default organization's
-/// ledger, so wakes run only through the default organization's nodes: a
-/// node token of another organization is refused (`org_unsupported`), and
-/// its nodes are never chosen as a wake node. The session side
-/// (`session_wake_opt_in`, `_grant`, `_decline`, `_status`) is refused the
-/// same way, so another organization's caller neither reads nor writes the
-/// default organization's wake rows.
-const WAKE_ORG: &str = ua_core::DEFAULT_ORG;
-
-fn wake_org(caller: &Caller) -> UaResult<()> {
-    if caller.org_id == WAKE_ORG {
-        Ok(())
-    } else {
-        Err(UaError::denied(
-            "org_unsupported",
-            "idle-session wakes run only through the default organization's nodes",
-        ))
-    }
-}
+// Organizations: a wake row, an offer and its events belong to the session's
+// organization (its agent's). Every read and write filters `org_id`: a node
+// token sees only its own organization's sessions and nodes, a session's
+// wake node is a node of its own organization, the mailbox reads count only
+// that organization's mail, and another organization's session answers
+// exactly as a missing one. Events about another organization's session
+// carry no node name, agent label or reason (`ORG-EVENT-DEFAULT`, through
+// `agents::emit`).
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "wake.v1",
@@ -223,10 +210,28 @@ fn ts_f(s: Option<&str>) -> Option<f64> {
     s.and_then(ua_core::time::parse_ts).map(|t| t.as_millisecond() as f64 / 1000.0)
 }
 
-fn record(tx: &mut WriteTx<'_>, channel: &str, kind: &str, mut payload: Value, by: &str) -> UaResult<()> {
+/// A wake event about a session of organization `org`. Another
+/// organization's event keeps only the session id, the offer id, the
+/// sequence and the kind: its node name, agent label and reason are `null`.
+fn record(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    kind: &str,
+    mut payload: Value,
+    by: &str,
+) -> UaResult<()> {
     payload["kind"] = json!(kind);
-    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
-    Ok(())
+    if org != ua_core::DEFAULT_ORG
+        && let Some(map) = payload.as_object_mut()
+    {
+        for key in ["node", "agent", "reason"] {
+            if map.contains_key(key) {
+                map.insert(key.into(), Value::Null);
+            }
+        }
+    }
+    super::agents::emit(tx, org, channel, payload, by, None)
 }
 
 // --- rows -----------------------------------------------------------------------
@@ -259,12 +264,15 @@ struct WakeRow {
     paused_reason: Option<String>,
     /// The node the session named when it asked, if any.
     node: Option<String>,
+    /// The session's organization (its agent's).
+    org: String,
 }
 
 const ROW_COLS: &str = "w.session_id, s.agent, s.external_session_id, s.host, s.status, w.opted_in, \
     w.granted_at IS NOT NULL, w.declined_at IS NOT NULL, w.offered_at, w.offered_seq, w.offered_id, w.retry_at, \
     w.attempts, w.last_wake_at, w.last_wake_seq, w.hour_started_at, w.wakes_last_hour, w.unacked_wakes, \
-    w.last_attempt_at, w.attempt_hour_started_at, w.attempts_last_hour, w.unacked_attempts, w.paused_reason, w.node";
+    w.last_attempt_at, w.attempt_hour_started_at, w.attempts_last_hour, w.unacked_attempts, w.paused_reason, w.node, \
+    w.org_id";
 
 fn wake_row(r: &Row<'_>) -> rusqlite::Result<WakeRow> {
     Ok(WakeRow {
@@ -292,16 +300,19 @@ fn wake_row(r: &Row<'_>) -> rusqlite::Result<WakeRow> {
         unacked_attempts: r.get(21)?,
         paused_reason: r.get(22)?,
         node: r.get(23)?,
+        org: r.get(24)?,
     })
 }
 
-fn load_row(c: &Connection, session_id: &str) -> UaResult<Option<WakeRow>> {
+/// The wake row of `session_id` in organization `org`; another
+/// organization's is `None`, exactly as a missing one.
+fn load_row(c: &Connection, org: &str, session_id: &str) -> UaResult<Option<WakeRow>> {
     Ok(c.query_row(
         &format!(
             "SELECT {ROW_COLS} FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
-             WHERE w.session_id = ?1"
+             AND s.org_id = w.org_id WHERE w.session_id = ?1 AND w.org_id = ?2"
         ),
-        [session_id],
+        [session_id, org],
         wake_row,
     )
     .optional()?)
@@ -324,7 +335,7 @@ fn wake_node(c: &Connection, row: &WakeRow) -> UaResult<Option<String>> {
         let owned = c
             .query_row(
                 "SELECT 1 FROM nodes WHERE node = ?1 AND agent = ?2 AND org_id = ?3 AND retired_at IS NULL",
-                params![named, row.agent, WAKE_ORG],
+                params![named, row.agent, row.org],
                 |_| Ok(()),
             )
             .optional()?
@@ -340,7 +351,7 @@ fn wake_node(c: &Connection, row: &WakeRow) -> UaResult<Option<String>> {
         "SELECT node FROM nodes WHERE agent = ?1 AND org_id = ?2 AND retired_at IS NULL ORDER BY node",
     )?;
     let same_short: Vec<String> = stmt
-        .query_map([row.agent.as_str(), WAKE_ORG], |r| r.get::<_, String>(0))?
+        .query_map([row.agent.as_str(), row.org.as_str()], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|n| host_key(n) == key)
@@ -360,11 +371,13 @@ fn wakes_through(c: &Connection, row: &WakeRow, node: &str) -> UaResult<bool> {
     Ok(wake_node(c, row)?.as_deref() == Some(node))
 }
 
-/// The session's agent, or not found.
-fn session_agent(c: &Connection, session_id: &str) -> UaResult<(String, String)> {
-    c.query_row("SELECT agent, status FROM agent_sessions WHERE id = ?1", [session_id], |r| {
-        Ok((r.get(0)?, r.get(1)?))
-    })
+/// The session's agent, or not found (another organization's session too).
+fn session_agent(c: &Connection, org: &str, session_id: &str) -> UaResult<(String, String)> {
+    c.query_row(
+        "SELECT agent, status FROM agent_sessions WHERE id = ?1 AND org_id = ?2",
+        [session_id, org],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
     .optional()?
     .ok_or_else(|| UaError::not_found(format!("session {session_id:?} does not exist")))
 }
@@ -378,30 +391,29 @@ fn check_session_id(raw: &str) -> UaResult<String> {
 }
 
 /// Clear any outstanding offer of `session_id` (consent changed).
-fn invalidate_offers(tx: &WriteTx<'_>, session_id: &str, now: f64) -> UaResult<()> {
+fn invalidate_offers(tx: &WriteTx<'_>, org: &str, session_id: &str, now: f64) -> UaResult<()> {
     tx.execute(
-        "UPDATE session_wake_offers SET invalidated_at = ?2 WHERE session_id = ?1 \
+        "UPDATE session_wake_offers SET invalidated_at = ?2 WHERE session_id = ?1 AND org_id = ?3 \
          AND recorded_at IS NULL AND invalidated_at IS NULL",
-        params![session_id, now],
+        params![session_id, now, org],
     )?;
     Ok(())
 }
 
 // --- mailbox reads ----------------------------------------------------------------
 //
-// A wake is for an agent session, and every session is the default
-// organization's until agents carry one, so these reads count only the
-// default organization's mail (`i.org_id = ?`, bound to `DEFAULT_ORG`).
+// A wake is for an agent session, so these reads count only the session's
+// organization's mail (`i.org_id = ?`, bound to the wake row's `org_id`).
 
 /// Did the session (or its label) read any of its mail after `since`?
-fn read_since(c: &Connection, agent: &str, session_id: &str, since: f64) -> UaResult<bool> {
+fn read_since(c: &Connection, org: &str, agent: &str, session_id: &str, since: f64) -> UaResult<bool> {
     let row: Option<i64> = c
         .query_row(
             "SELECT 1 FROM message_index i \
              LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
              WHERE i.org_id = ?4 AND i.recipient = ?2 AND (i.target_session IS NULL OR i.target_session = ?1) \
              AND COALESCE(i.read_at, r.read_at) > ?3 LIMIT 1",
-            params![session_id, agent, iso(since), ua_core::DEFAULT_ORG],
+            params![session_id, agent, iso(since), org],
             |r| r.get(0),
         )
         .optional()?;
@@ -416,7 +428,14 @@ struct Trigger {
     newest_at: Option<f64>,
 }
 
-fn trigger(c: &Connection, agent: &str, session_id: &str, after: i64, through: i64) -> UaResult<Trigger> {
+fn trigger(
+    c: &Connection,
+    org: &str,
+    agent: &str,
+    session_id: &str,
+    after: i64,
+    through: i64,
+) -> UaResult<Trigger> {
     let acts = WAKE_ACTS.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(",");
     Ok(c.query_row(
         &format!(
@@ -426,7 +445,7 @@ fn trigger(c: &Connection, agent: &str, session_id: &str, after: i64, through: i
              AND (i.target_session IS NULL OR i.target_session = ?1) \
              AND (i.act IN ({acts}) OR i.expects_reply = 1) AND i.event_seq > ?3 AND i.event_seq <= ?4"
         ),
-        params![session_id, agent, after, through, ua_core::DEFAULT_ORG],
+        params![session_id, agent, after, through, org],
         |r| {
             Ok(Trigger {
                 n: r.get(0)?,
@@ -439,13 +458,13 @@ fn trigger(c: &Connection, agent: &str, session_id: &str, after: i64, through: i
 }
 
 /// Every unread message of the session: label mail plus mail to it.
-fn unread(c: &Connection, agent: &str, session_id: &str) -> UaResult<i64> {
+fn unread(c: &Connection, org: &str, agent: &str, session_id: &str) -> UaResult<i64> {
     Ok(c.query_row(
         "SELECT COUNT(*) FROM message_index i \
          LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
          WHERE i.org_id = ?3 AND i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
          AND (i.target_session IS NULL OR i.target_session = ?1)",
-        params![session_id, agent, ua_core::DEFAULT_ORG],
+        params![session_id, agent, org],
         |r| r.get(0),
     )?)
 }
@@ -466,7 +485,7 @@ fn budget(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Option<&'static 
     let mut reset = false;
     if unacked > 0
         && let Some(since) = read_after
-        && read_since(c, &row.agent, &row.session_id, since)?
+        && read_since(c, &row.org, &row.agent, &row.session_id, since)?
     {
         unacked = 0;
         reset = true;
@@ -491,16 +510,16 @@ fn budget(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Option<&'static 
 fn budget_hold(tx: &WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Option<&'static str>> {
     let (hold, reset) = budget(tx, row, now)?;
     if reset {
-        reset_breaker(tx, &row.session_id)?;
+        reset_breaker(tx, &row.org, &row.session_id)?;
     }
     Ok(hold)
 }
 
-fn reset_breaker(tx: &WriteTx<'_>, session_id: &str) -> UaResult<()> {
+fn reset_breaker(tx: &WriteTx<'_>, org: &str, session_id: &str) -> UaResult<()> {
     tx.execute(
         "UPDATE session_wake SET unacked_wakes = 0, unacked_attempts = 0, paused_reason = NULL \
-         WHERE session_id = ?1",
-        [session_id],
+         WHERE session_id = ?1 AND org_id = ?2",
+        [session_id, org],
     )?;
     Ok(())
 }
@@ -525,7 +544,7 @@ fn evaluate(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Verdict, bool)
     if let Some(hold) = hold {
         return Ok((Verdict::Hold(hold), reset));
     }
-    let mail = trigger(c, &row.agent, &row.session_id, row.last_wake_seq, i64::MAX)?;
+    let mail = trigger(c, &row.org, &row.agent, &row.session_id, row.last_wake_seq, i64::MAX)?;
     let Some(newest) = mail.newest.filter(|_| mail.n > 0) else {
         return Ok((Verdict::Hold("nothing_to_wake"), reset));
     };
@@ -534,7 +553,7 @@ fn evaluate(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Verdict, bool)
     if quiet < DEBOUNCE_QUIET_S && held < DEBOUNCE_MAX_HOLD_S {
         return Ok((Verdict::Hold("debounce"), reset));
     }
-    let unread = unread(c, &row.agent, &row.session_id)?;
+    let unread = unread(c, &row.org, &row.agent, &row.session_id)?;
     if unread <= 0 {
         return Ok((Verdict::Hold("nothing_to_wake"), reset));
     }
@@ -544,21 +563,23 @@ fn evaluate(c: &Connection, row: &WakeRow, now: f64) -> UaResult<(Verdict, bool)
 fn gate(tx: &mut WriteTx<'_>, row: &WakeRow, now: f64) -> UaResult<Verdict> {
     let (verdict, reset) = evaluate(tx, row, now)?;
     if reset {
-        reset_breaker(tx, &row.session_id)?;
+        reset_breaker(tx, &row.org, &row.session_id)?;
     }
     Ok(verdict)
 }
 
-/// Granted, opted-in, undeclined open sessions with a native id whose wake
-/// node is `node`, which `agent` owns: only the agent's own sessions.
-fn candidates(c: &Connection, node: &str, agent: &str) -> UaResult<Vec<WakeRow>> {
+/// Granted, opted-in, undeclined open sessions of organization `org` with a
+/// native id whose wake node is `node`, which `agent` owns: only the
+/// agent's own sessions.
+fn candidates(c: &Connection, org: &str, node: &str, agent: &str) -> UaResult<Vec<WakeRow>> {
     let mut stmt = c.prepare(&format!(
         "SELECT {ROW_COLS} FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
-         WHERE w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
+         AND s.org_id = w.org_id \
+         WHERE w.org_id = ?2 AND w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
          AND s.status IN ({OPEN}) AND s.external_session_id IS NOT NULL AND s.agent = ?1 \
          ORDER BY w.session_id"
     ))?;
-    let rows = stmt.query_map([agent], wake_row)?.collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt.query_map([agent, org], wake_row)?.collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         if wakes_through(c, &r, node)? {
@@ -571,8 +592,8 @@ fn candidates(c: &Connection, node: &str, agent: &str) -> UaResult<Vec<WakeRow>>
 /// Whether a poll of `node` has anything to write now: an offer due, a
 /// breaker reset or a pause to record. Read-only, so an idle long-poll never
 /// takes the write lock.
-fn poll_pending(c: &Connection, node: &str, agent: &str, now: f64) -> UaResult<bool> {
-    for row in candidates(c, node, agent)? {
+fn poll_pending(c: &Connection, org: &str, node: &str, agent: &str, now: f64) -> UaResult<bool> {
+    for row in candidates(c, org, node, agent)? {
         let (verdict, reset) = evaluate(c, &row, now)?;
         let pause = matches!(verdict, Verdict::Hold("breaker"))
             && row.paused_reason.as_deref() != Some(PAUSED_NO_READ);
@@ -585,10 +606,11 @@ fn poll_pending(c: &Connection, node: &str, agent: &str, now: f64) -> UaResult<b
 
 /// Sessions whose wake node is `node` that are due a wake now, marked
 /// offered.
-fn due_wakes(tx: &mut WriteTx<'_>, node: &str, identity: &str, now: f64) -> UaResult<Vec<Value>> {
-    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
+fn due_wakes(tx: &mut WriteTx<'_>, org: &str, node: &str, identity: &str, now: f64) -> UaResult<Vec<Value>> {
+    node_queue::require_org(tx, org)?;
+    let name = node_queue::owned_node(tx, org, node, identity)?.node;
     let mut out = Vec::new();
-    for row in candidates(tx, &name, identity)? {
+    for row in candidates(tx, org, &name, identity)? {
         if out.len() >= MAX_OFFERS {
             break;
         }
@@ -596,8 +618,8 @@ fn due_wakes(tx: &mut WriteTx<'_>, node: &str, identity: &str, now: f64) -> UaRe
             Verdict::Hold(why) => {
                 if why == "breaker" && row.paused_reason.as_deref() != Some(PAUSED_NO_READ) {
                     tx.execute(
-                        "UPDATE session_wake SET paused_reason = ?2 WHERE session_id = ?1",
-                        params![row.session_id, PAUSED_NO_READ],
+                        "UPDATE session_wake SET paused_reason = ?2 WHERE session_id = ?1 AND org_id = ?3",
+                        params![row.session_id, PAUSED_NO_READ, org],
                     )?;
                 }
             }
@@ -605,17 +627,18 @@ fn due_wakes(tx: &mut WriteTx<'_>, node: &str, identity: &str, now: f64) -> UaRe
                 let offer_id = uuid::Uuid::new_v4().simple().to_string();
                 let expires_at = now + OFFER_LEASE_S;
                 tx.execute(
-                    "INSERT INTO session_wake_offers (offer_id, session_id, node, offered_seq, offered_at, expires_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![offer_id, row.session_id, name, newest_seq, now, expires_at],
+                    "INSERT INTO session_wake_offers (org_id, offer_id, session_id, node, offered_seq, offered_at, \
+                     expires_at) VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![offer_id, row.session_id, name, newest_seq, now, expires_at, org],
                 )?;
                 tx.execute(
                     "UPDATE session_wake SET offered_at = ?2, offered_seq = ?3, offered_id = ?4, updated_at = ?5 \
-                     WHERE session_id = ?1",
-                    params![row.session_id, now, newest_seq, offer_id, ua_core::time::now()],
+                     WHERE session_id = ?1 AND org_id = ?6",
+                    params![row.session_id, now, newest_seq, offer_id, ua_core::time::now(), org],
                 )?;
                 record(
                     tx,
+                    org,
                     CHANNEL_WAKE,
                     "offered",
                     json!({ "session_id": row.session_id, "node": name, "seq": newest_seq, "offer_id": offer_id }),
@@ -664,8 +687,9 @@ fn reserve_attempt(
     identity: &str,
 ) -> UaResult<bool> {
     let changed = tx.execute(
-        "UPDATE session_wake_offers SET attempted_at = ?2 WHERE offer_id = ?1 AND attempted_at IS NULL",
-        params![offer_id, now],
+        "UPDATE session_wake_offers SET attempted_at = ?2 WHERE offer_id = ?1 AND org_id = ?3 \
+         AND attempted_at IS NULL",
+        params![offer_id, now, row.org],
     )?;
     if changed == 0 {
         return Ok(false);
@@ -674,7 +698,7 @@ fn reserve_attempt(
     let unacked = row.unacked_attempts + 1;
     tx.execute(
         "UPDATE session_wake SET last_attempt_at = ?2, attempt_hour_started_at = ?3, attempts_last_hour = ?4, \
-         unacked_attempts = ?5, paused_reason = ?6 WHERE session_id = ?1",
+         unacked_attempts = ?5, paused_reason = ?6 WHERE session_id = ?1 AND org_id = ?7",
         params![
             row.session_id,
             now,
@@ -682,10 +706,12 @@ fn reserve_attempt(
             if fresh_hour { 1 } else { row.attempts_last_hour + 1 },
             unacked,
             if unacked >= BREAKER_AFTER { Some(PAUSED_NO_READ.to_string()) } else { row.paused_reason.clone() },
+            row.org,
         ],
     )?;
     record(
         tx,
+        &row.org,
         CHANNEL_ATTEMPT,
         "reserved",
         json!({ "session_id": row.session_id, "offer_id": offer_id }),
@@ -715,10 +741,11 @@ fn check_offer_id(id: &str) -> UaResult<String> {
     Ok(id.to_string())
 }
 
-/// The wake row of `session_id` when `node` (which `agent` owns) is its wake
-/// node, else not found: no other node may check, report or see it.
-fn node_row(c: &Connection, session_id: &str, node: &str, agent: &str) -> UaResult<WakeRow> {
-    match load_row(c, session_id)? {
+/// The wake row of `session_id` in organization `org` when `node` (which
+/// `agent` owns) is its wake node, else not found: no other node may check,
+/// report or see it.
+fn node_row(c: &Connection, org: &str, session_id: &str, node: &str, agent: &str) -> UaResult<WakeRow> {
+    match load_row(c, org, session_id)? {
         Some(r) if r.agent == agent && wakes_through(c, &r, node)? => Ok(r),
         _ => {
             Err(UaError::not_found(format!("session {session_id:?} is not a wake session on node {node:?}")))
@@ -726,20 +753,28 @@ fn node_row(c: &Connection, session_id: &str, node: &str, agent: &str) -> UaResu
     }
 }
 
-fn check_offer(tx: &mut WriteTx<'_>, node: &str, identity: &str, a: &CheckArgs, now: f64) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
+fn check_offer(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    node: &str,
+    identity: &str,
+    a: &CheckArgs,
+    now: f64,
+) -> UaResult<Value> {
+    node_queue::require_org(tx, org)?;
+    let name = node_queue::owned_node(tx, org, node, identity)?.node;
     let sid = check_session_id(&a.session_id)?;
     let seq = check_seq(a.seq)?;
     let expires_at = check_stamp(a.expires_at, "expires_at")?;
     let offer_id = check_offer_id(&a.offer_id)?;
-    let row = node_row(tx, &sid, &name, identity)?;
+    let row = node_row(tx, org, &sid, &name, identity)?;
     let mut remaining = live_offer(&row, seq, now, expires_at, &offer_id);
     if remaining > 0.0 {
         let attempted: Option<Option<f64>> = tx
             .query_row(
                 "SELECT attempted_at FROM session_wake_offers WHERE offer_id = ?1 AND session_id = ?2 \
-                 AND node = ?3",
-                params![offer_id, sid, name],
+                 AND node = ?3 AND org_id = ?4",
+                params![offer_id, sid, name, org],
                 |r| r.get(0),
             )
             .optional()?;
@@ -747,14 +782,14 @@ fn check_offer(tx: &mut WriteTx<'_>, node: &str, identity: &str, a: &CheckArgs, 
             remaining = 0.0;
         }
     }
-    if remaining > 0.0 && trigger(tx, &row.agent, &sid, row.last_wake_seq, seq)?.n == 0 {
+    if remaining > 0.0 && trigger(tx, org, &row.agent, &sid, row.last_wake_seq, seq)?.n == 0 {
         remaining = 0.0;
     }
     if remaining > 0.0 && budget_hold(tx, &row, now)?.is_some() {
         remaining = 0.0;
     }
     if remaining > 0.0 {
-        let fresh = node_row(tx, &sid, &name, identity)?;
+        let fresh = node_row(tx, org, &sid, &name, identity)?;
         remaining = live_offer(&fresh, seq, now, expires_at, &offer_id);
         if remaining > 0.0 && !reserve_attempt(tx, &fresh, &offer_id, now, identity)? {
             remaining = 0.0;
@@ -786,12 +821,14 @@ struct OfferRow {
 
 fn record_receipt(
     tx: &mut WriteTx<'_>,
+    org: &str,
     node: &str,
     identity: &str,
     a: &ReceiptArgs,
     now: f64,
 ) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
+    node_queue::require_org(tx, org)?;
+    let name = node_queue::owned_node(tx, org, node, identity)?.node;
     let outcome = a.outcome.trim().to_string();
     if !OUTCOMES.contains(&outcome.as_str()) {
         return Err(UaError::invalid(format!("outcome must be one of {}", OUTCOMES.join(", "))));
@@ -808,12 +845,12 @@ fn record_receipt(
         }
         _ => None,
     };
-    let row = node_row(tx, &sid, &name, identity)?;
+    let row = node_row(tx, org, &sid, &name, identity)?;
     let offer: Option<OfferRow> = tx
         .query_row(
             "SELECT offered_seq, expires_at, attempted_at, invalidated_at, recorded_at FROM session_wake_offers \
-             WHERE offer_id = ?1 AND session_id = ?2 AND node = ?3",
-            params![offer_id, sid, name],
+             WHERE offer_id = ?1 AND session_id = ?2 AND node = ?3 AND org_id = ?4",
+            params![offer_id, sid, name, org],
             |r| {
                 Ok(OfferRow {
                     offered_seq: r.get(0)?,
@@ -859,7 +896,7 @@ fn record_receipt(
              offered_seq = CASE WHEN ?8 THEN NULL ELSE offered_seq END, \
              offered_id = CASE WHEN ?8 THEN NULL ELSE offered_id END, \
              retry_at = NULL, attempts = 0, last_outcome = ?9, last_reason = ?10, updated_at = ?11 \
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND org_id = ?12",
             params![
                 sid,
                 stamp,
@@ -872,6 +909,7 @@ fn record_receipt(
                 outcome,
                 reason,
                 ts,
+                org,
             ],
         )?;
     } else if uncertain {
@@ -882,8 +920,8 @@ fn record_receipt(
              offered_at = CASE WHEN ?3 THEN NULL ELSE offered_at END, \
              offered_seq = CASE WHEN ?3 THEN NULL ELSE offered_seq END, \
              offered_id = CASE WHEN ?3 THEN NULL ELSE offered_id END, \
-             last_outcome = ?4, last_reason = ?5, updated_at = ?6 WHERE session_id = ?1",
-            params![sid, cursor, same_generation, outcome, reason, ts],
+             last_outcome = ?4, last_reason = ?5, updated_at = ?6 WHERE session_id = ?1 AND org_id = ?7",
+            params![sid, cursor, same_generation, outcome, reason, ts, org],
         )?;
     } else {
         let attempts = row.attempts + 1;
@@ -891,7 +929,7 @@ fn record_receipt(
         tx.execute(
             "UPDATE session_wake SET offered_at = NULL, offered_seq = NULL, offered_id = NULL, retry_at = ?2, \
              attempts = ?3, last_wake_seq = ?4, last_outcome = ?5, last_reason = ?6, updated_at = ?7 \
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND org_id = ?8",
             params![
                 sid,
                 (!give_up).then_some(now + RETRY_S),
@@ -900,16 +938,18 @@ fn record_receipt(
                 outcome,
                 reason,
                 ts,
+                org,
             ],
         )?;
     }
     tx.execute(
         "UPDATE session_wake_offers SET recorded_at = ?2, outcome = ?3, delivered_at = ?4, reason = ?5 \
-         WHERE offer_id = ?1",
-        params![offer_id, stamp, outcome, delivered_at, reason],
+         WHERE offer_id = ?1 AND org_id = ?6",
+        params![offer_id, stamp, outcome, delivered_at, reason, org],
     )?;
     record(
         tx,
+        org,
         CHANNEL_WAKE,
         &outcome,
         json!({ "session_id": sid, "node": name, "seq": seq, "offer_id": offer_id, "reason": reason }),
@@ -926,16 +966,23 @@ fn record_receipt(
 /// `(id, agent, status, exit_status, external_session_id)` of one session.
 type LiveRow = (String, String, String, Option<String>, Option<String>);
 
-fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[String]) -> UaResult<Value> {
-    let name = node_queue::owned_node(tx, WAKE_ORG, node, identity)?.node;
+fn note_live_sessions(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    node: &str,
+    identity: &str,
+    ids: &[String],
+) -> UaResult<Value> {
+    node_queue::require_org(tx, org)?;
+    let name = node_queue::owned_node(tx, org, node, identity)?.node;
     let rows: Vec<LiveRow> = {
         let mut stmt = tx.prepare(
             "SELECT s.id, s.agent, s.status, s.exit_status, s.external_session_id \
-             FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
-             WHERE w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
+             FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id AND s.org_id = w.org_id \
+             WHERE w.org_id = ?2 AND w.opted_in = 1 AND w.granted_at IS NOT NULL AND w.declined_at IS NULL \
              AND s.external_session_id IS NOT NULL AND s.agent = ?1",
         )?;
-        stmt.query_map([identity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        stmt.query_map([identity, org], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<Result<_, _>>()?
     };
     let ts = ua_core::time::now();
@@ -944,28 +991,34 @@ fn note_live_sessions(tx: &mut WriteTx<'_>, node: &str, identity: &str, ids: &[S
         if !ext.as_ref().is_some_and(|e| ids.contains(e)) {
             continue;
         }
-        let Some(row) = load_row(tx, &id)? else { continue };
+        let Some(row) = load_row(tx, org, &id)? else { continue };
         if !wakes_through(tx, &row, &name)? {
             continue;
         }
         if matches!(status.as_str(), "starting" | "running" | "waiting") {
-            tx.execute("UPDATE agent_sessions SET last_heartbeat_at = ?2 WHERE id = ?1", params![id, ts])?;
+            tx.execute(
+                "UPDATE agent_sessions SET last_heartbeat_at = ?2 WHERE id = ?1 AND org_id = ?3",
+                params![id, ts, org],
+            )?;
             kept += 1;
         } else if status == "abandoned" && exit.as_deref() == Some(REAPED_EXIT) {
             tx.execute(
                 "UPDATE agent_sessions SET last_heartbeat_at = ?2, status = 'running', ended_at = NULL, \
-                 exit_status = NULL WHERE id = ?1",
-                params![id, ts],
+                 exit_status = NULL WHERE id = ?1 AND org_id = ?3",
+                params![id, ts, org],
             )?;
             revived += 1;
-            ledger::append(
+            super::agents::emit(
                 tx,
-                EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    CHANNEL_REVIVED,
-                    json!({ "session_id": id, "agent": agent, "node": name }),
-                )
-                .by(identity.to_string()),
+                org,
+                CHANNEL_REVIVED,
+                json!({
+                    "session_id": id,
+                    "agent": super::plans::ledger_text(org, &agent),
+                    "node": super::plans::ledger_text(org, &name),
+                }),
+                identity,
+                None,
             )?;
         }
     }
@@ -1067,7 +1120,7 @@ pub struct ReceiptArgs {
 }
 
 async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
     let agent = node_queue::device_agent(&ctx.caller)?;
     if a.offer_version != Some(3) {
         return Err(UaError::invalid("idle wakes require offer_version=3"));
@@ -1079,9 +1132,8 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
         Some(_) => return Err(UaError::invalid("wait_s must be a number")),
     };
     // Only the node's own agent holds a poll (and a slot) open.
-    let (n, ag) = (node.clone(), agent.clone());
-    let node =
-        ctx.hub.db().read_async(move |c| Ok(node_queue::owned_node(c, WAKE_ORG, &n, &ag)?.node)).await?;
+    let (n, ag, o) = (node.clone(), agent.clone(), org.clone());
+    let node = ctx.hub.db().read_async(move |c| Ok(node_queue::owned_node(c, &o, &n, &ag)?.node)).await?;
     let _slot = PollSlot::take(&ctx.hub, &node)?;
     if let Some(live) = a.live_sessions {
         if live.len() > MAX_LIVE_SESSIONS
@@ -1089,18 +1141,18 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
         {
             return Err(UaError::invalid("live_sessions must be a short list of ids"));
         }
-        let (n, ag) = (node.clone(), agent.clone());
-        ctx.hub.db().write_async(move |tx| note_live_sessions(tx, &n, &ag, &live)).await?;
+        let (n, ag, o) = (node.clone(), agent.clone(), org.clone());
+        ctx.hub.db().write_async(move |tx| note_live_sessions(tx, &o, &n, &ag, &live)).await?;
     }
     let deadline = Instant::now() + Duration::from_secs_f64(wait);
     loop {
         let last = Instant::now() >= deadline;
         // Read first: the write transaction runs only when something is due.
-        let (n, ag) = (node.clone(), agent.clone());
-        let pending = ctx.hub.db().read_async(move |c| poll_pending(c, &n, &ag, now_f())).await?;
+        let (n, ag, o) = (node.clone(), agent.clone(), org.clone());
+        let pending = ctx.hub.db().read_async(move |c| poll_pending(c, &o, &n, &ag, now_f())).await?;
         if pending {
-            let (n, ag) = (node.clone(), agent.clone());
-            let wakes = ctx.hub.db().write_async(move |tx| due_wakes(tx, &n, &ag, now_f())).await?;
+            let (n, ag, o) = (node.clone(), agent.clone(), org.clone());
+            let wakes = ctx.hub.db().write_async(move |tx| due_wakes(tx, &o, &n, &ag, now_f())).await?;
             if !wakes.is_empty() {
                 return Ok(json!({ "wakes": wakes }));
             }
@@ -1113,15 +1165,15 @@ async fn node_wake(ctx: ToolCtx, a: WakePollArgs) -> UaResult<Value> {
 }
 
 async fn node_wake_check(ctx: ToolCtx, a: CheckArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
     let agent = node_queue::device_agent(&ctx.caller)?;
-    ctx.hub.db().write_async(move |tx| check_offer(tx, &a.node.clone(), &agent, &a, now_f())).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| check_offer(tx, &org, &a.node.clone(), &agent, &a, now_f())).await
 }
 
 async fn node_wake_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
     let agent = node_queue::device_agent(&ctx.caller)?;
-    ctx.hub.db().write_async(move |tx| record_receipt(tx, &a.node.clone(), &agent, &a, now_f())).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().write_async(move |tx| record_receipt(tx, &org, &a.node.clone(), &agent, &a, now_f())).await
 }
 
 // --- consent: coordination_manage actions -----------------------------------------
@@ -1175,7 +1227,7 @@ fn verified_identity(caller: &Caller, verb: &str) -> UaResult<String> {
 }
 
 pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
     let who = verified_identity(&ctx.caller, "session_wake_opt_in")?;
     let sid = check_session_id(&a.session_id)?;
     let wake = a.wake.unwrap_or(true);
@@ -1186,7 +1238,8 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let (agent, status) = session_agent(tx, &sid)?;
+            node_queue::require_org(tx, &org)?;
+            let (agent, status) = session_agent(tx, &org, &sid)?;
             if agent != who {
                 return Err(UaError::denied(
                     "not_session_owner",
@@ -1198,12 +1251,14 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
             }
             // A named wake node must be one of the session's own agent's.
             if let Some(n) = &node {
-                node_queue::owned_node(tx, WAKE_ORG, n, &who)?;
+                node_queue::owned_node(tx, &org, n, &who)?;
             }
             let before: Option<(i64, Option<String>)> = tx
-                .query_row("SELECT opted_in, node FROM session_wake WHERE session_id = ?1", [&sid], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+                .query_row(
+                    "SELECT opted_in, node FROM session_wake WHERE session_id = ?1 AND org_id = ?2",
+                    [&sid, &org],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()?;
             let renamed = node.is_some() && before.as_ref().and_then(|(_, n)| n.as_ref()) != node.as_ref();
             let changed = before.as_ref().map_or(0, |(o, _)| *o) != i64::from(wake) || renamed;
@@ -1211,44 +1266,45 @@ pub(crate) async fn session_wake_opt_in(ctx: ToolCtx, a: OptInArgs) -> UaResult<
             if wake {
                 if renamed {
                     // Offers made through another node no longer count.
-                    invalidate_offers(tx, &sid, now_f())?;
+                    invalidate_offers(tx, &org, &sid, now_f())?;
                 }
                 tx.execute(
-                    "INSERT INTO session_wake (session_id, opted_in, requested_at, node, updated_at) \
-                     VALUES (?1, 1, ?2, ?3, ?2) \
+                    "INSERT INTO session_wake (org_id, session_id, opted_in, requested_at, node, updated_at) \
+                     VALUES (?5, ?1, 1, ?2, ?3, ?2) \
                      ON CONFLICT(session_id) DO UPDATE SET opted_in = 1, \
                      requested_at = COALESCE(requested_at, excluded.requested_at), \
                      node = COALESCE(excluded.node, node), \
                      offered_at = CASE WHEN ?4 THEN NULL ELSE offered_at END, \
                      offered_seq = CASE WHEN ?4 THEN NULL ELSE offered_seq END, \
                      offered_id = CASE WHEN ?4 THEN NULL ELSE offered_id END, \
-                     updated_at = excluded.updated_at",
-                    params![sid, ts, node, renamed],
+                     updated_at = excluded.updated_at WHERE session_wake.org_id = excluded.org_id",
+                    params![sid, ts, node, renamed, org],
                 )?;
             } else if changed {
                 tx.execute(
                     "UPDATE session_wake SET opted_in = 0, requested_at = NULL, offered_at = NULL, offered_seq = NULL, \
-                     offered_id = NULL, updated_at = ?2 WHERE session_id = ?1",
-                    params![sid, ts],
+                     offered_id = NULL, updated_at = ?2 WHERE session_id = ?1 AND org_id = ?3",
+                    params![sid, ts, org],
                 )?;
-                invalidate_offers(tx, &sid, now_f())?;
+                invalidate_offers(tx, &org, &sid, now_f())?;
             }
             if changed {
                 record(
                     tx,
+                    &org,
                     CHANNEL_REQUEST,
                     if wake { "requested" } else { "withdrawn" },
                     json!({ "session_id": sid, "agent": agent, "node": node }),
                     &who,
                 )?;
             }
-            Ok(json!({ "session_id": sid, "requested": wake, "changed": changed, "state": state(tx, &sid)? }))
+            Ok(json!({ "session_id": sid, "requested": wake, "changed": changed, "state": state(tx, &org, &sid)? }))
         })
         .await
 }
 
 pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
     let Some(actor) = verified(&ctx.caller).filter(|_| ctx.caller.is_human()).map(str::to_string) else {
         return Err(UaError::denied(
             "human_required",
@@ -1260,11 +1316,12 @@ pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<V
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let (agent, _) = session_agent(tx, &sid)?;
+            node_queue::require_org(tx, &org)?;
+            let (agent, _) = session_agent(tx, &org, &sid)?;
             let before: Option<(i64, bool)> = tx
                 .query_row(
-                    "SELECT opted_in, granted_at IS NOT NULL FROM session_wake WHERE session_id = ?1",
-                    [&sid],
+                    "SELECT opted_in, granted_at IS NOT NULL FROM session_wake WHERE session_id = ?1 AND org_id = ?2",
+                    [&sid, &org],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -1275,22 +1332,24 @@ pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<V
                 if grant {
                     // A grant is the human changing their mind: it clears a decline.
                     tx.execute(
-                        "INSERT INTO session_wake (session_id, granted_at, granted_by, updated_at) \
-                         VALUES (?1, ?2, ?3, ?2) ON CONFLICT(session_id) DO UPDATE SET \
+                        "INSERT INTO session_wake (org_id, session_id, granted_at, granted_by, updated_at) \
+                         VALUES (?4, ?1, ?2, ?3, ?2) ON CONFLICT(session_id) DO UPDATE SET \
                          granted_at = excluded.granted_at, granted_by = excluded.granted_by, declined_at = NULL, \
-                         declined_by = NULL, decline_reason = NULL, updated_at = excluded.updated_at",
-                        params![sid, ts, actor],
+                         declined_by = NULL, decline_reason = NULL, updated_at = excluded.updated_at \
+                         WHERE session_wake.org_id = excluded.org_id",
+                        params![sid, ts, actor, org],
                     )?;
                 } else {
-                    invalidate_offers(tx, &sid, now_f())?;
+                    invalidate_offers(tx, &org, &sid, now_f())?;
                     tx.execute(
                         "UPDATE session_wake SET granted_at = NULL, granted_by = NULL, offered_at = NULL, \
-                         offered_seq = NULL, offered_id = NULL, updated_at = ?2 WHERE session_id = ?1",
-                        params![sid, ts],
+                         offered_seq = NULL, offered_id = NULL, updated_at = ?2 WHERE session_id = ?1 AND org_id = ?3",
+                        params![sid, ts, org],
                     )?;
                 }
                 record(
                     tx,
+                    &org,
                     CHANNEL_GRANT,
                     if grant { "granted" } else { "revoked" },
                     json!({ "session_id": sid, "agent": agent }),
@@ -1303,7 +1362,7 @@ pub(crate) async fn session_wake_grant(ctx: ToolCtx, a: GrantArgs) -> UaResult<V
 }
 
 pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
     let actor = verified_identity(&ctx.caller, "session_wake_decline")?;
     let sid = check_session_id(&a.session_id)?;
     let reason = a
@@ -1319,12 +1378,13 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
         || Authz::new(ctx.hub.cfg()).holds(
             &ctx.caller,
             &[Authority::Operator, Authority::LifecycleOperator],
-            ua_core::DEFAULT_ORG,
+            &ctx.caller.org_id,
         );
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let (agent, _) = session_agent(tx, &sid)?;
+            node_queue::require_org(tx, &org)?;
+            let (agent, _) = session_agent(tx, &org, &sid)?;
             if !maintainer && agent != actor {
                 return Err(UaError::denied(
                     "not_authorized",
@@ -1332,25 +1392,28 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
                 ));
             }
             let declined: Option<bool> = tx
-                .query_row("SELECT declined_at IS NOT NULL FROM session_wake WHERE session_id = ?1", [&sid], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT declined_at IS NOT NULL FROM session_wake WHERE session_id = ?1 AND org_id = ?2",
+                    [&sid, &org],
+                    |r| r.get(0),
+                )
                 .optional()?;
             let changed = !declined.unwrap_or(false);
             if changed {
-                invalidate_offers(tx, &sid, now_f())?;
+                invalidate_offers(tx, &org, &sid, now_f())?;
                 let ts = ua_core::time::now();
                 tx.execute(
-                    "INSERT INTO session_wake (session_id, declined_at, declined_by, decline_reason, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?2) ON CONFLICT(session_id) DO UPDATE SET \
+                    "INSERT INTO session_wake (org_id, session_id, declined_at, declined_by, decline_reason, \
+                     updated_at) VALUES (?5, ?1, ?2, ?3, ?4, ?2) ON CONFLICT(session_id) DO UPDATE SET \
                      declined_at = excluded.declined_at, declined_by = excluded.declined_by, \
                      decline_reason = excluded.decline_reason, granted_at = NULL, granted_by = NULL, \
-                     offered_at = NULL, offered_seq = NULL, offered_id = NULL, updated_at = excluded.updated_at",
-                    params![sid, ts, actor, reason],
+                     offered_at = NULL, offered_seq = NULL, offered_id = NULL, updated_at = excluded.updated_at \
+                     WHERE session_wake.org_id = excluded.org_id",
+                    params![sid, ts, actor, reason, org],
                 )?;
-                record(tx, CHANNEL_GRANT, "declined", json!({ "session_id": sid, "agent": agent }), &actor)?;
+                record(tx, &org, CHANNEL_GRANT, "declined", json!({ "session_id": sid, "agent": agent }), &actor)?;
             }
-            let mut out = state(tx, &sid)?;
+            let mut out = state(tx, &org, &sid)?;
             out["session_id"] = json!(sid);
             out["changed"] = json!(changed);
             Ok(out)
@@ -1358,15 +1421,16 @@ pub(crate) async fn session_wake_decline(ctx: ToolCtx, a: DeclineArgs) -> UaResu
         .await
 }
 
-/// One session's wake state for display.
-fn state(c: &Connection, sid: &str) -> UaResult<Value> {
+/// One session's wake state for display, in organization `org`.
+fn state(c: &Connection, org: &str, sid: &str) -> UaResult<Value> {
     Ok(c.query_row(
         "SELECT w.session_id, s.agent, s.status, s.host, w.opted_in, w.requested_at, w.granted_at, w.granted_by, \
          w.declined_at, w.declined_by, w.decline_reason, w.offered_at, w.retry_at, w.last_wake_at, w.last_wake_seq, \
          w.wakes_last_hour, w.unacked_wakes, w.unacked_attempts, w.paused_reason, w.last_outcome, w.last_reason, \
          w.attempts \
-         FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id WHERE w.session_id = ?1",
-        [sid],
+         FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id AND s.org_id = w.org_id \
+         WHERE w.session_id = ?1 AND w.org_id = ?2",
+        [sid, org],
         state_json,
     )
     .optional()?
@@ -1406,33 +1470,34 @@ fn state_json(r: &Row<'_>) -> rusqlite::Result<Value> {
 }
 
 pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
-    wake_org(&ctx.caller)?;
     let who = verified_identity(&ctx.caller, "session_wake_status")?;
+    let org = ctx.caller.org_id.clone();
     let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        &org,
     );
     let sid = a.session_id.as_deref().map(check_session_id).transpose()?;
     ctx.hub
         .db()
         .read_async(move |c| {
             if let Some(sid) = sid {
-                let (agent, _) = session_agent(c, &sid)?;
+                let (agent, _) = session_agent(c, &org, &sid)?;
                 if !maintainer && agent != who {
                     return Err(UaError::not_found(format!("session {sid:?} does not exist")));
                 }
-                return state(c, &sid);
+                return state(c, &org, &sid);
             }
             let mut stmt = c.prepare(
                 "SELECT w.session_id, s.agent, s.status, s.host, w.opted_in, w.requested_at, w.granted_at, \
                  w.granted_by, w.declined_at, w.declined_by, w.decline_reason, w.offered_at, w.retry_at, \
                  w.last_wake_at, w.last_wake_seq, w.wakes_last_hour, w.unacked_wakes, w.unacked_attempts, \
                  w.paused_reason, w.last_outcome, w.last_reason, w.attempts \
-                 FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id \
-                 WHERE (?1 OR s.agent = ?2) ORDER BY w.requested_at, w.session_id LIMIT 500",
+                 FROM session_wake w JOIN agent_sessions s ON s.id = w.session_id AND s.org_id = w.org_id \
+                 WHERE w.org_id = ?3 AND (?1 OR s.agent = ?2) ORDER BY w.requested_at, w.session_id LIMIT 500",
             )?;
-            let rows = stmt.query_map(params![maintainer, who], state_json)?.collect::<Result<Vec<_>, _>>()?;
+            let rows =
+                stmt.query_map(params![maintainer, who, org], state_json)?.collect::<Result<Vec<_>, _>>()?;
             let open = |v: &Value| matches!(v["session_status"].as_str(), Some("starting" | "running" | "waiting"));
             let requested: Vec<&Value> = rows.iter().filter(|v| open(v) && v["requested"] == json!(true)).collect();
             let awaiting: Vec<&Value> = requested
@@ -1442,8 +1507,9 @@ pub(crate) async fn session_wake_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
                 .collect();
             let woken: i64 = c.query_row(
                 "SELECT COUNT(DISTINCT o.session_id) FROM session_wake_offers o \
-                 JOIN agent_sessions s ON s.id = o.session_id WHERE o.outcome = 'delivered' AND (?1 OR s.agent = ?2)",
-                params![maintainer, who],
+                 JOIN agent_sessions s ON s.id = o.session_id AND s.org_id = o.org_id \
+                 WHERE o.org_id = ?3 AND o.outcome = 'delivered' AND (?1 OR s.agent = ?2)",
+                params![maintainer, who, org],
                 |r| r.get(0),
             )?;
             Ok(json!({
@@ -1554,7 +1620,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let pending = || hub.db().read(|c| poll_pending(c, "box", "builder-1", now_f())).unwrap();
+        let pending =
+            || hub.db().read(|c| poll_pending(c, ua_core::DEFAULT_ORG, "box", "builder-1", now_f())).unwrap();
         assert!(!pending(), "no mail: nothing to write");
         reg.call(
             &hub,
@@ -1575,7 +1642,7 @@ mod tests {
             .unwrap();
         assert!(pending(), "due: the poll writes the offer");
         assert!(
-            !hub.db().read(|c| poll_pending(c, "box", "intruder", now_f())).unwrap(),
+            !hub.db().read(|c| poll_pending(c, ua_core::DEFAULT_ORG, "box", "intruder", now_f())).unwrap(),
             "only the owner's sessions"
         );
     }

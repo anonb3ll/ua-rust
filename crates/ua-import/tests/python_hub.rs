@@ -567,6 +567,11 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
     // Legacy nodes land in the default organization.
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE org_id <> 'default'"), 0);
+    // So do legacy agents, their tokens and their handoff notes.
+    for t in ["agents", "agent_tokens", "session_handoff_notes"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
+    assert!(n(&db, "SELECT COUNT(*) FROM agents") > 0);
     assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = 'default'"), 1);
 

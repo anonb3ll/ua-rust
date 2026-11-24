@@ -36,17 +36,35 @@
 //! pause followed by a self-terminate is still the operator's stop); only an
 //! operator transition back to `active` clears it. Retire and unretire are
 //! operator actions only, for an agent's own label too.
+//!
+//! **Forget** (`agent_forget`, lifecycle operators only) deletes a retired
+//! agent's row, its lifecycle row and its profile bindings, so the label can
+//! be registered again; its sessions, notes and revoked tokens stay as
+//! history in its organization.
+//!
+//! Organizations: a lifecycle row is in its agent's organization, and every
+//! action works in the caller's organization. A label another organization's
+//! agent holds reads as an agent with no lifecycle record (`agent_state`),
+//! and a change to it is refused as a taken label. Agent labels are one hub
+//! namespace, so a default-organization lifecycle operator can recover a
+//! label any organization holds: `agent_retire` and `agent_forget` with
+//! `any_org=true` act in the agent's own organization through the same code,
+//! and another organization's agent answers only
+//! `{agent, org_id, changed, retired or forgotten, hub_recovery}`. Events
+//! about another organization's agent carry no label, reason or actor
+//! (`ORG-EVENT-DEFAULT`, through `agents::emit`).
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_store::WriteTx;
 
 use super::{clean_reason, now, verified_actor};
-use crate::families::agents::validate_label;
+use crate::families::agents::{self, validate_label};
 use crate::families::dispatch;
+use crate::families::plans::{ledger_label, ledger_text};
 use crate::families::{node_queue, tokens};
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
@@ -62,6 +80,7 @@ enum Verb {
     Terminate,
     Retire,
     Unretire,
+    Forget,
 }
 
 impl Verb {
@@ -72,6 +91,7 @@ impl Verb {
             Verb::Terminate => "terminate",
             Verb::Retire => "retire",
             Verb::Unretire => "unretire",
+            Verb::Forget => "forget",
         }
     }
 
@@ -80,16 +100,16 @@ impl Verb {
             Verb::Pause => "paused",
             Verb::Resume | Verb::Unretire => "active",
             Verb::Terminate => "terminated",
-            Verb::Retire => "retired",
+            Verb::Retire | Verb::Forget => "retired",
         }
     }
 
     fn operator_only(self) -> bool {
-        matches!(self, Verb::Retire | Verb::Unretire)
+        matches!(self, Verb::Retire | Verb::Unretire | Verb::Forget)
     }
 
     fn reason_required(self) -> bool {
-        matches!(self, Verb::Pause | Verb::Terminate | Verb::Retire)
+        matches!(self, Verb::Pause | Verb::Terminate | Verb::Retire | Verb::Forget)
     }
 }
 
@@ -124,9 +144,22 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 
+/// `agent`'s lifecycle row in any organization. An agent label is one
+/// hub-wide namespace and an agent belongs to one organization, so the claim
+/// gate and the HTTP adapter read a label's state wherever it is.
 fn load(c: &Connection, agent: &str) -> UaResult<Option<Row>> {
     Ok(c.query_row(&format!("SELECT {COLUMNS} FROM agent_lifecycle WHERE agent = ?1"), [agent], row_from)
         .optional()?)
+}
+
+/// `agent`'s lifecycle row in organization `org` only.
+fn load_in(c: &Connection, org: &str, agent: &str) -> UaResult<Option<Row>> {
+    Ok(c.query_row(
+        &format!("SELECT {COLUMNS} FROM agent_lifecycle WHERE org_id = ?1 AND agent = ?2"),
+        [org, agent],
+        row_from,
+    )
+    .optional()?)
 }
 
 fn state_json(agent: &str, row: Option<&Row>) -> Value {
@@ -230,27 +263,50 @@ pub struct RetireArgs {
     pub reason: Option<String>,
     /// Owner of record: an identity label, at most 120 characters.
     pub owner: Option<String>,
+    /// Hub recovery: retire the agent of whichever organization holds the
+    /// label, in that organization. The default organization's lifecycle
+    /// operators only.
+    pub any_org: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForgetArgs {
+    /// Agent label of a retired agent.
+    pub agent: String,
+    /// Why (required), at most 500 characters.
+    pub reason: Option<String>,
+    /// Hub recovery: forget the agent of whichever organization holds the
+    /// label, in that organization. The default organization's lifecycle
+    /// operators only.
+    pub any_org: Option<bool>,
 }
 
 // --- reads ----------------------------------------------------------------------
 
-/// `coordination_manage(action="agent_state")`.
+/// `coordination_manage(action="agent_state")`. Another organization's
+/// agent reads as one with no lifecycle record, exactly as an unknown label.
 pub(crate) async fn agent_state(ctx: ToolCtx, a: StateArgs) -> UaResult<Value> {
     let label = validate_label(Some(&a.agent), "agent")?;
-    ctx.hub.db().read_async(move |c| Ok(state_json(&label, load(c, &label)?.as_ref()))).await
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| Ok(state_json(&label, load_in(c, &org, &label)?.as_ref()))).await
 }
 
-/// `coordination_manage(action="agent_states")`.
+/// `coordination_manage(action="agent_states")`: the caller's organization's
+/// agents and lifecycle rows only.
 pub(crate) async fn agent_states(ctx: ToolCtx, _a: StatesArgs) -> UaResult<Value> {
     let operators = ctx.hub.cfg().lifecycle_operators().to_vec();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
-            let mut stmt = c.prepare(&format!("SELECT {COLUMNS} FROM agent_lifecycle ORDER BY agent"))?;
-            let changed: Vec<Row> = stmt.query_map([], row_from)?.collect::<Result<_, _>>()?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {COLUMNS} FROM agent_lifecycle WHERE org_id = ?1 ORDER BY agent"
+            ))?;
+            let changed: Vec<Row> = stmt.query_map([&org], row_from)?.collect::<Result<_, _>>()?;
             let mut labels: Vec<String> = c
-                .prepare("SELECT label FROM agents")?
-                .query_map([], |r| r.get(0))?
+                .prepare("SELECT label FROM agents WHERE org_id = ?1")?
+                .query_map([&org], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             labels.extend(changed.iter().map(|r| r.agent.clone()));
             labels.sort_by_key(|l| l.to_ascii_lowercase());
@@ -343,16 +399,20 @@ fn doing_claims(c: &Connection, agent: &str) -> UaResult<Vec<(i64, String)>> {
     Ok(ids)
 }
 
-/// Revoke `agent`'s managed tokens and OAuth sign-ins. Returns what was revoked.
-fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) -> UaResult<Value> {
+/// Revoke `agent`'s managed tokens (in its organization `org`), OAuth
+/// sign-ins and session credentials. Returns what was revoked.
+fn revoke_credentials(tx: &mut WriteTx<'_>, org: &str, agent: &str, who: &str, at: &str) -> UaResult<Value> {
     let token_ids: Vec<i64> = tx
-        .prepare("SELECT id FROM agent_tokens WHERE agent_label = ?1 COLLATE NOCASE AND status = 'active' ORDER BY id")?
-        .query_map([agent], |r| r.get(0))?
+        .prepare(
+            "SELECT id FROM agent_tokens WHERE org_id = ?2 AND agent_label = ?1 COLLATE NOCASE \
+             AND status = 'active' ORDER BY id",
+        )?
+        .query_map([agent, org], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     tx.execute(
         "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
-         WHERE agent_label = ?1 COLLATE NOCASE AND status = 'active'",
-        params![agent, at],
+         WHERE org_id = ?3 AND agent_label = ?1 COLLATE NOCASE AND status = 'active'",
+        params![agent, at, org],
     )?;
     let families: Vec<String> = tx
         .prepare(
@@ -364,31 +424,34 @@ fn revoke_credentials(tx: &mut WriteTx<'_>, agent: &str, who: &str, at: &str) ->
     for f in &families {
         oauth_tokens += tokens::revoke_family(tx, f, "agent_retired")?;
     }
-    let session_credentials = crate::families::node_queue::revoke_for_agent(tx, agent, "agent_retired", who)?;
+    let session_credentials =
+        crate::families::node_queue::revoke_for_agent(tx, org, agent, "agent_retired", who)?;
     if !token_ids.is_empty() {
-        ledger::append(
+        agents::emit(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG,
-                "agent.token.revoked",
-                json!({ "agent": agent, "token_ids": token_ids, "reason": "agent_retired", "revoked_at": at }),
-            )
-            .by(who.to_string()),
+            org,
+            "agent.token.revoked",
+            json!({
+                "agent": ledger_text(org, agent), "token_ids": token_ids, "reason": "agent_retired",
+                "revoked_at": at,
+            }),
+            who,
+            None,
         )?;
     }
     if !families.is_empty() {
-        ledger::append(
+        agents::emit(
             tx,
-            EventInput::new(
-                ua_core::DEFAULT_ORG,
-                "agent.oauth.sessions_revoked",
-                json!({
-                    "identity": agent,
-                    "revoked_sessions": families.len(),
-                    "revoked_tokens": oauth_tokens,
-                    "reason": "agent_retired",
-                }),
-            )
-            .by(who.to_string()),
+            org,
+            "agent.oauth.sessions_revoked",
+            json!({
+                "identity": ledger_text(org, agent),
+                "revoked_sessions": families.len(),
+                "revoked_tokens": oauth_tokens,
+                "reason": "agent_retired",
+            }),
+            who,
+            None,
         )?;
     }
     Ok(
@@ -510,6 +573,53 @@ struct Changed {
     stops: Vec<Value>,
     runs: Vec<(String, i64, String)>,
     revoked: Option<Value>,
+    /// The organization the change was made in (the agent's).
+    org: String,
+}
+
+/// Whether an action asked for hub recovery (`any_org`): the caller must be a
+/// lifecycle operator of the default organization, the hub-level authority
+/// (checked over [`ua_core::DEFAULT_ORG`], which no other organization's
+/// caller holds).
+fn hub_recovery(ctx: &ToolCtx, any_org: Option<bool>, verb: Verb) -> UaResult<bool> {
+    if any_org != Some(true) {
+        return Ok(false);
+    }
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::LifecycleOperator], ua_core::DEFAULT_ORG) {
+        return Err(UaError::denied(
+            "not_lifecycle_operator",
+            format!(
+                "hub recovery (agent_{} with any_org) is for the default organization's lifecycle operators only",
+                verb.as_str()
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// The organization a change works in: the caller's own, or under hub
+/// recovery the one holding `label` (the caller's own when none does, so an
+/// unknown label answers as it always has). Outside hub recovery a label
+/// another organization holds is refused as taken: its agent is not the
+/// caller's to change, and the label namespace already shows that it is held.
+fn action_org(c: &Connection, caller_org: &str, label: &str, hub: bool) -> UaResult<String> {
+    match agents::label_org(c, label)? {
+        Some(held) if hub => Ok(held),
+        Some(held) if held != caller_org => Err(agents::label_taken(label)),
+        _ => Ok(caller_org.to_string()),
+    }
+}
+
+/// The lifecycle event payload of a change in organization `org`: another
+/// organization's carries no label, reason, actor or owner.
+fn redact_stops(org: &str, stops: &[Value]) -> Value {
+    if org == ua_core::DEFAULT_ORG {
+        return json!(stops);
+    }
+    json!(stops
+        .iter()
+        .map(|s| json!({ "path": s["path"], "ref": s["ref"], "task_id": s["task_id"], "control": s["control"] }))
+        .collect::<Vec<_>>())
 }
 
 async fn change(
@@ -518,6 +628,7 @@ async fn change(
     verb: Verb,
     reason: Option<&str>,
     owner: Option<&str>,
+    any_org: Option<bool>,
 ) -> UaResult<Value> {
     let label = validate_label(Some(agent), "agent")?;
     let reason = clean_reason(
@@ -525,6 +636,7 @@ async fn change(
         verb.reason_required().then_some(match verb {
             Verb::Pause => "pause an agent",
             Verb::Terminate => "terminate an agent",
+            Verb::Forget => "forget an agent",
             _ => "retire an agent",
         }),
     )?;
@@ -537,20 +649,27 @@ async fn change(
         Some(o) => Some(validate_label(Some(o), "owner")?),
     };
     let who = verified_actor(&ctx.caller, "changing an agent's lifecycle")?;
+    let hub = hub_recovery(&ctx, any_org, verb)?;
+    let caller_org = ctx.caller.org_id.clone();
     let maintainer = Authz::new(ctx.hub.cfg()).holds(
         &ctx.caller,
         &[Authority::Operator, Authority::LifecycleOperator],
-        ua_core::DEFAULT_ORG,
+        &caller_org,
     );
-    let (l2, w2, r2) = (label.clone(), who.clone(), reason.clone());
+    let (l2, w2, r2, co) = (label.clone(), who.clone(), reason.clone(), caller_org.clone());
     let out = ctx
         .hub
         .db()
         .write_async(move |tx| {
             let (label, who, reason) = (l2, w2, r2);
-            let current = load(tx, &label)?;
+            let org = action_org(tx, &co, &label, hub)?;
+            agents::require_org(tx, &org)?;
+            let current = load_in(tx, &org, &label)?;
             let state = current.as_ref().map_or("active", |r| r.state.as_str()).to_string();
             authorize(&who, maintainer, &label, verb, current.as_ref())?;
+            if verb == Verb::Forget {
+                return forget(tx, &org, &label, &who, &reason, current.as_ref());
+            }
             check_transition(&label, verb, &state)?;
             let target = verb.target();
             if state == target {
@@ -560,6 +679,7 @@ async fn change(
                     stops: Vec::new(),
                     runs: Vec::new(),
                     revoked: None,
+                    org,
                 });
             }
             let at = now();
@@ -579,7 +699,7 @@ async fn change(
                         ),
                     ));
                 }
-                revoked = Some(revoke_credentials(tx, &label, &who, &at)?);
+                revoked = Some(revoke_credentials(tx, &org, &label, &who, &at)?);
             }
             let stored = current.as_ref().map_or(label.clone(), |r| r.agent.clone());
             // Who imposed the stop in force: an operator's stop is recorded
@@ -588,18 +708,19 @@ async fn change(
             // clears it.
             let imposed_by = if target == "active" {
                 None
-            } else if maintainer && !who.eq_ignore_ascii_case(&label) {
+            } else if (maintainer || hub) && !who.eq_ignore_ascii_case(&label) {
                 Some(who.clone())
             } else {
                 current.as_ref().and_then(|r| r.imposed_by.clone())
             };
-            tx.execute(
-                "INSERT INTO agent_lifecycle (agent, state, previous, action, reason, actor, imposed_by, owner, since) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+            let n = tx.execute(
+                "INSERT INTO agent_lifecycle (org_id, agent, state, previous, action, reason, actor, imposed_by, \
+                 owner, since) VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(agent) DO UPDATE SET state = excluded.state, previous = excluded.previous, \
                  action = excluded.action, reason = excluded.reason, actor = excluded.actor, \
                  imposed_by = excluded.imposed_by, \
-                 owner = COALESCE(excluded.owner, agent_lifecycle.owner), since = excluded.since",
+                 owner = COALESCE(excluded.owner, agent_lifecycle.owner), since = excluded.since \
+                 WHERE agent_lifecycle.org_id = excluded.org_id",
                 params![
                     stored,
                     target,
@@ -609,25 +730,31 @@ async fn change(
                     who,
                     imposed_by,
                     owner,
-                    at
+                    at,
+                    org
                 ],
             )?;
+            // Another organization's lifecycle row for this label (one made
+            // before the label was registered there) is never changed.
+            if n == 0 {
+                return Err(agents::label_taken(&label));
+            }
             let mut payload = json!({
                 "kind": "lifecycle.changed",
-                "agent": stored,
+                "agent": ledger_text(&org, &stored),
                 "state": target,
                 "previous": state,
                 "action": verb.as_str(),
-                "reason": (!reason.is_empty()).then_some(&reason),
-                "actor": who,
-                "imposed_by": imposed_by,
+                "reason": ledger_label(&org, (!reason.is_empty()).then_some(reason.as_str())),
+                "actor": ledger_text(&org, &who),
+                "imposed_by": ledger_label(&org, imposed_by.as_deref()),
                 "at": at,
             });
             if verb == Verb::Retire {
-                payload["owner"] = json!(owner);
+                payload["owner"] = ledger_label(&org, owner.as_deref());
                 payload["revoked"] = revoked.clone().unwrap_or(Value::Null);
             }
-            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(who.clone()))?;
+            agents::emit(tx, &org, CHANNEL, payload, &who, None)?;
 
             // Stops on what the hub can reach. Runs are cancelled after commit.
             let mut stops = Vec::new();
@@ -651,8 +778,8 @@ async fn change(
                     }
                 }
             }
-            let row = load(tx, &stored)?;
-            Ok(Changed { state: state_json(&stored, row.as_ref()), changed: true, stops, runs, revoked })
+            let row = load_in(tx, &org, &stored)?;
+            Ok(Changed { state: state_json(&stored, row.as_ref()), changed: true, stops, runs, revoked, org })
         })
         .await?;
 
@@ -662,17 +789,33 @@ async fn change(
         stops.extend(stop_runs(&ctx.hub, &who, out.runs, &why).await);
     }
     if out.changed && !stops.is_empty() {
+        let org = out.org.clone();
         let (by, payload) = (
             who.clone(),
-            json!({ "kind": "lifecycle.stops_requested", "agent": label, "actor": who, "stops": stops }),
+            json!({
+                "kind": "lifecycle.stops_requested",
+                "agent": ledger_text(&org, &label),
+                "actor": ledger_text(&org, &who),
+                "stops": redact_stops(&org, &stops),
+            }),
         );
-        ctx.hub
-            .db()
-            .write_async(move |tx| {
-                ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by))?;
-                Ok(())
-            })
-            .await?;
+        ctx.hub.db().write_async(move |tx| agents::emit(tx, &org, CHANNEL, payload, &by, None)).await?;
+    }
+    // Hub recovery of another organization's agent answers without the
+    // agent's own fields (its reasons, actors, owner, stops, credentials).
+    if out.org != caller_org {
+        let mut answer = json!({
+            "agent": label,
+            "org_id": out.org,
+            "changed": out.changed,
+            "hub_recovery": true,
+        });
+        if verb == Verb::Forget {
+            answer["forgotten"] = json!(out.changed);
+        } else {
+            answer["retired"] = json!(true);
+        }
+        return Ok(answer);
     }
     let mut result = out.state;
     result["changed"] = json!(out.changed);
@@ -680,32 +823,97 @@ async fn change(
     if let Some(r) = out.revoked {
         result["revoked"] = r;
     }
+    if hub {
+        result["hub_recovery"] = json!(true);
+    }
     Ok(result)
+}
+
+/// Forget a retired agent of organization `org`: delete its agent row, its
+/// lifecycle row and its profile bindings there, so its label is free again.
+/// Its sessions, handoff notes, wake rows and revoked tokens stay in `org`
+/// as history. Refused unless the agent is retired (a retire already refused
+/// it while it held doing claims, and revoked its credentials).
+fn forget(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    label: &str,
+    who: &str,
+    reason: &str,
+    current: Option<&Row>,
+) -> UaResult<Changed> {
+    if current.is_none_or(|r| r.state != "retired") {
+        return Err(UaError::conflict_code(
+            "agent_not_retired",
+            format!(
+                "{label:?} is not retired; retire it (coordination_manage agent_retire) before forgetting it"
+            ),
+        ));
+    }
+    let stored = current.map_or(label.to_string(), |r| r.agent.clone());
+    let agents_deleted = tx.execute(
+        "DELETE FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE",
+        params![org, stored],
+    )?;
+    tx.execute("DELETE FROM agent_lifecycle WHERE org_id = ?1 AND agent = ?2", params![org, stored])?;
+    let profiles = tx.execute(
+        "DELETE FROM session_profiles WHERE org_id = ?1 AND identity = ?2 COLLATE NOCASE",
+        params![org, stored],
+    )?;
+    agents::emit(
+        tx,
+        org,
+        CHANNEL,
+        json!({
+            "kind": "lifecycle.forgotten",
+            "agent": ledger_text(org, &stored),
+            "reason": ledger_text(org, reason),
+            "actor": ledger_text(org, who),
+            "agent_rows": agents_deleted,
+            "profile_bindings": profiles,
+            "at": now(),
+        }),
+        who,
+        None,
+    )?;
+    Ok(Changed {
+        state: json!({ "agent": stored, "state": "forgotten", "forgotten": true }),
+        changed: true,
+        stops: Vec::new(),
+        runs: Vec::new(),
+        revoked: None,
+        org: org.to_string(),
+    })
 }
 
 /// `coordination_manage(action="agent_pause")`.
 pub(crate) async fn agent_pause(ctx: ToolCtx, a: ChangeArgs) -> UaResult<Value> {
-    change(ctx, &a.agent, Verb::Pause, a.reason.as_deref(), None).await
+    change(ctx, &a.agent, Verb::Pause, a.reason.as_deref(), None, None).await
 }
 
 /// `coordination_manage(action="agent_resume")`.
 pub(crate) async fn agent_resume(ctx: ToolCtx, a: ChangeArgs) -> UaResult<Value> {
-    change(ctx, &a.agent, Verb::Resume, a.reason.as_deref(), None).await
+    change(ctx, &a.agent, Verb::Resume, a.reason.as_deref(), None, None).await
 }
 
 /// `coordination_manage(action="agent_terminate")`.
 pub(crate) async fn agent_terminate(ctx: ToolCtx, a: ChangeArgs) -> UaResult<Value> {
-    change(ctx, &a.agent, Verb::Terminate, a.reason.as_deref(), None).await
+    change(ctx, &a.agent, Verb::Terminate, a.reason.as_deref(), None, None).await
 }
 
 /// `coordination_manage(action="agent_retire")`.
 pub(crate) async fn agent_retire(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value> {
-    change(ctx, &a.agent, Verb::Retire, a.reason.as_deref(), a.owner.as_deref()).await
+    change(ctx, &a.agent, Verb::Retire, a.reason.as_deref(), a.owner.as_deref(), a.any_org).await
 }
 
 /// `coordination_manage(action="agent_unretire")`.
 pub(crate) async fn agent_unretire(ctx: ToolCtx, a: ChangeArgs) -> UaResult<Value> {
-    change(ctx, &a.agent, Verb::Unretire, a.reason.as_deref(), None).await
+    change(ctx, &a.agent, Verb::Unretire, a.reason.as_deref(), None, None).await
+}
+
+/// `coordination_manage(action="agent_forget")`.
+pub(crate) async fn agent_forget(ctx: ToolCtx, a: ForgetArgs) -> UaResult<Value> {
+    change(ctx, &a.agent, Verb::Forget, a.reason.as_deref(), None, a.any_org).await
 }
 
 #[cfg(test)]

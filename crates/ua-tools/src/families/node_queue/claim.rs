@@ -467,7 +467,7 @@ pub(crate) fn on_heartbeat(
             params![item.id, lease, now(), org],
         )?;
         renew_run(tx, &item, &lease)?;
-        credentials::slide_idle(tx, &item.id, node)?;
+        credentials::slide_idle(tx, org, &item.id, node)?;
         if !item.cancel_requested
             && let Some(why) = run_gate(tx, &item)?
         {

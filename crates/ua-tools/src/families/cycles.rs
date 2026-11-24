@@ -411,7 +411,7 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
             Some(list.into_iter().collect())
         }
     };
-    let profile = crate::sessions::default_profile(&ctx.hub, &actor);
+    let profile = crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, &actor);
     let registry = crate::families::workflows::step_registry();
     let denied: Vec<String> = requested
         .iter()

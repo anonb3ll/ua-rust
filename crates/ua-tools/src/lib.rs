@@ -199,6 +199,16 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::node_queue::TENANT_KEYS.into());
     parts.push(families::node_queue::TENANT_PART.into());
     parts.push(families::node_queue::ORG_SCOPE.into());
+    // The organization column and triggers of the nine agent and session
+    // tables (no key rebuild: agent labels stay one hub-wide namespace, and
+    // every other key is hub-generated or led by a label or a session id),
+    // then the organization-led indexes and the rules that a session, token,
+    // lifecycle row, profile binding, session credential, handoff note and
+    // wake row stay in their agent's, session's, node's and item's
+    // organization. Every existing row lands in the default organization.
+    // After the node parts: the triggers read `nodes` and `node_dispatch`.
+    parts.push(families::agents::TENANT_PART.into());
+    parts.push(families::agents::ORG_SCOPE.into());
     parts
 }
 

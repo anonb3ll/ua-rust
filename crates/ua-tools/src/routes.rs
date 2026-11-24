@@ -159,6 +159,7 @@ pub const MANAGERS: &[Manager] = &[
         handler_gated: &["node_command_start", "node_item_restart"],
         actions: &[
             ("agent_context", Standalone("agent_context")),
+            ("agent_forget", Own),
             ("agent_list", Standalone("agent_list")),
             ("agent_pause", Own),
             ("agent_resume", Own),

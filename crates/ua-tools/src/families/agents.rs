@@ -14,6 +14,16 @@
 //! Identity: a verified caller (an agent or human with a credential) acts as
 //! itself and cannot name another label. An unverified local caller may name
 //! the label it acts for and defaults to its configured local label.
+//!
+//! Organizations (`docs/organization.md`, the agents and sessions family).
+//! **Design assumption (the owner may revisit it):** an agent belongs to
+//! exactly one organization, the one of the token or grant it authenticates
+//! with; its sessions, profile bindings, session credentials, handoff notes
+//! and wake rows belong to that organization too. Agent labels stay one
+//! hub-wide namespace, compared without regard to case: a label another
+//! organization holds is refused ([`label_taken`]), which reveals only that
+//! the label is taken. Every read and write here filters `org_id`, and
+//! another organization's agent or session answers exactly as a missing one.
 
 use jiff::{SignedDuration, Timestamp};
 use rusqlite::types::Value as SqlValue;
@@ -23,9 +33,219 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::time::{format_ts, parse_ts};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
+use crate::families::plans::{ledger_label, ledger_text};
 use crate::registry::{Registry, ToolCtx, tool};
+
+/// `organization.v1.tools.agents`: `org_id` on the nine agent and session
+/// tables, and their generated `<table>_org_exists` / `<table>_org_immutable`
+/// triggers. Every existing row lands in the default organization (before
+/// this change no caller outside it could be authenticated, `org_guard`);
+/// nothing is moved, rewritten or dropped.
+///
+/// No key needs a rebuild: `agents.label` (and `agent_lifecycle.agent`, its
+/// case-insensitive twin) is the hub-wide label namespace, a session id is a
+/// hub-generated ULID, a token or session-credential digest is a digest of a
+/// random secret, a session credential id and a wake offer id are random, a
+/// handoff note's key is an AUTOINCREMENT id, `session_wake` is keyed by its
+/// session id, and `session_profiles (identity, session_key)` is led by a
+/// label.
+pub const TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.agents",
+    &[
+        "agents",
+        "agent_sessions",
+        "agent_tokens",
+        "agent_lifecycle",
+        "session_profiles",
+        "session_credentials",
+        "session_handoff_notes",
+        "session_wake",
+        "session_wake_offers",
+    ],
+);
+
+/// `agents.v2.org_scope`: indexes led by `org_id` for the per-organization
+/// agent, session, token and note queries, and the triggers (on insert and
+/// on a changed reference) that keep every reference inside the row's
+/// organization: a session's agent and task, a token's, a lifecycle row's
+/// and a profile binding's agent, a session credential's agent, node and
+/// item, a handoff note's session, and a wake row's and a wake offer's
+/// session and node. A reference to no row passes (a profile binding of a
+/// human label, a legacy row), as in the earlier families.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "agents.v2.org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_agents_org_seen ON agents(org_id, last_seen);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_org_agent ON agent_sessions(org_id, agent, status);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_org_started ON agent_sessions(org_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tokens_org_label ON agent_tokens(org_id, agent_label, status);
+CREATE INDEX IF NOT EXISTS idx_session_credentials_org_agent ON session_credentials(org_id, agent_label);
+CREATE INDEX IF NOT EXISTS idx_session_handoff_notes_org_session
+    ON session_handoff_notes(org_id, session_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS agent_sessions_org_parent BEFORE INSERT ON agent_sessions
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent or task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS agent_sessions_org_parent_update BEFORE UPDATE OF agent, task_id ON agent_sessions
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent or task belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS agent_tokens_org_parent BEFORE INSERT ON agent_tokens
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent_label COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS agent_tokens_org_parent_update BEFORE UPDATE OF agent_label ON agent_tokens
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent_label COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS agent_lifecycle_org_parent BEFORE INSERT ON agent_lifecycle
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS agent_lifecycle_org_parent_update BEFORE UPDATE OF agent ON agent_lifecycle
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_profiles_org_parent BEFORE INSERT ON session_profiles
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.identity COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS session_profiles_org_parent_update BEFORE UPDATE OF identity ON session_profiles
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.identity COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_credentials_org_parent BEFORE INSERT ON session_credentials
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent_label COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM node_dispatch WHERE id = NEW.item_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent, node or item belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS session_credentials_org_parent_update
+BEFORE UPDATE OF agent_label, node, item_id ON session_credentials
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent_label COLLATE NOCASE AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM node_dispatch WHERE id = NEW.item_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'agent, node or item belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_handoff_notes_org_parent BEFORE INSERT ON session_handoff_notes
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS session_handoff_notes_org_parent_update
+BEFORE UPDATE OF session_id ON session_handoff_notes
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_wake_org_parent BEFORE INSERT ON session_wake
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session or node belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS session_wake_org_parent_update BEFORE UPDATE OF session_id, node ON session_wake
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session or node belongs to another organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS session_wake_offers_org_parent BEFORE INSERT ON session_wake_offers
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session or node belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS session_wake_offers_org_parent_update
+BEFORE UPDATE OF session_id, node ON session_wake_offers
+WHEN EXISTS (SELECT 1 FROM agent_sessions WHERE id = NEW.session_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM nodes WHERE node = NEW.node AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'session or node belongs to another organization'); END;
+",
+};
+
+// --- organizations --------------------------------------------------------------
+
+/// Refuse an organization `orgs` does not hold, or holds as suspended,
+/// before anything is read for a write or written. The `org_exists`
+/// triggers fire only on insert and never read the status, so a write with
+/// nothing to insert (a heartbeat, a session end) would otherwise pass.
+pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no agent or session was changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no agent or session was changed"),
+        )),
+    }
+}
+
+/// The organization holding agent label `label`, compared without regard to
+/// case (the label namespace is one and case-insensitive): the organization
+/// of an agent row with that label (an exact match wins over a case
+/// variant), else of a lifecycle row for it (a label paused or retired
+/// before it ever registered), else of an active managed token for it (a
+/// token issued before its agent first connected), else none.
+pub(crate) fn label_org(c: &Connection, label: &str) -> UaResult<Option<String>> {
+    for sql in [
+        "SELECT org_id FROM agents WHERE label = ?1 COLLATE NOCASE ORDER BY (label = ?1) DESC LIMIT 1",
+        "SELECT org_id FROM agent_lifecycle WHERE agent = ?1",
+        "SELECT org_id FROM agent_tokens WHERE agent_label = ?1 COLLATE NOCASE AND status = 'active' \
+         ORDER BY (agent_label = ?1) DESC, id LIMIT 1",
+    ] {
+        let held: Option<String> = c.query_row(sql, [label], |r| r.get(0)).optional()?;
+        if held.is_some() {
+            return Ok(held);
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal of a label another organization holds. It says only that the
+/// label is taken, never by which organization.
+pub(crate) fn label_taken(label: &str) -> UaError {
+    UaError::conflict_code(
+        "agent_label_taken",
+        format!(
+            "agent label {label:?} is taken; agent labels are one hub-wide namespace. Nothing was changed"
+        ),
+    )
+}
+
+/// Whether `label` is an agent of another organization than `org`: to
+/// `org` it is a missing agent.
+pub(crate) fn foreign_label(c: &Connection, org: &str, label: &str) -> UaResult<bool> {
+    Ok(label_org(c, label)?.is_some_and(|o| o != org))
+}
+
+/// Refuse `label` when another organization's agent holds it.
+pub(crate) fn require_label_free(c: &Connection, org: &str, label: &str) -> UaResult<()> {
+    if foreign_label(c, org, label)? { Err(label_taken(label)) } else { Ok(()) }
+}
+
+/// Append an agents-family event about a row of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization until
+/// `org_guard` admits another. So a non-default row's event carries no
+/// caller-supplied text or label (callers pass labels, hosts, paths, models,
+/// external session ids and reasons through [`ledger_text`] /
+/// [`ledger_label`]), its originator is the neutral `system`, and it has no
+/// dedupe key or episode built from a label.
+pub(crate) fn emit(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    payload: Value,
+    by: &str,
+    dedupe: Option<String>,
+) -> UaResult<()> {
+    let default = org == ua_core::DEFAULT_ORG;
+    let by = if default { by } else { "system" };
+    let mut ev = EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string());
+    if let Some(d) = dedupe.filter(|_| default) {
+        ev = ev.dedupe(d);
+    }
+    ledger::append(tx, ev)?;
+    Ok(())
+}
 
 /// An open session not seen for this long is not `live` (not offered as a
 /// message target).
@@ -169,11 +389,16 @@ fn open_marks() -> String {
     OPEN_STATUSES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
 }
 
-/// Record that `label` was alive just now. Returns true when this created the
-/// agent's row; the first sighting is written to the ledger, later heartbeats
-/// are not (they only move `last_seen`).
+/// Record that `label`, an agent of organization `org`, was alive just now.
+/// Returns true when this created the agent's row; the first sighting is
+/// written to the ledger, later heartbeats are not (they only move
+/// `last_seen`). A label another organization holds is refused
+/// ([`label_taken`]) before anything is written: one organization never
+/// moves, revives or reads another's agent row.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn touch_agent(
     tx: &mut WriteTx<'_>,
+    org: &str,
     label: &str,
     via: &str,
     kind: Option<&str>,
@@ -181,13 +406,17 @@ pub(crate) fn touch_agent(
     version: Option<&str>,
     verified_self: bool,
 ) -> UaResult<bool> {
-    let existed: bool =
-        tx.query_row("SELECT 1 FROM agents WHERE label = ?1", [label], |_| Ok(())).optional()?.is_some();
+    require_org(tx, org)?;
+    require_label_free(tx, org, label)?;
+    let existed: bool = tx
+        .query_row("SELECT 1 FROM agents WHERE org_id = ?1 AND label = ?2", params![org, label], |_| Ok(()))
+        .optional()?
+        .is_some();
     let ts = ua_core::time::now();
     tx.execute(
-        "INSERT INTO agents (label, kind, host, known, first_seen, last_seen, last_seen_via, version, \
+        "INSERT INTO agents (org_id, label, kind, host, known, first_seen, last_seen, last_seen_via, version, \
          created_at, updated_at, meta) \
-         VALUES (?1, COALESCE(?2, 'unknown'), ?3, ?4, ?5, ?5, ?6, ?7, ?5, ?5, '{}') \
+         VALUES (?8, ?1, COALESCE(?2, 'unknown'), ?3, ?4, ?5, ?5, ?6, ?7, ?5, ?5, '{}') \
          ON CONFLICT(label) DO UPDATE SET \
            last_seen = excluded.last_seen, \
            last_seen_via = excluded.last_seen_via, \
@@ -196,56 +425,64 @@ pub(crate) fn touch_agent(
            kind = CASE WHEN excluded.kind = 'unknown' THEN agents.kind ELSE excluded.kind END, \
            host = COALESCE(excluded.host, agents.host), \
            version = COALESCE(excluded.version, agents.version), \
-           updated_at = excluded.updated_at",
-        params![label, kind, host, i64::from(verified_self), ts, via, version],
+           updated_at = excluded.updated_at \
+         WHERE agents.org_id = excluded.org_id",
+        params![label, kind, host, i64::from(verified_self), ts, via, version, org],
     )?;
     if !existed {
-        ledger::append(
+        emit(
             tx,
-            EventInput::new(
-                ua_core::DEFAULT_ORG,
-                "agent.agent.registered",
-                json!({ "label": label, "kind": kind, "via": via }),
-            )
-            .by(label.to_string())
-            .dedupe(format!("agent.registered:{label}")),
+            org,
+            "agent.agent.registered",
+            json!({ "label": ledger_text(org, label), "kind": ledger_label(org, kind), "via": via }),
+            label,
+            Some(format!("agent.registered:{label}")),
         )?;
     }
     Ok(!existed)
 }
 
 /// Mark open sessions with no heartbeat for [`SESSION_ABANDON_MINUTES`] as
-/// `abandoned`. Returns how many were reaped.
+/// `abandoned`, in every organization (a hub job: each session is reaped in
+/// its own organization). Returns how many were reaped. The ledger event
+/// names only hub-generated session ids, the default organization's and the
+/// others' in separate events.
 pub(crate) fn reap(tx: &mut WriteTx<'_>) -> UaResult<usize> {
     let cutoff = ago(SESSION_ABANDON_MINUTES * 60);
-    let ids: Vec<String> = {
+    let rows: Vec<(String, String)> = {
         let mut stmt = tx.prepare(&format!(
-            "SELECT id FROM agent_sessions WHERE status IN ({}) AND last_heartbeat_at < ?1 ORDER BY id",
+            "SELECT id, org_id FROM agent_sessions WHERE status IN ({}) AND last_heartbeat_at < ?1 \
+             ORDER BY org_id, id",
             open_marks()
         ))?;
-        stmt.query_map([&cutoff], |r| r.get(0))?.collect::<Result<_, _>>()?
+        stmt.query_map([&cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
     };
-    if ids.is_empty() {
+    if rows.is_empty() {
         return Ok(0);
     }
     let now = ua_core::time::now();
-    for id in &ids {
+    let mut by_org: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (id, org) in rows {
         tx.execute(
             "UPDATE agent_sessions SET status = 'abandoned', ended_at = ?2, \
-             exit_status = COALESCE(exit_status, 'no_heartbeat') WHERE id = ?1",
-            params![id, now],
+             exit_status = COALESCE(exit_status, 'no_heartbeat') WHERE id = ?1 AND org_id = ?3",
+            params![id, now, org],
         )?;
+        by_org.entry(org).or_default().push(id);
     }
-    ledger::append(
-        tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
+    let mut n = 0;
+    for (org, ids) in by_org {
+        n += ids.len();
+        emit(
+            tx,
+            &org,
             "agent.session.reaped",
             json!({ "session_ids": ids, "count": ids.len() }),
-        )
-        .by("system"),
-    )?;
-    Ok(ids.len())
+            "system",
+            None,
+        )?;
+    }
+    Ok(n)
 }
 
 /// The parts of a session the messaging family needs.
@@ -262,11 +499,15 @@ impl SessionRef {
     }
 }
 
-pub(crate) fn session_ref(conn: &Connection, id: &str) -> UaResult<Option<SessionRef>> {
+/// Session `id` of organization `org`; another organization's session is
+/// `None`, exactly as a missing one.
+pub(crate) fn session_ref(conn: &Connection, org: &str, id: &str) -> UaResult<Option<SessionRef>> {
     let row = conn
-        .query_row("SELECT agent, status, last_heartbeat_at FROM agent_sessions WHERE id = ?1", [id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        })
+        .query_row(
+            "SELECT agent, status, last_heartbeat_at FROM agent_sessions WHERE org_id = ?1 AND id = ?2",
+            [org, id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )
         .optional()?;
     Ok(row.map(|(agent, status, hb)| {
         let live = is_live(&status, Some(&hb), now_s());
@@ -276,7 +517,7 @@ pub(crate) fn session_ref(conn: &Connection, id: &str) -> UaResult<Option<Sessio
 
 /// Count a call as the session's heartbeat. `revive` also reopens a session
 /// the reaper marked `abandoned`; a session ended by its agent stays ended.
-pub(crate) fn touch_session(conn: &Connection, id: &str, revive: bool) -> UaResult<bool> {
+pub(crate) fn touch_session(conn: &Connection, org: &str, id: &str, revive: bool) -> UaResult<bool> {
     let states =
         if revive { "'starting','running','waiting','abandoned'" } else { "'starting','running','waiting'" };
     let n = conn.execute(
@@ -285,20 +526,27 @@ pub(crate) fn touch_session(conn: &Connection, id: &str, revive: bool) -> UaResu
              status = CASE WHEN status = 'abandoned' THEN 'running' ELSE status END, \
              ended_at = CASE WHEN status = 'abandoned' THEN NULL ELSE ended_at END, \
              exit_status = CASE WHEN status = 'abandoned' THEN NULL ELSE exit_status END \
-             WHERE id = ?1 AND status IN ({states})"
+             WHERE id = ?1 AND org_id = ?3 AND status IN ({states})"
         ),
-        params![id, ua_core::time::now()],
+        params![id, ua_core::time::now(), org],
     )?;
     Ok(n > 0)
 }
 
 /// Check that `id` is a session of `owner` and count the call as its
 /// heartbeat. One error covers "no such session" and "someone else's", so a
-/// probe learns nothing about other agents' sessions. Needs a write connection.
-pub(crate) fn own_session(conn: &Connection, id: &str, owner: &str, revive: bool) -> UaResult<SessionRef> {
-    match session_ref(conn, id)? {
+/// probe learns nothing about other agents' sessions, or about another
+/// organization's (`org` is the caller's). Needs a write connection.
+pub(crate) fn own_session(
+    conn: &Connection,
+    org: &str,
+    id: &str,
+    owner: &str,
+    revive: bool,
+) -> UaResult<SessionRef> {
+    match session_ref(conn, org, id)? {
         Some(s) if s.agent == owner => {
-            touch_session(conn, id, revive)?;
+            touch_session(conn, org, id, revive)?;
             Ok(s)
         }
         _ => Err(UaError::invalid(format!("session {id:?} is not a session of {owner:?}"))),
@@ -309,22 +557,28 @@ pub(crate) fn own_session(conn: &Connection, id: &str, owner: &str, revive: bool
 /// recent heartbeat), `degraded` (known but quiet; the message waits) or
 /// `unknown` (no liveness record). Returns the availability object and the
 /// delivery warning, if any. Never refuses a send: label mail is durable.
-pub(crate) fn availability(conn: &Connection, label: &str) -> UaResult<(Value, Option<String>)> {
+/// Reads only organization `org`'s agent and sessions, so a label another
+/// organization holds is `unknown` here, exactly as an unregistered one.
+pub(crate) fn availability(conn: &Connection, org: &str, label: &str) -> UaResult<(Value, Option<String>)> {
     let now = now_s();
     let live_cutoff = ago(SESSION_LIVE_MINUTES * 60);
     let live: bool = conn
         .query_row(
             &format!(
-                "SELECT 1 FROM agent_sessions WHERE agent = ?1 AND status IN ({}) AND last_heartbeat_at >= ?2 LIMIT 1",
+                "SELECT 1 FROM agent_sessions WHERE org_id = ?3 AND agent = ?1 AND status IN ({}) \
+                 AND last_heartbeat_at >= ?2 LIMIT 1",
                 open_marks()
             ),
-            params![label, live_cutoff],
+            params![label, live_cutoff, org],
             |_| Ok(()),
         )
         .optional()?
         .is_some();
-    let last_seen: Option<Option<String>> =
-        conn.query_row("SELECT last_seen FROM agents WHERE label = ?1", [label], |r| r.get(0)).optional()?;
+    let last_seen: Option<Option<String>> = conn
+        .query_row("SELECT last_seen FROM agents WHERE org_id = ?1 AND label = ?2", [org, label], |r| {
+            r.get(0)
+        })
+        .optional()?;
     let (state, reason, warning) = if live {
         ("available", "live_session", None)
     } else {
@@ -348,7 +602,8 @@ pub(crate) fn availability(conn: &Connection, label: &str) -> UaResult<(Value, O
 // --- session rows ---------------------------------------------------------------
 
 /// A session row with its task's title and status. `?1` is the reader's
-/// organization: another organization's task shows no title or status.
+/// organization: every query adds `s.org_id = ?1`, and another
+/// organization's task shows no title or status.
 const SESSION_SELECT: &str = "SELECT s.*, t.title AS task_title, t.status AS task_status \
                               FROM agent_sessions s LEFT JOIN tasks t ON t.id = s.task_id AND t.org_id = ?1";
 
@@ -391,7 +646,9 @@ fn session_json(r: &Row<'_>, now: i64) -> rusqlite::Result<Value> {
 fn get_session(conn: &Connection, org: &str, id: &str) -> UaResult<Option<Value>> {
     let now = now_s();
     Ok(conn
-        .query_row(&format!("{SESSION_SELECT} WHERE s.id = ?2"), [org, id], |r| session_json(r, now))
+        .query_row(&format!("{SESSION_SELECT} WHERE s.org_id = ?1 AND s.id = ?2"), [org, id], |r| {
+            session_json(r, now)
+        })
         .optional()?)
 }
 
@@ -403,7 +660,7 @@ fn list_sessions(
     limit: i64,
     live_only: bool,
 ) -> UaResult<Vec<Value>> {
-    let mut clauses: Vec<String> = Vec::new();
+    let mut clauses: Vec<String> = vec!["s.org_id = ?1".into()];
     // `?1` in SESSION_SELECT; the bare `?`s that follow number from 2.
     let mut args: Vec<SqlValue> = vec![SqlValue::Text(org.to_string())];
     if let Some(a) = agent {
@@ -423,7 +680,7 @@ fn list_sessions(
         clauses.push("s.last_heartbeat_at >= ?".into());
         args.push(SqlValue::Text(ago(SESSION_LIVE_MINUTES * 60)));
     }
-    let filter = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
+    let filter = format!(" WHERE {}", clauses.join(" AND "));
     args.push(SqlValue::Integer(limit.clamp(1, 500)));
     let now = now_s();
     let mut stmt =
@@ -502,13 +759,17 @@ fn agent_json(r: &Row<'_>, now: i64) -> rusqlite::Result<Value> {
     }))
 }
 
-fn get_agent(conn: &Connection, label: &str) -> UaResult<Option<Value>> {
+fn get_agent(conn: &Connection, org: &str, label: &str) -> UaResult<Option<Value>> {
     let now = now_s();
-    Ok(conn.query_row("SELECT * FROM agents WHERE label = ?1", [label], |r| agent_json(r, now)).optional()?)
+    Ok(conn
+        .query_row("SELECT * FROM agents WHERE org_id = ?1 AND label = ?2", [org, label], |r| {
+            agent_json(r, now)
+        })
+        .optional()?)
 }
 
-/// Every agent, with its open sessions and its `doing` tasks in the
-/// reader's organization `org`.
+/// Every agent of the reader's organization `org`, with its open sessions
+/// and its `doing` tasks there.
 pub(crate) fn list_agents(conn: &Connection, org: &str) -> UaResult<Vec<Value>> {
     let now = now_s();
     let count_by = |sql: &str, p: &[&str]| -> UaResult<std::collections::BTreeMap<String, i64>> {
@@ -520,19 +781,20 @@ pub(crate) fn list_agents(conn: &Connection, org: &str) -> UaResult<Vec<Value>> 
     };
     let open = count_by(
         &format!(
-            "SELECT agent, COUNT(*) FROM agent_sessions WHERE status IN ({}) GROUP BY agent",
+            "SELECT agent, COUNT(*) FROM agent_sessions WHERE org_id = ?1 AND status IN ({}) GROUP BY agent",
             open_marks()
         ),
-        &[],
+        &[org],
     )?;
     let active = count_by(
         "SELECT claimed_by, COUNT(*) FROM tasks WHERE org_id = ?1 AND claimed_by IS NOT NULL AND status = 'doing' \
          GROUP BY claimed_by",
         &[org],
     )?;
-    let mut stmt =
-        conn.prepare("SELECT * FROM agents ORDER BY (last_seen IS NULL), last_seen DESC, label")?;
-    let rows = stmt.query_map([], |r| agent_json(r, now))?;
+    let mut stmt = conn.prepare(
+        "SELECT * FROM agents WHERE org_id = ?1 ORDER BY (last_seen IS NULL), last_seen DESC, label",
+    )?;
+    let rows = stmt.query_map([org], |r| agent_json(r, now))?;
     let mut out = Vec::new();
     for row in rows {
         let mut agent = row?;
@@ -671,11 +933,13 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
     let label = acting_label(&ctx.caller, a.agent.as_deref(), "agent")?;
     let verified_self = verified(&ctx.caller).is_some();
     let host = clean(a.host.as_deref());
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
             touch_agent(
                 tx,
+                &org,
                 &label,
                 "heartbeat_tool",
                 clean(a.kind.as_deref()).as_deref(),
@@ -683,7 +947,7 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
                 clean(a.version.as_deref()).as_deref(),
                 verified_self,
             )?;
-            let row = get_agent(tx, &label)?.unwrap_or_else(|| json!({}));
+            let row = get_agent(tx, &org, &label)?.unwrap_or_else(|| json!({}));
             Ok(json!({
                 "agent": label,
                 "recorded": true,
@@ -709,9 +973,10 @@ pub(crate) async fn agent_list(ctx: ToolCtx, _a: AgentListArgs) -> UaResult<Valu
                 counts.insert(status, json!(n));
             }
             let unregistered: Vec<String> = {
-                let mut stmt =
-                    c.prepare("SELECT label FROM agents WHERE known = 0 AND last_seen >= ?1 ORDER BY label")?;
-                stmt.query_map([ago(7 * 86_400)], |r| r.get(0))?.collect::<Result<_, _>>()?
+                let mut stmt = c.prepare(
+                    "SELECT label FROM agents WHERE org_id = ?2 AND known = 0 AND last_seen >= ?1 ORDER BY label",
+                )?;
+                stmt.query_map([ago(7 * 86_400), org.clone()], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
             Ok(json!({ "agents": agents, "counts": counts, "unregistered": unregistered }))
         })
@@ -793,6 +1058,8 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
+            require_label_free(tx, &org, &label)?;
             reap(tx)?;
             if let Some(tid) = task_id {
                 let found = tx
@@ -805,9 +1072,9 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
             let existing: Option<(String, String)> = match &ext {
                 Some(e) => tx
                     .query_row(
-                        "SELECT id, status FROM agent_sessions WHERE agent = ?1 AND external_session_id = ?2 \
-                         ORDER BY started_at DESC, id DESC LIMIT 1",
-                        params![label, e],
+                        "SELECT id, status FROM agent_sessions WHERE org_id = ?3 AND agent = ?1 \
+                         AND external_session_id = ?2 ORDER BY started_at DESC, id DESC LIMIT 1",
+                        params![label, e, org],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?,
@@ -820,8 +1087,9 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                         "UPDATE agent_sessions SET status = 'running', ended_at = NULL, exit_status = NULL, \
                          last_heartbeat_at = ?2, task_id = COALESCE(?3, task_id), \
                          worktree_path = COALESCE(?4, worktree_path), branch = COALESCE(?5, branch), \
-                         transcript_path = COALESCE(?6, transcript_path), host = COALESCE(?7, host) WHERE id = ?1",
-                        params![id, now, task_id, worktree, branch, transcript, host],
+                         transcript_path = COALESCE(?6, transcript_path), host = COALESCE(?7, host) \
+                         WHERE id = ?1 AND org_id = ?8",
+                        params![id, now, task_id, worktree, branch, transcript, host, org],
                     )?;
                     let reopened = (!is_open(&previous)).then_some(previous);
                     (id, false, reopened)
@@ -830,17 +1098,19 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                     let host = match host.clone() {
                         Some(h) => Some(h),
                         None => tx
-                            .query_row("SELECT host FROM agents WHERE label = ?1", [&label], |r| {
-                                r.get::<_, Option<String>>(0)
-                            })
+                            .query_row(
+                                "SELECT host FROM agents WHERE org_id = ?1 AND label = ?2",
+                                [&org, &label],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
                             .optional()?
                             .flatten(),
                     };
                     let id = ulid::Ulid::generate().to_string();
                     tx.execute(
-                        "INSERT INTO agent_sessions (id, agent, kind, status, started_at, last_heartbeat_at, task_id, \
-                         worktree_path, branch, external_session_id, transcript_path, host, meta) \
-                         VALUES (?1, ?2, ?3, 'running', ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        "INSERT INTO agent_sessions (org_id, id, agent, kind, status, started_at, last_heartbeat_at, \
+                         task_id, worktree_path, branch, external_session_id, transcript_path, host, meta) \
+                         VALUES (?12, ?1, ?2, ?3, 'running', ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                         params![
                             id,
                             label,
@@ -852,33 +1122,38 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                             ext,
                             transcript,
                             host,
-                            meta.to_string()
+                            meta.to_string(),
+                            org
                         ],
                     )?;
                     (id, true, None)
                 }
             };
-            touch_agent(tx, &label, "session_start", None, host.as_deref(), None, verified_self)?;
+            touch_agent(tx, &org, &label, "session_start", None, host.as_deref(), None, verified_self)?;
             if created {
-                ledger::append(
+                emit(
                     tx,
-                    EventInput::new(ua_core::DEFAULT_ORG,
-                        "agent.session.started",
-                        json!({
-                            "session_id": session_id, "agent": label, "kind": kind, "task_id": task_id,
-                            "branch": branch, "external_session_id": ext,
-                        }),
-                    )
-                    .by(label.clone()),
+                    &org,
+                    "agent.session.started",
+                    json!({
+                        "session_id": session_id, "agent": ledger_text(&org, &label),
+                        "kind": ledger_text(&org, &kind), "task_id": task_id,
+                        "branch": ledger_label(&org, branch.as_deref()),
+                        "external_session_id": ledger_label(&org, ext.as_deref()),
+                    }),
+                    &label,
+                    None,
                 )?;
             } else if let Some(previous) = &reopened_from {
-                ledger::append(
+                emit(
                     tx,
-                    EventInput::new(ua_core::DEFAULT_ORG,
-                        "agent.session.reopened",
-                        json!({ "session_id": session_id, "agent": label, "previous_status": previous }),
-                    )
-                    .by(label.clone()),
+                    &org,
+                    "agent.session.reopened",
+                    json!({
+                        "session_id": session_id, "agent": ledger_text(&org, &label), "previous_status": previous,
+                    }),
+                    &label,
+                    None,
                 )?;
             }
             let row = get_session(tx, &org, &session_id)?.unwrap_or_else(|| json!({}));
@@ -901,9 +1176,9 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
             if recall && let Some(tid) = task_id {
                 let prior: Option<String> = tx
                     .query_row(
-                        "SELECT id FROM agent_sessions WHERE task_id = ?1 AND id != ?2 \
+                        "SELECT id FROM agent_sessions WHERE org_id = ?3 AND task_id = ?1 AND id != ?2 \
                          ORDER BY started_at DESC, id DESC LIMIT 1",
-                        params![tid, session_id],
+                        params![tid, session_id, org],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -925,13 +1200,15 @@ async fn session_end(ctx: ToolCtx, a: SessionEndArgs) -> UaResult<Value> {
     let originator = ctx.caller.label.clone();
     let session_id = a.session_id.trim().to_string();
     let (exit_status, summary) = (clean(a.exit_status.as_deref()), clean(a.summary.as_deref()));
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let row: Option<(String, String, Option<i64>)> = tx
                 .query_row(
-                    "SELECT agent, status, task_id FROM agent_sessions WHERE id = ?1",
-                    [&session_id],
+                    "SELECT agent, status, task_id FROM agent_sessions WHERE org_id = ?1 AND id = ?2",
+                    [&org, &session_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
@@ -949,20 +1226,21 @@ async fn session_end(ctx: ToolCtx, a: SessionEndArgs) -> UaResult<Value> {
             let now = ua_core::time::now();
             tx.execute(
                 "UPDATE agent_sessions SET status = ?2, ended_at = ?3, last_heartbeat_at = ?3, \
-                 exit_status = COALESCE(?4, exit_status), summary = COALESCE(?5, summary) WHERE id = ?1",
-                params![session_id, status, now, exit_status, summary],
+                 exit_status = COALESCE(?4, exit_status), summary = COALESCE(?5, summary) \
+                 WHERE id = ?1 AND org_id = ?6",
+                params![session_id, status, now, exit_status, summary, org],
             )?;
-            ledger::append(
+            emit(
                 tx,
-                EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    "agent.session.ended",
-                    json!({
-                        "session_id": session_id, "agent": owner, "status": status,
-                        "previous_status": previous, "exit_status": exit_status, "task_id": task_id,
-                    }),
-                )
-                .by(me.unwrap_or(originator)),
+                &org,
+                "agent.session.ended",
+                json!({
+                    "session_id": session_id, "agent": ledger_text(&org, &owner), "status": status,
+                    "previous_status": previous, "exit_status": ledger_label(&org, exit_status.as_deref()),
+                    "task_id": task_id,
+                }),
+                &me.unwrap_or(originator),
+                None,
             )?;
             Ok(json!({
                 "session_id": session_id,
@@ -1004,6 +1282,26 @@ async fn session_list(ctx: ToolCtx, a: SessionListArgs) -> UaResult<Value> {
         .await
 }
 
+/// One `/`-delimited part of a stored key: `%` and `/` escaped.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F")
+}
+
+/// The stored idempotency key of a `lifecycle_record` call.
+/// `idempotency_keys` is still a hub-wide table, so another organization's
+/// key is prefixed with its organization
+/// (`org:<org>/lifecycle/<session>/<kind>/<key>`, each part with `%` and `/`
+/// escaped) and never replays, probes or occupies the default
+/// organization's, or a third's. The default organization keeps the
+/// `lifecycle:<session>:<kind>:<key>` form byte for byte.
+fn lifecycle_key(org: &str, session: &str, kind: &str, key: &str) -> String {
+    if org == ua_core::DEFAULT_ORG {
+        format!("lifecycle:{session}:{kind}:{key}")
+    } else {
+        format!("org:{}/lifecycle/{}/{kind}/{}", key_part(org), key_part(session), key_part(key))
+    }
+}
+
 /// Drop excluded keys at any depth.
 fn strip_excluded(value: Value) -> Value {
     match value {
@@ -1034,12 +1332,14 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
     }
     let session_id = clean(a.session_id.as_deref());
     let task_id = a.task_id;
+    let org = ctx.caller.org_id.clone();
     let key = clean(a.idempotency_key.as_deref())
-        .map(|k| format!("lifecycle:{}:{kind}:{k}", session_id.as_deref().unwrap_or("_")));
+        .map(|k| lifecycle_key(&org, session_id.as_deref().unwrap_or("_"), &kind, &k));
     let outcome = ctx
         .hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             if let Some(k) = &key {
                 let cached: Option<String> = tx
                     .query_row(
@@ -1054,16 +1354,50 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
                     return Ok(out);
                 }
             }
+            // A session of another organization is recorded as no session,
+            // so an observation never joins another organization's session
+            // view; the reply still echoes the id, as for a missing session.
+            // Another organization's observation keeps only its kind, its
+            // own session id and the task id: no tool name, payload or label
+            // reaches the default ledger (ORG-EVENT-DEFAULT).
+            let default = org == ua_core::DEFAULT_ORG;
+            let foreign_session = match &session_id {
+                Some(sid) => tx
+                    .query_row(
+                        "SELECT 1 FROM agent_sessions WHERE id = ?1 AND org_id != ?2",
+                        [sid, &org],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some(),
+                None => false,
+            };
+            let own_session = if foreign_session { None } else { session_id.clone() };
+            let recorded_session = if default {
+                own_session
+            } else {
+                match own_session {
+                    Some(sid) => tx
+                        .query_row(
+                            "SELECT id FROM agent_sessions WHERE id = ?1 AND org_id = ?2",
+                            [&sid, &org],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?,
+                    None => None,
+                }
+            };
             let event = ledger::append(
                 tx,
                 EventInput {
                     channel: lifecycle_channel(&kind),
                     payload: json!({
-                        "kind": kind, "session_id": session_id, "task_id": task_id,
-                        "tool": tool_name, "payload": body,
+                        "kind": kind, "session_id": recorded_session, "task_id": task_id,
+                        "tool": if default { json!(tool_name) } else { Value::Null },
+                        "payload": if default { body } else { Value::Null },
                     }),
-                    originator: Some(agent),
-                    episode_id: session_id.clone(),
+                    originator: Some(if default { agent } else { "system".into() }),
+                    episode_id: recorded_session.clone(),
                     org_id: ua_core::DEFAULT_ORG.into(),
                     dedupe_key: None,
                     causal_parent_id: None,

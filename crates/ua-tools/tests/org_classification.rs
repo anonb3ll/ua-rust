@@ -176,20 +176,10 @@ const TENANT: &[&str] = &[
 /// and `memory_embeddings` (`organization.v1.memory`, `memory.v2.org_scope`),
 /// `message_index` and `message_reads` (`organization.v1.tools.messaging`),
 /// `relay_messages` (`organization.v1.tools.relay`), the seven node tables
-/// (`node_queue.v2.tenant_keys`, `organization.v1.tools.nodes`) and
-/// `dispatch_runs` and `dispatch_receipts` (`organization.v1.tools.dispatch`).
-const TENANT_MISSING_ORG_ID: &[&str] = &[
-    "agent_lifecycle",
-    "agent_sessions",
-    "agent_tokens",
-    "agents",
-    "idempotency_keys",
-    "session_credentials",
-    "session_handoff_notes",
-    "session_profiles",
-    "session_wake",
-    "session_wake_offers",
-];
+/// (`node_queue.v2.tenant_keys`, `organization.v1.tools.nodes`),
+/// `dispatch_runs` and `dispatch_receipts` (`organization.v1.tools.dispatch`)
+/// and the nine agent and session tables (`organization.v1.tools.agents`).
+const TENANT_MISSING_ORG_ID: &[&str] = &["idempotency_keys"];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];
 
@@ -555,22 +545,15 @@ fn a_tenant_table_must_leave_the_missing_list_once_it_passes_and_fail_otherwise(
         ["idempotency_keys: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]
     );
 
-    // Off the list, `idempotency_keys` passes, and `agents` (still without org_id) fails.
-    let shrunk: Vec<&str> = TENANT_MISSING_ORG_ID
-        .iter()
-        .copied()
-        .filter(|t| !["idempotency_keys", "agents"].contains(t))
-        .collect();
+    // Off the list, `idempotency_keys` passes; a converted table that loses
+    // a generated trigger (`agents`, off the list since the agents family
+    // converted) fails.
+    conn.execute_batch("DROP TRIGGER agents_org_immutable;").unwrap();
+    let shrunk: Vec<&str> =
+        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "idempotency_keys").collect();
     let l = Lists { missing: &shrunk, ..lists() };
     let found = problems(&conn, &l);
-    assert_eq!(
-        found,
-        [
-            "agents: tenant table with no org_id",
-            "agents: tenant table with no agents_org_exists trigger",
-            "agents: tenant table with no agents_org_immutable trigger",
-        ]
-    );
+    assert_eq!(found, ["agents: tenant table with no agents_org_immutable trigger"]);
 }
 
 #[test]

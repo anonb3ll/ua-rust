@@ -608,10 +608,6 @@ fn decode(row: &mut Map<String, Value>, cols: &[&str]) {
     }
 }
 
-fn one_row(c: &Connection, sql: &str, id: &str) -> UaResult<Option<Map<String, Value>>> {
-    Ok(c.query_row(sql, [id], row_map).optional()?)
-}
-
 /// One row of organization `org` (`sql` binds the id then the
 /// organization), without its `org_id`.
 fn org_row(c: &Connection, sql: &str, id: &str, org: &str) -> UaResult<Option<Map<String, Value>>> {
@@ -711,14 +707,21 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
         // A delegation of the reader's organization, without `org_id`.
         "delegation" => org_row(c, "SELECT * FROM delegations WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
             .map(Value::Object),
-        "agent" => one_row(c, "SELECT * FROM agents WHERE label = ?1", id)?.map(|mut a| {
-            decode(&mut a, &["meta"]);
-            Value::Object(a)
-        }),
-        "session" => one_row(c, "SELECT * FROM agent_sessions WHERE id = ?1", id)?.map(|mut s| {
-            decode(&mut s, &["meta"]);
-            Value::Object(s)
-        }),
+        // An agent or session of the reader's organization, without `org_id`.
+        "agent" => org_row(c, "SELECT * FROM agents WHERE label = ?1 AND org_id = ?2", id, &caller.org_id)?.map(
+            |mut a| {
+                decode(&mut a, &["meta"]);
+                Value::Object(a)
+            },
+        ),
+        "session" => {
+            org_row(c, "SELECT * FROM agent_sessions WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?.map(
+                |mut s| {
+                    decode(&mut s, &["meta"]);
+                    Value::Object(s)
+                },
+            )
+        }
         // A note of the reader's organization, without `org_id`.
         "memory_note" => org_row(
             c,

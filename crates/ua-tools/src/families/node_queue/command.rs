@@ -309,8 +309,8 @@ pub(crate) async fn node_command_start(ctx: ToolCtx, a: StartArgs) -> UaResult<V
     let argv = validate_argv(&a.argv)?;
     let session = a.session_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if let Some(s) = session.clone() {
-        let who2 = who.clone();
-        ctx.hub.db().read_async(move |c| agents::own_session(c, &s, &who2, false).map(|_| ())).await?;
+        let (who2, org) = (who.clone(), ctx.caller.org_id.clone());
+        ctx.hub.db().read_async(move |c| agents::own_session(c, &org, &s, &who2, false).map(|_| ())).await?;
     }
     let prompt = clip(&format!("command: {}", shell_join(&argv)), 2000);
     let mut n =
@@ -414,7 +414,7 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
                 )));
             }
             if let Some(s) = &session {
-                agents::own_session(tx, s, &cmd.owner_agent, false).map_err(|_| {
+                agents::own_session(tx, &org, s, &cmd.owner_agent, false).map_err(|_| {
                     UaError::invalid(format!("session {s:?} does not belong to {:?}", cmd.owner_agent))
                 })?;
             }

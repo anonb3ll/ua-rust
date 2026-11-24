@@ -569,6 +569,18 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             return Ok(done);
         }
         crate::families::tasks::require_org(tx, &org)?;
+        // A delegation targets only an agent of the delegator's own
+        // organization: another organization's agent could never claim it
+        // (its claim reads its own organization), so the request fails
+        // closed, answered as for an agent this organization does not have.
+        // A label no organization holds is accepted, as before (it may
+        // register here later).
+        if crate::families::agents::foreign_label(tx, &org, &to_agent)? {
+            return Err(UaError::not_found(format!(
+                "no agent {to_agent:?} in this organization; a delegation targets an agent of the delegator's \
+                 organization. Nothing was created"
+            )));
+        }
         let ts = ua_core::time::now();
         let (parent_untrusted, parent_project) = match a.parent_task_id {
             Some(pid) => tx

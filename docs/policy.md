@@ -475,6 +475,14 @@ a held task's items, which stay queued until the hold is released.
 | `agent_terminate` (`agent`, `reason`) | An operator, or the agent itself | As pause, and the agent's `doing` claims return to `open` and its queued node items are cancelled. |
 | `agent_retire` (`agent`, `reason`, `owner`) | Lifecycle operators only | Refused while the agent holds `doing` claims. Revokes its `agent_tokens` rows and OAuth sign-ins; the HTTP adapter refuses its static token too. |
 | `agent_unretire` (`agent`) | Lifecycle operators only | Back to `active`; re-issues nothing. |
+| `agent_forget` (`agent`, `reason`) | Lifecycle operators only | Refused unless the agent is retired. Deletes its agent row, lifecycle row and profile bindings so the label can be registered again; its sessions, notes and revoked tokens stay as history in its organization. |
+
+Every action works in the caller's organization; a label another
+organization holds is refused (`agent_label_taken`). `agent_retire` and
+`agent_forget` take `any_org=true` for hub recovery by the default
+organization's lifecycle operators: the agent of whichever organization holds
+the label is retired or forgotten there, and the answer is only `{agent,
+org_id, changed, retired or forgotten, hub_recovery}`.
 
 An operator is a `lifecycle_operators` identity (default: the human
 identities) or a human. Each result lists `stops` with an honest `control`

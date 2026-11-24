@@ -530,6 +530,40 @@ from its commit history.
   into active and retired, and counts those that take no work under
   `node_require_acceptance` and their unsent command notices. The importer
   writes legacy nodes to `default`.
+- Agents and sessions are organization-scoped (`docs/organization.md`, the
+  agents and sessions family). **Design assumption (the owner may revisit
+  it):** an agent belongs to exactly one organization, the one of the token
+  or grant it authenticates with; its sessions, profile bindings, session
+  credentials, handoff notes and wake rows belong to it too. Agent labels
+  stay one hub-wide, case-insensitive namespace: a label another
+  organization holds is refused (`agent_label_taken`), and a default
+  lifecycle operator recovers one with `agent_retire` and the new
+  `agent_forget` `any_org=true`, acting in that agent's organization.
+  `organization.v1.tools.agents` gives `agents`, `agent_sessions`,
+  `agent_tokens`, `agent_lifecycle`, `session_profiles`,
+  `session_credentials`, `session_handoff_notes`, `session_wake` and
+  `session_wake_offers` `org_id` and their triggers; `agents.v2.org_scope`
+  adds org-led indexes and same-organization reference triggers. No key is
+  rebuilt; every existing row lands in `default` and none is dropped. The
+  HTTP resolver binds a caller to its credential's organization: a managed
+  token resolves to its own organization and is refused when that is not
+  its agent's; a session credential to its item's; a static token or an
+  OAuth grant to the default organization, refused while another
+  organization's agent holds its label (`org_guard` admits `caller_for` as
+  the one resolver site). Every read and write filters `org_id`, and
+  another organization's agent or session answers like a missing one. The
+  interim carve-outs are lifted: a session can be addressed inside its own
+  organization (`cross_org_recipient` and `require_default_sessions` are
+  gone), `crew_view` and `crew_intervene` work in the caller's organization,
+  session credentials and idle-session wakes run per organization, and
+  `node_reassign` reads `agents.org_id`. A delegation to another
+  organization's agent now fails closed (`not_found`). Device acceptance,
+  command notices and learning-proposal and drop-file writes into the hub's
+  shared vault and workspace stay default-organization only. Events about
+  another organization's agents and sessions keep only ids, states and
+  counts, under the `system` originator; its `lifecycle_record` keys are
+  stored organization-prefixed. The importer writes legacy agents, tokens
+  and handoff notes to `default`.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the
