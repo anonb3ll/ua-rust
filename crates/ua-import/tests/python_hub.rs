@@ -553,6 +553,10 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_reads"), 1);
+    // Messages and their read receipts land in the default organization.
+    for t in ["message_index", "message_reads"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(table(&r, "tasks").copied, 4);
 
     // Nodes: owner, version and retirement move across; host facts do not,

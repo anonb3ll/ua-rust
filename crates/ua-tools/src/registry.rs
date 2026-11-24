@@ -65,6 +65,10 @@ pub struct ToolDef {
     /// call always records its `tool_calls` row, even inside
     /// [`page_reads`].
     pub side_effects: Option<SideEffects>,
+    /// A refusal decided on the caller and arguments alone, checked after
+    /// admission and before any approval gate: a call it refuses parks no
+    /// approval and runs nothing (it is recorded as a failed call).
+    pub pre_gate: Option<PreGate>,
     /// Deserializes arguments into the tool's typed argument struct, so a
     /// request can be checked without running the handler.
     check: Checker,
@@ -86,6 +90,9 @@ pub enum HandlerGate {
     /// Calls that carry this argument (not null).
     WithArg(&'static str),
 }
+
+/// See [`ToolDef::pre_gate`].
+pub type PreGate = fn(&Caller, &Value) -> UaResult<()>;
 
 /// Maps a call's arguments to the payload its approval binds.
 pub type GatePayload = fn(&ua_core::Config, &Value) -> Value;
@@ -184,6 +191,13 @@ impl ToolDef {
         self.gate_payload = Some(f);
         self
     }
+
+    /// Refuse a call with `f` before any approval is parked (see
+    /// [`ToolDef::pre_gate`]).
+    pub fn pre_gate(mut self, f: PreGate) -> Self {
+        self.pre_gate = Some(f);
+        self
+    }
 }
 
 /// Build a tool from a typed handler. `A` is the argument struct; derive
@@ -226,6 +240,7 @@ where
         handler_may_gate: HandlerGate::Never,
         secret_args: false,
         side_effects: None,
+        pre_gate: None,
         check,
         handler,
     }
@@ -360,6 +375,17 @@ impl Registry {
             self.admit(hub, caller, name, args, true).await?;
         let caller = &caller;
         let routed = route.as_ref().and_then(Route::recorded);
+
+        // A refusal the tool decides on the caller alone comes before any
+        // approval is parked, and is recorded as the call's failure.
+        if let Err(e) = pre_gate_check(self, def, route.as_ref(), caller, &args) {
+            let result = Err(e);
+            let rec = Recorded { tool: name, action_tool: routed.as_deref() };
+            let started_at = ua_core::time::now();
+            record_call(hub, caller, rec, started_at, std::time::Duration::ZERO, &result, reservation, false)
+                .await;
+            return result;
+        }
 
         let plan =
             self.gate_plan(hub.cfg(), def, name, &args, policy_gated, route.as_ref(), route_policy_gated);
@@ -499,6 +525,7 @@ impl Registry {
         };
         let Admitted { args, policy_gated, route, route_policy_gated, .. } =
             self.admit(hub, caller, name, args, false).await?;
+        pre_gate_check(self, def, route.as_ref(), caller, &args)?;
         let plan =
             self.gate_plan(hub.cfg(), def, name, &args, policy_gated, route.as_ref(), route_policy_gated);
         if !plan.gated {
@@ -1007,6 +1034,27 @@ fn reserve_call(
 
 /// Drop `caller`'s reservation for a call that never ran (parked or refused
 /// later).
+/// The pre-gate of the tool called and, for a routed action, of the
+/// standalone tool it runs (on the action's arguments).
+fn pre_gate_check(
+    reg: &Registry,
+    def: &ToolDef,
+    route: Option<&Route>,
+    caller: &Caller,
+    args: &Value,
+) -> UaResult<()> {
+    if let Some(f) = def.pre_gate {
+        f(caller, args)?;
+    }
+    if let Some(r) = route
+        && let Some(d) = r.standalone().and_then(|s| reg.tools.get(s))
+        && let Some(f) = d.pre_gate
+    {
+        f(caller, &r.args)?;
+    }
+    Ok(())
+}
+
 async fn release_reservation(hub: &Hub, caller: &Caller, reservation: Option<i64>) {
     let Some(id) = reservation else { return };
     let org = caller.org_id.clone();

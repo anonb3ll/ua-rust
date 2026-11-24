@@ -322,16 +322,26 @@ fn build_packet(conn: &Connection, a: &PacketArgs, ctx: &ToolCtx) -> UaResult<Va
         None => Vec::new(),
     };
 
+    // Only the reader's organization's mail.
     let prior_handoff: Value = match task_id {
         Some(t) => conn
             .query_row(
-                "SELECT i.message_id, i.sender, i.created_at, e.payload FROM message_index i \
-                 LEFT JOIN event_log e ON e.ulid = i.event_ulid \
-                 WHERE i.task_id = ?1 AND i.act = 'handoff' \
-                   AND (?2 OR i.sender = ?3 OR (i.recipient = ?3 AND \
-                       (i.target_session IS NULL OR i.target_session = ?4))) \
-                 ORDER BY i.event_seq DESC LIMIT 1",
-                params![t, may_read_all_mail(ctx.hub.cfg(), &ctx.caller), who, own_session],
+                &format!(
+                    "SELECT i.message_id, i.sender, i.created_at, {} FROM message_index i \
+                     LEFT JOIN event_log e ON e.ulid = i.event_ulid \
+                     WHERE i.org_id = ?5 AND i.task_id = ?1 AND i.act = 'handoff' \
+                       AND (?2 OR i.sender = ?3 OR (i.recipient = ?3 AND \
+                           (i.target_session IS NULL OR i.target_session = ?4))) \
+                     ORDER BY i.event_seq DESC LIMIT 1",
+                    super::messaging::MESSAGE_PAYLOAD
+                ),
+                params![
+                    t,
+                    may_read_all_mail(ctx.hub.cfg(), &ctx.caller),
+                    who,
+                    own_session,
+                    ctx.caller.org_id
+                ],
                 |r| {
                     let payload: Option<String> = r.get(3)?;
                     let payload: Value =
@@ -1166,7 +1176,17 @@ fn drop_message_ids(path: Option<&Path>) -> Vec<String> {
         .collect()
 }
 
+/// Every session is the default organization's until agents carry an
+/// organization (`messaging::require_default_sessions`): another
+/// organization's caller can neither view nor steer one, and is refused
+/// before anything is read, approved or written. Also `crew_intervene`'s
+/// registry pre-gate, so no approval is parked for such a call.
+fn crew_default_org(caller: &ua_core::Caller, _args: &Value) -> UaResult<()> {
+    super::messaging::require_default_sessions(&caller.org_id, "session_id")
+}
+
 async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
+    crew_default_org(&ctx.caller, &Value::Null)?;
     let sid = a.session_id.trim().to_string();
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
@@ -1181,7 +1201,15 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         .filter(|_| !super::messaging::may_read_all_mail(ctx.hub.cfg(), &ctx.caller))
         .map(str::to_string);
     let party_q = party.clone();
-    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &org, &sid2)).await?;
+    let org_q = org.clone();
+    let session = ctx
+        .hub
+        .db()
+        .read_async(move |conn| {
+            super::messaging::require_org(conn, &org)?;
+            needs_session(conn, &org, &sid2)
+        })
+        .await?;
     let drop_path = intervention_path(&ctx, session["worktree_path"].as_str());
     let drop_path2 = drop_path.clone();
     let drop_ids = blocking(move || Ok(drop_message_ids(drop_path2.as_deref()))).await?;
@@ -1191,24 +1219,29 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
         .db()
         .read_async(move |conn| {
             let session = session2;
+            // Only the reader's organization's mail.
             let rows = query_rows(
                 conn,
-                "SELECT i.event_seq, i.event_ulid, i.created_at, i.message_id, i.act, i.conversation_id, i.reply_to, \
-                 i.sender, i.recipient, i.task_id, i.delegation_id, i.target_session, i.sender_session, \
-                 i.read_at, i.acked_at, e.payload \
-                 FROM message_index i LEFT JOIN event_log e ON e.ulid = i.event_ulid \
-                 WHERE (i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
-                 OR (?3 IS NOT NULL AND i.delegation_id = ?3)) \
-                 AND (?5 IS NULL OR i.sender = ?5 OR (i.recipient = ?5 \
-                      AND (i.target_session IS NULL OR i.target_session = ?6))) \
-                 ORDER BY i.event_seq DESC LIMIT ?4",
+                &format!(
+                    "SELECT i.event_seq, i.event_ulid, i.created_at, i.message_id, i.act, i.conversation_id, \
+                     i.reply_to, i.sender, i.recipient, i.task_id, i.delegation_id, i.target_session, \
+                     i.sender_session, i.read_at, i.acked_at, {} \
+                     FROM message_index i LEFT JOIN event_log e ON e.ulid = i.event_ulid \
+                     WHERE i.org_id = ?7 AND (i.conversation_id = ?1 OR (?2 IS NOT NULL AND i.task_id = ?2) \
+                     OR (?3 IS NOT NULL AND i.delegation_id = ?3)) \
+                     AND (?5 IS NULL OR i.sender = ?5 OR (i.recipient = ?5 \
+                          AND (i.target_session IS NULL OR i.target_session = ?6))) \
+                     ORDER BY i.event_seq DESC LIMIT ?4",
+                    super::messaging::MESSAGE_PAYLOAD
+                ),
                 params![
                     crew_conversation_id(&sid2),
                     session["task_id"].as_i64(),
                     session["delegation_id"].as_i64(),
                     cap,
                     party_q,
-                    sid2
+                    sid2,
+                    org_q
                 ],
                 |r| {
                     let payload: Option<String> = r.get(15)?;
@@ -1242,10 +1275,11 @@ async fn crew_view(ctx: ToolCtx, a: CrewViewArgs) -> UaResult<Value> {
                     conn,
                     "SELECT message_id, created_at, sender, recipient, target_session, task_id, delegation_id, \
                      event_seq FROM message_index \
-                     WHERE message_id = ?1 AND conversation_id = ?2 AND recipient = ?3 AND act = 'request' \
+                     WHERE org_id = ?6 AND message_id = ?1 AND conversation_id = ?2 AND recipient = ?3 \
+                     AND act = 'request' \
                      AND (?4 IS NULL OR sender = ?4 OR (recipient = ?4 \
                           AND (target_session IS NULL OR target_session = ?5)))",
-                    params![id, crew_conversation_id(&sid2), session["agent"].as_str(), party_q, sid2],
+                    params![id, crew_conversation_id(&sid2), session["agent"].as_str(), party_q, sid2, org_q],
                     |r| {
                         Ok(json!({
                             "message_id": r.get::<_, String>(0)?, "ts": r.get::<_, String>(1)?,
@@ -1286,6 +1320,8 @@ fn registry() -> &'static crate::Registry {
 }
 
 async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
+    // Checked again here, though the registry's pre-gate already refused it.
+    crew_default_org(&ctx.caller, &Value::Null)?;
     // The reviewer profile may watch a crew but not steer it. The profile table
     // does not list this tool, so the tool enforces it itself.
     if ctx.caller.profile == ua_core::Profile::Reviewer {
@@ -1309,7 +1345,14 @@ async fn crew_intervene(ctx: ToolCtx, a: CrewIntervene) -> UaResult<Value> {
 
     let sid2 = sid.clone();
     let org = ctx.caller.org_id.clone();
-    let session = ctx.hub.db().read_async(move |conn| needs_session(conn, &org, &sid2)).await?;
+    let session = ctx
+        .hub
+        .db()
+        .read_async(move |conn| {
+            super::messaging::require_org(conn, &org)?;
+            needs_session(conn, &org, &sid2)
+        })
+        .await?;
     let recipient = session["agent"].as_str().unwrap_or("").trim().to_string();
     if recipient.is_empty() {
         return Err(UaError::invalid(format!("session {sid} has no agent")));
@@ -1444,7 +1487,8 @@ pub fn register(r: &mut Registry) {
             crew_intervene,
         )
         .family("sessions")
-        .always_gated(),
+        .always_gated()
+        .pre_gate(crew_default_org),
     );
 }
 

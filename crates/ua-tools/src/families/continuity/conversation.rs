@@ -112,17 +112,20 @@ fn reader(ctx: &ToolCtx, verb: &str) -> UaResult<Option<String>> {
     governance::verified_actor(&ctx.caller, verb).map(Some)
 }
 
-fn visible(conn: &Connection, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
+/// Whether conversation `cid` has a message in organization `org` the
+/// viewer may see. Another organization's conversation answers exactly as a
+/// missing one, for every reader.
+fn visible(conn: &Connection, org: &str, cid: &str, viewer: Option<&str>) -> UaResult<bool> {
     let found: bool = match viewer {
         None => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1)",
-            [cid],
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?2 AND conversation_id = ?1)",
+            params![cid, org],
             |r| r.get(0),
         )?,
         Some(me) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_index WHERE conversation_id = ?1 \
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?3 AND conversation_id = ?1 \
              AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
-            params![cid, me],
+            params![cid, me, org],
             |r| r.get(0),
         )?,
     };
@@ -151,6 +154,37 @@ fn create_key(
     format!("{HANDOFF_KEY_PREFIX}{}", &digest[..40])
 }
 
+/// What a handoff event records as its conversation, and the base of its
+/// dedupe key.
+///
+/// The default organization's are the conversation id itself and
+/// `conversation-handoff:<cid>:<task>:<actor>`, byte for byte as before, so
+/// existing events still deduplicate and still list. Another organization's
+/// event is written to the default ledger (ORG-EVENT-DEFAULT), so it carries
+/// neither the conversation id nor the actor: its conversation is
+/// `org/<digest of (org, cid)>`, which only that organization's reader
+/// derives, and its key `conversation-handoff:org/<digest of (org, cid,
+/// task, actor)>`. Both contain `/`, which no conversation id may, so neither
+/// can equal a default value.
+fn ledger_refs(org: &str, cid: &str, task_id: i64, actor: &str) -> (String, String) {
+    if org == ua_core::DEFAULT_ORG {
+        return (cid.to_string(), format!("conversation-handoff:{cid}:{task_id}:{actor}"));
+    }
+    let key = json!([org, cid, task_id, actor]).to_string();
+    let key = hex::encode(Sha256::digest(key.as_bytes()));
+    (ledger_conversation(org, cid), format!("{HANDOFF_KEY_PREFIX}org/{}", &key[..40]))
+}
+
+/// The conversation a handoff event of organization `org` records (see
+/// [`ledger_refs`]).
+fn ledger_conversation(org: &str, cid: &str) -> String {
+    if org == ua_core::DEFAULT_ORG {
+        return cid.to_string();
+    }
+    let material = json!([org, cid]).to_string();
+    format!("org/{}", &hex::encode(Sha256::digest(material.as_bytes()))[..40])
+}
+
 /// The prefix of every handoff key. `task_add` refuses client keys that
 /// start with it, so the keys older hubs stored under `task_add` can be
 /// neither probed nor squatted.
@@ -168,8 +202,18 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
         return Err(UaError::invalid("pass exactly one of task_id (link) or title (create)"));
     }
     let viewer = (!unrestricted(&ctx)).then(|| actor.clone());
-    let c2 = cid.clone();
-    if !ctx.hub.db().read_async(move |c| visible(c, &c2, viewer.as_deref())).await? {
+    let (c2, org) = (cid.clone(), ctx.caller.org_id.clone());
+    // An unknown or suspended organization is refused before anything is
+    // read or written.
+    let seen = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            crate::families::messaging::require_org(c, &org)?;
+            visible(c, &org, &c2, viewer.as_deref())
+        })
+        .await?;
+    if !seen {
         return Err(UaError::not_found("conversation not found"));
     }
 
@@ -262,7 +306,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let base = format!("conversation-handoff:{c2}:{task_id}:{a2}");
+            let (conversation, base) = ledger_refs(&org, &c2, task_id, &a2);
             let creator_recorded: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM event_log WHERE dedupe_key = ?1)",
                 [format!("{base}:created")],
@@ -274,7 +318,8 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
             }
             let key = if created { format!("{base}:created") } else { base };
             // ORG-EVENT-DEFAULT: another organization's handoff names no
-            // agent in the default ledger and has a neutral originator.
+            // agent and no conversation in the default ledger (`ledger_refs`)
+            // and has a neutral originator.
             let default = org == ua_core::DEFAULT_ORG;
             let by = if default { a2.clone() } else { "system".to_string() };
             ledger::append(
@@ -282,7 +327,7 @@ pub(crate) async fn conversation_handoff(ctx: ToolCtx, a: HandoffArgs) -> UaResu
                 EventInput::new(
                     ua_core::DEFAULT_ORG,
                     CHANNEL,
-                    json!({ "conversation_id": c2, "task_id": task_id, "created": created,
+                    json!({ "conversation_id": conversation, "task_id": task_id, "created": created,
                             "by": crate::families::tasks::ledger_text(&org, &a2) }),
                 )
                 .by(by)
@@ -309,7 +354,8 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
     ctx.hub
         .db()
         .read_async(move |c| {
-            if !visible(c, &cid, viewer.as_deref())? {
+            crate::families::messaging::require_org(c, &org)?;
+            if !visible(c, &org, &cid, viewer.as_deref())? {
                 return Err(UaError::not_found("conversation not found"));
             }
             let mut stmt = c.prepare(
@@ -317,13 +363,15 @@ pub(crate) async fn conversation_handoffs(ctx: ToolCtx, a: HandoffsArgs) -> UaRe
             )?;
             let noted: BTreeSet<i64> =
                 stmt.query_map(params![reference(&cid), org], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            // The first event per task says who handed off and when.
+            // The first event per task says who handed off and when. Only
+            // this organization's events match: another organization's
+            // record a digest no conversation id equals (`ledger_refs`).
             let mut audit: BTreeMap<i64, (Option<String>, String)> = BTreeMap::new();
             let mut stmt = c.prepare(
                 "SELECT json_extract(payload, '$.task_id'), json_extract(payload, '$.by'), created_at \
                  FROM event_log WHERE channel = ?1 AND json_extract(payload, '$.conversation_id') = ?2 ORDER BY seq",
             )?;
-            let rows = stmt.query_map(params![CHANNEL, cid], |r| {
+            let rows = stmt.query_map(params![CHANNEL, ledger_conversation(&org, &cid)], |r| {
                 Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
             })?;
             for row in rows {
