@@ -51,7 +51,7 @@
 //! default organization's ledger (`ORG-EVENT-DEFAULT`) with originator
 //! `system` for another organization.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -230,6 +230,92 @@ pub fn orgs_holding(conn: &Connection, kind: CredentialKind) -> UaResult<Vec<Str
         .query_map([kind.secret_name(), kind.consumer(), DEFAULT_ORG], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(std::iter::once(DEFAULT_ORG.to_string()).chain(others).collect())
+}
+
+/// Organization `org`'s webhook secret, for a delivery on that
+/// organization's own route, or `None` when the route must refuse it: an
+/// organization `orgs` does not hold as active (the default organization
+/// always is), no secret, or a stored secret that cannot be used. Only this
+/// organization's secret is read, and decrypted only when it is held. An
+/// unusable stored secret, and the default organization's unset one, are
+/// logged at most once per interval each; nothing about the caller's
+/// request is logged, and never a secret.
+pub(crate) fn webhook_secret_for_route(
+    conn: &Connection,
+    cfg: &Config,
+    org: &str,
+) -> UaResult<Option<SecretString>> {
+    if org != DEFAULT_ORG {
+        let active: Option<i64> = conn
+            .query_row("SELECT 1 FROM orgs WHERE id = ?1 AND status = 'active'", [org], |r| r.get(0))
+            .optional()?;
+        if active.is_none() {
+            return Ok(None);
+        }
+    }
+    match github_credential_for(conn, cfg, org, CredentialKind::WebhookSecret) {
+        Ok(Some(cred)) => Ok(Some(cred.secret().clone())),
+        Ok(None) => {
+            if org == DEFAULT_ORG && super::webhook::warn_now("default:unset") {
+                tracing::warn!(
+                    "a GitHub delivery reached the default organization's webhook route, but \
+                     github_webhook_secret_env names no secret; it was refused"
+                );
+            }
+            Ok(None)
+        }
+        Err(e) => {
+            if super::webhook::warn_now(&format!("unusable:{org}")) {
+                tracing::warn!(
+                    org = %org,
+                    code = e.code(),
+                    "a stored GitHub webhook secret is unusable; deliveries to its route are refused"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Refuse `sealed` as organization `org`'s webhook secret when another
+/// organization's stored webhook secret, or (outside the default
+/// organization) the hub configuration's, is the same value. Compared by
+/// keyed fingerprint only, under the key each stored row was sealed with
+/// (a row whose key is no longer configured cannot verify anything and is
+/// not compared); never by plaintext, and the refusal names no
+/// organization. Suspended organizations count: one may be reactivated.
+pub(crate) fn refuse_shared_webhook_secret(
+    conn: &Connection,
+    cfg: &Config,
+    org: &str,
+    sealed: &Sealed,
+) -> UaResult<()> {
+    let in_use = || {
+        UaError::conflict_code(
+            "webhook_secret_in_use",
+            "this webhook secret is already in use by another organization or the hub; every organization's \
+             webhook secret must be its own, so choose a different value",
+        )
+    };
+    if org != DEFAULT_ORG
+        && let Some(hub) = cfg.github_webhook_secret()
+        && managed_secrets::config_fingerprint(cfg, hub.expose_secret()).as_deref()
+            == Some(sealed.fingerprint.as_str())
+    {
+        return Err(in_use());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT key_id, fingerprint FROM managed_secrets WHERE name = ?1 AND consumer = ?2 AND org_id <> ?3",
+    )?;
+    let rows = stmt
+        .query_map([WEBHOOK_SECRET, WEBHOOK_CONSUMER, org], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.iter().any(|(key_id, fp)| sealed.fingerprint_under(key_id) == Some(fp.as_str())) {
+        return Err(in_use());
+    }
+    Ok(())
 }
 
 /// Whether a credential is usable, without decrypting it.
@@ -609,6 +695,79 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Store through `put` under `cfg` and return what it said.
+    fn try_store(hub: &Hub, cfg: &Config, org: &str, kind: CredentialKind, value: &str) -> UaResult<()> {
+        let sealed =
+            managed_secrets::seal_value(cfg, org, kind.secret_name(), kind.consumer(), value).unwrap();
+        let caller = Caller::system_for(org);
+        let (cfg, org) = (cfg.clone(), org.to_string());
+        hub.db().write(move |tx| {
+            let out = managed_secrets::put(
+                tx,
+                &cfg,
+                &caller,
+                &org,
+                "github_credential_set",
+                kind.secret_name(),
+                kind.consumer(),
+                &sealed,
+                true,
+            )?;
+            assert!(out.is_ok());
+            Ok(())
+        })
+    }
+
+    fn webhook_rows(hub: &Hub) -> Vec<String> {
+        hub.db()
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT org_id FROM managed_secrets WHERE name = 'github:webhook-secret' ORDER BY org_id",
+                )?;
+                Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)
+            })
+            .unwrap()
+    }
+
+    /// An organization's webhook secret must be its own: `put` refuses a
+    /// value another organization stores (even one sealed under an older
+    /// key) or the hub configuration holds, by fingerprint, without naming
+    /// either. The same value as a token, or the organization's own current
+    /// value again, is fine.
+    #[test]
+    fn a_webhook_secret_another_organization_uses_is_refused_without_naming_it() {
+        let hub = hub(true);
+        let cfg = hub.cfg().clone();
+        store(&hub, ORG_B, CredentialKind::WebhookSecret, B_HOOK);
+        for value in [B_HOOK, HUB_HOOK] {
+            let err = try_store(&hub, &cfg, ORG_C, CredentialKind::WebhookSecret, value).unwrap_err();
+            assert_eq!(err.reason_code(), Some("webhook_secret_in_use"), "{err:?}");
+            let text = format!("{err:?} {err}");
+            for leak in [ORG_B, DEFAULT_ORG, B_HOOK, HUB_HOOK, "fingerprint"] {
+                assert!(!text.contains(leak), "{leak} in {text}");
+            }
+        }
+        assert_eq!(webhook_rows(&hub), [ORG_B], "nothing stored for organization C");
+        // A token may share the value; the rule is for webhook secrets.
+        try_store(&hub, &cfg, ORG_C, CredentialKind::Token, B_HOOK).unwrap();
+        // B storing its own value again is not a clash with itself.
+        try_store(&hub, &cfg, ORG_B, CredentialKind::WebhookSecret, B_HOOK).unwrap();
+        // A distinct value is stored.
+        try_store(&hub, &cfg, ORG_C, CredentialKind::WebhookSecret, "fake-org-c-webhook-not-real").unwrap();
+        assert_eq!(webhook_rows(&hub), [ORG_B, ORG_C]);
+
+        // After a key rotation B's row is still sealed under the old key: the
+        // candidate is compared under that key, and still refused.
+        let mut rotated = cfg.clone();
+        rotated.managed_secret_key = Some(format!("{},{KEY}", base64_key()).into());
+        let err = try_store(&hub, &rotated, ORG_C, CredentialKind::WebhookSecret, B_HOOK).unwrap_err();
+        assert_eq!(err.reason_code(), Some("webhook_secret_in_use"));
+        // Without the hub configuration, its old value is free.
+        let mut no_hub = cfg.clone();
+        no_hub.github_webhook_secret_value = None;
+        try_store(&hub, &no_hub, ORG_C, CredentialKind::WebhookSecret, HUB_HOOK).unwrap();
     }
 
     fn resolve(hub: &Hub, org: &str, kind: CredentialKind) -> UaResult<Option<GithubCredential>> {

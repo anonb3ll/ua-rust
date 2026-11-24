@@ -446,6 +446,18 @@ pub(crate) struct Sealed {
     ciphertext: Vec<u8>,
     pub(crate) fingerprint: String,
     pub(crate) value_bytes: usize,
+    /// The value's keyed fingerprint under every configured key, by key id
+    /// (the write key's is `fingerprint`): what a stored row sealed under an
+    /// older key is compared with. Never stored, never returned.
+    fingerprints: Vec<(String, String)>,
+}
+
+impl Sealed {
+    /// The value's keyed fingerprint under the key `key_id` names, when that
+    /// key is configured.
+    pub(crate) fn fingerprint_under(&self, key_id: &str) -> Option<&str> {
+        self.fingerprints.iter().find(|(k, _)| k == key_id).map(|(_, fp)| fp.as_str())
+    }
 }
 
 /// Check the size of `value`, then seal it for `org`, `name` and `consumer`
@@ -462,8 +474,13 @@ pub(crate) fn seal_value(
     }
     let key = write_key(cfg)?;
     let fingerprint = fingerprint(&key, value);
+    let fingerprints = keyring(cfg)?
+        .unwrap_or_default()
+        .iter()
+        .map(|k| (k.id.clone(), self::fingerprint(k, value)))
+        .collect();
     let (nonce, ciphertext) = seal(&key, org, name, consumer, value)?;
-    Ok(Sealed { key_id: key.id, nonce, ciphertext, fingerprint, value_bytes: value.len() })
+    Ok(Sealed { key_id: key.id, nonce, ciphertext, fingerprint, value_bytes: value.len(), fingerprints })
 }
 
 /// What an approval of a secret write binds: never the value.
@@ -484,7 +501,9 @@ pub(crate) struct Stored {
 /// the registry already consumed a pass for this call (`registry_gated`),
 /// it needs a one-time human approval of `tool`, bound to the new value's
 /// fingerprint. `Ok(Err(id))` is a pending approval. Writes no event: the
-/// tool records its own.
+/// tool records its own. An organization's GitHub webhook secret must be its
+/// own: a value another organization or the hub configuration already uses
+/// is refused ([`gh_credentials::refuse_shared_webhook_secret`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put(
     tx: &mut WriteTx<'_>,
@@ -497,6 +516,9 @@ pub(crate) fn put(
     sealed: &Sealed,
     registry_gated: bool,
 ) -> UaResult<Result<Stored, i64>> {
+    if name == gh_credentials::WEBHOOK_SECRET && consumer == gh_credentials::WEBHOOK_CONSUMER {
+        gh_credentials::refuse_shared_webhook_secret(tx, cfg, org, sealed)?;
+    }
     let prior: Option<String> = tx
         .query_row("SELECT consumer FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name], |r| {
             r.get(0)

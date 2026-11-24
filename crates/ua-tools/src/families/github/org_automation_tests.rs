@@ -1,6 +1,6 @@
 //! The GitHub and CI automation per organization, against a local mock of
-//! the REST API: a webhook delivery belongs to the organizations whose own
-//! secret verifies it, the poller polls each organization with its own token
+//! the REST API: a webhook delivery belongs to the organization its route
+//! names and is checked against that organization's secret only, the poller polls each organization with its own token
 //! and skips one without, CI lookups and merged reconciliation use the
 //! task's organization's token and bindings, and no path ever sends the
 //! hub's token for another organization.
@@ -32,7 +32,7 @@ mod cases {
     use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile, UaError, identity::Transport};
 
     use super::super::credentials::CredentialKind;
-    use super::super::webhook::{WebhookDelivery, WebhookError, receive, signature_for};
+    use super::super::webhook::{WebhookDelivery, WebhookError, receive, receive_org, signature_for};
     use crate::Hub;
     use crate::families::managed_secrets;
 
@@ -342,16 +342,19 @@ mod cases {
             self.mock.lock().unwrap().log.iter().map(|(.., f)| f.clone()).collect()
         }
 
+        /// A delivery to organization `to`'s route (the bare route for the
+        /// default organization), signed with `secret`.
         async fn deliver(
             &self,
+            to: &str,
             secret: Option<&str>,
             event: &str,
             id: &str,
             body: &[u8],
         ) -> Result<Value, WebhookError> {
             let sig = secret.map(|s| signature_for(s.as_bytes(), body));
-            receive(&self.hub, WebhookDelivery { event, delivery_id: id, signature: sig.as_deref(), body })
-                .await
+            let d = WebhookDelivery { event, delivery_id: id, signature: sig.as_deref(), body };
+            if to == DEFAULT_ORG { receive(&self.hub, d).await } else { receive_org(&self.hub, to, d).await }
         }
     }
 
@@ -372,14 +375,15 @@ mod cases {
 
     // --- webhook --------------------------------------------------------------------------
 
-    /// The same merged-PR body, for a repository three organizations bind, is
-    /// signed once with organization B's secret and once with the default
-    /// organization's: each delivery belongs to the organization whose secret
-    /// verified it, closes only that organization's task, and is recorded under
-    /// that organization's own replay keys (so the identical body is not a
-    /// replay for the other).
+    /// The same merged-PR body, for a repository three organizations bind,
+    /// goes to organization B's route signed with B's secret, and to the bare
+    /// route signed with the default organization's: each closes only its own
+    /// organization's task and is recorded under that organization's own
+    /// replay keys (so the identical body is not a replay for the other). B's
+    /// route takes only B's signature, and the bare route never verifies with
+    /// another organization's secret.
     #[tokio::test]
-    async fn a_delivery_belongs_to_the_organization_whose_secret_verifies_it() {
+    async fn a_delivery_belongs_to_the_organization_its_route_names() {
         let h = H::new(ALL).await;
         let link = format!("{SHARED}#8");
         let (ta, tb, tc) = (
@@ -389,10 +393,19 @@ mod cases {
         );
         let body = merge_body(SHARED, 8);
 
-        let out = h.deliver(Some(B_HOOK), "pull_request", "merge-8-b", &body).await.unwrap();
+        // B's route refuses every secret but B's, and the bare route refuses
+        // B's: nothing is recorded or closed.
+        for (to, secret) in [(ORG_B, HUB_HOOK), (ORG_B, C_HOOK), (DEFAULT_ORG, B_HOOK), (DEFAULT_ORG, C_HOOK)]
+        {
+            let e = h.deliver(to, Some(secret), "pull_request", "merge-8-x", &body).await.unwrap_err();
+            assert_eq!(e, WebhookError::BadSignature, "{to}");
+        }
+        assert_eq!(h.count("SELECT count(*) FROM inbound_deliveries WHERE source = 'github'"), 0);
+
+        let out = h.deliver(ORG_B, Some(B_HOOK), "pull_request", "merge-8-b", &body).await.unwrap();
         // Another organization's delivery is answered neutrally; what it did
         // is in its own ledger.
-        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        assert_eq!(out, json!({ "ok": true }));
         let closed: Vec<i64> = h
             .events("agent.github.closed_on_merge", ORG_B)
             .iter()
@@ -402,39 +415,50 @@ mod cases {
         assert_eq!((h.status(ta), h.status(tb), h.status(tc)), ("open".into(), "done".into(), "open".into()));
         // Its event is organization B's: repository redacted, neutral originator.
         let (repo, by) = (
-        h.text(
-            "SELECT json_extract(payload, '$.repo') FROM event_log WHERE channel = 'agent.github.webhook.received' \
-             AND json_extract(payload, '$.org_id') = 'org-b'",
-        ),
-        h.text(
-            "SELECT originator FROM event_log WHERE channel = 'agent.github.closed_on_merge' \
-             AND json_extract(payload, '$.org_id') = 'org-b'",
-        ),
-    );
+            h.text(
+                "SELECT json_extract(payload, '$.repo') FROM event_log WHERE channel = 'agent.github.webhook.received' \
+                 AND json_extract(payload, '$.org_id') = 'org-b'",
+            ),
+            h.text(
+                "SELECT originator FROM event_log WHERE channel = 'agent.github.closed_on_merge' \
+                 AND json_extract(payload, '$.org_id') = 'org-b'",
+            ),
+        );
         assert_eq!(repo, None, "another organization's repository stays out of the default ledger");
         assert_eq!(by.as_deref(), Some("system"));
 
         // The identical body, signed with the default organization's secret.
-        let out = h.deliver(Some(HUB_HOOK), "pull_request", "merge-8-d", &body).await.unwrap();
+        let out = h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "pull_request", "merge-8-d", &body).await.unwrap();
         assert_eq!(out["org_id"], DEFAULT_ORG, "{out}");
         assert_eq!(closed_ids(&out), [ta], "{out}");
-        assert_eq!(h.status(tc), "open", "organization C's secret signed nothing");
+        assert_eq!(h.status(tc), "open", "nothing reached organization C's route");
 
         // Each organization's replay keys are its own.
         for org in [DEFAULT_ORG, ORG_B] {
             let n = h.count(&format!(
-            "SELECT count(*) FROM inbound_deliveries WHERE org_id = '{org}' AND source = 'github' AND kind = 'body_sha256'"
-        ));
+                "SELECT count(*) FROM inbound_deliveries WHERE org_id = '{org}' AND source = 'github' AND kind = 'body_sha256'"
+            ));
             assert_eq!(n, 1, "{org}");
         }
         assert_eq!(h.count("SELECT count(*) FROM inbound_deliveries WHERE org_id = 'org-c'"), 0);
         // A webhook never calls the API for a merge: no token was sent at all.
         assert!(h.all_tokens().is_empty());
-        // And a resend of B's under a fresh id is still a replay for B.
+        // A resend of B's under a fresh id is still a replay for B, and of the
+        // default organization's for it.
         assert_eq!(
-            h.deliver(Some(B_HOOK), "pull_request", "merge-8-b2", &body).await.unwrap_err(),
+            h.deliver(ORG_B, Some(B_HOOK), "pull_request", "merge-8-b2", &body).await.unwrap_err(),
             WebhookError::Replayed
         );
+        assert_eq!(
+            h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "pull_request", "merge-8-d2", &body).await.unwrap_err(),
+            WebhookError::Replayed
+        );
+        // The same body is new to organization C: its own route takes it.
+        assert_eq!(
+            h.deliver(ORG_C, Some(C_HOOK), "pull_request", "merge-8-c", &body).await.unwrap(),
+            json!({ "ok": true })
+        );
+        assert_eq!(h.status(tc), "done");
     }
 
     #[tokio::test]
@@ -443,16 +467,19 @@ mod cases {
         let link = format!("{SHARED}#9");
         let ids = [h.task(DEFAULT_ORG, "web", &link).await, h.task(ORG_B, "web", &link).await];
         let body = merge_body(SHARED, 9);
-        for (secret, id) in [(None, "u-1"), (Some(WRONG_HOOK), "u-2")] {
-            let e = h.deliver(secret, "pull_request", id, &body).await.unwrap_err();
-            assert_eq!(e, WebhookError::BadSignature);
+        for to in [DEFAULT_ORG, ORG_B] {
+            for (secret, id) in [(None, "u-1"), (Some(WRONG_HOOK), "u-2")] {
+                let e = h.deliver(to, secret, "pull_request", id, &body).await.unwrap_err();
+                assert_eq!(e, WebhookError::BadSignature, "{to}");
+            }
         }
-        // A signature with another organization's secret over a changed body.
+        // B's signature over a changed body, on B's route.
         let sig = signature_for(B_HOOK.as_bytes(), &body);
         let mut tampered = body.clone();
         tampered.push(b' ');
-        let e = receive(
+        let e = receive_org(
             &h.hub,
+            ORG_B,
             WebhookDelivery {
                 event: "pull_request",
                 delivery_id: "u-3",
@@ -470,63 +497,63 @@ mod cases {
         assert_eq!(h.count("SELECT count(*) FROM event_log WHERE channel GLOB 'agent.github.*'"), 0);
     }
 
+    /// A route whose organization holds no secret refuses every delivery
+    /// with the same answer as a bad signature. Organization B's secret, once
+    /// stored, verifies B's route only, never the bare one.
     #[tokio::test]
-    async fn with_no_secret_anywhere_every_delivery_is_refused() {
+    async fn a_route_without_a_secret_refuses_like_a_bad_signature() {
         let h = H::new(Creds { hub: false, b_token: false, b_hook: None, c_hook: None }).await;
         let body = merge_body(SHARED, 1);
-        let e = h.deliver(Some(HUB_HOOK), "pull_request", "n-1", &body).await.unwrap_err();
-        assert_eq!(e, WebhookError::NotConfigured);
-        // The default organization off, organization B's secret alone still
-        // verifies only B's deliveries.
+        for to in [DEFAULT_ORG, ORG_B] {
+            let e = h.deliver(to, Some(HUB_HOOK), "pull_request", "n-1", &body).await.unwrap_err();
+            assert_eq!(e, WebhookError::BadSignature, "{to}");
+        }
         h.store(ORG_B, CredentialKind::WebhookSecret, B_HOOK);
         assert_eq!(
-            h.deliver(Some(HUB_HOOK), "ping", "n-2", b"{}").await.unwrap_err(),
+            h.deliver(DEFAULT_ORG, Some(B_HOOK), "ping", "n-2", b"{}").await.unwrap_err(),
             WebhookError::BadSignature
         );
-        let out = h.deliver(Some(B_HOOK), "ping", "n-3", b"{}").await.unwrap();
-        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        let out = h.deliver(ORG_B, Some(B_HOOK), "ping", "n-3", b"{}").await.unwrap();
+        assert_eq!(out, json!({ "ok": true }));
         assert_eq!(h.events("agent.github.webhook.received", ORG_B).len(), 1);
         assert!(h.events("agent.github.webhook.received", DEFAULT_ORG).is_empty());
     }
 
-    /// The multi-match rule: two organizations configured with the same secret
-    /// both verify a delivery, and it is processed for each, in a fixed order,
-    /// against each one's own tasks. The answer is organization-neutral: no
-    /// organization id, title or task of either reaches the sender.
+    /// An unknown organization, a malformed organization id, a suspended
+    /// organization, one with no secret and a bad signature all get the same
+    /// refusal: one status, one code, one message.
     #[tokio::test]
-    async fn a_secret_two_organizations_share_processes_the_delivery_for_each() {
-        const C_TITLE: &str = "org-c-private-title-4";
-        let h =
-            H::new(Creds { hub: true, b_token: false, b_hook: Some(B_HOOK), c_hook: Some(HUB_HOOK) }).await;
-        let link = format!("{SHARED}#4");
-        let (ta, tb, tc) = (
-            h.task_titled(DEFAULT_ORG, "web", &link, "default-title-4").await,
-            h.task(ORG_B, "web", &link).await,
-            h.task_titled(ORG_C, "web", &link, C_TITLE).await,
+    async fn every_refusal_on_an_organization_route_is_the_same_answer() {
+        let h = H::new(ALL).await;
+        h.sql(
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
+             VALUES ('org-d', 'org-d', 'org-d', '[\"developer\"]', '2026-01-01T00:00:00+00:00');",
         );
-        let body = merge_body(SHARED, 4);
-        let out = h.deliver(Some(HUB_HOOK), "pull_request", "multi-4", &body).await.unwrap();
-        assert_eq!(out, json!({ "ok": true, "matched": 2, "statuses": [200, 200] }));
-        let text = out.to_string();
-        for leak in [C_TITLE, "default-title-4", ORG_C, DEFAULT_ORG, "task_id", SHARED] {
-            assert!(!text.contains(leak), "{leak} in {text}");
+        h.sql(&format!("UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_C}'"));
+        let body = b"{}";
+        let cases: [(&str, &str, Option<&str>); 6] = [
+            ("unknown", "org-nope", Some(B_HOOK)),
+            ("malformed id", "org b/../x", Some(B_HOOK)),
+            ("suspended", ORG_C, Some(C_HOOK)),
+            ("no secret", "org-d", Some(B_HOOK)),
+            ("bad signature", ORG_B, Some(WRONG_HOOK)),
+            ("no signature", ORG_B, None),
+        ];
+        let mut answers = Vec::new();
+        for (what, to, secret) in cases {
+            let e = h.deliver(to, secret, "ping", "parity-1", body).await.unwrap_err();
+            answers.push((what, e.http_status(), e.code(), e.message()));
         }
-        assert_eq!((h.status(ta), h.status(tc)), ("done".into(), "done".into()));
-        // Each organization's own ledger has its closure.
-        for (org, id) in [(DEFAULT_ORG, ta), (ORG_C, tc)] {
-            let closed: Vec<i64> = h
-                .events("agent.github.closed_on_merge", org)
-                .iter()
-                .map(|e| e["task_id"].as_i64().unwrap())
-                .collect();
-            assert_eq!(closed, [id], "{org}");
+        for (what, status, code, message) in &answers[1..] {
+            assert_eq!(
+                (status, code, message),
+                (&answers[0].1, &answers[0].2, &answers[0].3),
+                "{what} differs from an unknown organization"
+            );
         }
-        assert_eq!(h.status(tb), "open", "organization B's secret did not sign it");
-        // Again: a replay for both.
-        assert_eq!(
-            h.deliver(Some(HUB_HOOK), "pull_request", "multi-4b", &body).await.unwrap_err(),
-            WebhookError::Replayed
-        );
+        assert_eq!((answers[0].1, answers[0].2), (401, "bad_signature"));
+        assert_eq!(h.count("SELECT count(*) FROM inbound_deliveries"), 0);
+        assert_eq!(h.count("SELECT count(*) FROM event_log WHERE channel GLOB 'agent.github.*'"), 0);
     }
 
     // --- CI re-verification ---------------------------------------------------------------
@@ -558,8 +585,8 @@ mod cases {
         let body =
             serde_json::to_vec(&json!({ "after": head, "repository": { "full_name": SHARED } })).unwrap();
 
-        let out = h.deliver(Some(B_HOOK), "push", "push-b", &body).await.unwrap();
-        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        let out = h.deliver(ORG_B, Some(B_HOOK), "push", "push-b", &body).await.unwrap();
+        assert_eq!(out, json!({ "ok": true }));
         let reverified = h.events("agent.github.checks_reverified", ORG_B);
         assert_eq!(reverified.len(), 1);
         let checks: Vec<i64> = reverified[0]["checks"]
@@ -579,7 +606,7 @@ mod cases {
         assert!(!seen.is_empty() && seen.iter().all(|f| *f == fp(B_TOKEN)), "{seen:?}");
 
         let before = h.all_tokens().len();
-        h.deliver(Some(C_HOOK), "push", "push-c", &body).await.unwrap();
+        h.deliver(ORG_C, Some(C_HOOK), "push", "push-c", &body).await.unwrap();
         let reverified = h.events("agent.github.checks_reverified", ORG_C);
         assert_eq!(reverified.len(), 1);
         assert_eq!(reverified[0]["checks"][0]["task_id"].as_i64(), Some(tasks[ORG_C]));
@@ -777,12 +804,11 @@ mod cases {
 
     // --- the signature header -------------------------------------------------------------
 
-    /// A missing or malformed `X-Hub-Signature-256` is refused (401) before
-    /// any secret is looked up: on a hub with no secret at all, where any
-    /// lookup would answer `not_configured` (503), it still answers
-    /// `bad_signature`. A well-formed one reaches the lookup.
+    /// A missing or malformed `X-Hub-Signature-256` is refused (401) on
+    /// every route, and so is a well-formed one on a hub with no secret at
+    /// all: the same answer, nothing recorded.
     #[tokio::test]
-    async fn a_missing_or_malformed_signature_is_refused_before_any_lookup() {
+    async fn a_missing_or_malformed_signature_is_refused_and_records_nothing() {
         let h = H::new(Creds { hub: false, b_token: false, b_hook: None, c_hook: None }).await;
         let body = b"{}";
         let hex64 = "a".repeat(64);
@@ -795,34 +821,26 @@ mod cases {
             Some(format!("sha256={hex64}a")),
             Some(format!("sha256={}", "g".repeat(64))),
             Some(format!("SHA256={hex64}")),
+            Some(format!("sha256={hex64}")),
         ];
-        for sig in &malformed {
-            let e = receive(
-                &h.hub,
-                WebhookDelivery { event: "ping", delivery_id: "sig-1", signature: sig.as_deref(), body },
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(e, WebhookError::BadSignature, "{sig:?}");
-            assert_eq!(e.http_status(), 401);
+        for to in [DEFAULT_ORG, ORG_B] {
+            for sig in &malformed {
+                let d =
+                    WebhookDelivery { event: "ping", delivery_id: "sig-1", signature: sig.as_deref(), body };
+                let e = receive_org(&h.hub, to, d).await.unwrap_err();
+                assert_eq!(e, WebhookError::BadSignature, "{to} {sig:?}");
+                assert_eq!(e.http_status(), 401);
+            }
         }
-        let well_formed = format!("sha256={hex64}");
-        let e = receive(
-            &h.hub,
-            WebhookDelivery { event: "ping", delivery_id: "sig-2", signature: Some(&well_formed), body },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e, WebhookError::NotConfigured, "a well-formed header goes on to the lookup");
         assert_eq!(h.count("SELECT count(*) FROM inbound_deliveries"), 0);
     }
 
     // --- unusable and suspended -----------------------------------------------------------
 
     /// Organization C's stored secret is organization B's ciphertext moved
-    /// across: it never opens in C, so C is skipped. A delivery signed with
-    /// B's secret belongs to B alone (C is never handed B's secret), and one
-    /// signed with C's old secret verifies nowhere.
+    /// across: it never opens in C, so C's route refuses everything, B's
+    /// secret included (C is never handed B's secret), while B's own route
+    /// still works.
     #[tokio::test]
     async fn an_unusable_stored_secret_is_skipped_and_never_replaced() {
         let h = H::new(ALL).await;
@@ -830,18 +848,20 @@ mod cases {
         let link = format!("{SHARED}#21");
         let (tb, tc) = (h.task(ORG_B, "web", &link).await, h.task(ORG_C, "web", &link).await);
         let body = merge_body(SHARED, 21);
-        let out = h.deliver(Some(B_HOOK), "pull_request", "moved-1", &body).await.unwrap();
-        assert_eq!(out, json!({ "ok": true, "matched": 1, "statuses": [200] }));
+        for secret in [C_HOOK, B_HOOK] {
+            assert_eq!(
+                h.deliver(ORG_C, Some(secret), "pull_request", "moved-2", &body).await.unwrap_err(),
+                WebhookError::BadSignature
+            );
+        }
+        let out = h.deliver(ORG_B, Some(B_HOOK), "pull_request", "moved-1", &body).await.unwrap();
+        assert_eq!(out, json!({ "ok": true }));
         assert_eq!((h.status(tb), h.status(tc)), ("done".into(), "open".into()));
         assert!(h.events("agent.github.webhook.received", ORG_C).is_empty());
-        assert_eq!(
-            h.deliver(Some(C_HOOK), "pull_request", "moved-2", &body).await.unwrap_err(),
-            WebhookError::BadSignature
-        );
         assert_eq!(h.status(tc), "open");
     }
 
-    /// A suspended organization's secret is never consulted.
+    /// A suspended organization's route refuses its own secret.
     #[tokio::test]
     async fn a_suspended_organizations_secret_verifies_nothing() {
         let h = H::new(ALL).await;
@@ -853,25 +873,25 @@ mod cases {
             .unwrap();
         assert_eq!(held, [DEFAULT_ORG, ORG_B]);
         assert_eq!(
-            h.deliver(Some(C_HOOK), "ping", "suspended-1", b"{}").await.unwrap_err(),
+            h.deliver(ORG_C, Some(C_HOOK), "ping", "suspended-1", b"{}").await.unwrap_err(),
             WebhookError::BadSignature
         );
         assert!(h.events("agent.github.webhook.received", ORG_C).is_empty());
     }
 
-    // --- multi-match outcomes -------------------------------------------------------------
+    // --- outcomes on an organization's route --------------------------------------------
 
-    /// The default organization and C share a secret. C's handling fails
-    /// (an injected database failure): the delivery answers 500, C's records
-    /// are released, and the default organization's are kept. GitHub's
-    /// redelivery is then processed for C only; the default organization
-    /// reports a replay. The PR merged off the merge branch, so each
+    /// Organization C's handling fails (an injected database failure): its
+    /// route answers 500 with a fixed message, and C's records are released,
+    /// so GitHub's redelivery is processed. The default organization takes
+    /// the same body on its own route independently (replay records are per
+    /// organization). The PR merged off the merge branch, so each
     /// organization ledgers `merged_to_non_default`: the default
     /// organization's names the branches, C's does not.
     #[tokio::test]
-    async fn a_partial_failure_is_redelivered_to_the_failed_organization_only() {
+    async fn an_internal_failure_answers_neutrally_and_the_redelivery_is_processed() {
         const BASE: &str = "release-branch-91c2";
-        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(HUB_HOOK) }).await;
+        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(C_HOOK) }).await;
         let link = format!("{SHARED}#12");
         let (ta, tc) = (h.task(DEFAULT_ORG, "web", &link).await, h.task(ORG_C, "web", &link).await);
         let body = serde_json::to_vec(&json!({
@@ -885,21 +905,26 @@ mod cases {
               AND json_extract(NEW.payload, '$.org_id') = 'org-c'
              BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
         );
-        let e = h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap_err();
+        let e = h.deliver(ORG_C, Some(C_HOOK), "pull_request", "partial-12", &body).await.unwrap_err();
         assert!(matches!(e, WebhookError::Internal(_)), "{e:?}");
         assert_eq!(e.http_status(), 500);
-        assert!(!e.message().contains(ORG_C), "{}", e.message());
-        assert_eq!(h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(), 1);
+        for leak in [ORG_C, "injected", SHARED, BASE] {
+            assert!(!e.message().contains(leak), "{leak} in {}", e.message());
+        }
         assert!(h.events("agent.github.merged_to_non_default", ORG_C).is_empty());
+        let out = h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap();
+        assert_eq!(out["org_id"], DEFAULT_ORG, "{out}");
+        assert_eq!(h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(), 1);
 
         h.sql("DROP TRIGGER fail_org_c_off_branch;");
-        let out = h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap();
-        assert_eq!(out, json!({ "ok": true, "matched": 2, "statuses": [409, 200] }));
+        let out = h.deliver(ORG_C, Some(C_HOOK), "pull_request", "partial-12", &body).await.unwrap();
+        assert_eq!(out, json!({ "ok": true }));
         assert_eq!(
-            h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(),
-            1,
-            "not processed twice"
+            h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap_err(),
+            WebhookError::Replayed,
+            "not processed twice for the default organization"
         );
+        assert_eq!(h.events("agent.github.merged_to_non_default", DEFAULT_ORG).len(), 1);
         let c_events = h.events("agent.github.merged_to_non_default", ORG_C);
         assert_eq!(c_events.len(), 1);
         // Redaction: C's event keeps ids, numbers and the merge commit, never
@@ -917,18 +942,18 @@ mod cases {
         let d = &h.events("agent.github.merged_to_non_default", DEFAULT_ORG)[0];
         assert_eq!((d["base_ref"].as_str(), d["merge_branch"].as_str()), (Some(BASE), Some("main")));
         assert_eq!((h.status(ta), h.status(tc)), ("open".into(), "open".into()));
-        // A third copy is a replay for both.
+        // A third copy is a replay for C.
         assert_eq!(
-            h.deliver(Some(HUB_HOOK), "pull_request", "partial-12", &body).await.unwrap_err(),
+            h.deliver(ORG_C, Some(C_HOOK), "pull_request", "partial-12", &body).await.unwrap_err(),
             WebhookError::Replayed
         );
     }
 
-    /// When every matched organization refuses a delivery as a bad request,
-    /// the answer is 400, as for a single match.
+    /// A delivery an organization's route refuses as a bad request answers
+    /// 400, and is finished: the next copy is a replay.
     #[tokio::test]
-    async fn every_matched_organization_refusing_it_answers_bad_request() {
-        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(HUB_HOOK) }).await;
+    async fn a_bad_request_on_an_organization_route_answers_bad_request() {
+        let h = H::new(Creds { hub: true, b_token: false, b_hook: None, c_hook: Some(C_HOOK) }).await;
         let mut pr = merged_pr(SHARED, 13);
         pr.as_object_mut().unwrap().remove("merge_commit_sha");
         let body = serde_json::to_vec(&json!({
@@ -936,12 +961,11 @@ mod cases {
             "repository": { "full_name": SHARED, "default_branch": "main" },
         }))
         .unwrap();
-        let e = h.deliver(Some(HUB_HOOK), "pull_request", "bad-13", &body).await.unwrap_err();
+        let e = h.deliver(ORG_C, Some(C_HOOK), "pull_request", "bad-13", &body).await.unwrap_err();
         assert!(matches!(e, WebhookError::BadRequest(_)), "{e:?}");
         assert_eq!(e.http_status(), 400);
-        // Both organizations finished it: the next copy is a replay for both.
         assert_eq!(
-            h.deliver(Some(HUB_HOOK), "pull_request", "bad-13", &body).await.unwrap_err(),
+            h.deliver(ORG_C, Some(C_HOOK), "pull_request", "bad-13", &body).await.unwrap_err(),
             WebhookError::Replayed
         );
     }

@@ -12,6 +12,23 @@ from its commit history.
 
 ### Added
 
+- GitHub webhooks per organization: `POST /api/github/webhook/{org}` (the
+  organization's id) checks a delivery against that organization's own
+  webhook secret only, and handles it for that organization only. The bare
+  `POST /api/github/webhook` stays the default organization's route (also
+  reachable as `/api/github/webhook/default`) and checks only
+  `github_webhook_secret_env`. Configure each organization's GitHub webhook
+  with its own URL (`docs/github.md#security-model`).
+- `github_webhook_max_in_flight` (default 4, clamped to 1-256): one cap on
+  deliveries being read or handled across both webhook routes; over it a
+  delivery is answered 429 `busy` with `Retry-After: 1` before its body is
+  read, and nothing is recorded.
+- `github_credential_set` kind `webhook_secret` refuses a value that another
+  organization already stores, or (outside the default organization) the
+  hub's `github_webhook_secret_env` value: 409 `webhook_secret_in_use`,
+  naming no organization. Compared by keyed fingerprint under each stored
+  row's own key, never by plaintext. Set and clear still refuse every caller
+  until memberships exist, so this waits for that path.
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
 - Crate `ua-ingress` (`docs/ingress.md`): one address classifier
@@ -772,6 +789,21 @@ from its commit history.
 
 ### Behaviour changes
 
+- GitHub webhook multi-match is removed. A delivery belongs to the one
+  organization its route names, not to every organization whose secret
+  verifies it, and the aggregate answer (`{"ok", "matched", "statuses"}`)
+  is gone: another organization's route answers `{"ok": true}` on success.
+  The bare route no longer tries other organizations' secrets, and
+  `503 not_configured` is gone: a route with no secret answers the same
+  401 `bad_signature` as a wrong signature (the hub logs, at most every
+  five minutes, when the default organization's secret is unset).
+  **Migration note:** a deployment where another organization's GitHub
+  webhook pointed at the bare `/api/github/webhook` must repoint it to
+  `/api/github/webhook/<org id>`; until then its deliveries are refused
+  (401). A deployment where two organizations shared one webhook secret
+  (multi-match) must give each its own secret and its own URL: the shared
+  delivery now reaches only the routed organization, and storing the shared
+  value again for a second organization is refused.
 - `managed_secret_set` refuses the names `github:token` and
   `github:webhook-secret` and consumers of kind `github`
   (`reserved_secret`). **Upgrade note:** a secret already stored under one
@@ -1121,6 +1153,14 @@ from its commit history.
 
 ### Security
 
+- The unauthenticated GitHub webhook costs one secret check per delivery:
+  it loads and decrypts only the routed organization's secret and computes
+  one MAC (over a fixed dummy key when there is no secret), instead of one
+  decrypt and one MAC over up to 5 MiB per organization. An unknown,
+  malformed or suspended organization, one with no secret, an unusable
+  stored secret and a bad signature all get one byte-identical answer, so
+  the route no longer reveals whether any organization has a secret. Both
+  webhook routes share an in-flight cap (`github_webhook_max_in_flight`).
 - Ledger event visibility: `agent.message.*`, `agent.mailbox.*` (inbox
   read/ack receipts), `agent.lifecycle.handoff` and
   `agent.conversation.handoff` rows are now visible only to the readers the

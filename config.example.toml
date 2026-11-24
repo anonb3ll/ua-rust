@@ -91,6 +91,7 @@ routines_enabled = false
 # github_require_default_branch_workflow = false  # true: the workflow file must match the default branch
 # github_ci_latest_attempt_only = false        # true: judge a re-run job on its latest attempt only
 # github_webhook_max_age_hours = 24            # refuse webhook payloads older than this; 0 = off
+# github_webhook_max_in_flight = 4            # webhook deliveries handled at once; over it: 429
 # github_web_host = "github.com"               # host PR links must name (default from github_api_url)
 # github_check_workflows = { tests = ".github/workflows/ci.yml", lint = "Lint" }  # check -> workflow name or file
 # github_merge_branches = { default = "main" } # project -> merge branch; unlisted: the repo's default branch

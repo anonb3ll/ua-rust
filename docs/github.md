@@ -10,7 +10,7 @@ out to a forge CLI. Module docs: `crates/ua-tools/src/families/github/`.
 |---|---|---|
 | REST client | `github/client.rs` | Pinned to one API host, bound repositories only, no redirects, bounded, rate-limit aware |
 | CI verifier | `ci.rs` (`GitHubCiVerifier`) | `task_check_record` / `task_check_verify` grade a check `verified` when the run proves it |
-| Webhook | `POST /api/github/webhook` | Signed deliveries: re-verify checks, close tasks on merge |
+| Webhook | `POST /api/github/webhook/{org}`, `POST /api/github/webhook` (default organization) | Signed deliveries: re-verify checks, close tasks on merge |
 | Poller | `ua serve`, `github_poll_interval_s` | The same effects from the open-PR list, with ETags |
 | Close-on-merge | `coordination_manage(action="queue_close_merged")` | On demand, dry run by default |
 | Policy authorizations | `policy_authorization_record`, `policy_authorization_list`, `policy_authorization_revoke` | A human's standing-policy authorization for one exact head |
@@ -33,6 +33,7 @@ github_ci_latest_attempt_only = false           # judge a job on its latest atte
 
 # Webhooks and close-on-merge.
 github_webhook_max_age_hours = 24               # refuse payloads whose own timestamp is older; 0 = off
+github_webhook_max_in_flight = 4                # deliveries read or handled at once; over it: 429
 # github_web_host = "github.com"                # host PR links must name (default: from github_api_url)
 # project -> branch a merged PR must target; unlisted: the repository's default branch
 # github_merge_branches = { default = "main" }
@@ -54,8 +55,10 @@ request (one connection pool), not rebuilt per call.
 - **Later sources.** A GitHub App installation token can replace the
   personal token behind the same client.
 - **Webhook secret.** `github_webhook_secret_env` names the variable holding
-  the secret set on the GitHub webhook. Without it the endpoint answers 503
-  to everything.
+  the secret set on the default organization's GitHub webhook. Without it
+  the default organization's routes refuse everything, with the same 401
+  `bad_signature` as a wrong signature (the hub logs, at most every five
+  minutes, that a delivery arrived with no secret set).
 
 ### Credentials per organization
 
@@ -107,11 +110,19 @@ reconciliation all do (see [Automation per organization](#automation-per-organiz
   one-time approval a replacement or clear binds. Events
   (`github.credential.set`, `github.credential.cleared`) carry the kind,
   whether a value was replaced and the approval id.
-- **Webhooks per organization (next).** A delivery will be checked against
-  the webhook secret of the organization its URL names, and only that one:
-  an organization with no secret answers 503 (`not_configured`) and is
-  never verified with another organization's or the hub's secret. The
-  default organization keeps `POST /api/github/webhook`.
+- **One webhook secret per organization.** `github_credential_set` with
+  kind `webhook_secret` refuses a value another organization already
+  stores (including a suspended one) or, outside the default organization,
+  the value of `github_webhook_secret_env`: 409 `webhook_secret_in_use`,
+  without saying which organization holds it. The comparison is by keyed
+  fingerprint, under the key each stored row was sealed with (a row sealed
+  under a key the hub no longer has cannot verify anything and is not
+  compared); no plaintext is compared or kept. Since set and clear refuse
+  every caller until memberships exist, this rule is enforced code that
+  waits for that path; it is tested through the shared write path. The hub
+  configuration itself is not checked against stored secrets when it
+  changes: routing (below) already keeps one organization's secret off
+  another's route.
 
 ## Security model
 
@@ -140,12 +151,31 @@ GitHub says the rate limit is spent (`x-ratelimit-remaining: 0`, or a
 reset (at most an hour) and answers `rate limited` without a request; a CI
 lookup then reads `insufficient` and can be verified again later.
 
-**Webhook authentication.** `/api/github/webhook` takes no bearer token
-(GitHub cannot send one). Before anything is parsed or stored:
+**Webhook routes.** Each organization has its own webhook URL:
+
+| Organization | Payload URL to set on GitHub | Secret checked |
+|---|---|---|
+| `default` | `https://<hub>/api/github/webhook` (or `.../webhook/default`) | `github_webhook_secret_env` |
+| any other | `https://<hub>/api/github/webhook/<org id>` | that organization's `github:webhook-secret` |
+
+A delivery belongs to the organization its URL names, and is checked
+against that organization's secret only: one secret loaded, one MAC
+computed. The bare route never tries another organization's secret, and
+the payload's repository never decides. Set content type
+`application/json` on the GitHub side.
+
+**Webhook authentication.** Neither route takes a bearer token (GitHub
+cannot send one). Before anything is parsed or stored:
 
 1. `X-Hub-Signature-256` must be `sha256=` + the HMAC-SHA256 of the raw body
-   under the webhook secret, compared in constant time. Otherwise 401
-   `bad_signature`.
+   under the routed organization's webhook secret, compared in constant
+   time. Otherwise 401 `bad_signature`. That one answer, byte for byte,
+   also covers an unknown or malformed organization id, a suspended
+   organization, an organization with no secret and a stored secret that
+   cannot be used, after the same one MAC (over a fixed dummy key when
+   there is no secret): an unauthenticated caller cannot tell which
+   organizations exist or have a secret. There is no `not_configured`
+   (503) answer any more.
 2. When the payload carries its own timestamp (`pull_request.merged_at`,
    `updated_at` or `closed_at`; `check_run.completed_at`;
    `check_suite.updated_at`; `workflow_run.updated_at`;
@@ -161,6 +191,12 @@ lookup then reads `insufficient` and can be verified again later.
    kept 30 days, at most 20 000 of each.
 4. The body must be `application/json` (the API guard refuses a form body
    with 415) and at most 5 MiB.
+5. Both routes share one in-flight cap, `github_webhook_max_in_flight`
+   (default 4, at least 1, at most 256): a delivery that arrives while that
+   many are being read or handled is answered 429 `busy` with
+   `Retry-After: 1` before its body is read, with nothing recorded or
+   ledgered, so a redelivery is processed normally. The permit is held from
+   before the body is read until the answer, so slow senders count too.
 
 The delivery id, the body hash (both `accepted` by this process) and an
 `agent.github.webhook.received` event are written in one transaction before
@@ -314,36 +350,28 @@ Every GitHub path acts for one organization at a time, with that
 organization's own credential and bindings, and never falls back to
 another's:
 
-- **Webhook.** A delivery belongs to the organizations whose own webhook
-  secret verifies its `X-Hub-Signature-256` (the default organization's
-  `github_webhook_secret_env`, every other organization's
-  `github:webhook-secret`), each compared in constant time; the payload's
-  repository never decides. The header must be `sha256=` and 64 hex digits,
-  checked before the database is touched (`bad_signature`, 401). No active
-  organization holds a secret (decided from metadata, nothing decrypted):
-  `not_configured` (503). Each held secret is then decrypted in one read and
-  the MACs computed after it; none verifies: `bad_signature` (401). It is then recorded
-  (replay keys in that organization), ledgered and handled against that
+- **Webhook.** A delivery belongs to the organization its route names
+  (`/api/github/webhook/<org id>`; the bare route is the default
+  organization's) and is checked against that organization's own secret
+  only (see [Webhook routes](#security-model)). It is then recorded (replay
+  keys in that organization), ledgered and handled against that
   organization's bound repositories and tasks only, as the hub identity
-  acting for it. **Multi-match rule:** when two organizations configured the
-  same secret, the delivery belongs to both and is processed once for each,
-  in a fixed order (the default organization first, then by id), each
-  against its own tasks. A stored secret that cannot be used is skipped,
-  never replaced by another's, and its warning is logged at most once per
-  five minutes per organization; a suspended organization's secret is never
-  consulted.
-- **Webhook response.** A delivery only the default organization matched is
-  answered with its result, as before organizations. Any other (one other
-  organization, or several) is answered organization-neutrally:
-  `{"ok": true, "matched": n, "statuses": [...]}`, one HTTP status per
-  matched organization in the fixed order, with no organization id,
-  repository, task id or title; what each did is in its own ledger. When
-  several matched, the status is: 500 when any failed internally (its replay
-  records are released, so GitHub's redelivery is processed for it while
-  the others answer it as a replay; every effect is idempotent); else 200
-  when any succeeded; else 400 when any refused it as a bad request, the
-  same as a single match; else 409 `replayed` (every one had already
-  processed it).
+  acting for it. A stored secret that cannot be used refuses its route and
+  is logged at most once per five minutes per organization; a suspended
+  organization's route refuses everything.
+- **Multi-match removed.** Before this change, every organization's secret
+  was tried on the one route, and two organizations configured with the
+  same secret both processed a delivery, with an aggregate answer
+  (`{"matched": n, "statuses": [...]}`). Routing plus the one-secret rule
+  replace that: one delivery, one organization, one answer.
+- **Webhook response.** A delivery to the default organization is answered
+  with its result, as before organizations. Any other organization's is
+  answered organization-neutrally, `{"ok": true}`, with no organization id,
+  repository, task id or title; what it did is in its own ledger. Its
+  refusals (`bad_signature`, `replayed`, `stale`, `bad_request`) are as on
+  the default route; an internal failure answers 500 with a fixed message,
+  never the error's text, and releases its replay records so GitHub's
+  redelivery is processed.
 - **Poller.** Each pass polls every organization that has a token, its bound
   repositories with its token; an organization without one is skipped and
   one whose stored token is unusable is reported `unusable`. A repository

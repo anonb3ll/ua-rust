@@ -657,8 +657,15 @@ here for memory columns, owners and defaults.
   consumer are `null` and the originator is `system`. The automation paths
   run per organization through `github_credential_for` (the
   `ORG-GITHUB-DEFAULT` marker and the `TASK_ORG` constant are gone): a
-  webhook delivery belongs to every organization whose own secret verifies
-  it (the multi-match rule in [github.md](github.md#automation-per-organization)),
+  webhook delivery belongs to the organization its route names
+  (`POST /api/github/webhook/<org id>`; the bare `POST /api/github/webhook`
+  is the default organization's) and is checked against that
+  organization's secret only, one secret and one MAC per delivery, with one
+  byte-identical refusal for an unknown, suspended or secretless
+  organization and a bad signature; every organization's webhook secret
+  must be distinct (`webhook_secret_in_use`, checked by keyed fingerprint
+  at `github_credential_set`), and the former multi-match rule is gone
+  (see [github.md](github.md#automation-per-organization)),
   the poller polls each organization with its own token and skips one
   without, CI lookups and `queue_close_merged` use the task's or caller's
   organization's token and bindings, and the hub's token never serves
@@ -675,9 +682,10 @@ here for memory columns, owners and defaults.
   count), but head and merge commit SHAs and pull request numbers stay
   visible, as task ids already do: they identify commits and numbers, not
   names, and the default organization's operators can correlate them only
-  with a repository they can already see. The webhook's HTTP answer for
-  any delivery another organization matched carries no organization id,
-  repository or task (`{"ok", "matched", "statuses"}`).
+  with a repository they can already see. The webhook's HTTP answer on
+  another organization's route carries no organization id, repository or
+  task (`{"ok": true}`), and an internal failure there answers a fixed
+  message, never the error's text.
   `crates/ua-tools/src/families/github/org_automation_tests.rs` holds
   the per-organization automation tests. The importer has
   no managed-secret mapping (the Python hub kept none), so it writes nothing

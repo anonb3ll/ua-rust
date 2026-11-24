@@ -53,7 +53,7 @@ use crate::families::tasks::{emit, ledger_text};
 use crate::registry::Registry;
 
 pub use poll::{poll_once, spawn_poller};
-pub use webhook::{WebhookDelivery, WebhookError, receive, signature_for};
+pub use webhook::{WebhookDelivery, WebhookError, receive, receive_org, signature_for};
 
 /// The identity GitHub-driven effects are recorded under.
 pub const GITHUB_ACTOR: &str = "hub-github";

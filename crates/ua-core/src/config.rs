@@ -357,8 +357,9 @@ pub struct Config {
     /// Unset: no GitHub lookups at all.
     pub github_token_env: Option<String>,
     /// Name of the environment variable holding the secret that
-    /// `POST /api/github/webhook` verifies `X-Hub-Signature-256` with.
-    /// Unset: the endpoint refuses every delivery.
+    /// the default organization's webhook routes (`POST /api/github/webhook`
+    /// and `POST /api/github/webhook/default`) verify `X-Hub-Signature-256`
+    /// with. Unset: those routes refuse every delivery.
     pub github_webhook_secret_env: Option<String>,
     /// Seconds between polls of the bound repositories' open pull requests
     /// under `ua serve` (a fallback for hubs GitHub cannot reach). 0 (the
@@ -389,6 +390,12 @@ pub struct Config {
     /// `completed_at`, ...) may lag behind the hub clock before the delivery
     /// is refused as stale. 0 turns the check off. Default 24.
     pub github_webhook_max_age_hours: u64,
+    /// Most GitHub webhook deliveries handled at once, across both
+    /// unauthenticated routes (`POST /api/github/webhook` and
+    /// `POST /api/github/webhook/{org}`), body read included. A delivery
+    /// over the cap is answered 429 before its body is read. 0 is taken
+    /// as 1. Default 4.
+    pub github_webhook_max_in_flight: usize,
     /// The branch a merged pull request must target to close its task, by
     /// project. Unlisted projects use the repository's default branch.
     pub github_merge_branches: BTreeMap<String, String>,
@@ -782,6 +789,7 @@ impl Default for Config {
             github_require_default_branch_workflow: false,
             github_ci_latest_attempt_only: false,
             github_webhook_max_age_hours: 24,
+            github_webhook_max_in_flight: 4,
             github_merge_branches: BTreeMap::new(),
             github_web_host: None,
             source_host: None,
@@ -1510,6 +1518,7 @@ provider_fallback = true
         assert_eq!(d.github_web_host(), "github.com");
         assert_eq!(d.github_ci_apps, vec!["github-actions".to_string()]);
         assert_eq!(d.github_webhook_max_age_hours, 24);
+        assert_eq!(d.github_webhook_max_in_flight, 4);
         assert!(!d.github_require_default_branch_workflow && !d.github_ci_latest_attempt_only);
     }
 
