@@ -1036,6 +1036,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
     let task_id = a.task_id;
     let key = clean(a.idempotency_key.as_deref())
         .map(|k| format!("lifecycle:{}:{kind}:{k}", session_id.as_deref().unwrap_or("_")));
+    // The key is the caller's organization's: another organization's use of
+    // the same session id, kind and key is a fresh capture, never a replay.
+    let org = ctx.caller.org_id.clone();
     let outcome = ctx
         .hub
         .db()
@@ -1043,8 +1046,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
             if let Some(k) = &key {
                 let cached: Option<String> = tx
                     .query_row(
-                        "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = 'lifecycle_record'",
-                        [k],
+                        "SELECT result_json FROM idempotency_keys \
+                         WHERE org_id = ?1 AND key = ?2 AND tool = 'lifecycle_record'",
+                        [org.as_str(), k.as_str()],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -1080,9 +1084,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
             });
             if let Some(k) = &key {
                 tx.execute(
-                    "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
-                     VALUES (?1, 'lifecycle_record', ?2, ?3)",
-                    params![k, out.to_string(), ua_core::time::now()],
+                    "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
+                     VALUES (?1, ?2, 'lifecycle_record', ?3, ?4)",
+                    params![org, k, out.to_string(), ua_core::time::now()],
                 )?;
             }
             Ok(out)

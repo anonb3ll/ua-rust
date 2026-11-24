@@ -21,6 +21,7 @@ pub mod github;
 pub mod governance;
 pub mod graph;
 pub mod harness_config;
+pub mod idempotency;
 pub mod injection;
 pub mod managed_secrets;
 pub mod mcp;

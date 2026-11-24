@@ -530,6 +530,26 @@ from its commit history.
   into active and retired, and counts those that take no work under
   `node_require_acceptance` and their unsent command notices. The importer
   writes legacy nodes to `default`.
+- Idempotency receipts are organization-scoped (`docs/organization.md`,
+  the idempotency keys family). The standalone
+  `idempotency.v2.tenant_keys` rebuilds `idempotency_keys` around
+  `(org_id, key)` and `organization.v1.tools.idempotency` adds its
+  triggers. Every row keeps its rowid, key text, tool, stored result and
+  timestamp; a row whose key carries the interim prefix of exactly one
+  organization (`org:<org>/<tool>:…`, or the escaped
+  `org:<org>/<tool>/…`) moves to it, and every other row lands in
+  `default`. Nothing is dropped or rewritten. A prefix naming an
+  organization `orgs` does not hold, or two at once, stays in `default`,
+  where no writer builds such a key, so it never replays to anyone;
+  `system_doctor` reports the count (`database.idempotency_keys_unplaced`,
+  default organization only) and the rebuild's audit record names the row
+  ids. Every reader (`task_add`, `task_update`, the conversation handoff,
+  `delegate` and its `lookup`, `memory_save`, `message_send`,
+  `lifecycle_record`) filters on the caller's organization and every writer
+  names it. The writers keep the organization prefix in the key text, byte
+  for byte as before, as defence in depth and so a retry in flight across
+  the upgrade still replays. `lifecycle_record`'s keys, which carried no
+  organization, are now the caller's organization's.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the
