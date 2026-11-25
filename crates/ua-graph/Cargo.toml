@@ -1,0 +1,26 @@
+[package]
+name = "ua-graph"
+description = "Shared tenant-scoped graph store domain, validation, and bounded traversals for ua-rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+# Depends on ua-core and ua-store only, never on the tool registry or ua-org.
+# Only ua-tools depends on this crate: it registers the governed graph tools
+# and runs ua-org::authz checks before calling here (tests/dependencies.rs).
+[dependencies]
+ua-core.workspace = true
+ua-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

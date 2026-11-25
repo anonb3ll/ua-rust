@@ -233,6 +233,8 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::skill_sources::SCHEMA.into());
     parts.push(families::skill_sources::TENANT_PART.into());
     parts.push(families::skill_registry::SOURCE_ID_SCHEMA.into());
+    // Shared tenant-scoped graph store (`ua-graph`, born tenant-scoped; C1).
+    parts.extend(families::graph_store::schema_parts());
     parts
 }
 

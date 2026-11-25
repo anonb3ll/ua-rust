@@ -90,7 +90,7 @@ async fn list_tools(
 /// Map an error to an HTTP status.
 pub fn status_for(e: &UaError) -> StatusCode {
     match e {
-        UaError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        UaError::InvalidArgument(_) | UaError::InvalidArgumentCode { .. } => StatusCode::BAD_REQUEST,
         UaError::NotFound(_) => StatusCode::NOT_FOUND,
         UaError::Denied { .. } => StatusCode::FORBIDDEN,
         UaError::ApprovalRequired { .. } => StatusCode::ACCEPTED,

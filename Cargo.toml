@@ -19,6 +19,7 @@ ua-store = { path = "crates/ua-store" }
 ua-memory = { path = "crates/ua-memory" }
 ua-org = { path = "crates/ua-org" }
 ua-deliverables = { path = "crates/ua-deliverables" }
+ua-graph = { path = "crates/ua-graph" }
 ua-tools = { path = "crates/ua-tools" }
 ua-server = { path = "crates/ua-server" }
 ua-import = { path = "crates/ua-import" }
@@ -42,7 +43,7 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1.54", features = ["full"] }
-rusqlite = { version = "0.43", features = ["bundled", "serde_json"] }
+rusqlite = { version = "0.43", features = ["bundled", "serde_json", "hooks"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 tempfile = "3"
 
