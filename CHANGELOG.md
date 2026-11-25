@@ -902,6 +902,11 @@ from its commit history.
   extend and per-file-ignores settings, validated, as `--config` pairs, and
   still runs with `--isolated`, from an empty directory, on an absolute path. Its ledger event lists the files a run changed and ruff's
   fixed and reformatted counts.
+- The organization registry (offices, role grants, agent seats and service
+  identities) lives in a new `ua-org` crate. It stores them in SQLite and
+  reaches the database through `ua-store`'s `OrgRead` and `OrgWrite`. The
+  tools are `org_registry_read`, `org_office_register`, `org_role_register`,
+  `org_seat_register` and `org_service_register`.
 - The memory domain (schema, note model, save, search, ranking, embeddings,
   lifecycle) moved from `ua-tools` into a new `ua-memory` crate, which does
   not depend on the tool registry. Tool names, arguments, schema parts and
