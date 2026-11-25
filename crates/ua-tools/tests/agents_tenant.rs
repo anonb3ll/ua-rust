@@ -959,10 +959,11 @@ async fn an_unknown_or_suspended_organization_is_refused_before_any_write() {
             .await
             .unwrap_err();
         assert_eq!(reason(&e), want, "{org}: token issue: {e:?}");
-        // A lifecycle observation is fire-and-forget: it reports the
-        // capture failure and records nothing.
-        let r = h.ok(&who, "lifecycle_record", json!({ "kind": "stop" })).await;
-        assert_eq!(r["accepted"], false, "{r}");
+        // The registry refuses the organization before any tool runs, so
+        // even a fire-and-forget lifecycle observation is refused and
+        // records nothing.
+        let e = h.call(&who, "lifecycle_record", json!({ "kind": "stop" })).await.unwrap_err();
+        assert_eq!(reason(&e), want, "{org}: lifecycle_record: {e:?}");
     }
     assert_eq!(h.snapshot(), before, "nothing changed");
 }

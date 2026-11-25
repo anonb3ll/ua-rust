@@ -530,24 +530,35 @@ pub struct ManageArgs {
 /// no exact match are refused (`agent_label_ambiguous`), as `agent_forget`
 /// refuses them, rather than silently picking one.
 fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<String>> {
-    let spellings: Vec<String> = c
-        .prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
-        .query_map(params![org, label], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
+    let spellings = case_variants(c, org, label)?;
     if spellings.iter().any(|s| s == label) {
         return Ok(Some(label.to_string()));
     }
     match spellings.len() {
         0 => Ok(None),
         1 => Ok(spellings.into_iter().next()),
-        n => Err(UaError::conflict_code(
-            "agent_label_ambiguous",
-            format!(
-                "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
-                 Nothing was created"
-            ),
-        )),
+        n => Err(ambiguous_target(label, n)),
     }
+}
+
+/// The refusal for a target `label` that `n` agents spell in different
+/// letter cases, none exactly (`agent_label_ambiguous`).
+fn ambiguous_target(label: &str, n: usize) -> UaError {
+    UaError::conflict_code(
+        "agent_label_ambiguous",
+        format!(
+            "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
+             Nothing was created"
+        ),
+    )
+}
+
+/// Every registered spelling of `label` in organization `org`, in any letter
+/// case.
+fn case_variants(c: &Connection, org: &str, label: &str) -> UaResult<Vec<String>> {
+    Ok(c.prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
+        .query_map(params![org, label], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
 }
 
 /// Every door to this (`delegate`, `delegation_manage` create, `handoff`)
@@ -605,14 +616,29 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         });
         hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()))
     };
-    let digests_for = |c: &Connection, org: &str| -> Vec<String> {
-        let mut out = vec![digest_for(&to_agent)];
-        if let Ok(Some(reg)) = registered_target(c, org, &to_agent)
-            && reg != to_agent
-        {
-            out.insert(0, digest_for(&reg));
+    //
+    // A target that became ambiguous after the receipt (a second case
+    // variant registered since) no longer resolves, but the receipt's digest
+    // is over the one spelling registered then: each variant's digest is
+    // tried, and a match replays that committed result, creating and
+    // re-routing nothing. A retry that matches none is refused as ambiguous
+    // (`agent_label_ambiguous`), not as a different request. A database
+    // error while resolving or reading propagates as itself.
+    let lookup = |c: &Connection, org: &str, k: &(String, Vec<String>)| -> UaResult<Option<Value>> {
+        let variants = case_variants(c, org, &to_agent)?;
+        let exact = variants.contains(&to_agent);
+        let ambiguous = !exact && variants.len() > 1;
+        let mut digests = vec![digest_for(&to_agent)];
+        if !exact {
+            match variants.as_slice() {
+                [reg] => digests.insert(0, digest_for(reg)),
+                many => digests.extend(many.iter().map(|v| digest_for(v))),
+            }
         }
-        out
+        match find_receipt(c, org, k, &digests) {
+            Err(UaError::Conflict(_)) if ambiguous => Err(ambiguous_target(&to_agent, variants.len())),
+            other => other,
+        }
     };
     let org = ctx.caller.org_id.clone();
     let rkeys = idem
@@ -622,7 +648,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 
     // A committed retry replays before any gate: no second approval, no effect.
     if let Some(k) = rkeys.clone() {
-        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digests_for(c, &org)))?;
+        let found = ctx.hub.db().read(|c| lookup(c, &org, &k))?;
         if let Some(done) = found {
             return Ok(done);
         }
@@ -632,7 +658,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
         if let Some(k) = rkeys.as_ref()
-            && let Some(done) = find_receipt(tx, &org, k, &digests_for(tx, &org))?
+            && let Some(done) = lookup(tx, &org, k)?
         {
             return Ok(done);
         }

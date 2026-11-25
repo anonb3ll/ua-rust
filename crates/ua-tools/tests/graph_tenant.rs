@@ -247,7 +247,8 @@ async fn organizations_share_board_names_but_have_independent_scenes_history_and
     assert_eq!(saved["created"], true, "the default org's board does not count toward the org cap");
 
     for err in [write(UNKNOWN, "invalid").await.unwrap_err(), restore(UNKNOWN, 99).await.unwrap_err()] {
-        assert_eq!(err.code(), "invalid_argument");
+        // The registry refuses the organization before the tool runs.
+        assert_eq!(err.reason_code(), Some("unknown_organization"), "{err}");
         assert!(err.to_string().contains("unknown organization"), "{err}");
     }
     hub.db()
