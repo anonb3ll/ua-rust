@@ -142,6 +142,16 @@ ALTER TABLE skill_publish_staging ADD COLUMN package_payload TEXT;
 ",
 };
 
+/// `skill_registry.v4.source_id`: bind staged Git imports to the originating
+/// `skill_sources.id` so source revocation reaches already-staged and in-flight
+/// imports at both stage commit and publish time.
+pub const SOURCE_ID_SCHEMA: SchemaPart = SchemaPart {
+    name: "skill_registry.v4.source_id",
+    sql: "
+ALTER TABLE skill_publish_staging ADD COLUMN source_id TEXT;
+",
+};
+
 /// `skill_registry.v2.tenant_keys`: rebuild `skill_versions` around
 /// `UNIQUE(org_id, name, version)` and `skill_assignments` around
 /// `UNIQUE(org_id, skill_name, target_type, target)`, each with
@@ -556,7 +566,8 @@ pub(crate) fn is_allowed_binary_extension(path: &str) -> bool {
 
 /// Canonical relative member path inside a skill package: no absolute paths,
 /// no `..`/`.` segments, no hidden files or directories (leading `.`), no
-/// backslashes, colons or control characters, within depth and length limits.
+/// backslashes, colons, C0/C1 control characters, or hidden/bidi Unicode code
+/// points, within depth and length limits.
 pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
     if value.is_empty()
         || value.len() > MAX_PACKAGE_PATH
@@ -564,7 +575,7 @@ pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
         || value.ends_with('/')
         || value.contains('\\')
         || value.contains(':')
-        || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || value.chars().any(|c| c.is_control() || super::skills::hidden_char(c))
     {
         return Err(UaError::invalid(format!("unsafe supporting file path {value:?}")));
     }
@@ -1431,6 +1442,7 @@ struct Staged {
     content: String,
     content_hash: String,
     source: String,
+    source_id: Option<String>,
     findings: Value,
     requested_by: String,
     published_version: Option<i64>,
@@ -1440,27 +1452,47 @@ struct Staged {
 
 fn load_staged(c: &Connection, org: &str, id: &str) -> UaResult<Option<Staged>> {
     Ok(c.query_row(
-        "SELECT id, name, content, content_hash, source, findings_json, requested_by, published_version, \
-         package_manifest, package_payload \
+        "SELECT id, name, content, content_hash, source, source_id, findings_json, requested_by, \
+         published_version, package_manifest, package_payload \
          FROM skill_publish_staging WHERE org_id = ?1 AND id = ?2",
         params![org, id],
         |r| {
-            let findings: String = r.get(5)?;
+            let findings: String = r.get(6)?;
             Ok(Staged {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 content: r.get(2)?,
                 content_hash: r.get(3)?,
                 source: r.get(4)?,
+                source_id: r.get(5)?,
                 findings: serde_json::from_str(&findings).unwrap_or_else(|_| json!([])),
-                requested_by: r.get(6)?,
-                published_version: r.get(7)?,
-                package_manifest: r.get(8)?,
-                package_payload: r.get(9)?,
+                requested_by: r.get(7)?,
+                published_version: r.get(8)?,
+                package_manifest: r.get(9)?,
+                package_payload: r.get(10)?,
             })
         },
     )
     .optional()?)
+}
+
+fn active_source_pinned_sha(c: &Connection, org: &str, source_id: &str, what: &str) -> UaResult<String> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT status, pinned_sha FROM skill_sources WHERE org_id = ?1 AND id = ?2",
+            params![org, source_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, pinned_sha)) = row else {
+        return Err(UaError::conflict(format!(
+            "skill source {source_id:?} does not exist; {what} is refused"
+        )));
+    };
+    if status != "active" {
+        return Err(UaError::conflict(format!("skill source {source_id:?} is revoked; {what} is refused")));
+    }
+    Ok(pinned_sha)
 }
 
 /// Parse `git:<canonical_url>@<40-char-sha>:<repo_path>` provenance strings.
@@ -1531,8 +1563,27 @@ fn compute_skill_md_diff(prev_md: &str, new_md: &str) -> String {
     diff.unified_diff().context_radius(3).header("a/SKILL.md", "b/SKILL.md").to_string()
 }
 
-/// Format a human-readable summary of `member_diff` and `skill_md_diff` for
-/// `ApprovalRow::display` (`approval_pending`, `approvals::get`, and Inbox UI).
+/// Escape control characters (such as ESC and CR) and hidden Unicode characters
+/// before rendering approval diff text so terminals and UI views cannot be
+/// spoofed.
+fn escape_display_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' || c == '\t' {
+            out.push(c);
+        } else if c.is_control() || super::skills::hidden_char(c) {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "\\u{{{:04X}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Format a human-readable summary of `member_diff`, source changes, pin
+/// advances, and `skill_md_diff` for `ApprovalRow::display`
+/// (`approval_pending`, `approvals::get`, and Inbox UI).
 pub(crate) fn approval_display(
     _c: &Connection,
     approval_org: &str,
@@ -1545,83 +1596,120 @@ pub(crate) fn approval_display(
     if org != approval_org {
         return Ok(None);
     }
-    let Some(member_diff) = payload.get("member_diff") else {
-        return Ok(None);
+    let member_diff = payload.get("member_diff");
+    let pin_advance = match (payload["source_pinned_sha"].as_str(), payload["new_sha"].as_str()) {
+        (Some(pin), Some(new)) if pin != new => Some((pin, new)),
+        _ => None,
     };
+    if member_diff.is_none() && pin_advance.is_none() {
+        return Ok(None);
+    }
+
     let mut lines: Vec<String> = Vec::new();
+    let source_changed = payload["source_changed"].as_bool().unwrap_or(false);
+    if source_changed {
+        let skill_name = payload["name"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "WARNING: SOURCE CHANGED — a different repository or path is claiming existing skill {skill_name:?}"
+        ));
+    }
     if let Some(prev_v) = payload["previous_version"].as_i64() {
         let prev_hash = payload["previous_content_hash"].as_str().unwrap_or("");
         let new_hash = payload["content_hash"].as_str().unwrap_or("");
         lines.push(format!("Upgrade from v{prev_v} ({prev_hash}) to new revision ({new_hash})"));
     }
+    if let Some((pin, new)) = pin_advance {
+        lines.push(format!("Pin advance: {pin} \u{2192} {new} (explicit upgrade from tracking_ref tip)"));
+    }
+    if let Some(prev_src) = payload["previous_source"].as_str() {
+        lines.push(format!("Previous source: {prev_src}"));
+    }
     if let Some(src) = payload["source"].as_str() {
         lines.push(format!("Source: {src}"));
     }
-    lines.push("Members:".into());
-    for item in member_diff["added"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "+ {} ({} bytes, sha256 {})",
-            item["path"].as_str().unwrap_or("?"),
-            item["new_bytes"].as_u64().unwrap_or(0),
-            item["new_sha256"].as_str().unwrap_or("?"),
-        ));
-    }
-    for item in member_diff["removed"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "- {} ({} bytes, sha256 {})",
-            item["path"].as_str().unwrap_or("?"),
-            item["old_bytes"].as_u64().unwrap_or(0),
-            item["old_sha256"].as_str().unwrap_or("?"),
-        ));
-    }
-    for item in member_diff["modified"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "~ {} ({} -> {} bytes, sha256 {} -> {})",
-            item["path"].as_str().unwrap_or("?"),
-            item["old_bytes"].as_u64().unwrap_or(0),
-            item["new_bytes"].as_u64().unwrap_or(0),
-            item["old_sha256"].as_str().unwrap_or("?"),
-            item["new_sha256"].as_str().unwrap_or("?"),
-        ));
-    }
-    for item in member_diff["unchanged"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "  {} (unchanged, {} bytes)",
-            item["path"].as_str().unwrap_or("?"),
-            item["bytes"].as_u64().unwrap_or(0),
-        ));
+    if let Some(member_diff) = member_diff {
+        lines.push("Members:".into());
+        for item in member_diff["added"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "+ {} ({} bytes, sha256 {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["new_bytes"].as_u64().unwrap_or(0),
+                item["new_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["removed"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "- {} ({} bytes, sha256 {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["old_bytes"].as_u64().unwrap_or(0),
+                item["old_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["modified"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "~ {} ({} -> {} bytes, sha256 {} -> {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["old_bytes"].as_u64().unwrap_or(0),
+                item["new_bytes"].as_u64().unwrap_or(0),
+                item["old_sha256"].as_str().unwrap_or("?"),
+                item["new_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["unchanged"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  {} (unchanged, {} bytes)",
+                item["path"].as_str().unwrap_or("?"),
+                item["bytes"].as_u64().unwrap_or(0),
+            ));
+        }
     }
     let skill_md_diff = payload["skill_md_diff"].as_str().unwrap_or_default();
     if !skill_md_diff.is_empty() {
         lines.push(String::new());
         lines.push(skill_md_diff.trim_end().to_string());
     }
-    let diff_text = lines.join("\n");
+    let diff_text = escape_display_text(&lines.join("\n"));
     let mut lines_added = 0usize;
     let mut lines_removed = 0usize;
+    let mut in_hunk = false;
     for l in skill_md_diff.lines() {
-        if l.starts_with('+') && !l.starts_with("+++") {
-            lines_added += 1;
-        } else if l.starts_with('-') && !l.starts_with("---") {
-            lines_removed += 1;
+        if l.starts_with("@@ ") {
+            in_hunk = true;
+        } else if in_hunk {
+            if l.starts_with('+') {
+                lines_added += 1;
+            } else if l.starts_with('-') {
+                lines_removed += 1;
+            }
         }
     }
-    Ok(Some(json!({
+    let mut out = json!({
         "previous_version": payload["previous_version"],
         "previous_content_hash": payload["previous_content_hash"],
-        "member_diff": member_diff,
+        "previous_source": payload["previous_source"],
+        "source_changed": source_changed,
         "lines_added": lines_added,
         "lines_removed": lines_removed,
         "diff": diff_text,
-    })))
+    });
+    if let Some(diff) = member_diff {
+        out["member_diff"] = diff.clone();
+    }
+    if let Some((pin, new)) = pin_advance {
+        out["source_pinned_sha"] = json!(pin);
+        out["new_sha"] = json!(new);
+    }
+    Ok(Some(out))
 }
 
 /// What a publish approval shows and binds: the organization, the full staged
 /// `SKILL.md` (at most 64 KiB), its hash, the review's findings, for staged
 /// packages the canonical manifest (every file's path, size, hash and mode)
 /// plus every supporting file's full text (within `MAX_APPROVAL_TEXT_BYTES`),
-/// Git provenance when imported from a Git source, and on upgrade the member
-/// diff and `SKILL.md` unified diff against the latest published version (§5).
+/// Git provenance and `source_id` / `source_pinned_sha` when imported from a
+/// Git source, and on upgrade the member diff, `previous_source`,
+/// `source_changed`, and `SKILL.md` unified diff against the latest published
+/// version (§5).
 fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
     let members = verify_and_decode(
         &s.content,
@@ -1638,6 +1726,19 @@ fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
         "content": s.content,
         "review_findings": s.findings,
     });
+    if let Some(sid) = &s.source_id {
+        payload["source_id"] = json!(sid);
+        let pinned: Option<String> = c
+            .query_row(
+                "SELECT pinned_sha FROM skill_sources WHERE org_id = ?1 AND id = ?2",
+                params![org, sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(pin) = pinned {
+            payload["source_pinned_sha"] = json!(pin);
+        }
+    }
     if let Some((canonical_url, new_sha, repo_path)) = parse_git_provenance(&s.source) {
         payload["source"] = json!(s.source);
         payload["canonical_url"] = json!(canonical_url);
@@ -1670,12 +1771,18 @@ fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
         && prev.public["content_hash"].as_str() != Some(s.content_hash.as_str())
     {
         let prev_md = prev.public["content"].as_str().unwrap_or_default();
+        let source_changed = match (parse_git_provenance(&prev.source), parse_git_provenance(&s.source)) {
+            (Some((p_url, _, p_path)), Some((n_url, _, n_path))) => p_url != n_url || p_path != n_path,
+            (None, None) => false,
+            _ => true,
+        };
         payload["previous_version"] = prev.public["version"].clone();
         payload["previous_content_hash"] = prev.public["content_hash"].clone();
+        payload["previous_source"] = json!(prev.source);
+        payload["source_changed"] = json!(source_changed);
         payload["member_diff"] = compute_member_diff(&prev.members, &members);
         payload["skill_md_diff"] = json!(compute_skill_md_diff(prev_md, &s.content));
-        if parse_git_provenance(&s.source).is_some() {
-            payload["previous_source"] = json!(prev.source);
+        if parse_git_provenance(&s.source).is_some() || parse_git_provenance(&prev.source).is_some() {
             payload["previous_sha"] = match parse_git_provenance(&prev.source) {
                 Some((_, old_sha, _)) => json!(old_sha),
                 None => Value::Null,
@@ -1720,6 +1827,7 @@ pub(super) fn stage_members(
     who: &str,
     name: String,
     source_provenance: String,
+    source_id: Option<String>,
     members: BTreeMap<String, PackageMember>,
     mut review: Value,
 ) -> UaResult<Value> {
@@ -1792,14 +1900,20 @@ pub(super) fn stage_members(
     let who = who.to_string();
     let org = ctx.caller.org_id.as_str();
     ctx.hub.db().write(|tx| {
+        // M1: re-check source revocation inside the write transaction so a
+        // revoke racing an in-flight fetch still blocks staging.
+        if let Some(sid) = source_id.as_deref() {
+            active_source_pinned_sha(tx, org, sid, "import")?;
+        }
         if let Some(skill) = existing_version(tx, org, &name, &hash)? {
             return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
         }
         let reuse: Option<String> = tx
             .query_row(
                 "SELECT id FROM skill_publish_staging WHERE org_id = ?1 AND name = ?2 AND content_hash = ?3 \
-                 AND source = ?4 AND requested_by = ?5 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
-                params![org, name, hash, source_provenance, who],
+                 AND source = ?4 AND COALESCE(source_id, '') = COALESCE(?5, '') AND requested_by = ?6 \
+                 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![org, name, hash, source_provenance, source_id, who],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1809,8 +1923,8 @@ pub(super) fn stage_members(
                 let id = format!("sk-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
                 tx.execute(
                     "INSERT INTO skill_publish_staging (org_id, id, name, content, content_hash, source, \
-                     findings_json, requested_by, created_at, package_manifest, package_payload) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     source_id, findings_json, requested_by, created_at, package_manifest, package_payload) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         org,
                         id,
@@ -1818,6 +1932,7 @@ pub(super) fn stage_members(
                         text,
                         hash,
                         source_provenance,
+                        source_id,
                         json!(findings).to_string(),
                         who,
                         ua_core::time::now(),
@@ -1843,6 +1958,9 @@ pub(super) fn stage_members(
             "review": review,
             "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the source",
         });
+        if let Some(sid) = &source_id {
+            resp["source_id"] = json!(sid);
+        }
         if let Some(diff) = approval_payload.get("member_diff") {
             resp["previous_version"] = approval_payload["previous_version"].clone();
             resp["member_diff"] = diff.clone();
@@ -1866,7 +1984,7 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
     if md_after != members["SKILL.md"].bytes {
         return Err(UaError::conflict("skill changed while it was being reviewed; retry publish"));
     }
-    stage_members(ctx, who, name, rel_md, members, review)
+    stage_members(ctx, who, name, rel_md, None, members, review)
 }
 
 /// `publish {staging_id}`: version the staged copy behind its approval.
@@ -1880,6 +1998,11 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             let staged = load_staged(tx, org, id.trim())?.ok_or_else(missing)?;
             if staged.requested_by != who {
                 return Err(missing());
+            }
+            // M1: if this staged import came from a Git source, refuse publishing
+            // if that source has been revoked since staging.
+            if let Some(sid) = staged.source_id.as_deref() {
+                active_source_pinned_sha(tx, org, sid, "publish")?;
             }
             verify_and_decode(
                 &staged.content,
@@ -2382,7 +2505,7 @@ pub fn register(r: &mut Registry) {
              allowed_subpaths?} (human operator only, behind human approval: register an https:// Git skill source \
              pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator only, behind \
              human approval: terminally revoke a skill source), source_list {status?} (list this organization's \
-             skill sources), source_refresh {source_id, tracking_ref?} (resolve tracking_ref to a candidate SHA and \
+             skill sources), source_refresh {source_id} (resolve the source's tracking_ref to a candidate SHA and \
              report changes without moving pinned_sha), source_discover {source_id, sha?} (plumbing-only discovery \
              of candidate skill packages under allowed_subpaths at pinned_sha), source_import {source_id, path, \
              name?, sha?} (operator: read blobs by object id, run full D1 screens, stage into skill_publish_staging \

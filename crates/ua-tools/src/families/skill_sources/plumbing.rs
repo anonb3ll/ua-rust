@@ -157,6 +157,35 @@ pub fn ensure_safe_tree_entry(entry: &TreeEntry) -> UaResult<u64> {
     entry.size.ok_or_else(|| UaError::invalid(format!("git blob {:?} is missing a byte size", entry.path)))
 }
 
+/// Maximum byte length of a repository-relative path prefix (for example
+/// `.claude/skills/my-skill` in a deep monorepo). Separate from
+/// [`crate::families::skill_registry::MAX_PACKAGE_PATH`], which bounds paths
+/// *inside* a skill package.
+pub const MAX_REPO_PATH_BYTES: usize = 512;
+
+/// Validate a repository-relative path (prefix or tree path). Leading-dot
+/// repo directories such as `.claude/skills` and deeper monorepo layouts are
+/// permitted; `.`, `..`, `.git`, backslashes, colons, control characters, and
+/// hidden/bidi Unicode code points are refused.
+pub fn validate_repo_path(raw: &str) -> UaResult<String> {
+    if raw.is_empty()
+        || raw.len() > MAX_REPO_PATH_BYTES
+        || raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw.contains('\\')
+        || raw.contains(':')
+        || raw.chars().any(|c| c.is_control() || crate::families::skills::hidden_char(c))
+    {
+        return Err(UaError::invalid(format!("unsafe repository path {raw:?}")));
+    }
+    for part in raw.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git") {
+            return Err(UaError::invalid(format!("unsafe repository path {raw:?}")));
+        }
+    }
+    Ok(raw.to_string())
+}
+
 /// Whether `repo_path` (e.g. `"skills/demo"` or `"."`) falls within `allowed_subpaths`.
 pub fn path_allowed(repo_path: &str, allowed_subpaths: &[String]) -> bool {
     if allowed_subpaths.is_empty() {
@@ -185,7 +214,7 @@ pub fn validate_skill_repo_path(raw: &str, allowed_subpaths: &[String]) -> UaRes
         return Ok(".".into());
     }
     let cleaned = trimmed.trim_end_matches('/');
-    let validated = validate_package_path(cleaned)?;
+    let validated = validate_repo_path(cleaned)?;
     if !path_allowed(&validated, allowed_subpaths) {
         return Err(UaError::denied(
             "subpath_not_allowed",
@@ -195,19 +224,25 @@ pub fn validate_skill_repo_path(raw: &str, allowed_subpaths: &[String]) -> UaRes
     Ok(validated)
 }
 
+fn is_skill_md_name(file_name: &str) -> bool {
+    file_name.eq_ignore_ascii_case("SKILL.md")
+}
+
 /// Group `ls-tree` entries into candidate skill packages (directories holding a
 /// `SKILL.md`) under `allowed_subpaths`, refusing symlinks, gitlinks,
-/// non-regular modes, nested `SKILL.md` directories, and >200 packages.
+/// non-regular modes, hostile/unvalidated paths, nested `SKILL.md` directories,
+/// and >200 packages.
 pub fn discover_packages_from_entries(
     entries: &[TreeEntry],
     allowed_subpaths: &[String],
 ) -> UaResult<Vec<DiscoveredPackage>> {
-    // First pass: refuse any symlink, gitlink, or non-regular mode in scope,
-    // and collect every directory containing a `SKILL.md`.
+    // First pass: refuse any symlink, gitlink, non-regular mode, or hostile
+    // path in scope, and collect every directory containing a `SKILL.md`.
     let mut skill_dirs: BTreeMap<String, String> = BTreeMap::new();
     let mut sized_entries: Vec<(&TreeEntry, u64)> = Vec::with_capacity(entries.len());
     for entry in entries {
         let size = ensure_safe_tree_entry(entry)?;
+        validate_repo_path(&entry.path)?;
         sized_entries.push((entry, size));
         if entry.path == "SKILL.md" {
             if path_allowed(".", allowed_subpaths) {
@@ -242,28 +277,43 @@ pub fn discover_packages_from_entries(
         }
     }
 
-    // Second pass: count files and bytes inside each candidate package.
+    // Second pass: count files and bytes inside each candidate package and
+    // validate package-relative paths (catching C1/bidi/hidden/case-insensitive
+    // nested SKILL.md inside discovered packages).
     let mut counts: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for dir in skill_dirs.keys() {
         counts.insert(dir.clone(), (0, 0));
     }
     for (entry, size) in sized_entries {
-        if skill_dirs.contains_key(".") {
-            let stat = counts.get_mut(".").expect("root key exists");
+        let owning_dir: Option<&str> = if skill_dirs.contains_key(".") {
+            Some(".")
+        } else {
+            let mut found = None;
+            let mut cursor = entry.path.as_str();
+            while let Some((parent, _)) = cursor.rsplit_once('/') {
+                if skill_dirs.contains_key(parent) {
+                    found = Some(parent);
+                    break;
+                }
+                cursor = parent;
+            }
+            found
+        };
+        if let Some(dir) = owning_dir {
+            let rel = if dir == "." {
+                entry.path.as_str()
+            } else {
+                entry.path.strip_prefix(&format!("{dir}/")).unwrap_or(entry.path.as_str())
+            };
+            validate_package_path(rel)?;
+            if rel.contains('/') && rel.rsplit('/').next().is_some_and(is_skill_md_name) {
+                return Err(UaError::invalid(format!(
+                    "nested SKILL.md at {rel:?} inside {dir:?} is not allowed"
+                )));
+            }
+            let stat = counts.get_mut(dir).expect("owning dir key exists");
             stat.0 += 1;
             stat.1 = stat.1.saturating_add(size);
-            continue;
-        }
-        // Walk path prefixes to find which skill dir owns this entry (at most one,
-        // because nested SKILL.md directories were already refused above).
-        let mut cursor = entry.path.as_str();
-        while let Some((parent, _)) = cursor.rsplit_once('/') {
-            if let Some(stat) = counts.get_mut(parent) {
-                stat.0 += 1;
-                stat.1 = stat.1.saturating_add(size);
-                break;
-            }
-            cursor = parent;
         }
     }
 
@@ -508,6 +558,125 @@ pub fn discover_source(
     })
 }
 
+/// One validated tree entry approved for blob reading after all pre-read checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedBlob {
+    pub rel: String,
+    pub oid: String,
+    pub declared_size: u64,
+    pub cap: usize,
+}
+
+/// Pre-read validation of `ls-tree` entries for one skill package directory:
+/// refuses symlinks, gitlinks, non-regular modes, unsafe paths, case-insensitive
+/// nested `SKILL.md`, path collisions, file/entry count caps, and declared
+/// per-file / total byte caps BEFORE any `cat-file blob` runs.
+pub(crate) fn plan_package_entries(clean_path: &str, entries: &[TreeEntry]) -> UaResult<Vec<PlannedBlob>> {
+    if entries.len() > MAX_PACKAGE_ENTRIES {
+        return Err(UaError::invalid(format!("skill package exceeds the {MAX_PACKAGE_ENTRIES}-entry limit")));
+    }
+    let prefix = if clean_path == "." { String::new() } else { format!("{clean_path}/") };
+    let mut plan: Vec<PlannedBlob> = Vec::new();
+    let mut portable_names: BTreeSet<String> = BTreeSet::new();
+    let mut declared_total = 0usize;
+
+    for entry in entries {
+        let declared_size = ensure_safe_tree_entry(entry)?;
+        validate_repo_path(&entry.path)?;
+        let rel_raw = if prefix.is_empty() {
+            entry.path.as_str()
+        } else {
+            let Some(stripped) = entry.path.strip_prefix(&prefix) else {
+                if entry.path == clean_path {
+                    return Err(UaError::invalid(format!(
+                        "skill path {clean_path:?} is a single file, not a skill directory"
+                    )));
+                }
+                continue;
+            };
+            stripped
+        };
+        let rel = validate_package_path(rel_raw)?;
+        if rel.contains('/') && rel.rsplit('/').next().is_some_and(is_skill_md_name) {
+            return Err(UaError::invalid(format!(
+                "nested SKILL.md at {rel:?} is not allowed inside a skill package"
+            )));
+        }
+        if !portable_names.insert(portable_collision_key(&rel)) {
+            return Err(UaError::invalid(format!(
+                "skill package refuses case-insensitive or Unicode path collision at {rel:?}"
+            )));
+        }
+        if plan.len() >= MAX_PACKAGE_FILES {
+            return Err(UaError::invalid(format!(
+                "skill package exceeds the {MAX_PACKAGE_FILES}-file limit"
+            )));
+        }
+        let cap = if rel == "SKILL.md" { MAX_SKILL_FILE_BYTES } else { MAX_PACKAGE_FILE_BYTES };
+        if declared_size > cap as u64 {
+            return Err(UaError::invalid(format!(
+                "skill package member {rel:?} ({declared_size} bytes) exceeds the {cap}-byte limit"
+            )));
+        }
+        declared_total = declared_total.saturating_add(declared_size as usize);
+        if declared_total > MAX_PACKAGE_BYTES {
+            return Err(UaError::invalid(format!(
+                "skill package exceeds the {MAX_PACKAGE_BYTES}-byte total size limit"
+            )));
+        }
+        plan.push(PlannedBlob { rel, oid: entry.oid.clone(), declared_size, cap });
+    }
+
+    if !plan.iter().any(|b| b.rel == "SKILL.md") {
+        return Err(UaError::invalid(format!("path {clean_path:?} has no SKILL.md at its root")));
+    }
+    Ok(plan)
+}
+
+/// Read every planned blob strictly by object ID (`cat-file blob <oid>`) from
+/// `cache`, re-checking byte length against `declared_size` and total caps.
+pub(crate) fn read_planned_blobs(
+    cache: &Path,
+    clean_path: &str,
+    plan: &[PlannedBlob],
+    opts: &FetchOptions,
+) -> UaResult<BTreeMap<String, PackageMember>> {
+    let mut members: BTreeMap<String, PackageMember> = BTreeMap::new();
+    let mut actual_total = 0usize;
+    for blob in plan {
+        let spec = build_git_command(Some(cache), None, None, &["cat-file", "blob", &blob.oid], opts)?;
+        let bytes = run_git(&spec, opts.timeout, blob.cap)?;
+        if bytes.len() as u64 != blob.declared_size || bytes.len() > blob.cap {
+            return Err(UaError::conflict(format!(
+                "git blob {} for {:?} changed size (expected {}, got {})",
+                blob.oid,
+                blob.rel,
+                blob.declared_size,
+                bytes.len()
+            )));
+        }
+        actual_total = actual_total.saturating_add(bytes.len());
+        if actual_total > MAX_PACKAGE_BYTES {
+            return Err(UaError::invalid(format!(
+                "skill package exceeds the {MAX_PACKAGE_BYTES}-byte total size limit"
+            )));
+        }
+        let sha256 = sha256_bytes(&bytes);
+        members.insert(
+            blob.rel.clone(),
+            PackageMember { path: blob.rel.clone(), bytes, sha256, mode: MODE_FILE },
+        );
+    }
+
+    let md = members
+        .get("SKILL.md")
+        .ok_or_else(|| UaError::invalid(format!("path {clean_path:?} has no SKILL.md at its root")))?;
+    if md.bytes.contains(&0) || std::str::from_utf8(&md.bytes).is_err() {
+        return Err(UaError::invalid("SKILL.md must be valid UTF-8 without NUL bytes"));
+    }
+    Ok(members)
+}
+
 /// Fetch `target_sha` and read every blob of the skill package at `skill_path`
 /// strictly by object ID (`cat-file blob <oid>`), enforcing every D1 path,
 /// symlink, gitlink, mode, collision, count, and size cap before returning the
@@ -538,101 +707,8 @@ pub(crate) fn read_package_from_source(
                 fetched.commit_sha
             )));
         }
-        if entries.len() > MAX_PACKAGE_ENTRIES {
-            return Err(UaError::invalid(format!(
-                "skill package exceeds the {MAX_PACKAGE_ENTRIES}-entry limit"
-            )));
-        }
-
-        let prefix = if clean_path == "." { String::new() } else { format!("{clean_path}/") };
-        let mut plan: Vec<(String, String, u64, usize)> = Vec::new();
-        let mut portable_names: BTreeSet<String> = BTreeSet::new();
-        let mut declared_total = 0usize;
-
-        for entry in &entries {
-            let declared_size = ensure_safe_tree_entry(entry)?;
-            let rel_raw = if prefix.is_empty() {
-                entry.path.as_str()
-            } else {
-                let Some(stripped) = entry.path.strip_prefix(&prefix) else {
-                    if entry.path == clean_path {
-                        return Err(UaError::invalid(format!(
-                            "skill path {clean_path:?} is a single file, not a skill directory"
-                        )));
-                    }
-                    continue;
-                };
-                stripped
-            };
-            let rel = validate_package_path(rel_raw)?;
-            if rel.ends_with("/SKILL.md") {
-                return Err(UaError::invalid(format!(
-                    "nested SKILL.md at {rel:?} is not allowed inside a skill package"
-                )));
-            }
-            if !portable_names.insert(portable_collision_key(&rel)) {
-                return Err(UaError::invalid(format!(
-                    "skill package refuses case-insensitive or Unicode path collision at {rel:?}"
-                )));
-            }
-            if plan.len() >= MAX_PACKAGE_FILES {
-                return Err(UaError::invalid(format!(
-                    "skill package exceeds the {MAX_PACKAGE_FILES}-file limit"
-                )));
-            }
-            let cap = if rel == "SKILL.md" { MAX_SKILL_FILE_BYTES } else { MAX_PACKAGE_FILE_BYTES };
-            if declared_size > cap as u64 {
-                return Err(UaError::invalid(format!(
-                    "skill package member {rel:?} ({declared_size} bytes) exceeds the {cap}-byte limit"
-                )));
-            }
-            declared_total = declared_total.saturating_add(declared_size as usize);
-            if declared_total > MAX_PACKAGE_BYTES {
-                return Err(UaError::invalid(format!(
-                    "skill package exceeds the {MAX_PACKAGE_BYTES}-byte total size limit"
-                )));
-            }
-            plan.push((rel, entry.oid.clone(), declared_size, cap));
-        }
-
-        if !plan.iter().any(|(rel, _, _, _)| rel == "SKILL.md") {
-            return Err(UaError::invalid(format!("path {clean_path:?} has no SKILL.md at its root")));
-        }
-
-        let mut members: BTreeMap<String, PackageMember> = BTreeMap::new();
-        let mut actual_total = 0usize;
-        for (rel, oid, declared_size, cap) in plan {
-            let spec = build_git_command(
-                Some(&fetched.cache_dir),
-                None,
-                None,
-                &["cat-file", "blob", &oid],
-                src.opts,
-            )?;
-            let bytes = run_git(&spec, src.opts.timeout, cap)?;
-            if bytes.len() as u64 != declared_size || bytes.len() > cap {
-                return Err(UaError::conflict(format!(
-                    "git blob {oid} for {rel:?} changed size (expected {declared_size}, got {})",
-                    bytes.len()
-                )));
-            }
-            actual_total = actual_total.saturating_add(bytes.len());
-            if actual_total > MAX_PACKAGE_BYTES {
-                return Err(UaError::invalid(format!(
-                    "skill package exceeds the {MAX_PACKAGE_BYTES}-byte total size limit"
-                )));
-            }
-            let sha256 = sha256_bytes(&bytes);
-            members.insert(rel.clone(), PackageMember { path: rel, bytes, sha256, mode: MODE_FILE });
-        }
-
-        let md = members
-            .get("SKILL.md")
-            .ok_or_else(|| UaError::invalid(format!("path {clean_path:?} has no SKILL.md at its root")))?;
-        if md.bytes.contains(&0) || std::str::from_utf8(&md.bytes).is_err() {
-            return Err(UaError::invalid("SKILL.md must be valid UTF-8 without NUL bytes"));
-        }
-        Ok(members)
+        let plan = plan_package_entries(&clean_path, &entries)?;
+        read_planned_blobs(&fetched.cache_dir, &clean_path, &plan, src.opts)
     })
 }
 
@@ -693,5 +769,95 @@ mod tests {
         let entries = parse_ls_tree_z(nested.as_bytes()).unwrap();
         let e = discover_packages_from_entries(&entries, &[]).unwrap_err();
         assert!(e.to_string().contains("nested"), "{e}");
+
+        // Case-insensitive nested skill.md is also refused.
+        let nested_ci = format!(
+            "100644 blob {oid}      10\tskills/outer/SKILL.md\0\
+             100644 blob {oid}      10\tskills/outer/inner/skill.md\0"
+        );
+        let entries_ci = parse_ls_tree_z(nested_ci.as_bytes()).unwrap();
+        let e_ci = discover_packages_from_entries(&entries_ci, &[]).unwrap_err();
+        assert!(e_ci.to_string().contains("nested"), "{e_ci}");
+    }
+
+    #[test]
+    fn repo_prefixes_allow_dot_claude_and_refuse_c1_bidi_and_preread_oversize_or_mismatch() {
+        let oid = "b".repeat(40);
+        // .claude/skills/ and deeper >8-level prefixes are accepted as repo paths.
+        let deep_raw = format!(
+            "100644 blob {oid}      20\t.claude/skills/a/b/c/d/e/f/g/h/demo/SKILL.md\0\
+             100644 blob {oid}      10\t.claude/skills/a/b/c/d/e/f/g/h/demo/references/guide.md\0"
+        );
+        let entries = parse_ls_tree_z(deep_raw.as_bytes()).unwrap();
+        let pkgs = discover_packages_from_entries(&entries, &[".claude/skills".into()]).unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].path, ".claude/skills/a/b/c/d/e/f/g/h/demo");
+
+        // Hostile C1 CSI and bidi characters in member paths are refused by both discover and plan.
+        for bad in ["skills/demo/bad\u{009B}csi.txt", "skills/demo/run\u{202E}txt.sh"] {
+            let raw = format!(
+                "100644 blob {oid}      20\tskills/demo/SKILL.md\0\
+                 100644 blob {oid}      10\t{bad}\0"
+            );
+            let e_entries = parse_ls_tree_z(raw.as_bytes()).unwrap();
+            assert!(discover_packages_from_entries(&e_entries, &[]).is_err(), "discover: {bad:?}");
+            assert!(plan_package_entries("skills/demo", &e_entries).is_err(), "plan: {bad:?}");
+        }
+
+        // Pre-read declared-size check refuses an over-cap blob BEFORE cat-file ever runs
+        // (even for a nonexistent oid that would otherwise fail with a git command error).
+        let bogus_oid = "f".repeat(40);
+        let oversize = vec![
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                oid: oid.clone(),
+                size: Some(20),
+                path: "skills/demo/SKILL.md".into(),
+            },
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                oid: bogus_oid,
+                size: Some(MAX_PACKAGE_FILE_BYTES as u64 + 1),
+                path: "skills/demo/references/huge.txt".into(),
+            },
+        ];
+        let err = plan_package_entries("skills/demo", &oversize).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("exceeds the {MAX_PACKAGE_FILE_BYTES}-byte limit")),
+            "expected pre-read declared-size refusal, got: {err}"
+        );
+
+        // Actual blob size disagreeing with declared ls-tree size fails with Conflict.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("bare.git");
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git").args(args).output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "--quiet", "--bare", repo.to_str().unwrap()]);
+        let mut child = std::process::Command::new("git")
+            .args(["--git-dir", repo.to_str().unwrap(), "hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"0123456789").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let real_oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let bad_plan = vec![PlannedBlob {
+            rel: "SKILL.md".into(),
+            oid: real_oid,
+            declared_size: 5, // real blob is 10 bytes
+            cap: MAX_SKILL_FILE_BYTES,
+        }];
+        let mismatch =
+            read_planned_blobs(&repo, "skills/demo", &bad_plan, &FetchOptions::production()).unwrap_err();
+        assert!(matches!(mismatch, UaError::Conflict { .. }), "{mismatch:?}");
+        assert!(mismatch.to_string().contains("changed size"), "{mismatch}");
     }
 }

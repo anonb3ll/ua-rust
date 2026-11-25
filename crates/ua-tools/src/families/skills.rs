@@ -83,6 +83,7 @@ struct Skill {
     dir: PathBuf,
     /// `SKILL.md` path shown in findings.
     relpath: String,
+    raw_text: String,
     meta: Map<String, Value>,
     meta_error: Option<String>,
     body: String,
@@ -128,6 +129,7 @@ fn parse_skill_text(
     let mut skill = Skill {
         dir,
         relpath,
+        raw_text: text.clone(),
         meta: Map::new(),
         meta_error: None,
         body: String::new(),
@@ -420,6 +422,30 @@ fn check_security(skill: &Skill, out: &mut Vec<Finding>) {
             format!("invisible or bidi control code point U+{:04X}", c as u32),
             "remove it; text a reviewer cannot see must not reach an agent",
         ));
+    }
+    // Refuse ESC (U+001B, terminal escape injection) and CR (U+000D, line
+    // overwrite in terminal/approval diffs) in SKILL.md.
+    let mut ctrl_hits = 0usize;
+    for (idx, raw_line) in skill.raw_text.split('\n').enumerate() {
+        for c in raw_line.chars() {
+            if c == '\x1b' || c == '\r' {
+                out.push(finding(
+                    skill,
+                    "SKILL-HIDDEN-TEXT",
+                    "high",
+                    Some(idx + 1),
+                    format!("disallowed control code point U+{:04X} in SKILL.md", c as u32),
+                    "remove ESC/CR control characters and use plain LF line endings",
+                ));
+                ctrl_hits += 1;
+                if ctrl_hits >= 10 {
+                    break;
+                }
+            }
+        }
+        if ctrl_hits >= 10 {
+            break;
+        }
     }
 }
 

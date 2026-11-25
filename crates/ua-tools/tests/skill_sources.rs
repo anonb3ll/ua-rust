@@ -426,7 +426,9 @@ async fn every_refused_url_shape_and_unported_source_action_is_rejected() {
             .unwrap_err();
         assert_eq!(e.code(), "invalid_argument", "{bad_sha:?}: {e:?}");
     }
-    for bad_subpath in ["../escape", ".hidden", "skills/.git", "a:b"] {
+    for bad_subpath in
+        ["../escape", "skills/.git", "a:b", "skills/bidi\u{202E}name", "skills/csi\u{009B}name"]
+    {
         let e = h
             .call(
                 &human(),
@@ -870,6 +872,8 @@ mod d2b_file_fixtures {
         }
         let payload_v1 = h.approval_payload(approval_v1);
         assert_eq!(payload_v1["source"], expected_prov_v1);
+        assert_eq!(payload_v1["source_id"], "src-demo");
+        assert_eq!(payload_v1["source_pinned_sha"], sha1);
         assert_eq!(payload_v1["new_sha"], sha1);
         assert_eq!(payload_v1["repo_path"], "skills/demo");
 
@@ -899,15 +903,36 @@ mod d2b_file_fixtures {
             .unwrap();
         assert_eq!(stored_src, expected_prov_v1);
 
-        // Upstream pushes v2: modifies SKILL.md & scripts/run.sh, removes templates/old.txt,
-        // adds templates/new.md, leaves references/guide.md unchanged.
-        fx.write("skills/demo/SKILL.md", valid_skill_md("demo", "Version 2 instructions.\n").as_bytes());
+        // Allow direct SHA wants (as GitHub/GitLab do) so default import of approved
+        // pinned_sha can be tested after upstream advances main.
+        fx.git(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
+
+        // Upstream pushes v2 (including a line starting with `++` to verify lines_added counts it):
+        // modifies SKILL.md & scripts/run.sh, removes templates/old.txt, adds templates/new.md,
+        // leaves references/guide.md unchanged.
+        fx.write(
+            "skills/demo/SKILL.md",
+            valid_skill_md("demo", "Version 2 instructions.\n++added-double-plus\n").as_bytes(),
+        );
         fx.write("skills/demo/scripts/run.sh", b"#!/bin/sh\necho v2-updated\n");
         fx.remove("skills/demo/templates/old.txt");
         fx.write("skills/demo/templates/new.md", b"# Added in v2\n");
         let sha2 = fx.commit_all("v2");
 
-        // source_refresh reports candidate_sha and changes without moving pinned_sha, versions, or assignments.
+        // Create a non-tracking branch `alt` at a third commit while `main` stays at sha2.
+        fx.git(&["checkout", "-b", "alt"]);
+        fx.write("skills/demo/SKILL.md", valid_skill_md("demo", "Alt branch commit.\n").as_bytes());
+        let sha_alt = fx.commit_all("alt-branch");
+        fx.git(&["checkout", "main"]);
+
+        // source_refresh refuses a caller-supplied tracking_ref override (Low 1).
+        let override_err = h
+            .call(&dev, "source_refresh", json!({ "source_id": "src-demo", "tracking_ref": "alt" }))
+            .await
+            .unwrap_err();
+        assert_eq!(override_err.code(), "invalid_argument", "{override_err:?}");
+
+        // source_refresh uses the row's tracking_ref only and never moves pinned_sha, versions, or assignments.
         let ref_out = h.call(&dev, "source_refresh", json!({ "source_id": "src-demo" })).await.unwrap();
         assert_eq!(ref_out["changed"], true, "{ref_out}");
         assert_eq!(ref_out["pinned_sha"], sha1);
@@ -935,19 +960,38 @@ mod d2b_file_fixtures {
             .unwrap();
         assert_eq!(assign_count, 0, "source_refresh must never assign");
 
-        // Calling source_discover or source_import at old pinned_sha when main moved to sha2 refuses (tracking_ref mismatch).
-        let mismatch_disc =
-            h.call(&dev, "source_discover", json!({ "source_id": "src-demo" })).await.unwrap_err();
+        // M4: omitting `sha` still imports/discovers the exact approved `pinned_sha` even after main moved to sha2.
+        let pin_disc = h.call(&dev, "source_discover", json!({ "source_id": "src-demo" })).await.unwrap();
+        assert_eq!(pin_disc["sha"], sha1, "{pin_disc}");
+        let pin_reimport = h
+            .call(&human(), "source_import", json!({ "source_id": "src-demo", "path": "skills/demo" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            pin_reimport["idempotent"], true,
+            "default import must stay on pinned_sha: {pin_reimport}"
+        );
+
+        // M4: an explicit `sha` on a non-tracking branch (`alt`) is refused (tracking_ref mismatch).
+        let mismatch_disc = h
+            .call(&dev, "source_discover", json!({ "source_id": "src-demo", "sha": sha_alt }))
+            .await
+            .unwrap_err();
         assert!(matches!(mismatch_disc, UaError::Conflict { .. }), "{mismatch_disc:?}");
         assert!(mismatch_disc.to_string().contains("does not match pinned_sha"), "{mismatch_disc}");
 
         let mismatch_imp = h
-            .call(&human(), "source_import", json!({ "source_id": "src-demo", "path": "skills/demo" }))
+            .call(
+                &human(),
+                "source_import",
+                json!({ "source_id": "src-demo", "path": "skills/demo", "sha": sha_alt }),
+            )
             .await
             .unwrap_err();
         assert!(matches!(mismatch_imp, UaError::Conflict { .. }), "{mismatch_imp:?}");
 
-        // Upgrade import at sha2 succeeds and populates member_diff + SKILL.md diff in payload & approval display.
+        // Explicit upgrade import at sha2 (current tracking_ref tip) succeeds and populates
+        // member_diff, SKILL.md diff, source_id, source_pinned_sha, and `pinned_sha → new_sha` display.
         let staged_v2 = h
             .call(
                 &human(),
@@ -958,13 +1002,18 @@ mod d2b_file_fixtures {
             .unwrap();
         assert_eq!(staged_v2["status"], "approval_pending", "{staged_v2}");
         assert_eq!(staged_v2["previous_version"], 1);
+        assert_eq!(staged_v2["source_id"], "src-demo");
         let approval_v2 = staged_v2["approval_id"].as_i64().unwrap();
         let staging_v2 = staged_v2["staging_id"].as_str().unwrap().to_string();
 
         let payload_v2 = h.approval_payload(approval_v2);
+        assert_eq!(payload_v2["source_id"], "src-demo");
+        assert_eq!(payload_v2["source_pinned_sha"], sha1);
         assert_eq!(payload_v2["previous_version"], 1);
         assert_eq!(payload_v2["previous_sha"], sha1);
         assert_eq!(payload_v2["new_sha"], sha2);
+        assert_eq!(payload_v2["previous_source"], expected_prov_v1);
+        assert_eq!(payload_v2["source_changed"], false);
         let diff = &payload_v2["member_diff"];
         assert_eq!(diff["added"].as_array().unwrap().len(), 1, "{diff}");
         assert_eq!(diff["added"][0]["path"], "templates/new.md");
@@ -981,8 +1030,10 @@ mod d2b_file_fixtures {
         let md_diff = payload_v2["skill_md_diff"].as_str().unwrap();
         assert!(md_diff.contains("-Version 1 instructions."), "{md_diff}");
         assert!(md_diff.contains("+Version 2 instructions."), "{md_diff}");
+        assert!(md_diff.contains("+++added-double-plus"), "{md_diff}");
 
-        // approval_pending returns display.diff with member diff + SKILL.md unified diff text.
+        // approval_pending returns display.diff with pin advance, previous_source, member diff,
+        // SKILL.md unified diff, and accurate lines_added (including `++` line).
         let pending = h
             .reg
             .call(&h.hub, &approver(), "approval_pending", json!({ "tool": "skill_registry" }))
@@ -994,7 +1045,15 @@ mod d2b_file_fixtures {
             .iter()
             .find(|r| r["id"] == approval_v2)
             .expect("pending v2 approval");
+        assert_eq!(row["display"]["lines_added"], 2, "must count added line starting with ++: {row}");
+        assert_eq!(row["display"]["lines_removed"], 1, "{row}");
+        assert_eq!(row["display"]["source_changed"], false, "{row}");
         let display_diff = row["display"]["diff"].as_str().unwrap();
+        assert!(
+            display_diff.contains(&format!("{sha1} \u{2192} {sha2}")),
+            "display must show pinned_sha → new_sha:\n{display_diff}"
+        );
+        assert!(display_diff.contains(&format!("Previous source: {expected_prov_v1}")), "{display_diff}");
         assert!(display_diff.contains("+ templates/new.md"), "{display_diff}");
         assert!(display_diff.contains("- templates/old.txt"), "{display_diff}");
         assert!(display_diff.contains("~ scripts/run.sh"), "{display_diff}");
@@ -1082,7 +1141,10 @@ mod d2b_file_fixtures {
                 .await
                 .unwrap_err();
             assert_eq!(e.code(), "invalid_argument", "{e:?}");
-            assert!(e.to_string().contains("limit"), "{e}");
+            assert!(
+                e.to_string().contains(&format!("exceeds the {MAX_PACKAGE_FILE_BYTES}-byte limit")),
+                "must fail at pre-read declared-size cap, not post-read git overflow: {e}"
+            );
 
             let fx_cap = GitFixture::new();
             fx_cap.write("skills/cap/SKILL.md", valid_skill_md("cap", "").as_bytes());
@@ -1191,5 +1253,205 @@ mod d2b_file_fixtures {
         }
 
         assert_eq!(h.approval_count(), 1, "only the clean allowlisted-png import may park an approval");
+    }
+
+    #[tokio::test]
+    async fn revoke_between_stage_and_publish_source_change_warning_nested_and_controls() {
+        let h = Harness::new();
+
+        // M1: Revoke between stage and publish must refuse publishing the already-staged import.
+        {
+            let fx = GitFixture::new();
+            fx.write("skills/revoked-mid/SKILL.md", valid_skill_md("revoked-mid", "").as_bytes());
+            fx.write("skills/revoked-mid/references/guide.md", b"# Guide\n");
+            let sha = fx.commit_all("v1");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, "src-rev-mid", &fx, &sha, "main", &["skills"]);
+
+            let staged = h
+                .call(
+                    &human(),
+                    "source_import",
+                    json!({ "source_id": "src-rev-mid", "path": "skills/revoked-mid" }),
+                )
+                .await
+                .unwrap();
+            let approval_id = staged["approval_id"].as_i64().unwrap();
+            let staging_id = staged["staging_id"].as_str().unwrap().to_string();
+
+            // Revoke the source BEFORE publish, even though a human approves the parked publish.
+            h.gated(
+                &human(),
+                "source_revoke",
+                json!({ "source_id": "src-rev-mid", "reason": "compromised after staging" }),
+            )
+            .await;
+            h.approve(approval_id).await;
+
+            let err = h.call(&human(), "publish", json!({ "staging_id": staging_id })).await.unwrap_err();
+            assert!(matches!(err, UaError::Conflict { .. }), "{err:?}");
+            assert!(err.to_string().contains("revoked"), "{err}");
+
+            let versions: i64 = h
+                .hub
+                .db()
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM skill_versions WHERE name = 'revoked-mid'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(versions, 0, "revoked source must not produce a published skill version");
+        }
+
+        // M3: Another repository claiming an existing skill name flags WARNING: SOURCE CHANGED
+        // and shows previous_source prominently in approval_display.
+        {
+            let fx_a = GitFixture::new();
+            fx_a.write("skills/shared-name/SKILL.md", valid_skill_md("shared-name", "From A.\n").as_bytes());
+            fx_a.write("skills/shared-name/references/guide.md", b"# Guide A\n");
+            let sha_a = fx_a.commit_all("a1");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, "src-a", &fx_a, &sha_a, "main", &["skills"]);
+
+            let st_a = h
+                .call(
+                    &human(),
+                    "source_import",
+                    json!({ "source_id": "src-a", "path": "skills/shared-name" }),
+                )
+                .await
+                .unwrap();
+            h.approve(st_a["approval_id"].as_i64().unwrap()).await;
+            h.call(&human(), "publish", json!({ "staging_id": st_a["staging_id"] })).await.unwrap();
+
+            let fx_b = GitFixture::new();
+            fx_b.write("skills/shared-name/SKILL.md", valid_skill_md("shared-name", "From B.\n").as_bytes());
+            fx_b.write("skills/shared-name/references/guide.md", b"# Guide B\n");
+            let sha_b = fx_b.commit_all("b1");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, "src-b", &fx_b, &sha_b, "main", &["skills"]);
+
+            let st_b = h
+                .call(
+                    &human(),
+                    "source_import",
+                    json!({ "source_id": "src-b", "path": "skills/shared-name" }),
+                )
+                .await
+                .unwrap();
+            let app_b = st_b["approval_id"].as_i64().unwrap();
+            let payload_b = h.approval_payload(app_b);
+            assert_eq!(payload_b["source_changed"], true, "{payload_b}");
+            let expected_prev = format!("git:{}@{}:skills/shared-name", fx_a.url(), sha_a);
+            assert_eq!(payload_b["previous_source"], expected_prev);
+
+            let pending = h
+                .reg
+                .call(&h.hub, &approver(), "approval_pending", json!({ "tool": "skill_registry" }))
+                .await
+                .unwrap();
+            let row = pending["pending"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == app_b)
+                .expect("pending source-change approval");
+            assert_eq!(row["display"]["source_changed"], true, "{row}");
+            let diff = row["display"]["diff"].as_str().unwrap();
+            assert!(diff.contains("WARNING: SOURCE CHANGED"), "{diff}");
+            assert!(diff.contains(&format!("Previous source: {expected_prev}")), "{diff}");
+            assert!(
+                diff.contains(&format!("Source: git:{}@{}:skills/shared-name", fx_b.url(), sha_b)),
+                "{diff}"
+            );
+        }
+
+        // M2: C1 control (U+009B) and bidi override (U+202E) in a member path are refused on both discover and import.
+        for (id, bad_name) in [
+            ("src-c1", "skills/badpath/run\u{009B}csi.txt"),
+            ("src-bidi", "skills/badpath/run\u{202E}txt.sh"),
+        ] {
+            let fx = GitFixture::new();
+            fx.write("skills/badpath/SKILL.md", valid_skill_md("badpath", "").as_bytes());
+            fx.write("skills/badpath/references/guide.md", b"# Guide\n");
+            fx.write(bad_name, b"echo ok\n");
+            let sha = fx.commit_all("bad-path");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, id, &fx, &sha, "main", &["skills"]);
+
+            let e_disc = h.call(&human(), "source_discover", json!({ "source_id": id })).await.unwrap_err();
+            assert_eq!(e_disc.code(), "invalid_argument", "{id} discover: {e_disc:?}");
+            let e_imp = h
+                .call(&human(), "source_import", json!({ "source_id": id, "path": "skills/badpath" }))
+                .await
+                .unwrap_err();
+            assert_eq!(e_imp.code(), "invalid_argument", "{id} import: {e_imp:?}");
+        }
+
+        // Mutation 1 + Nit 2: Nested SKILL.md (and case-insensitive skill.md) refused on source_import.
+        for (id, nested_rel) in [
+            ("src-nested-upper", "skills/outer/inner/SKILL.md"),
+            ("src-nested-lower", "skills/outer/inner/skill.md"),
+        ] {
+            let fx = GitFixture::new();
+            fx.write("skills/outer/SKILL.md", valid_skill_md("outer", "").as_bytes());
+            fx.write("skills/outer/references/guide.md", b"# Guide\n");
+            fx.write(nested_rel, valid_skill_md("inner", "").as_bytes());
+            let sha = fx.commit_all("nested");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, id, &fx, &sha, "main", &["skills"]);
+
+            let e = h
+                .call(&human(), "source_import", json!({ "source_id": id, "path": "skills/outer" }))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code(), "invalid_argument", "{id}: {e:?}");
+            assert!(e.to_string().contains("nested"), "{id}: {e}");
+        }
+
+        // Low 2: ESC (\x1b) and CR (\r) in SKILL.md are blocked by skill_review.
+        for (id, payload) in [("src-esc", "Escape \x1b[31mred\x1b[0m\n"), ("src-cr", "Fake\roverwrite\n")] {
+            let fx = GitFixture::new();
+            fx.write("skills/ctrl/SKILL.md", valid_skill_md("ctrl", payload).as_bytes());
+            fx.write("skills/ctrl/references/guide.md", b"# Guide\n");
+            let sha = fx.commit_all("ctrl");
+            insert_file_source(&h, ua_core::DEFAULT_ORG, id, &fx, &sha, "main", &["skills"]);
+
+            let out = h
+                .call(&human(), "source_import", json!({ "source_id": id, "path": "skills/ctrl" }))
+                .await
+                .unwrap();
+            assert_eq!(out["blocked"], true, "{id}: {out}");
+            assert_eq!(out["review"]["status"], "fail", "{id}: {out}");
+        }
+
+        // Low 3: Leading-dot repo prefix `.claude/skills` and deeper layouts work end-to-end.
+        {
+            let fx = GitFixture::new();
+            let deep_dir = ".claude/skills/team/platform/a/b/c/d/e/dot-skill";
+            fx.write(&format!("{deep_dir}/SKILL.md"), valid_skill_md("dot-skill", "").as_bytes());
+            fx.write(&format!("{deep_dir}/references/guide.md"), b"# Guide\n");
+            let sha = fx.commit_all("dot-claude");
+            insert_file_source(
+                &h,
+                ua_core::DEFAULT_ORG,
+                "src-claude",
+                &fx,
+                &sha,
+                "main",
+                &[".claude/skills"],
+            );
+
+            let disc =
+                h.call(&human(), "source_discover", json!({ "source_id": "src-claude" })).await.unwrap();
+            let pkgs = disc["packages"].as_array().unwrap();
+            assert_eq!(pkgs.len(), 1, "{disc}");
+            assert_eq!(pkgs[0]["path"], deep_dir);
+
+            let staged = h
+                .call(&human(), "source_import", json!({ "source_id": "src-claude", "path": deep_dir }))
+                .await
+                .unwrap();
+            assert_eq!(staged["status"], "approval_pending", "{staged}");
+            assert_eq!(staged["name"], "dot-skill");
+        }
     }
 }

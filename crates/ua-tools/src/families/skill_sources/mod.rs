@@ -145,9 +145,6 @@ pub(crate) struct SourceListParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceRefreshParams {
     pub source_id: String,
-    /// Optional tracking ref override; defaults to the source's `tracking_ref`.
-    #[serde(default)]
-    pub tracking_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,10 +503,6 @@ pub(crate) fn source_refresh(ctx: &ToolCtx, p: SourceRefreshParams) -> UaResult<
         UaError::denied("identity_required", "refreshing a skill source requires an authenticated identity")
     })?;
     let row = load_active_source(ctx, &p.source_id, "refresh")?;
-    let tracking_ref = match p.tracking_ref.as_deref() {
-        Some(r) => validate_tracking_ref(r)?,
-        None => row.tracking_ref.clone(),
-    };
     let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
     let src = SourceFetchCtx {
         data_home: &ctx.hub.cfg().home,
@@ -519,7 +512,7 @@ pub(crate) fn source_refresh(ctx: &ToolCtx, p: SourceRefreshParams) -> UaResult<
         resolver: &SystemDnsResolver,
         opts: &opts,
     };
-    let report = refresh_source(&src, &tracking_ref, &row.pinned_sha)?;
+    let report = refresh_source(&src, &row.tracking_ref, &row.pinned_sha)?;
     Ok(json!({
         "ok": true,
         "source_id": row.id,
@@ -546,7 +539,10 @@ pub(crate) fn source_discover(ctx: &ToolCtx, p: SourceDiscoverParams) -> UaResul
         Some(s) => validate_sha(s)?,
         None => row.pinned_sha.clone(),
     };
-    let verify_ref = (row.tracking_ref != target_sha).then_some(row.tracking_ref.as_str());
+    // Default (`pinned_sha`): fetch the approved pin directly by SHA even if
+    // upstream has moved `tracking_ref`. An explicit different `sha` is allowed
+    // only when it equals the current `tracking_ref` tip.
+    let verify_ref = (target_sha != row.pinned_sha).then_some(row.tracking_ref.as_str());
     let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
     let src = SourceFetchCtx {
         data_home: &ctx.hub.cfg().home,
@@ -580,7 +576,10 @@ pub(crate) fn source_import_as(ctx: &ToolCtx, who: &str, p: SourceImportParams) 
         Some(s) => validate_sha(s)?,
         None => row.pinned_sha.clone(),
     };
-    let verify_ref = (row.tracking_ref != target_sha).then_some(row.tracking_ref.as_str());
+    // Default (`pinned_sha`): import the approved pin directly by SHA even if
+    // upstream has moved `tracking_ref`. An explicit different `sha` is allowed
+    // only as an explicit upgrade equal to the current `tracking_ref` tip.
+    let verify_ref = (target_sha != row.pinned_sha).then_some(row.tracking_ref.as_str());
     let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
     let src = SourceFetchCtx {
         data_home: &ctx.hub.cfg().home,
@@ -608,7 +607,7 @@ pub(crate) fn source_import_as(ctx: &ToolCtx, who: &str, p: SourceImportParams) 
     let member_paths: BTreeSet<String> = members.keys().cloned().collect();
     let review = review_in_memory(dir_name, md_text, &member_paths, "info");
     let provenance = format!("git:{}@{}:{clean_path}", row.canonical_url, target_sha);
-    stage_members(ctx, who, name, provenance, members, review)
+    stage_members(ctx, who, name, provenance, Some(row.id), members, review)
 }
 
 #[cfg(test)]

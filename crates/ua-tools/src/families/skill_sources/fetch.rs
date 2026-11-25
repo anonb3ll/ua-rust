@@ -45,7 +45,7 @@ use url::{Host, Url};
 
 pub const MAX_URL_BYTES: usize = 512;
 pub const MAX_REF_BYTES: usize = 200;
-pub const MAX_SUBPATH_BYTES: usize = 240;
+pub const MAX_SUBPATH_BYTES: usize = 512;
 pub const MAX_ALLOWED_SUBPATHS: usize = 32;
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -311,6 +311,9 @@ pub fn validate_tracking_ref(raw: &str) -> UaResult<String> {
 }
 
 /// Validate and canonically sort optional allowed repository-relative subpath prefixes.
+/// Leading-dot repo directories (such as `.claude/skills`) are permitted as
+/// repo-relative prefixes; `.`, `..`, `.git`, backslashes, colons, control
+/// characters, and hidden/bidi Unicode code points are refused.
 pub fn validate_allowed_subpaths(raw: Option<Vec<String>>) -> UaResult<Vec<String>> {
     let Some(list) = raw else {
         return Ok(Vec::new());
@@ -327,12 +330,12 @@ pub fn validate_allowed_subpaths(raw: Option<Vec<String>>) -> UaResult<Vec<Strin
             || trimmed.len() > MAX_SUBPATH_BYTES
             || trimmed.contains('\\')
             || trimmed.contains(':')
-            || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || trimmed.chars().any(|c| c.is_control() || crate::families::skills::hidden_char(c))
         {
             return Err(UaError::invalid(format!("unsafe allowed_subpaths entry {entry:?}")));
         }
         for part in trimmed.split('/') {
-            if part.is_empty() || part == "." || part == ".." || part.starts_with('.') {
+            if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git") {
                 return Err(UaError::invalid(format!("unsafe allowed_subpaths entry {entry:?}")));
             }
         }
