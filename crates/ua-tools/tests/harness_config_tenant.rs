@@ -217,6 +217,54 @@ fn legacy_upgrade_rebuilds_keys_and_keeps_rows_ids_indexes_triggers_and_views() 
         .unwrap();
 }
 
+/// Review follow-up: the upgrade expires harness config approvals whose
+/// payload does not bind `org_id`, inside a schema part that cannot append
+/// to the ledger. `system_doctor` reports how many it expired, to a
+/// default-organization reader only; an approval already carrying a reason,
+/// and one still matching, are not counted.
+#[tokio::test]
+async fn the_doctor_reports_approvals_the_upgrade_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.human_identities = vec!["operator".into()];
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &old_parts()).unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) VALUES
+                   ('harness_config_apply', '{\"node\":\"node-a\"}', 'builder-1', 'pending', 't0', 't0'),
+                   ('harness_config_publish', '{\"version\":\"v9\"}', 'operator', 'approved', 't0', 't0'),
+                   ('harness_config_apply', '{\"node\":\"node-a\",\"org_id\":\"default\"}', 'builder-1',
+                    'pending', 't0', 't0'),
+                   ('fs_write', '{\"path\":\"x\"}', 'builder-1', 'pending', 't0', 't0');
+                 INSERT INTO approvals (tool, payload, requested_by, status, reason, created_at, updated_at) VALUES
+                   ('harness_config_apply', '{}', 'builder-1', 'pending', 'fake earlier reason', 't0', 't0');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let hub = Hub::open(cfg).unwrap();
+    add_org(&hub, ORG_B);
+    let expired: i64 =
+        hub.db().read(|c| Ok(count(c, "SELECT COUNT(*) FROM approvals WHERE status = 'expired'"))).unwrap();
+    assert_eq!(expired, 3, "three unscoped harness config approvals were expired");
+    let reg = builtin_registry();
+    let doctor = |who: Caller| {
+        let (reg, hub) = (&reg, &hub);
+        async move { reg.call(hub, &who, "system_doctor", json!({})).await.unwrap()["database"].clone() }
+    };
+    let db = doctor(human()).await;
+    assert_eq!(db["harness_config_approvals_expired_at_upgrade"], 2, "{db}");
+    let b = Caller {
+        profile: Profile::Operator,
+        enforce_profile: false,
+        ..caller("operator", ActorKind::Human, ORG_B)
+    };
+    let db_b = doctor(b).await;
+    assert!(db_b["harness_config_approvals_expired_at_upgrade"].is_null(), "{db_b}");
+}
+
 #[test]
 fn the_rebuild_is_safe_to_rerun_after_a_crash_before_recording() {
     let dir = tempfile::tempdir().unwrap();

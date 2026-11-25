@@ -264,10 +264,11 @@ async fn node_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
         .db()
         .write_async(move |tx| post(tx, hub.cfg(), &org, &agent, &a.node, &id2, &receipt))
         .await??;
-    let hub = ctx.hub.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || command::deliver_pending(&hub, command::NoticeScope::Item(&id)))
-            .await;
+    let (hub, org) = (ctx.hub.clone(), ctx.caller.org_id.clone());
+    let _ = tokio::task::spawn_blocking(move || {
+        command::deliver_pending(&hub, command::NoticeScope::Item(&org, &id))
+    })
+    .await;
     Ok(out)
 }
 

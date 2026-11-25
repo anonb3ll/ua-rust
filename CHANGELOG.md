@@ -790,6 +790,32 @@ from its commit history.
 
 ### Fixed
 
+- Organization-tenancy review follow-ups (latent while `authz` admits only
+  the default organization):
+  - Another organization's node command notices are now mailed within that
+    organization, to the command's owner, in its own mailbox (the mailbox
+    carries `org_id`); before, they were recorded and never sent. A notice
+    left unsent by an earlier build goes out with the next sweep.
+  - `zulip_fetch_messages` refuses an unknown organization and any
+    organization but the default (`zulip_not_configured`) before any
+    request, cursor or event, as a send does.
+  - Events no longer carry another organization's names or unsalted
+    digests into the default ledger: skill registry events (name, target,
+    source, content hash), notification events (category; originator
+    `system`), routine fires (the fire key, formerly a `sha256:` digest, is
+    now `run:<receipt id>`; originator `system`) and work-proposal events
+    (contract digests). Events written earlier keep what they recorded.
+  - `system_doctor` reports the harness config approvals the organization
+    upgrade expired (`database.harness_config_approvals_expired_at_upgrade`),
+    since that schema part could leave no ledger event.
+  - The `task_add`, `task_update`, `delegate` and conversation-handoff
+    idempotency keys of an organization whose id holds `%` or `/` escape it,
+    as the other writers do; a receipt stored in the earlier unescaped form
+    still replays in its own organization. Default-organization keys are
+    unchanged.
+  - A guard test fails on any read, update or delete of `idempotency_keys`
+    in non-test source that does not filter `org_id`.
+
 - Organization hardening of the approval queue (latent: every caller is in
   the default organization today). Approval events for another
   organization's approval record the neutral originator `system` instead of
@@ -897,6 +923,18 @@ from its commit history.
   `proc_pidinfo`.
 
 ### Behaviour changes
+
+- Another organization's `not_configured` notification row no longer
+  keeps its message text: it has no destination, and nothing resends from
+  the outbox automatically (a resend is manual). The default
+  organization's row still does.
+- Known gap, documented: `goals.v2.org_scope` deleted every
+  `task_goal_links` row whose goal was in another organization than its
+  task, with no ledger event, count or archive. The part is merged and
+  cannot change, and on an upgraded database those links are gone; only a
+  backup taken before the upgrade holds them. A hub upgraded with a single
+  organization lost none (see `docs/organization.md`, the goal and
+  work-proposal tables).
 
 - `delegate` (and `delegation_manage` create and `handoff`) accepts only a
   `to_agent` that is a registered agent of the delegator's own

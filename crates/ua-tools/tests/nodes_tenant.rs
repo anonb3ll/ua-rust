@@ -1278,3 +1278,169 @@ async fn the_doctor_counts_other_organizations_blocked_nodes_and_unsent_notices(
     assert!(row.get("other_org_nodes_not_accepted").is_none(), "{row}");
     assert!(!row["detail"].as_str().unwrap().contains("take no real work"), "{row}");
 }
+
+/// Start a supervised command on `node` as `lead` (approved by SQL), claim
+/// it as `device` and post its finished receipt. Returns the item id.
+async fn run_command(h: &H, lead: &Caller, device: &Caller, node: &str, root: &str, arg: &str) -> String {
+    let params = json!({ "node": node, "argv": ["ls", arg], "cwd": format!("{root}/repo") });
+    let parked = h.manage(lead, "node_command_start", params.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id, .. } = parked else {
+        panic!("expected an approval: {parked:?}")
+    };
+    h.approve(approval_id);
+    let id =
+        h.manage(lead, "node_command_start", params).await.unwrap()["item_id"].as_str().unwrap().to_string();
+    let claimed = h.ok(device, "node_claim", json!({ "node": node })).await;
+    assert_eq!(claimed["item"]["item_id"], id.as_str(), "{claimed}");
+    let token = claimed["item"]["command"]["fence_token"].as_str().unwrap().to_string();
+    let receipt = json!({ "status": "finished", "attempt": 1, "exit_code": 0, "fence_token": token });
+    h.ok(device, "node_receipt", json!({ "node": node, "item_id": id, "receipt": receipt })).await;
+    id
+}
+
+/// Follow-up of the nodes conversion: now that the mailbox carries an
+/// organization (`message_index.org_id`), a command notice of another
+/// organization is mailed within that organization, to its own command
+/// owner, and never through the default organization's mailbox; its text
+/// stays out of the default ledger.
+#[tokio::test]
+async fn a_command_notice_is_mailed_within_its_own_organization() {
+    let h = H::new();
+    h.fleet().await;
+    let a_item = run_command(&h, &lead_a(), &device_a(), NODE_A, ROOT_A, "fake-a-dir").await;
+    let b_item = run_command(&h, &lead_b(), &device_b(), NODE_B, ROOT_B, B_OUTPUT).await;
+
+    // Each receipt delivered its own notice, in its own organization.
+    assert_eq!(h.count("SELECT COUNT(*) FROM node_command_notice WHERE sent_at IS NULL"), 0);
+    for (org, item, owner) in [(DEFAULT_ORG, &a_item, "lead-1"), (ORG_B, &b_item, B_LEAD)] {
+        let row = h.text(&format!(
+            "SELECT m.org_id || '|' || m.recipient || '|' || m.sender FROM message_index m \
+             JOIN node_command_notice n ON n.message_id = m.message_id AND n.org_id = m.org_id \
+             WHERE n.item_id = '{item}'"
+        ));
+        assert_eq!(row, format!("{org}|{owner}|hub-node"));
+    }
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM message_index WHERE recipient = '{B_LEAD}'")), 1);
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND recipient = '{B_LEAD}'"
+        )),
+        0
+    );
+
+    // B's owner reads it in B; the default organization's owner sees only its own.
+    let inbox = h.ok(&lead_b(), "message_list", json!({ "to_agent": B_LEAD })).await;
+    let msgs = inbox["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{inbox}");
+    assert_eq!(msgs[0]["from_agent"], "hub-node");
+    assert_eq!(msgs[0]["client_message_id"], format!("node-command-{b_item}-1-finished"));
+    assert!(msgs[0]["body"].as_str().unwrap().contains(B_OUTPUT), "{inbox}");
+    let a_inbox = h.ok(&lead_a(), "message_list", json!({ "to_agent": "lead-1" })).await;
+    assert_eq!(a_inbox["messages"].as_array().unwrap().len(), 1, "{a_inbox}");
+    assert!(!a_inbox.to_string().contains(B_OUTPUT) && !a_inbox.to_string().contains(&b_item), "{a_inbox}");
+
+    // Nothing of B's notice reaches the default ledger as text or originator.
+    for (channel, originator, dedupe, payload) in h.ledger() {
+        let row = format!("{channel} {originator:?} {dedupe:?} {payload}");
+        for secret in [B_OUTPUT, B_LEAD, NODE_B] {
+            assert!(!row.contains(secret), "{secret} reached the default ledger: {row}");
+        }
+    }
+
+    // A retried sweep sends nothing twice; the doctor counts no unsent notice.
+    let swept = ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(swept["notices_delivered"], 0, "{swept}");
+    assert_eq!(h.count("SELECT COUNT(*) FROM message_index WHERE sender = 'hub-node'"), 2);
+}
+
+/// An owed notice of another organization is retried by its node's sweep
+/// (matched to the node within the notice's organization) and by the hub
+/// sweep, and mailed in that organization.
+#[tokio::test]
+async fn an_owed_notice_of_another_organization_is_retried_within_it() {
+    let h = H::new();
+    h.fleet().await;
+    let ts = "2026-01-01T00:00:00+00:00";
+    for (org, item, node, owner) in [
+        (ORG_B, "nd-00000000000000b1", NODE_B, B_LEAD),
+        (DEFAULT_ORG, "nd-00000000000000a1", NODE_A, "lead-1"),
+    ] {
+        h.sql(&format!(
+            "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+             created_by, created_at, updated_at) VALUES ('{org}', '{item}', '{node}', 'fake-agent', 'command', 'p', \
+             '/srv', 60, 'finished', 1, '{owner}', '{ts}', '{ts}'); \
+             INSERT INTO node_command_notice (org_id, item_id, attempt, terminal, owner_agent, body, created_at) \
+             VALUES ('{org}', '{item}', 1, 'finished', '{owner}', 'fake done {B_OUTPUT}', '{ts}');"
+        ))
+        .unwrap();
+    }
+    let sent = |item: &str| {
+        h.count(&format!("SELECT sent_at IS NOT NULL FROM node_command_notice WHERE item_id = '{item}'"))
+    };
+    ua_tools::families::node_queue::sweep(&h.hub, Some(NODE_B)).unwrap();
+    assert_eq!((sent("nd-00000000000000b1"), sent("nd-00000000000000a1")), (1, 0));
+    assert_eq!(
+        h.text("SELECT org_id || '|' || recipient FROM message_index WHERE sender = 'hub-node'"),
+        format!("{ORG_B}|{B_LEAD}")
+    );
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(sent("nd-00000000000000a1"), 1);
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND sender = 'hub-node'"
+        )),
+        1
+    );
+}
+
+/// A suspended organization's owed notices are skipped, not attempted (the
+/// mailbox would refuse them, and failures at the head of the queue would
+/// fill every batch); they go out once it is active again.
+#[tokio::test]
+async fn a_suspended_organizations_notices_wait_without_blocking_others() {
+    let h = H::new();
+    h.fleet().await;
+    let ts = "2026-01-01T00:00:00+00:00";
+    let mut b_items = Vec::new();
+    for n in 0..55 {
+        let item = format!("nd-00000000000b{n:04}");
+        h.sql(&format!(
+            "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+             created_by, created_at, updated_at) VALUES ('{ORG_B}', '{item}', '{NODE_B}', 'fake-agent', 'command', \
+             'p', '/srv', 60, 'finished', 1, '{B_LEAD}', '{ts}', '{ts}'); \
+             INSERT INTO node_command_notice (org_id, item_id, attempt, terminal, owner_agent, body, created_at) \
+             VALUES ('{ORG_B}', '{item}', 1, 'finished', '{B_LEAD}', 'fake done', '{ts}');"
+        ))
+        .unwrap();
+        b_items.push(item);
+    }
+    let later = "2026-01-02T00:00:00+00:00";
+    h.sql(&format!(
+        "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+         created_by, created_at, updated_at) VALUES ('{DEFAULT_ORG}', 'nd-00000000000000a9', '{NODE_A}', \
+         'fake-agent', 'command', 'p', '/srv', 60, 'finished', 1, 'lead-1', '{later}', '{later}'); \
+         INSERT INTO node_command_notice (org_id, item_id, attempt, terminal, owner_agent, body, created_at) \
+         VALUES ('{DEFAULT_ORG}', 'nd-00000000000000a9', 1, 'finished', 'lead-1', 'fake done', '{later}'); \
+         UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_B}';"
+    ))
+    .unwrap();
+    let swept = ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(swept["notices_delivered"], 1, "{swept}");
+    assert_eq!(
+        h.count("SELECT COUNT(*) FROM node_command_notice WHERE org_id = 'default' AND sent_at IS NULL"),
+        0
+    );
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM node_command_notice WHERE org_id = '{ORG_B}' AND sent_at IS NULL \
+             AND last_error IS NULL"
+        )),
+        55
+    );
+    h.sql(&format!("UPDATE orgs SET status = 'active' WHERE id = '{ORG_B}'")).unwrap();
+    let swept = ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(swept["notices_delivered"], 50, "{swept}");
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM node_command_notice WHERE sent_at IS NULL"), 0);
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM message_index WHERE org_id = '{ORG_B}'")), 55);
+}

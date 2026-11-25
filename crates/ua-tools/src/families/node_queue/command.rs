@@ -197,9 +197,11 @@ pub(crate) fn record_completion(tx: &WriteTx<'_>, item: &Item, status: &str, sto
 /// Which owed notices [`deliver_pending`] retries.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NoticeScope<'a> {
-    /// One item's notices (after its receipt).
-    Item(&'a str),
-    /// Notices for one node's items (an idle claim, a node's sweep).
+    /// One item's notices (after its receipt): the item's organization and id.
+    Item(&'a str, &'a str),
+    /// Notices for one node's items (an idle claim, a node's sweep). Node
+    /// names are one hub namespace, so each notice is matched to the node
+    /// within the notice's own organization.
     Node(&'a str),
     /// Any node's (the `ua serve` sweep).
     All,
@@ -209,40 +211,49 @@ pub(crate) enum NoticeScope<'a> {
 /// under a stable message id, so a retry never sends twice. Returns how
 /// many were delivered now.
 ///
-/// Only the default organization's notices are sent: the mailbox
-/// (`message_index`) carries no `org_id` yet, so another organization's
-/// notice stays recorded on its `node_command_notice` row, unsent, and its
-/// owner reads the outcome with `node_command_status` (the notification
-/// family's rule for destinations a second organization does not have).
+/// Every organization's notices are sent, each within its own organization:
+/// the mailbox (`message_index`) is keyed by organization, so a notice is
+/// mailed to its owner (the command's `owner_agent`, an agent of the notice's
+/// organization) in that organization's mailbox, its owner session is looked
+/// up there, and another organization's message event keeps no content in
+/// the default ledger (`messaging::send_system`). A notice is never mailed
+/// through another organization's mailbox. A suspended organization's
+/// notices are left owed, not attempted: the mailbox refuses it, and failing
+/// notices at the head of the queue would otherwise fill every batch. They
+/// go out once it is active again (the doctor counts them meanwhile).
 pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usize> {
-    let (item, node) = match scope {
-        NoticeScope::Item(i) => (Some(i.to_string()), None),
-        NoticeScope::Node(n) => (None, Some(n.to_string())),
-        NoticeScope::All => (None, None),
+    let (org, item, node) = match scope {
+        NoticeScope::Item(o, i) => (Some(o.to_string()), Some(i.to_string()), None),
+        NoticeScope::Node(n) => (None, None, Some(n.to_string())),
+        NoticeScope::All => (None, None, None),
     };
-    let owed: Vec<(String, i64, String, String, String, Option<i64>)> = hub.db().read(|c| {
+    type Owed = (String, String, i64, String, String, String, Option<i64>);
+    let owed: Vec<Owed> = hub.db().read(|c| {
         let mut stmt = c.prepare(
-            "SELECT item_id, attempt, terminal, owner_agent, body, task_id FROM node_command_notice \
-             WHERE org_id = ?3 AND sent_at IS NULL AND (?1 IS NULL OR item_id = ?1) \
-             AND (?2 IS NULL OR item_id IN (SELECT id FROM node_dispatch WHERE org_id = ?3 AND node = ?2)) \
-             ORDER BY created_at LIMIT 50",
+            "SELECT n.org_id, n.item_id, n.attempt, n.terminal, n.owner_agent, n.body, n.task_id \
+             FROM node_command_notice n \
+             WHERE n.sent_at IS NULL AND (?3 IS NULL OR n.org_id = ?3) AND (?1 IS NULL OR n.item_id = ?1) \
+             AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = n.org_id AND o.status = 'active') \
+             AND (?2 IS NULL OR n.item_id IN \
+                  (SELECT d.id FROM node_dispatch d WHERE d.org_id = n.org_id AND d.node = ?2)) \
+             ORDER BY n.created_at LIMIT 50",
         )?;
         let rows = stmt
-            .query_map(params![item, node, ua_core::DEFAULT_ORG], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            .query_map(params![item, node, org], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     })?;
     let mut sent = 0;
-    for (item_id, attempt, terminal, owner, body, task_id) in owed {
+    for (org, item_id, attempt, terminal, owner, body, task_id) in owed {
         let mid = format!("node-command-{item_id}-{attempt}-{terminal}");
         // The owner's chosen session (node_command_adopt) first; label mail
         // when that session can no longer take it.
         let session: Option<String> = hub.db().read(|c| {
             Ok(c.query_row(
                 "SELECT owner_session FROM node_command WHERE item_id = ?1 AND org_id = ?2",
-                params![item_id, ua_core::DEFAULT_ORG],
+                params![item_id, org],
                 |r| r.get(0),
             )
             .optional()?
@@ -250,14 +261,22 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
         })?;
         let send = |to_session: Option<&str>| {
             hub.db().write(|tx| {
-                let sent =
-                    messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                let sent = messaging::send_system(
+                    tx,
+                    &org,
+                    NOTICE_SENDER,
+                    &owner,
+                    to_session,
+                    &mid,
+                    &body,
+                    task_id,
+                )?;
                 // `mid` is hub-node's client id; the message's own id is the hub's.
                 let message_id = sent["message_id"].as_str().unwrap_or(&mid).to_string();
                 tx.execute(
                     "UPDATE node_command_notice SET sent_at = ?4, message_id = ?5, last_error = NULL \
                      WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3 AND org_id = ?6",
-                    params![item_id, attempt, terminal, now(), message_id, ua_core::DEFAULT_ORG],
+                    params![item_id, attempt, terminal, now(), message_id, org],
                 )?;
                 Ok(())
             })
@@ -274,7 +293,7 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
                     tx.execute(
                         "UPDATE node_command_notice SET last_error = ?4 \
                          WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3 AND org_id = ?5",
-                        params![item_id, attempt, terminal, msg, ua_core::DEFAULT_ORG],
+                        params![item_id, attempt, terminal, msg, org],
                     )?;
                     Ok(())
                 })?;

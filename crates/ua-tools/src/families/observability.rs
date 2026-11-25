@@ -957,6 +957,11 @@ struct DbFacts {
     /// organization held (`families::idempotency::unplaced_rows`). A
     /// hub-wide count, so only a default-organization reader gets it.
     idempotency_unplaced: Option<i64>,
+    /// Harness config approvals `harness_config.v3.tenant_keys` expired
+    /// (`families::harness_config::upgrade_expired_approvals`): the upgrade
+    /// left no ledger event, so the doctor reports them. Default-organization
+    /// readers only.
+    harness_approvals_expired_at_upgrade: Option<i64>,
 }
 
 /// Database facts for `system_doctor`. The memory counts are organization
@@ -1007,6 +1012,9 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
         idempotency_unplaced: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::idempotency::unplaced_rows(c).ok())
+            .flatten(),
+        harness_approvals_expired_at_upgrade: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::harness_config::upgrade_expired_approvals(c).ok())
             .flatten(),
     })
 }
@@ -1327,6 +1335,14 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
              organization holds"
         ));
     }
+    // Informational: the harness config upgrade expired these approvals in
+    // a schema part, which cannot append to the ledger.
+    if let Some(n) = facts.harness_approvals_expired_at_upgrade.filter(|n| *n > 0) {
+        detail.push_str(&format!(
+            "; {n} harness config approval(s) expired by the organization upgrade (payload without org_id; \
+             no ledger event)"
+        ));
+    }
     let stats = json!({
         "file_bytes": main,
         "wal_bytes": wal,
@@ -1336,6 +1352,7 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         "journal_mode": facts.journal_mode,
         "quick_check": facts.quick_check,
         "idempotency_keys_unplaced": facts.idempotency_unplaced,
+        "harness_config_approvals_expired_at_upgrade": facts.harness_approvals_expired_at_upgrade,
     });
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }
@@ -1775,8 +1792,8 @@ fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     if blocked > 0 {
         row["other_org_nodes_not_accepted"] = json!(blocked);
     }
-    // Another organization's command notices are kept, never sent (the
-    // mailbox has no organization yet); the owner reads node_command_status.
+    // Another organization's command notices are mailed within it; one still
+    // unsent (its delivery keeps failing) is counted here, never named.
     if fleet.other_org_unsent_notices > 0 {
         row["other_org_unsent_command_notices"] = json!(fleet.other_org_unsent_notices);
     }

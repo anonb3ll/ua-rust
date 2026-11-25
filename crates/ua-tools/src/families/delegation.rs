@@ -229,8 +229,9 @@ fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
 /// never share a stored key. Receipts are keyed by `(org_id, key)` and read
 /// only in the caller's organization; another organization's key text also
 /// keeps its organization prefix (`crate::families::tasks::idem_key`), and
-/// the default keeps the `delegate:<label>:<key>` form. Only a label holding `:` is stored
-/// differently from before; [`legacy_receipt_key`] names its old form.
+/// the default keeps the `delegate:<label>:<key>` form. Only a label holding `:`
+/// (and an organization id holding `%` or `/`) is stored differently from
+/// before; [`legacy_receipt_keys`] names the old forms.
 fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
     crate::families::tasks::idem_key(org, "delegate", &format!("{}:{key}", escape_label(from_agent)))
 }
@@ -239,14 +240,31 @@ fn escape_label(label: &str) -> String {
     label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
 }
 
-/// The key a receipt was stored under before labels were escaped, when that
-/// differs from [`receipt_key`] (a label holding `:`). That form is ambiguous
-/// (`a:b` with key `k` and `a` with key `b:k` share it), so a receipt found
-/// there counts only once it is shown to be this agent's: by the request
-/// digest, which covers `from_agent`, or by its delegation's `from_agent`.
-fn legacy_receipt_key(org: &str, from_agent: &str, key: &str) -> Option<String> {
-    (escape_label(from_agent) != from_agent)
-        .then(|| crate::families::tasks::idem_key(org, "delegate", &format!("{from_agent}:{key}")))
+/// The keys a receipt may have been stored under earlier, where they differ
+/// from [`receipt_key`]: before labels were escaped (a label holding `:`),
+/// and, for an organization id holding `%` or `/`, before organization ids
+/// were escaped (`crate::families::tasks::interim_idem_key`). The unescaped
+/// label form is ambiguous (`a:b` with key `k` and `a` with key `b:k` share
+/// it), so a receipt found under any of them counts only once it is shown to
+/// be this agent's: by the request digest, which covers `from_agent`, or by
+/// its delegation's `from_agent`.
+fn legacy_receipt_keys(org: &str, from_agent: &str, key: &str) -> Vec<String> {
+    use crate::families::tasks::{idem_key, interim_idem_key};
+    let current = receipt_key(org, from_agent, key);
+    let escaped = format!("{}:{key}", escape_label(from_agent));
+    let raw = format!("{from_agent}:{key}");
+    let mut out: Vec<String> = Vec::new();
+    let candidates = [
+        Some(idem_key(org, "delegate", &raw)),
+        interim_idem_key(org, "delegate", &escaped),
+        interim_idem_key(org, "delegate", &raw),
+    ];
+    for k in candidates.into_iter().flatten() {
+        if k != current && !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
 }
 
 /// A delegation event about a delegation of organization `org`, through the
@@ -306,17 +324,18 @@ fn replay(existing: Option<(String, Value)>, digests: &[String]) -> UaResult<Opt
 fn find_receipt(
     c: &Connection,
     org: &str,
-    keys: &(String, Option<String>),
+    keys: &(String, Vec<String>),
     digests: &[String],
 ) -> UaResult<Option<Value>> {
     if let Some(done) = replay(read_receipt(c, org, &keys.0)?, digests)? {
         return Ok(Some(done));
     }
-    if let Some(old) = &keys.1
-        && let Some((d, result)) = read_receipt(c, org, old)?
-        && digests.contains(&d)
-    {
-        return Ok(Some(result));
+    for old in &keys.1 {
+        if let Some((d, result)) = read_receipt(c, org, old)?
+            && digests.contains(&d)
+        {
+            return Ok(Some(result));
+        }
     }
     Ok(None)
 }
@@ -624,7 +643,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let org = ctx.caller.org_id.clone();
     let rkeys = idem
         .as_deref()
-        .map(|k| (receipt_key(&org, &from_agent, k), legacy_receipt_key(&org, &from_agent, k)));
+        .map(|k| (receipt_key(&org, &from_agent, k), legacy_receipt_keys(&org, &from_agent, k)));
     let rkey = rkeys.as_ref().map(|k| k.0.clone());
 
     // A committed retry replays before any gate: no second approval, no effect.
@@ -752,25 +771,29 @@ fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let key = validate_idempotency_key(&a.idempotency_key)?;
     let org = ctx.caller.org_id.clone();
     let rkey = receipt_key(&org, &actor, &key);
-    let old = legacy_receipt_key(&org, &actor, &key);
+    let old = legacy_receipt_keys(&org, &actor, &key);
     let found = ctx.hub.db().read(|c| {
         if let Some(hit) = read_receipt(c, &org, &rkey)? {
             return Ok(Some(hit));
         }
-        // A receipt under the old unescaped key counts only when its
-        // delegation is this agent's: that key is shared with another label.
-        let Some(old) = old else { return Ok(None) };
-        let Some((d, result)) = read_receipt(c, &org, &old)? else { return Ok(None) };
-        let Some(id) = result["delegation_id"].as_i64() else { return Ok(None) };
-        let mine = c
-            .query_row(
-                "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2 AND from_agent = ?3",
-                params![org, id, actor],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(mine.then_some((d, result)))
+        // A receipt under an older key counts only when its delegation is
+        // this agent's: the unescaped label form is shared with another label.
+        for old in &old {
+            let Some((d, result)) = read_receipt(c, &org, old)? else { continue };
+            let Some(id) = result["delegation_id"].as_i64() else { continue };
+            let mine = c
+                .query_row(
+                    "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2 AND from_agent = ?3",
+                    params![org, id, actor],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if mine {
+                return Ok(Some((d, result)));
+            }
+        }
+        Ok(None)
     })?;
     Ok(match found {
         Some((_, result)) => json!({ "idempotency_key": key, "state": "committed", "result": result }),
