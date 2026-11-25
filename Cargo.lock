@@ -5421,6 +5421,7 @@ dependencies = [
  "reqwest 0.13.5",
  "rmcp",
  "rusqlite",
+ "rustix",
  "rustls",
  "schemars 1.2.3",
  "secrecy",

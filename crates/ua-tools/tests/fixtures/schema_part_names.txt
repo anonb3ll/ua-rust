@@ -71,6 +71,8 @@ import.v1
 organization.v1.tools.code
 deliverables.v1
 organization.v1.deliverables
+deliverables.v2.files
+organization.v1.deliverable_files
 organization.v1.tools.graph
 organization.v1.tools.web
 skill_registry.v2.tenant_keys

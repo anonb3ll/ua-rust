@@ -905,6 +905,11 @@ fn resolve(ctx: &ToolCtx, args: ResolveArgs) -> UaResult<Value> {
                 if row.requested_by.as_deref() == Some(resolver.as_str()) {
                     return Err(UaError::denied("self_approval", "the approver must differ from the requester"));
                 }
+                if row.tool == crate::families::deliverables::RELEASE_TOOL {
+                    crate::families::deliverables::require_independent_approver(
+                        &row.payload, row.requested_by.as_deref().unwrap_or_default(), &resolver,
+                    )?;
+                }
                 "approved"
             }
             "deny" => {

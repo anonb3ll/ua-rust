@@ -124,6 +124,7 @@ rmcp = { version = "=3.11.0", optional = true, default-features = false, feature
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

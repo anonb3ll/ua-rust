@@ -26,6 +26,14 @@
 //! deliverable is readable by every caller of the task's organization, and
 //! by nobody else (a row of another organization answers `not_found`).
 
+#[cfg(unix)]
+mod file_io;
+mod files;
+#[cfg(not(unix))]
+mod unsupported_io;
+
+pub(crate) use files::{RELEASE_TOOL, require_independent as require_independent_approver};
+
 use rusqlite::Connection;
 use rusqlite::types::Value as Sql;
 use schemars::JsonSchema;
@@ -276,6 +284,7 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
 // --- registration -------------------------------------------------------------------
 
 pub fn register(r: &mut Registry) {
+    files::register(r);
     r.add(
         tool(
             "deliverable_create",
