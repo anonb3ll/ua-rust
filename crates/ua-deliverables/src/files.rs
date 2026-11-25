@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 pub const MAX_BYTES: usize = 1024 * 1024;
 pub const AUTHORIZED: &str = "agent.deliverable.release_authorized";
 pub const RELEASED: &str = "agent.deliverable.released";
+pub const CANCELLED: &str = "agent.deliverable.release_cancelled";
 pub const TAMPERED: &str = "agent.deliverable.tampered";
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -140,6 +141,7 @@ pub fn submit(tx: &mut WriteTx<'_>, input: Submission<'_>) -> UaResult<(FileRevi
 
 pub struct Release {
     pub approval_id: i64,
+    pub revision_id: i64,
     pub requester: String,
     pub approver: String,
     pub destination: String,
@@ -149,37 +151,68 @@ pub struct Release {
     pub ownership_generation: i64,
     pub payload: Option<Vec<u8>>,
     pub released_at: Option<String>,
+    pub cancelled_at: Option<String>,
+}
+
+const RELEASE_COLUMNS: &str = "approval_id, revision_id, requester, approver, destination, root_identity,
+    staging_id, workflow_revision, ownership_generation, payload, released_at, cancelled_at";
+
+fn decode_release(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
+    Ok(Release {
+        approval_id: row.get(0)?,
+        revision_id: row.get(1)?,
+        requester: row.get(2)?,
+        approver: row.get(3)?,
+        destination: row.get(4)?,
+        root_identity: row.get(5)?,
+        staging_id: row.get(6)?,
+        workflow_revision: row.get(7)?,
+        ownership_generation: row.get(8)?,
+        payload: row.get(9)?,
+        released_at: row.get(10)?,
+        cancelled_at: row.get(11)?,
+    })
 }
 
 pub fn release(conn: &Connection, org: &str, revision_id: i64) -> UaResult<Option<Release>> {
     Ok(conn
         .query_row(
-            "SELECT approval_id, requester, approver, destination, root_identity, staging_id,
-                    workflow_revision, ownership_generation, payload, released_at
-             FROM deliverable_releases WHERE org_id = ?1 AND revision_id = ?2",
+            &format!(
+                "SELECT {RELEASE_COLUMNS} FROM deliverable_releases
+                WHERE org_id = ?1 AND revision_id = ?2 AND cancelled_at IS NULL"
+            ),
             params![org, revision_id],
-            |row| {
-                Ok(Release {
-                    approval_id: row.get(0)?,
-                    requester: row.get(1)?,
-                    approver: row.get(2)?,
-                    destination: row.get(3)?,
-                    root_identity: row.get(4)?,
-                    staging_id: row.get(5)?,
-                    workflow_revision: row.get(6)?,
-                    ownership_generation: row.get(7)?,
-                    payload: row.get(8)?,
-                    released_at: row.get(9)?,
-                })
-            },
+            decode_release,
         )
         .optional()?)
+}
+
+pub fn release_by_approval(conn: &Connection, org: &str, approval_id: i64) -> UaResult<Option<Release>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {RELEASE_COLUMNS} FROM deliverable_releases WHERE org_id = ?1 AND approval_id = ?2"
+            ),
+            params![org, approval_id],
+            decode_release,
+        )
+        .optional()?)
+}
+
+pub fn latest_cancellation(conn: &Connection, org: &str, revision_id: i64) -> UaResult<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT MAX(approval_id) FROM deliverable_releases
+         WHERE org_id = ?1 AND revision_id = ?2 AND cancelled_at IS NOT NULL",
+        params![org, revision_id],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn destination_reserved(conn: &Connection, org: &str, root: &str, name: &str) -> UaResult<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM deliverable_releases
-         WHERE org_id = ?1 AND root_identity = ?2 AND destination = ?3 COLLATE NOCASE)",
+         WHERE org_id = ?1 AND root_identity = ?2 AND destination = ?3 COLLATE NOCASE
+           AND cancelled_at IS NULL)",
         params![org, root, name],
         |row| row.get(0),
     )?)
@@ -196,21 +229,38 @@ pub fn authorize(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release) -
             release.root_identity, release.staging_id, release.workflow_revision, release.ownership_generation,
             release.payload],
     )?;
-    release_event(tx, file, release, AUTHORIZED)
+    release_event(tx, file, release, AUTHORIZED, &release.requester)
 }
 
 pub fn complete(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release) -> UaResult<String> {
     let org = row_org(tx, &file.deliverable.org_id)?;
     let now = ua_core::time::now();
     let changed = tx.execute(
-        "UPDATE deliverable_releases SET released_at = ?3, payload = NULL
-         WHERE org_id = ?1 AND revision_id = ?2 AND released_at IS NULL",
-        params![org, file.revision.id, now],
+        "UPDATE deliverable_releases SET released_at = ?4, payload = NULL
+         WHERE org_id = ?1 AND revision_id = ?2 AND approval_id = ?3
+           AND released_at IS NULL AND cancelled_at IS NULL",
+        params![org, file.revision.id, release.approval_id, now],
     )?;
     if changed != 1 {
         return Err(UaError::conflict("release is already complete"));
     }
-    release_event(tx, file, release, RELEASED)?;
+    release_event(tx, file, release, RELEASED, &release.requester)?;
+    Ok(now)
+}
+
+pub fn cancel(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release, by: &str) -> UaResult<String> {
+    let org = row_org(tx, &file.deliverable.org_id)?;
+    let now = ua_core::time::now();
+    let changed = tx.execute(
+        "UPDATE deliverable_releases SET cancelled_at = ?4, cancelled_by = ?5, payload = NULL
+         WHERE org_id = ?1 AND revision_id = ?2 AND approval_id = ?3
+           AND released_at IS NULL AND cancelled_at IS NULL",
+        params![org, file.revision.id, release.approval_id, now, by],
+    )?;
+    if changed != 1 {
+        return Err(UaError::conflict("release is no longer pending"));
+    }
+    release_event(tx, file, release, CANCELLED, by)?;
     Ok(now)
 }
 
@@ -219,6 +269,7 @@ fn release_event(
     file: &FileRevision,
     release: &Release,
     channel: &str,
+    by: &str,
 ) -> UaResult<()> {
     ledger::append(
         tx,
@@ -228,7 +279,7 @@ fn release_event(
             "approval_id": release.approval_id, "approver": release.approver,
             "destination": release.destination, "root_identity": release.root_identity,
         }))
-        .by(release.requester.as_str()),
+        .by(by),
     )?;
     Ok(())
 }

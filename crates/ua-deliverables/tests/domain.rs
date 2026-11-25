@@ -60,6 +60,63 @@ fn the_released_schema_part_keeps_its_name_and_checksum() {
 }
 
 #[test]
+fn cancellation_migration_preserves_pending_and_completed_intents() {
+    use ua_deliverables::files::{destination_reserved, release, release_by_approval};
+    use ua_store::schema::apply;
+
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let mut parts: Vec<Part> =
+        vec![ledger::SCHEMA.into(), ledger::META_SCHEMA.into(), ua_store::org::STORE_PART.into()];
+    let releases = ua_deliverables::schema_parts();
+    parts.extend_from_slice(&releases[..4]);
+    apply(&mut conn, &parts).unwrap();
+    conn.execute_batch(
+        "INSERT INTO deliverables (id, org_id, task_id, kind, title, created_by, created_at)
+         VALUES (2, 'default', 1, 'file', 'pending', 'builder-1', 'created'),
+                (4, 'default', 2, 'file', 'complete', 'builder-1', 'created');
+         INSERT INTO deliverable_revisions (id, org_id, deliverable_id, rev_no, identity, producer, recorded_at)
+         SELECT id, org_id, id, 1, printf('%064d', id), 'builder-1', 'recorded' FROM deliverables;
+         INSERT INTO deliverable_files (revision_id, org_id, source_path, size_bytes)
+         VALUES (2, 'default', 'draft.txt', 4), (4, 'default', 'final.txt', 4);
+         INSERT INTO deliverable_releases (
+             revision_id, org_id, approval_id, requester, approver, destination, root_identity, staging_id,
+             workflow_revision, ownership_generation, payload, released_at
+         )
+         VALUES (2, 'default', 17, 'builder-1', 'operator', 'draft.txt', 'test-root', 'stage-a', 8, 3,
+                 X'74657374', NULL),
+                (4, 'default', 32, 'builder-1', 'operator', 'final.txt', 'test-root', 'stage-b', 2, 1,
+                 NULL, 'completed');",
+    )
+    .unwrap();
+    parts.extend_from_slice(&releases[4..]);
+    assert_eq!(
+        apply(&mut conn, &parts).unwrap(),
+        ["deliverables.v3.release_cancellation", "organization.v1.deliverable_release_cancellation"]
+    );
+    assert!(apply(&mut conn, &parts).unwrap().is_empty());
+    let pending = release(&conn, DEFAULT_ORG, 2).unwrap().unwrap();
+    assert_eq!((pending.approval_id, pending.staging_id.as_str()), (17, "stage-a"));
+    assert_eq!((pending.workflow_revision, pending.ownership_generation), (8, 3));
+    assert_eq!(pending.payload.as_deref(), Some(b"test".as_slice()));
+    assert!(pending.cancelled_at.is_none());
+    let completed = release_by_approval(&conn, DEFAULT_ORG, 32).unwrap().unwrap();
+    assert_eq!((completed.revision_id, completed.released_at.as_deref()), (4, Some("completed")));
+    assert!(completed.payload.is_none());
+    assert!(destination_reserved(&conn, DEFAULT_ORG, "test-root", "FINAL.TXT").unwrap());
+    assert!(destination_reserved(&conn, DEFAULT_ORG, "test-root", "DRAFT.TXT").unwrap());
+    for sql in [
+        "UPDATE deliverable_releases SET destination = 'elsewhere.txt' WHERE approval_id = 17",
+        "UPDATE deliverable_releases SET cancelled_at = 'cancelled', payload = NULL WHERE approval_id = 17",
+        "UPDATE deliverable_releases SET released_at = NULL, cancelled_at = 'cancelled',
+         cancelled_by = 'operator' WHERE approval_id = 32",
+        "DELETE FROM deliverable_releases WHERE approval_id = 17",
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "{sql}");
+    }
+}
+
+#[test]
 fn revisions_are_numbered_in_order_and_each_is_ledgered() {
     let db = db();
     let (d, created) = db.write(|tx| ua_deliverables::create(tx, new(7, "changelog generator"))).unwrap();

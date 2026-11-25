@@ -588,6 +588,11 @@ mod file_releases {
         let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
         f.review().await;
         let args = json!({"revision_id":rev, "destination":"report.txt"});
+        let (id, stage) = authorize_without_publishing(f, &args).await;
+        (id, args, stage)
+    }
+
+    async fn authorize_without_publishing(f: &Files, args: &Value) -> (i64, PathBuf) {
         let id = f.approval(&builder(), args.clone()).await;
         f.approve(id).await;
         f.h.hub
@@ -615,7 +620,7 @@ mod file_releases {
                 .unwrap();
         let stage = f.destination.join(format!(".ua-release-{stage_id}"));
         f.h.hub.db().write(|tx| Ok(tx.execute_batch("DROP TRIGGER fail_release_event")?)).unwrap();
-        (id, args, stage)
+        (id, stage)
     }
 
     #[tokio::test]
@@ -674,6 +679,136 @@ mod file_releases {
         assert!(!f.destination.join("report.txt").exists());
         assert!(f.h.events("agent.deliverable.released").is_empty());
         assert_eq!(f.h.n("SELECT COUNT(*) FROM tasks WHERE status = 'done'"), 0);
+    }
+
+    const CANCEL: &str = "deliverable_release_cancel";
+    const CANCELLED: &str = "agent.deliverable.release_cancelled";
+
+    #[tokio::test]
+    async fn operator_cancels_an_unpublished_intent_and_a_new_attempt_needs_fresh_approval() {
+        let f = Files::new().await;
+        let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
+        f.review().await;
+        let alternate = json!({"revision_id": rev, "destination": "alternate.txt"});
+        let old_alternate = f.approval(&builder(), alternate.clone()).await;
+        f.approve(old_alternate).await;
+        let args = json!({"revision_id": rev, "destination": "report.txt"});
+        let (id, stage) = authorize_without_publishing(&f, &args).await;
+        let cancel = json!({"approval_id": id});
+        let dest = f.destination.join("report.txt");
+        // The same bytes at a different inode are an unrelated collision.
+        fs::write(&stage, b"reviewed report").unwrap();
+        fs::write(&dest, b"reviewed report").unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_release", args.clone()).await),
+            "release_destination_exists"
+        );
+        for agent in [builder(), reviewer()] {
+            let agent = Caller { enforce_profile: false, ..agent };
+            assert_eq!(reason(&f.h.err(&agent, CANCEL, cancel.clone()).await), "authority_required");
+        }
+        let foreign = Caller { org_id: "org-other".into(), ..human() };
+        assert_eq!(reason(&f.h.err(&foreign, CANCEL, cancel.clone()).await), "org_unsupported");
+
+        let operator = Caller { enforce_profile: true, ..human() };
+        let result = f.h.ok(&operator, CANCEL, cancel.clone()).await;
+        assert_eq!(result["approval_id"], id);
+        assert_eq!(result["revision_id"], rev);
+        assert_eq!(result["cancelled"], true);
+        assert!(!stage.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"reviewed report");
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals WHERE status = 'consumed'"), 1);
+        assert_eq!(
+            f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE payload IS NULL
+                   AND cancelled_at IS NOT NULL AND cancelled_by = 'operator' AND released_at IS NULL"),
+            1
+        );
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM task_workflow WHERE stage = 'review'"), 1);
+        assert!(f.h.events("agent.deliverable.released").is_empty());
+        let events = f.h.events(CANCELLED);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_by"], "operator");
+        assert_eq!(events[0]["approval_id"], id);
+
+        assert_ne!(f.approval(&builder(), alternate).await, old_alternate);
+        fs::remove_file(&dest).unwrap();
+        let fresh = f.approval(&builder(), args.clone()).await;
+        assert_ne!(fresh, id);
+        f.approve(fresh).await;
+        let out = f.h.ok(&builder(), "deliverable_release", args).await;
+        assert_eq!(out["approval_id"], fresh);
+        let replay = f.h.ok(&operator, CANCEL, cancel).await;
+        assert_eq!(replay["cancelled"], false);
+        assert_eq!(replay["cancelled_at"], result["cancelled_at"]);
+        assert_eq!(f.h.events(CANCELLED).len(), 1);
+        assert_eq!(fs::read(&dest).unwrap(), b"reviewed report");
+        assert_eq!(
+            reason(&f.h.err(&operator, CANCEL, json!({"approval_id": fresh})).await),
+            "release_already_published"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_refuses_an_already_linked_or_uncertain_intent() {
+        let f = Files::new().await;
+        let (id, args, stage) = pending_intent(&f).await;
+        fs::write(&stage, b"reviewed report").unwrap();
+        let dest = f.destination.join("report.txt");
+        fs::hard_link(&stage, &dest).unwrap();
+        let cancel = json!({"approval_id": id});
+        assert_eq!(reason(&f.h.err(&human(), CANCEL, cancel.clone()).await), "release_already_published");
+        let moved = f.destination.join("moved.txt");
+        fs::rename(&dest, &moved).unwrap();
+        assert_eq!(reason(&f.h.err(&human(), CANCEL, cancel).await), "release_publication_uncertain");
+        assert!(f.h.events(CANCELLED).is_empty());
+        assert_eq!(fs::read(&moved).unwrap(), b"reviewed report");
+        fs::rename(moved, &dest).unwrap();
+        assert_eq!(f.h.ok(&builder(), "deliverable_release", args).await["approval_id"], id);
+        assert_eq!(fs::read(dest).unwrap(), b"reviewed report");
+    }
+
+    #[tokio::test]
+    async fn failed_cancellation_preserves_pending_bytes_and_staging() {
+        let f = Files::new().await;
+        let (id, args, stage) = pending_intent(&f).await;
+        fs::write(&stage, b"reviewed report").unwrap();
+        f.h.hub
+            .db()
+            .write(|tx| {
+                Ok(tx.execute_batch(
+                    "CREATE TRIGGER fail_cancel_event BEFORE INSERT ON event_log
+             WHEN NEW.channel = 'agent.deliverable.release_cancelled'
+             BEGIN SELECT RAISE(ABORT, 'simulated cancellation ledger failure'); END;",
+                )?)
+            })
+            .unwrap();
+        assert!(f.h.call(&human(), CANCEL, json!({"approval_id": id})).await.is_err());
+        assert_eq!(
+            f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE payload IS NOT NULL
+                         AND cancelled_at IS NULL AND released_at IS NULL"),
+            1
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"reviewed report");
+        assert!(f.h.events(CANCELLED).is_empty());
+        assert_eq!(f.h.ok(&builder(), "deliverable_release", args).await["approval_id"], id);
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_publication_cannot_both_succeed() {
+        let f = Files::new().await;
+        let (id, args, stage) = pending_intent(&f).await;
+        let requester = builder();
+        let operator = human();
+        let (publish, cancel) = tokio::join!(
+            f.h.call(&requester, "deliverable_release", args),
+            f.h.call(&operator, CANCEL, json!({"approval_id": id})),
+        );
+        assert_ne!(publish.is_ok(), cancel.is_ok());
+        assert_eq!(f.destination.join("report.txt").exists(), publish.is_ok());
+        assert!(!stage.exists());
+        assert_eq!(f.h.events(CANCELLED).len(), usize::from(cancel.is_ok()));
+        assert_eq!(f.h.events("agent.deliverable.released").len(), usize::from(publish.is_ok()));
     }
 
     #[tokio::test]
