@@ -39,6 +39,7 @@ pub mod routines;
 pub mod runs;
 pub mod sessions_lifecycle;
 pub mod skill_registry;
+pub mod skill_sources;
 pub mod skills;
 pub mod slack;
 pub mod tasks;

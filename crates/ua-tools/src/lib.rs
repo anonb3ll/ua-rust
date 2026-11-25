@@ -222,6 +222,9 @@ pub fn schema_parts() -> Vec<Part> {
     // After the node parts: the triggers read `nodes` and `node_dispatch`.
     parts.push(families::agents::TENANT_PART.into());
     parts.push(families::agents::ORG_SCOPE.into());
+    // Org-scoped Git skill source allowlist (born tenant-scoped; D2a).
+    parts.push(families::skill_sources::SCHEMA.into());
+    parts.push(families::skill_sources::TENANT_PART.into());
     parts
 }
 
