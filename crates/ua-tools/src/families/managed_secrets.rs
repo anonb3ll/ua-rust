@@ -445,9 +445,15 @@ pub(crate) fn open_once(
                     format!("managed secret {name:?} was sealed with a key that is no longer configured"),
                 ))),
             },
-            _ => Err(Err(UaError::denied(
+            Ok(None) => Err(Err(UaError::denied(
                 "secret_key_unset",
                 "managed_secret_key is not set; stored secrets cannot be decrypted",
+            ))),
+            // The setting does not parse: say so, not that it is unset.
+            Err(_) => Err(Err(UaError::denied(
+                "secret_key_invalid",
+                "managed_secret_key does not parse (32 bytes as base64 or 64 hex characters, comma-separated \
+                 to rotate); stored secrets cannot be decrypted",
             ))),
         },
     };
@@ -1120,6 +1126,26 @@ mod tests {
         assert!(decode_key(&base64::engine::general_purpose::STANDARD.encode([1u8; 16])).is_none());
         assert!(keyring(&cfg_with("nope")).is_err());
         assert!(keyring(&Config::for_home(std::env::temp_dir())).unwrap().is_none());
+    }
+
+    /// A stored row under a key setting that does not parse is reported
+    /// as that, not as an unset key; an unset key stays `secret_key_unset`.
+    #[test]
+    fn open_once_names_why_the_keyring_is_unusable() {
+        let row = SealedRow {
+            consumer: "mcp:docs".into(),
+            key_id: "0000000000000000".into(),
+            nonce: vec![0; 12],
+            ciphertext: vec![0; 32],
+            aad_v: AAD_V,
+        };
+        let code = |cfg: &Config| {
+            let e = open_once(cfg, DEFAULT_ORG, "tok", "mcp:docs", Some(&row)).unwrap_err();
+            e.reason_code().map(str::to_string)
+        };
+        assert_eq!(code(&cfg_with("not-a-key")).as_deref(), Some("secret_key_invalid"));
+        assert_eq!(code(&Config::for_home(std::env::temp_dir())).as_deref(), Some("secret_key_unset"));
+        assert_eq!(code(&cfg_with(K1)).as_deref(), Some("secret_key_missing"));
     }
 
     #[test]

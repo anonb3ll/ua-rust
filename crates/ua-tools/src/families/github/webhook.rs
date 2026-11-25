@@ -68,9 +68,10 @@
 //! of that organization.
 //! Afterwards both records are marked `finished`; when handling failed with
 //! an internal error they are released instead, so a redelivery (by hand
-//! from GitHub, which does not redeliver on its own) is processed. A delivery that was accepted but never finished (the hub
-//! stopped while handling it, or it has been in flight for 15 minutes) is
-//! processed again when it is redelivered, not refused: every effect is
+//! from GitHub, which does not redeliver on its own) is processed. A
+//! delivery that was accepted but never finished (the hub stopped while
+//! handling it, or it has been in flight for 15 minutes) is processed
+//! again when it is redelivered, not refused: every effect is
 //! idempotent. The ledger event of such a redelivery says
 //! `"redelivered": true`. Settling is by claim: records a redelivery took
 //! over meanwhile are left to it. When the sweep abandons deliveries taken
@@ -113,7 +114,8 @@ use crate::families::tasks::{emit, ledger_text};
 pub(crate) const KEEP_DAYS: i64 = 30;
 const KEEP_MAX: i64 = 20_000;
 /// A delivery accepted longer ago than this, or by a process that has
-/// stopped, is taken on again when GitHub redelivers it.
+/// stopped, is taken on again when it is redelivered (by hand from GitHub,
+/// which does not redeliver on its own).
 const IN_FLIGHT_S: i64 = 15 * 60;
 const SOURCE: &str = "github";
 const KIND_ID: &str = "delivery_id";

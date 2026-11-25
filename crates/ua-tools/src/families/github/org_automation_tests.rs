@@ -22,6 +22,7 @@
 mod cases {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use axum::Router;
     use axum::extract::{Request, State};
@@ -652,6 +653,79 @@ mod cases {
         assert!(h.doctor_line().await.contains("0 webhook route(s) refused"));
     }
 
+    /// Hide the table the sharing check reads, so the check fails with a
+    /// database error, run it, and put the table back.
+    async fn fail_one_check(h: &H) {
+        h.sql("ALTER TABLE managed_secrets RENAME TO managed_secrets_hidden");
+        h.hub.rescan_shared_webhook_secrets().await;
+        h.sql("ALTER TABLE managed_secrets_hidden RENAME TO managed_secrets");
+    }
+
+    /// A sharing check that fails (an injected database error) refuses
+    /// every route, the bare route included, with the answer a bad
+    /// signature gets, and the doctor says every route is refused. A later
+    /// check that succeeds serves them all again.
+    #[tokio::test]
+    async fn a_failed_sharing_check_refuses_every_route_until_one_succeeds() {
+        let h = H::new(ALL).await;
+        // No background retry during this test: only the explicit check.
+        h.hub.set_webhook_scan_retry(Duration::from_secs(3600), Duration::from_secs(3600));
+        h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "failed-0", b"{\"n\": 0}").await.unwrap();
+        fail_one_check(&h).await;
+        assert!(h.hub.shared_webhook_routes().is_none());
+        for (i, (to, secret)) in
+            [(DEFAULT_ORG, HUB_HOOK), (ORG_B, B_HOOK), (ORG_C, C_HOOK)].into_iter().enumerate()
+        {
+            let body = format!("{{\"n\": {}}}", i + 1);
+            let e = h.deliver(to, Some(secret), "ping", &format!("failed-{}", i + 1), body.as_bytes()).await;
+            assert_eq!(e.unwrap_err(), WebhookError::BadSignature, "{to}");
+        }
+        assert!(
+            h.doctor_line()
+                .await
+                .contains("every webhook route refused because the webhook secret sharing check failed")
+        );
+
+        h.hub.rescan_shared_webhook_secrets().await;
+        assert!(h.hub.shared_webhook_routes().unwrap().is_empty());
+        for (i, (to, secret)) in
+            [(DEFAULT_ORG, HUB_HOOK), (ORG_B, B_HOOK), (ORG_C, C_HOOK)].into_iter().enumerate()
+        {
+            let body = format!("{{\"n\": {}}}", i + 4);
+            h.deliver(to, Some(secret), "ping", &format!("failed-{}", i + 4), body.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// On a serving hub a failed sharing check is retried in the
+    /// background while it keeps failing; the first retry that succeeds
+    /// serves the routes again, and the retry then stops.
+    #[tokio::test]
+    async fn a_failed_sharing_check_is_retried_in_the_background() {
+        let h = H::new(ALL).await;
+        h.hub.set_webhook_scan_retry(Duration::from_millis(20), Duration::from_millis(80));
+        h.sql("ALTER TABLE managed_secrets RENAME TO managed_secrets_hidden");
+        h.hub.rescan_shared_webhook_secrets().await;
+        assert!(h.hub.shared_webhook_routes().is_none());
+        assert!(h.hub.webhook_scan_retrying());
+        // Several retries run and fail while the table is gone.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(h.hub.shared_webhook_routes().is_none());
+        assert!(h.hub.webhook_scan_retrying());
+        h.sql("ALTER TABLE managed_secrets_hidden RENAME TO managed_secrets");
+        let started = std::time::Instant::now();
+        while h.hub.shared_webhook_routes().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the retry never succeeded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.hub.shared_webhook_routes().unwrap().is_empty());
+        h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "retried-1", b"{\"n\": 1}").await.unwrap();
+        h.deliver(ORG_B, Some(B_HOOK), "ping", "retried-2", b"{\"n\": 2}").await.unwrap();
+        while h.hub.webhook_scan_retrying() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the retry did not stop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// An internal failure on the default organization's route answers 500
     /// with the same fixed message as any other route, never the error's
     /// text.
@@ -998,11 +1072,11 @@ mod cases {
 
     /// Organization C's handling fails (an injected database failure): its
     /// route answers 500 with a fixed message, and C's records are released,
-    /// so GitHub's redelivery is processed. The default organization takes
-    /// the same body on its own route independently (replay records are per
-    /// organization). The PR merged off the merge branch, so each
-    /// organization ledgers `merged_to_non_default`: the default
-    /// organization's names the branches, C's does not.
+    /// so a redelivery (sent by hand from GitHub) is processed. The default
+    /// organization takes the same body on its own route independently
+    /// (replay records are per organization). The PR merged off the merge
+    /// branch, so each organization ledgers `merged_to_non_default`: the
+    /// default organization's names the branches, C's does not.
     #[tokio::test]
     async fn an_internal_failure_answers_neutrally_and_the_redelivery_is_processed() {
         const BASE: &str = "release-branch-91c2";

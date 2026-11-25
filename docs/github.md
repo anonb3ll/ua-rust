@@ -142,9 +142,17 @@ reconciliation all do (see [Automation per organization](#automation-per-organiz
   whose secret is shared. The hub logs an error naming the organizations
   (never a value or a fingerprint), and the `system_doctor`
   `github_credentials` line counts the refused routes and reads DEGRADED.
-  If the check itself fails, every webhook route is refused until one
-  succeeds (restart the hub, or set or clear a webhook secret). Fix it by
-  giving each route its own secret, then restart the hub.
+  If the check itself fails (a database error), every webhook route, the
+  bare route included, is refused until one succeeds; GitHub does not
+  redeliver those deliveries. While that lasts the serving hub retries the
+  check in the background, after 1 second and then doubling to once a
+  minute, and stops as soon as one succeeds; restart the hub if it keeps
+  failing. Fix a shared secret by giving each route its own, then restart
+  the hub. Only the serving hub (`ua serve`) runs the check; a secret
+  cleared from a separate `ua` process (`ua call`) is not seen by the
+  serving hub until its next check or a restart, and the background retry
+  does not cover that case, since it runs only while the last check
+  failed.
 
 ## Security model
 
@@ -237,9 +245,16 @@ cannot send one). Before anything is parsed or stored:
    `github_webhook_read_timeout_ms` (default 10 000, GitHub's own delivery
    timeout; 50 to 60 000) to send its whole body; a slower one is answered
    408 `timeout` and its slot is freed. A sender that declares a body and
-   never sends it therefore holds a slot for that long at most; enough of
-   them at once can still fill the cap, which is what the wait and the
-   larger default absorb.
+   never sends it therefore holds a slot for that long at most, but no
+   longer protects anything: at the defaults, a sustained sender opening
+   about 1.6 connections a second (16 slots over 10 seconds) keeps all 16
+   slots busy, and real deliveries are answered 429. The cap is a floor
+   that bounds memory and work, not protection against that. On a hub
+   reachable from the internet, put one of these in front: a reverse proxy
+   that buffers the whole request body before passing it on (nginx
+   `proxy_request_buffering on`, its default), an allowlist of GitHub's
+   hook source ranges (the `hooks` list of GitHub's `/meta` API), or a
+   per-IP connection or rate limit.
 
 **A delivery answered 429, 408 or 500 is lost unless something brings it
 back.** GitHub does not redeliver a failed delivery on its own. Enable the
@@ -253,8 +268,9 @@ The delivery id, the body hash (both `accepted` by this process) and an
 `agent.github.webhook.received` event are written in one transaction before
 any effect. After the effects both records are marked `finished`, and a later
 copy is a replay. If an effect fails with an internal error, the id and hash
-are released instead, so a redelivery (by hand, or the poller's pass) is
-processed again. If the hub
+are released instead, so a redelivery (by hand from GitHub) is processed
+again; the poller, when enabled, reconciles what the delivery would have
+done, but does not redeliver it. If the hub
 stops between recording a delivery and finishing it, or the delivery has been
 in flight for 15 minutes, a redelivery is processed again rather than
 refused, and its ledger event says `"redelivered": true`. Every effect is

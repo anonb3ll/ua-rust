@@ -36,6 +36,9 @@ from its commit history.
   each other; every matching route, the bare route included, answers
   401 `bad_signature` until each has its own secret. The hub logs an error
   naming the organizations, and `system_doctor` counts the refused routes.
+  Only the serving hub runs the check. If it fails (a database error),
+  every route is refused while the hub retries it in the background with
+  a backoff capped at one minute, until one succeeds.
 - Every webhook refusal takes the same steps: one database read with the
   same query for any organization id, one AES-GCM decryption (a dummy one
   when there is nothing to decrypt) and one MAC. Equal work, not constant

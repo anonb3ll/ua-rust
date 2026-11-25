@@ -245,6 +245,69 @@ async fn an_oversized_declared_body_is_refused_without_a_slot() {
     assert_eq!(hub.send(req).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A body that trickles in, one byte at a time and never finishing, is
+/// held to the whole-body deadline, not a per-read one: it is answered 408
+/// `timeout` and its slot serves the next delivery.
+#[tokio::test]
+async fn a_trickling_body_is_held_to_the_whole_body_deadline() {
+    let mut cfg = config(true);
+    cfg.github_webhook_max_in_flight = 1;
+    cfg.github_webhook_busy_wait_ms = 0;
+    cfg.github_webhook_read_timeout_ms = 200;
+    let hub = hub_with_orgs(cfg);
+    let trickle = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Some((Ok::<_, std::io::Error>(Bytes::from_static(b" ")), ()))
+    });
+    let req = Request::post("/api/github/webhook")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-github-event", "ping")
+        .header("x-github-delivery", "trickle-1")
+        .body(Body::from_stream(trickle))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let resp = hub.send(req).await;
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(json_body(resp).await["error"], "timeout");
+    let resp = hub.send(ping("/api/github/webhook", Some(HUB_HOOK), "trickle-2")).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the slot was freed");
+}
+
+/// A chunked body with no Content-Length is cut off once it passes 5 MiB:
+/// answered 413 `too_large`, nothing recorded, and its slot is freed.
+#[tokio::test]
+async fn an_oversized_chunked_body_is_refused_at_the_limit() {
+    let mut cfg = config(true);
+    cfg.github_webhook_max_in_flight = 1;
+    cfg.github_webhook_busy_wait_ms = 0;
+    cfg.github_webhook_read_timeout_ms = 5_000;
+    let hub = hub_with_orgs(cfg);
+    // 200 chunks of 64 KiB (12.5 MiB): the limit is passed at the 81st.
+    let chunk = Bytes::from(vec![b' '; 64 * 1024]);
+    let chunks = futures::stream::iter((0..200).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+    let req = Request::post("/api/github/webhook")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-github-event", "ping")
+        .header("x-github-delivery", "chunked-1")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+    assert!(req.headers().get(header::CONTENT_LENGTH).is_none());
+    let resp = hub.send(req).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(json_body(resp).await["error"], "too_large");
+    let n: i64 = hub
+        .state
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM inbound_deliveries", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(n, 0, "nothing was recorded");
+    let resp = hub.send(ping("/api/github/webhook", Some(HUB_HOOK), "chunked-2")).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the slot was freed");
+}
+
 #[test]
 fn the_cap_defaults_to_sixteen_and_is_at_least_one() {
     use std::time::Duration;

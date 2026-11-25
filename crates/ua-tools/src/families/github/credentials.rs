@@ -305,7 +305,7 @@ pub(crate) fn webhook_route_secret(cfg: &Config, org: &str, found: RouteLookup) 
         }
         Ok(None) => None,
         Err(e) => {
-            unusable(e.code());
+            unusable(e.reason_code().unwrap_or(e.code()));
             None
         }
     }
@@ -388,7 +388,8 @@ pub fn log_shared_webhook_secrets(found: Option<&SharedWebhookRoutes>) {
     match found {
         None => tracing::error!(
             "could not check GitHub webhook secrets for sharing; every GitHub webhook route is refused until a \
-             check succeeds (restart the hub, or set or clear a webhook secret)"
+             check succeeds (the serving hub retries the check, backing off to once a minute; restart the hub if \
+             it keeps failing)"
         ),
         Some(shared) if !shared.is_empty() => tracing::error!(
             routes = shared.len(),
