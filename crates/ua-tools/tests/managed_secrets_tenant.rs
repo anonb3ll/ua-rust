@@ -1037,11 +1037,14 @@ async fn another_organizations_gateway_call_writes_nothing_to_the_default_ledger
     assert_eq!(gateway_events("lead-1"), 1, "the default organization's call is still ledgered");
 }
 
-/// The gateway's organization refusal is a registry pre-gate: with a
-/// registry approval gate on `mcp_gateway` (`UA_APPROVAL_TOOLS`), another
-/// organization's call is refused `org_unsupported` and parks no approval
-/// nobody could grant. The default organization's call does park one, which
-/// shows the gate applies.
+/// The MCP tools' organization refusal is a registry pre-gate: with a
+/// registry approval gate on `mcp_gateway` and `mcp_server_list`
+/// (`UA_APPROVAL_TOOLS`), another organization's call to either is refused
+/// `org_unsupported` and parks no approval nobody could grant. The default
+/// organization's call to each does park one, which shows the gate applies
+/// to both: `approval_tools` gates a read-only tool too, so without its
+/// pre-gate organization B's `mcp_server_list` call would park an approval
+/// (checked by removing it) and each half of the test is load-bearing.
 #[tokio::test]
 async fn the_gateway_refuses_another_organization_before_any_approval_is_parked() {
     if !cfg!(feature = "mcp-gateway") {
@@ -1082,6 +1085,9 @@ async fn the_gateway_refuses_another_organization_before_any_approval_is_parked(
     let e = h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "docs", "tool": "echo" })).await;
     assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
     assert_eq!(approvals(), 1);
+    let e = h.err(&op(agent(DEFAULT_ORG)), "mcp_server_list", json!({})).await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
+    assert_eq!(approvals(), 2);
 }
 
 #[test]

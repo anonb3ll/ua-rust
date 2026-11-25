@@ -1002,8 +1002,11 @@ here for memory columns, owners and defaults.
   organization's work: the device plane binds every call to the node
   token's organization (`Caller.org_id`), so a token of organization B never
   reaches a default node even under the same label. Hub-wide operator views
-  stay default-organization only, plus counts: `system_doctor`'s fleet row
-  names only the default organization's nodes and adds `other_org_nodes`
+  stay default-organization only, plus counts: a default-organization
+  caller's `system_doctor` fleet row names only the default organization's
+  nodes (another organization's caller sees its own nodes there and no
+  counts, see "No workspace outside the default organization yet") and
+  adds `other_org_nodes`
   (`{active, retired}`), `other_org_nodes_not_accepted` (nodes in service
   that take no real work while `node_require_acceptance` is on, named in
   the row's detail) and `other_org_unsent_command_notices`, and a provider
@@ -1338,13 +1341,31 @@ here for memory columns, owners and defaults.
     so it never learns whether a proposal or an earlier one exists there.
     The Dash docsets (`dash_list`, `dash_search`, `dash_view`) are refused
     (`org_unsupported`) before `dash_docsets` is read. `system_doctor`
-    gives another organization one neutral line each for `vault`,
-    `workspace_root`, `database` and `policy_file` ("not available to this
-    organization", the same whatever the hub holds) and never runs those
-    checks for it: no host name, no database or WAL size, page counts,
-    statistics or deep `quick_check`, and nothing about whether a policy
-    file is configured, missing or broken. Its own counts (memory notes,
-    embeddings, tokens) stay in their lines. A local
+    for another organization's caller reports exactly this. Its own:
+    `semantic_search` (its own notes and embeddings), `github_credentials`
+    (its own credentials, failing polls and refused webhook route, counts
+    only) and `fleet_nodes` (its own nodes in service with their state and
+    last heartbeat, and its own retired node names; no `other_org_*`
+    count). Neutral hub lines, `DORMANT` "not available to this
+    organization" whatever the hub holds, for `hub_auth`, `vault`,
+    `workspace_root`, `database`, `schema`, `notify_webhook` and
+    `policy_file`; none of those checks runs for it, so it learns no
+    static-token or human count, path, database or WAL size, page count,
+    deep `quick_check`, drifted schema object, webhook scheme, host,
+    secret header or last delivery, nor whether a policy file is
+    configured or broken. `ledger_chain`: `LIVE` "the hub's ledger
+    verifies" or `DEGRADED` "the hub's ledger is broken", with no entry
+    count, seq or reason; it reuses the hub's last full verify (a
+    default-organization doctor or anomaly check runs one on every call)
+    while that is at most five minutes old, else runs one and keeps it, so
+    other organizations cause at most one full ledger read per five
+    minutes and the answer may be that old. The build-wide lines are the
+    same for every caller: `http_bind`, `approval_gating`,
+    `search_provider`, `build_features`, `zulip`, `slack`, `edition` and
+    the `build` block. The top-level `host` and `database` are null and
+    `deep_checks` is false. `check_anomalies` likewise gives it the
+    neutral `ledger_chain` anomaly ("the hub's ledger is broken") and
+    never runs `host_low_memory` (the hub's RAM) for it. A local
     harness (`dispatch_task` or `dispatch_resume` with a harness) is a
     process on the hub and is refused (`org_unsupported`) before the
     harness is looked up or a task's `worktree_path` is resolved, and
