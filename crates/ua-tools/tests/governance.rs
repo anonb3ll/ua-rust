@@ -928,9 +928,17 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
 
 // --- stale worktrees ------------------------------------------------------------
 
+/// Run git for a fixture. Auto maintenance is off: after a commit, git
+/// starts `git maintenance run --auto --detach` (`gc --auto` on older git)
+/// in the background with its working directory inside the worktree, and a
+/// process still alive when the cleanup scans running processes makes that
+/// worktree read as `in_use`. On a loaded or containerised runner it
+/// outlives the commit often enough to flip the outcome; nothing in a
+/// fixture this small needs maintenance.
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
