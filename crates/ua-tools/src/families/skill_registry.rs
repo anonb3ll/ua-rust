@@ -404,6 +404,11 @@ pub const MAX_PACKAGE_DEPTH: usize = 8;
 /// approval payload. Staging fails closed above this cap so a human never
 /// approves text that was truncated out of the approval payload.
 pub const MAX_APPROVAL_TEXT_BYTES: usize = 256 * 1024;
+/// File extensions allowed for non-UTF-8 (or NUL-containing) binary assets in
+/// a skill package. Any other extension (including `.md`, `.txt`, `.sh`,
+/// `.py`) must be valid UTF-8 text with no NUL bytes so the approver sees it
+/// verbatim in the approval payload.
+pub const BINARY_ASSET_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
 /// Canonical manifest schema version (matches the Python hub).
 pub const PACKAGE_SCHEMA_VERSION: u64 = 1;
 /// File mode recorded for every file published by this hub (`0o644`).
@@ -533,6 +538,20 @@ impl PackageMember {
 
 pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Whether `path` has a lowercase file extension on [`BINARY_ASSET_EXTENSIONS`].
+/// Paths without an extension (or with an empty stem) return `false`.
+pub(crate) fn is_allowed_binary_extension(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || ext.is_empty() {
+        return false;
+    }
+    let ext = ext.to_ascii_lowercase();
+    BINARY_ASSET_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// Canonical relative member path inside a skill package: no absolute paths,
@@ -678,6 +697,11 @@ fn verify_and_decode(
     if m_str.len() > MAX_PACKAGE_FILES * 1024 {
         return Err(bad());
     }
+    // Python's `_store_version` always inserts `package_manifest` and
+    // `package_payload` together, and Python's `_verify_package_row` itself
+    // refuses a row where `package_manifest` is non-NULL and `package_payload`
+    // is NULL. Only legacy single-file rows have both columns NULL (handled
+    // above).
     let p_str = payload_raw.ok_or_else(bad)?;
     if p_str.len() > MAX_PACKAGE_BYTES * 2 {
         return Err(bad());
@@ -818,20 +842,29 @@ pub(crate) struct Resolved {
     pub via: &'static str,
 }
 
-/// The skills assigned to `agent` in `org` directly or through `profile`: direct
-/// assignments first (each source sorted by name), a direct one winning over
-/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. A pinned
-/// version that is missing is skipped; a stored version whose hash or member
-/// attestation fails is refused, never served.
-pub(crate) fn resolve(
+/// One assigned skill whose stored version failed hash or member attestation.
+#[derive(Debug, Clone)]
+pub(crate) struct SkippedSkill {
+    pub name: String,
+    pub version: Option<i64>,
+    pub via: &'static str,
+    pub reason: &'static str,
+}
+
+/// Resolve the skills assigned to `agent` in `org` directly or through
+/// `profile`, failing closed per skill: a stored version whose hash or member
+/// attestation fails is skipped (never served) and returned in the skipped
+/// list so callers such as harness config bundle assembly can keep serving
+/// other valid skills.
+pub(crate) fn resolve_with_skips(
     c: &Connection,
     org: &str,
     agent: &str,
     profile: Option<&str>,
-) -> UaResult<Vec<Resolved>> {
+) -> UaResult<(Vec<Resolved>, Vec<SkippedSkill>)> {
     let agent = agent.trim();
     if agent.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let rows = |target_type: &str, targets: &[String]| -> UaResult<Vec<(String, Option<i64>)>> {
         let mut out: Vec<(String, Option<i64>)> = Vec::new();
@@ -863,8 +896,17 @@ pub(crate) fn resolve(
         }
     }
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for (name, pin, via) in picked.into_iter().take(MAX_RESOLVED_SKILLS) {
-        let Some(loaded) = load_version(c, org, &name, pin)? else { continue };
+        let loaded = match load_version(c, org, &name, pin) {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => continue,
+            Err(UaError::Conflict { .. }) => {
+                skipped.push(SkippedSkill { name, version: pin, via, reason: "attestation_failed" });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let manifest = match &loaded.public["package_manifest"] {
             Value::Null => None,
             other => Some(other.clone()),
@@ -879,7 +921,25 @@ pub(crate) fn resolve(
             via,
         });
     }
-    Ok(out)
+    Ok((out, skipped))
+}
+
+/// The skills assigned to `agent` in `org` directly or through `profile`: direct
+/// assignments first (each source sorted by name), a direct one winning over
+/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. A pinned
+/// version that is missing is skipped; a stored version whose hash or member
+/// attestation fails is refused, never served.
+pub(crate) fn resolve(
+    c: &Connection,
+    org: &str,
+    agent: &str,
+    profile: Option<&str>,
+) -> UaResult<Vec<Resolved>> {
+    let (resolved, skipped) = resolve_with_skips(c, org, agent, profile)?;
+    if !skipped.is_empty() {
+        return Err(UaError::conflict("skill content hash does not match the reviewed registry version"));
+    }
+    Ok(resolved)
 }
 
 // --- actions ----------------------------------------------------------------------
@@ -1268,9 +1328,18 @@ fn capture_package(dir: &Path, shown: &str) -> UaResult<BTreeMap<String, Package
     Ok(members)
 }
 
-/// Audit captured supporting files for credential material, hidden Unicode and
-/// the approval review text cap. Returns any hidden-text findings (blocking
-/// review) or refuses immediately on credentials or text cap overflow.
+/// Audit every captured supporting file (text or binary) for credential
+/// material, hidden Unicode, binary extension allowlist compliance, and the
+/// approval review text cap.
+///
+/// - Credentials / private keys and non-UTF-8 files outside
+///   [`BINARY_ASSET_EXTENSIONS`] (for example a `.md`, `.txt`, `.sh`, or `.py`
+///   containing a NUL byte) are refused immediately.
+/// - Hidden Unicode in any member (scanned via `String::from_utf8_lossy`)
+///   produces a `high`-severity `SKILL-HIDDEN-TEXT` finding that blocks publish.
+/// - Every allowlisted binary member produces a `medium`-severity
+///   `SKILL-BINARY-ASSET` finding carrying its `path`, `bytes`, and `sha256`
+///   so the human approver reviews it explicitly.
 fn audit_supporting_files(members: &BTreeMap<String, PackageMember>) -> UaResult<Vec<Value>> {
     let mut findings = Vec::new();
     let mut text_bytes = 0usize;
@@ -1278,29 +1347,51 @@ fn audit_supporting_files(members: &BTreeMap<String, PackageMember>) -> UaResult
         if path == "SKILL.md" {
             continue;
         }
-        let Some(text) = member.text() else {
-            continue;
-        };
-        text_bytes = text_bytes.saturating_add(text.len());
-        if text_bytes > MAX_APPROVAL_TEXT_BYTES {
-            return Err(UaError::invalid(format!(
-                "supporting text files exceed the {MAX_APPROVAL_TEXT_BYTES}-byte approval review limit"
-            )));
-        }
-        if !check_secrets("skill-package-payload", text).is_empty()
-            || !check_private_key(path, text).is_empty()
+        let lossy = String::from_utf8_lossy(&member.bytes);
+        if !check_secrets("skill-package-payload", &lossy).is_empty()
+            || !check_private_key(path, &lossy).is_empty()
         {
             return Err(UaError::invalid(format!(
                 "supporting file {path:?} contains credential material and cannot be published"
             )));
         }
-        for (line, ch) in hidden_chars(text) {
+        for (line, ch) in hidden_chars(&lossy) {
             findings.push(json!({
                 "rule": "SKILL-HIDDEN-TEXT",
                 "severity": "high",
                 "file": path,
+                "path": path,
                 "line": line,
                 "message": format!("hidden Unicode code point U+{:04X} in supporting file {path:?}", ch as u32),
+            }));
+        }
+        if let Some(text) = member.text() {
+            text_bytes = text_bytes.saturating_add(text.len());
+            if text_bytes > MAX_APPROVAL_TEXT_BYTES {
+                return Err(UaError::invalid(format!(
+                    "supporting text files exceed the {MAX_APPROVAL_TEXT_BYTES}-byte approval review limit"
+                )));
+            }
+        } else {
+            if !is_allowed_binary_extension(path) {
+                return Err(UaError::invalid(format!(
+                    "supporting file {path:?} contains NUL or non-UTF-8 bytes; only allowlisted binary assets ({}) may be non-text",
+                    BINARY_ASSET_EXTENSIONS.join(", ")
+                )));
+            }
+            findings.push(json!({
+                "rule": "SKILL-BINARY-ASSET",
+                "severity": "medium",
+                "file": path,
+                "path": path,
+                "bytes": member.bytes.len(),
+                "sha256": member.sha256,
+                "line": Value::Null,
+                "message": format!(
+                    "binary asset {path:?} ({} bytes, sha256 {}) is not shown as text; verify before approving",
+                    member.bytes.len(),
+                    member.sha256
+                ),
             }));
         }
     }
@@ -1439,7 +1530,20 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
         if let Some(arr) = review["findings"].as_array_mut() {
             arr.extend(support_findings.iter().cloned());
         }
-        review["status"] = json!("fail");
+        if let Some(summary) = review["summary"].as_object_mut() {
+            for f in &support_findings {
+                if let Some(sev) = f["severity"].as_str()
+                    && let Some(count) = summary.get_mut(sev)
+                {
+                    *count = json!(count.as_u64().unwrap_or(0) + 1);
+                }
+            }
+        }
+        if support_findings.iter().any(|f| f["severity"] == "high") {
+            review["status"] = json!("fail");
+        } else if support_findings.iter().any(|f| f["severity"] == "medium") && review["status"] == "pass" {
+            review["status"] = json!("warn");
+        }
     }
     if review["status"] == "fail" {
         return Ok(json!({ "ok": false, "blocked": true, "name": name, "review": review }));
@@ -1466,7 +1570,22 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|f| json!({ "rule": f["rule"], "severity": f["severity"], "message": f["message"], "line": f["line"] }))
+        .map(|f| {
+            let mut out = json!({
+                "rule": f["rule"],
+                "severity": f["severity"],
+                "message": f["message"],
+                "line": f["line"],
+            });
+            for key in ["path", "bytes", "sha256"] {
+                if let Some(v) = f.get(key)
+                    && !v.is_null()
+                {
+                    out[key] = v.clone();
+                }
+            }
+            out
+        })
         .collect();
     let caller = ctx.caller.clone();
     let cfg = ctx.hub.cfg().clone();
@@ -1840,6 +1959,30 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
     Ok(json!({ "agent_label": label, "profile": profile, "skills": skills }))
 }
 
+/// Normalize imported Python-hub `0o755` modes to `0o644` when computing the
+/// drift comparison hash, because `capture_package` never honours on-disk
+/// execute bits and always records `0o644`. Stored `content_hash` values are
+/// unchanged; this prevents imported executable packages from reading as
+/// permanently stale when on-disk file bytes match.
+fn drift_compare_hash(stored_hash: &str, manifest: Option<&Value>) -> String {
+    let Some(m) = manifest else {
+        return stored_hash.to_string();
+    };
+    let Some(files) = m["files"].as_array() else {
+        return stored_hash.to_string();
+    };
+    if !files.iter().any(|f| f["mode"].as_u64().is_some_and(|mode| mode != MODE_FILE)) {
+        return stored_hash.to_string();
+    }
+    let mut normalized = m.clone();
+    if let Some(items) = normalized["files"].as_array_mut() {
+        for item in items {
+            item["mode"] = json!(MODE_FILE);
+        }
+    }
+    package_hash(&normalized)
+}
+
 fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     let (root, _) = workspace_target(ctx, &p.surface_dir)?;
     if !is_real_dir(&root) {
@@ -1890,7 +2033,7 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     let org = ctx.caller.org_id.as_str();
     let (all_latest, resolved) = ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(
-            "SELECT sv.name, sv.version, sv.content_hash FROM skill_versions sv \
+            "SELECT sv.name, sv.version, sv.content_hash, sv.package_manifest FROM skill_versions sv \
              JOIN (SELECT name, MAX(version) AS version FROM skill_versions WHERE org_id = ?1 GROUP BY name) latest \
              ON sv.name = latest.name AND sv.version = latest.version WHERE sv.org_id = ?1",
         )?;
@@ -1899,7 +2042,10 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
                 let name: String = r.get(0)?;
                 let version: i64 = r.get(1)?;
                 let hash: String = r.get(2)?;
-                Ok((name, version, hash))
+                let manifest: Option<String> = r.get(3)?;
+                let manifest = manifest.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                let cmp = drift_compare_hash(&hash, manifest.as_ref());
+                Ok((name, version, hash, cmp))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let resolved = match &label {
@@ -1908,11 +2054,17 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         };
         Ok((rows, resolved))
     })?;
-    let latest_all: BTreeMap<String, (i64, String)> =
-        all_latest.iter().map(|(n, v, h)| (n.clone(), (*v, h.clone()))).collect();
+    let latest_all: BTreeMap<String, (i64, String, String)> =
+        all_latest.into_iter().map(|(n, v, h, cmp)| (n, (v, h, cmp))).collect();
     let scoped = resolved.is_some();
-    let latest: BTreeMap<String, (i64, String)> = match &resolved {
-        Some(list) => list.iter().map(|s| (s.name.clone(), (s.version, s.hash.clone()))).collect(),
+    let latest: BTreeMap<String, (i64, String, String)> = match &resolved {
+        Some(list) => list
+            .iter()
+            .map(|s| {
+                let cmp = drift_compare_hash(&s.hash, s.package_manifest.as_ref());
+                (s.name.clone(), (s.version, s.hash.clone(), cmp))
+            })
+            .collect(),
         None => latest_all.clone(),
     };
     let mut names: BTreeSet<String> = on_disk.keys().cloned().collect();
@@ -1923,18 +2075,18 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         let disk = on_disk.get(&name);
         let reg = latest.get(&name);
         match (disk, reg) {
-            (None, Some((v, _))) => missing.push(json!({ "name": name, "registry_version": v })),
+            (None, Some((v, _, _))) => missing.push(json!({ "name": name, "registry_version": v })),
             (None, None) => {}
             (Some(h), None) => match (scoped, latest_all.get(&name)) {
-                (true, Some((v, _))) => {
+                (true, Some((v, _, _))) => {
                     unassigned.push(json!({ "name": name, "on_disk_hash": h, "registry_version": v }));
                 }
                 _ => unregistered.push(json!({ "name": name, "on_disk_hash": h })),
             },
-            (Some(h), Some((v, rh))) if h != rh => stale.push(json!({
+            (Some(h), Some((v, rh, cmp))) if h != cmp => stale.push(json!({
                 "name": name, "on_disk_hash": h, "registry_hash": rh, "registry_version": v,
             })),
-            (Some(_), Some((v, _))) => synced.push(json!({ "name": name, "version": v })),
+            (Some(_), Some((v, _, _))) => synced.push(json!({ "name": name, "version": v })),
         }
     }
     Ok(json!({

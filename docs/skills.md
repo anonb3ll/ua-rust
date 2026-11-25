@@ -96,10 +96,24 @@ Every bound is enforced at staging time and re-verified on every read:
   `.env`, `.git`, `.DS_Store`) is refused.
 - **No execution:** Executable permission bits are ignored (`mode` is stored as
   `0o644`), and nothing runs at publish, staging, resolve, or install time.
-- **Content screening:** `skill_review` runs on `SKILL.md` (blocking permission
-  front matter and hidden text). Every supporting UTF-8 text file is also
+  When `drift` compares an on-disk directory against an imported Python-hub
+  package whose manifest carries `0o755` modes, `drift` normalizes the imported
+  modes to `0o644` for comparison so matching files report `synced` rather than
+  permanently `stale`.
+- **Binary extension allowlist:** Non-UTF-8 or NUL-containing files are refused
+  at publish and in harness config policy unless their extension is on the
+  explicit binary asset allowlist (`BINARY_ASSET_EXTENSIONS`: `png`, `jpg`,
+  `jpeg`, `gif`, `webp`, `ico`, `pdf`). Text formats (such as `.md`, `.txt`,
+  `.sh`, `.py`) must be valid UTF-8 with no NUL bytes so they appear verbatim
+  in the publish approval payload.
+- **Content screening (text and binary):** `skill_review` runs on `SKILL.md`
+  (blocking permission front matter and hidden text). Every supporting file —
+  including allowlisted binaries, scanned via `String::from_utf8_lossy` — is
   screened for hidden Unicode code points (blocked as `SKILL-HIDDEN-TEXT`) and
-  credential/private-key material (refused before staging).
+  credential/private-key material (refused before staging), both at publish and
+  in harness config policy. Every allowlisted binary file also emits an
+  explicit `medium`-severity `SKILL-BINARY-ASSET` approval finding carrying its
+  `path`, `bytes`, and `sha256` so the human approver approves it knowingly.
 
 ## Trust rule: staging, approval, and read verification
 
@@ -126,7 +140,11 @@ prompt-injection path:
    recomputes the SHA-256 and byte length of every stored file, confirms
    `SKILL.md` matches the `content` column, confirms the payload contains no
    unmanifested files, and confirms the canonical manifest hashes to
-   `content_hash`. Any tampering is refused (`conflict`), never served.
+   `content_hash`. `get` and `resolve` refuse tampered packages directly
+   (`conflict`). `node_config` fails closed per skill: a tampered skill is
+   skipped (never served) and recorded in `assigned_skills` with
+   `skipped: "attestation_failed"`, while other valid skills and the harness
+   bundle continue to be served.
 4. **Tenant isolation:** Versions, assignments, and staged publishes are scoped
    to `Caller.org_id`. Another organization's package or staging ID answers as
    missing (`not_found`).

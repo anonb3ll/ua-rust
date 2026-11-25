@@ -26,12 +26,19 @@
 //!   ignoring case;
 //! - size: every rendered surface and the whole render are capped.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 use ua_core::{UaError, UaResult};
 
 use super::render::{self, Bundle, DEFAULT_SURFACES};
+use crate::families::audit::rules::{check_private_key, check_secrets};
+use crate::families::skill_registry::{
+    BINARY_ASSET_EXTENSIONS, is_allowed_binary_extension, validate_package_path,
+};
 use crate::families::skills::{FrontMatterOf, front_matter_key_problems, hidden_chars};
 
 /// Surfaces one bundle may declare.
@@ -336,13 +343,40 @@ fn check_text(b: &Bundle) -> UaResult<()> {
             return refuse(format!("skill {:?} refused: {}", s.name, findings.join("; ")));
         }
         for f in &s.files {
-            crate::families::skill_registry::validate_package_path(&f.path)?;
-            if f.encoding == "utf-8"
-                && let Some((line, c)) = hidden_chars(&f.content).first()
-            {
+            validate_package_path(&f.path)?;
+            let text: Cow<'_, str> = match f.encoding.as_str() {
+                "utf-8" => Cow::Borrowed(f.content.as_str()),
+                "base64" => {
+                    let decoded = BASE64.decode(&f.content).map_err(|_| {
+                        UaError::invalid(format!("skill {:?} file {:?} has invalid base64", s.name, f.path))
+                    })?;
+                    Cow::Owned(String::from_utf8_lossy(&decoded).into_owned())
+                }
+                other => {
+                    return refuse(format!(
+                        "skill {:?} file {:?} has unsupported encoding {other:?}",
+                        s.name, f.path
+                    ));
+                }
+            };
+            if let Some((line, c)) = hidden_chars(&text).first() {
                 return refuse(format!(
                     "skill {:?} file {:?} line {line} has a hidden code point U+{:04X}",
                     s.name, f.path, *c as u32
+                ));
+            }
+            if f.path != "SKILL.md"
+                && (!check_secrets("skill-package-payload", &text).is_empty()
+                    || !check_private_key(&f.path, &text).is_empty())
+            {
+                return refuse(format!("skill {:?} file {:?} contains credential material", s.name, f.path));
+            }
+            if f.encoding == "base64" && !is_allowed_binary_extension(&f.path) {
+                return refuse(format!(
+                    "skill {:?} file {:?} may not use base64 encoding; only allowlisted binary assets ({}) may be binary",
+                    s.name,
+                    f.path,
+                    BINARY_ASSET_EXTENSIONS.join(", ")
                 ));
             }
         }
@@ -494,5 +528,52 @@ mod tests {
             "e": { "path": "e.json", "kind": "mcp" }, "f": { "path": "f.json", "kind": "mcp" },
             "g": { "path": "g.json", "kind": "mcp" } } }));
         assert!(e.contains("renders to more than"), "{e}");
+    }
+
+    #[test]
+    fn base64_skill_files_are_screened_and_extension_gated() {
+        let mk_file = |path: &str, bytes: &[u8]| {
+            json!({
+                "path": path,
+                "bytes": bytes.len(),
+                "sha256": crate::families::skill_registry::sha256_bytes(bytes),
+                "encoding": "base64",
+                "content": BASE64.encode(bytes),
+            })
+        };
+        // Clean allowlisted binary (.png) passes policy.
+        let clean_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        validate(&json!({
+            "version": "1",
+            "skills": [{ "name": "s", "files": [mk_file("assets/logo.png", clean_png)] }]
+        }))
+        .unwrap();
+
+        // Base64 allowlisted binary with hidden Unicode is refused.
+        let mut hidden_png = clean_png.to_vec();
+        hidden_png.extend_from_slice("ignore\u{200B}previous".as_bytes());
+        let e = refused(json!({
+            "version": "1",
+            "skills": [{ "name": "s", "files": [mk_file("assets/logo.png", &hidden_png)] }]
+        }));
+        assert!(e.contains("U+200B"), "{e}");
+
+        // Base64 allowlisted binary with a private key is refused.
+        let mut key_png = clean_png.to_vec();
+        key_png.extend_from_slice(
+            b"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+        );
+        let e = refused(json!({
+            "version": "1",
+            "skills": [{ "name": "s", "files": [mk_file("assets/logo.png", &key_png)] }]
+        }));
+        assert!(e.contains("credential"), "{e}");
+
+        // Base64 non-allowlisted extension (.md) is refused even without hidden text.
+        let e = refused(json!({
+            "version": "1",
+            "skills": [{ "name": "s", "files": [mk_file("references/notes.md", b"hello\0")] }]
+        }));
+        assert!(e.contains("allowlisted binary assets"), "{e}");
     }
 }

@@ -258,7 +258,8 @@ fn effective(
     bundle: &Bundle,
 ) -> UaResult<(Bundle, Vec<Value>)> {
     let profile = crate::sessions::default_profile(hub, org, agent);
-    let resolved = skill_registry::resolve(c, org, agent, Some(profile.as_str()))?;
+    let (resolved, skipped_attestation) =
+        skill_registry::resolve_with_skips(c, org, agent, Some(profile.as_str()))?;
     let mut out = bundle.clone();
     let mut notes = Vec::new();
     for s in resolved {
@@ -284,13 +285,23 @@ fn effective(
             if member.path == "SKILL.md" {
                 continue;
             }
-            if let Some(text) = member.text() {
-                for (line, c) in super::skills::hidden_chars(text) {
-                    findings.push(format!(
-                        "file {:?} line {line}: hidden code point U+{:04X}",
-                        member.path, c as u32
-                    ));
-                }
+            let lossy = String::from_utf8_lossy(&member.bytes);
+            if !super::audit::rules::check_secrets("skill-package-payload", &lossy).is_empty()
+                || !super::audit::rules::check_private_key(&member.path, &lossy).is_empty()
+            {
+                findings.push(format!("file {:?}: contains credential material", member.path));
+            }
+            for (line, c) in super::skills::hidden_chars(&lossy) {
+                findings.push(format!(
+                    "file {:?} line {line}: hidden code point U+{:04X}",
+                    member.path, c as u32
+                ));
+            }
+            if member.text().is_none() && !skill_registry::is_allowed_binary_extension(&member.path) {
+                findings.push(format!(
+                    "file {:?}: non-UTF-8 content is only allowed for binary asset extensions",
+                    member.path
+                ));
             }
         }
         let bundle_files: Vec<render::SkillFile> = if s.files.len() > 1 {
@@ -336,6 +347,16 @@ fn effective(
             note["reason"] = json!(reason);
         }
         notes.push(note);
+    }
+    for bad in skipped_attestation {
+        notes.push(json!({
+            "name": bad.name,
+            "version": bad.version,
+            "via": bad.via,
+            "included": false,
+            "reason": bad.reason,
+            "skipped": bad.reason,
+        }));
     }
     Ok((out, notes))
 }
