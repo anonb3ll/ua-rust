@@ -630,9 +630,8 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
 /// The entry hash stored at `seq`, or `None` when the row is absent or has no
 /// hash. A checkpoint names this value; the caller compares it.
 pub fn entry_hash_at(conn: &Connection, seq: i64) -> UaResult<Option<String>> {
-    let row: Option<Option<String>> = conn
-        .query_row("SELECT entry_hash FROM event_log WHERE seq = ?1", [seq], |r| r.get(0))
-        .optional()?;
+    let row: Option<Option<String>> =
+        conn.query_row("SELECT entry_hash FROM event_log WHERE seq = ?1", [seq], |r| r.get(0)).optional()?;
     Ok(row.flatten())
 }
 
