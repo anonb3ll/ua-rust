@@ -143,6 +143,8 @@ pub struct StreamAuth {
     credential: Credential,
     label: String,
     kind: ActorKind,
+    /// The organization the credential resolved to.
+    org_id: String,
     path: &'static str,
     session_key: Option<String>,
     transport: Transport,
@@ -173,6 +175,7 @@ impl StreamAuth {
             credential,
             label: caller.label.clone(),
             kind: caller.kind,
+            org_id: caller.org_id.clone(),
             path,
             session_key: caller.session_key.clone(),
             transport: caller.transport,
@@ -191,20 +194,16 @@ impl StreamAuth {
         admitted_gated: bool,
     ) -> Result<(), &'static str> {
         let id = match &self.credential {
-            Credential::Unverified => {
-                AuthIdentity { label: self.label.clone(), kind: self.kind, verified: false, grant: None }
-            }
+            Credential::Unverified => AuthIdentity::in_default(self.label.clone(), self.kind, false),
             Credential::Bearer(t) => {
                 resolve_bearer_blocking(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
             }
             Credential::Cookie(h) => match crate::login::session_from_headers_blocking(state, h) {
-                Some(s) => {
-                    AuthIdentity { label: s.label, kind: ActorKind::Human, verified: true, grant: None }
-                }
+                Some(s) => AuthIdentity::in_default(s.label, ActorKind::Human, true),
                 None => return Err("credential_invalid"),
             },
         };
-        if id.label != self.label || id.kind != self.kind {
+        if id.label != self.label || id.kind != self.kind || id.org_id != self.org_id {
             return Err("identity_changed");
         }
         let caller = caller_for(state, &id, self.session_key.clone(), self.transport);
@@ -241,7 +240,7 @@ fn admit(state: &AppState, caller: &Caller, scope: &EventScope) -> Result<Admiss
         && caller.enforce_profile
         && caller.kind != ActorKind::Human
     {
-        let code_default = ua_tools::sessions::default_profile(&state.hub, &caller.label);
+        let code_default = ua_tools::sessions::default_profile(&state.hub, &caller.org_id, &caller.label);
         let tools = state.registry.all().map(|t| t.name);
         if let Some(overlay) = policy::overlay_profile(p, &caller.label, code_default, tools)
             && profile.rank() > overlay.rank()
@@ -620,6 +619,7 @@ mod tests {
             credential: Credential::Unverified,
             label: "local".into(),
             kind: ActorKind::Anonymous,
+            org_id: ua_core::DEFAULT_ORG.into(),
             path: "/api/events/stream",
             session_key: None,
             transport: Transport::Http,

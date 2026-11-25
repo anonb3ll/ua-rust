@@ -209,69 +209,60 @@ fn an_upgraded_database_keeps_its_symbols_in_the_default_organization() {
     assert_eq!(trigger_names(&hub), ["code_symbols_org_exists", "code_symbols_org_immutable"]);
 }
 
+/// The hub workspace is the default organization's (`workspace::sandbox`):
+/// another organization's code tools are refused before any filesystem
+/// access and store nothing. Its rows (made in SQL, as no tool can make
+/// them until per-organization workspaces exist) never reach the default
+/// organization's reads or re-indexing.
 #[cfg(feature = "code-intel")]
 #[tokio::test]
-async fn two_organizations_index_the_same_workspace_without_seeing_each_other() {
+async fn another_organization_has_no_code_index_of_the_hub_workspace() {
     let env = setup();
     let default = ua_core::DEFAULT_ORG;
     let idx = env.ok(default, "fs_index_symbols", json!({})).await;
     assert_eq!(idx["symbols_indexed"], 1, "{idx}");
 
-    // The other organization sees none of the default organization's rows.
-    let res = env.ok(OTHER, "fs_search_symbols", json!({ "query": "shared_fn" })).await;
-    assert_eq!(res["results"], json!([]), "{res}");
-    let list = env.ok(OTHER, "fs_list_symbols", json!({ "file_path": "src/lib.rs" })).await;
-    assert_eq!(list["source"], "parse", "not from the default organization's index: {list}");
+    let before = stored(&env.hub);
+    for (tool, args) in [
+        ("fs_index_symbols", json!({})),
+        ("fs_search_symbols", json!({ "query": "shared_fn" })),
+        ("fs_list_symbols", json!({ "file_path": "src/lib.rs" })),
+        ("fs_repo_map", json!({})),
+    ] {
+        let err = env.call(OTHER, tool, args.clone()).await.unwrap_err();
+        assert_eq!(err.reason_code(), Some("org_unsupported"), "{tool}({args}): {err}");
+        assert!(!err.to_string().contains("shared_fn"), "{err}");
+    }
+    assert_eq!(stored(&env.hub), before, "nothing stored for the other organization");
 
-    // It indexes the same workspace into its own rows; the workspace key and
-    // the symbols are the same, and neither collides with the other.
-    write(&env.ws, "src/other.rs", "pub fn other_only() {}\n");
-    env.ok(OTHER, "fs_index_symbols", json!({})).await;
-    assert_eq!(
-        stored(&env.hub),
-        [
-            (OTHER.to_string(), "other_only".to_string()),
-            (OTHER.to_string(), "shared_fn".to_string()),
-            (default.to_string(), "shared_fn".to_string()),
-        ]
-    );
-    let list = env.ok(OTHER, "fs_list_symbols", json!({ "file_path": "src/lib.rs" })).await;
-    assert_eq!(list["source"], "index");
-
+    // Another organization's row under the same workspace key.
+    let ws = env.ws.to_string_lossy().into_owned();
+    env.hub
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO code_symbols (org_id, workspace, file_path, language, symbol_name, symbol_type, \
+                 symbol_kind, line_no) VALUES (?1, ?2, 'src/other.rs', 'rust', 'other_only', 'function', 'fn', 1)",
+                [OTHER, ws.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     // The default organization's reads stay its own.
     let res = env.ok(default, "fs_search_symbols", json!({ "query": "other_only" })).await;
     assert_eq!(res["results"], json!([]), "{res}");
-    let list = env.ok(default, "fs_list_symbols", json!({ "file_path": "src/other.rs" })).await;
-    assert_eq!(list["source"], "parse", "{list}");
     let map = env.ok(default, "fs_repo_map", json!({})).await;
     let text = map["repo_map"].as_str().unwrap();
     assert!(text.contains("src/lib.rs") && !text.contains("src/other.rs"), "{text}");
-
-    // Re-indexing in one organization replaces only its own rows, for the
+    // Re-indexing replaces only the default organization's rows, for the
     // whole workspace and for a subtree.
     std::fs::remove_file(env.ws.join("src/lib.rs")).unwrap();
+    write(&env.ws, "src/next.rs", "pub fn next_fn() {}\n");
     env.ok(default, "fs_index_symbols", json!({})).await;
     env.ok(default, "fs_index_symbols", json!({ "path": "src" })).await;
     assert_eq!(
         stored(&env.hub),
-        [
-            (OTHER.to_string(), "other_only".to_string()),
-            (OTHER.to_string(), "shared_fn".to_string()),
-            (default.to_string(), "other_only".to_string()),
-        ]
-    );
-    let res = env.ok(OTHER, "fs_search_symbols", json!({ "query": "shared_fn" })).await;
-    assert_eq!(res["results"].as_array().unwrap().len(), 1, "{res}");
-
-    // The repository map of the other organization is built from its rows
-    // only: with them deleted at the storage level it re-indexes into its own
-    // organization and leaves the default organization's rows alone.
-    env.hub.db().write(|tx| Ok(tx.execute("DELETE FROM code_symbols WHERE org_id = ?1", [OTHER])?)).unwrap();
-    let map = env.ok(OTHER, "fs_repo_map", json!({})).await;
-    assert!(map["repo_map"].as_str().unwrap().contains("src/other.rs"), "{map}");
-    assert_eq!(
-        stored(&env.hub),
-        [(OTHER.to_string(), "other_only".to_string()), (default.to_string(), "other_only".to_string())]
+        [(OTHER.to_string(), "other_only".to_string()), (default.to_string(), "next_fn".to_string())]
     );
 }
 
@@ -280,15 +271,15 @@ async fn two_organizations_index_the_same_workspace_without_seeing_each_other() 
 async fn an_unknown_organization_is_refused_and_writes_nothing() {
     let env = setup();
     let before = stored(&env.hub);
+    // Refused before the workspace is read (it is the default
+    // organization's), so before the organization is even looked up.
     let err = env.call("nowhere", "fs_index_symbols", json!({})).await.unwrap_err();
-    assert_eq!(err.code(), "invalid_argument", "{err}");
-    assert!(err.to_string().contains("unknown organization"), "{err}");
-    // Also with nothing to insert, which the trigger alone would not catch.
+    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
     std::fs::create_dir_all(env.ws.join("empty")).unwrap();
     let err = env.call("nowhere", "fs_index_symbols", json!({ "path": "empty" })).await.unwrap_err();
-    assert!(err.to_string().contains("unknown organization"), "{err}");
+    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
     let err = env.call("nowhere", "fs_repo_map", json!({})).await.unwrap_err();
-    assert!(err.to_string().contains("unknown organization"), "{err}");
+    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
     assert_eq!(stored(&env.hub), before);
     let events: i64 = env
         .hub

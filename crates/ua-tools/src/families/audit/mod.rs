@@ -398,6 +398,12 @@ pub fn resolve_target(ctx: &ToolCtx, path: &str, vault: bool, for_write: bool) -
     if path.contains('\0') {
         return Err(UaError::invalid("path contains a NUL byte"));
     }
+    // The workspace, read roots and vault are the hub's, the default
+    // organization's (see `workspace::sandbox`): another organization's
+    // caller audits none of them, and nothing is read.
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(crate::families::workspace::workspace_org_unsupported());
+    }
     let cfg = ctx.hub.cfg();
     let inbox = cfg.vault_inbox_dir.trim().trim_matches('/').to_string();
     if vault {

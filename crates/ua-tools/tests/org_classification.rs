@@ -178,19 +178,11 @@ const TENANT: &[&str] = &[
 /// `relay_messages` (`organization.v1.tools.relay`), the seven node tables
 /// (`node_queue.v2.tenant_keys`, `organization.v1.tools.nodes`),
 /// `dispatch_runs` and `dispatch_receipts` (`organization.v1.tools.dispatch`)
-/// and `idempotency_keys` (`idempotency.v2.tenant_keys`,
-/// `organization.v1.tools.idempotency`).
-const TENANT_MISSING_ORG_ID: &[&str] = &[
-    "agent_lifecycle",
-    "agent_sessions",
-    "agent_tokens",
-    "agents",
-    "session_credentials",
-    "session_handoff_notes",
-    "session_profiles",
-    "session_wake",
-    "session_wake_offers",
-];
+/// `idempotency_keys` (`idempotency.v2.tenant_keys`,
+/// `organization.v1.tools.idempotency`) and the nine agent and session
+/// tables (`organization.v1.tools.agents`): every tenant table, so the list
+/// is empty and the guard now holds every tenant table to the full check.
+const TENANT_MISSING_ORG_ID: &[&str] = &[];
 
 const DERIVED_INDEX: &[&str] = &["task_fts", "memory_fts"];
 
@@ -538,58 +530,46 @@ fn a_stale_entry_fails() {
 
 #[test]
 fn a_tenant_table_must_leave_the_missing_list_once_it_passes_and_fail_otherwise() {
+    // The live list is empty, so park a converted baseline table on a list
+    // built here: a table that passes may not stay listed.
     let conn = schema();
-    // Give `agent_lifecycle` its tenant shape by hand, as its part will.
-    conn.execute_batch(
-        "ALTER TABLE agent_lifecycle ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER agent_lifecycle_org_exists BEFORE INSERT ON agent_lifecycle
-         WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
-         BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER agent_lifecycle_org_immutable BEFORE UPDATE OF org_id ON agent_lifecycle
-         WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
-         BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
-    )
-    .unwrap();
-    let found = problems(&conn, &lists());
+    let parked = ["agent_lifecycle"];
+    let found = problems(&conn, &Lists { missing: &parked, ..lists() });
     assert_eq!(found, ["agent_lifecycle: now passes the tenant check; remove it from TENANT_MISSING_ORG_ID"]);
 
-    // Off the list, `agent_lifecycle` passes, and `agents` (still without org_id) fails.
-    let shrunk: Vec<&str> = TENANT_MISSING_ORG_ID
-        .iter()
-        .copied()
-        .filter(|t| !["agent_lifecycle", "agents"].contains(t))
-        .collect();
-    let l = Lists { missing: &shrunk, ..lists() };
-    let found = problems(&conn, &l);
+    // Strip a generated trigger: listed, it is a tolerated gap; off the
+    // list, the same gap fails, as does a gap in any other converted table.
+    conn.execute_batch("DROP TRIGGER agent_lifecycle_org_immutable; DROP TRIGGER agents_org_exists;")
+        .unwrap();
+    let found = problems(&conn, &Lists { missing: &parked, ..lists() });
+    assert_eq!(found, ["agents: tenant table with no agents_org_exists trigger"]);
+    let found = problems(&conn, &lists());
     assert_eq!(
         found,
         [
-            "agents: tenant table with no org_id",
+            "agent_lifecycle: tenant table with no agent_lifecycle_org_immutable trigger",
             "agents: tenant table with no agents_org_exists trigger",
-            "agents: tenant table with no agents_org_immutable trigger",
         ]
     );
+
+    // A synthetic tenant table with no org_id at all fails off the list too.
+    conn.execute_batch("CREATE TABLE synthetic_widgets (id INTEGER PRIMARY KEY);").unwrap();
+    let tenant: Vec<&str> = TENANT.iter().copied().chain(["synthetic_widgets"]).collect();
+    let mut l: Lists<'_> = lists();
+    l.classes.retain(|(c, _)| *c != Class::Tenant);
+    l.classes.push((Class::Tenant, tenant.as_slice()));
+    let found = problems(&conn, &l);
+    assert!(found.contains(&"synthetic_widgets: tenant table with no org_id".to_string()), "{found:?}");
 }
 
 #[test]
 fn only_tenant_tables_may_be_listed_as_missing() {
     let conn = schema();
-    // Swap one entry for a hub table, so the list keeps its length.
-    let missing: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().filter(|t| *t != "agent_lifecycle").chain(["orgs"]).collect();
-    // Give `agent_lifecycle` its tenant shape, so leaving the list is not itself a finding.
-    conn.execute_batch(
-        "ALTER TABLE agent_lifecycle ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default';
-         CREATE TRIGGER agent_lifecycle_org_exists BEFORE INSERT ON agent_lifecycle
-         WHEN NOT EXISTS (SELECT 1 FROM orgs WHERE id = NEW.org_id)
-         BEGIN SELECT RAISE(ABORT, 'unknown organization'); END;
-         CREATE TRIGGER agent_lifecycle_org_immutable BEFORE UPDATE OF org_id ON agent_lifecycle
-         WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id
-         BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;",
-    )
-    .unwrap();
-    let l = Lists { missing: &missing, ..lists() };
-    let found = problems(&conn, &l);
+    // A hub table on the list fails; a genuinely gapped tenant table beside
+    // it does not, so the hub entry is the only finding.
+    conn.execute_batch("DROP TRIGGER agent_lifecycle_org_immutable;").unwrap();
+    let missing = ["agent_lifecycle", "orgs"];
+    let found = problems(&conn, &Lists { missing: &missing, ..lists() });
     assert_eq!(found, ["orgs: listed as missing org_id but is not a tenant table"]);
 }
 
@@ -619,11 +599,13 @@ fn a_new_tenant_table_cannot_be_parked_on_the_missing_list() {
         "{found:?}"
     );
 
-    // A list longer than the baseline fails on its length alone (the list has
-    // shrunk below the baseline, so pad it with entries already on it).
-    let padded: Vec<&str> =
-        TENANT_MISSING_ORG_ID.iter().copied().cycle().take(TENANT_MISSING_BASELINE_LEN + 1).collect();
-    let found = problems(&schema(), &Lists { missing: &padded, ..lists() });
+    // A list longer than the baseline fails on its length alone (the live
+    // list is empty, so pad with one baseline table whose trigger is
+    // stripped, which may legitimately stay listed).
+    let conn = schema();
+    conn.execute_batch("DROP TRIGGER agent_lifecycle_org_immutable;").unwrap();
+    let padded: Vec<&str> = std::iter::repeat_n("agent_lifecycle", TENANT_MISSING_BASELINE_LEN + 1).collect();
+    let found = problems(&conn, &Lists { missing: &padded, ..lists() });
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("TENANT_MISSING_ORG_ID has 69 entries"), "{found:?}");
 }

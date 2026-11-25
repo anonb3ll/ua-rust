@@ -739,6 +739,11 @@ fn workspace_target(ctx: &ToolCtx, raw: &str) -> UaResult<(PathBuf, String)> {
     if raw_t.contains('\0') {
         return Err(not_found());
     }
+    // The hub workspace is the default organization's (see
+    // `workspace::sandbox`): another organization reads nothing there.
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(crate::families::workspace::workspace_org_unsupported());
+    }
     let ws = ctx.hub.cfg().workspace_root();
     let ws_real = ws.canonicalize().map_err(|_| not_found())?;
     let p = Path::new(if raw_t.is_empty() { "." } else { raw_t });
@@ -1253,7 +1258,9 @@ fn resolve_action(ctx: &ToolCtx, p: ResolveParams) -> UaResult<Value> {
     let profile = match p.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => Some(profile_target(raw)?),
         None if label.is_empty() => None,
-        None => Some(crate::sessions::default_profile(&ctx.hub, &label).as_str().to_string()),
+        None => {
+            Some(crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, &label).as_str().to_string())
+        }
     };
     let skills = ctx.hub.db().read(|c| resolve(c, &ctx.caller.org_id, &label, profile.as_deref()))?;
     let skills: Vec<Value> = skills
@@ -1309,7 +1316,9 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     let label = p.agent_label.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let profile = match (p.profile.as_deref().map(str::trim).filter(|s| !s.is_empty()), &label) {
         (Some(raw), _) => Some(profile_target(raw)?),
-        (None, Some(l)) => Some(crate::sessions::default_profile(&ctx.hub, l).as_str().to_string()),
+        (None, Some(l)) => {
+            Some(crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, l).as_str().to_string())
+        }
         (None, None) => None,
     };
     // The registry side: every skill's latest version, and with an agent the
@@ -1451,7 +1460,9 @@ mod tests {
     /// entry points cannot reach these paths for B; this test calls the
     /// functions behind the operator check with an organization-B caller,
     /// and approves B's requests in SQL (no human can approve outside the
-    /// default organization yet).
+    /// default organization yet). B cannot stage from the hub workspace,
+    /// which is the default organization's (`workspace::sandbox`), so its
+    /// staged row is made in SQL from the default organization's.
     #[tokio::test]
     async fn organization_b_writes_and_approvals_bind_its_organization() {
         use ua_core::{ActorKind, Caller, Profile, identity::Transport};
@@ -1529,21 +1540,49 @@ mod tests {
             author: None,
         };
 
-        // B stages: the request is B's and its payload binds B.
-        let staged_b = stage(&b, who, Some("review-diff".into()), "skills/review-diff").unwrap();
-        let b_req = staged_b["approval_id"].as_i64().unwrap();
-        let (org, payload) = approval(b_req);
-        assert_eq!((org.as_str(), payload["org_id"].as_str()), ("org-b", Some("org-b")), "{payload}");
-        let b_staging = staged_b["staging_id"].as_str().unwrap().to_string();
+        // B may not read the hub workspace at all: nothing is staged.
+        let e = stage(&b, who, Some("review-diff".into()), "skills/review-diff").unwrap_err();
+        assert_eq!(e.reason_code(), Some("org_unsupported"), "{e:?}");
+        let staged_rows = |org: &'static str| {
+            hub.db()
+                .read(move |c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM skill_publish_staging WHERE org_id = ?1",
+                        [org],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(staged_rows("org-b"), 0);
 
-        // The default organization stages identical content under the same
-        // label: it never reuses B's unpublished staged row.
+        // The default organization stages; its request binds the default.
         let staged_a = stage(&a, who, Some("review-diff".into()), "skills/review-diff").unwrap();
-        assert_ne!(staged_a["staging_id"].as_str().unwrap(), b_staging, "{staged_a}");
+        let a_staging = staged_a["staging_id"].as_str().unwrap().to_string();
         let (org, payload) = approval(staged_a["approval_id"].as_i64().unwrap());
         assert_eq!((org.as_str(), payload["org_id"].as_str()), ("default", Some("default")), "{payload}");
 
-        // B publishes its approved staged copy.
+        // B's staged copy of the same content (SQL; see above).
+        let b_staging = "sk-orgb-not-real".to_string();
+        let (from, to) = (a_staging.clone(), b_staging.clone());
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO skill_publish_staging (org_id, id, name, content, content_hash, source, \
+                     findings_json, requested_by, created_at) SELECT 'org-b', ?2, name, content, content_hash, \
+                     source, findings_json, requested_by, created_at FROM skill_publish_staging WHERE id = ?1",
+                    params![from, to],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // The default organization never reuses B's unpublished row.
+        assert_ne!(a_staging, b_staging);
+
+        // B publishes its staged copy behind an approval that binds B.
+        let b_req = parked(publish_staged(&b, who, &b_staging));
+        let (org, payload) = approval(b_req);
+        assert_eq!((org.as_str(), payload["org_id"].as_str()), ("org-b", Some("org-b")), "{payload}");
         approve(b_req);
         let published = publish_staged(&b, who, &b_staging).unwrap();
         assert_eq!(

@@ -10,7 +10,11 @@
 //!   the row it is about, never the caller's, so `caller.org_id` or any other
 //!   expression fails;
 //! - `org_id` in a `Caller { .. }` literal must be `DEFAULT_ORG`; the
-//!   shorthand `Caller { org_id, .. }` fails too;
+//!   shorthand `Caller { org_id, .. }` fails too. The one exception is the
+//!   HTTP resolver ([`RESOLVER_ALLOWED`]): `caller_for` builds a caller in
+//!   the organization its credential resolved to (`AuthIdentity::org_id`,
+//!   a managed token's or a session credential's, which must be its
+//!   agent's), and nowhere else does;
 //! - nothing assigns `.org_id = ...` except from `DEFAULT_ORG`;
 //! - `Caller::system_for` is called nowhere except the GitHub family's
 //!   [`SYSTEM_FOR_ALLOWED`] site: callerless per-organization work (a
@@ -26,8 +30,10 @@
 //! are blanked before matching, so braces and code-like text inside them do
 //! not count.
 //!
-//! When memberships land, the resolver becomes the one other source of an
-//! organization, and this test changes with it.
+//! The resolver is the one other source of an organization: since the
+//! agents family converted, a managed token or a session credential carries
+//! its agent's organization, and `caller_for` builds its caller there. When
+//! memberships land, the resolver's other credentials join it.
 
 mod support;
 
@@ -100,6 +106,15 @@ fn org_field(body: &str) -> Option<&str> {
 /// delivery or a poll belongs to.
 const SYSTEM_FOR_ALLOWED: &[(&str, usize)] = &[("ua-tools/src/families/github/mod.rs", 1)];
 
+/// The only places a `Caller { .. }` literal may set `org_id` from anything
+/// but `DEFAULT_ORG`, as (path suffix, literals allowed there): the HTTP
+/// resolver's `caller_for`, whose two literals take the organization the
+/// credential resolved to, `id.org_id`.
+const RESOLVER_ALLOWED: &[(&str, usize)] = &[("ua-server/src/auth.rs", 2)];
+
+/// The value the resolver's literals may set `org_id` to.
+const RESOLVER_ORG: &str = "id.org_id.clone()";
+
 /// The one directory whose code may call `github_caller_for`.
 const GITHUB_CALLER_FOR_HOME: &str = "ua-tools/src/families/github/";
 
@@ -108,6 +123,9 @@ fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
     for (path, src) in files {
         let name = path.display();
         let m = without_tests(src);
+        let unix_path = path.to_string_lossy().replace('\\', "/");
+        let mut resolver_left =
+            RESOLVER_ALLOWED.iter().find(|(suffix, _)| unix_path.ends_with(suffix)).map_or(0, |(_, n)| *n);
         for ty in ["Caller", "EventInput"] {
             for at in find_all(&m, &format!("{ty} {{")) {
                 let before = m[..at].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
@@ -120,6 +138,10 @@ fn findings(files: &[(PathBuf, String)]) -> Vec<String> {
                 if let Some(v) = org_field(body)
                     && !is_default_org(v)
                 {
+                    if ty == "Caller" && resolver_left > 0 && v == RESOLVER_ORG {
+                        resolver_left -= 1;
+                        continue;
+                    }
                     out.push(format!(
                         "{name}:{}: {ty} literal sets org_id to `{v}`, not DEFAULT_ORG",
                         line_of(&m, at)
@@ -192,9 +214,19 @@ fn one(src: &str) -> Vec<String> {
 fn non_test_callers_and_events_are_in_the_default_organization() {
     let files = sources();
     assert!(files.len() > 100, "found only {} source files", files.len());
-    let events: usize =
-        files.iter().map(|(_, s)| find_all(&without_tests(s), "EventInput::new(").count()).sum();
-    assert!(events > 100, "found only {events} EventInput::new calls outside tests");
+    // A sanity floor for the scanner, not a quota. Families route their
+    // events through an `emit` helper as often as they build an
+    // `EventInput` in place, so both spellings count; an `fn emit(`
+    // definition is not a call.
+    let events: usize = files
+        .iter()
+        .map(|(_, s)| {
+            let m = without_tests(s);
+            let emits = find_all(&m, "emit(").count().saturating_sub(find_all(&m, "fn emit(").count());
+            find_all(&m, "EventInput::new(").count() + emits
+        })
+        .sum();
+    assert!(events > 100, "found only {events} EventInput::new and emit( calls outside tests");
     let found = findings(&files);
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
@@ -233,6 +265,14 @@ fn the_guard_catches_a_caller_in_another_organization() {
         one("fn f() -> Caller { Caller { label: x, org_id: ua_core::DEFAULT_ORG.into(), kind: k } }")
             .is_empty()
     );
+    // The HTTP resolver's two literals take the credential's organization;
+    // a third there, another value there, or the same literal elsewhere fails.
+    let lit = "let c = Caller { label: x, org_id: id.org_id.clone(), kind: k };";
+    let resolver = |n: usize| at("crates/ua-server/src/auth.rs", &format!("fn f() {{ {} }}", lit.repeat(n)));
+    assert!(resolver(2).is_empty());
+    assert_eq!(resolver(3).len(), 1);
+    assert_eq!(at("crates/ua-server/src/auth.rs", "fn f() { Caller { org_id: other, kind: k }; }").len(), 1);
+    assert_eq!(at("crates/ua-server/src/api.rs", &format!("fn f() {{ {lit} }}")).len(), 1);
 }
 
 #[test]

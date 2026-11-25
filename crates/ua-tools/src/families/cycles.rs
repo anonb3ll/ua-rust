@@ -411,7 +411,7 @@ async fn start(ctx: ToolCtx, a: StartArgs) -> UaResult<Value> {
             Some(list.into_iter().collect())
         }
     };
-    let profile = crate::sessions::default_profile(&ctx.hub, &actor);
+    let profile = crate::sessions::default_profile(&ctx.hub, &ctx.caller.org_id, &actor);
     let registry = crate::families::workflows::step_registry();
     let denied: Vec<String> = requested
         .iter()
@@ -1181,6 +1181,18 @@ async fn eligibility(
         .ok()
         .flatten();
     let Some((Some(dir), branch)) = wt else { return no(reasons, "no git worktree found for this task") };
+    // The worktree is a path on the hub's filesystem and the validation
+    // command is the hub's: like every workspace tool (`workspace::sandbox`),
+    // they serve the default organization only. Another organization's
+    // cycle (whose task lookup above stays in its own organization) is held
+    // for a human before the path is touched or anything runs.
+    if org != ua_core::DEFAULT_ORG {
+        return no(
+            reasons,
+            "org_unsupported: the hub runs git and validation gates only in the default organization's \
+             worktrees",
+        );
+    }
     if !std::path::Path::new(&dir).is_dir() {
         return no(reasons, "no git worktree found for this task");
     }

@@ -270,16 +270,24 @@ async fn execute(
     response_url: Option<url::Url>,
 ) {
     let command = parsed["command"].as_str().unwrap_or_default().to_string();
-    let id = AuthIdentity {
-        label: identity.clone(),
-        // `slack_identities` maps only to `human_identities` (checked at load
-        // and again on every lookup).
-        kind: ActorKind::Human,
-        verified: true,
-        grant: None,
-    };
+    // `slack_identities` maps only to `human_identities` (checked at load
+    // and again on every lookup), the default organization's.
+    let id = AuthIdentity::in_default(identity.clone(), ActorKind::Human, true);
     let caller = caller_for(&state, &id, None, Transport::Slack);
+    // Refused, like a static token, while a row of another organization
+    // holds the identity's label. Defence in depth: it cannot fire today,
+    // because a Slack identity is a configuration-reserved label
+    // (`agents::Reserved`), always the default organization's. It stays so
+    // a later change to the reservation cannot quietly let one through.
+    let held = crate::auth::held_outside_default(&state, &identity).await;
     let (tool, outcome) = match slack::command_call(&parsed, &d.delivery_id) {
+        _ if held => (
+            None,
+            Err(ua_core::UaError::denied(
+                "agent_label_taken",
+                "this Slack identity's label is held outside the default organization; nothing was run",
+            )),
+        ),
         Ok(Some(call)) => {
             (Some(call.tool), state.registry.call(&state.hub, &caller, call.tool, call.args).await)
         }

@@ -47,8 +47,9 @@
 //! [`RETIRE_BLOCKERS`].
 //!
 //! Organizations: every operator action works in the caller's organization,
-//! and a node is reassigned only to an agent not known to work in another
-//! one. Since node names are one hub namespace, a default-organization
+//! and a node is reassigned only to an agent of its own organization (an
+//! agent row of another organization, or a label with node work there, is
+//! refused `agent_org_mismatch`). Since node names are one hub namespace, a default-organization
 //! lifecycle operator can recover a name any organization holds with
 //! `node_retire` / `node_forget` `any_org=true` (hub recovery), acting in the
 //! node's own organization and answering without its fields.
@@ -964,10 +965,16 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
     // The node belongs to the registering caller's organization, for good
     // (`nodes_org_immutable`).
     let org = ctx.caller.org_id.clone();
+    let reserved = super::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             super::node_queue::require_org(tx, &org)?;
+            // The owning label must be free for the caller's organization:
+            // another organization's agent label, or (outside the default
+            // organization) a configuration-reserved one, never owns a node
+            // here, so no label-keyed setting follows the node.
+            super::agents::require_label_free(tx, &reserved, &org, &agent)?;
             let existing: Option<RegisteredRow> = tx
                 .query_row(
                     "SELECT agent, retired_at, version, facts_json, org_id FROM nodes WHERE node = ?1",
@@ -1417,6 +1424,7 @@ pub(crate) async fn node_unretire(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value
 
 fn reassign(
     tx: &mut WriteTx<'_>,
+    reserved: &super::agents::Reserved,
     org: &str,
     name: &str,
     to: &str,
@@ -1431,7 +1439,10 @@ fn reassign(
     if from == to {
         return Ok(json!({ "node": name, "agent": to, "changed": false }));
     }
-    if agent_orgs(tx, to)?.iter().any(|o| o != org) {
+    // An agent belongs to one organization (`agents.org_id`); a label with
+    // no agent row is still refused when it owns a node, has node work or
+    // has a dispatch run in another organization.
+    if super::agents::foreign_label(tx, reserved, org, to)? || agent_orgs(tx, to)?.iter().any(|o| o != org) {
         return Err(UaError::denied(
             "agent_org_mismatch",
             format!("agent {to:?} works in another organization; a node is reassigned only within its own"),
@@ -1476,12 +1487,11 @@ fn reassign(
     }))
 }
 
-/// The organizations `agent` is known to work in. The `agents` table has
-/// no `org_id` yet, so this reads the organization-keyed rows that name an
-/// agent: the nodes it owns, the node work queued for it and its dispatch
-/// runs. An agent with none of those (a label that never registered a node
-/// or ran work) has no known organization, and a reassignment to it is not
-/// refused on this ground: that is the limit until agents carry `org_id`.
+/// The organizations `agent` is known to work in through rows that name it
+/// without an agent row behind them: the nodes it owns, the node work
+/// queued for it and its dispatch runs. `node_reassign` reads the agent's
+/// own organization from `agents.org_id` first ([`super::agents::foreign_label`]);
+/// this covers a label that never registered as an agent.
 fn agent_orgs(c: &Connection, agent: &str) -> UaResult<BTreeSet<String>> {
     let mut stmt = c.prepare(
         "SELECT org_id FROM nodes WHERE agent = ?1 COLLATE NOCASE \
@@ -1538,7 +1548,8 @@ pub(crate) async fn node_reassign(ctx: ToolCtx, a: ReassignArgs) -> UaResult<Val
     let to = validate_label(Some(&a.to_agent), "to_agent")?;
     let reason = retire_reason(a.reason.as_deref())?;
     let org = ctx.caller.org_id.clone();
-    ctx.hub.db().write_async(move |tx| reassign(tx, &org, &name, &to, &who, &reason)).await
+    let reserved = super::agents::Reserved::of(ctx.hub.cfg());
+    ctx.hub.db().write_async(move |tx| reassign(tx, &reserved, &org, &name, &to, &who, &reason)).await
 }
 
 /// `coordination_manage(action="node_forget")`: delete a retired node's row

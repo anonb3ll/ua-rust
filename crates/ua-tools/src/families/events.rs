@@ -51,10 +51,12 @@ pub(super) const VISIBLE_EVENT: &str = "(
         ? OR EXISTS (
         SELECT 1 FROM session_handoff_notes n
           WHERE n.id = json_extract(event_log.payload, '$.note_id')
+            AND n.org_id = event_log.org_id
             AND ? IN (n.agent, n.assigned_to, n.delivered_to)
     ) OR EXISTS (
         SELECT 1 FROM agent_sessions s
           WHERE s.id = json_extract(event_log.payload, '$.session_id')
+            AND s.org_id = event_log.org_id
             AND s.agent = ?
     )))
     OR (channel = 'agent.conversation.handoff' AND org_id = ? AND json_valid(event_log.payload) AND (

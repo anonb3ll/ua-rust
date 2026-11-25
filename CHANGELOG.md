@@ -596,6 +596,66 @@ from its commit history.
   sends the same session, kind and key gets the old receipt (its event id
   and the caller-supplied values), as anyone on the hub could before.
   Stored keys are kept indefinitely; there is no retention sweep yet.
+- Agents and sessions are organization-scoped (`docs/organization.md`, the
+  agents and sessions family). **Design assumption (the owner may revisit
+  it):** an agent belongs to exactly one organization, the one of the token
+  or grant it authenticates with; its sessions, profile bindings, session
+  credentials, handoff notes and wake rows belong to it too. Agent labels
+  stay one hub-wide, case-insensitive namespace: a label another
+  organization holds is refused (`agent_label_taken`), and a default
+  lifecycle operator recovers one with `agent_retire` and the new
+  `agent_forget` `any_org=true`, acting in that agent's organization.
+  `organization.v1.tools.agents` gives `agents`, `agent_sessions`,
+  `agent_tokens`, `agent_lifecycle`, `session_profiles`,
+  `session_credentials`, `session_handoff_notes`, `session_wake` and
+  `session_wake_offers` `org_id` and their triggers; `agents.v2.org_scope`
+  adds org-led indexes and same-organization reference triggers. No key is
+  rebuilt; every existing row lands in `default` and none is dropped. The
+  HTTP resolver binds a caller to its credential's organization: a managed
+  token resolves to its own organization and is refused when that is not
+  its agent's; a session credential to its item's; a static token or an
+  OAuth grant to the default organization, refused while another
+  organization's agent holds its label (`org_guard` admits `caller_for` as
+  the one resolver site). Every read and write filters `org_id`, and
+  another organization's agent or session answers like a missing one. The
+  interim carve-outs are lifted: a session can be addressed inside its own
+  organization (`cross_org_recipient` and `require_default_sessions` are
+  gone), `crew_view` and `crew_intervene` work in the caller's organization,
+  session credentials and idle-session wakes run per organization, and
+  `node_reassign` reads `agents.org_id`. A delegation must target a
+  registered agent of the delegator's organization (see Behaviour
+  changes); the target matches without regard to case and the registered
+  spelling is stored. Labels hub configuration names (human identities,
+  lifecycle operators, static tokens, `[profiles]`, `agent_scopes`,
+  `agent_workspaces`, `revoked_agents`, OAuth and Slack identities, policy
+  role identities) are reserved for the default organization: no other
+  organization can register, bind or hold a token for one, so none
+  inherits a label-keyed setting, and the default credential for it always
+  authenticates. While the policy file is unreadable, another organization
+  cannot register or get a token for a label it does not already hold
+  (`policy_unavailable`). A stale row of another organization for a
+  reserved label (one older than the reservation) still blocks the default
+  credential's writes: `session_start` is refused `agent_label_blocked`
+  and `agent_heartbeat` answers `recorded: false`, until hub recovery
+  (`agent_retire` and `agent_forget` with `any_org=true`), which reaches
+  that row, removes it. `agent_forget` revokes every credential issued
+  since the retire and is refused for a configured label in the default
+  organization (`agent_label_configured`), whose retired row is what keeps
+  its static token refused, and while the agent owns a node in service
+  (`agent_owns_nodes`); it never deletes a second spelling of the label
+  (`agent_label_ambiguous`). Lifecycle stops act in the agent's
+  organization only. Workspace tools (`fs_*`, `run_cmd*`, `git_*` and the
+  rest), `skill_registry` publish and drift, and the `security_audit` and
+  `skill_review` targets are refused
+  (`org_unsupported`) outside the default organization before any
+  filesystem access, and another organization's autonomous cycle is held
+  before its worktree is read. Device acceptance,
+  command notices and learning-proposal and drop-file writes into the hub's
+  shared vault and workspace stay default-organization only. Events about
+  another organization's agents and sessions keep only ids, states and
+  counts, under the `system` originator; its `lifecycle_record` keys are
+  its own through the `(org_id, key)` idempotency table. The importer writes legacy agents, tokens
+  and handoff notes to `default`.
 - Managed secrets are organization-scoped and each organization can hold
   its own GitHub credentials: `managed_secrets.v2.tenant_keys` rebuilds the
   table around `(org_id, name)` and adds `aad_v` (new writes bind the
@@ -838,6 +898,15 @@ from its commit history.
 
 ### Behaviour changes
 
+- `delegate` (and `delegation_manage` create and `handoff`) accepts only a
+  `to_agent` that is a registered agent of the delegator's own
+  organization: an `agents` row there with exactly that label. A label no
+  agent has registered is now refused in every organization, the default
+  included, with the same `not_found` answer as a label another
+  organization's agent holds, so neither reveals whether the label exists.
+  **Upgrade note:** a workflow that delegated to an agent before it first
+  connected must have the agent connect (heartbeat or `session_start`)
+  first. Delegations already created are unchanged.
 - GitHub webhook multi-match is removed. A delivery belongs to the one
   organization its route names, not to every organization whose secret
   verifies it, and the aggregate answer (`{"ok", "matched", "statuses"}`)

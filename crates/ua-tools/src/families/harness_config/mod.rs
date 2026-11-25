@@ -256,7 +256,7 @@ fn effective(
     agent: &str,
     bundle: &Bundle,
 ) -> UaResult<(Bundle, Vec<Value>)> {
-    let profile = crate::sessions::default_profile(hub, agent);
+    let profile = crate::sessions::default_profile(hub, org, agent);
     let resolved = skill_registry::resolve(c, org, agent, Some(profile.as_str()))?;
     let mut out = bundle.clone();
     let mut notes = Vec::new();

@@ -94,6 +94,14 @@ pub fn lifecycle_rule(cfg: &Config, caller: &Caller) -> bool {
     }
 }
 
+/// Every identity label the configuration grants an authority to: the
+/// human identities and the lifecycle operators. The agents family reserves
+/// these (with the configuration's other labels) for the default
+/// organization, so no other organization can register one.
+pub fn authority_labels(cfg: &Config) -> impl Iterator<Item = &str> {
+    cfg.human_identities.iter().chain(cfg.lifecycle_operators()).map(String::as_str)
+}
+
 /// The caller's verified label: an authenticated agent or human. Anonymous,
 /// system and internal callers have none.
 fn verified_label(caller: &Caller) -> Option<&str> {

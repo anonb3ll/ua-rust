@@ -53,6 +53,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 use super::{
     LEASE_GRACE_S, check_item_id, device_agent, load_item, load_node, owned_node, require_org, run_gate,
 };
+use crate::families::plans::{ledger_label, ledger_text};
 use crate::families::{governance, nodes};
 use crate::grant::SessionGrant;
 use crate::hub::Hub;
@@ -133,10 +134,11 @@ fn plus(t: Timestamp, secs: i64) -> Timestamp {
     t.checked_add(SignedDuration::from_secs(secs)).unwrap_or(Timestamp::MAX)
 }
 
-/// The `acp-session` list, narrowed by `label`'s own default profile: a
-/// credential never reaches a tool its subject could not.
-fn ceiling(hub: &Hub, label: &str) -> BTreeSet<String> {
-    let own = crate::sessions::default_profile(hub, label);
+/// The `acp-session` list, narrowed by `label`'s own default profile in its
+/// organization `org`: a credential never reaches a tool its subject could
+/// not.
+fn ceiling(hub: &Hub, org: &str, label: &str) -> BTreeSet<String> {
+    let own = crate::sessions::default_profile(hub, org, label);
     crate::builtin_registry_shared()
         .all()
         .map(|t| t.name)
@@ -148,44 +150,51 @@ fn ceiling(hub: &Hub, label: &str) -> BTreeSet<String> {
 // --- revocation -----------------------------------------------------------------
 
 /// Revoke every active credential matching `clause` (one of this module's
-/// constant clauses) in the caller's transaction, with one `.revoked` event
-/// each. Returns the ids.
+/// constant clauses) in the caller's transaction, in organization `org` when
+/// one is given (else in each credential's own organization: a lapse found
+/// by [`verify`]), with one `.revoked` event each, in the credential's
+/// organization (another organization's names no actor). Returns the ids.
 fn revoke_where(
     tx: &mut WriteTx<'_>,
+    org: Option<&str>,
     clause: &str,
     p: &[&dyn rusqlite::ToSql],
     reason: &str,
     actor: Option<&str>,
 ) -> UaResult<Vec<String>> {
-    let ids: Vec<String> = {
+    let rows: Vec<(String, String)> = {
         let mut stmt = tx.prepare(&format!(
-            "SELECT credential_id FROM session_credentials WHERE revoked_at IS NULL AND ({clause}) ORDER BY issued_at"
+            "SELECT credential_id, org_id FROM session_credentials WHERE revoked_at IS NULL AND ({clause}) \
+             ORDER BY issued_at"
         ))?;
-        stmt.query_map(p, |r| r.get(0))?.collect::<Result<_, _>>()?
+        stmt.query_map(p, |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
     };
     let ts = ua_core::time::now();
-    for id in &ids {
+    let mut ids = Vec::new();
+    for (id, row_org) in rows {
+        if org.is_some_and(|o| o != row_org) {
+            continue;
+        }
         tx.execute(
             "UPDATE session_credentials SET revoked_at = ?2, revoke_reason = ?3 \
-             WHERE credential_id = ?1 AND revoked_at IS NULL",
-            params![id, ts, reason],
+             WHERE credential_id = ?1 AND org_id = ?4 AND revoked_at IS NULL",
+            params![id, ts, reason, row_org],
         )?;
-        let mut ev = EventInput::new(
-            ua_core::DEFAULT_ORG,
+        crate::families::agents::emit(
+            tx,
+            &row_org,
             CHANNEL_REVOKED,
-            json!({ "credential_id": id, "reason": reason, "actor": actor }),
-        );
-        if let Some(a) = actor {
-            ev = ev.by(a.to_string());
-        }
-        ledger::append(tx, ev)?;
+            json!({ "credential_id": id, "reason": reason, "actor": ledger_label(&row_org, actor) }),
+            actor.unwrap_or("system"),
+            None,
+        )?;
+        ids.push(id);
     }
     Ok(ids)
 }
 
 /// Revoke the credentials of item `item_id` of organization `org` (receipt,
-/// cancel, lease expiry). Only the default organization's items hold
-/// credentials ([`mint_tx`]), so another organization's item has none.
+/// cancel, lease expiry).
 pub(crate) fn revoke_for_item(
     tx: &mut WriteTx<'_>,
     org: &str,
@@ -193,33 +202,32 @@ pub(crate) fn revoke_for_item(
     reason: &str,
     actor: &str,
 ) -> UaResult<Vec<String>> {
-    if org != ua_core::DEFAULT_ORG {
-        return Ok(Vec::new());
-    }
-    revoke_where(tx, "item_id = ?1", &[&item_id], reason, Some(actor))
+    revoke_where(tx, Some(org), "item_id = ?1", &[&item_id], reason, Some(actor))
 }
 
-/// Revoke the credentials running as `agent` (agent retirement).
+/// Revoke the credentials running as `agent`, an agent of organization
+/// `org` (agent retirement).
 pub(crate) fn revoke_for_agent(
     tx: &mut WriteTx<'_>,
+    org: &str,
     agent: &str,
     reason: &str,
     actor: &str,
 ) -> UaResult<Vec<String>> {
-    revoke_where(tx, "agent_label = ?1 COLLATE NOCASE", &[&agent], reason, Some(actor))
+    revoke_where(tx, Some(org), "agent_label = ?1 COLLATE NOCASE", &[&agent], reason, Some(actor))
 }
 
-/// Slide the idle window of `item_id`'s live credentials forward, in the
-/// heartbeat's transaction. Never past the expiry, never reviving a lapsed
-/// window.
-pub(crate) fn slide_idle(tx: &mut WriteTx<'_>, item_id: &str, node: &str) -> UaResult<()> {
+/// Slide the idle window of `item_id`'s live credentials (in organization
+/// `org`, the item's) forward, in the heartbeat's transaction. Never past
+/// the expiry, never reviving a lapsed window.
+pub(crate) fn slide_idle(tx: &mut WriteTx<'_>, org: &str, item_id: &str, node: &str) -> UaResult<()> {
     let now = Timestamp::now();
     let rows: Vec<(String, String, String)> = {
         let mut stmt = tx.prepare(
             "SELECT credential_id, idle_expires_at, expires_at FROM session_credentials \
-             WHERE item_id = ?1 AND node = ?2 AND revoked_at IS NULL",
+             WHERE org_id = ?3 AND item_id = ?1 AND node = ?2 AND revoked_at IS NULL",
         )?;
-        stmt.query_map(params![item_id, node], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        stmt.query_map(params![item_id, node, org], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
     for (id, idle, cap) in rows {
@@ -230,8 +238,9 @@ pub(crate) fn slide_idle(tx: &mut WriteTx<'_>, item_id: &str, node: &str) -> UaR
         let renewed = plus(now, IDLE_WINDOW_S).min(cap);
         if renewed > idle {
             tx.execute(
-                "UPDATE session_credentials SET idle_expires_at = ?2 WHERE credential_id = ?1 AND revoked_at IS NULL",
-                params![id, format_ts(renewed)],
+                "UPDATE session_credentials SET idle_expires_at = ?2 \
+                 WHERE credential_id = ?1 AND org_id = ?3 AND revoked_at IS NULL",
+                params![id, format_ts(renewed), org],
             )?;
         }
     }
@@ -321,13 +330,10 @@ fn conflict(code: &str, msg: impl Into<String>) -> UaError {
 
 /// Mint a credential for the node token of organization `org`.
 ///
-/// A session credential authenticates as its subject in the default
-/// organization (`session_credentials` carries no `org_id` yet, and the
-/// HTTP adapter's credential caller is a default-organization caller), so
-/// one is minted only for the default organization's items: another
-/// organization's node is refused (`org_unsupported`) before anything is
-/// read, rather than handed a credential that would act in the wrong
-/// organization.
+/// The credential is the item's organization's (`session_credentials.org_id`,
+/// the node token's organization, which is the node's and the item's), and
+/// the HTTP adapter runs its requests as a caller of that organization
+/// ([`Verified::org`]).
 fn mint_tx(
     tx: &mut WriteTx<'_>,
     hub: &Hub,
@@ -338,12 +344,6 @@ fn mint_tx(
     attempt: i64,
 ) -> UaResult<Value> {
     require_org(tx, org)?;
-    if org != ua_core::DEFAULT_ORG {
-        return Err(refuse(
-            "org_unsupported",
-            "session credentials are issued only in the default organization until they carry one",
-        ));
-    }
     // Ownership: another label's node, or a retired node, is a binding failure.
     let row = owned_node(tx, org, node, agent).map_err(|e| match e {
         UaError::NotFound(m) => conflict("node_binding", m),
@@ -420,7 +420,7 @@ fn mint_tx(
             return Err(conflict("task_closed", "the item's task is closed or missing"));
         }
     }
-    let tools: Vec<String> = ceiling(hub, &subject).into_iter().collect();
+    let tools: Vec<String> = ceiling(hub, org, &subject).into_iter().collect();
     let idle = plus(now, IDLE_WINDOW_S).min(expires);
 
     let mut raw = [0u8; 32];
@@ -434,13 +434,19 @@ fn mint_tx(
     }
 
     // At most one active credential per (item, attempt).
-    let superseded =
-        revoke_where(tx, "item_id = ?1 AND attempt = ?2", &[&item_id, &attempt], "superseded", Some(agent))?;
+    let superseded = revoke_where(
+        tx,
+        Some(org),
+        "item_id = ?1 AND attempt = ?2",
+        &[&item_id, &attempt],
+        "superseded",
+        Some(agent),
+    )?;
     let issued = ua_core::time::now();
     tx.execute(
-        "INSERT INTO session_credentials (credential_id, token_sha256, agent_label, node, item_id, attempt, task_id, \
-         run_id, tools_json, issued_by, issued_at, idle_expires_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO session_credentials (org_id, credential_id, token_sha256, agent_label, node, item_id, attempt, \
+         task_id, run_id, tools_json, issued_by, issued_at, idle_expires_at, expires_at) \
+         VALUES (?14, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             credential_id,
             digest(&value),
@@ -455,28 +461,28 @@ fn mint_tx(
             issued,
             format_ts(idle),
             format_ts(expires),
+            org,
         ],
     )?;
-    ledger::append(
+    crate::families::agents::emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            CHANNEL_MINTED,
-            json!({
-                "credential_id": credential_id,
-                "item_id": item_id,
-                "attempt": attempt,
-                "node": node,
-                "task_id": item.task_id,
-                "run_id": item.run_id,
-                "agent_label": subject,
-                "tools": tools,
-                "idle_expires_at": format_ts(idle),
-                "expires_at": format_ts(expires),
-                "superseded": superseded,
-            }),
-        )
-        .by(agent.to_string()),
+        org,
+        CHANNEL_MINTED,
+        json!({
+            "credential_id": credential_id,
+            "item_id": item_id,
+            "attempt": attempt,
+            "node": ledger_text(org, &node),
+            "task_id": item.task_id,
+            "run_id": item.run_id,
+            "agent_label": ledger_text(org, &subject),
+            "tools": tools,
+            "idle_expires_at": format_ts(idle),
+            "expires_at": format_ts(expires),
+            "superseded": superseded,
+        }),
+        agent,
+        None,
     )?;
     Ok(json!({
         "credential": value,
@@ -522,10 +528,12 @@ async fn node_session_credential(ctx: ToolCtx, a: MintArgs) -> UaResult<Value> {
 
 // --- per-request verification ---------------------------------------------------
 
-/// A credential the hub let in: who it runs as, and its grant.
+/// A credential the hub let in: who it runs as, in which organization (the
+/// credential's, so its item's and node's), and its grant.
 #[derive(Debug, Clone)]
 pub struct Verified {
     pub subject: String,
+    pub org: String,
     pub grant: SessionGrant,
 }
 
@@ -544,6 +552,7 @@ enum Decision {
 
 struct CredRow {
     credential_id: String,
+    org: String,
     agent_label: String,
     item_id: String,
     task_id: Option<i64>,
@@ -552,6 +561,7 @@ struct CredRow {
 
 fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<Decision> {
     type Raw = (
+        String,
         String,
         String,
         String,
@@ -567,10 +577,11 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     let raw: Option<Raw> = c
         .query_row(
             "SELECT credential_id, agent_label, node, item_id, attempt, task_id, tools_json, idle_expires_at, \
-             expires_at, last_used_at, revoked_at FROM session_credentials WHERE token_sha256 = ?1",
+             expires_at, last_used_at, revoked_at, org_id FROM session_credentials WHERE token_sha256 = ?1",
             [digest(token)],
             |r| {
                 Ok((
+                    r.get(11)?,
                     r.get(0)?,
                     r.get(1)?,
                     r.get(2)?,
@@ -586,7 +597,8 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
             },
         )
         .optional()?;
-    let Some((id, agent, node, item_id, attempt, task_id, tools, idle, expires, last_used, revoked)) = raw
+    let Some((org, id, agent, node, item_id, attempt, task_id, tools, idle, expires, last_used, revoked)) =
+        raw
     else {
         return Ok(Decision::Refuse("unknown_or_revoked", None));
     };
@@ -599,8 +611,9 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     if parse_ts(&idle).is_none_or(|i| now >= i) {
         return Ok(Decision::Lapse("idle_expired", id));
     }
-    // Only the default organization's items hold credentials (`mint_tx`).
-    let org = ua_core::DEFAULT_ORG;
+    // Everything is read in the credential's own organization: its item,
+    // task and node are that organization's (`session_credentials_org_parent`).
+    let org = org.as_str();
     let item = load_item(c, org, &item_id)?;
     let Some(item) = item.filter(|i| i.status == "claimed" && i.node == node && i.attempts == attempt) else {
         return Ok(Decision::Refuse("item_not_live", Some(id)));
@@ -633,11 +646,20 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     if hub.cfg().revoked_agents.iter().any(|r| r.eq_ignore_ascii_case(&agent)) || hub.cfg().is_human(&agent) {
         return Ok(Decision::Refuse("label_revoked", Some(id)));
     }
+    // Defence in depth, as for a managed token: the credential's
+    // organization must be the one holding its subject's label (a
+    // configuration-reserved label is the default organization's). The
+    // `_org_parent` triggers keep a credential in its item's organization,
+    // but nothing there ties the item's agent label to that organization.
+    let reserved = crate::families::agents::Reserved::of(hub.cfg());
+    if crate::families::agents::label_org(c, &reserved, &agent)?.is_some_and(|held| held != org) {
+        return Ok(Decision::Refuse("org_mismatch", Some(id)));
+    }
     let touch =
         last_used.as_deref().and_then(parse_ts).is_none_or(|t| (now - t).as_secs() >= LAST_USED_RESOLUTION_S);
     let tools: Vec<String> = serde_json::from_str::<Vec<String>>(&tools).unwrap_or_default();
     Ok(Decision::Admit {
-        row: CredRow { credential_id: id, agent_label: agent, item_id, task_id, tools },
+        row: CredRow { credential_id: id, org: org.to_string(), agent_label: agent, item_id, task_id, tools },
         touch,
     })
 }
@@ -669,7 +691,7 @@ pub fn verify(hub: &Hub, token: &str) -> Result<Verified, Refused> {
         Decision::Lapse(reason, id) => {
             let cid = id.clone();
             let res = hub.db().write(move |tx| {
-                revoke_where(tx, "credential_id = ?1", &[&cid], reason, None)?;
+                revoke_where(tx, None, "credential_id = ?1", &[&cid], reason, None)?;
                 Ok(())
             });
             if let Err(e) = res {
@@ -679,20 +701,21 @@ pub fn verify(hub: &Hub, token: &str) -> Result<Verified, Refused> {
         }
         Decision::Admit { row, touch } => {
             if touch {
-                let id = row.credential_id.clone();
+                let (id, org) = (row.credential_id.clone(), row.org.clone());
                 let ts = format_ts(now);
                 let _ = hub.db().write(move |tx| {
                     tx.execute(
-                        "UPDATE session_credentials SET last_used_at = ?2 WHERE credential_id = ?1",
-                        params![id, ts],
+                        "UPDATE session_credentials SET last_used_at = ?2 WHERE credential_id = ?1 AND org_id = ?3",
+                        params![id, ts, org],
                     )?;
                     Ok(())
                 });
             }
-            let ceiling = ceiling(hub, &row.agent_label);
+            let ceiling = ceiling(hub, &row.org, &row.agent_label);
             let tools = row.tools.into_iter().filter(|t| ceiling.contains(t)).collect();
             Ok(Verified {
                 subject: row.agent_label,
+                org: row.org,
                 grant: SessionGrant {
                     tools,
                     credential_id: row.credential_id,
@@ -744,10 +767,12 @@ pub(crate) async fn session_credential_revoke(ctx: ToolCtx, a: RevokeArgs) -> Ua
     } else {
         ("node = ?1", nodes::validate_node_name(a.node.as_deref().unwrap_or(""))?)
     };
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let ids = revoke_where(tx, clause, &[&key], "operator", Some(&who))?;
+            require_org(tx, &org)?;
+            let ids = revoke_where(tx, Some(&org), clause, &[&key], "operator", Some(&who))?;
             let creds = metadata(tx, &ids)?;
             Ok(json!({ "revoked": ids, "count": ids.len(), "credentials": creds }))
         })

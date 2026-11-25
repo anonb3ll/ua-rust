@@ -6,7 +6,10 @@
 //! 1. resolves the server (registry or config) and refuses it when it is
 //!    revoked, past its review window, or misconfigured;
 //! 2. refuses a tool the registration does not classify;
-//! 3. for a read, refuses an anonymous caller when the server injects secrets
+//! 3. refuses another organization's caller for a server that injects the
+//!    hub's secrets or runs as a stdio process on the hub (a static `list`
+//!    reads neither and is not refused);
+//!    for a read, refuses an anonymous caller when the server injects secrets
 //!    and checks the caller against `read_profiles` (empty: humans and
 //!    configured operator identities); for a write, needs an authenticated
 //!    caller who passes the prod-action checks;
@@ -183,7 +186,7 @@ async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value
     let server = ctx.hub.db().read_async(move |c| resolve(c, &cfg, &name)).await?;
     server.usable()?;
     if t.action == "call" || a.live {
-        require_hub_org_for_secrets(ctx, &server)?;
+        require_hub_org_for_server(ctx, &server)?;
     }
     if t.action == "list" {
         return list(ctx, &server, a.live, t).await;
@@ -460,15 +463,32 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 
 /// A downstream server's credentials are the hub's (the default
 /// organization's managed secrets): another organization's caller never has
-/// them injected on its behalf. Checked before the policy check, the slot
-/// and any approval. Fail closed until servers are per organization.
-fn require_hub_org_for_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
-    if !server.spec.secrets.is_empty() && ctx.caller.org_id != super::HUB_SECRETS_ORG {
+/// them injected on its behalf. A stdio server is a process the hub spawns
+/// on its own host, with the hub's filesystem and network, so it too serves
+/// the default organization only, secrets or not. A Streamable HTTP server
+/// with no injected secret is not refused here. Checked before the policy
+/// check, the slot, any approval and any spawn or connection. Fail closed
+/// until servers are per organization.
+fn require_hub_org_for_server(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
+    if ctx.caller.org_id == super::HUB_SECRETS_ORG {
+        return Ok(());
+    }
+    if !server.spec.secrets.is_empty() {
         return Err(UaError::denied(
             "org_unsupported",
             format!(
                 "MCP server {:?} injects the hub's credentials, which serve the default organization only; \
                  nothing was read or sent",
+                server.name
+            ),
+        ));
+    }
+    if server.spec.transport == TransportKind::Stdio {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "MCP server {:?} runs as a process on the hub, which serves the default organization only; \
+                 nothing was started or sent",
                 server.name
             ),
         ));

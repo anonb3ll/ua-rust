@@ -102,7 +102,36 @@ impl H {
     }
 
     async fn call(&self, who: &Caller, tool: &str, args: Value) -> Result<Value, UaError> {
+        self.register_target(who, tool, &args);
         self.reg.call(&self.hub, who, tool, args).await
+    }
+
+    /// Register a delegation's `to_agent` as an agent of the caller's
+    /// organization before the call: a delegation targets only a registered
+    /// agent of the delegator's organization. Agent labels are one hub-wide
+    /// namespace, and these tests reuse one target label across
+    /// organizations, so the registration moves with the delegator (by SQL,
+    /// which writes no ledger event and no row these tests snapshot).
+    fn register_target(&self, who: &Caller, tool: &str, args: &Value) {
+        let to = match tool {
+            "delegate" | "handoff" => args.get("to_agent"),
+            "delegation_manage" if args["action"] == "create" => args["params"].get("to_agent"),
+            _ => None,
+        };
+        let Some(to) = to.and_then(Value::as_str) else { return };
+        let (to, org) = (to.replace('\'', "''"), who.org_id.replace('\'', "''"));
+        let sql = format!(
+            "DELETE FROM agents WHERE label = '{to}' AND org_id <> '{org}';
+             INSERT OR IGNORE INTO agents (org_id, label, created_at, updated_at)
+                 SELECT '{org}', '{to}', 't0', 't0' WHERE EXISTS (SELECT 1 FROM orgs WHERE id = '{org}');"
+        );
+        self.hub
+            .db()
+            .write(move |tx| {
+                tx.execute_batch(&sql)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     async fn ok(&self, who: &Caller, tool: &str, args: Value) -> Value {
@@ -843,21 +872,94 @@ async fn organization_b_text_and_labels_never_reach_the_default_ledger() {
     assert!(p.contains("Add a CSV export to the report page."), "{p}");
 }
 
-/// Owner decision (c): a delegation to another organization's agent is
-/// created in the delegator's organization, and that agent, whose every read
-/// and claim is scoped to its own organization, can never reach it.
+/// Owner decision: a delegation targets only a registered agent of the
+/// delegator's organization, so one to another organization's agent is
+/// refused before anything is written, exactly as one to a label no agent
+/// has registered.
 #[tokio::test]
 async fn a_delegation_to_another_organization_s_agent_fails_closed() {
     let h = H::new();
-    let (d, task) = h.delegate(&agent_named("lead-1", DEFAULT_ORG), "builder-b").await;
-    assert_eq!(h.text(&format!("SELECT org_id FROM delegations WHERE id = {d}")).unwrap(), DEFAULT_ORG);
-    let them = agent_named("builder-b", ORG_B);
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    // `builder-b` registers in organization B (a heartbeat), never in A.
+    h.reg.call(&h.hub, &agent_named("builder-b", ORG_B), "agent_heartbeat", json!({})).await.unwrap();
     let before = (h.snapshot(), h.events());
-    let v = h.ok(&them, "delegate_list", json!({ "to_agent": "builder-b" })).await;
-    assert!(ids(&v).is_empty(), "{v}");
-    let got = h.manage(&them, "claim", json!({ "id": d })).await;
-    same_as_missing(&got, &h.manage(&them, "claim", json!({ "id": ABSENT })).await, d);
-    assert!(h.call(&them, "task_claim", json!({ "id": task })).await.is_err());
-    assert_eq!((h.snapshot(), h.events()), before, "the delegation stays pending, untouched");
-    assert_eq!(h.text(&format!("SELECT status FROM delegations WHERE id = {d}")).unwrap(), "pending");
+    let args = |to: &str| json!({ "task_spec": SPEC, "to_agent": to });
+    // The raw registry call: `H::call` would register the target first.
+    let theirs = h.reg.call(&h.hub, &lead, "delegate", args("builder-b")).await.unwrap_err();
+    assert_eq!(theirs.code(), "not_found", "{theirs:?}");
+    assert_eq!((h.snapshot(), h.events()), before, "nothing created");
+    let unregistered = h.reg.call(&h.hub, &lead, "delegate", args("builder-z")).await.unwrap_err();
+    assert_eq!(
+        format!("{theirs:?}").replace("builder-b", "L"),
+        format!("{unregistered:?}").replace("builder-z", "L"),
+        "another organization's agent answers as a label no agent has registered"
+    );
+}
+
+/// Two agents of one organization whose labels differ only in letter case
+/// (`agents.label` is case-sensitive): a delegation naming one exactly goes
+/// to it, and one naming neither exactly is refused as ambiguous
+/// (`agent_label_ambiguous`, as `agent_forget` refuses) rather than silently
+/// sent to one of them.
+#[tokio::test]
+async fn a_case_variant_delegation_target_is_exact_or_ambiguous() {
+    let h = H::new();
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    h.sql(
+        "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES
+             ('default', 'Builder-Case', 't0', 't0'),
+             ('default', 'builder-case', 't0', 't0');",
+    )
+    .unwrap();
+    let args = |to: &str| json!({ "task_spec": SPEC, "to_agent": to });
+    let before = (h.snapshot(), h.events());
+    // The raw registry call: `H::call` would register the target first.
+    let e = h.reg.call(&h.hub, &lead, "delegate", args("BUILDER-CASE")).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_label_ambiguous", "{e:?}");
+    assert_eq!((h.snapshot(), h.events()), before, "nothing created");
+    for exact in ["Builder-Case", "builder-case"] {
+        let v = h.reg.call(&h.hub, &lead, "delegate", args(exact)).await.unwrap();
+        let id = v["delegation_id"].as_i64().unwrap();
+        assert_eq!(
+            h.text(&format!("SELECT to_agent FROM delegations WHERE id = {id}")).as_deref(),
+            Some(exact)
+        );
+    }
+    // One case-insensitive match is still found and stored as registered.
+    h.sql("INSERT INTO agents (org_id, label, created_at, updated_at) VALUES ('default', 'Solo-Case', 't0', 't0');")
+        .unwrap();
+    let v = h.reg.call(&h.hub, &lead, "delegate", args("solo-CASE")).await.unwrap();
+    let id = v["delegation_id"].as_i64().unwrap();
+    assert_eq!(
+        h.text(&format!("SELECT to_agent FROM delegations WHERE id = {id}")).as_deref(),
+        Some("Solo-Case")
+    );
+}
+
+/// The receipt digest is over the target's registered spelling, so a retry
+/// with the same idempotency key that spells `to_agent` in other letter
+/// cases is the same request and replays; a different target is still a
+/// conflict.
+#[tokio::test]
+async fn a_retry_spelling_the_target_in_other_letter_cases_replays() {
+    let h = H::new();
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    h.sql(
+        "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES
+             ('default', 'builder-retry', 't0', 't0'),
+             ('default', 'other-target', 't0', 't0');",
+    )
+    .unwrap();
+    let args =
+        |to: &str| json!({ "task_spec": SPEC, "to_agent": to, "idempotency_key": "retry-key-not-real" });
+    let first = h.reg.call(&h.hub, &lead, "delegate", args("Builder-Retry")).await.unwrap();
+    let before = (h.snapshot(), h.events());
+    for spelling in ["BUILDER-RETRY", "builder-retry", "Builder-Retry"] {
+        let again = h.reg.call(&h.hub, &lead, "delegate", args(spelling)).await.unwrap();
+        assert_eq!(again, first, "{spelling}");
+    }
+    assert_eq!((h.snapshot(), h.events()), before, "a replay creates nothing");
+    let e = h.reg.call(&h.hub, &lead, "delegate", args("other-target")).await.unwrap_err();
+    assert_eq!(e.code(), "conflict", "{e:?}");
+    assert_eq!((h.snapshot(), h.events()), before);
 }

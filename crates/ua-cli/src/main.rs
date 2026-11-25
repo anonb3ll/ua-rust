@@ -160,11 +160,20 @@ pub(crate) fn issue_agent_token(
     let token = format!("ua_{}", hex::encode(raw));
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
     let now = ua_core::time::now();
+    let reserved = ua_tools::families::agents::Reserved::of(hub.cfg());
     hub.db().write(|tx| {
+        // The CLI runs on the hub host and issues default-organization
+        // tokens; a label another organization's agent holds is refused.
+        if ua_tools::families::tokens::held_outside_default(tx, &reserved, label)? {
+            return Err(ua_core::UaError::conflict_code(
+                "agent_label_taken",
+                format!("agent label {label:?} is taken; agent labels are one hub-wide namespace"),
+            ));
+        }
         tx.execute(
-            "INSERT INTO agent_tokens (agent_label, token_hash, issued_at, issued_by, note) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![label, hash, now, by, note],
+            "INSERT INTO agent_tokens (org_id, agent_label, token_hash, issued_at, issued_by, note) \
+             VALUES (?6, ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![label, hash, now, by, note, ua_core::DEFAULT_ORG],
         )?;
         ua_store::ledger::append(
             tx,
@@ -635,8 +644,8 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                                 let n = hub.db().write(|tx| {
                                     let n = tx.execute(
                                         "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
-                                         WHERE agent_label = ?1 AND status = 'active'",
-                                        rusqlite::params![label, now],
+                                         WHERE org_id = ?3 AND agent_label = ?1 AND status = 'active'",
+                                        rusqlite::params![label, now, ua_core::DEFAULT_ORG],
                                     )?;
                                     ua_store::ledger::append(
                                         tx,

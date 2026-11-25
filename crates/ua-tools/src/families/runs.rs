@@ -250,8 +250,12 @@ fn dispatch_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResu
 
 // --- sessions ------------------------------------------------------------------
 
-fn session_rows(c: &Connection, f: &Filter<'_>, stale_before: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "agent", "started_at", "id");
+/// Sessions of the reader's organization `org` only: another
+/// organization's session answers exactly as a missing run.
+fn session_rows(c: &Connection, f: &Filter<'_>, org: &str, stale_before: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "agent", "started_at", "id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT id, agent, kind, status, started_at, ended_at, last_heartbeat_at, task_id, delegation_id, \
@@ -550,7 +554,7 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
         rows.extend(dispatch_rows(c, &f, &viewer.org, &now)?);
     }
     if has("session") {
-        rows.extend(session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?);
+        rows.extend(session_rows(c, &f, &viewer.org, &ago(SESSION_ABANDON_MINUTES * 60))?);
     }
     if has("workflow") {
         rows.extend(workflow_rows(c, &f, &viewer.org, &now)?);
@@ -596,7 +600,7 @@ fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaRes
         rows = dispatch_rows(c, &f, &viewer.org, &now)?;
     }
     if rows.is_empty() && has("session") {
-        rows = session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?;
+        rows = session_rows(c, &f, &viewer.org, &ago(SESSION_ABANDON_MINUTES * 60))?;
     }
     if rows.is_empty() && has("workflow") {
         rows = workflow_rows(c, &f, &viewer.org, &now)?;

@@ -29,7 +29,10 @@ const PARTS: [&str; 4] = [
 const TABLES: [&str; 4] = ["routines", "routine_runs", "workflow_runs", "workflow_checkpoints"];
 
 /// A workflow every organization can run: one read-only step.
-const VET: &str = "inputs: [command]\nsteps:\n  - name: vet\n    tool: run_cmd_check\n    args: { command: \"{{ inputs.command }}\" }\n";
+/// A one-step workflow over a database-only tool: a workspace tool
+/// (`run_cmd_check`) would be refused to organization B, whose callers have
+/// no hub workspace (`workspace::sandbox`).
+const VET: &str = "inputs: [command]\nsteps:\n  - name: vet\n    tool: memory_search\n    args: { query: \"{{ inputs.command }}\" }\n";
 
 /// The parts before this family's conversion: without its parts, and
 /// without the later `*.task_org` parts, whose triggers read its `org_id`.

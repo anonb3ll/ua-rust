@@ -475,6 +475,10 @@ async fn another_organization_never_reaches_a_task() {
     let spec = "### Objective\nAdd a CSV export.\n\n### Scope\n- src/report.rs\n\n### Definition of Done\n\
                 - Calling export on a report with two rows returns a CSV with a header and two lines\n\n\
                 ### TDD Constraints\n- Stub: none\n\n### Boundaries\n- Do not change the report schema\n";
+    // A delegation targets a registered agent of the delegator's organization.
+    let builder_2 =
+        Caller { label: "builder-2".into(), session_key: Some("builder-2-s".into()), ..agent(DEFAULT_ORG) };
+    h.call(&builder_2, "agent_heartbeat", json!({})).await.unwrap();
     let deleg = h.call(&me, "delegate", json!({ "task_spec": spec, "to_agent": "builder-2" })).await;
     let deleg = deleg.map(|d| d["delegation_id"].as_i64()).unwrap_or_else(|e| panic!("delegate: {e}"));
 

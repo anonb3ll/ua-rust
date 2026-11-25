@@ -373,8 +373,8 @@ fn run_inner(
             let rev = hub.db().write(|tx| {
                 let changed = tx.execute(
                     "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?1 \
-                     WHERE id > ?2 AND agent_label = ?3 AND status = 'active'",
-                    rusqlite::params![&now, prev_max_id, &label],
+                     WHERE id > ?2 AND agent_label = ?3 AND org_id = ?4 AND status = 'active'",
+                    rusqlite::params![&now, prev_max_id, &label, ua_core::DEFAULT_ORG],
                 )?;
                 if changed > 0 {
                     ua_store::ledger::append(

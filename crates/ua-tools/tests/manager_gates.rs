@@ -82,7 +82,36 @@ fn pending(e: UaError) -> (String, i64) {
 
 impl Env {
     async fn call(&self, who: &Caller, tool: &str, args: Value) -> Result<Value, UaError> {
+        self.register_target(who, tool, &args);
         self.reg.call(&self.hub, who, tool, args).await
+    }
+
+    /// Register a delegation's `to_agent` as an agent of the caller's
+    /// organization before the call: a delegation targets only a registered
+    /// agent of the delegator's organization. Agent labels are one hub-wide
+    /// namespace, and these tests reuse one target label across
+    /// organizations, so the registration moves with the delegator (by SQL,
+    /// which writes no ledger event and no row these tests snapshot).
+    fn register_target(&self, who: &Caller, tool: &str, args: &Value) {
+        let to = match tool {
+            "delegate" | "handoff" => args.get("to_agent"),
+            "delegation_manage" if args["action"] == "create" => args["params"].get("to_agent"),
+            _ => None,
+        };
+        let Some(to) = to.and_then(Value::as_str) else { return };
+        let (to, org) = (to.replace('\'', "''"), who.org_id.replace('\'', "''"));
+        let sql = format!(
+            "DELETE FROM agents WHERE label = '{to}' AND org_id <> '{org}';
+             INSERT OR IGNORE INTO agents (org_id, label, created_at, updated_at)
+                 SELECT '{org}', '{to}', 't0', 't0' WHERE EXISTS (SELECT 1 FROM orgs WHERE id = '{org}');"
+        );
+        self.hub
+            .db()
+            .write(move |tx| {
+                tx.execute_batch(&sql)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     async fn manage(&self, who: &Caller, tool: &str, action: &str, params: Value) -> Result<Value, UaError> {

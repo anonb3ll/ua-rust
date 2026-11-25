@@ -127,14 +127,23 @@ async fn profile_activation_rules() {
     // Downgrading is allowed and binds to this session only.
     let lead = agent("lead-1", Profile::Coordinator);
     reg.call(&hub, &lead, "profile_activate", json!({"profile": "research"})).await.unwrap();
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s1")), Profile::Research);
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("other")), Profile::Coordinator);
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("s1")),
+        Profile::Research
+    );
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("other")),
+        Profile::Coordinator
+    );
 
     // A legacy profile name activates the profile it names.
     let other = Caller { session_key: Some("s2".into()), ..lead.clone() };
     let out = reg.call(&hub, &other, "profile_activate", json!({"profile": "steward"})).await.unwrap();
     assert_eq!(out["profile"], "reviewer");
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s2")), Profile::Reviewer);
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("s2")),
+        Profile::Reviewer
+    );
 }
 
 #[tokio::test]

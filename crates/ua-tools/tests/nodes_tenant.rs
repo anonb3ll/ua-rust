@@ -67,7 +67,7 @@ const B_PROGRESS: &str = "osprey-progress-not-real";
 const B_OUTPUT: &str = "osprey-output-not-real";
 
 fn old_parts() -> Vec<ua_store::Part> {
-    ua_tools::schema_parts().into_iter().filter(|p| !PARTS.contains(&p.name)).collect()
+    ua_tools::schema_parts().into_iter().take_while(|p| !PARTS.contains(&p.name)).collect()
 }
 
 fn add_org(db: &ua_store::Db, id: &str, status: &str) {
@@ -665,8 +665,10 @@ async fn a_node_token_of_another_organization_never_claims_default_work() {
     h.ok(&device_b(), "node_claim", json!({ "node": NODE_B, "claim_op": op })).await;
     assert_eq!(h.count(&format!("SELECT COUNT(*) FROM node_claim_ops WHERE org_id = '{ORG_B}'")), 1);
 
-    // B's receipt settles B's item; B's session credential is refused, since
-    // a credential authenticates in the default organization only.
+    // B's receipt settles B's item; B's session credential is checked in
+    // B's own organization (session credentials carry one since the agents
+    // family converted): this item is not an ACP item, the answer a default
+    // node gets too.
     let r = h
         .ok(
             &device_b(),
@@ -683,15 +685,15 @@ async fn a_node_token_of_another_organization_never_claims_default_work() {
         )
         .await
         .unwrap_err();
-    assert_eq!(reason(&e), "org_unsupported", "{e:?}");
-    // Device acceptance and idle wakes read and write default-organization
-    // evidence, so another organization's node is refused before anything
-    // is queued.
+    assert_eq!(reason(&e), "not_acp", "{e:?}");
+    // Device acceptance reads default-organization evidence, so another
+    // organization's node is refused before anything is queued.
     let e = h.manage(&device_b(), "node_acceptance_start", json!({ "node": NODE_B })).await.unwrap_err();
     assert_eq!(reason(&e), "org_unsupported", "{e:?}");
-    let e =
-        h.call(&device_b(), "node_wake", json!({ "node": NODE_B, "offer_version": 3 })).await.unwrap_err();
-    assert_eq!(reason(&e), "org_unsupported", "{e:?}");
+    // Idle wakes run per organization: B's node polls B's sessions only
+    // (it has none).
+    let v = h.ok(&device_b(), "node_wake", json!({ "node": NODE_B, "offer_version": 3 })).await;
+    assert_eq!(v, json!({ "wakes": [] }));
 }
 
 #[tokio::test]
@@ -1200,29 +1202,40 @@ async fn another_organizations_dedupe_keys_carry_only_hub_ids() {
 }
 
 #[tokio::test]
-async fn session_wakes_refuse_another_organizations_caller() {
+async fn session_wakes_answer_another_organizations_session_as_missing() {
     let h = H::new();
     h.fleet().await;
+    // A default-organization session (its agent's wake rows would be the
+    // default organization's).
+    let a_agent = caller("wren-agent-a-not-real", ActorKind::Agent, DEFAULT_ORG);
+    let sid = h.ok(&a_agent, "session_start", json!({ "kind": "interactive" })).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let before = h.count("SELECT COUNT(*) FROM session_wake");
     for who in [device_b(), operator_b()] {
         for (action, params) in [
-            ("session_wake_opt_in", json!({ "session_id": "fake-session-1", "node": NODE_B })),
-            ("session_wake_grant", json!({ "session_id": "fake-session-1" })),
-            ("session_wake_decline", json!({ "session_id": "fake-session-1", "reason": "fake" })),
-            ("session_wake_status", json!({ "session_id": "fake-session-1" })),
+            ("session_wake_opt_in", json!({ "session_id": "SID", "node": NODE_B })),
+            ("session_wake_grant", json!({ "session_id": "SID" })),
+            ("session_wake_decline", json!({ "session_id": "SID", "reason": "fake" })),
+            ("session_wake_status", json!({ "session_id": "SID" })),
         ] {
-            let e = h.manage(&who, action, params).await.unwrap_err();
-            assert_eq!(reason(&e), "org_unsupported", "{}: {action}: {e:?}", who.label);
+            let with =
+                |id: &str| serde_json::from_str::<Value>(&params.to_string().replace("SID", id)).unwrap();
+            let got = h.manage(&who, action, with(&sid)).await;
+            let missing = h.manage(&who, action, with("fake-session-1")).await;
+            let norm = |r: &Result<Value, UaError>, id: &str| match r {
+                Ok(v) => format!("ok {v}"),
+                Err(e) => format!("err {} {}", e.code(), e.to_string().replace(id, "ID")),
+            };
+            assert!(got.is_err(), "{}: {action}: {got:?}", who.label);
+            assert_eq!(norm(&got, &sid), norm(&missing, "fake-session-1"), "{}: {action}", who.label);
         }
     }
     assert_eq!(h.count("SELECT COUNT(*) FROM session_wake"), before);
-    // The default organization's callers pass the gate (to the missing
-    // session).
-    let e = h
-        .manage(&human(), "session_wake_status", json!({ "session_id": "fake-session-1" }))
-        .await
-        .unwrap_err();
-    assert_eq!(e.code(), "not_found", "{e:?}");
+    // The default organization's callers reach their own session.
+    let v = h.manage(&human(), "session_wake_status", json!({ "session_id": sid })).await.unwrap();
+    assert_eq!(v["session_id"], json!(sid), "{v}");
 }
 
 fn fleet_row(doctor: &Value) -> Value {

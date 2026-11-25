@@ -484,7 +484,7 @@ fn owner_caller(hub: &Hub, owner: &str, attended: bool) -> Caller {
     Caller {
         label: owner.to_string(),
         kind,
-        profile: crate::sessions::default_profile(hub, owner),
+        profile: crate::sessions::default_profile(hub, ua_core::DEFAULT_ORG, owner),
         enforce_profile: true,
         session_key: None,
         transport: Transport::Internal,

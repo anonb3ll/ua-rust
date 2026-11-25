@@ -16,7 +16,8 @@
 //! carry only their id and stored hash when restricted. A file export is
 //! refused (`org_unsupported`) outside the default organization, whose
 //! workspace the file would land in; an inline export works for every
-//! organization.
+//! organization, except `export_journal`, which reads the hub's vault and is
+//! refused (`org_unsupported`) outside the default organization.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -464,6 +465,10 @@ fn journal_entries_in(
 }
 
 async fn export_journal(ctx: ToolCtx, a: JournalArgs) -> UaResult<Value> {
+    // The journal is read from the hub's vault, the default organization's:
+    // another organization's caller is refused before any file is read,
+    // inline or not.
+    crate::families::vault::require_hub_org(&ctx)?;
     let Some(vault) = ctx.hub.cfg().vault_path.clone() else {
         return Err(UaError::invalid("no vault is configured (UA_VAULT_PATH)"));
     };
@@ -1824,8 +1829,8 @@ mod tests {
              -- The columns VISIBLE_EVENT joins on, minimal versions of the
              -- real tables.
              CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY, agent TEXT,
-                 assigned_to TEXT, delivered_to TEXT);
-             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT);",
+                 assigned_to TEXT, delivered_to TEXT, org_id TEXT NOT NULL DEFAULT 'default');
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT, org_id TEXT NOT NULL DEFAULT 'default');",
         )
         .unwrap();
         c

@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Profile, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, ledger};
+use ua_store::SchemaPart;
 
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -45,10 +45,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_tokens_label ON agent_tokens(agent_label, s
 ",
 };
 
-/// The profile an identity gets when nothing is activated.
-/// A configured profile no identity may hold (`acp-session`; config loading
-/// refuses it) resolves to `public`, never to the broad default.
-pub fn default_profile(hub: &Hub, label: &str) -> Profile {
+/// The profile an identity of organization `org` gets when nothing is
+/// activated. The hub configuration's `[profiles]` map is the default
+/// organization's (`docs/organization.md`, Profiles); another
+/// organization's agent gets `developer` until agents carry a default
+/// profile of their own. A configured profile no identity may hold
+/// (`acp-session`; config loading refuses it) resolves to `public`, never to
+/// the broad default.
+pub fn default_profile(hub: &Hub, org: &str, label: &str) -> Profile {
+    if org != ua_core::DEFAULT_ORG {
+        return Profile::Developer;
+    }
     match hub.cfg().profiles.get(label).and_then(|p| p.parse::<Profile>().ok()) {
         Some(p) if p.assignable() => p,
         Some(_) => Profile::Public,
@@ -56,14 +63,16 @@ pub fn default_profile(hub: &Hub, label: &str) -> Profile {
     }
 }
 
-/// The profile currently bound to (identity, session), else the default.
-pub fn resolve_profile(hub: &Hub, label: &str, session_key: Option<&str>) -> Profile {
+/// The profile currently bound to (identity, session) in organization
+/// `org`, else the default. Another organization's binding of the same
+/// label and session key is never read.
+pub fn resolve_profile(hub: &Hub, org: &str, label: &str, session_key: Option<&str>) -> Profile {
     let bound = session_key.and_then(|key| {
         hub.db()
             .read(|c| {
                 Ok(c.query_row(
-                    "SELECT profile FROM session_profiles WHERE identity = ?1 AND session_key = ?2",
-                    params![label, key],
+                    "SELECT profile FROM session_profiles WHERE org_id = ?3 AND identity = ?1 AND session_key = ?2",
+                    params![label, key, org],
                     |r| r.get::<_, String>(0),
                 )
                 .optional()?)
@@ -74,7 +83,7 @@ pub fn resolve_profile(hub: &Hub, label: &str, session_key: Option<&str>) -> Pro
     bound
         .and_then(|p| p.parse::<Profile>().ok())
         .filter(|p| p.assignable())
-        .unwrap_or_else(|| default_profile(hub, label))
+        .unwrap_or_else(|| default_profile(hub, org, label))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -96,7 +105,7 @@ fn status(ctx: &ToolCtx) -> Value {
         "kind": c.kind,
         "session_scoped": c.session_key.is_some(),
         "enforced": c.enforce_profile,
-        "default_profile": default_profile(&ctx.hub, &c.label).as_str(),
+        "default_profile": default_profile(&ctx.hub, &c.org_id, &c.label).as_str(),
         "transport": c.transport,
     })
 }
@@ -106,8 +115,9 @@ async fn bind(ctx: ToolCtx, profile: Option<Profile>) -> UaResult<Value> {
         return Err(UaError::invalid("profile changes need a client session; this caller has none"));
     };
     let label = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
     if let Some(p) = profile {
-        let default = default_profile(&ctx.hub, &label);
+        let default = default_profile(&ctx.hub, &org, &label);
         let escalates = p.rank() > default.rank();
         if escalates && ctx.caller.kind != ActorKind::Human {
             return Err(UaError::denied(
@@ -117,33 +127,48 @@ async fn bind(ctx: ToolCtx, profile: Option<Profile>) -> UaResult<Value> {
         }
     }
     let now = ua_core::time::now();
-    let label2 = label.clone();
+    let (label2, org2) = (label.clone(), org.clone());
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            match profile {
+            let org = org2;
+            crate::families::agents::require_org(tx, &org)?;
+            crate::families::agents::require_label_free(tx, &reserved, &org, &label2)?;
+            let n = match profile {
                 Some(p) => tx.execute(
-                    "INSERT INTO session_profiles (identity, session_key, profile, updated_at) VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT(identity, session_key) DO UPDATE SET profile = excluded.profile, updated_at = excluded.updated_at",
-                    params![label2, key, p.as_str(), now],
+                    "INSERT INTO session_profiles (org_id, identity, session_key, profile, updated_at) \
+                     VALUES (?5, ?1, ?2, ?3, ?4) \
+                     ON CONFLICT(identity, session_key) DO UPDATE SET profile = excluded.profile, \
+                     updated_at = excluded.updated_at WHERE session_profiles.org_id = excluded.org_id",
+                    params![label2, key, p.as_str(), now, org],
                 )?,
                 None => tx.execute(
-                    "DELETE FROM session_profiles WHERE identity = ?1 AND session_key = ?2",
-                    params![label2, key],
+                    "DELETE FROM session_profiles WHERE org_id = ?3 AND identity = ?1 AND session_key = ?2",
+                    params![label2, key, org],
                 )?,
             };
-            ledger::append(
+            // Another organization's binding of this label and key (a label
+            // that organization registered after the binding was made) is
+            // never changed: the label is taken.
+            if profile.is_some() && n == 0 {
+                return Err(crate::families::agents::label_taken(&label2));
+            }
+            crate::families::agents::emit(
                 tx,
-                EventInput::new(ua_core::DEFAULT_ORG,
-                    "agent.profile.changed",
-                    json!({ "identity": label2, "profile": profile.map(Profile::as_str) }),
-                )
-                .by(label2.clone()),
+                &org,
+                "agent.profile.changed",
+                json!({
+                    "identity": crate::families::plans::ledger_text(&org, &label2),
+                    "profile": profile.map(Profile::as_str),
+                }),
+                &label2,
+                None,
             )?;
             Ok(())
         })
         .await?;
-    let effective = profile.unwrap_or_else(|| default_profile(&ctx.hub, &label));
+    let effective = profile.unwrap_or_else(|| default_profile(&ctx.hub, &org, &label));
     Ok(
         json!({ "ok": true, "profile": effective.as_str(), "note": "applies to calls from this session from now on" }),
     )

@@ -692,7 +692,11 @@ pub(crate) fn tombstone_block(
 /// The host to stamp on a new note: the caller's registered host, else this machine.
 pub(crate) fn source_host(conn: &Connection, caller: &Caller) -> Option<String> {
     let registered: Option<String> = conn
-        .query_row("SELECT host FROM agents WHERE label = ?1", [&caller.label], |r| r.get(0))
+        .query_row(
+            "SELECT host FROM agents WHERE label = ?1 AND org_id = ?2",
+            [&caller.label, &caller.org_id],
+            |r| r.get(0),
+        )
         .optional()
         .ok()
         .flatten()

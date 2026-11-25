@@ -20,10 +20,17 @@ pub(crate) struct Ref {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Plain,
+    /// Legacy agents are imported into the default organization (a source
+    /// `org_id` is never copied).
+    Agents,
+    /// Legacy session handoff notes are imported into the default
+    /// organization, with their sessions' agents.
+    HandoffNotes,
     /// History only: a pending request or an approved, unconsumed pass is
     /// never imported. Imported into the default organization.
     Approvals,
     /// Hashes only, and only in the scheme ua-rust verifies (hex SHA-256).
+    /// Imported into the default organization, with their agents.
     Tokens,
     /// `event_seq` may be NULL in older Python rows; it is filled from the
     /// imported ledger by `event_ulid`. Legacy messages are imported into the
@@ -103,6 +110,9 @@ impl Kind {
                 | Kind::Nodes
                 | Kind::MessageIndex
                 | Kind::MessageReads
+                | Kind::Agents
+                | Kind::Tokens
+                | Kind::HandoffNotes
         )
     }
 }
@@ -132,7 +142,7 @@ const PLAN_REF: Ref = Ref { col: "plan_id", table: "plans", key: "id" };
 
 /// Copy order: referenced tables before the tables that point at them.
 pub(crate) const MAPS: &[TableMap] = &[
-    plain("agents"),
+    TableMap { kind: Kind::Agents, ..plain("agents") },
     TableMap {
         self_ref: Some(Ref { col: "rotated_from", table: "agent_tokens", key: "id" }),
         kind: Kind::Tokens,
@@ -168,7 +178,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_workflow") },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_checks") },
     // A handoff note keeps its task id as a record even when the task is gone.
-    plain("session_handoff_notes"),
+    TableMap { kind: Kind::HandoffNotes, ..plain("session_handoff_notes") },
     TableMap { kind: Kind::Plans, ..plain("plans") },
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_steps") },
     TableMap { refs: &[PLAN_REF], kind: Kind::Plans, ..plain("plan_checkpoints") },

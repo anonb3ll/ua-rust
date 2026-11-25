@@ -969,7 +969,6 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         &crate::optional_schema_parts(),
     )
     .map_err(|e| e.to_string());
-    let count = |sql: &str| -> UaResult<i64> { Ok(c.query_row(sql, [], |r| r.get(0)).unwrap_or(0)) };
     // The hub's webhook is the default organization's destination
     // (`families::notify`): its health is that organization's last delivery.
     let last_delivery = c
@@ -998,7 +997,11 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
                 |r| r.get(0),
             )
             .unwrap_or(0),
-        active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
+        active_tokens: c
+            .query_row("SELECT COUNT(*) FROM agent_tokens WHERE org_id = ?1 AND status = 'active'", [org], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0),
         last_delivery,
         quick_check,
         fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),

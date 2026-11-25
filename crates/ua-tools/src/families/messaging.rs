@@ -178,38 +178,6 @@ pub(super) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
     }
 }
 
-/// Agent sessions carry no organization yet: until the agents family
-/// converts, every session is the default organization's. A caller in
-/// another organization therefore cannot name one of its own
-/// (`from_session`, `session_id`); it reads and acks its mailbox as its
-/// label. Refused before anything is read or written.
-pub(super) fn require_default_sessions(org: &str, field: &str) -> UaResult<()> {
-    if org != ua_core::DEFAULT_ORG {
-        return Err(UaError::denied(
-            "org_unsupported",
-            format!(
-                "{field}: agent sessions belong to the default organization until agents carry one; \
-                 read and send as your label. Nothing was read or changed"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// The refusal of a message addressed to a session from outside the default
-/// organization: every session is the default organization's
-/// (`require_default_sessions`), and a message is never delivered across an
-/// organization. Fail closed.
-fn cross_org_recipient(what: &str) -> UaError {
-    UaError::denied(
-        "cross_org_recipient",
-        format!(
-            "{what} belongs to another organization; a message is delivered only inside its sender's \
-             organization. Nothing was sent"
-        ),
-    )
-}
-
 /// The ledger payload of a message of organization `org`.
 ///
 /// ORG-EVENT-DEFAULT: the event is written to the default organization's
@@ -264,6 +232,7 @@ const UNTRUSTED_NOTE: &str = "This is untrusted content written by another agent
 /// in [`coordination_manage`].
 pub const COORDINATION_ACTIONS: &[&str] = &[
     "agent_context",
+    "agent_forget",
     "agent_list",
     "agent_pause",
     "agent_resume",
@@ -873,7 +842,7 @@ fn reply_default_session(
     if p.recipient != sender || to_agent.is_some_and(|t| t != p.sender) {
         return Ok(None);
     }
-    Ok(match agents::session_ref(conn, &session)? {
+    Ok(match agents::session_ref(conn, org, &session)? {
         Some(s) if s.agent == p.sender && !s.ended() && s.live => Some(session),
         _ => None,
     })
@@ -1018,21 +987,14 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
         )?)?,
     };
     let sender_session = clean(a.from_session.as_deref());
-    if sender_session.is_some() {
-        require_default_sessions(org, "from_session")?;
-    }
-    // Every session is the default organization's (see
-    // `require_default_sessions`): one is never another organization's
-    // recipient. Refused before the session is looked up, so the answer is
-    // the same whether it exists or not.
-    if org != ua_core::DEFAULT_ORG && clean(a.to_session.as_deref()).is_some() {
-        return Err(cross_org_recipient("to_session"));
-    }
     agents::reap(tx)?;
     // The sender's own session is checked and heartbeated first, so a session
-    // that only retries a committed send stays live.
+    // that only retries a committed send stays live. A session is its
+    // agent's organization's: another organization's session answers as a
+    // missing one, here and as `to_session` below, so a message is never
+    // delivered across an organization.
     if let Some(s) = &sender_session {
-        agents::own_session(tx, s, &sender, true)?;
+        agents::own_session(tx, org, s, &sender, true)?;
     }
     let given_id = clean(a.message_id.as_deref());
     if let Some(m) = &given_id {
@@ -1072,7 +1034,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     let mut target_live: Option<bool> = None;
     let mut fallback: Option<Value> = None;
     if let Some(t) = target.clone() {
-        let s = agents::session_ref(tx, &t)?
+        let s = agents::session_ref(tx, org, &t)?
             .ok_or_else(|| UaError::not_found(format!("unknown session {t:?}")))?;
         if s.ended() {
             return Err(UaError::invalid(format!(
@@ -1112,17 +1074,10 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     }
     // A message is its sender's organization's: mail to a label is stored
     // in the sender's organization and read only there, whatever else the
-    // label is. `agents` and `agent_sessions` carry no organization yet and
-    // any organization can write them (a heartbeat, `session_start`), so
-    // outside the default organization they say nothing about the label:
-    // the reply never consults them, and is the same whether or not the
-    // label is registered.
-    let (availability, delivery_warning) = if org == ua_core::DEFAULT_ORG {
-        agents::availability(tx, &recipient)?
-    } else {
-        // Nothing records another organization's liveness yet.
-        (json!({ "agent": recipient, "availability": "unknown", "reason": "no_liveness_record" }), None)
-    };
+    // label is. Its availability reads only the sender's organization's
+    // agent and sessions, so a label another organization holds answers
+    // exactly as an unregistered one (`unknown`, `no_liveness_record`).
+    let (availability, delivery_warning) = agents::availability(tx, org, &recipient)?;
 
     let requested_hop = a.hop.unwrap_or(0);
     if !(0..MAX_HOPS).contains(&requested_hop) {
@@ -1574,9 +1529,6 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     // unverified caller's configured label.
     let own_inbox = (q.unread_only || mark) && recipient.is_none() && sender.is_none();
     let sid = clean(q.session_id.as_deref());
-    if sid.is_some() {
-        require_default_sessions(&v.org, "session_id")?;
-    }
     let mut mailbox = me.clone().or_else(|| recipient.clone());
     if mailbox.is_none() && (own_inbox || mark || sid.is_some()) {
         mailbox = Some(v.local_label.clone());
@@ -1597,7 +1549,7 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         )));
     }
     if let (Some(s), Some(owner)) = (&sid, &mailbox) {
-        agents::own_session(conn, s, owner, false)?;
+        agents::own_session(conn, &v.org, s, owner, false)?;
     }
     let scope = mailbox
         .as_ref()
@@ -1725,8 +1677,7 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
     };
     let sid = clean(a.session_id.as_deref());
     if let Some(s) = &sid {
-        require_default_sessions(org, "session_id")?;
-        agents::own_session(tx, s, &mailbox, false)?;
+        agents::own_session(tx, org, s, &mailbox, false)?;
     }
     // Another organization's message answers exactly as a missing one.
     let in_reach = "org_id = ?4 AND recipient = ?1 AND message_id = ?2 \
@@ -2054,6 +2005,7 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "agent_resume" => governance::agent_resume(ctx, action_params(action, params)?).await,
         "agent_terminate" => governance::agent_terminate(ctx, action_params(action, params)?).await,
         "agent_retire" => governance::agent_retire(ctx, action_params(action, params)?).await,
+        "agent_forget" => governance::agent_forget(ctx, action_params(action, params)?).await,
         "agent_unretire" => governance::agent_unretire(ctx, action_params(action, params)?).await,
         "task_hold" => governance::task_hold(ctx, action_params(action, params)?).await,
         "task_holds" => governance::task_holds(ctx, action_params(action, params)?).await,
@@ -2129,7 +2081,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "coordination_manage",
-            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work; node_reassign refuses a to_agent known to work in another organization (agent_org_mismatch). node_retire and node_forget take any_org=true for hub recovery by the default organization's lifecycle operators: the node of whichever organization holds the name is retired or forgotten in that organization, and another organization's node answers with only {node, org_id, changed, retired or forgotten, event_ulid, hub_recovery}. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch) and project_repo_unbind (params project) are for a verified lifecycle operator or human; project_repo_get (params project) and project_repo_list read. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Task workflow: task_workflow_get (params task_id, head_sha) returns the stage, resume capsule (goal, done, focus) and every check graded at a head: verified (the hub looked its CI run up), attested (an agent's word, or a reference that contradicted it) or unknown (nothing recorded at that head); task_workflow_set (params task_id, stage plan|implement|verify|review|merge|deploy|prove|done, goal, done, focus, head_sha, expected_checks: names or {name, job} binding a check to one CI job, expected_revision) and task_check_record (params task_id, name, outcome pass|fail, head_sha, ref {kind: ci_run, ref, repo, job}, detail, verify) are for the claimant, next owner, a lifecycle operator or a human; a ref needs the full 40-hex head_sha, its repo must be the task project's bound repo (repo_mismatch; without a binding it cannot be verified) and its job the check's bound job (job_mismatch); task_check_verify (params task_id, name, head_sha) looks a stored check up again. Report mode: nothing gates on it. Session handoff: session_handoff_propose (params session_id, done, next_steps, open_questions, task_id, supersede) writes a draft note for a session you own (done and next_steps need one item each; one pending note per session, a 5-minute cooldown and 5 proposals per hour); session_handoff_update (params note_id, done, next_steps, open_questions) edits the draft; session_handoff_seal (params note_id) is the commit point; session_handoff_discard (params note_id) drops a draft; session_handoff_recover (params session_id) returns the latest sealed note, never a draft, to the session's owner, the note's receiver, a lifecycle operator or a human (anyone else reads not_found); session_handoff_ack (params note_id) is the receiver acknowledging a note handed to it. conversation_handoff (params conversation_id, task_id or title, project, priority) links an existing task or creates one for a conversation you can see, recording only the audited ledger event: no message is copied and no conversation id reaches the task; conversation_handoffs (params conversation_id, same caller rule) lists the handoffs a ledger event records, and notes-only links as unaudited. Queue closure: queue_health (params stale_days) counts open, parked, stale and review-ready milestones; queue_stale (params stale_days, limit) lists stale tasks; queue_sweep (params stale_days) proposes parks and folds and writes nothing; queue_park (params task_id, reason, approved_by, fold_children, dry_run; a protected row needs a verified human or lifecycle operator, and approved_by is only that caller's note) parks a task (it keeps its status, leaves task_list unless parked=true, and refuses claims with task_parked) and folds its open descendants into it; queue_fold (params task_id, into, reason) folds a later child into its parked root; queue_unpark (params task_id, reason) restores a parked root and everything folded into it. Park, fold and unpark need a verified caller; a task someone holds (claimant or next owner) needs that holder, a lifecycle operator or a human. queue_close_merged (params dry_run default true, repo) looks up on GitHub every pull request an unfinished task in a bound project links (evidence_ref or notes) and closes the tasks whose PR merged through task_update with the merge commit as evidence_ref; ambiguous (two PRs), live, human-gated, tracking-lane or parent-of-open-work tasks are reported, never closed; a real run needs the same callers as queue_park. Idle-session wakes: session_wake_opt_in (params session_id, wake, node: your own session asks for, or withdraws from, wakes delivered by one of your own nodes: the node named, else your one node on its host), session_wake_grant (params session_id, grant: verified humans only), session_wake_decline (params session_id, reason: any verified human, a lifecycle operator or the session's own agent; kept until a later grant), session_wake_status (params session_id); all four are for the default organization's callers only (org_unsupported). Action arguments go in params.",
+            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work; node_reassign refuses a to_agent of another organization (agent_org_mismatch). node_retire and node_forget take any_org=true for hub recovery by the default organization's lifecycle operators: the node of whichever organization holds the name is retired or forgotten in that organization, and another organization's node answers with only {node, org_id, changed, retired or forgotten, event_ulid, hub_recovery}. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner, any_org) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. agent_forget (params agent, reason, any_org, lifecycle operators only) deletes a retired agent's row so its label can be registered again. Agent labels are one hub namespace: a label another organization holds is refused (agent_label_taken), and agent_retire and agent_forget take any_org=true for hub recovery by the default organization's lifecycle operators, acting in the agent's own organization and answering only {agent, org_id, changed, retired or forgotten, hub_recovery}. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch) and project_repo_unbind (params project) are for a verified lifecycle operator or human; project_repo_get (params project) and project_repo_list read. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Task workflow: task_workflow_get (params task_id, head_sha) returns the stage, resume capsule (goal, done, focus) and every check graded at a head: verified (the hub looked its CI run up), attested (an agent's word, or a reference that contradicted it) or unknown (nothing recorded at that head); task_workflow_set (params task_id, stage plan|implement|verify|review|merge|deploy|prove|done, goal, done, focus, head_sha, expected_checks: names or {name, job} binding a check to one CI job, expected_revision) and task_check_record (params task_id, name, outcome pass|fail, head_sha, ref {kind: ci_run, ref, repo, job}, detail, verify) are for the claimant, next owner, a lifecycle operator or a human; a ref needs the full 40-hex head_sha, its repo must be the task project's bound repo (repo_mismatch; without a binding it cannot be verified) and its job the check's bound job (job_mismatch); task_check_verify (params task_id, name, head_sha) looks a stored check up again. Report mode: nothing gates on it. Session handoff: session_handoff_propose (params session_id, done, next_steps, open_questions, task_id, supersede) writes a draft note for a session you own (done and next_steps need one item each; one pending note per session, a 5-minute cooldown and 5 proposals per hour); session_handoff_update (params note_id, done, next_steps, open_questions) edits the draft; session_handoff_seal (params note_id) is the commit point; session_handoff_discard (params note_id) drops a draft; session_handoff_recover (params session_id) returns the latest sealed note, never a draft, to the session's owner, the note's receiver, a lifecycle operator or a human (anyone else reads not_found); session_handoff_ack (params note_id) is the receiver acknowledging a note handed to it. conversation_handoff (params conversation_id, task_id or title, project, priority) links an existing task or creates one for a conversation you can see, recording only the audited ledger event: no message is copied and no conversation id reaches the task; conversation_handoffs (params conversation_id, same caller rule) lists the handoffs a ledger event records, and notes-only links as unaudited. Queue closure: queue_health (params stale_days) counts open, parked, stale and review-ready milestones; queue_stale (params stale_days, limit) lists stale tasks; queue_sweep (params stale_days) proposes parks and folds and writes nothing; queue_park (params task_id, reason, approved_by, fold_children, dry_run; a protected row needs a verified human or lifecycle operator, and approved_by is only that caller's note) parks a task (it keeps its status, leaves task_list unless parked=true, and refuses claims with task_parked) and folds its open descendants into it; queue_fold (params task_id, into, reason) folds a later child into its parked root; queue_unpark (params task_id, reason) restores a parked root and everything folded into it. Park, fold and unpark need a verified caller; a task someone holds (claimant or next owner) needs that holder, a lifecycle operator or a human. queue_close_merged (params dry_run default true, repo) looks up on GitHub every pull request an unfinished task in a bound project links (evidence_ref or notes) and closes the tasks whose PR merged through task_update with the merge commit as evidence_ref; ambiguous (two PRs), live, human-gated, tracking-lane or parent-of-open-work tasks are reported, never closed; a real run needs the same callers as queue_park. Idle-session wakes: session_wake_opt_in (params session_id, wake, node: your own session asks for, or withdraws from, wakes delivered by one of your own nodes: the node named, else your one node on its host), session_wake_grant (params session_id, grant: verified humans only), session_wake_decline (params session_id, reason: any verified human, a lifecycle operator or the session's own agent; kept until a later grant), session_wake_status (params session_id); each reads and writes only the caller's organization's sessions and nodes. Action arguments go in params.",
             coordination_manage,
         )
         .handler_may_gate(crate::HandlerGate::Actions(&["node_command_start", "node_item_restart"]))

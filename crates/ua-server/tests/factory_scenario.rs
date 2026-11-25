@@ -616,7 +616,9 @@ fn check_of<'a>(view: &'a Value, name: &str) -> Option<&'a Value> {
 // --- step 1: plan and delegate ----------------------------------------------------------
 
 async fn plan_and_delegate(s: &Scenario, card: &mut Card, cx: &mut Ctx) {
-    // A lead delegates the task; the first harness accepts it.
+    // A lead delegates the task to a registered agent of its organization
+    // (the first harness has connected); the harness accepts it.
+    s.must(&builder(), "agent_heartbeat", json!({})).await;
     let delegated = s.must(&lead(), "delegate", json!({ "task_spec": SPEC, "to_agent": "builder-1" })).await;
     cx.task = delegated["task_id"].as_i64().unwrap();
     let delegation = delegated["delegation_id"].as_i64().unwrap();
