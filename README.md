@@ -12,7 +12,7 @@ existing MCP client can point at this process unchanged. That program is a
 separate codebase. Building and running this repository does not require it.
 The storage schema and some of the user interface are new.
 
-> **Status: alpha.** 214 tools are registered and the core families are ported.
+> **Status: alpha.** 219 tools are registered and the core families are ported.
 > It is not yet run in production. See [What is in](#what-is-in) and [Not yet ported](#not-yet-ported).
 
 ## How it fits together
@@ -38,6 +38,7 @@ a rule is written once and holds for every client.
 | `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
 | `ua-deliverables` | Deliverables: what a task produces, and its immutable, ordered revisions ([docs/deliverables.md](docs/deliverables.md)) |
+| `ua-org` | Organization registry: offices, roles and seats ([docs/organization.md](docs/organization.md)) |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |

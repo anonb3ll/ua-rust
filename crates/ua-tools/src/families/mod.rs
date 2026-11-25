@@ -31,6 +31,7 @@ pub mod node_queue;
 pub mod nodes;
 pub mod notify;
 pub mod observability;
+pub mod org;
 pub mod plans;
 pub mod platform;
 pub mod provider_accounts;
@@ -77,6 +78,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(mcp::SCHEMA);
     parts.push(messaging::SCHEMA);
     parts.extend(node_queue::schema_parts());
+    parts.extend(org::schema_parts());
     parts.push(nodes::SCHEMA);
     parts.push(notify::SCHEMA);
     parts.push(plans::SCHEMA);
@@ -120,6 +122,7 @@ pub fn register(r: &mut Registry) {
     nodes::register(r);
     notify::register(r);
     observability::register(r);
+    org::register(r);
     plans::register(r);
     provider_accounts::register(r);
     platform::register(r);
