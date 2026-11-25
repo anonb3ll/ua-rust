@@ -3,12 +3,13 @@
 //! A deliverable is a typed attachment to a task. Its revisions are
 //! immutable and ordered: revision 1 is the first one recorded, and a new
 //! version of the work is a new revision, never an edit of an old one. For
-//! the `commit` kind (the only kind built so far) a revision's identity is
+//! the `commit` kind a revision's identity is
 //! the full 40-hex commit SHA, in the repository the task's project is bound
-//! to. See `docs/deliverables.md`.
+//! to. A file revision records the SHA-256 of a task worktree file.
+//! See `docs/deliverables.md`.
 //!
 //! This crate is the domain: the schema ([`schema`]), validation, and the
-//! reads and writes over the two tables. It depends on `ua-core` and
+//! reads and writes over the deliverable tables. It depends on `ua-core` and
 //! `ua-store` only, never on the tool registry. The tools
 //! (`deliverable_create`, `deliverable_revise`, `deliverable_get`,
 //! `deliverable_list`) are registered by `ua-tools`
@@ -21,6 +22,7 @@
 //! ledger event in that transaction. Event payloads carry ids, the kind,
 //! the repository and the revision identity; never a title or summary.
 
+pub mod files;
 pub mod schema;
 
 pub use schema::{SCHEMA, TENANT_PART, schema_parts};
@@ -60,9 +62,7 @@ impl Kind {
     pub fn parse(raw: &str) -> UaResult<Kind> {
         match raw.trim() {
             "commit" => Ok(Kind::Commit),
-            "file" => Err(UaError::invalid(
-                "kind \"file\" is not built yet: a deliverable is a commit (kind \"commit\") for now",
-            )),
+            "file" => Err(UaError::invalid("kind \"file\" is submitted through deliverable_submit")),
             other => Err(UaError::invalid(format!("kind must be \"commit\", not {other:?}"))),
         }
     }
@@ -187,16 +187,18 @@ pub struct Revision {
 impl Revision {
     /// The revision as callers see it: for a commit, `commit` is the identity.
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut out = json!({
             "id": self.id,
             "deliverable_id": self.deliverable_id,
             "rev_no": self.rev_no,
-            "commit": self.identity,
             "repo": self.repo,
             "summary": self.summary,
             "producer": self.producer,
             "recorded_at": self.recorded_at,
-        })
+        });
+        let key = if self.repo.is_some() { "commit" } else { "sha256" };
+        out[key] = json!(self.identity);
+        out
     }
 }
 

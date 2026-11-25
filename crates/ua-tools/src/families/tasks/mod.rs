@@ -13,6 +13,7 @@ mod goals;
 mod graph;
 mod list;
 mod write;
+pub(crate) use write::complete_after_release;
 
 pub(crate) use write::{NewTask, insert_task};
 

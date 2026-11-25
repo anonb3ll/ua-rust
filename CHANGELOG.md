@@ -12,6 +12,11 @@ from its commit history.
 
 ### Added
 
+- File deliverables can be submitted from a task worktree, verified by SHA-256
+  and released to a configured directory after an independent human approves
+  the exact revision and destination. The release records approval and
+  completion evidence and moves the task and workflow to done.
+
 - GitHub webhooks per organization: `POST /api/github/webhook/{org}` (the
   organization's id) checks a delivery against that organization's own
   webhook secret only, and handles it for that organization only. The bare

@@ -175,6 +175,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                 ],
             ),
         ),
+        ("families/deliverables/files.rs", (1, vec![("deliverable_release", json!({}))])),
         ("families/audit/mod.rs", (1, vec![("security_audit", json!({ "remediate": true }))])),
         (
             "families/cycles.rs",

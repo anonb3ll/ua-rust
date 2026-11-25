@@ -370,3 +370,263 @@ async fn revisions_cannot_be_edited_or_removed_and_survive_their_task() {
     let e = h.err(&builder(), "deliverable_revise", json!({ "deliverable_id": d, "commit": B })).await;
     assert_eq!(e.code(), "not_found", "no task, no new revision: {e}");
 }
+
+#[cfg(unix)]
+mod file_releases {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+
+    struct Files {
+        h: H,
+        _home: tempfile::TempDir,
+        source: PathBuf,
+        destination: PathBuf,
+        task_id: i64,
+    }
+
+    impl Files {
+        async fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let workspace = home.path().join("workspace");
+            let worktree = workspace.join("work");
+            let destination = home.path().join("release");
+            fs::create_dir_all(&worktree).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+            let source = worktree.join("report.txt");
+            fs::write(&source, b"reviewed report").unwrap();
+            let mut cfg = Config::for_home(home.path().join("hub"));
+            cfg.workspace = Some(workspace);
+            cfg.deliverable_release_root = Some(destination.clone());
+            cfg.human_identities = vec!["operator".into(), "editor".into()];
+            let h = H { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry() };
+            h.hub
+                .db()
+                .write(|tx| {
+                    Ok(tx.execute_batch(
+                        "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
+                 VALUES ('org-other', 'org-other', 'Other', '[\"developer\"]', '2026-01-01T00:00:00Z');",
+                    )?)
+                })
+                .unwrap();
+            let t = h.ok(&builder(), "task_add", json!({"title":"Release the report"})).await;
+            let task_id = t["id"].as_i64().unwrap();
+            h.ok(&builder(), "task_claim", json!({"id": task_id, "worktree_path":"work"})).await;
+            Self { h, _home: home, source, destination, task_id }
+        }
+
+        async fn submit(&self, who: &Caller) -> Value {
+            self.h.ok(who, "deliverable_submit", self.submission("report.txt")).await
+        }
+
+        fn submission(&self, path: &str) -> Value {
+            json!({"task_id": self.task_id, "title":"report", "path":path})
+        }
+
+        async fn review(&self) {
+            self.h
+                .act(&builder(), "task_workflow_set", json!({"task_id":self.task_id, "stage":"review"}))
+                .await;
+        }
+
+        async fn approval(&self, who: &Caller, args: Value) -> i64 {
+            match self.h.err(who, "deliverable_release", args).await {
+                UaError::ApprovalRequired { approval_id, .. } => approval_id,
+                e => panic!("expected a pending release, got {e:?}"),
+            }
+        }
+
+        async fn approve(&self, id: i64) {
+            self.h.ok(&human(), "approval_resolve", json!({"id": id, "decision":"approve"})).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn releases_the_approved_bytes_once_and_verifies_the_result() {
+        let f = Files::new().await;
+        let first = f.submit(&builder()).await;
+        let rev = first["revision"]["id"].as_i64().unwrap();
+        assert_eq!(first["revision"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(first["revision"].get("commit").is_none());
+        assert_eq!(first["workflow_head"], Value::Null);
+        assert_eq!(f.submit(&builder()).await["recorded"], false);
+
+        let requester = other();
+        f.h.ok(&builder(), "task_update", json!({"id": f.task_id, "next_owner": requester.label})).await;
+        let args = json!({"revision_id":rev, "destination":"report.txt"});
+        assert_eq!(
+            reason(&f.h.err(&requester, "deliverable_release", args.clone()).await),
+            "review_required"
+        );
+        f.review().await;
+        let id = f.approval(&requester, args.clone()).await;
+        let approvals = f.h.ok(&human(), "approval_pending", json!({"tool":"deliverable_release"})).await;
+        let payload = &approvals["pending"][0]["payload"];
+        assert_eq!(payload["revision_id"], rev);
+        assert_eq!(payload["sha256"], first["revision"]["sha256"]);
+        assert_eq!(payload["destination"], "report.txt");
+        assert_eq!(payload["producer"], "builder-1");
+        assert!(!approvals.to_string().contains("reviewed report"));
+        f.approve(id).await;
+        let other = json!({"revision_id":rev, "destination":"other.txt"});
+        assert_ne!(f.approval(&requester, other).await, id);
+        let (a, b) = tokio::join!(
+            f.h.ok(&requester, "deliverable_release", args.clone()),
+            f.h.ok(&requester, "deliverable_release", args.clone())
+        );
+        assert_ne!(a["created"], b["created"]);
+        assert_eq!(a["approval_id"], id);
+        let dest = f.destination.join("report.txt");
+        assert_eq!(fs::read(&dest).unwrap(), b"reviewed report");
+        assert_eq!(fs::read_dir(&f.destination).unwrap().count(), 1);
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE payload IS NULL"), 1);
+        let events = f.h.events("agent.deliverable.released");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["approval_id"], id);
+        let workflow = f.h.act(&builder(), "task_workflow_get", json!({"task_id":f.task_id})).await;
+        assert_eq!(workflow["stage"], "done");
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM tasks WHERE status = 'done'"), 1);
+        let verify = json!({"revision_id":rev});
+        assert_eq!(f.h.ok(&requester, "deliverable_verify", verify.clone()).await["matches"], true);
+        fs::write(&dest, b"changed release").unwrap();
+        assert_eq!(f.h.ok(&requester, "deliverable_verify", verify).await["matches"], false);
+        assert_eq!(reason(&f.h.err(&requester, "deliverable_release", args).await), "deliverable_tampered");
+    }
+
+    #[tokio::test]
+    async fn refuses_self_approval_for_a_producer_and_refuses_changed_source_without_spending() {
+        let f = Files::new().await;
+        let editor = Caller { label: "editor".into(), ..human() };
+        let rev = f.submit(&editor).await["revision"]["id"].as_i64().unwrap();
+        f.review().await;
+        let args = json!({"revision_id": rev, "destination":"report.txt"});
+        let id = f.approval(&builder(), args.clone()).await;
+        let approve = json!({"id":id, "decision":"approve"});
+        assert_eq!(reason(&f.h.err(&editor, "approval_resolve", approve).await), "self_approval");
+        f.approve(id).await;
+
+        fs::write(&f.source, b"edited after approval").unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_release", args.clone()).await),
+            "deliverable_tampered"
+        );
+        assert_eq!(f.h.events("agent.deliverable.tampered").len(), 1);
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals WHERE status = 'approved'"), 1);
+        assert_eq!(fs::read_dir(&f.destination).unwrap().count(), 0);
+
+        let next = f.submit(&builder()).await;
+        assert_eq!(next["revision"]["rev_no"], 2);
+        assert_eq!(reason(&f.h.err(&builder(), "deliverable_release", args).await), "revision_not_latest");
+    }
+
+    #[tokio::test]
+    async fn refuses_cross_org_access_and_unsafe_source_and_destination_paths() {
+        let f = Files::new().await;
+        let src_dir = f.source.parent().unwrap();
+        let symlink_path = src_dir.join("linked.txt");
+        symlink(&f.source, &symlink_path).unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_submit", f.submission("linked.txt")).await),
+            "unsafe_deliverable_file"
+        );
+        fs::remove_file(&symlink_path).unwrap();
+        fs::hard_link(&f.source, &symlink_path).unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_submit", f.submission("linked.txt")).await),
+            "unsafe_deliverable_file"
+        );
+        fs::remove_file(&symlink_path).unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_submit", f.submission("../report.txt")).await),
+            "invalid_argument"
+        );
+        fs::write(src_dir.join(".env"), b"fixture").unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_submit", f.submission(".env")).await),
+            "secret_file"
+        );
+        let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
+        f.review().await;
+        let args = json!({"revision_id":rev, "destination":"report.txt"});
+        let foreign = Caller { org_id: "org-other".into(), ..builder() };
+        assert_eq!(reason(&f.h.err(&foreign, "deliverable_release", args.clone()).await), "org_unsupported");
+        let anon = Caller { kind: ActorKind::Anonymous, ..builder() };
+        assert_eq!(reason(&f.h.err(&anon, "deliverable_release", args.clone()).await), "unauthenticated");
+        assert_eq!(
+            reason(
+                &f.h.err(
+                    &builder(),
+                    "deliverable_release",
+                    json!({"revision_id":rev, "destination":"../report.txt"})
+                )
+                .await
+            ),
+            "invalid_argument"
+        );
+        let existing = f.destination.join("report.txt");
+        symlink(&f.source, &existing).unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_release", args).await),
+            "release_destination_exists"
+        );
+        assert!(existing.is_symlink());
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals"), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_intent_survives_a_completion_error_and_can_be_retried() {
+        let f = Files::new().await;
+        let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
+        f.review().await;
+        let args = json!({"revision_id":rev, "destination":"report.txt"});
+        let id = f.approval(&builder(), args.clone()).await;
+        f.approve(id).await;
+        f.h.hub
+            .db()
+            .write(|tx| {
+                Ok(tx.execute_batch(
+                    "CREATE TRIGGER fail_release_event BEFORE INSERT ON event_log
+             WHEN NEW.channel = 'agent.deliverable.released'
+             BEGIN SELECT RAISE(ABORT, 'simulated ledger write failure'); END;",
+                )?)
+            })
+            .unwrap();
+        assert!(f.h.call(&builder(), "deliverable_release", args.clone()).await.is_err());
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals WHERE status = 'consumed'"), 1);
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE released_at IS NULL"), 1);
+        assert!(!f.destination.join("report.txt").exists());
+        assert_eq!(f.h.events("agent.deliverable.released").len(), 0);
+
+        // Simulate a crash after the filesystem link but before the SQL commit.
+        let stage_id: String =
+            f.h.hub
+                .db()
+                .read(|conn| {
+                    Ok(conn.query_row("SELECT staging_id FROM deliverable_releases", [], |row| row.get(0))?)
+                })
+                .unwrap();
+        let stage = f.destination.join(format!(".ua-release-{stage_id}"));
+        fs::write(&stage, b"reviewed report").unwrap();
+        let dest = f.destination.join("report.txt");
+        fs::hard_link(&stage, &dest).unwrap();
+        f.h.hub.db().write(|tx| Ok(tx.execute_batch("DROP TRIGGER fail_release_event")?)).unwrap();
+
+        // Even identical bytes at a different inode are a collision.
+        fs::remove_file(&dest).unwrap();
+        fs::write(&dest, b"reviewed report").unwrap();
+        assert_eq!(
+            reason(&f.h.err(&builder(), "deliverable_release", args.clone()).await),
+            "release_destination_exists"
+        );
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE released_at IS NULL"), 1);
+        fs::remove_file(&dest).unwrap();
+        fs::hard_link(&stage, &dest).unwrap();
+        let out = f.h.ok(&builder(), "deliverable_release", args).await;
+        assert_eq!(out["approval_id"], id);
+        assert_eq!(fs::read(dest).unwrap(), b"reviewed report");
+        assert!(!stage.exists());
+        assert_eq!(f.h.events("agent.deliverable.released").len(), 1);
+    }
+}

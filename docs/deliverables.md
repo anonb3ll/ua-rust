@@ -14,10 +14,10 @@ governed registry like every other tool.
 
 ## The object
 
-- A **deliverable** is a typed attachment to a task. The only kind built so
-  far is `commit`: a commit in the repository the task's project is bound to
-  (`project_repo_bind`). A task has at most one commit deliverable. Its
-  task, kind and repository never change, and it is never deleted.
+- A **deliverable** is a typed attachment to a task. A `commit` deliverable names a commit in the repository the task's project
+  is bound to (`project_repo_bind`). A task has at most one commit deliverable.
+  A `file` deliverable uses a title within the task and a SHA-256 revision.
+  Its task, kind and repository are immutable.
 - A **revision** is one version of a deliverable. For a commit deliverable
   its identity is the full 40-character hex commit SHA (lowercased). An
   abbreviated SHA is ambiguous and refused. Revisions are numbered from 1 in
@@ -58,7 +58,7 @@ Refusals, each with a reason code:
 
 | Reason | When |
 |---|---|
-| `invalid_argument` | Not a full 40-hex commit SHA; an empty or over-long title or summary; kind `file` (not built yet) or any other unknown kind |
+| `invalid_argument` | Not a full 40-hex commit SHA; an empty or over-long title or summary; kind `file` passed to `deliverable_create` (use `deliverable_submit`) or any unknown kind |
 | `not_found` | An unknown task or deliverable, or a deliverable whose task was deleted (for a new revision) |
 | `not_task_owner` | The caller may not write the task's workflow record |
 | `repo_unbound` | The task's project has no bound repository |
@@ -69,13 +69,55 @@ Refusals, each with a reason code:
 | `unknown_organization` | The caller's organization does not exist |
 | `org_mismatch` | The caller is in another organization than the task |
 
+## File releases
+
+On a Unix hub, a verified default-organization task writer submits a relative
+worktree path with `deliverable_submit(task_id, title, path, summary?)`. The
+hub reads a regular file up to 1 MiB and records the path, size, SHA-256
+and producer. The path must stay in the caller's workspace. Symbolic links,
+multiply linked files, dependency or hook paths, and credential-looking
+paths are refused. Reusing a title records a new revision when the bytes
+change. Repeating the latest submission with identical metadata returns the
+existing revision. File revisions leave the commit workflow head untouched.
+
+Set `deliverable_release_root` to an existing absolute directory owned by the
+hub user with mode `0700`, separate from workspaces and the vault. Releases
+are disabled when it is unset. The directory and its ancestors are
+operator-managed.
+
+1. Move the workflow to `review` and call
+   `deliverable_release(revision_id, destination)` with the latest file
+   revision and a new basename in the configured directory.
+2. A verified human other than the requester and producer approves. The
+   approval binds the task, file revision, SHA-256, workflow revision,
+   ownership generation, destination name and directory identity.
+3. Repeat the exact call. It rereads the source and refuses changed bytes
+   before consuming approval. Once consumed, the exact approved bytes and
+   release intent are recorded together. The hub publishes the staged file
+   with exclusive creation, then commits the release receipt and both the
+   task status and workflow stage `done`.
+
+For an interrupted release, retry the same call as the original requester.
+A saved intent allows the hub to resume from the approved bytes even if the
+source later changes. The staged inode identifies a publication whose
+completion transaction did not commit. An unrelated existing destination
+is refused, even when its bytes have the same hash. The approval is consumed
+once, the release is ledgered once, and retries of a completed release verify
+the published bytes before returning its receipt.
+
+`deliverable_verify(revision_id)` compares the stored identity with the
+current source or with the published file after release. It returns the
+comparison and does not return file contents. Pending release intents hold
+up to 1 MiB of approved file bytes in SQLite until completion. Database
+backups made during a pending release can therefore contain those bytes.
+
 ## What is recorded
 
-Two tables, both carrying `org_id NOT NULL` and the generated organization
-triggers from their first parts (`deliverables.v1`,
-`organization.v1.deliverables`): `deliverables` and
-`deliverable_revisions`. Triggers keep revisions immutable, numbered in
-order, and in their deliverable's organization.
+The `deliverables` and `deliverable_revisions` tables carry an organization
+key from their first schema part. The additive file schema introduces
+`deliverable_files` and `deliverable_releases` with the same tenant fences.
+Triggers keep revisions immutable, numbered in order, and scoped to their
+deliverable's organization.
 
 Every state change appends one ledger event in the same write transaction,
 in the row's organization. Payloads carry ids, the kind, the repository and
@@ -106,9 +148,6 @@ Later slices add:
   and add a release tag effect in the hub's own repository.
 - **Isolation and read surfaces.** A platform object kind and an evidence
   report section for deliverables, checked across organizations.
-- **File deliverables.** A document or file whose revision identity is a
-  content hash the hub computes.
 
 The older hub's work-product routes (`/api/work-products*`) still answer
-501; deliverables replace them, and no compatibility shim is planned until a
-client needs one.
+501. The compatibility routes and SDK migration are a later slice.
