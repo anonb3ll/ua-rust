@@ -537,14 +537,20 @@ fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<
     match spellings.len() {
         0 => Ok(None),
         1 => Ok(spellings.into_iter().next()),
-        n => Err(UaError::conflict_code(
-            "agent_label_ambiguous",
-            format!(
-                "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
-                 Nothing was created"
-            ),
-        )),
+        n => Err(ambiguous_target(label, n)),
     }
+}
+
+/// The refusal for a target `label` that `n` agents spell in different
+/// letter cases, none exactly (`agent_label_ambiguous`).
+fn ambiguous_target(label: &str, n: usize) -> UaError {
+    UaError::conflict_code(
+        "agent_label_ambiguous",
+        format!(
+            "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
+             Nothing was created"
+        ),
+    )
 }
 
 /// Every registered spelling of `label` in organization `org`, in any letter
@@ -616,29 +622,23 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     // is over the one spelling registered then: each variant's digest is
     // tried, and a match replays that committed result, creating and
     // re-routing nothing. A retry that matches none is refused as ambiguous
-    // (`agent_label_ambiguous`), not as a different request.
-    let digests_for = |c: &Connection, org: &str| -> Vec<String> {
-        let mut out = vec![digest_for(&to_agent)];
-        match registered_target(c, org, &to_agent) {
-            Ok(Some(reg)) if reg != to_agent => out.insert(0, digest_for(&reg)),
-            Ok(_) => {}
-            Err(_) => out.extend(
-                case_variants(c, org, &to_agent)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|v| **v != to_agent)
-                    .map(|v| digest_for(v)),
-            ),
-        }
-        out
-    };
-    let lookup = |c: &Connection, org: &str, k: &(String, Option<String>)| -> UaResult<Option<Value>> {
-        find_receipt(c, org, k, &digests_for(c, org)).map_err(|e| {
-            match registered_target(c, org, &to_agent) {
-                Err(ambiguous) => ambiguous,
-                Ok(_) => e,
+    // (`agent_label_ambiguous`), not as a different request. A database
+    // error while resolving or reading propagates as itself.
+    let lookup = |c: &Connection, org: &str, k: &(String, Vec<String>)| -> UaResult<Option<Value>> {
+        let variants = case_variants(c, org, &to_agent)?;
+        let exact = variants.contains(&to_agent);
+        let ambiguous = !exact && variants.len() > 1;
+        let mut digests = vec![digest_for(&to_agent)];
+        if !exact {
+            match variants.as_slice() {
+                [reg] => digests.insert(0, digest_for(reg)),
+                many => digests.extend(many.iter().map(|v| digest_for(v))),
             }
-        })
+        }
+        match find_receipt(c, org, k, &digests) {
+            Err(UaError::Conflict(_)) if ambiguous => Err(ambiguous_target(&to_agent, variants.len())),
+            other => other,
+        }
     };
     let org = ctx.caller.org_id.clone();
     let rkeys = idem

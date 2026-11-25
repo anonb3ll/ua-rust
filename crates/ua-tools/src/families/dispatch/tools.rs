@@ -259,9 +259,6 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-/// Resolve and check the directory a harness runs in: absolute, existing,
-/// not the filesystem root and not inside the hub's home (`$UA_HOME`, which
-/// holds the database and run logs).
 /// A local harness is a process the hub spawns on its own host, in a
 /// directory of the hub's filesystem: the default organization's. Another
 /// organization's caller is refused (`org_unsupported`) before the harness
@@ -280,6 +277,9 @@ fn require_hub_org_for_harness(caller: &Caller) -> UaResult<()> {
     Ok(())
 }
 
+/// Resolve and check the directory a harness runs in: absolute, existing,
+/// not the filesystem root and not inside the hub's home (`$UA_HOME`, which
+/// holds the database and run logs).
 fn resolve_workdir(raw: &str, ua_home: &Path) -> UaResult<PathBuf> {
     let p = PathBuf::from(raw);
     if !p.is_absolute() {

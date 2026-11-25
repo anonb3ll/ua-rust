@@ -721,18 +721,23 @@ here for memory columns, owners and defaults.
   or key id. The fingerprint is visible only in the one-time approval a
   replacement or clear binds, as for every managed secret. The relay
   (`relay_manage` `request_send`, `send`) and an MCP server that injects
-  secrets (`mcp_gateway` `call`, live `list`) use the default
-  organization's secrets, so another organization's caller is refused
-  (`org_unsupported`) before anything is read. Every downstream MCP
-  server is the hub's, secrets or not: a stdio server is a process the hub
-  spawns on its own host, and a Streamable HTTP server is reached from the
-  hub's network position (loopback, tailnet and private ranges). So
-  `mcp_gateway` `call` and live `list` are refused to another
-  organization's caller on every server, before the policy check, the
-  slot, any approval, any secret read and any spawn or connection, until
-  servers are per organization. A static `list` reads only the
-  registration, which `mcp_server_list` already shows, and is not
-  refused. The `github.credential.*` and `managed_secret.*` events are
+  secrets use the default organization's secrets, so another
+  organization's caller is refused (`org_unsupported`) before anything is
+  read. Every downstream MCP server is the hub's, secrets or not: a stdio
+  server is a process the hub spawns on its own host, a Streamable HTTP
+  server is reached from the hub's network position (loopback, tailnet
+  and private ranges), and its registration (URL or command, address
+  scope, secret names and whether each is stored, review state) is the
+  hub's configuration. So every `mcp_gateway` action (`call`, and `list`
+  live or static) and `mcp_server_list` are refused to another
+  organization's caller, until servers are per organization. The refusal
+  is the tools' registry pre-gate, on the caller alone: it comes before
+  any registry approval gate (`UA_APPROVAL_TOOLS` or a policy
+  `require_approval` rule), so no approval is parked that nobody could
+  grant, and before any server is resolved, the policy check, the slot,
+  any secret read and any spawn or connection. Such a call writes no
+  `agent.mcp_gateway.call` event: that event is in the default
+  organization's ledger and names the caller and server. The `github.credential.*` and `managed_secret.*` events are
   `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
   consumer are `null` and the originator is `system`. The automation paths
   run per organization through `github_credential_for` (the
@@ -1333,22 +1338,26 @@ here for memory columns, owners and defaults.
     so it never learns whether a proposal or an earlier one exists there.
     The Dash docsets (`dash_list`, `dash_search`, `dash_view`) are refused
     (`org_unsupported`) before `dash_docsets` is read. `system_doctor`
-    gives another organization one neutral `vault` line and one neutral
-    `workspace_root` line ("not available to this organization", the same
-    whatever the hub holds) and never runs either check for it. A local
+    gives another organization one neutral line each for `vault`,
+    `workspace_root`, `database` and `policy_file` ("not available to this
+    organization", the same whatever the hub holds) and never runs those
+    checks for it: no host name, no database or WAL size, page counts,
+    statistics or deep `quick_check`, and nothing about whether a policy
+    file is configured, missing or broken. Its own counts (memory notes,
+    embeddings, tokens) stay in their lines. A local
     harness (`dispatch_task` or `dispatch_resume` with a harness) is a
     process on the hub and is refused (`org_unsupported`) before the
     harness is looked up or a task's `worktree_path` is resolved, and
     every downstream MCP server, stdio or Streamable HTTP, is refused for
-    `mcp_gateway` `call` and live `list` (above). A `worktree_path` another
-    organization records through `task_claim` or `session_start` is stored
-    as given: it is data in that organization's rows, and every tool that
-    would treat it as a path on the hub (the local harness, the `git_*`
-    task tools through `workspace::sandbox`, the crew drop file, an
-    autonomous cycle's worktree read) refuses another organization first;
-    a node route resolves it on the node, which serves the default
-    organization only. So until per-organization workspaces and vaults
-    exist, another organization has no hub filesystem at all: no
+    every `mcp_gateway` action and for `mcp_server_list` (above). A
+    `worktree_path` another organization records through `task_claim` or
+    `session_start` is stored as given: it is data in that organization's
+    rows, and every tool that would treat it as a path on the hub (the
+    local harness, the `git_*` task tools through `workspace::sandbox`,
+    the crew drop file, an autonomous cycle's worktree read) refuses
+    another organization first; a node route resolves it on that
+    organization's own node. So until per-organization workspaces and
+    vaults exist, another organization has no hub filesystem at all: no
     workspace, vault, Obsidian, docset, local harness or MCP server
     process, and no report of their state. (The hub's configuration files
     are read on every organization's behalf, as configuration: the policy

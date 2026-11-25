@@ -1105,17 +1105,15 @@ fn approval_check(cfg: &Config, reg: &Registry) -> Value {
     finding("approval_gating", status, detail, "UA_APPROVAL_TOOLS, UA_HUMAN_IDENTITIES")
 }
 
-/// A check of the hub's own filesystem (the vault, the workspace), which
-/// belongs to the default organization. Another organization's caller gets
-/// one neutral line, the same whatever the hub holds, and the check never
-/// runs for it: it learns neither whether the path exists nor whether a
-/// directory is writable (`docs/organization.md`, hub resources).
-fn hub_filesystem_check(
-    caller: &Caller,
-    capability: &str,
-    gate: &str,
-    check: impl FnOnce() -> Value,
-) -> Value {
+/// A check of the hub's own resources, which belong to the default
+/// organization: its filesystem (the vault, the workspace), the shared
+/// database file (its size, WAL size and page counts) and the policy file.
+/// Another organization's caller gets one neutral line, the same whatever
+/// the hub holds, and the check never runs for it: it learns neither
+/// whether a path exists, whether a directory is writable, how large the
+/// hub's database is, nor whether a policy file is configured or broken
+/// (`docs/organization.md`, hub resources).
+fn hub_resource_check(caller: &Caller, capability: &str, gate: &str, check: impl FnOnce() -> Value) -> Value {
     if caller.org_id == ua_core::DEFAULT_ORG {
         return check();
     }
@@ -1810,7 +1808,13 @@ fn host_name() -> Option<String> {
 
 async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
-    let deep = a.refresh;
+    // The hub's host and its shared database file are the default
+    // organization's: another organization gets neither the host name nor
+    // the database line and statistics (nor runs the deep `quick_check`
+    // over the whole file). Its own counts (memory notes, embeddings,
+    // tokens) stay in their checks.
+    let hub_reader = ctx.caller.org_id == ua_core::DEFAULT_ORG;
+    let deep = a.refresh && hub_reader;
     let org = ctx.caller.org_id.clone();
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
     let github = {
@@ -1821,13 +1825,17 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
-    let (db_row, db_stats) = database_check(&facts, path);
+    let (db_row, db_stats) = if hub_reader {
+        database_check(&facts, path)
+    } else {
+        (hub_resource_check(&ctx.caller, "database", "UA_DB_PATH", || Value::Null), Value::Null)
+    };
     let checks = vec![
         hub_auth_check(cfg, &facts),
         bind_check(cfg),
         approval_check(cfg, reg),
-        hub_filesystem_check(&ctx.caller, "vault", "UA_VAULT_PATH, UA_VAULT_WRITE_DIRS", || vault_check(cfg)),
-        hub_filesystem_check(&ctx.caller, "workspace_root", "UA_WORKSPACE, UA_AGENT_WORKSPACES", || {
+        hub_resource_check(&ctx.caller, "vault", "UA_VAULT_PATH, UA_VAULT_WRITE_DIRS", || vault_check(cfg)),
+        hub_resource_check(&ctx.caller, "workspace_root", "UA_WORKSPACE, UA_AGENT_WORKSPACES", || {
             workspace_check(cfg)
         }),
         search_check(reg),
@@ -1840,7 +1848,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         zulip_check(cfg),
         slack_check(cfg),
         github,
-        policy_check(cfg),
+        hub_resource_check(&ctx.caller, "policy_file", "UA_POLICY_FILE", || policy_check(cfg)),
         fleet_nodes_check(&facts, cfg.node_require_acceptance),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
@@ -1856,7 +1864,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     Ok(json!({
         "checks": checks,
         "summary": summary,
-        "host": host_name(),
+        "host": if hub_reader { host_name() } else { None },
         "as_of": ua_core::time::now(),
         "cached": false,
         "refreshing": false,

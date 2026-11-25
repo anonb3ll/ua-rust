@@ -1,16 +1,16 @@
 //! `mcp_gateway`: call a tool on a registered downstream MCP server.
 //!
 //! The caller names a registered server and one of its catalogued tools;
-//! never a URL, a command or a credential. In order, a call:
+//! never a URL, a command or a credential. Another organization's caller is
+//! refused every action (`org_unsupported`) by the tool's pre-gate
+//! (`super::require_hub_org`), in the registry before any approval gate,
+//! and again first in the handler; such a call reads no server and writes
+//! no `agent.mcp_gateway.call` event. In order, a default-organization call:
 //!
 //! 1. resolves the server (registry or config) and refuses it when it is
 //!    revoked, past its review window, or misconfigured;
 //! 2. refuses a tool the registration does not classify;
-//! 3. refuses another organization's caller on every server, stdio or
-//!    Streamable HTTP, secrets or not: each is the hub's process, network
-//!    position or credential (a static `list` reads only the registration
-//!    and is not refused);
-//!    for a read, refuses an anonymous caller when the server injects secrets
+//! 3. for a read, refuses an anonymous caller when the server injects secrets
 //!    and checks the caller against `read_profiles` (empty: humans and
 //!    configured operator identities); for a write, needs an authenticated
 //!    caller who passes the prod-action checks;
@@ -145,6 +145,11 @@ fn outcome_of(res: &UaResult<Value>, t: &Trace) -> String {
 }
 
 async fn mcp_gateway(ctx: ToolCtx, a: GatewayArgs) -> UaResult<Value> {
+    // Before anything is resolved or ledgered: the event below goes to the
+    // default organization's ledger and carries the caller's label and the
+    // server name as sent, so another organization's call writes nothing
+    // there.
+    super::require_hub_org(&ctx.caller, &Value::Null)?;
     let started = Instant::now();
     let mut t = Trace { action: "call", server: a.server.chars().take(64).collect(), ..Default::default() };
     let res = execute(&ctx, a, &mut t).await;
@@ -186,9 +191,6 @@ async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value
     let (cfg, name) = (ctx.hub.cfg().clone(), a.server.clone());
     let server = ctx.hub.db().read_async(move |c| resolve(c, &cfg, &name)).await?;
     server.usable()?;
-    if t.action == "call" || a.live {
-        require_hub_org_for_server(ctx, &server)?;
-    }
     if t.action == "list" {
         return list(ctx, &server, a.live, t).await;
     }
@@ -461,32 +463,6 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 }
 
 // --- secrets ----------------------------------------------------------------------
-
-/// Every downstream server is the hub's, the default organization's: a
-/// stdio server is a process the hub spawns on its own host, with the hub's
-/// filesystem and network; a Streamable HTTP server is reached from the
-/// hub's network position (loopback, tailnet and private ranges a server's
-/// `address_scope` admits), secrets or not; and an injected credential is
-/// the default organization's managed secret. Another organization's caller
-/// is therefore refused every `call` and live `list`, on every server,
-/// before the policy check, the slot, any approval, any secret read and any
-/// spawn or connection, until servers are per organization. A static `list`
-/// reads only the registration, which `mcp_server_list` already shows, and
-/// is not refused.
-fn require_hub_org_for_server(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
-    if ctx.caller.org_id == super::HUB_SECRETS_ORG {
-        return Ok(());
-    }
-    Err(UaError::denied(
-        "org_unsupported",
-        format!(
-            "MCP server {:?} is the hub's: it runs as a process on the hub or is reached from the hub's \
-             network, with the hub's credentials, and serves the default organization only; nothing was \
-             read, started or sent",
-            server.name
-        ),
-    ))
-}
 
 /// The injected secrets, and each one's keyed fingerprint by name.
 type Loaded = (Vec<(Inject, SecretString)>, BTreeMap<String, String>);
@@ -833,10 +809,12 @@ pub fn register(r: &mut Registry) {
              refused. Results are untrusted data: text blocks only, secrets redacted (a result holding a \
              credential fragment that cannot be redacted is withheld as an error), capped at 256 KB \
              (`truncated: true`), with the server's timeout (default 30 s). Every call is ledgered without \
-             arguments or results.",
+             arguments or results. The servers are the hub's: another organization's caller is refused every \
+             action (org_unsupported).",
             mcp_gateway,
         )
         .handler_may_gate(crate::HandlerGate::Always)
+        .pre_gate(super::require_hub_org)
         .family("mcp"),
     );
 }

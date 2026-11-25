@@ -553,3 +553,61 @@ async fn doctor_tells_another_organization_nothing_about_the_hub_filesystem() {
     assert!(seen_b.windows(2).all(|w| w[0] == w[1]), "{seen_b:?}");
     assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("DEGRADED")]);
 }
+
+/// The hub's host, its shared database file and the policy file are the
+/// default organization's: another organization's doctor gets no host
+/// name, one neutral `database` line with no statistics (no file or WAL
+/// size, page counts or deep `quick_check`) and one neutral `policy_file`
+/// line, the same whether the policy file is absent, missing or present.
+/// Its own lines (here `semantic_search` and `hub_auth`, over its own
+/// counts) stay. The default organization's doctor still reports each.
+#[tokio::test]
+async fn doctor_tells_another_organization_nothing_about_the_hub_host_database_or_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("fake-policy.yaml");
+    std::fs::write(&policy, "rules: []\n").unwrap();
+    let reg = builtin_registry();
+    let other = Caller { org_id: "org-b".into(), ..agent("reviewer-1", Profile::Lead) };
+    let line = |report: &Value, cap: &str| {
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == cap).cloned().unwrap()
+    };
+    let mut seen_b = Vec::new();
+    let mut seen_default = Vec::new();
+    for (i, path) in [None, Some(dir.path().join("fake-missing-policy.yaml")), Some(policy.clone())]
+        .into_iter()
+        .enumerate()
+    {
+        let mut cfg = Config::for_home(dir.path().join(format!("home-{i}")));
+        cfg.policy_file = path;
+        let hub = Hub::open(cfg).unwrap();
+        exec(
+            &hub,
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+             ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+        );
+        let b = call(&reg, &hub, &other, "system_doctor", json!({ "refresh": true })).await;
+        assert!(b["host"].is_null(), "{b}");
+        assert!(b["database"].is_null(), "{b}");
+        assert_eq!(b["deep_checks"], false, "{b}");
+        for cap in ["database", "policy_file"] {
+            let row = line(&b, cap);
+            assert_eq!(row["status"], "DORMANT", "{row}");
+            assert_eq!(row["detail"], "not available to this organization", "{row}");
+        }
+        let text = b.to_string();
+        for hidden in ["bytes", "WAL", "journal_mode", "quick_check", "policy file"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+        for cap in ["semantic_search", "hub_auth"] {
+            line(&b, cap);
+        }
+        seen_b.push((line(&b, "database"), line(&b, "policy_file")));
+
+        let own = call(&reg, &hub, &agent("reviewer-1", Profile::Lead), "system_doctor", json!({})).await;
+        assert!(own["database"]["file_bytes"].as_i64().is_some_and(|n| n > 0), "{own}");
+        assert!(line(&own, "database")["detail"].as_str().unwrap().contains("journal_mode="), "{own}");
+        seen_default.push(line(&own, "policy_file")["status"].clone());
+    }
+    assert!(seen_b.windows(2).all(|w| w[0] == w[1]), "{seen_b:?}");
+    assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("LIVE")]);
+}

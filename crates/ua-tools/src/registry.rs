@@ -1146,3 +1146,87 @@ mod tests {
         }
     }
 }
+
+/// The registry refuses a caller whose organization `orgs` does not hold
+/// before any tool runs ([`require_caller_org`]), so the tenant tests that go
+/// through [`Registry::call`] stop there. These run handlers directly,
+/// bypassing the registry, to prove each family's own guard stays behind
+/// it: the family's `require_org` (with its own wording, including on a
+/// write that inserts nothing, which the trigger cannot see) and the
+/// `org_exists` insert trigger on a raw insert.
+#[cfg(test)]
+mod family_org_guards {
+    use serde_json::{Value, json};
+    use ua_core::{ActorKind, Caller, Config, Profile, UaResult, identity::Transport};
+
+    use super::ToolCtx;
+    use crate::Hub;
+
+    const GHOST: &str = "org-ghost-not-real";
+
+    fn ghost() -> Caller {
+        Caller {
+            label: "builder-1".into(),
+            kind: ActorKind::Agent,
+            profile: Profile::Operator,
+            enforce_profile: false,
+            session_key: Some("builder-1-s".into()),
+            transport: Transport::Mcp,
+            org_id: GHOST.into(),
+        }
+    }
+
+    /// The tool's handler alone: no admission, organization check, grant,
+    /// policy, gate or `tool_calls` row.
+    async fn handler_only(hub: &Hub, tool: &str, args: Value) -> UaResult<Value> {
+        let reg = crate::builtin_registry_shared();
+        let def = reg.get(tool).unwrap_or_else(|| panic!("no tool {tool}"));
+        (def.handler)(ToolCtx { hub: hub.clone(), caller: ghost() }, args).await
+    }
+
+    fn count(hub: &Hub, sql: &str) -> i64 {
+        hub.db().read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_familys_own_guard_refuses_an_unknown_organization_behind_the_registry() {
+        let hub = Hub::in_memory(Config::for_home(std::env::temp_dir())).unwrap();
+        let unknown = format!("unknown organization {GHOST:?}");
+        for (tool, args, wording) in [
+            ("task_add", json!({ "title": "fake task" }), "no task was changed"),
+            (
+                "plan_manage",
+                json!({ "action": "create", "params": { "goal": "fake plan", "steps": ["one"] } }),
+                "no plan was changed",
+            ),
+            ("routine_add", json!({ "title": "fake routine", "trigger": "api" }), "no routine was changed"),
+            // A pause or a delete inserts nothing, so only the family's
+            // guard sees it.
+            ("routine_pause", json!({ "routine_id": 1 }), "no routine was changed"),
+            (
+                "plan_manage",
+                json!({ "action": "delete", "params": { "plan_id": "fake-plan" } }),
+                "no plan was changed",
+            ),
+        ] {
+            let e = handler_only(&hub, tool, args).await.unwrap_err();
+            assert!(e.to_string().contains(&format!("{unknown}; {wording}")), "{tool}: {e:?}");
+            assert!(!e.to_string().contains("nothing ran and nothing was written"), "{tool}: {e:?}");
+        }
+        for table in ["tasks", "plans", "routines"] {
+            assert_eq!(count(&hub, &format!("SELECT COUNT(*) FROM {table} WHERE org_id = '{GHOST}'")), 0);
+        }
+        assert_eq!(count(&hub, "SELECT COUNT(*) FROM tool_calls"), 0);
+
+        // The insert trigger stays behind both.
+        let e = hub
+            .db()
+            .write(|tx| {
+                tx.execute("INSERT INTO tasks (org_id, title) VALUES (?1, 'fake task')", [GHOST])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown organization"), "{e:?}");
+        assert_eq!(count(&hub, &format!("SELECT COUNT(*) FROM tasks WHERE org_id = '{GHOST}'")), 0);
+    }
+}
