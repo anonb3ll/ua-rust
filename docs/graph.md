@@ -116,9 +116,14 @@ remain enforceable.
 | `promoted_from` | `vault_note ↔ memory_note` | Directed (derived → source) | M:N | No self-loop | Lineage | `vault` (`promote` / `ingest`) |
 | `supersedes` | `memory_note → memory_note` | Directed (newer → older) | M:N | No self-loop | Lineage | `ua-memory` (`memory.superseded_by`) |
 | `contradicts` | `memory_note → memory_note` | Directed as asserted; queried bidirectionally | M:N | No self-loop; supports `state = 'proposed'` | Topical | `ua-memory` / contradiction workbench |
-| `evidence` | `memory_note → memory_note \| task \| run \| deliverable` | Directed | M:N | No self-loop | Lineage | `ua-memory` (`memory.evidence`) |
+| `evidence` | `memory_note → memory_note \| task \| run \| deliverable` | Directed | M:N | No self-loop; domain-owned only (never generic) | Lineage | `ua-memory` (`memory.evidence`) |
 | `extends` | `memory_note → memory_note` | Directed | M:N | No self-loop | Topical | `ua-memory` or governed `graph_edge_assert` |
 | `derives` | `memory_note → memory_note` | Directed (source → summary, per [memory.md](memory.md) §4) | M:N | No self-loop | Lineage | `ua-memory` (`memory_consolidate_commit`) |
+
+Before every insert (both generic and domain-owned), `ua-graph` validates that
+`(src_node.kind, dst_node.kind)` satisfies the allowed `Source → Target` pair in
+the table above for `edge.kind`, refusing mismatches (for example `depends_on`
+between `goal` nodes) with `invalid_argument` (`invalid_endpoint_kind`).
 
 Cardinality constraints marked `N:1` are enforced in SQLite by a partial unique
 index over live rows (`WHERE valid_to IS NULL`). Acyclicity constraints
@@ -129,12 +134,24 @@ reachability check** within `org_id` over live edges of the same kind:
 - **Hard write-time cycle-check bounds:** at most `CYCLE_CHECK_MAX_NODES = 1,000`
   visited nodes, `CYCLE_CHECK_MAX_EDGES = 5,000` visited edges, and a
   `CYCLE_CHECK_DEADLINE_MS = 50` ms wall-clock budget.
-- **Fail-closed on bound hit:** if the check detects a path from `dst_id` back
-  to `src_id`, or hits any of the three bounds before exhausting reachable nodes,
-  the write is refused with `invalid_argument` (never guessed or allowed
-  unverified). Because this runs inside the write transaction, the bound keeps
-  every insert strictly sub-linear in total graph size and prevents quadratic
-  blowup on pathological chains.
+- **Distinct reason codes (fail-closed):**
+  - If the check detects a real path from `dst_id` back to `src_id`, the write
+    is refused with `invalid_argument` and reason code `cycle_detected`
+    (preserving C2 parity with `dependency_add`).
+  - If the check hits any of the three bounds before exhausting reachable nodes,
+    the write is refused with `invalid_argument` and a distinct reason code
+    `cycle_check_bound_exceeded` (never guessed or allowed unverified, while
+    letting callers distinguish a scale/load bound hit from a real cycle).
+- **Mirror behavior on bound hit:** because a domain mirror runs in the **same
+  write transaction** as its authoritative table write (`subtask_of`,
+  `goal_parent`, `delegates_to`, `escalates_to`), a
+  `cycle_check_bound_exceeded` refusal aborts and rolls back the entire write
+  transaction rather than letting the authoritative table and `graph_edges`
+  diverge; the caller may retry on transient deadline hits. (Bounded trees such
+  as `goals.parent_goal_id`, capped at depth 8, visit at most 8 edges and cannot
+  trigger the node or edge caps.) Because the check is bounded inside the write
+  transaction, every insert stays strictly sub-linear in total graph size and
+  prevents quadratic blowup on pathological chains.
 
 ## Provenance and temporal validity
 
@@ -165,9 +182,17 @@ wrapper without blocking on #2790, under two strict rules:
    principal IDs. Later readers must not treat pre-#2790 `'default'` values as
    permanent identities until that backfill completes.
 2. **Non-default organizations (`org_id != 'default'`) before #2790:** any
-   `asserted_by` write (node creation or edge assertion) for an organization
-   other than `'default'` is **refused** until #2790 supplies immutable
-   principal IDs, so mutable labels never enter multi-org rows.
+   non-`'system'` `asserted_by` write (`asserted_by_kind` in `'agent'`,
+   `'person'`, `'node'`) for an organization other than `'default'` is
+   **refused** (`principal_id_required`) until #2790 supplies immutable
+   principal IDs, so mutable labels never enter multi-org rows. Deterministic
+   hub-internal `'system'` projections (`asserted_by = 'system'`,
+   `asserted_by_kind = 'system'`, `source_kind` in `'mirror'`, `'import'`,
+   including the C1 benchmark's org-B fixture seeded inside the bench harness)
+   are permitted because `'system'` is a fixed hub constant, not a mutable
+   caller label. This rule is enforced at **both** layers: in `ua-tools`
+   (`families/graph_store.rs`) before opening a write transaction, and as a
+   defense-in-depth invariant inside `GraphRepo` in `ua-store` on every insert.
 
 **Ledger linkage.** Every node creation and edge assertion/retraction appends an
 `agent.graph.node_created`, `agent.graph.edge_asserted`, or
@@ -182,10 +207,18 @@ Every edge carries a half-open validity interval `[valid_from, valid_to)` in
 normalized RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SS+00:00`, matching
 `ua_core::time::now()`):
 
-- `valid_from TEXT NOT NULL`: defaults to `asserted_at` when not supplied.
+- `valid_from TEXT NOT NULL`: set by the hub to `asserted_at` on every normal
+  write (`source_kind` in `'tool'`, `'event'`, `'mirror'`); callers cannot
+  supply a backdated `valid_from` to rewrite `as_of` history. Only
+  `source_kind = 'import'` may supply a historical `valid_from <= asserted_at`.
 - `valid_to TEXT`: `NULL` while the edge is currently valid. Retracting,
   expiring, or retiring an edge sets `valid_to` (once) rather than deleting the
-  row, so historical traversals remain reproducible.
+  row, so historical traversals remain reproducible. **Write-time validation in
+  `ua-graph` requires `valid_to <= now`** (no future-dated `valid_to` on insert
+  or update). Because no live edge can carry a future `valid_to`, the partial
+  unique indexes (`WHERE valid_to IS NULL`, including
+  `idx_graph_edges_single_out_live` for `N:1` edges) stay in exact agreement
+  with current reads (`valid_to IS NULL OR :now < valid_to`).
 - `CHECK (valid_to IS NULL OR valid_to >= valid_from)` rejects inverted
   intervals.
 - All timestamps are validated and normalized to fixed-width UTC on write so
@@ -368,8 +401,12 @@ to operate over `graph_edges`.
 ### Crate placement and schema parts
 
 - **Crate:** `crates/ua-graph`, depending only on `ua-core` and `ua-store`
-  (matching `ua-deliverables` and `ua-memory`, enforced by a
-  `crates/ua-graph/tests/dependencies.rs` guard test).
+  (matching `ua-deliverables`, enforced by a
+  `crates/ua-graph/tests/dependencies.rs` guard test; note that `ua-memory` also
+  depends on `ua-org`). All `ua_org::authz` checks (including
+  operator/lifecycle-operator checks for `graph_edge_retract`) run in
+  `ua-tools` (`crates/ua-tools/src/families/graph_store.rs`) before calling
+  `ua-graph`.
 - **Tool registration:** `crates/ua-tools/src/families/graph_store.rs` (keeping
   `crates/ua-tools/src/families/graph.rs` untouched for the planning canvas).
 - **No new crate dependencies.** Everything needed (`rusqlite`, `ulid`, `jiff`,
@@ -428,7 +465,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_source
     ON graph_nodes (org_id, source_kind, source_ref);
 
 CREATE TRIGGER IF NOT EXISTS graph_nodes_identity_immutable
-BEFORE UPDATE OF kind, external_id, asserted_by, asserted_by_kind,
+BEFORE UPDATE OF id, kind, external_id, asserted_by, asserted_by_kind,
                  source_kind, source_ref, created_at ON graph_nodes
 BEGIN
     SELECT RAISE(ABORT, 'graph node identity and provenance are immutable');
@@ -511,8 +548,16 @@ BEGIN
     SELECT RAISE(ABORT, 'graph edge endpoints must exist in the edge organization');
 END;
 
+CREATE TRIGGER IF NOT EXISTS graph_edges_org_endpoints_update
+BEFORE UPDATE ON graph_edges
+WHEN NOT EXISTS (SELECT 1 FROM graph_nodes WHERE id = NEW.src_id AND org_id = NEW.org_id)
+  OR NOT EXISTS (SELECT 1 FROM graph_nodes WHERE id = NEW.dst_id AND org_id = NEW.org_id)
+BEGIN
+    SELECT RAISE(ABORT, 'graph edge endpoints must exist in the edge organization');
+END;
+
 CREATE TRIGGER IF NOT EXISTS graph_edges_provenance_immutable
-BEFORE UPDATE OF src_id, dst_id, kind, assertion_scope,
+BEFORE UPDATE OF id, src_id, dst_id, kind, assertion_scope,
                  asserted_by, asserted_by_kind, asserted_at,
                  source_kind, source_ref, valid_from ON graph_edges
 BEGIN
@@ -659,8 +704,11 @@ library) and **meet or beat every floor below before merge**.
   - **20,000 nodes** and **100,000 live edges** (`valid_to IS NULL`) plus
     **10,000 historical closed edges** (`valid_to IS NOT NULL`), total 110,000
     edge rows.
-  - **2 organizations:** 90,000 live edges in org A and 10,000 live edges in
-    org B, exercising `org_id` index selectivity on every read.
+  - **2 organizations:** 90,000 live edges in org A (`'default'`) and 10,000
+    live edges in org B (seeded inside the bench harness using
+    `asserted_by = 'system'`, `asserted_by_kind = 'system'`,
+    `source_kind = 'import'`, respecting the pre-#2790 non-default-org
+    principal rule), exercising `org_id` index selectivity on every read.
 - **Degree distribution** (heavy-tailed, matching task/memory/vault graphs):
   - 70.0% ordinary nodes (degree 2–10),
   - 25.0% medium nodes (degree 11–50),
@@ -684,7 +732,8 @@ the C1 PR):
 | Workload | Parameters | Floor |
 | --- | --- | --- |
 | Batched edge insert | 1,000 edges/tx across 100k edges, triggers + indexes active | **≥ 15,000 edges/sec** |
-| Single governed edge write (incl. B4 cycle check) | 1 edge + `ledger::append` in one write transaction, including write-time acyclicity check on acyclic kinds (`depends_on` 500-hop chain + bound-hit refusal probe at `1,000` nodes / `5,000` edges / `50 ms`) | **≤ 3 ms p95** (and bounded `invalid_argument` refusal when cycle-check cap is hit) |
+| Single governed edge write (normal) | 1 edge + `ledger::append` in one write transaction, including write-time acyclicity check on a 500-hop `depends_on` chain | **≤ 3 ms p95** |
+| Cycle-check bound-hit probe | 1 `depends_on` write exceeding `CYCLE_CHECK_MAX_NODES` (1,000) / `CYCLE_CHECK_MAX_EDGES` (5,000) / `CYCLE_CHECK_DEADLINE_MS` (50 ms) | **≤ 60 ms p95**, refused with `invalid_argument` (`cycle_check_bound_exceeded`) |
 | 2-hop `k_hop` (100k edges) | 3 seeds, `max_hops = 2`, `max_degree_per_node = 50`, `max_nodes = 100`, `as_of` active, org-fenced | **≤ 15 ms p95** (≤ 25 ms p95 with `memory_note` sub-org visibility filter) |
 | `seed_expand` PPR (100k edges) | 5 seeds, 2-hop bounded subgraph (≤5,000 nodes, ≤25,000 edges), `damping = 0.85`, `max_iters = 30`, `eps = 1e-6`, `max_results = 10` | **≤ 40 ms p95** (≤ 20 ms p95 on exact ≤5k-node subgraphs) |
 | `shortest_path` (100k edges) | Bidirectional BFS, `max_depth = 4`, `max_expanded_edges = 10,000` | **≤ 15 ms p95** |
@@ -720,8 +769,9 @@ the C1 PR):
   for PPR, `max_nodes ≤ 500`, `max_edges ≤ 1,000`, `max_iters ≤ 50`,
   `deadline_ms ≤ 2,000`). Write-time acyclicity checks enforce
   `CYCLE_CHECK_MAX_NODES = 1,000`, `CYCLE_CHECK_MAX_EDGES = 5,000`, and
-  `CYCLE_CHECK_DEADLINE_MS = 50` ms, refusing `invalid_argument` when any bound
-  is exceeded.
+  `CYCLE_CHECK_DEADLINE_MS = 50` ms, refusing `invalid_argument` with distinct
+  reason codes `cycle_detected` (real cycle) vs `cycle_check_bound_exceeded`
+  (any bound exceeded).
 - **Cycle immunity:** All traversals track visited node IDs in memory; cyclic
   subgraphs cannot cause infinite recursion or exponential blowup.
 - **Storage and payload caps:** Configurable per-organization quotas
@@ -750,31 +800,45 @@ session profile:
    `person`/`agent` node to `private` through a generic tool.
 2. **Domain-owned edges cannot be forged via generic graph tools.** Edges
    representing governance, approvals, deliverables, team topology, memory
-   entity indexing, or authoritative domain links (`approved_by`,
-   `governed_by`, `reviewed_by`, `produces`, `executes`, `executed_by`,
-   `delegates_to`, `reviews`, `escalates_to`, `can_observe`, `depends_on`,
-   `subtask_of`, `serves_goal`, `goal_parent`, `delegated_to`, `uses_skill`,
-   `promoted_from`, `supersedes`, `derives`, `mentions`) may be written
-   **only** by their owning domain code path. Calling generic
-   `graph_edge_assert` or `graph_edge_retract` with one of those kinds is
-   refused (`domain_owned_edge`). In particular, `mentions` is strictly
-   domain-owned by `ua-memory` / vault ingest because it drives the memory
-   graph leg's hub cutoff and PPR retrieval scores.
-3. **Generic assertions (`extends`, `evidence`, `contradicts` as `proposed`,
-   `links_to`, `plan_tracks`):**
+   entity indexing, memory evidence, or authoritative domain links
+   (`approved_by`, `governed_by`, `reviewed_by`, `produces`, `executes`,
+   `executed_by`, `delegates_to`, `reviews`, `escalates_to`, `can_observe`,
+   `depends_on`, `subtask_of`, `serves_goal`, `goal_parent`, `delegated_to`,
+   `uses_skill`, `promoted_from`, `supersedes`, `derives`, `mentions`,
+   `evidence`) may be written **only** by their owning domain code path. Calling
+   generic `graph_edge_assert` or `graph_edge_retract` with one of those kinds
+   is refused (`domain_owned_edge`). In particular, `mentions` is strictly
+   domain-owned by `ua-memory` / vault ingest (drives the memory graph leg's hub
+   cutoff and PPR retrieval scores), and `evidence` is strictly domain-owned by
+   `ua-memory` (`memory.evidence` is the single authority with owner-only
+   `task:` refs; allowing generic assertions would bypass the owner rule and
+   shift the memory graph leg).
+3. **Generic assertions (`extends`, `contradicts` as `proposed`, `links_to`,
+   `plan_tracks`):**
+   - **Never create nodes:** `graph_edge_assert` never creates missing nodes;
+     both endpoint nodes must already exist in the caller's organization
+     (`org_id`), else the call returns `not_found` identically for missing and
+     foreign-org endpoints (zero existence oracle). In C1, domain code paths and
+     tests create nodes via internal `graph_node_ensure`.
    - Require a verified caller (`ActorKind::Human` or `ActorKind::Agent`) in
      the target organization; anonymous callers cannot write.
-   - Until #2790 supplies immutable principal IDs, writes for any organization
-     other than `'default'` are refused (`principal_id_required`).
+   - Until #2790 supplies immutable principal IDs, non-`'system'` writes for any
+     organization other than `'default'` are refused (`principal_id_required`)
+     in both `ua-tools` (`families/graph_store.rs`) and `GraphRepo` in
+     `ua-store`.
    - Require read visibility on **both** endpoint nodes (prevents linking to or
-     probing hidden records).
+     probing hidden records), and validate endpoint node kinds against the typed
+     edge table (`invalid_endpoint_kind`).
+   - Require `valid_from = asserted_at` (no caller-supplied backdating) and
+     `valid_to IS NULL` on assert (`valid_to <= now` on retract).
    - Every write records `asserted_by` from the verified caller's `PrincipalId`
      (never caller-supplied).
-4. **Retraction (`graph_edge_retract`, sets `valid_to`):**
+4. **Retraction (`graph_edge_retract`, sets `valid_to = now`):**
    - Allowed only on generic-assertable edge kinds, for the original
      `asserted_by` principal, an `Authority::Operator` (`org_admin`+ once
      memberships land), or `Authority::LifecycleOperator` for fleet maintenance
-     — all checked via `ua_org::authz::require` in the edge's organization.
+     — all checked via `ua_org::authz::require` in `ua-tools`
+     (`families/graph_store.rs`) before calling `ua-graph`.
    - Retracting another principal's edge as an operator records the retractor
      in the `agent.graph.edge_retracted` ledger event while leaving the edge's
      original `asserted_by` untouched.
