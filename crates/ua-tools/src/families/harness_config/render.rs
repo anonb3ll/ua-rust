@@ -20,11 +20,17 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
+
+use crate::families::skill_registry::{
+    self, MAX_PACKAGE_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILES, MAX_SKILL_FILE_BYTES,
+};
 
 pub const MAX_BUNDLE_BYTES: usize = 512_000;
 pub const MAX_FILE_BYTES: usize = 256_000;
@@ -78,12 +84,23 @@ pub fn valid_surface(s: &str) -> bool {
 // --- the bundle -------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillFile {
+    pub path: String,
+    pub bytes: usize,
+    pub sha256: String,
+    pub encoding: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<SkillFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,7 +323,103 @@ fn validate_skills(v: Option<&Value>) -> UaResult<Vec<Skill>> {
         if body.len() > MAX_FILE_BYTES {
             return Err(UaError::invalid(format!("skill {} body exceeds size limit", repr(&name))));
         }
-        out.push(Skill { name, description, body });
+        let files = validate_skill_files(&name, raw.get("files"))?;
+        out.push(Skill { name, description, body, files });
+    }
+    Ok(out)
+}
+
+fn validate_skill_files(skill_name: &str, v: Option<&Value>) -> UaResult<Vec<SkillFile>> {
+    let list = match v {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(UaError::invalid(format!("skill {} files must be a list", repr(skill_name)))),
+    };
+    if list.len() > MAX_PACKAGE_FILES {
+        return Err(UaError::invalid(format!(
+            "skill {} exceeds the {MAX_PACKAGE_FILES}-file package limit",
+            repr(skill_name)
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(list.len());
+    for raw in list {
+        let Some(obj) = raw.as_object() else {
+            return Err(UaError::invalid(format!("skill {} file entry must be an object", repr(skill_name))));
+        };
+        let path_raw = obj
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| UaError::invalid(format!("skill {} file path is required", repr(skill_name))))?;
+        let path = skill_registry::validate_package_path(path_raw)?;
+        if !seen.insert(path.clone()) {
+            return Err(UaError::invalid(format!(
+                "skill {} has duplicate package file {:?}",
+                repr(skill_name),
+                path
+            )));
+        }
+        let encoding = obj.get("encoding").and_then(Value::as_str).ok_or_else(|| {
+            UaError::invalid(format!("skill {} file encoding is required", repr(skill_name)))
+        })?;
+        let content = obj.get("content").and_then(Value::as_str).ok_or_else(|| {
+            UaError::invalid(format!("skill {} file content is required", repr(skill_name)))
+        })?;
+        let decoded = match encoding {
+            "utf-8" => content.as_bytes().to_vec(),
+            "base64" => BASE64.decode(content).map_err(|_| {
+                UaError::invalid(format!("skill {} file {:?} has invalid base64", repr(skill_name), path))
+            })?,
+            _ => {
+                return Err(UaError::invalid(format!(
+                    "skill {} file {:?} encoding must be utf-8 or base64",
+                    repr(skill_name),
+                    path
+                )));
+            }
+        };
+        let cap = if path == "SKILL.md" { MAX_SKILL_FILE_BYTES } else { MAX_PACKAGE_FILE_BYTES };
+        if decoded.len() > cap {
+            return Err(UaError::invalid(format!(
+                "skill {} file {:?} exceeds the {cap}-byte limit",
+                repr(skill_name),
+                path
+            )));
+        }
+        total = total.saturating_add(decoded.len());
+        if total > MAX_PACKAGE_BYTES {
+            return Err(UaError::invalid(format!(
+                "skill {} exceeds the {MAX_PACKAGE_BYTES}-byte package limit",
+                repr(skill_name)
+            )));
+        }
+        let expected_bytes = obj.get("bytes").and_then(Value::as_u64).unwrap_or(decoded.len() as u64);
+        if expected_bytes as usize != decoded.len() {
+            return Err(UaError::invalid(format!(
+                "skill {} file {:?} byte count does not match its content",
+                repr(skill_name),
+                path
+            )));
+        }
+        let actual_sha = skill_registry::sha256_bytes(&decoded);
+        let expected_sha = obj.get("sha256").and_then(Value::as_str).ok_or_else(|| {
+            UaError::invalid(format!("skill {} file {:?} sha256 is required", repr(skill_name), path))
+        })?;
+        if actual_sha != expected_sha {
+            return Err(UaError::invalid(format!(
+                "skill {} file {:?} sha256 does not match its content",
+                repr(skill_name),
+                path
+            )));
+        }
+        out.push(SkillFile {
+            path,
+            bytes: decoded.len(),
+            sha256: actual_sha,
+            encoding: encoding.to_string(),
+            content: content.to_string(),
+        });
     }
     Ok(out)
 }
@@ -473,7 +586,13 @@ pub fn render_surface(bundle: &Bundle, surface: &str) -> UaResult<String> {
     let skills: Vec<Value> = bundle
         .skills
         .iter()
-        .map(|s| json!({ "name": s.name, "description": s.description, "body": s.body }))
+        .map(|s| {
+            let mut v = json!({ "name": s.name, "description": s.description, "body": s.body });
+            if !s.files.is_empty() {
+                v["files"] = serde_json::to_value(&s.files).unwrap_or_else(|_| json!([]));
+            }
+            v
+        })
         .collect();
     let mut payload = json!({ "ua_bundle_version": bundle.version, "mcp": mcp, "skills": skills });
     if let Some(text) = non_empty(rules.get(&surface)).or_else(|| non_empty(rules.get("agents"))) {
