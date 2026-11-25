@@ -2873,6 +2873,37 @@ such change does:
   this trait is where it would plug in, and the bundled SQLite WAL store stays
   the zero-configuration default.
 
+### The registry slice as built
+
+The first slice ships the crate skeleton and the registry only: offices,
+role grants, seats and service identities in `organization.registry.v1`, with
+`organization.v1.registry.tenant` adding the tenant triggers. Team specs,
+plans, topology, self-organization and blueprints are later slices.
+
+- **The organization is the caller's.** No tool takes an `org_id` argument
+  (`deny_unknown_fields` refuses one). Every read and write is scoped to
+  `caller.org_id`, and `ua_org::authz::require_same_org` rejects a caller whose
+  organization is not the row's. Until tenancy lands, `authz` admits only the
+  default organization, so a row of another organization is refused outright.
+- **Every write needs a verified human operator.** `org_office_register`,
+  `org_role_register`, `org_seat_register` and `org_service_register` call
+  `Authority::Operator` through `Registry::call`. An agent-kind caller is
+  refused however wide its profile. `org_registry_read` is read-only and
+  scoped but needs no authority.
+- **A role grant is always gated.** `org_role_register` carries
+  `always_gated`: one human approval per grant, on top of the authority check.
+- **Registry rows are keyed by label for now.** Seats and role grants are keyed
+  by the identity label, with no foreign key to an immutable id. That is the
+  gap #2794 owns: the tenancy design keys seats and grants by `agent_id` /
+  `user_id`, so a recreated label cannot inherit a seat. Until then the label
+  is the key and the registry refuses a label that is both a seat and a role.
+- **The ledger append is redacted across organizations.** A registry row
+  belongs to its organization, but the ledger event lands in the default
+  organization's ledger (`ORG-EVENT-DEFAULT`). A row outside the default
+  organization records a neutral originator and omits the label and office name
+  from the payload, so another organization's names do not leak into the
+  default ledger.
+
 ## The importer
 
 `organization.v1` adds `org_id` to the target tables, which would turn today's

@@ -1,6 +1,6 @@
 [package]
 name = "ua-org"
-description = "Organizations for ua-rust: the authz module every authority check goes through."
+description = "Organizations: the authority module and the registry of offices, roles and seats."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,12 @@ readme.workspace = true
 
 [dependencies]
 ua-core.workspace = true
+ua-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true

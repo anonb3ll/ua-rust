@@ -63,6 +63,8 @@ pub fn schema_parts() -> Vec<Part> {
     // `orgs`, the default organization and the ledger's organization columns.
     parts.push(ua_store::org::STORE_PART.into());
     parts.extend(families::schema_parts().into_iter().map(Part::from));
+    // The generated triggers of the registry tables (their org_id already exists).
+    parts.push(families::org::TENANT_PART.into());
     // The organization column and triggers of the code family's table.
     parts.push(families::code::TENANT_PART.into());
     parts.push(families::graph::TENANT_KEYS.into());
