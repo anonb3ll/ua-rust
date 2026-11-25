@@ -865,15 +865,6 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
         return Err(UaError::invalid("session_id is required"));
     }
     let dry_run = a.dry_run;
-    let vault = super::vault::vault(&ctx);
-    // A real write needs the vault; a dry run works without one.
-    if !dry_run && let Err(e) = &vault {
-        return Err(UaError::denied("vault_not_configured", e.to_string()));
-    }
-    let inbox = ctx.hub.cfg().vault_inbox_dir.trim().trim_matches('/').to_string();
-    if inbox.is_empty() {
-        return Err(UaError::invalid("no vault inbox directory is configured"));
-    }
     // The proposal lands in the hub-scoped vault, which belongs to the
     // default organization: another organization may preview (dry_run) but
     // never write one. Refused before anything is read or written.
@@ -883,6 +874,17 @@ async fn propose_session_learnings(ctx: ToolCtx, a: ProposeArgs) -> UaResult<Val
             "a learning proposal is written to the hub's vault, which belongs to the default organization; \
              nothing was written. Pass dry_run=true to preview it",
         ));
+    }
+    // Another organization's preview sees no vault (`vault` refuses it), so
+    // it never learns whether a proposal file exists there.
+    let vault = super::vault::vault(&ctx);
+    // A real write needs the vault; a dry run works without one.
+    if !dry_run && let Err(e) = &vault {
+        return Err(UaError::denied("vault_not_configured", e.to_string()));
+    }
+    let inbox = ctx.hub.cfg().vault_inbox_dir.trim().trim_matches('/').to_string();
+    if inbox.is_empty() {
+        return Err(UaError::invalid("no vault inbox directory is configured"));
     }
     let vault_root = vault.as_ref().ok().map(|v| v.root.clone());
     let rel = proposal_relpath(&inbox, &sid);

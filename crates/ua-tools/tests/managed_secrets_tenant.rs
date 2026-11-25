@@ -833,6 +833,48 @@ async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
     assert!(h.events() >= events);
 }
 
+/// A stdio MCP server is a process the hub spawns on its own host, the
+/// default organization's: another organization's caller is refused its
+/// `call` and live `list` even when it injects no secret, before anything is
+/// spawned. A static `list` reads nothing and is not refused.
+#[tokio::test]
+async fn a_stdio_mcp_server_refuses_another_organizations_caller_without_secrets() {
+    if !cfg!(feature = "mcp-gateway") {
+        return;
+    }
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "local-docs".into(),
+            json!({
+                "transport": "stdio",
+                "command": "/nonexistent/fake-mcp-server-not-real",
+                "tools": { "echo": "read" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+            }),
+        );
+    });
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    for who in [agent(ORG_B), human(ORG_B)] {
+        let gw = dev(who);
+        for args in [
+            json!({ "server": "local-docs", "tool": "echo" }),
+            json!({ "action": "list", "server": "local-docs", "live": true }),
+        ] {
+            let e = h.err(&gw, "mcp_gateway", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+            assert!(e.to_string().contains("process on the hub"), "{e:?}");
+        }
+        h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "local-docs" })).await;
+    }
+    // The default organization's caller passes the check and fails later,
+    // trying to start the (nonexistent) command.
+    let e = h
+        .err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "local-docs", "tool": "echo" }))
+        .await;
+    assert_ne!(reason(&e), "org_unsupported", "{e:?}");
+}
+
 #[test]
 fn a_legacy_row_with_a_null_name_stops_the_upgrade_with_its_row_id() {
     let dir = tempfile::tempdir().unwrap();

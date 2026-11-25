@@ -286,9 +286,9 @@ fn read_receipt(c: &Connection, org: &str, key: &str) -> UaResult<Option<(String
     }))
 }
 
-fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Value>> {
+fn replay(existing: Option<(String, Value)>, digests: &[String]) -> UaResult<Option<Value>> {
     match existing {
-        Some((d, result)) if d == digest => Ok(Some(result)),
+        Some((d, result)) if digests.contains(&d) => Ok(Some(result)),
         Some(_) => {
             Err(UaError::conflict("idempotency_key was already used for a different delegation request"))
         }
@@ -298,21 +298,23 @@ fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Va
 
 /// The committed result of this request, if any: its receipt under the
 /// current key (a different request there is a conflict), else under the old
-/// unescaped key when its digest is this request's. The digest covers
+/// unescaped key when its digest is this request's. `digests` are this
+/// request's digests: over the registered spelling of `to_agent` (what a
+/// receipt stores) and over the spelling sent. The digest covers
 /// `from_agent`, so the old key never replays another agent's receipt; any
 /// other receipt there reads as none, and the request runs fresh.
 fn find_receipt(
     c: &Connection,
     org: &str,
     keys: &(String, Option<String>),
-    digest: &str,
+    digests: &[String],
 ) -> UaResult<Option<Value>> {
-    if let Some(done) = replay(read_receipt(c, org, &keys.0)?, digest)? {
+    if let Some(done) = replay(read_receipt(c, org, &keys.0)?, digests)? {
         return Ok(Some(done));
     }
     if let Some(old) = &keys.1
         && let Some((d, result)) = read_receipt(c, org, old)?
-        && d == digest
+        && digests.contains(&d)
     {
         return Ok(Some(result));
     }
@@ -502,6 +504,33 @@ pub struct ManageArgs {
 // ---------------------------------------------------------------------------
 // Create.
 
+/// The registered spelling of the delegation target `label` in `org`: an
+/// agent whose label matches exactly, else the one agent whose label matches
+/// without regard to case (the label namespace is case-insensitive).
+/// `Ok(None)` when no agent of `org` matches. Two or more case variants and
+/// no exact match are refused (`agent_label_ambiguous`), as `agent_forget`
+/// refuses them, rather than silently picking one.
+fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<String>> {
+    let spellings: Vec<String> = c
+        .prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
+        .query_map(params![org, label], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if spellings.iter().any(|s| s == label) {
+        return Ok(Some(label.to_string()));
+    }
+    match spellings.len() {
+        0 => Ok(None),
+        1 => Ok(spellings.into_iter().next()),
+        n => Err(UaError::conflict_code(
+            "agent_label_ambiguous",
+            format!(
+                "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
+                 Nothing was created"
+            ),
+        )),
+    }
+}
+
 /// Every door to this (`delegate`, `delegation_manage` create, `handoff`)
 /// passes `delegate`'s profile entry, policy rules and approval gate in the
 /// registry first, on the arguments of a `delegate` call (see
@@ -539,17 +568,33 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         )));
     }
 
-    let request = json!({
-        "task_spec": task_spec,
-        "from_agent": from_agent,
-        "to_agent": to_agent,
-        "deadline": deadline,
-        "callback": callback,
-        "priority": priority,
-        "parent_task_id": a.parent_task_id,
-        "project": project,
-    });
-    let digest = hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()));
+    // The receipt digest is over the target's registered spelling, so a
+    // retry that spells `to_agent` in other letter cases is the same request
+    // and replays. The spelling sent is hashed too, as a fallback for a
+    // retry whose target no longer resolves (forgotten since): that retry
+    // replays only when it sends the registered spelling.
+    let digest_for = |to: &str| {
+        let request = json!({
+            "task_spec": task_spec,
+            "from_agent": from_agent,
+            "to_agent": to,
+            "deadline": deadline,
+            "callback": callback,
+            "priority": priority,
+            "parent_task_id": a.parent_task_id,
+            "project": project,
+        });
+        hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()))
+    };
+    let digests_for = |c: &Connection, org: &str| -> Vec<String> {
+        let mut out = vec![digest_for(&to_agent)];
+        if let Ok(Some(reg)) = registered_target(c, org, &to_agent)
+            && reg != to_agent
+        {
+            out.insert(0, digest_for(&reg));
+        }
+        out
+    };
     let org = ctx.caller.org_id.clone();
     let rkeys = idem
         .as_deref()
@@ -558,7 +603,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 
     // A committed retry replays before any gate: no second approval, no effect.
     if let Some(k) = rkeys.clone() {
-        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digest))?;
+        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digests_for(c, &org)))?;
         if let Some(done) = found {
             return Ok(done);
         }
@@ -568,29 +613,21 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
         if let Some(k) = rkeys.as_ref()
-            && let Some(done) = find_receipt(tx, &org, k, &digest)?
+            && let Some(done) = find_receipt(tx, &org, k, &digests_for(tx, &org))?
         {
             return Ok(done);
         }
         crate::families::tasks::require_org(tx, &org)?;
         // A delegation targets only a registered agent of the delegator's
-        // own organization (owner decision): an `agents` row in this
-        // organization whose label matches without regard to case (the
-        // label namespace is case-insensitive), an exact spelling first.
-        // The registered spelling is what is stored as `to_agent`, since
-        // that is the spelling the agent's claims and lists match. A label
-        // no agent has registered and a label another organization's agent
-        // holds get the same answer, built from the requested label alone,
-        // so neither reveals whether the label exists elsewhere.
-        let registered: Option<String> = tx
-            .query_row(
-                "SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE \
-                 ORDER BY (label = ?2) DESC, label LIMIT 1",
-                params![org, to_agent],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(to_agent) = registered else {
+        // own organization (owner decision): see `registered_target` (an
+        // exact spelling, else the one case-insensitive match; several case
+        // variants are ambiguous). The registered spelling is what is
+        // stored as `to_agent` and hashed into the receipt, since that is
+        // the spelling the agent's claims and lists match. A label no agent
+        // has registered and a label another organization's agent holds get
+        // the same answer, built from the requested label alone, so neither
+        // reveals whether the label exists elsewhere.
+        let Some(to_agent) = registered_target(tx, &org, &to_agent)? else {
             return Err(UaError::not_found(format!(
                 "no agent {to_agent:?} in this organization; a delegation targets a registered agent of the \
                  delegator's organization. Nothing was created"
@@ -673,6 +710,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             result["spec_warnings"] = json!(warnings);
         }
         if let Some(k) = rkey.as_deref() {
+            let digest = digest_for(&to_agent);
             tx.execute(
                 "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
                  VALUES (?1, ?2, 'delegate', ?3, ?4)",

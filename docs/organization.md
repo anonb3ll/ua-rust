@@ -676,7 +676,11 @@ here for memory columns, owners and defaults.
   (`relay_manage` `request_send`, `send`) and an MCP server that injects
   secrets (`mcp_gateway` `call`, live `list`) use the default
   organization's secrets, so another organization's caller is refused
-  (`org_unsupported`) before anything is read. The `github.credential.*` and `managed_secret.*` events are
+  (`org_unsupported`) before anything is read. A stdio MCP server is a
+  process the hub spawns on its own host, so its `call` and live `list`
+  are refused to another organization's caller the same way, secrets or
+  not, before anything is started; a Streamable HTTP server that injects
+  no secret, and a static `list`, are not refused. The `github.credential.*` and `managed_secret.*` events are
   `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
   consumer are `null` and the originator is `system`. The automation paths
   run per organization through `github_credential_for` (the
@@ -790,11 +794,14 @@ here for memory columns, owners and defaults.
   not hold is refused (`unknown_organization`), and one for a suspended
   organization (`organization_suspended`), before anything changes.
   `memory_promote` copies a note into the hub-wide vault, so another
-  organization's caller is refused (`org_unsupported`). A file export
-  (`export_memory`, `export_tasks`, `export_journal` with
-  `write_to_vault`, the default) lands in the hub's shared workspace, so it
-  is refused outside the default organization (`org_unsupported`, nothing
-  written or ledgered); `write_to_vault=false` returns the export inline.
+  organization's caller is refused (`org_unsupported`); so is
+  `vault_to_memory_ingest`, which reads the vault. A file export
+  (`export_memory`, `export_tasks` with `write_to_vault`, the default)
+  lands in the hub's shared workspace, so it is refused outside the
+  default organization (`org_unsupported`, nothing written or ledgered);
+  `write_to_vault=false` returns the export inline. `export_journal` reads
+  the hub's vault, so it is refused outside the default organization
+  inline or not.
   A save's idempotency key is stored as `org:<org>/memory_save/<label>/<key>`
   in another organization, with `%` and `/` escaped in both the
   organization and the label (the default keeps `memory_save/<label>/<key>`
@@ -1150,8 +1157,12 @@ here for memory columns, owners and defaults.
     of whichever organization's **row** holds the label (the rows, not the
     configuration reservation, so a stale row another organization keeps
     for a reserved label is reachable too) is retired (doing claims
-    still refuse it; its tokens, OAuth sign-ins and session credentials are
-    revoked), then forgotten (its agent row, lifecycle row and profile
+    still refuse it; its managed tokens and session credentials, in its
+    organization, are revoked, and so are its OAuth sign-ins when it is
+    the default organization's: `oauth_grants` carries no organization
+    yet, so every grant is the default's, and recovering another
+    organization's row never revokes the default grant for the same label
+    text), then forgotten (its agent row, lifecycle row and profile
     bindings deleted, so the label is free; its sessions, notes and revoked
     tokens stay in its organization as history), in that organization,
     through the ordinary code. The answer is only `{agent, org_id, changed,
@@ -1237,8 +1248,15 @@ here for memory columns, owners and defaults.
     drift, and the `security_audit` and `skill_review` targets), `capability_catalog` lists no
     workspace skills to another organization, and an autonomous cycle of
     another organization is held for a human before its worktree is read
-    or the validation command runs. So until per-organization workspaces
-    exist, another organization has no hub filesystem at all.
+    or the validation command runs. The vault is the hub's too: every
+    `vault_*` tool (through `vault::vault`), every `obsidian_*` tool
+    (before any request reaches the plugin, configured or not),
+    `memory_promote`, `vault_to_memory_ingest` and `export_journal` refuse
+    another organization's caller (`org_unsupported`) before a path is
+    resolved, and its learning-proposal preview reads no vault. A stdio
+    `mcp_gateway` server, a process on the hub, is refused the same way.
+    So until per-organization workspaces and vaults exist, another
+    organization has no hub filesystem at all.
   - **No human or operator path outside the default organization yet.**
     Human identities and lifecycle operators are hub configuration, the
     default organization's, and no resolver produces a verified human of
@@ -2495,7 +2513,9 @@ and that its `org_exists` and `org_immutable` triggers exist.
 
 The vault is hub-scoped, so anything that copies tenant data into it —
 `memory_promote` above all — is allowed only in `'default'` (see
-`docs/memory.md`).
+`docs/memory.md`). Reading it is too: every `vault_*` and `obsidian_*`
+tool and `export_journal` refuse another organization's caller
+(`org_unsupported`) before touching the vault or the plugin.
 
 ## The ledger
 

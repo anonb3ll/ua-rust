@@ -6,6 +6,9 @@
 //! and `obsidian_api_key` (`UA_OBSIDIAN_API_KEY`). Without both, every tool
 //! returns `{configured: false, reason: "not-configured", missing}`. The key
 //! is held as a secret, sent only as a bearer header and redacted from errors.
+//! The plugin serves the hub's vault, the default organization's: every tool
+//! refuses another organization's caller (`org_unsupported`) before any
+//! request is sent, configured or not.
 //!
 //! Requests go through `ua_ingress::Outbound` under `obsidian.local_rest`:
 //! loopback addresses only (checked at connect time and on the connection's
@@ -24,7 +27,7 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
 
-use super::{LOCK_HEAD_BYTES, frontmatter, locked_error, record, vault, with_note_locks};
+use super::{LOCK_HEAD_BYTES, frontmatter, locked_error, record, require_hub_org, vault, with_note_locks};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -195,6 +198,7 @@ async fn payload(resp: Response) -> UaResult<Value> {
 }
 
 async fn status(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     let body = payload(api.send(Method::GET, "/", None, None).await?).await?;
     Ok(match body {
@@ -207,6 +211,7 @@ async fn status(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
 }
 
 async fn open(ctx: ToolCtx, a: OpenArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     if a.path.trim().is_empty() {
         return Err(UaError::invalid("path must not be empty"));
@@ -219,6 +224,7 @@ async fn open(ctx: ToolCtx, a: OpenArgs) -> UaResult<Value> {
 }
 
 async fn active_note(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     let resp = api.send(Method::GET, "/active/", None, None).await?;
     let path = resp.headers().get("Content-Location").and_then(|h| h.to_str().ok()).map(str::to_string);
@@ -227,6 +233,7 @@ async fn active_note(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
 }
 
 async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     if a.query.trim().is_empty() {
         return Err(UaError::invalid("query must not be empty"));
     }
@@ -253,6 +260,7 @@ fn lock_and_version(p: &std::path::Path, shown: &str) -> UaResult<Option<(bool, 
 }
 
 async fn append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     if a.path.trim().is_empty() {
         return Err(UaError::invalid("path must not be empty"));

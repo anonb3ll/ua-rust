@@ -9,7 +9,8 @@
 //! static token from recording anything (`agents.label` is the table's
 //! key): `session_start` is refused and `agent_heartbeat` answers
 //! `recorded: false` until hub recovery (`any_org`) retires and forgets that
-//! row. Retiring then forgetting an agent never brings a static or managed
+//! row, without revoking the default organization's OAuth grant for the
+//! label. Retiring then forgetting an agent never brings a static or managed
 //! token back. Every value here is fake.
 
 mod common;
@@ -152,6 +153,29 @@ async fn a_stale_row_of_another_organization_blocks_writes_until_hub_recovery() 
         "0",
         "no registration is ledgered for a write that did not happen"
     );
+    // A default-organization OAuth sign-in for the label (`oauth_grants`
+    // carries no organization, so every grant is the default's).
+    sql(
+        &hub,
+        &format!(
+            "INSERT INTO oauth_grants (family_id, client_id, client_name, subject, approved_by, grant_type, \
+                 scope, resource, created_at)
+                 VALUES ('fam-squatted-not-real', 'client-not-real', 'Client', 'squatted-label', 'operator', \
+                 'authorization_code', 'mcp', 'https://hub.example.com/mcp', 't0');
+             INSERT INTO oauth_tokens (token_hash, kind, family_id, client_id, subject, scope, resource, \
+                 issued_at, expires_at)
+                 VALUES ('{}', 'refresh', 'fam-squatted-not-real', 'client-not-real', 'squatted-label', 'mcp', \
+                 'https://hub.example.com/mcp', 't0', '9999-01-01T00:00:00Z');",
+            digest("oauth-refresh-not-real")
+        ),
+    );
+    let grant_live = |hub: &TestHub| {
+        text(
+            hub,
+            "SELECT CAST(COUNT(*) AS TEXT) FROM oauth_grants \
+             WHERE family_id = 'fam-squatted-not-real' AND revoked_at IS NULL",
+        ) == "1"
+    };
     // Without any_org a default operator's lifecycle action is refused.
     let resp = manage(&hub, "agent_retire", json!({ "agent": "squatted-label", "reason": "stale" })).await;
     assert_ne!(resp.status(), StatusCode::OK);
@@ -179,6 +203,16 @@ async fn a_stale_row_of_another_organization_blocks_writes_until_hub_recovery() 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["forgotten"], true, "{body}");
+    // Recovering organization B's row never revoked the default
+    // organization's OAuth grant for the same label text.
+    assert!(grant_live(&hub), "the default OAuth grant survives hub recovery of org B's row");
+    assert_eq!(
+        text(
+            &hub,
+            "SELECT CAST(COUNT(*) AS TEXT) FROM oauth_tokens WHERE family_id = 'fam-squatted-not-real' AND status = 'active'"
+        ),
+        "1"
+    );
     // The default credential records again.
     let resp = call(&hub, STATIC_TOKEN, "session_start", json!({ "kind": "interactive" })).await;
     assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
@@ -194,6 +228,8 @@ async fn a_stale_row_of_another_organization_blocks_writes_until_hub_recovery() 
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // Retiring the default organization's own row does revoke its grant.
+    assert!(!grant_live(&hub), "retiring the default row revokes its OAuth grant");
     let resp = manage(
         &hub,
         "agent_forget",

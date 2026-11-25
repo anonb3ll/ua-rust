@@ -1218,6 +1218,10 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
             // A reserved label whose stale row is in another organization
             // passes the check above, but the session's parent trigger and
             // the agents key would refuse it: say why, before any write.
+            // Case-insensitive on purpose, like the parent triggers: a
+            // case-variant row elsewhere would make the session insert fail
+            // in the trigger, though `touch_agent`'s exact-case upsert (keyed
+            // on the case-sensitive `agents.label`) would not itself conflict.
             let blocked = tx
                 .query_row(
                     "SELECT 1 FROM agents WHERE label = ?1 COLLATE NOCASE AND org_id != ?2 LIMIT 1",

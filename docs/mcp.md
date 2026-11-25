@@ -46,6 +46,11 @@ pieces make this work:
   name. Because the MCP servers' secrets are the default organization's,
   another organization's caller is refused (`org_unsupported`) by
   `mcp_gateway` `call` and live `list` on a server that injects secrets.
+  A stdio server runs as a process on the hub, the default organization's
+  host, so its `call` and live `list` are refused to another
+  organization's caller too, with or without secrets, before anything is
+  spawned. A static `list` and a Streamable HTTP server with no secret
+  are not refused.
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
   secret's organization, name and consumer as associated data, so a row
   copied into another organization or under another name or consumer does

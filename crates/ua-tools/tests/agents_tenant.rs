@@ -1344,8 +1344,9 @@ async fn forget_is_refused_while_the_agent_owns_a_node_in_service() {
     assert_eq!(out["forgotten"], true, "{out}");
 }
 
-/// Every workspace tool refuses another organization's caller before any
-/// filesystem access: the hub workspace is the default organization's.
+/// Every workspace, vault and Obsidian tool refuses another organization's
+/// caller before any filesystem access or plugin request: the hub workspace
+/// and the hub vault are the default organization's.
 #[tokio::test]
 async fn workspace_tools_refuse_another_organization_before_touching_the_filesystem() {
     let root = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -1354,20 +1355,76 @@ async fn workspace_tools_refuse_another_organization_before_touching_the_filesys
         let ws = dir.join("hub-workspace");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("hub-only-file-not-real.txt"), "x").unwrap();
-        *r2.lock().unwrap() = Some(ws.clone());
+        let vault = dir.join("hub-vault");
+        for d in ["Inbox", "Wiki", "Logs"] {
+            std::fs::create_dir_all(vault.join(d)).unwrap();
+        }
+        std::fs::write(vault.join("hub-note.md"), "hub-vault-secret-not-real [[Wiki/page]]\n").unwrap();
+        std::fs::write(vault.join("Wiki/page.md"), "hub-vault-secret-not-real\n").unwrap();
+        std::fs::write(vault.join("Inbox/capture.md"), "hub-vault-secret-not-real\n").unwrap();
+        std::fs::write(vault.join("Logs/2026-01-01.md"), "- 09:00 heron-agent: hub-vault-secret-not-real\n")
+            .unwrap();
+        *r2.lock().unwrap() = Some((ws.clone(), vault.clone()));
         cfg.workspace = Some(ws);
+        cfg.vault_path = Some(vault);
+        cfg.vault_write_dirs = vec!["Inbox".into(), "Wiki".into(), "Logs".into()];
+        // Nothing listens here: a request that got out would fail, not answer.
+        cfg.obsidian_api_url = Some("http://127.0.0.1:9".into());
+        cfg.obsidian_api_key = Some(secrecy::SecretString::from("fake-obsidian-key-not-real"));
     });
-    let ws = root.lock().unwrap().clone().unwrap();
+    let (ws, vault) = root.lock().unwrap().clone().unwrap();
     let b = agent(B_AGENT, ORG_B);
-    let listing = || {
-        let mut v: Vec<String> = std::fs::read_dir(&ws)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
+    let tree = |root: &Path| {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p.clone());
+                }
+                let body = if p.is_file() { std::fs::read_to_string(&p).unwrap() } else { String::new() };
+                out.push((p.strip_prefix(root).unwrap().to_string_lossy().into_owned(), body));
+            }
+        }
+        out.sort();
+        out
     };
+    let listing = || (tree(&ws), tree(&vault));
     let before = listing();
+    let ledger_before = h.snapshot();
+    for (tool, args) in [
+        ("vault_read", json!({ "path": "hub-note.md" })),
+        ("vault_write", json!({ "path": "Inbox/b-wrote-this-not-real.md", "content": "y" })),
+        ("vault_move", json!({ "source": "Inbox/capture.md", "destination": "Wiki/moved-not-real.md" })),
+        ("vault_list", json!({})),
+        ("vault_search", json!({ "pattern": "hub-vault-secret" })),
+        ("vault_links", json!({ "path": "hub-note.md" })),
+        ("vault_query", json!({ "query": "hub vault secret" })),
+        ("vault_journal", json!({ "entry": "b wrote this not real", "agent": B_AGENT })),
+        ("vault_briefing_digest", json!({})),
+        ("vault_ingest_status", json!({ "path": "Inbox/capture.md" })),
+        ("vault_archive_plan", json!({})),
+        ("vault_wiki_custodian", json!({})),
+        ("vault_to_memory_ingest", json!({})),
+        ("memory_promote", json!({ "id": "1" })),
+        ("obsidian_status", json!({})),
+        ("obsidian_open", json!({ "path": "hub-note.md" })),
+        ("obsidian_active_note", json!({})),
+        ("obsidian_search", json!({ "query": "hub-vault-secret" })),
+        ("obsidian_append", json!({ "path": "Inbox/capture.md", "content": "b appended not real" })),
+        ("export_journal", json!({ "write_to_vault": false })),
+    ] {
+        let e = h.call(&b, tool, args.clone()).await.unwrap_err();
+        assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e:?}");
+        assert!(!e.to_string().contains("hub-vault-secret"), "{tool}: {e:?}");
+    }
+    assert_eq!(listing(), before, "no vault note was read into an answer, written or moved");
+    assert_eq!(h.snapshot(), ledger_before, "nothing recorded");
+    // The default organization's caller still reads the vault.
+    let read = h.ok(&agent(A_AGENT, DEFAULT_ORG), "vault_read", json!({ "path": "hub-note.md" })).await;
+    assert!(read.to_string().contains("hub-vault-secret-not-real"), "{read}");
     for (tool, args) in [
         ("fs_list", json!({ "path": "." })),
         ("fs_read", json!({ "path": "hub-only-file-not-real.txt" })),

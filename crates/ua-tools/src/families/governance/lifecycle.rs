@@ -424,8 +424,9 @@ fn doing_claims(c: &Connection, org: &str, agent: &str) -> UaResult<Vec<(i64, St
     Ok(ids)
 }
 
-/// Revoke `agent`'s managed tokens (in its organization `org`), OAuth
-/// sign-ins and session credentials. Returns what was revoked.
+/// Revoke `agent`'s managed tokens and session credentials (in its
+/// organization `org`) and, for a default-organization agent only, its
+/// OAuth sign-ins. Returns what was revoked.
 fn revoke_credentials(
     tx: &mut WriteTx<'_>,
     org: &str,
@@ -446,12 +447,20 @@ fn revoke_credentials(
          WHERE org_id = ?3 AND agent_label = ?1 COLLATE NOCASE AND status = 'active'",
         params![agent, at, org],
     )?;
-    let families: Vec<String> = tx
-        .prepare(
+    // `oauth_grants` carries no organization: every grant is the default
+    // organization's (an OAuth subject is a configuration-reserved label).
+    // So only a default-organization row's grants are revoked; hub recovery
+    // (`any_org`) of another organization's row with the same label text
+    // never touches them. Revisit when `oauth_grants` gains an `org_id`.
+    let families: Vec<String> = if org == ua_core::DEFAULT_ORG {
+        tx.prepare(
             "SELECT family_id FROM oauth_grants WHERE subject = ?1 COLLATE NOCASE AND revoked_at IS NULL",
         )?
         .query_map([agent], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     let mut oauth_tokens = 0;
     for f in &families {
         oauth_tokens += tokens::revoke_family(tx, f, why)?;

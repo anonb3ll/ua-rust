@@ -895,3 +895,71 @@ async fn a_delegation_to_another_organization_s_agent_fails_closed() {
         "another organization's agent answers as a label no agent has registered"
     );
 }
+
+/// Two agents of one organization whose labels differ only in letter case
+/// (`agents.label` is case-sensitive): a delegation naming one exactly goes
+/// to it, and one naming neither exactly is refused as ambiguous
+/// (`agent_label_ambiguous`, as `agent_forget` refuses) rather than silently
+/// sent to one of them.
+#[tokio::test]
+async fn a_case_variant_delegation_target_is_exact_or_ambiguous() {
+    let h = H::new();
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    h.sql(
+        "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES
+             ('default', 'Builder-Case', 't0', 't0'),
+             ('default', 'builder-case', 't0', 't0');",
+    )
+    .unwrap();
+    let args = |to: &str| json!({ "task_spec": SPEC, "to_agent": to });
+    let before = (h.snapshot(), h.events());
+    // The raw registry call: `H::call` would register the target first.
+    let e = h.reg.call(&h.hub, &lead, "delegate", args("BUILDER-CASE")).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_label_ambiguous", "{e:?}");
+    assert_eq!((h.snapshot(), h.events()), before, "nothing created");
+    for exact in ["Builder-Case", "builder-case"] {
+        let v = h.reg.call(&h.hub, &lead, "delegate", args(exact)).await.unwrap();
+        let id = v["delegation_id"].as_i64().unwrap();
+        assert_eq!(
+            h.text(&format!("SELECT to_agent FROM delegations WHERE id = {id}")).as_deref(),
+            Some(exact)
+        );
+    }
+    // One case-insensitive match is still found and stored as registered.
+    h.sql("INSERT INTO agents (org_id, label, created_at, updated_at) VALUES ('default', 'Solo-Case', 't0', 't0');")
+        .unwrap();
+    let v = h.reg.call(&h.hub, &lead, "delegate", args("solo-CASE")).await.unwrap();
+    let id = v["delegation_id"].as_i64().unwrap();
+    assert_eq!(
+        h.text(&format!("SELECT to_agent FROM delegations WHERE id = {id}")).as_deref(),
+        Some("Solo-Case")
+    );
+}
+
+/// The receipt digest is over the target's registered spelling, so a retry
+/// with the same idempotency key that spells `to_agent` in other letter
+/// cases is the same request and replays; a different target is still a
+/// conflict.
+#[tokio::test]
+async fn a_retry_spelling_the_target_in_other_letter_cases_replays() {
+    let h = H::new();
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    h.sql(
+        "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES
+             ('default', 'builder-retry', 't0', 't0'),
+             ('default', 'other-target', 't0', 't0');",
+    )
+    .unwrap();
+    let args =
+        |to: &str| json!({ "task_spec": SPEC, "to_agent": to, "idempotency_key": "retry-key-not-real" });
+    let first = h.reg.call(&h.hub, &lead, "delegate", args("Builder-Retry")).await.unwrap();
+    let before = (h.snapshot(), h.events());
+    for spelling in ["BUILDER-RETRY", "builder-retry", "Builder-Retry"] {
+        let again = h.reg.call(&h.hub, &lead, "delegate", args(spelling)).await.unwrap();
+        assert_eq!(again, first, "{spelling}");
+    }
+    assert_eq!((h.snapshot(), h.events()), before, "a replay creates nothing");
+    let e = h.reg.call(&h.hub, &lead, "delegate", args("other-target")).await.unwrap_err();
+    assert_eq!(e.code(), "conflict", "{e:?}");
+    assert_eq!((h.snapshot(), h.events()), before);
+}
