@@ -318,7 +318,7 @@ fn release_output(file: &FileRevision, r: &Release, at: String, created: bool) -
 
 async fn release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult<Value> {
     require_file_caller(&ctx.caller)?;
-    let id = positive(a.revision_id, "revision_id")?;
+    positive(a.revision_id, "revision_id")?;
     destination_name(&a.destination)?;
     let db = ctx.hub.db().clone();
     let ctx2 = ctx.clone();
