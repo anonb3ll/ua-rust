@@ -95,6 +95,8 @@ enum Cmd {
     Init(ops::init::InitArgs),
     /// Run read-only health, security, permission, database, and ledger checks.
     Doctor(ops::doctor::DoctorArgs),
+    /// Manage evidence signing keys and checkpoint signatures.
+    Evidence(ops::evidence::EvidenceArgs),
     /// Take a verified, consistent SQLite snapshot of the hub database (safe while serving).
     Backup(ops::backup::BackupArgs),
     /// Verify and atomically restore a hub database snapshot (requires hub to be stopped).
@@ -661,6 +663,9 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                                 println!("revoked {n} token(s) for {label}");
                             }
                         },
+                        Cmd::Evidence(args) => {
+                            ops::evidence::run(&hub, args)?;
+                        }
                         Cmd::LoginLink { label } => {
                             // A login link signs a browser in as a human; same bar as acting
                             // as a human from the CLI.

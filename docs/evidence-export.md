@@ -317,3 +317,32 @@ shipping it would invite the wrong reading.
    operator-only. Receipts carry no signature of their own — the manifest
    carries their digests and the checkpoint signature covers it. This replaces
    the earlier single whole-hub assumption (review, 2026-11-22).
+
+
+## S2: the key store and checkpoint signing
+
+Implemented in `crates/ua-store/src/evidence.rs` and the `ua evidence` CLI.
+The hub never holds a private key: it writes a checkpoint row and its digest,
+and the operator signs that digest offline.
+
+- **Key store.** `evidence_key` holds public keys only — `key_id`, the
+  algorithm (`ed25519`), the 32-byte public key as hex, when it was added, and
+  an optional retirement time. A retired key still verifies old bundles; it
+  only stops new checkpoints naming it. There is no private-key column and no
+  path that would add one.
+- **Checkpoint rows.** `evidence_checkpoint` holds one row per checkpoint:
+  its class, the class's signed fields, the digest, the key id, and the
+  operator's signature once attached. A row is signed once; a second
+  signature is refused, so the row cannot hide which key attested it.
+- **The digest.** The signed value is the raw 32-byte SHA-256 of one canonical
+  JSON object holding exactly the class's fields with sorted keys and explicit
+  `null`s. The canonical encoding is the ledger's: `,`/`:` separators and
+  non-ASCII escaped as `\uXXXX`. The signature is Ed25519 over the raw digest
+  bytes, not over the hex text. A row whose stored fields no longer hash to
+  the stored digest is reported as a digest mismatch, never as a pass.
+- **The commands.** `ua evidence key-generate` writes a 0600 seed file on the
+  operator's machine and prints the public key; `key-add` and `key-retire`
+  maintain the store; `checkpoint` writes a row and prints its digest; `sign`
+  signs a digest offline with the seed file; `attach` stores the signature;
+  `verify` recomputes the digest and checks the signature. `verify` exits
+  non-zero unless the verdict is a valid signature.

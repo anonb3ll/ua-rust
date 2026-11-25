@@ -216,6 +216,10 @@ pub fn schema_parts() -> Vec<Part> {
     // After the node parts: the triggers read `nodes` and `node_dispatch`.
     parts.push(families::agents::TENANT_PART.into());
     parts.push(families::agents::ORG_SCOPE.into());
+    // The evidence key store and checkpoint table. Public keys only; the hub
+    // never holds a private key (docs/evidence-export.md, S2). Last, so its
+    // foreign key to `evidence_key` is the only order it needs.
+    parts.push(ua_store::evidence::KEY_STORE_PART.into());
     parts
 }
 

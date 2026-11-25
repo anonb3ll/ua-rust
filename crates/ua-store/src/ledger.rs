@@ -234,7 +234,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Event> {
 }
 
 /// Encode a string the way Python's `json.dumps` does with `ensure_ascii=True`.
-fn py_json_str(out: &mut String, s: &str) {
+pub(crate) fn py_json_str(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
         match ch {
