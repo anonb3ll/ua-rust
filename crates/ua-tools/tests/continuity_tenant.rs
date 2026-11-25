@@ -695,7 +695,7 @@ async fn organization_b_writes_land_in_organization_b() {
     assert_eq!(
         h.count(&format!(
             "SELECT COUNT(*) FROM notify_outbox WHERE org_id = 'org-b' AND category = 'review_ready' \
-             AND message LIKE '%#{tb} %'"
+             AND status = 'not_configured' AND message IS NULL"
         )),
         1
     );
