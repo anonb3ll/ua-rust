@@ -58,7 +58,7 @@ impl Kind {
         }
     }
 
-    /// The kind named `raw`. `file` is planned and refused until it is built.
+    /// Parse the kind for commit creation. File submissions have their own entry point.
     pub fn parse(raw: &str) -> UaResult<Kind> {
         match raw.trim() {
             "commit" => Ok(Kind::Commit),

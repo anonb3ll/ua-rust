@@ -553,7 +553,10 @@ mod file_releases {
         let foreign = Caller { org_id: "org-other".into(), ..builder() };
         assert_eq!(reason(&f.h.err(&foreign, "deliverable_release", args.clone()).await), "org_unsupported");
         let anon = Caller { kind: ActorKind::Anonymous, ..builder() };
-        assert_eq!(reason(&f.h.err(&anon, "deliverable_release", args.clone()).await), "unauthenticated");
+        assert_eq!(
+            reason(&f.h.err(&anon, "deliverable_release", args.clone()).await),
+            "anonymous_prod_action"
+        );
         assert_eq!(
             reason(
                 &f.h.err(
@@ -598,6 +601,8 @@ mod file_releases {
         assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE released_at IS NULL"), 1);
         assert!(!f.destination.join("report.txt").exists());
         assert_eq!(f.h.events("agent.deliverable.released").len(), 0);
+
+        fs::write(&f.source, b"changed after the approved bytes were recorded").unwrap();
 
         // Simulate a crash after the filesystem link but before the SQL commit.
         let stage_id: String =

@@ -99,8 +99,9 @@ operator-managed.
 
 For an interrupted release, retry the same call as the original requester.
 A saved intent allows the hub to resume from the approved bytes even if the
-source later changes. The staged inode identifies a publication whose
-completion transaction did not commit. An unrelated existing destination
+source later changes. The task review, ownership and configured directory
+must still match the release intent. The staged inode identifies a
+publication whose completion transaction did not commit. An unrelated existing destination
 is refused, even when its bytes have the same hash. The approval is consumed
 once, the release is ledgered once, and retries of a completed release verify
 the published bytes before returning its receipt.
