@@ -12,6 +12,46 @@ from its commit history.
 
 ### Added
 
+- GitHub webhooks per organization: `POST /api/github/webhook/{org}` (the
+  organization's id) checks a delivery against that organization's own
+  webhook secret only, and handles it for that organization only. The bare
+  `POST /api/github/webhook` stays the default organization's route (also
+  reachable as `/api/github/webhook/default`) and checks only
+  `github_webhook_secret_env`. Configure each organization's GitHub webhook
+  with its own URL (`docs/github.md#security-model`).
+- `github_webhook_max_in_flight` (default 16, clamped to 1-256): one cap on
+  deliveries being read or handled across both webhook routes. Over it a
+  delivery waits up to `github_webhook_busy_wait_ms` (default 2000) for a
+  slot, then is answered 429 `busy` with `Retry-After: 1` before its body
+  is read, and nothing is recorded. A delivery holding a slot must send its
+  whole body within `github_webhook_read_timeout_ms` (default 10000) or is
+  answered 408 `timeout` and its slot freed, so senders that declare a body
+  and never send it cannot hold the cap. GitHub does not redeliver a
+  refused delivery on its own: enable the poller as a backstop and
+  redeliver by hand (`docs/github.md#security-model`).
+- Webhook routes whose secret another route shares are refused (fail
+  closed). At startup and after every webhook-secret change the hub
+  compares the hub configuration's secret with every organization's stored
+  one (by keyed fingerprint under each row's key) and the stored ones with
+  each other; every matching route, the bare route included, answers
+  401 `bad_signature` until each has its own secret. The hub logs an error
+  naming the organizations, and `system_doctor` counts the refused routes.
+  Only the serving hub runs the check. If it fails (a database error),
+  every route is refused while the hub retries it in the background with
+  a backoff capped at one minute, until one succeeds.
+- Every webhook refusal takes the same steps: one database read with the
+  same query for any organization id, one AES-GCM decryption (a dummy one
+  when there is nothing to decrypt) and one MAC. Equal work, not constant
+  time: SQLite's time to find or miss a row is not equalised.
+- `github_credential_set` kind `webhook_secret` refuses a value that another
+  organization already stores, or (outside the default organization) the
+  hub's `github_webhook_secret_env` value: 409 `webhook_secret_in_use`,
+  naming no organization. Compared by keyed fingerprint under each stored
+  row's own key, never by plaintext, after the approval gate (a
+  replacement answers nothing before its approval), and each refusal is
+  ledgered as `github.credential.refused` with the attempted value's keyed
+  fingerprint only. Set and clear still refuse every caller until
+  memberships exist, so this waits for that path.
 - Workspace crates `ua-core`, `ua-store`, `ua-tools`, `ua-server`, `ua-cli` and
   `ua-import`.
 - Crate `ua-ingress` (`docs/ingress.md`): one address classifier
@@ -867,6 +907,31 @@ from its commit history.
   **Upgrade note:** a workflow that delegated to an agent before it first
   connected must have the agent connect (heartbeat or `session_start`)
   first. Delegations already created are unchanged.
+- GitHub webhook multi-match is removed. A delivery belongs to the one
+  organization its route names, not to every organization whose secret
+  verifies it, and the aggregate answer (`{"ok", "matched", "statuses"}`)
+  is gone: another organization's route answers `{"ok": true}` on success.
+  The bare route no longer tries other organizations' secrets, and
+  `503 not_configured` is gone: a route with no secret answers the same
+  401 `bad_signature` as a wrong signature (the hub logs, at most every
+  five minutes, when the default organization's secret is unset).
+  **Migration note:** a deployment where another organization's GitHub
+  webhook pointed at the bare `/api/github/webhook` must repoint it to
+  `/api/github/webhook/<org id>`; until then its deliveries are refused
+  (401), and GitHub does not redeliver them on its own. After repointing,
+  redeliver each refused delivery by hand from the hook's "Recent
+  Deliveries" page within `github_webhook_max_age_hours` (older ones are
+  refused as `stale`), or let the poller catch up merged pull requests. A
+  deployment where two organizations shared one webhook secret
+  (multi-match) must give each its own secret and its own URL: the shared
+  delivery now reaches only the routed organization, storing the shared
+  value again for a second organization is refused, and the hub refuses
+  every route of a shared secret it finds at startup until each has its
+  own.
+- An internal failure on the default organization's webhook route answers
+  500 with a fixed message, as every other route does, never the error's
+  text (the hub's log has it). An organization id that is not UTF-8 gets
+  the uniform 401 `bad_signature`, not a 400.
 - `managed_secret_set` refuses the names `github:token` and
   `github:webhook-secret` and consumers of kind `github`
   (`reserved_secret`). **Upgrade note:** a secret already stored under one
@@ -1216,6 +1281,14 @@ from its commit history.
 
 ### Security
 
+- The unauthenticated GitHub webhook costs one secret check per delivery:
+  it loads and decrypts only the routed organization's secret and computes
+  one MAC (over a fixed dummy key when there is no secret), instead of one
+  decrypt and one MAC over up to 5 MiB per organization. An unknown,
+  malformed or suspended organization, one with no secret, an unusable
+  stored secret and a bad signature all get one byte-identical answer, so
+  the route no longer reveals whether any organization has a secret. Both
+  webhook routes share an in-flight cap (`github_webhook_max_in_flight`).
 - Ledger event visibility: `agent.message.*`, `agent.mailbox.*` (inbox
   read/ack receipts), `agent.lifecycle.handoff` and
   `agent.conversation.handoff` rows are now visible only to the readers the

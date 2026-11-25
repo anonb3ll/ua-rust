@@ -934,8 +934,10 @@ async fn the_github_webhook_authenticates_by_signature_and_refuses_replays() {
     let resp = hub.send(post_json("/api/tools/task_list", &json!({}), &[])).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // Without a configured secret the endpoint refuses everything.
+    // Without a configured secret the endpoint refuses everything, with the
+    // same answer as a bad signature.
     let hub2 = TestHub::new(stream_config());
     let resp = hub2.send(webhook(&payload, "delivery-2", "pull_request", WEBHOOK_SECRET)).await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(resp).await["error"], "bad_signature");
 }

@@ -227,8 +227,9 @@ fn is_public_path(path: &str) -> bool {
         || path_is(path, "/oauth")
         || path_is(path, "/login")
         || path == "/logout"
-        // GitHub signs its deliveries instead (see `github_api`).
-        || path == crate::github_api::WEBHOOK_PATH
+        // GitHub signs its deliveries instead (see `github_api`): the default
+        // organization's route and each organization's one segment below it.
+        || crate::github_api::is_webhook_path(path)
         // Slack signs its requests too (see `slack_api`); 404 unless mounted.
         || crate::slack_api::is_slack_path(path)
 }

@@ -86,7 +86,7 @@ pub fn router(state: AppState, ct: CancellationToken) -> Router {
         .merge(oauth::routes())
         .merge(login::routes())
         .merge(compat_api::routes())
-        .merge(github_api::routes())
+        .merge(github_api::routes(state.hub.cfg()))
         .merge(node_api::routes())
         .merge(platform_api::routes())
         .merge(slack_api::routes(state.hub.cfg()))
