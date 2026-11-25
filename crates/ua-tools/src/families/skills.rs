@@ -83,12 +83,17 @@ struct Skill {
     dir: PathBuf,
     /// `SKILL.md` path shown in findings.
     relpath: String,
+    raw_text: String,
     meta: Map<String, Value>,
     meta_error: Option<String>,
     body: String,
     /// 1-based line where the body begins.
     body_start: usize,
     fm_lines: Vec<String>,
+    /// When `Some`, support-file links are checked against this in-memory
+    /// member set rather than the filesystem (used by Git skill imports, which
+    /// never check out a working tree).
+    member_paths: Option<BTreeSet<String>>,
 }
 
 impl Skill {
@@ -104,18 +109,33 @@ impl Skill {
     fn meta_line(&self, key: &str) -> Option<usize> {
         self.fm_lines.iter().position(|l| l.starts_with(&format!("{key}:"))).map(|i| i + 2)
     }
+
+    fn has_support_file(&self, target: &str) -> bool {
+        if let Some(paths) = &self.member_paths {
+            let norm = target.trim_start_matches("./").trim_end_matches('/');
+            paths.contains(norm) || paths.iter().any(|p| p.starts_with(&format!("{norm}/")))
+        } else {
+            self.dir.join(target).exists()
+        }
+    }
 }
 
-fn parse_skill(dir: &Path, relpath: String) -> Skill {
-    let text = read_text_lossy(&dir.join("SKILL.md")).unwrap_or_default();
+fn parse_skill_text(
+    dir: PathBuf,
+    relpath: String,
+    text: String,
+    member_paths: Option<BTreeSet<String>>,
+) -> Skill {
     let mut skill = Skill {
-        dir: dir.to_path_buf(),
+        dir,
         relpath,
+        raw_text: text.clone(),
         meta: Map::new(),
         meta_error: None,
         body: String::new(),
         body_start: 1,
         fm_lines: Vec::new(),
+        member_paths,
     };
     let Some(rest) = text.strip_prefix("---\n") else {
         skill.meta_error = Some("file does not start with a `---` YAML frontmatter block".into());
@@ -137,6 +157,11 @@ fn parse_skill(dir: &Path, relpath: String) -> Skill {
         Ok(_) => skill.meta_error = Some("frontmatter is not a YAML mapping".into()),
     }
     skill
+}
+
+fn parse_skill(dir: &Path, relpath: String) -> Skill {
+    let text = read_text_lossy(&dir.join("SKILL.md")).unwrap_or_default();
+    parse_skill_text(dir.to_path_buf(), relpath, text, None)
 }
 
 fn finding(
@@ -398,6 +423,30 @@ fn check_security(skill: &Skill, out: &mut Vec<Finding>) {
             "remove it; text a reviewer cannot see must not reach an agent",
         ));
     }
+    // Refuse ESC (U+001B, terminal escape injection) and CR (U+000D, line
+    // overwrite in terminal/approval diffs) in SKILL.md.
+    let mut ctrl_hits = 0usize;
+    for (idx, raw_line) in skill.raw_text.split('\n').enumerate() {
+        for c in raw_line.chars() {
+            if c == '\x1b' || c == '\r' {
+                out.push(finding(
+                    skill,
+                    "SKILL-HIDDEN-TEXT",
+                    "high",
+                    Some(idx + 1),
+                    format!("disallowed control code point U+{:04X} in SKILL.md", c as u32),
+                    "remove ESC/CR control characters and use plain LF line endings",
+                ));
+                ctrl_hits += 1;
+                if ctrl_hits >= 10 {
+                    break;
+                }
+            }
+        }
+        if ctrl_hits >= 10 {
+            break;
+        }
+    }
 }
 
 fn check_body(skill: &Skill, out: &mut Vec<Finding>) {
@@ -442,7 +491,7 @@ fn check_body(skill: &Skill, out: &mut Vec<Finding>) {
             if rx().scheme.is_match(target) || target.starts_with('/') {
                 continue; // URL, mailto: or absolute path: not a support file
             }
-            if !skill.dir.join(target).exists() {
+            if !skill.has_support_file(target) {
                 out.push(finding(
                     skill,
                     "SKILL-BROKEN-REF",
@@ -592,6 +641,52 @@ pub(crate) fn review_dirs(skill_dirs: Vec<PathBuf>, base: &Path, min_severity: &
         "summary": summary,
         "findings": findings.iter().filter(|f| severity_rank(f.severity) <= cutoff).map(Finding::to_json).collect::<Vec<_>>(),
         "truncated": truncated,
+    })
+}
+
+/// Review a single skill package in memory without touching disk (used by Git
+/// skill source imports, which never materialize a working tree).
+pub(crate) fn review_in_memory(
+    dir_name: &str,
+    skill_md: &str,
+    member_paths: &BTreeSet<String>,
+    min_severity: &str,
+) -> Value {
+    let skill = parse_skill_text(
+        PathBuf::from(dir_name),
+        "SKILL.md".into(),
+        skill_md.to_string(),
+        Some(member_paths.clone()),
+    );
+    let mut findings = Vec::new();
+    check_frontmatter(&skill, &mut findings);
+    check_name(&skill, &mut findings);
+    check_description(&skill, &mut findings);
+    check_body(&skill, &mut findings);
+    check_security(&skill, &mut findings);
+    findings.sort_by(|a, b| {
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.unwrap_or(0).cmp(&b.line.unwrap_or(0)))
+    });
+    let count = |sev: &str| findings.iter().filter(|f| f.severity == sev).count();
+    let summary: Map<String, Value> = SEVERITIES.iter().map(|s| (s.to_string(), json!(count(s)))).collect();
+    let status = if count("high") > 0 {
+        "fail"
+    } else if count("medium") > 0 {
+        "warn"
+    } else {
+        "pass"
+    };
+    let cutoff = severity_rank(min_severity);
+    json!({
+        "root": dir_name,
+        "skills_reviewed": [dir_name],
+        "status": status,
+        "summary": summary,
+        "findings": findings.iter().filter(|f| severity_rank(f.severity) <= cutoff).map(Finding::to_json).collect::<Vec<_>>(),
+        "truncated": false,
     })
 }
 

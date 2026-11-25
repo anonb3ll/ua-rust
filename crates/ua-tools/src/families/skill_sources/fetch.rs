@@ -45,7 +45,7 @@ use url::{Host, Url};
 
 pub const MAX_URL_BYTES: usize = 512;
 pub const MAX_REF_BYTES: usize = 200;
-pub const MAX_SUBPATH_BYTES: usize = 240;
+pub const MAX_SUBPATH_BYTES: usize = 512;
 pub const MAX_ALLOWED_SUBPATHS: usize = 32;
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -311,6 +311,9 @@ pub fn validate_tracking_ref(raw: &str) -> UaResult<String> {
 }
 
 /// Validate and canonically sort optional allowed repository-relative subpath prefixes.
+/// Leading-dot repo directories (such as `.claude/skills`) are permitted as
+/// repo-relative prefixes; `.`, `..`, `.git`, backslashes, colons, control
+/// characters, and hidden/bidi Unicode code points are refused.
 pub fn validate_allowed_subpaths(raw: Option<Vec<String>>) -> UaResult<Vec<String>> {
     let Some(list) = raw else {
         return Ok(Vec::new());
@@ -327,12 +330,12 @@ pub fn validate_allowed_subpaths(raw: Option<Vec<String>>) -> UaResult<Vec<Strin
             || trimmed.len() > MAX_SUBPATH_BYTES
             || trimmed.contains('\\')
             || trimmed.contains(':')
-            || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || trimmed.chars().any(|c| c.is_control() || crate::families::skills::hidden_char(c))
         {
             return Err(UaError::invalid(format!("unsafe allowed_subpaths entry {entry:?}")));
         }
         for part in trimmed.split('/') {
-            if part.is_empty() || part == "." || part == ".." || part.starts_with('.') {
+            if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git") {
                 return Err(UaError::invalid(format!("unsafe allowed_subpaths entry {entry:?}")));
             }
         }
@@ -480,6 +483,11 @@ impl FetchOptions {
     pub fn for_local_file_test() -> Self {
         Self { allow_file_urls: true, ..Self::production() }
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn is_file_allowed(&self) -> bool {
+        self.allow_file_urls
+    }
 }
 
 /// Exact program, argv, and scrubbed environment built for one `git` invocation.
@@ -605,7 +613,7 @@ where
 
 // --- bare cache & locked execution -------------------------------------------------
 
-fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+pub(crate) fn hex_prefix(bytes: &[u8], chars: usize) -> String {
     let full = hex::encode(Sha256::digest(bytes));
     full[..chars.min(full.len())].to_string()
 }
@@ -626,7 +634,7 @@ fn cache_mutex(path: &Path) -> Arc<Mutex<()>> {
     guard.entry(path.to_path_buf()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResult<T> {
+pub(crate) fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResult<T> {
     let parent = cache.parent().ok_or_else(|| UaError::internal("invalid cache path"))?;
     fs::create_dir_all(parent)
         .map_err(|e| UaError::internal(format!("could not create skill_sources cache dir: {e}")))?;
@@ -664,7 +672,7 @@ fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResu
     res
 }
 
-fn dir_size_bytes(root: &Path) -> u64 {
+pub(crate) fn dir_size_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -838,7 +846,7 @@ pub fn build_fetch_command(
     )
 }
 
-fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
+pub(crate) fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
     if cache.join("HEAD").is_file() {
         return Ok(());
     }
@@ -855,7 +863,7 @@ fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
     Ok(())
 }
 
-fn commit_present(cache: &Path, sha: &str, opts: &FetchOptions) -> bool {
+pub(crate) fn commit_present(cache: &Path, sha: &str, opts: &FetchOptions) -> bool {
     let target = format!("{sha}^{{commit}}");
     let Ok(spec) = build_git_command(Some(cache), None, None, &["cat-file", "-e", &target], opts) else {
         return false;
