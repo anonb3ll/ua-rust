@@ -1,6 +1,7 @@
 # Graph store
 
-Status: **design, not implemented.** Scope: track C, slice C0 (#2717). This
+Status: **design, not implemented** (C1 gate: independent review + benchmark
+floor + CI/Cloud Build green). Scope: track C, slice C0 (#2717). This
 document is the review gate for the shared graph store before any code lands.
 Its companions are [organization.md](organization.md), [memory.md](memory.md),
 [deliverables.md](deliverables.md), and [evidence-export.md](evidence-export.md).
@@ -59,6 +60,11 @@ hashes (`skill_versions`, `deliverable_revisions`), and normalized entity keys,
 while letting display labels change (for example an agent rename or a vault note
 move) without rewriting edges.
 
+**`display_label` rule:** `graph_nodes.display_label` is display-only metadata
+— it is **never an identity**, **never a join key**, and **never written to the
+default ledger for another organization** (redacted to `null` under
+`ORG-EVENT-DEFAULT`, matching `external_id` and `meta_json`).
+
 ### Node kinds
 
 `graph_nodes.kind` is a closed, versioned set enforced by a SQLite `CHECK`
@@ -96,7 +102,7 @@ remain enforceable.
 | `delegated_to` | `task → agent` | Directed | M:N | One active primary per delegation | Lineage / topical | `delegation` |
 | `executes` | `run → task \| plan` | Directed | N:1 | One live target per run | Lineage | `dispatch` / `workflows` / `sessions` |
 | `executed_by` | `run → agent \| person` | Directed | N:1 | One actor per run | Lineage | `dispatch` / `workflows` / `sessions` |
-| `produces` | `run \| task → deliverable` | Directed | M:N | 1 commit deliverable per task | Lineage | `deliverables` |
+| `produces` | `run \| task → deliverable` | Directed | M:N | — (deliverable uniqueness stays in `ua-deliverables`) | Lineage | `deliverables` |
 | `uses_skill` | `agent \| run → skill` | Directed | M:N | — | Lineage / topical | `skill_registry` / `dispatch` |
 | `reviewed_by` | `deliverable → agent \| person` | Directed | M:N | Self-review refused by domain layer | Lineage | `continuity` / review gate |
 | `approved_by` | `deliverable \| run → person` | Directed | M:N | Verified human; cites `approval` / event seq | Lineage | `approvals` / `policy_authorizations` |
@@ -105,7 +111,7 @@ remain enforceable.
 | `reviews` | `agent → agent` | Directed | M:N | No self-loop | Topical | `ua-org` (`team_specs` projection) |
 | `escalates_to` | `agent → agent \| person` | Directed | M:N | Acyclic, no self-loop | Topical | `ua-org` (`team_specs` projection) |
 | `can_observe` | `agent → agent` | Directed | M:N | No self-loop | Topical | `ua-org` (`team_specs` projection) |
-| `mentions` | `memory_note \| vault_note → memory_entity` | Directed | M:N | Max 64 live entities per `memory_note` | Topical | `ua-memory` / vault ingest |
+| `mentions` | `memory_note \| vault_note → memory_entity` | Directed | M:N | Max 64 live entities per `memory_note`; domain-owned only (never generic) | Topical | `ua-memory` / vault ingest |
 | `links_to` | `vault_note → vault_note` | Directed (`[[wikilink]]`; walked undirected in PPR) | M:N | No self-loop | Topical | `vault` ingest / governed tool |
 | `promoted_from` | `vault_note ↔ memory_note` | Directed (derived → source) | M:N | No self-loop | Lineage | `vault` (`promote` / `ingest`) |
 | `supersedes` | `memory_note → memory_note` | Directed (newer → older) | M:N | No self-loop | Lineage | `ua-memory` (`memory.superseded_by`) |
@@ -117,37 +123,57 @@ remain enforceable.
 Cardinality constraints marked `N:1` are enforced in SQLite by a partial unique
 index over live rows (`WHERE valid_to IS NULL`). Acyclicity constraints
 (`depends_on`, `subtask_of`, `goal_parent`, `delegates_to`, `escalates_to`) are
-enforced in the write transaction before insert by a bounded reachability check
-within `org_id` (the same check `dependency_add` runs today).
+enforced inside the write transaction before insert by a **hard-bounded
+reachability check** within `org_id` over live edges of the same kind:
+
+- **Hard write-time cycle-check bounds:** at most `CYCLE_CHECK_MAX_NODES = 1,000`
+  visited nodes, `CYCLE_CHECK_MAX_EDGES = 5,000` visited edges, and a
+  `CYCLE_CHECK_DEADLINE_MS = 50` ms wall-clock budget.
+- **Fail-closed on bound hit:** if the check detects a path from `dst_id` back
+  to `src_id`, or hits any of the three bounds before exhausting reachable nodes,
+  the write is refused with `invalid_argument` (never guessed or allowed
+  unverified). Because this runs inside the write transaction, the bound keeps
+  every insert strictly sub-linear in total graph size and prevents quadratic
+  blowup on pathological chains.
 
 ## Provenance and temporal validity
 
-### Edge provenance
+### Node and edge provenance
 
-Every row in `graph_edges` carries mandatory, immutable provenance columns:
+Every row in both `graph_nodes` and `graph_edges` carries mandatory, immutable
+provenance columns (protected by the `graph_nodes_identity_immutable` and
+`graph_edges_provenance_immutable` triggers):
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `asserted_by` | `TEXT NOT NULL` | **Immutable principal ID** of the actor that asserted the edge (stable agent ID, node ID, or user ID — never a mutable display label). `'system'` is used only for hub-internal deterministic projections (schema backfills, mirrors). |
-| `asserted_by_kind` | `TEXT NOT NULL` | One of `'agent'`, `'person'`, `'node'`, `'system'`. |
-| `asserted_at` | `TEXT NOT NULL` | RFC 3339 UTC timestamp (`+00:00`) when the hub recorded the assertion. |
-| `source_kind` | `TEXT NOT NULL` | One of `'tool'`, `'event'`, `'mirror'`, `'import'`. |
-| `source_ref` | `TEXT NOT NULL` | Concrete source identifier: `event:<seq>` (preferred when recorded in the same write transaction), `tool:<tool_name>:<call_id>`, `mirror:<table>:<pk>`, or `import:<source_hash>`. |
-| `assertion_scope` | `TEXT NOT NULL DEFAULT ''` | Optional scope distinguishing independent assertions of the same `(src_id, dst_id, kind)` — for example `note:<note_id>` when multiple memory notes independently assert the same topical link so the edge stays live until every asserting note retires ([memory.md](memory.md) §4). Empty string `''` for structural edges. |
+| Column | Tables | Type | Meaning |
+| --- | --- | --- | --- |
+| `asserted_by` | `graph_nodes`, `graph_edges` | `TEXT NOT NULL` | **Principal ID** of the actor that created the node or asserted the edge (stable agent ID, node ID, or user ID — never a note ID or overloaded scope). `'system'` is used only for hub-internal deterministic projections (schema backfills, mirrors). |
+| `asserted_by_kind` | `graph_nodes`, `graph_edges` | `TEXT NOT NULL` | One of `'agent'`, `'person'`, `'node'`, `'system'`. |
+| `asserted_at` | `graph_edges` (`created_at` on `graph_nodes`) | `TEXT NOT NULL` | RFC 3339 UTC timestamp (`+00:00`) when the hub recorded the row. |
+| `source_kind` | `graph_nodes`, `graph_edges` | `TEXT NOT NULL` | One of `'tool'`, `'event'`, `'mirror'`, `'import'`. |
+| `source_ref` | `graph_nodes`, `graph_edges` | `TEXT NOT NULL` | Concrete source identifier: `event:<seq>` (preferred when recorded in the same write transaction), `tool:<tool_name>:<call_id>`, `mirror:<table>:<pk>`, or `import:<source_hash>`. |
+| `assertion_scope` | `graph_edges` | `TEXT NOT NULL DEFAULT ''` | Optional scope distinguishing independent assertions of the same `(src_id, dst_id, kind)` — for example `note:<note_id>` when multiple memory notes independently assert the same topical link so the edge stays live until every asserting note retires ([memory.md](memory.md) §4). Empty string `''` for structural edges. |
 
-**Identity transition.** Immutable agent and node IDs land under the
-organization-local identity track (hub #2790, gated on the #2794 identity
-contract). C1 represents `asserted_by` through a dedicated `PrincipalId` type
-in `ua-graph` rather than raw label strings, so once `Caller` carries stable
-principal IDs, `ua-graph` records them directly with no schema change. If C1
-ships ahead of #2790, a single-org `'default'` transition rule is explicitly
-tracked in [Open questions](#open-questions) (#2) so mutable labels never leak
-into multi-org rows.
+**Identity transition (ruling 2, pre-#2790):** `asserted_by` means **only** the
+asserting principal (note-level assertion scope always lives in
+`assertion_scope`). Immutable agent and node IDs land under hub #2790 (gated on
+the #2794 identity contract). C1 ships with an opaque, validated `PrincipalId`
+wrapper without blocking on #2790, under two strict rules:
 
-**Ledger linkage.** Every edge assertion and retraction appends an
-`agent.graph.edge_asserted` or `agent.graph.edge_retracted` event to `event_log`
-in the same write transaction, and records `source_kind = 'event'`,
-`source_ref = 'event:<seq>'` (or the enclosing domain event's `seq` for mirrored
+1. **Default organization (`org_id = 'default'`) before #2790:** `asserted_by`
+   stores a **provisional** value (the verified caller label, marked explicitly
+   in the `graph.v1` DDL below) that **#2790's migration backfills** to stable
+   principal IDs. Later readers must not treat pre-#2790 `'default'` values as
+   permanent identities until that backfill completes.
+2. **Non-default organizations (`org_id != 'default'`) before #2790:** any
+   `asserted_by` write (node creation or edge assertion) for an organization
+   other than `'default'` is **refused** until #2790 supplies immutable
+   principal IDs, so mutable labels never enter multi-org rows.
+
+**Ledger linkage.** Every node creation and edge assertion/retraction appends an
+`agent.graph.node_created`, `agent.graph.edge_asserted`, or
+`agent.graph.edge_retracted` event to `event_log` in the same write transaction,
+and records `source_kind = 'event'`, `source_ref = 'event:<seq>'` (or
+`source_kind = 'mirror'` with the enclosing domain event's `seq` for mirrored
 domain writes).
 
 ### Validity and `as_of` reads
@@ -185,18 +211,25 @@ The same predicate applies to every hop of a traversal (`neighbors`, `k_hop`,
 is excluded from all standard traversals unless a caller explicitly requests
 proposed edges (for example the contradiction workbench).
 
-**Lineage vs topical edges.** Following [memory.md](memory.md) §4, topical
-retirement (superseding, invalidating, or narrowing an asserting note) sets
-`valid_to` only on **topical** edges (`extends`, `mentions`, accepted
-`contradicts`, `links_to`, etc.). **Lineage** edges (`supersedes`, `derives`,
-`evidence`, `produces`, `executes`, `executed_by`, `approved_by`,
-`governed_by`, `promoted_from`) are never closed by topical retirement, keeping
-audit and provenance traces walkable.
+**Lineage vs topical edges and the mirror-close carve-out (ruling 3).**
+Following [memory.md](memory.md) §4, topical retirement (superseding,
+invalidating, or narrowing an asserting note) sets `valid_to` only on
+**topical** edges (`extends`, `mentions`, accepted `contradicts`, `links_to`,
+etc.). **Lineage** edges (`supersedes`, `derives`, `evidence`, `produces`,
+`executes`, `executed_by`, `approved_by`, `governed_by`, `promoted_from`) are
+never closed by topical retirement, keeping audit and provenance traces
+walkable.
 
-Re-asserting a previously closed edge inserts a new row with a new ULID,
-`valid_from`, and provenance; the partial unique index (`WHERE valid_to IS NULL`)
-permits historical rows while guaranteeing at most one currently live row per
-`(org_id, src_id, dst_id, kind, assertion_scope)`.
+**Mirror-close carve-out:** an authoritative domain column change that
+invalidates a mirrored edge (for example `memory_restore` clearing
+`memory.superseded_by`) is **not** topical retirement — it closes the mirrored
+edge (`source_kind = 'mirror'`, or the enclosing domain event `seq`) by
+stamping `valid_to = now` (never `DELETE`), keeping the mirror synchronized
+with its authoritative table while preserving `as_of` history. If the
+authoritative column is later re-set, re-mirroring inserts a **new** edge row
+with a new ULID, `valid_from`, and provenance; the partial unique index
+(`WHERE valid_to IS NULL`) permits historical rows while guaranteeing at most
+one currently live row per `(org_id, src_id, dst_id, kind, assertion_scope)`.
 
 ## Tenant isolation (`org_id` scoping)
 
@@ -353,25 +386,35 @@ to operate over `graph_edges`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS graph_nodes (
-    id            TEXT PRIMARY KEY,
-    org_id        TEXT NOT NULL,
-    kind          TEXT NOT NULL CHECK (kind IN (
-                      'agent','person','skill','memory_note','memory_entity',
-                      'task','goal','plan','run','deliverable','vault_note',
-                      'approval','policy_revision'
-                  )),
-    external_id   TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 256),
-    display_label TEXT CHECK (display_label IS NULL OR length(display_label) <= 256),
-    visibility    TEXT NOT NULL DEFAULT 'org'
-                  CHECK (visibility IN ('private','team','org')),
-    team_id       TEXT,
-    owner_type    TEXT CHECK (owner_type IS NULL OR owner_type IN ('human','agent','org')),
-    owner_id      TEXT,
-    meta_json     TEXT NOT NULL DEFAULT '{}'
-                  CHECK (json_valid(meta_json) AND length(meta_json) <= 8192),
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL,
-    archived_at   TEXT,
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN (
+                         'agent','person','skill','memory_note','memory_entity',
+                         'task','goal','plan','run','deliverable','vault_note',
+                         'approval','policy_revision'
+                     )),
+    external_id      TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 256),
+    -- Display-only metadata: never an identity, never a join key, and never
+    -- written to the default ledger for non-default organizations.
+    display_label    TEXT CHECK (display_label IS NULL OR length(display_label) <= 256),
+    visibility       TEXT NOT NULL DEFAULT 'org'
+                     CHECK (visibility IN ('private','team','org')),
+    team_id          TEXT,
+    owner_type       TEXT CHECK (owner_type IS NULL OR owner_type IN ('human','agent','org')),
+    owner_id         TEXT,
+    -- Immutable node provenance (symmetric with graph_edges).
+    -- PROVISIONAL PRE-#2790: for org_id = 'default', asserted_by carries the
+    -- verified caller label until #2790 lands and backfills stable principal
+    -- IDs. Non-default org asserted_by writes are refused until #2790 lands.
+    asserted_by      TEXT NOT NULL CHECK (length(asserted_by) BETWEEN 1 AND 128),
+    asserted_by_kind TEXT NOT NULL CHECK (asserted_by_kind IN ('agent','person','node','system')),
+    source_kind      TEXT NOT NULL CHECK (source_kind IN ('tool','event','mirror','import')),
+    source_ref       TEXT NOT NULL CHECK (length(source_ref) BETWEEN 1 AND 256),
+    meta_json        TEXT NOT NULL DEFAULT '{}'
+                     CHECK (json_valid(meta_json) AND length(meta_json) <= 8192),
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    archived_at      TEXT,
     UNIQUE (org_id, kind, external_id),
     UNIQUE (org_id, id),
     CHECK (visibility != 'team' OR team_id IS NOT NULL),
@@ -381,11 +424,14 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_org_kind_vis
     ON graph_nodes (org_id, kind, visibility, team_id, owner_id)
     WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_source
+    ON graph_nodes (org_id, source_kind, source_ref);
 
 CREATE TRIGGER IF NOT EXISTS graph_nodes_identity_immutable
-BEFORE UPDATE OF kind, external_id, created_at ON graph_nodes
+BEFORE UPDATE OF kind, external_id, asserted_by, asserted_by_kind,
+                 source_kind, source_ref, created_at ON graph_nodes
 BEGIN
-    SELECT RAISE(ABORT, 'graph node kind, external_id and created_at are immutable');
+    SELECT RAISE(ABORT, 'graph node identity and provenance are immutable');
 END;
 
 CREATE TRIGGER IF NOT EXISTS graph_nodes_no_delete
@@ -411,6 +457,10 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     state            TEXT NOT NULL DEFAULT 'active'
                      CHECK (state IN ('active','proposed')),
     weight           REAL NOT NULL DEFAULT 1.0 CHECK (weight > 0.0 AND weight <= 1000.0),
+    -- PROVISIONAL PRE-#2790: principal ID only (note scope lives in
+    -- assertion_scope). For org_id = 'default', asserted_by carries the
+    -- verified caller label until #2790 lands and backfills stable principal
+    -- IDs. Non-default org asserted_by writes are refused until #2790 lands.
     asserted_by      TEXT NOT NULL CHECK (length(asserted_by) BETWEEN 1 AND 128),
     asserted_by_kind TEXT NOT NULL CHECK (asserted_by_kind IN ('agent','person','node','system')),
     asserted_at      TEXT NOT NULL,
@@ -492,13 +542,21 @@ END;
 
 ### Repository trait and second-backend mapping
 
-Following `OrgRepo` ([organization.md](organization.md)) and `MemoryRepo`
-([memory.md](memory.md)), storage access sits behind a synchronous `GraphRepo`
-trait exposing plain Rust domain types (zero `rusqlite` types in the public
-signature) so writes run inside the hub's existing write transaction and commit
-atomically with `ledger::append`. Traversal algorithms (`k_hop`, bidirectional
-`shortest_path`, `seed_expand` PPR) live in `ua-graph` and call `GraphRepo` for
+Following the `OrgRepo` ([organization.md](organization.md)) and `MemoryRepo`
+([memory.md](memory.md)) precedent, the synchronous `GraphRepo` trait and its
+SQLite implementation live in `ua-store` exposing plain Rust domain types (zero
+`rusqlite` types in the public signature) and **bounded adjacency primitives
+only**, so writes run inside the hub's existing write transaction and commit
+atomically with `ledger::append`, while `ua-store` stays free of tool logic.
+Traversal algorithms (`k_hop`, bidirectional `shortest_path`, `seed_expand`
+PPR) and domain validation live in `ua-graph` and call `GraphRepo` for
 bounded, org- and visibility-filtered adjacency reads.
+
+*(Note on crate boundaries: `crates/ua-memory/tests/boundary.rs` guards which
+crates may depend on `ua-memory` — today exclusively `ua-tools` — not
+`ua-memory`'s own dependencies. Placing `GraphRepo` in `ua-store` follows the
+repo-in-`ua-store` precedent so `ua-memory`, `ua-org`, and `ua-graph` all share
+the same storage primitives without circular crate dependencies.)*
 
 Mapping to a second backend (PostgreSQL, roadmap Phase 3):
 
@@ -523,7 +581,7 @@ tables, tool contracts, and tests remain untouched until C2.
 | `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Move in C2** to `graph_edges(kind = 'serves_goal')`, keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and preserving the `goal_manage` contract. |
 | `goals.parent_goal_id` | `crates/ua-tools/src/families/tasks/mod.rs:84` | Why-chain tree column (max depth 8). | Unchanged | **Stays** authoritative on `goals`; optional read-only mirror to `goal_parent` in C2 if cross-domain traversals need it. |
 | `graph_canvas_scenes`, `graph_canvas_revisions` | `crates/ua-tools/src/families/graph.rs` | Excalidraw scene blob store + deterministic parser emitting `task_suggestions` and `dependency_suggestions` (**proposals only**). | Unchanged | **Stays as-is.** Canvas scenes are visual documents, never an authoritative edge store. Post-C2 UI/tools may render a `ua-graph` subgraph onto a board, while human-approved proposals still create real edges through domain tools. |
-| `memory_entities`, `memory_links` | `crates/ua-tools/src/families/export.rs:586` (`GRAPH_TABLES`), [memory.md](memory.md) §4–§5 | Not yet created in `ua-memory`; `export.rs` checks `has_table()` for Python-hub migration manifests. | Unchanged | **Converge in C2** (or adopt `ua-graph` directly if C1 lands ahead of Memory §4 — see [Alignment with memory.md step 5](#alignment-with-memorymd-step-5)). `export.rs::GRAPH_TABLES` reads from `ua-graph` (or a compatibility view) so migration manifests stay backward-compatible. |
+| `memory_entities`, `memory_links` | `crates/ua-tools/src/families/export.rs:586` (`GRAPH_TABLES`), [memory.md](memory.md) §4–§5 | Do not exist in `crates/` today; `export.rs` checks `has_table()` for Python-hub migration manifests. | Unchanged | **No separate tables (`graph.v1` is the only edge store).** `memory.md` §4's model stands while its storage section is superseded by `graph_nodes` / `graph_edges` (amended in Memory v2 `#2799`, not C2). Memory §4 entity/link writes go through `GraphRepo` once C1 lands; `export.rs::GRAPH_TABLES` reads from `ua-graph` (or a compatibility view). |
 | `vault_query` (`[[wikilink]]` PPR) | `crates/ua-tools/src/families/vault/query.rs` | On-the-fly disk walk + undirected Personalized PageRank over markdown files. | Unchanged | **Stays disk-authoritative in C1.** In C2+ (with track B9 content-hash vault ingest), `vault_query` can read indexed `vault_note` / `links_to` rows through `seed_expand`, keeping the disk walk as fallback for unindexed vaults. |
 | Relational FKs (`tasks.parent_id`, `deliverables.task_id`, `delegations.task_id`, `task_hold_members`, `plan_steps.plan_id`) | Their owning families | Core relational invariants enforced by owning tables. | Unchanged | **Stay authoritative** on their owning tables; projected into `graph_edges` (`subtask_of`, `produces`, `delegated_to`) only where cross-domain traversal or G3 provenance needs them. |
 | Team-spec topology (`delegates_to`, `reviews`, `escalates_to`, `can_observe`) | [organization.md](organization.md) (`team_specs`) | Enforced seat interaction rules inside append-only canonical JSON specs. | Unchanged | **Authoritative in `team_specs`**; projected into `graph_edges` on spec commit in C2+ for graph queries and visualization, never editable directly via `graph_edge_assert`. |
@@ -558,29 +616,32 @@ follows:
   - `memory_links(org_id, src_id, dst_id, rel, asserted_by, proposed, actor, created_at, retired_at)`
     maps to `graph_edges(kind = rel, assertion_scope = 'note:<asserting_note_id>', state = 'proposed'|'active', asserted_by = <stable_principal_id>, valid_to = retired_at)`.
 
-### Reconciliation points with `memory.md` (flagged without modifying `memory.md`)
+### Architectural rulings with `memory.md` (resolved in C0)
 
-1. **Single vs second edge store:** [memory.md](memory.md) §4 currently defines
-   dedicated `memory_entities` and `memory_links` tables in `memory.links.v1`.
-   Roadmap §7.3(4) calls for deciding on the unified graph store before a second
-   edge store is built. If C1 lands before Memory §4, Memory §4 can write
-   directly through `GraphRepo` (avoiding duplicate tables); if Memory §4 lands
-   first, C2 converges them behind `GraphRepo` and retires the duplicate tables.
-2. **Meaning of `asserted_by`:** In `memory.md` §4, `memory_links.asserted_by`
-   is the *asserting note ID* (so two notes asserting the same edge keep it live
-   until both retire) and `actor` is a nullable label string. In `ua-graph`,
-   `asserted_by` is always the *stable principal ID* (never a label), and
-   note-level assertion ownership moves to `assertion_scope = 'note:<note_id>'`.
-   Both invariants are preserved without overloading one column.
-3. **Hard delete on mirror update vs append-only `valid_to`:** `memory.md` §4's
-   `memory_links_mirror_supersedes` trigger `DELETE`s an old mirrored edge when
-   `memory_restore` clears `superseded_by`. Under `graph_edges_no_delete`,
-   clearing an authoritative link instead stamps `valid_to = now`, hiding it
-   from live reads while preserving `as_of` history.
-4. **Crate dependency boundary:** `crates/ua-memory/tests/boundary.rs` restricts
-   `ua-memory`'s workspace dependencies. Placing the `GraphRepo` trait and its
-   SQLite implementation in `ua-store` lets `ua-memory` consume the shared graph
-   store without adding a crate dependency between `ua-memory` and `ua-graph`.
+1. **One edge store, not two:** `graph.v1` is the **only** edge store. Do not
+   create `memory.links.v1`, `memory_entities`, or `memory_links` tables.
+   [memory.md](memory.md) §4's *model* stands while its *storage section* is
+   superseded by `graph_nodes` / `graph_edges` (that doc amendment belongs with
+   Memory v2 `#2799`, not C2). Sequencing: the Memory §4 entity/link slice
+   waits for C1 or writes directly against `GraphRepo`.
+2. **`asserted_by` means only the principal:** `asserted_by` is always the
+   asserting principal (`PrincipalId`); memory's per-note assertion ownership
+   ("keep live until every asserting note retires") lives in
+   `assertion_scope = 'note:<note_id>'`. Pre-#2790, `'default'` rows store a
+   provisional label backfilled by #2790, and non-default org `asserted_by`
+   writes are refused until #2790 lands.
+3. **Close with `valid_to`, never delete (with mirror-close carve-out):**
+   `graph_edges_no_delete` stands. When an authoritative domain column changes
+   (for example `memory_restore` clearing `superseded_by`), the owning domain
+   closes its mirrored edge (`source_kind = 'mirror'` or enclosing event `seq`)
+   by setting `valid_to = now` — distinct from topical retirement. Re-mirroring
+   inserts a new row with a new ULID, permitted by `idx_graph_edges_live_unique`.
+4. **`GraphRepo` in `ua-store`:** `GraphRepo` and its SQLite implementation
+   live in `ua-store` (beside `OrgRepo` and `MemoryRepo`), exposing bounded
+   adjacency primitives only while `k_hop`, `shortest_path`, and `seed_expand`
+   stay in `ua-graph`. (`crates/ua-memory/tests/boundary.rs` guards which
+   crates may depend on `ua-memory` — `["ua-tools"]` — not `ua-memory`'s own
+   dependencies; `ua-memory` already depends on `ua-org` for `authz`.)
 
 ## Benchmark floor (C1 acceptance gate)
 
@@ -623,7 +684,7 @@ the C1 PR):
 | Workload | Parameters | Floor |
 | --- | --- | --- |
 | Batched edge insert | 1,000 edges/tx across 100k edges, triggers + indexes active | **≥ 15,000 edges/sec** |
-| Single governed edge write | 1 edge + `ledger::append` in one write transaction | **≤ 3 ms p95** |
+| Single governed edge write (incl. B4 cycle check) | 1 edge + `ledger::append` in one write transaction, including write-time acyclicity check on acyclic kinds (`depends_on` 500-hop chain + bound-hit refusal probe at `1,000` nodes / `5,000` edges / `50 ms`) | **≤ 3 ms p95** (and bounded `invalid_argument` refusal when cycle-check cap is hit) |
 | 2-hop `k_hop` (100k edges) | 3 seeds, `max_hops = 2`, `max_degree_per_node = 50`, `max_nodes = 100`, `as_of` active, org-fenced | **≤ 15 ms p95** (≤ 25 ms p95 with `memory_note` sub-org visibility filter) |
 | `seed_expand` PPR (100k edges) | 5 seeds, 2-hop bounded subgraph (≤5,000 nodes, ≤25,000 edges), `damping = 0.85`, `max_iters = 30`, `eps = 1e-6`, `max_results = 10` | **≤ 40 ms p95** (≤ 20 ms p95 on exact ≤5k-node subgraphs) |
 | `shortest_path` (100k edges) | Bidirectional BFS, `max_depth = 4`, `max_expanded_edges = 10,000` | **≤ 15 ms p95** |
@@ -657,7 +718,10 @@ the C1 PR):
   above its hard maximum (`max_hops ≤ 4`, `max_depth ≤ 6`, `seed_ids ≤ 20` / 50
   for PPR, `max_degree_per_node ≤ 200`, `max_visited_edges ≤ 10,000` / 25,000
   for PPR, `max_nodes ≤ 500`, `max_edges ≤ 1,000`, `max_iters ≤ 50`,
-  `deadline_ms ≤ 2,000`).
+  `deadline_ms ≤ 2,000`). Write-time acyclicity checks enforce
+  `CYCLE_CHECK_MAX_NODES = 1,000`, `CYCLE_CHECK_MAX_EDGES = 5,000`, and
+  `CYCLE_CHECK_DEADLINE_MS = 50` ms, refusing `invalid_argument` when any bound
+  is exceeded.
 - **Cycle immunity:** All traversals track visited node IDs in memory; cyclic
   subgraphs cannot cause infinite recursion or exponential blowup.
 - **Storage and payload caps:** Configurable per-organization quotas
@@ -665,86 +729,86 @@ the C1 PR):
   limits (`8 KiB` on nodes, `4 KiB` on edges), `external_id` length limit (256),
   and standard policy rate limits on write tools.
 
-### Who may assert and retract edges
+### Who may create/mutate nodes and assert/retract edges
 
 All graph reads and writes pass through `Registry::call` (profile → policy →
 approval gate → typed arguments → handler → same-transaction ledger event).
 Authority comes from `ua-org::authz` (identity and membership), never from a
 session profile:
 
-1. **Domain-owned edges cannot be forged via generic graph tools.** Edges
-   representing governance, approvals, deliverables, team topology, or
-   authoritative domain links (`approved_by`, `governed_by`, `reviewed_by`,
-   `produces`, `executes`, `executed_by`, `delegates_to`, `reviews`,
-   `escalates_to`, `can_observe`, `depends_on`, `serves_goal`, `supersedes`,
-   `derives`) may be written **only** by their owning domain code path. Calling
-   generic `graph_edge_assert` or `graph_edge_retract` with one of those kinds
-   is refused (`domain_owned_edge`).
-2. **Generic assertions (`extends`, `evidence`, `contradicts` as `proposed`,
-   `mentions`, `links_to`, `plan_tracks`):**
+1. **No public `graph_node_upsert` tool; nodes are domain-owned per kind.**
+   C1 exposes **no** public generic node-creation or node-upsert tool. Instead,
+   `ua-graph` / `GraphRepo` exposes an internal
+   `graph_node_ensure(org_id, kind, external_id, provenance)` primitive for
+   **domain code paths only**: it creates the node row if absent (recording its
+   immutable provenance) and touches nothing else if the row already exists.
+   Both node creation and every mutable-field update (`visibility`, `team_id`,
+   `owner_type`, `owner_id`, `display_label`, `meta_json`, `archived_at`) are
+   domain-owned per node kind — `visibility`, `owner_*`, and `team_id` change
+   only through the owning domain code path. This prevents forging `approval`,
+   `policy_revision`, or `person` nodes and prevents flipping an existing
+   `person`/`agent` node to `private` through a generic tool.
+2. **Domain-owned edges cannot be forged via generic graph tools.** Edges
+   representing governance, approvals, deliverables, team topology, memory
+   entity indexing, or authoritative domain links (`approved_by`,
+   `governed_by`, `reviewed_by`, `produces`, `executes`, `executed_by`,
+   `delegates_to`, `reviews`, `escalates_to`, `can_observe`, `depends_on`,
+   `subtask_of`, `serves_goal`, `goal_parent`, `delegated_to`, `uses_skill`,
+   `promoted_from`, `supersedes`, `derives`, `mentions`) may be written
+   **only** by their owning domain code path. Calling generic
+   `graph_edge_assert` or `graph_edge_retract` with one of those kinds is
+   refused (`domain_owned_edge`). In particular, `mentions` is strictly
+   domain-owned by `ua-memory` / vault ingest because it drives the memory
+   graph leg's hub cutoff and PPR retrieval scores.
+3. **Generic assertions (`extends`, `evidence`, `contradicts` as `proposed`,
+   `links_to`, `plan_tracks`):**
    - Require a verified caller (`ActorKind::Human` or `ActorKind::Agent`) in
      the target organization; anonymous callers cannot write.
+   - Until #2790 supplies immutable principal IDs, writes for any organization
+     other than `'default'` are refused (`principal_id_required`).
    - Require read visibility on **both** endpoint nodes (prevents linking to or
      probing hidden records).
-   - Every write records `asserted_by` from the verified caller's immutable
-     principal ID (never caller-supplied).
-3. **Retraction (`graph_edge_retract`, sets `valid_to`):**
-   - Allowed for the original `asserted_by` principal, an `Authority::Operator`
-     (`org_admin`+ once memberships land), or `Authority::LifecycleOperator`
-     for fleet maintenance — all checked via `ua_org::authz::require` in the
-     edge's organization.
+   - Every write records `asserted_by` from the verified caller's `PrincipalId`
+     (never caller-supplied).
+4. **Retraction (`graph_edge_retract`, sets `valid_to`):**
+   - Allowed only on generic-assertable edge kinds, for the original
+     `asserted_by` principal, an `Authority::Operator` (`org_admin`+ once
+     memberships land), or `Authority::LifecycleOperator` for fleet maintenance
+     — all checked via `ua_org::authz::require` in the edge's organization.
    - Retracting another principal's edge as an operator records the retractor
      in the `agent.graph.edge_retracted` ledger event while leaving the edge's
      original `asserted_by` untouched.
-4. **Profile exposure (C1):**
+5. **Profile exposure (C1):**
    - Read tools (`graph_node_get`, `graph_neighbors`, `graph_traverse`,
      `graph_shortest_path`, `graph_expand`) are `.read_only()` and exposed to
      standard read-capable profiles.
-   - Write tools (`graph_node_upsert`, `graph_edge_assert`,
-     `graph_edge_retract`) are omitted from read-only profiles (`public`,
-     `research`, `reviewer`) and remain subject to `approval_tools` and policy
-     rules.
+   - Write tools (`graph_edge_assert`, `graph_edge_retract`) are omitted from
+     read-only profiles (`public`, `research`, `reviewer`) and remain subject to
+     `approval_tools` and policy rules. There is no `graph_node_upsert` tool.
 
 ## Slices and gates
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| **C0** | This document (`docs/graph.md`). | Architecture review and independent diff read. No code. |
-| **C1** | `crates/ua-graph`, `GraphRepo` (SQLite), `graph.v1` + `organization.v1.graph`, `org_classification.rs` entry, governed tools, isolation & DoS tests, benchmark harness meeting [Benchmark floor](#benchmark-floor-c1-acceptance-gate). Rewrites zero existing consumers. | Independent review + benchmark floor + CI/Cloud Build green. |
-| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links`, Memory §4/§5 graph leg convergence, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
+| **C0** | This document (`docs/graph.md`). | CTO design read + independent diff read. No code. |
+| **C1** | `GraphRepo` (SQLite) in `ua-store`, `crates/ua-graph`, `graph.v1` + `organization.v1.graph`, `org_classification.rs` entry, governed tools (`graph_node_get`, `graph_neighbors`, `graph_traverse`, `graph_shortest_path`, `graph_expand`, `graph_edge_assert`, `graph_edge_retract`), internal `graph_node_ensure`, isolation & DoS tests, benchmark harness meeting [Benchmark floor](#benchmark-floor-c1-acceptance-gate). | Independent review + benchmark floor + CI/Cloud Build green. |
+| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links`, Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
 | **C3** | Dependency-driven workflow graph runner replacing YAML workflow engine and LangGraph surface. | Separate design amendment before code. |
 
-## Open questions
+**What C1 must not do:** no consumer rewrites, no `graph.links.v1`, no
+`memory_links` / `memory_entities` tables, no `graph_node_upsert` public tool,
+and no label-based identity in a non-default organization.
 
-Resolve these before C1 implementation starts:
+## Remaining open questions (C2 / CI details)
 
-1. **Memory §4/§5 convergence order (roadmap §7.3(4)).** Should Memory v2
-   (#2683 / #2799) adopt `ua-graph` directly for its entity/link store (if C1
-   lands ahead of Memory §4), or ship `memory_entities` / `memory_links` first
-   and converge onto `ua-graph` in C2?
-2. **Pre-#2790 `asserted_by` representation in C1.** Immutable agent/node IDs
-   (#2790) wait on the #2794 identity contract. Should C1 block until `Caller`
-   carries stable principal IDs, or ship C1 behind a typed `PrincipalId` wrapper
-   that is default-org-only until #2790 lands and backfills `'default'` rows
-   when stable IDs arrive?
-3. **Where `GraphRepo` lives.** Placing the `GraphRepo` trait and its SQLite
-   implementation in `ua-store` (beside `OrgRepo` and `MemoryRepo`) lets
-   `ua-memory` and `ua-org` call it in C2 without loosening their crate boundary
-   tests; `ua-graph` then holds domain types, validation, and traversal
-   algorithms (`k_hop`, `shortest_path`, `seed_expand`). Confirm this split vs
-   keeping `GraphRepo` inside `ua-graph`.
-4. **Authoritative visibility for `memory_note` nodes.** `graph_nodes` carries
-   `visibility`, `team_id`, `owner_type`, and `owner_id` so graph queries work
-   uniformly in C1. In C2, should `memory_note` visibility be read by joining
-   `memory` directly in SQL (zero drift risk when a note narrows from `org` to
-   `private`, at one PK join per candidate) or kept synchronized via an
+1. **Authoritative visibility for `memory_note` nodes in C2.** `graph_nodes`
+   carries `visibility`, `team_id`, `owner_type`, and `owner_id` so graph
+   queries work uniformly in C1. In C2, should `memory_note` visibility be read
+   by joining `memory` directly in SQL (zero drift risk when a note narrows from
+   `org` to `private`, at one PK join per candidate) or kept synchronized via an
    `AFTER UPDATE` trigger on `memory` in the same write transaction?
-5. **Append-only closure (`valid_to`) vs hard delete on `memory_restore`.**
-   When `memory_restore` clears `superseded_by`, `memory.md` §4's mirror
-   trigger currently deletes the mirrored edge. Confirm that closing with
-   `valid_to = now` (preserving `as_of` history under `graph_edges_no_delete`)
-   is the intended behavior once converged.
-6. **CI benchmark enforcement.** Shared CI runners have variable CPU timing.
+2. **CI benchmark enforcement.** Shared CI runners have variable CPU timing.
    Confirm whether CI should run a smaller deterministic smoke fixture (for
-   example 10k edges + super-hub DoS bound) while the full 100k-edge floor is
-   verified on a pinned local/Cloud Build run and recorded in the PR.
+   example 10k edges + super-hub DoS + B4 cycle-check bound) while the full
+   100k-edge floor is verified on a pinned local/Cloud Build run and recorded
+   in the C1 PR.
