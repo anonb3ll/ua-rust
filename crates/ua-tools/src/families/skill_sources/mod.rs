@@ -24,7 +24,9 @@ use ua_core::{UaError, UaResult};
 use ua_org::authz::{Authority, Authz};
 use ua_store::{Procedure, SchemaPart};
 
-use self::fetch::{validate_allowed_subpaths, validate_sha, validate_source_url, validate_tracking_ref};
+use self::fetch::{
+    url_uniqueness_key, validate_allowed_subpaths, validate_sha, validate_source_url, validate_tracking_ref,
+};
 use super::agents::verified;
 use super::plans::ledger_text;
 use super::skill_registry::{emit, gate_pass, pending};
@@ -58,12 +60,25 @@ CREATE TABLE IF NOT EXISTS skill_sources (
 CREATE INDEX IF NOT EXISTS idx_skill_sources_org_status
     ON skill_sources(org_id, status, added_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_sources_org_url_active
-    ON skill_sources(org_id, lower(canonical_url)) WHERE status = 'active';
+    ON skill_sources(
+        org_id,
+        CASE
+            WHEN lower(canonical_url) LIKE '%.git'
+            THEN substr(lower(canonical_url), 1, length(canonical_url) - 4)
+            ELSE lower(canonical_url)
+        END
+    ) WHERE status = 'active';
 CREATE TRIGGER IF NOT EXISTS skill_sources_revoke_terminal
 BEFORE UPDATE ON skill_sources
 WHEN OLD.status = 'revoked'
 BEGIN
     SELECT RAISE(ABORT, 'revoked skill sources are terminal and cannot be modified');
+END;
+CREATE TRIGGER IF NOT EXISTS skill_sources_revoke_no_delete
+BEFORE DELETE ON skill_sources
+WHEN OLD.status = 'revoked'
+BEGIN
+    SELECT RAISE(ABORT, 'revoked skill sources are terminal and cannot be deleted');
 END;
 ",
 };
@@ -188,8 +203,15 @@ pub(crate) fn source_add(ctx: &ToolCtx, p: SourceAddParams) -> UaResult<Value> {
     source_add_as(ctx, who, p)
 }
 
+const SQL_URL_KEY_EXPR: &str = "CASE \
+    WHEN lower(canonical_url) LIKE '%.git' \
+    THEN substr(lower(canonical_url), 1, length(canonical_url) - 4) \
+    ELSE lower(canonical_url) \
+END";
+
 pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> UaResult<Value> {
     let parsed = validate_source_url(&p.url)?;
+    let url_key = url_uniqueness_key(&parsed.canonical_url);
     let tracking_ref = validate_tracking_ref(p.tracking_ref.as_deref().unwrap_or("HEAD"))?;
     let pinned_sha = validate_sha(&p.pinned_sha)?;
     let allowed_subpaths = validate_allowed_subpaths(p.allowed_subpaths)?;
@@ -204,14 +226,15 @@ pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> U
                 .query_row(
                     &format!(
                         "SELECT {SOURCE_COLS} FROM skill_sources \
-                         WHERE org_id = ?1 AND lower(canonical_url) = lower(?2) AND status = 'active' LIMIT 1"
+                         WHERE org_id = ?1 AND ({SQL_URL_KEY_EXPR}) = ?2 AND status = 'active' LIMIT 1"
                     ),
-                    params![org, parsed.canonical_url],
+                    params![org, url_key],
                     source_row,
                 )
                 .optional()?;
             if let Some(row) = existing {
-                if row.tracking_ref == tracking_ref
+                if row.canonical_url == parsed.canonical_url
+                    && row.tracking_ref == tracking_ref
                     && row.pinned_sha == pinned_sha
                     && row.allowed_subpaths == allowed_subpaths
                 {
@@ -227,10 +250,12 @@ pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> U
             // for this repository in this organization.
             let revoked_same_sha: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM skill_sources \
-                     WHERE org_id = ?1 AND lower(canonical_url) = lower(?2) \
-                     AND pinned_sha = ?3 AND status = 'revoked' LIMIT 1",
-                    params![org, parsed.canonical_url, pinned_sha],
+                    &format!(
+                        "SELECT id FROM skill_sources \
+                         WHERE org_id = ?1 AND ({SQL_URL_KEY_EXPR}) = ?2 \
+                         AND pinned_sha = ?3 AND status = 'revoked' LIMIT 1"
+                    ),
+                    params![org, url_key, pinned_sha],
                     |r| r.get(0),
                 )
                 .optional()?;

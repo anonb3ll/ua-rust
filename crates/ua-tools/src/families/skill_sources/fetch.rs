@@ -6,7 +6,9 @@
 //!   `feature = "test-util"`).
 //! - Zero credentials, queries, fragments, IP literals, single-label hosts,
 //!   non-443 ports, empty authorities (`https:///...`), leading `-`, or control
-//!   characters in URLs; trailing `.git` is stripped from `canonical_url`.
+//!   characters in URLs; path case and any trailing `.git` suffix are preserved
+//!   in `canonical_url` so the exact approved URL is fetched, while uniqueness
+//!   normalizes both.
 //! - Git version verified once per process (`git >= 2.37` required so
 //!   `http.curloptResolve` and `GIT_CONFIG_GLOBAL` are honoured).
 //! - DNS resolved once per fetch, **every** returned IP classified against
@@ -75,9 +77,11 @@ impl SourceScheme {
 
 /// A validated, canonical skill source URL.
 ///
-/// Hostname is lowercased, trailing slashes and trailing `.git` are stripped.
-/// Repository path case is preserved so case-sensitive remotes remain
-/// fetchable; uniqueness and cache keying normalize path case separately.
+/// Hostname is lowercased, explicit `:443` and trailing slashes are stripped.
+/// Repository path case and any trailing `.git` suffix are preserved verbatim
+/// so case-sensitive and `.git`-only remotes (e.g. cgit, `git-http-backend`)
+/// are fetched at the exact approved URL; allowlist uniqueness normalizes both
+/// separately via [`url_uniqueness_key`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSourceUrl {
     pub canonical_url: String,
@@ -85,6 +89,22 @@ pub struct ParsedSourceUrl {
     pub host: String,
     pub port: u16,
     pub repo_path: String,
+}
+
+fn strip_trailing_dot_git(path: &str) -> &str {
+    if path.len() > 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
+        &path[..path.len() - 4]
+    } else {
+        path
+    }
+}
+
+/// Normalized uniqueness key for a canonical skill source URL: lowercased with
+/// any trailing `.git` stripped. Used only for org-level uniqueness and
+/// revoked-SHA checks, never as the fetched URL or bare cache key.
+pub fn url_uniqueness_key(canonical_url: &str) -> String {
+    let lower = canonical_url.to_ascii_lowercase();
+    if lower.len() > 4 && lower.ends_with(".git") { lower[..lower.len() - 4].to_string() } else { lower }
 }
 
 fn valid_domain_label(label: &str) -> bool {
@@ -114,20 +134,13 @@ fn valid_domain(host: &str) -> bool {
     lower.split('.').all(valid_domain_label)
 }
 
-fn strip_trailing_dot_git(path: &str) -> &str {
-    if path.len() > 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
-        &path[..path.len() - 4]
-    } else {
-        path
-    }
-}
-
 /// Validate a production `https://` skill source URL per `docs/skill-sources.md` §1.
 ///
 /// Refuses non-`https://` schemes, credentials, queries, fragments, backslashes,
 /// empty authorities (`https:///...`), IP literals, single-label hosts, non-443
 /// ports, leading `-`, spaces, control characters, and raw path traversal.
-/// Strips trailing `/` and `.git` while preserving path case.
+/// Strips trailing `/` while preserving path case and any `.git` suffix so the
+/// fetched URL matches the approved URL verbatim.
 pub fn validate_source_url(raw: &str) -> UaResult<ParsedSourceUrl> {
     if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(UaError::invalid("skill source url must not contain control characters"));
@@ -209,22 +222,26 @@ pub fn validate_source_url(raw: &str) -> UaResult<ParsedSourceUrl> {
     }
 
     let raw_path = parsed.path().trim_matches('/');
-    let stripped = strip_trailing_dot_git(raw_path).trim_end_matches('/');
-    if stripped.is_empty() || stripped.eq_ignore_ascii_case(".git") {
+    let without_git = strip_trailing_dot_git(raw_path).trim_end_matches('/');
+    if raw_path.is_empty()
+        || raw_path.eq_ignore_ascii_case(".git")
+        || without_git.is_empty()
+        || without_git.eq_ignore_ascii_case(".git")
+    {
         return Err(UaError::invalid("skill source url needs a non-empty repository path"));
     }
-    for seg in stripped.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
+    for seg in raw_path.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.eq_ignore_ascii_case(".git") {
             return Err(UaError::invalid("skill source repository path contains an unsafe segment"));
         }
     }
-    let canonical_url = format!("https://{host}/{stripped}");
+    let canonical_url = format!("https://{host}/{raw_path}");
     Ok(ParsedSourceUrl {
         canonical_url,
         scheme: SourceScheme::Https,
         host,
         port: 443,
-        repo_path: stripped.to_string(),
+        repo_path: raw_path.to_string(),
     })
 }
 
@@ -594,10 +611,11 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
 }
 
 /// Org-isolated bare cache directory (`$home/skill_sources/<org_digest>/<url_digest>.git`).
-/// Keyed by lowercased `canonical_url` so `Org/Repo` and `org/repo` share one cache.
+/// Keyed on the exact `canonical_url` so repos differing in path case never
+/// share a bare cache.
 pub fn cache_dir(data_home: &Path, org_id: &str, canonical_url: &str) -> PathBuf {
     let org_hash = hex_prefix(org_id.as_bytes(), 16);
-    let url_hash = hex_prefix(canonical_url.to_ascii_lowercase().as_bytes(), 24);
+    let url_hash = hex_prefix(canonical_url.as_bytes(), 24);
     data_home.join("skill_sources").join(org_hash).join(format!("{url_hash}.git"))
 }
 
@@ -979,11 +997,27 @@ mod tests {
         assert_eq!(ok.port, 443);
         assert_eq!(ok.repo_path, "Example-Org/skills-repo");
 
-        // Trailing .git is normalized away so foo/bar and foo/bar.git match.
+        // Trailing .git is preserved in canonical_url so .git-only hosts fetch
+        // the exact approved URL, while url_uniqueness_key normalizes it away.
         let dot_git = validate_source_url("https://github.com/Example-Org/skills-repo.git").unwrap();
-        assert_eq!(dot_git.canonical_url, "https://github.com/Example-Org/skills-repo");
+        assert_eq!(dot_git.canonical_url, "https://github.com/Example-Org/skills-repo.git");
+        assert_eq!(dot_git.repo_path, "Example-Org/skills-repo.git");
         let dot_git_upper = validate_source_url("https://github.com/Example-Org/skills-repo.GIT/").unwrap();
-        assert_eq!(dot_git_upper.canonical_url, "https://github.com/Example-Org/skills-repo");
+        assert_eq!(dot_git_upper.canonical_url, "https://github.com/Example-Org/skills-repo.GIT");
+        assert_eq!(url_uniqueness_key(&ok.canonical_url), "https://github.com/example-org/skills-repo");
+        assert_eq!(url_uniqueness_key(&dot_git.canonical_url), url_uniqueness_key(&ok.canonical_url));
+        assert_eq!(url_uniqueness_key(&dot_git_upper.canonical_url), url_uniqueness_key(&ok.canonical_url));
+
+        // Cache directory keys on the exact canonical URL, not the lowercased form.
+        let lower_url = validate_source_url("https://github.com/example-org/skills-repo").unwrap();
+        assert_ne!(
+            cache_dir(Path::new("/data"), "default", &ok.canonical_url),
+            cache_dir(Path::new("/data"), "default", &lower_url.canonical_url),
+        );
+        assert_ne!(
+            cache_dir(Path::new("/data"), "default", &ok.canonical_url),
+            cache_dir(Path::new("/data"), "default", &dot_git.canonical_url),
+        );
 
         // Explicit port 443 normalizes cleanly.
         let explicit_443 = validate_source_url("https://github.com:443/Example-Org/skills-repo").unwrap();

@@ -113,7 +113,8 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
     let sha1 = "1".repeat(40);
     let sha2 = "2".repeat(40);
 
-    // Add source with trailing .git: canonicalized without .git, parks bound approval.
+    // Add source with trailing .git: preserves .git in canonical_url so .git-only
+    // remotes fetch the exact approved URL, and parks bound approval.
     let add_params = json!({
         "url": "https://GitHub.com/Example-Org/Agent-Skills.git/",
         "tracking_ref": "main",
@@ -125,9 +126,9 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
     assert_eq!(added["idempotent"], false, "{added}");
     let src = &added["source"];
     let src_id = src["id"].as_str().unwrap().to_string();
-    assert_eq!(src["canonical_url"], "https://github.com/Example-Org/Agent-Skills");
+    assert_eq!(src["canonical_url"], "https://github.com/Example-Org/Agent-Skills.git");
     assert_eq!(src["host"], "github.com");
-    assert_eq!(src["repo_path"], "Example-Org/Agent-Skills");
+    assert_eq!(src["repo_path"], "Example-Org/Agent-Skills.git");
     assert_eq!(src["tracking_ref"], "main");
     assert_eq!(src["pinned_sha"], sha1);
     assert_eq!(src["allowed_subpaths"], json!(["skills/core", "skills/ops"]));
@@ -140,19 +141,20 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
         json!({
             "action": "source_add",
             "org_id": "default",
-            "canonical_url": "https://github.com/Example-Org/Agent-Skills",
+            "canonical_url": "https://github.com/Example-Org/Agent-Skills.git",
             "tracking_ref": "main",
             "pinned_sha": sha1,
             "allowed_subpaths": ["skills/core", "skills/ops"],
         })
     );
 
-    // Re-adding identical active source (with or without .git / differing path case) is idempotent.
+    // Re-adding the exact same canonical URL and params is idempotent.
     let again = h.call(&human(), "source_add", add_params).await.unwrap();
     assert_eq!(again["idempotent"], true, "{again}");
     assert_eq!(again["source"]["id"], src_id);
 
-    let same_ci = h
+    // Adding a case or .git variant while the original is active is refused (conflict).
+    let variant_conflict = h
         .call(
             &human(),
             "source_add",
@@ -164,11 +166,10 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
             }),
         )
         .await
-        .unwrap();
-    assert_eq!(same_ci["idempotent"], true, "{same_ci}");
-    assert_eq!(same_ci["source"]["id"], src_id);
+        .unwrap_err();
+    assert!(matches!(variant_conflict, UaError::Conflict { .. }), "{variant_conflict:?}");
 
-    // Adding a different pin for the same active URL (case-insensitive) is refused (conflict).
+    // Adding a different pin for the same active URL (case-insensitive / without .git) is refused.
     let conflict = h
         .call(
             &human(),
@@ -198,7 +199,7 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
     let rev_bound = h.approval_payload(rev_approval_id);
     assert_eq!(rev_bound["action"], "source_revoke");
     assert_eq!(rev_bound["source_id"], src_id);
-    assert_eq!(rev_bound["canonical_url"], "https://github.com/Example-Org/Agent-Skills");
+    assert_eq!(rev_bound["canonical_url"], "https://github.com/Example-Org/Agent-Skills.git");
 
     // Active list is now empty; revoked & all lists still show the historical row.
     assert_eq!(h.call(&human(), "source_list", json!({})).await.unwrap()["sources"], json!([]));
@@ -217,7 +218,7 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
         1
     );
 
-    // Revocation is terminal at both tool and SQLite trigger layers.
+    // Revocation is terminal at both tool and SQLite trigger layers (UPDATE and DELETE).
     let rev_again = h.call(&human(), "source_revoke", rev_params).await.unwrap_err();
     assert!(matches!(rev_again, UaError::Conflict { .. }), "{rev_again:?}");
 
@@ -230,13 +231,23 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
     });
     assert!(sql_reactivate.is_err(), "DB trigger must refuse modifying a revoked skill source");
 
-    // Re-adding the same URL with the previously revoked pinned_sha is refused (§1 fresh pinned_sha).
+    let sql_delete = h.hub.db().write({
+        let id = src_id.clone();
+        move |tx| {
+            tx.execute("DELETE FROM skill_sources WHERE id = ?1", [id])?;
+            Ok(())
+        }
+    });
+    assert!(sql_delete.is_err(), "DB trigger must refuse deleting a revoked skill source");
+
+    // Re-adding the same repo (even without .git / different case) with the previously
+    // revoked pinned_sha is refused (§1 fresh pinned_sha).
     let same_revoked_sha = h
         .call(
             &human(),
             "source_add",
             json!({
-                "url": "https://github.com/Example-Org/Agent-Skills",
+                "url": "https://github.com/example-org/agent-skills",
                 "tracking_ref": "main",
                 "pinned_sha": sha1,
             }),
@@ -259,6 +270,7 @@ async fn source_add_list_revoke_round_trip_and_terminal_revocation() {
         .await;
     assert_eq!(readded["idempotent"], false);
     assert_ne!(readded["source"]["id"], src_id);
+    assert_eq!(readded["source"]["canonical_url"], "https://github.com/Example-Org/Agent-Skills");
     assert_eq!(readded["source"]["approval_id"], new_approval_id);
 
     let channels: Vec<String> = h
