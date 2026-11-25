@@ -14,14 +14,15 @@
 //! # Digest form
 //!
 //! The signed value is the raw 32-byte SHA-256 of one canonical JSON object.
-//! The object carries exactly the fields `docs/evidence-export.md` names for
-//! the checkpoint's class, keys in sorted order, `,`/`:` separators, and a
-//! literal `null` for a field that does not apply. Strings are escaped the way
-//! Python's `json.dumps(ensure_ascii=True)` escapes them, so the encoding is
+//! The object carries the `format` tag `ua.evidence.checkpoint.v1`, the fields
+//! `docs/evidence-export.md` names for the checkpoint's class, keys in sorted
+//! order, `,`/`:` separators, and a literal `null` for a field that does not
+//! apply. Strings are escaped the way Python's
+//! `json.dumps(ensure_ascii=True)` escapes them, so the encoding is
 //! byte-stable across languages.
 //!
-//! - class `hub`: `{class, hash, key_id, org_id, seq, signed_at}`
-//! - class `org`: `{class, global_from_hash, global_head_hash, key_id,
+//! - class `hub`: `{class, format, hash, key_id, org_id, seq, signed_at}`
+//! - class `org`: `{class, format, global_from_hash, global_head_hash, key_id,
 //!   org_chain_hash, org_id, org_row_count, signed_at, window}`
 //!
 //! `window` is the object `{"end": …, "start": …}` with the same sorted-key
@@ -32,8 +33,17 @@
 //!
 //! Public keys only, hex-encoded 32-byte Ed25519 keys. A retired key stays in
 //! the table so bundles signed before the rotation still verify; retirement
-//! only stops new checkpoints from naming it. A checkpoint naming a key the
-//! store does not hold is a verification failure, never a pass.
+//! only stops new checkpoints from naming it. A revoked key is refused
+//! outright: `revoked_at` is set once and a checkpoint naming it no longer
+//! verifies. A checkpoint naming a key the store does not hold is a
+//! verification failure, never a pass.
+//!
+//! # Trust anchor
+//!
+//! [`verify_checkpoint`] takes an optional [`TrustAnchor`] the verifier
+//! obtained out of band. Without one it can only report that the signature
+//! matches the key stored in the same database it protects — not authorship.
+//! The caller must pass a pinned key to get [`CheckpointVerification::Valid`].
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -54,6 +64,7 @@ CREATE TABLE IF NOT EXISTS evidence_key (
     public_key TEXT NOT NULL,
     created_at TEXT NOT NULL,
     retired_at TEXT,
+    revoked_at TEXT,
     note TEXT
 );
 CREATE TABLE IF NOT EXISTS evidence_checkpoint (
@@ -77,11 +88,58 @@ CREATE TABLE IF NOT EXISTS evidence_checkpoint (
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_checkpoint_org
     ON evidence_checkpoint(org_id, created_at);
+CREATE TRIGGER IF NOT EXISTS evidence_key_no_delete
+BEFORE DELETE ON evidence_key
+BEGIN SELECT RAISE(ABORT, 'evidence_key rows are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_key_immutable
+BEFORE UPDATE ON evidence_key
+WHEN NOT (
+    OLD.key_id IS NEW.key_id
+    AND OLD.algorithm IS NEW.algorithm
+    AND OLD.public_key IS NEW.public_key
+    AND OLD.created_at IS NEW.created_at
+    AND OLD.note IS NEW.note
+    AND (OLD.retired_at IS NEW.retired_at
+         OR (OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL))
+    AND (OLD.revoked_at IS NEW.revoked_at
+         OR (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL))
+)
+BEGIN SELECT RAISE(ABORT, 'evidence_key fields are immutable; retired_at and revoked_at may be set once'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_checkpoint_no_delete
+BEFORE DELETE ON evidence_checkpoint
+BEGIN SELECT RAISE(ABORT, 'evidence_checkpoint rows are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_checkpoint_immutable
+BEFORE UPDATE ON evidence_checkpoint
+WHEN NOT (
+    OLD.checkpoint_id IS NEW.checkpoint_id
+    AND OLD.class IS NEW.class
+    AND OLD.org_id IS NEW.org_id
+    AND OLD.seq IS NEW.seq
+    AND OLD.hash IS NEW.hash
+    AND OLD.window_start IS NEW.window_start
+    AND OLD.window_end IS NEW.window_end
+    AND OLD.global_from_hash IS NEW.global_from_hash
+    AND OLD.global_head_hash IS NEW.global_head_hash
+    AND OLD.org_row_count IS NEW.org_row_count
+    AND OLD.org_chain_hash IS NEW.org_chain_hash
+    AND OLD.key_id IS NEW.key_id
+    AND OLD.signed_at IS NEW.signed_at
+    AND OLD.digest IS NEW.digest
+    AND OLD.created_at IS NEW.created_at
+    AND (OLD.signature IS NEW.signature
+         OR (OLD.signature IS NULL AND NEW.signature IS NOT NULL))
+)
+BEGIN SELECT RAISE(ABORT, 'evidence_checkpoint rows are immutable; only a signature may be set once'); END;
 ",
 };
 
 /// The only signing algorithm this build accepts.
 pub const ALGORITHM_ED25519: &str = "ed25519";
+
+/// The domain tag carried inside every signed checkpoint digest. It is signed
+/// so a signature over a checkpoint cannot be replayed as a signature over a
+/// different object type, and so the format can be versioned without guessing.
+pub const CHECKPOINT_FORMAT: &str = "ua.evidence.checkpoint.v1";
 
 /// A checkpoint's bundle class. The two classes carry different signed fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +211,17 @@ pub struct EvidenceKey {
     pub public_key: String,
     pub created_at: String,
     pub retired_at: Option<String>,
+    pub revoked_at: Option<String>,
     pub note: Option<String>,
+}
+
+/// A key the verifier obtained out of band. This is the only thing that turns
+/// a stored-key match into authorship: the key in the checkpoint's own
+/// database is attacker-controlled, so the verifier must pin one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustAnchor {
+    pub key_id: String,
+    pub public_key: String,
 }
 
 /// What verification concluded. A caller must not treat anything but
@@ -161,16 +229,28 @@ pub struct EvidenceKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CheckpointVerification {
-    /// The signature is present and checks out against the named key.
+    /// The signature is present and checks out against a pinned key.
     Valid,
+    /// The signature matches the key in the same store, but no trust anchor
+    /// was supplied. This is not authorship: the key row could have been
+    /// swapped with the checkpoint.
+    ValidInStoreOnly { key_id: String },
     /// The row exists but no signature was attached yet.
     Unsigned,
     /// The named key is not in the store.
     UnknownKey { key_id: String },
+    /// The named key is revoked: a checkpoint naming it no longer verifies.
+    KeyRevoked { key_id: String },
+    /// The checkpoint names a different key than the pinned anchor.
+    KeyMismatch { expected: String, found: String },
     /// The signature does not verify over the recomputed digest.
     InvalidSignature,
     /// The stored digest does not match the fields (a row edited after signing).
     DigestMismatch,
+    /// A hub checkpoint does not match the ledger chain it claims to cover.
+    LedgerMismatch { reason: String },
+    /// An `org` checkpoint cannot be checked against the ledger in this build.
+    OrgClassNotVerifiable,
 }
 
 impl Checkpoint {
@@ -181,8 +261,9 @@ impl Checkpoint {
         out.push('{');
         match self.class {
             CheckpointClass::Hub => {
-                // Sorted: class, hash, key_id, org_id, seq, signed_at.
+                // Sorted: class, format, hash, key_id, org_id, seq, signed_at.
                 field_str(&mut out, "class", self.class.as_str(), true);
+                field_str(&mut out, "format", CHECKPOINT_FORMAT, false);
                 field_opt(&mut out, "hash", self.hash.as_deref(), false);
                 field_str(&mut out, "key_id", &self.key_id, false);
                 field_opt(&mut out, "org_id", self.org_id.as_deref(), false);
@@ -190,9 +271,11 @@ impl Checkpoint {
                 field_str(&mut out, "signed_at", &self.signed_at, false);
             }
             CheckpointClass::Org => {
-                // Sorted: class, global_from_hash, global_head_hash, key_id,
-                // org_chain_hash, org_id, org_row_count, signed_at, window.
+                // Sorted: class, format, global_from_hash, global_head_hash,
+                // key_id, org_chain_hash, org_id, org_row_count, signed_at,
+                // window.
                 field_str(&mut out, "class", self.class.as_str(), true);
+                field_str(&mut out, "format", CHECKPOINT_FORMAT, false);
                 field_opt(&mut out, "global_from_hash", self.global_from_hash.as_deref(), false);
                 field_opt(&mut out, "global_head_hash", self.global_head_hash.as_deref(), false);
                 field_str(&mut out, "key_id", &self.key_id, false);
@@ -262,7 +345,8 @@ fn row_to_key(r: &Row<'_>) -> rusqlite::Result<EvidenceKey> {
         public_key: r.get(2)?,
         created_at: r.get(3)?,
         retired_at: r.get(4)?,
-        note: r.get(5)?,
+        revoked_at: r.get(5)?,
+        note: r.get(6)?,
     })
 }
 
@@ -295,7 +379,9 @@ fn row_to_checkpoint(r: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     })
 }
 
-/// Add a public key. Refuses a duplicate id and a key whose hex is not 32 bytes.
+/// Add a public key. Refuses a duplicate id and a key whose hex is not a valid
+/// 32-byte Ed25519 point. The hex is stored lowercase so a pinned anchor and
+/// the stored row compare byte-for-byte.
 pub fn key_add(
     tx: &mut WriteTx<'_>,
     key_id: &str,
@@ -303,10 +389,18 @@ pub fn key_add(
     created_at: &str,
     note: Option<&str>,
 ) -> UaResult<()> {
+    let normalized = public_key_hex.trim().to_ascii_lowercase();
     let bytes =
-        hex::decode(public_key_hex).map_err(|_| UaError::invalid("public key must be hex-encoded"))?;
+        hex::decode(&normalized).map_err(|_| UaError::invalid("public key must be hex-encoded"))?;
     if bytes.len() != 32 {
         return Err(UaError::invalid(format!("an Ed25519 public key is 32 bytes, got {}", bytes.len())));
+    }
+    let mut point = [0u8; 32];
+    point.copy_from_slice(&bytes);
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&point)
+        .map_err(|e| UaError::invalid(format!("public key is not a valid Ed25519 point: {e}")))?;
+    if verifying.is_weak() {
+        return Err(UaError::invalid("public key is a weak Ed25519 point"));
     }
     let exists: Option<String> = tx
         .query_row("SELECT key_id FROM evidence_key WHERE key_id = ?1", [key_id], |r| r.get(0))
@@ -315,15 +409,24 @@ pub fn key_add(
         return Err(UaError::conflict(format!("evidence key {key_id:?} already exists")));
     }
     tx.execute(
-        "INSERT INTO evidence_key (key_id, algorithm, public_key, created_at, retired_at, note) \
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-        params![key_id, ALGORITHM_ED25519, public_key_hex, created_at, note],
+        "INSERT INTO evidence_key (key_id, algorithm, public_key, created_at, retired_at, revoked_at, note) \
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)",
+        params![key_id, ALGORITHM_ED25519, normalized, created_at, note],
+    )?;
+    crate::ledger::append(
+        tx,
+        crate::EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "evidence.key.added",
+            serde_json::json!({ "key_id": key_id, "algorithm": ALGORITHM_ED25519 }),
+        )
+        .by("evidence"),
     )?;
     Ok(())
 }
 
 /// Retire a key: it stays in the store so old checkpoints verify, but new
-/// checkpoints may not name it.
+/// checkpoints may not name it. Retirement is not revocation.
 pub fn key_retire(tx: &mut WriteTx<'_>, key_id: &str, retired_at: &str) -> UaResult<()> {
     let changed = tx.execute(
         "UPDATE evidence_key SET retired_at = ?2 WHERE key_id = ?1 AND retired_at IS NULL",
@@ -334,6 +437,40 @@ pub fn key_retire(tx: &mut WriteTx<'_>, key_id: &str, retired_at: &str) -> UaRes
             "no active evidence key {key_id:?} (already retired or unknown)"
         )));
     }
+    crate::ledger::append(
+        tx,
+        crate::EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "evidence.key.retired",
+            serde_json::json!({ "key_id": key_id, "retired_at": retired_at }),
+        )
+        .by("evidence"),
+    )?;
+    Ok(())
+}
+
+/// Revoke a key: the key is compromised. Unlike retirement, a revoked key is
+/// refused for new checkpoints and every checkpoint naming it no longer
+/// verifies. Revocation is set once and cannot be undone.
+pub fn key_revoke(tx: &mut WriteTx<'_>, key_id: &str, revoked_at: &str) -> UaResult<()> {
+    let changed = tx.execute(
+        "UPDATE evidence_key SET revoked_at = ?2 WHERE key_id = ?1 AND revoked_at IS NULL",
+        params![key_id, revoked_at],
+    )?;
+    if changed == 0 {
+        return Err(UaError::not_found(format!(
+            "no unrevoked evidence key {key_id:?} (already revoked or unknown)"
+        )));
+    }
+    crate::ledger::append(
+        tx,
+        crate::EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "evidence.key.revoked",
+            serde_json::json!({ "key_id": key_id, "revoked_at": revoked_at }),
+        )
+        .by("evidence"),
+    )?;
     Ok(())
 }
 
@@ -341,7 +478,7 @@ pub fn key_retire(tx: &mut WriteTx<'_>, key_id: &str, retired_at: &str) -> UaRes
 pub fn key_get(conn: &Connection, key_id: &str) -> UaResult<Option<EvidenceKey>> {
     let key = conn
         .query_row(
-            "SELECT key_id, algorithm, public_key, created_at, retired_at, note \
+            "SELECT key_id, algorithm, public_key, created_at, retired_at, revoked_at, note \
              FROM evidence_key WHERE key_id = ?1",
             [key_id],
             row_to_key,
@@ -353,15 +490,16 @@ pub fn key_get(conn: &Connection, key_id: &str) -> UaResult<Option<EvidenceKey>>
 /// List every key, active first.
 pub fn key_list(conn: &Connection) -> UaResult<Vec<EvidenceKey>> {
     let mut stmt = conn.prepare(
-        "SELECT key_id, algorithm, public_key, created_at, retired_at, note \
-         FROM evidence_key ORDER BY retired_at IS NOT NULL, key_id",
+        "SELECT key_id, algorithm, public_key, created_at, retired_at, revoked_at, note \
+         FROM evidence_key ORDER BY revoked_at IS NOT NULL, retired_at IS NOT NULL, key_id",
     )?;
     let rows = stmt.query_map([], row_to_key)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Write a checkpoint row and return its digest. The key must exist and be
-/// active; a retired key is refused so a rotation cannot be silently undone.
+/// neither retired nor revoked; a retired key would undo a rotation, and a
+/// revoked key is compromised.
 pub fn checkpoint_write(tx: &mut WriteTx<'_>, checkpoint: &Checkpoint, created_at: &str) -> UaResult<String> {
     let key = key_get(tx, &checkpoint.key_id)?.ok_or_else(|| {
         UaError::not_found(format!("evidence key {:?} is not in the store", checkpoint.key_id))
@@ -369,6 +507,12 @@ pub fn checkpoint_write(tx: &mut WriteTx<'_>, checkpoint: &Checkpoint, created_a
     if key.retired_at.is_some() {
         return Err(UaError::conflict(format!(
             "evidence key {:?} is retired; a new checkpoint may not name it",
+            checkpoint.key_id
+        )));
+    }
+    if key.revoked_at.is_some() {
+        return Err(UaError::conflict(format!(
+            "evidence key {:?} is revoked; a new checkpoint may not name it",
             checkpoint.key_id
         )));
     }
@@ -396,11 +540,25 @@ pub fn checkpoint_write(tx: &mut WriteTx<'_>, checkpoint: &Checkpoint, created_a
             created_at,
         ],
     )?;
+    crate::ledger::append(
+        tx,
+        crate::EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "evidence.checkpoint.written",
+            serde_json::json!({
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "class": checkpoint.class.as_str(),
+                "key_id": checkpoint.key_id,
+            }),
+        )
+        .by("evidence"),
+    )?;
     Ok(digest)
 }
 
 /// Attach an operator's signature to a checkpoint. Refuses a second signature:
 /// a row is signed once, and a re-signature would hide which key attested it.
+/// A retired or revoked key cannot be used to sign a checkpoint.
 pub fn checkpoint_attach(tx: &mut WriteTx<'_>, checkpoint_id: &str, signature_hex: &str) -> UaResult<()> {
     let bytes = hex::decode(signature_hex).map_err(|_| UaError::invalid("signature must be hex-encoded"))?;
     if bytes.len() != 64 {
@@ -422,9 +580,37 @@ pub fn checkpoint_attach(tx: &mut WriteTx<'_>, checkpoint_id: &str, signature_he
         }
         Some(None) => {}
     }
+    let checkpoint = checkpoint_get(tx, checkpoint_id)?
+        .ok_or_else(|| UaError::not_found(format!("no checkpoint {checkpoint_id:?}")))?;
+    let key = key_get(tx, &checkpoint.key_id)?
+        .ok_or_else(|| UaError::not_found(format!("evidence key {:?} is not in the store", checkpoint.key_id)))?;
+    if key.retired_at.is_some() {
+        return Err(UaError::conflict(format!(
+            "evidence key {:?} is retired; its checkpoint cannot be signed",
+            checkpoint.key_id
+        )));
+    }
+    if key.revoked_at.is_some() {
+        return Err(UaError::conflict(format!(
+            "evidence key {:?} is revoked; its checkpoint cannot be signed",
+            checkpoint.key_id
+        )));
+    }
     tx.execute(
         "UPDATE evidence_checkpoint SET signature = ?2 WHERE checkpoint_id = ?1",
         params![checkpoint_id, signature_hex],
+    )?;
+    crate::ledger::append(
+        tx,
+        crate::EventInput::new(
+            ua_core::DEFAULT_ORG,
+            "evidence.checkpoint.signed",
+            serde_json::json!({
+                "checkpoint_id": checkpoint_id,
+                "key_id": checkpoint.key_id,
+            }),
+        )
+        .by("evidence"),
     )?;
     Ok(())
 }
@@ -459,9 +645,20 @@ pub fn checkpoint_signature(
     Ok(row)
 }
 
-/// Verify a checkpoint's stored signature. Recomputes the digest from the
-/// fields, so a row edited after signing fails as [`DigestMismatch`].
-pub fn verify_checkpoint(conn: &Connection, checkpoint_id: &str) -> UaResult<CheckpointVerification> {
+/// Verify a checkpoint's stored signature and, for a hub checkpoint, its
+/// ledger anchor. Recomputes the digest from the fields, so a row edited after
+/// signing fails as [`CheckpointVerification::DigestMismatch`].
+///
+/// `anchor` is the key the verifier obtained out of band. Without it the
+/// result is [`CheckpointVerification::ValidInStoreOnly`]: the signature
+/// matches the key in the same database the checkpoint protects, which is not
+/// authorship. A pinned key must be supplied for
+/// [`CheckpointVerification::Valid`].
+pub fn verify_checkpoint(
+    conn: &Connection,
+    checkpoint_id: &str,
+    anchor: Option<&TrustAnchor>,
+) -> UaResult<CheckpointVerification> {
     let Some(checkpoint) = checkpoint_get(conn, checkpoint_id)? else {
         return Err(UaError::not_found(format!("no checkpoint {checkpoint_id:?}")));
     };
@@ -470,6 +667,12 @@ pub fn verify_checkpoint(conn: &Connection, checkpoint_id: &str) -> UaResult<Che
     };
     if checkpoint.digest() != stored_digest {
         return Ok(CheckpointVerification::DigestMismatch);
+    }
+    if checkpoint.class == CheckpointClass::Org {
+        return Ok(CheckpointVerification::OrgClassNotVerifiable);
+    }
+    if let Some(reason) = ledger_mismatch(conn, &checkpoint)? {
+        return Ok(CheckpointVerification::LedgerMismatch { reason });
     }
     let Some(signature) = signature else {
         return Ok(CheckpointVerification::Unsigned);
@@ -480,10 +683,58 @@ pub fn verify_checkpoint(conn: &Connection, checkpoint_id: &str) -> UaResult<Che
     if key.algorithm != ALGORITHM_ED25519 {
         return Ok(CheckpointVerification::InvalidSignature);
     }
-    match verify_ed25519(&key.public_key, &stored_digest, &signature) {
-        Ok(()) => Ok(CheckpointVerification::Valid),
-        Err(_) => Ok(CheckpointVerification::InvalidSignature),
+    if key.revoked_at.is_some() {
+        return Ok(CheckpointVerification::KeyRevoked { key_id: checkpoint.key_id.clone() });
     }
+    match anchor {
+        Some(anchor) => {
+            if anchor.key_id != checkpoint.key_id {
+                return Ok(CheckpointVerification::KeyMismatch {
+                    expected: checkpoint.key_id.clone(),
+                    found: anchor.key_id.clone(),
+                });
+            }
+            if !anchor.public_key.eq_ignore_ascii_case(&key.public_key) {
+                return Ok(CheckpointVerification::KeyMismatch {
+                    expected: key.public_key.clone(),
+                    found: anchor.public_key.clone(),
+                });
+            }
+            match verify_ed25519(&anchor.public_key, &stored_digest, &signature) {
+                Ok(()) => Ok(CheckpointVerification::Valid),
+                Err(_) => Ok(CheckpointVerification::InvalidSignature),
+            }
+        }
+        None => match verify_ed25519(&key.public_key, &stored_digest, &signature) {
+            Ok(()) => Ok(CheckpointVerification::ValidInStoreOnly { key_id: checkpoint.key_id.clone() }),
+            Err(_) => Ok(CheckpointVerification::InvalidSignature),
+        },
+    }
+}
+
+/// Check a hub checkpoint against the ledger it claims to cover. Returns the
+/// reason it does not match, or `None` when the row and the chain up to it are
+/// intact. A rewritten or invented `seq`/`hash` therefore cannot verify.
+fn ledger_mismatch(conn: &Connection, checkpoint: &Checkpoint) -> UaResult<Option<String>> {
+    let Some(seq) = checkpoint.seq else {
+        return Ok(Some("hub checkpoint carries no seq".into()));
+    };
+    let Some(hash) = checkpoint.hash.as_deref() else {
+        return Ok(Some("hub checkpoint carries no hash".into()));
+    };
+    let Some(entry) = crate::ledger::entry_hash_at(conn, seq)? else {
+        return Ok(Some(format!("event_log has no row at seq {seq}")));
+    };
+    if !entry.eq_ignore_ascii_case(hash) {
+        return Ok(Some(format!(
+            "event_log[{seq}].entry_hash does not match the checkpoint hash"
+        )));
+    }
+    let report = crate::ledger::verify_through(conn, seq)?;
+    if !report.ok {
+        return Ok(Some(report.reason.unwrap_or_else(|| "ledger chain does not verify".into())));
+    }
+    Ok(None)
 }
 
 /// Verify an Ed25519 signature over the raw digest bytes. Public so the offline
@@ -519,7 +770,11 @@ mod tests {
 
     fn open() -> (tempfile::TempDir, Db) {
         let dir = tempdir().unwrap();
-        let db = Db::open(&dir.path().join("hub.db"), &[KEY_STORE_PART]).unwrap();
+        let db = Db::open(
+            &dir.path().join("hub.db"),
+            &[KEY_STORE_PART, crate::ledger::SCHEMA],
+        )
+        .unwrap();
         (dir, db)
     }
 
@@ -529,13 +784,30 @@ mod tests {
         (sk, pk)
     }
 
-    fn hub_checkpoint(key_id: &str) -> Checkpoint {
+    /// Append one event and return its seq and entry hash.
+    fn ledger_row(db: &Db) -> (i64, String) {
+        db.write(|tx| {
+            let event = crate::ledger::append(
+                tx,
+                crate::EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "test.event",
+                    serde_json::json!({"n": 1}),
+                ),
+            )?
+            .expect("event appended");
+            Ok((event.seq, event.entry_hash.expect("hashed")))
+        })
+        .unwrap()
+    }
+
+    fn hub_checkpoint(key_id: &str, seq: i64, hash: &str) -> Checkpoint {
         Checkpoint {
             checkpoint_id: "cp-1".into(),
             class: CheckpointClass::Hub,
             org_id: Some("default".into()),
-            seq: Some(42),
-            hash: Some("abc123".into()),
+            seq: Some(seq),
+            hash: Some(hash.into()),
             window: None,
             global_from_hash: None,
             global_head_hash: None,
@@ -546,16 +818,26 @@ mod tests {
         }
     }
 
+    fn signed_checkpoint(db: &Db, sk: &SigningKey, key_id: &str, seq: i64, hash: &str) -> String {
+        let cp = hub_checkpoint(key_id, seq, hash);
+        let digest = db.write(|tx| checkpoint_write(tx, &cp, "now")).unwrap();
+        let sig = hex::encode(sk.sign(&hex::decode(&digest).unwrap()).to_bytes());
+        db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
+        digest
+    }
+
     #[test]
     fn digest_is_stable_and_covers_only_the_class_fields() {
-        let cp = hub_checkpoint("k1");
+        let cp = hub_checkpoint("k1", 42, "abc123");
         let first = cp.digest();
         assert_eq!(first, cp.digest(), "digest must be deterministic");
         assert_eq!(first.len(), 64);
         let input = cp.digest_input();
-        assert!(input.starts_with("{\"class\":\"hub\",\"hash\":"));
+        assert!(
+            input.starts_with("{\"class\":\"hub\",\"format\":\"ua.evidence.checkpoint.v1\",\"hash\":"),
+            "{input}"
+        );
         assert!(!input.contains("window"), "hub digest must not carry org fields: {input}");
-        // An unused field set to a value must not change the digest.
         let mut other = cp.clone();
         other.window = Some(Window { start: "a".into(), end: "b".into() });
         assert_eq!(first, other.digest(), "hub digest ignores org-only fields");
@@ -569,7 +851,10 @@ mod tests {
             org_id: Some("acme".into()),
             seq: None,
             hash: None,
-            window: Some(Window { start: "2026-11-01T00:00:00Z".into(), end: "2026-11-02T00:00:00Z".into() }),
+            window: Some(Window {
+                start: "2026-11-01T00:00:00Z".into(),
+                end: "2026-11-02T00:00:00Z".into(),
+            }),
             global_from_hash: Some("g0".into()),
             global_head_hash: Some("g1".into()),
             org_row_count: Some(9),
@@ -578,11 +863,12 @@ mod tests {
             signed_at: "2026-11-25T00:00:00Z".into(),
         };
         let input = cp.digest_input();
+        assert!(input.contains("\"format\":\"ua.evidence.checkpoint.v1\""), "{input}");
         assert!(
-            input
-                .contains("\"window\":{\"end\":\"2026-11-02T00:00:00Z\",\"start\":\"2026-11-01T00:00:00Z\"}")
+            input.contains("\"window\":{\"end\":\"2026-11-02T00:00:00Z\",\"start\":\"2026-11-01T00:00:00Z\"}"),
+            "{input}"
         );
-        assert!(input.contains("\"org_row_count\":9"));
+        assert!(input.contains("\"org_row_count\":9"), "{input}");
         assert!(!input.contains("\"seq\""), "org digest must not carry seq: {input}");
     }
 
@@ -595,12 +881,14 @@ mod tests {
         assert_eq!(key.algorithm, "ed25519");
         assert_eq!(key.public_key, pk);
         assert!(key.retired_at.is_none());
+        assert!(key.revoked_at.is_none());
 
         db.write(|tx| key_retire(tx, "k1", "2026-11-26T00:00:00Z")).unwrap();
         assert!(db.read(|c| key_get(c, "k1")).unwrap().unwrap().retired_at.is_some());
-        // A retired key cannot be named by a new checkpoint.
-        let err =
-            db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1"), "2026-11-27T00:00:00Z")).unwrap_err();
+        let (seq, hash) = ledger_row(&db);
+        let err = db
+            .write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "2026-11-27T00:00:00Z"))
+            .unwrap_err();
         assert!(err.to_string().contains("retired"), "{err}");
     }
 
@@ -616,63 +904,71 @@ mod tests {
     }
 
     #[test]
-    fn signed_checkpoint_verifies_and_a_tampered_row_does_not() {
+    fn signed_checkpoint_verifies_with_a_pinned_anchor_only() {
         let (_dir, db) = open();
         let (sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
-        let cp = hub_checkpoint("k1");
-        let digest = db.write(|tx| checkpoint_write(tx, &cp, "now")).unwrap();
-        let sig = hex::encode(sk.sign(&hex::decode(&digest).unwrap()).to_bytes());
-        db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
 
-        assert_eq!(db.read(|c| verify_checkpoint(c, "cp-1")).unwrap(), CheckpointVerification::Valid);
-
-        // Editing a signed field after the signature is attached breaks the digest.
-        db.write(|tx| {
-            tx.execute("UPDATE evidence_checkpoint SET seq = 43 WHERE checkpoint_id = 'cp-1'", [])?;
-            Ok(())
-        })
-        .unwrap();
+        // No anchor: the signature checks against the store, but authorship is not proven.
         assert_eq!(
-            db.read(|c| verify_checkpoint(c, "cp-1")).unwrap(),
-            CheckpointVerification::DigestMismatch
+            db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
+            CheckpointVerification::ValidInStoreOnly { key_id: "k1".into() }
+        );
+        // A pinned anchor proves it.
+        let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk.clone() };
+        assert_eq!(
+            db.read(|c| verify_checkpoint(c, "cp-1", Some(&anchor))).unwrap(),
+            CheckpointVerification::Valid
+        );
+        // A different pinned key is refused.
+        let wrong = TrustAnchor { key_id: "k1".into(), public_key: hex::encode([9u8; 32]) };
+        assert!(matches!(
+            db.read(|c| verify_checkpoint(c, "cp-1", Some(&wrong))).unwrap(),
+            CheckpointVerification::KeyMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_must_match_the_ledger() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        // A seq the ledger does not contain at all.
+        signed_checkpoint(&db, &sk, "k1", 999, "not-a-real-hash");
+        let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk };
+        assert!(matches!(
+            db.read(|c| verify_checkpoint(c, "cp-1", Some(&anchor))).unwrap(),
+            CheckpointVerification::LedgerMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_revoked_key_is_refused() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
+        db.write(|tx| key_revoke(tx, "k1", "now")).unwrap();
+        let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk };
+        assert_eq!(
+            db.read(|c| verify_checkpoint(c, "cp-1", Some(&anchor))).unwrap(),
+            CheckpointVerification::KeyRevoked { key_id: "k1".into() }
         );
     }
 
     #[test]
-    fn unsigned_and_unknown_key_are_not_passes() {
+    fn unsigned_checkpoint_is_not_valid() {
         let (_dir, db) = open();
         let (_sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
-        db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1"), "now")).unwrap();
-        assert_eq!(db.read(|c| verify_checkpoint(c, "cp-1")).unwrap(), CheckpointVerification::Unsigned);
-
-        // A checkpoint whose key is no longer in the store. The store's foreign
-        // key refuses this through `Db`, so build the row on a raw connection
-        // with enforcement off: that is the state a verifier holding a foreign
-        // hub's bundle is in.
-        let dir = tempdir().unwrap();
-        let mut conn = Connection::open(dir.path().join("raw.db")).unwrap();
-        apply(&mut conn, &[KEY_STORE_PART]).unwrap();
-        conn.execute(
-            "INSERT INTO evidence_key (key_id, algorithm, public_key, created_at) \
-             VALUES ('k1', 'ed25519', ?1, 'now')",
-            [&pk],
-        )
-        .unwrap();
-        let cp = hub_checkpoint("k1");
-        conn.execute(
-            "INSERT INTO evidence_checkpoint \
-             (checkpoint_id, class, org_id, seq, hash, key_id, signed_at, digest, created_at, signature) \
-             VALUES ('cp-1', 'hub', 'default', 42, 'abc123', 'k1', '2026-11-25T00:00:00Z', ?1, 'now', ?2)",
-            rusqlite::params![cp.digest(), hex::encode([0u8; 64])],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute("DELETE FROM evidence_key WHERE key_id = 'k1'", []).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
         assert_eq!(
-            verify_checkpoint(&conn, "cp-1").unwrap(),
-            CheckpointVerification::UnknownKey { key_id: "k1".into() }
+            db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
+            CheckpointVerification::Unsigned
         );
     }
 
@@ -681,12 +977,14 @@ mod tests {
         let (_dir, db) = open();
         let (_sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
-        let digest = db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1"), "now")).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        let digest =
+            db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
         let other = SigningKey::from_bytes(&[9u8; 32]);
         let sig = hex::encode(other.sign(&hex::decode(&digest).unwrap()).to_bytes());
         db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
         assert_eq!(
-            db.read(|c| verify_checkpoint(c, "cp-1")).unwrap(),
+            db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
             CheckpointVerification::InvalidSignature
         );
     }
@@ -696,11 +994,113 @@ mod tests {
         let (_dir, db) = open();
         let (sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
-        let digest = db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1"), "now")).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        let digest =
+            db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
         let sig = hex::encode(sk.sign(&hex::decode(&digest).unwrap()).to_bytes());
         db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
         let err = db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap_err();
         assert!(err.to_string().contains("already carries a signature"), "{err}");
+    }
+
+    #[test]
+    fn a_tampered_row_fails_the_digest() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
+        // An attacker with SQL access drops the guard, then edits a signed field.
+        db.write(|tx| {
+            tx.execute("DROP TRIGGER evidence_checkpoint_immutable", [])?;
+            tx.execute("UPDATE evidence_checkpoint SET seq = 43 WHERE checkpoint_id = 'cp-1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
+            CheckpointVerification::DigestMismatch
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_not_a_pass() {
+        let (dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
+        // An attacker with SQL access removes the key row after signing. The
+        // pragma only takes effect outside a transaction, so use a raw
+        // connection to the same file.
+        let raw = Connection::open(dir.path().join("hub.db")).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        raw.execute("DROP TRIGGER evidence_key_no_delete", []).unwrap();
+        raw.execute("DELETE FROM evidence_key WHERE key_id = 'k1'", []).unwrap();
+        drop(raw);
+        assert_eq!(
+            db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
+            CheckpointVerification::UnknownKey { key_id: "k1".into() }
+        );
+    }
+
+    #[test]
+    fn triggers_refuse_key_and_checkpoint_edits() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
+
+        // The key's public material cannot be replaced.
+        let err = db
+            .write(|tx| {
+                tx.execute("UPDATE evidence_key SET public_key = '00' WHERE key_id = 'k1'", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
+        // A checkpoint's signed fields cannot be edited.
+        let err = db
+            .write(|tx| {
+                tx.execute("UPDATE evidence_checkpoint SET seq = 99 WHERE checkpoint_id = 'cp-1'", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
+        // Neither row can be deleted.
+        let err = db
+            .write(|tx| {
+                tx.execute("DELETE FROM evidence_checkpoint WHERE checkpoint_id = 'cp-1'", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
+    }
+
+    #[test]
+    fn key_and_checkpoint_changes_are_ledgered() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq, hash) = ledger_row(&db);
+        signed_checkpoint(&db, &sk, "k1", seq, &hash);
+        db.write(|tx| key_retire(tx, "k1", "now")).unwrap();
+        let channels: Vec<String> = db
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT channel FROM event_log ORDER BY seq")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        for expected in [
+            "evidence.key.added",
+            "evidence.checkpoint.written",
+            "evidence.checkpoint.signed",
+            "evidence.key.retired",
+        ] {
+            assert!(channels.iter().any(|c| c == expected), "missing {expected} in {channels:?}");
+        }
     }
 
     #[test]

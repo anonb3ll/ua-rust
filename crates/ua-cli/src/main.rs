@@ -447,6 +447,20 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
+        // Offline evidence commands never touch the hub database: no lock, no
+        // open, no migration. A signing key must not require a hub to exist.
+        Cmd::Evidence(ops::evidence::EvidenceArgs {
+            cmd: ops::evidence::EvidenceCmd::KeyGenerate { out },
+        }) => {
+            ops::evidence::run_key_generate(&out)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Evidence(ops::evidence::EvidenceArgs {
+            cmd: ops::evidence::EvidenceCmd::Sign { key_file, digest, out },
+        }) => {
+            ops::evidence::run_sign(&key_file, &digest, out.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
         cmd => {
             let cfg = load_config(explicit_config.as_deref())?;
 

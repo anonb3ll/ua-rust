@@ -16,8 +16,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde_json::json;
 use ua_store::evidence::{
-    Checkpoint, CheckpointClass, CheckpointVerification, Window, checkpoint_attach, checkpoint_write,
-    key_add, key_list, key_retire, verify_checkpoint,
+    Checkpoint, CheckpointClass, CheckpointVerification, TrustAnchor, Window, checkpoint_attach,
+    checkpoint_write, key_add, key_list, key_retire, key_revoke, verify_checkpoint,
 };
 use ua_tools::Hub;
 
@@ -45,6 +45,12 @@ pub enum EvidenceCmd {
     KeyList,
     /// Retire a key. It stays in the store so older bundles still verify.
     KeyRetire {
+        #[arg(long)]
+        key_id: String,
+    },
+    /// Revoke a key. A revoked key is refused for new checkpoints and no
+    /// checkpoint naming it verifies. Use this when the key is compromised.
+    KeyRevoke {
         #[arg(long)]
         key_id: String,
     },
@@ -77,10 +83,19 @@ pub enum EvidenceCmd {
         #[arg(long)]
         signature: String,
     },
-    /// Verify a checkpoint's signature against its named key.
+    /// Verify a checkpoint's signature. Pass the key you obtained out of band
+    /// (`--anchor-key`); without it the result is only "matches the key in the
+    /// same database", which is not authorship.
     Verify {
         #[arg(long)]
         checkpoint: String,
+        /// Hex-encoded 32-byte Ed25519 public key the verifier pinned out of band.
+        #[arg(long)]
+        anchor_key: Option<String>,
+        /// The key id the pinned anchor belongs to. Defaults to the checkpoint's
+        /// key id; a mismatch is refused.
+        #[arg(long)]
+        anchor_key_id: Option<String>,
     },
 }
 
@@ -140,9 +155,13 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<()> {
             hub.db().write(|tx| key_retire(tx, &key_id, &now))?;
             println!("{}", json!({ "key_id": key_id, "retired": true }));
         }
+        EvidenceCmd::KeyRevoke { key_id } => {
+            let now = ua_core::time::now();
+            hub.db().write(|tx| key_revoke(tx, &key_id, &now))?;
+            println!("{}", json!({ "key_id": key_id, "revoked": true }));
+        }
         EvidenceCmd::KeyGenerate { out } => {
-            let key = generate_key_file(&out)?;
-            println!("{}", json!({ "public_key": key, "key_file": out.display().to_string() }));
+            run_key_generate(&out)?;
         }
         EvidenceCmd::Checkpoint(args) => {
             let checkpoint = build_checkpoint(args)?;
@@ -159,28 +178,54 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<()> {
             );
         }
         EvidenceCmd::Sign { key_file, digest, out } => {
-            let sig = sign_digest(&key_file, &digest)?;
-            match out {
-                Some(path) => {
-                    write_atomic_file(&path, sig.as_bytes(), false)?;
-                    println!("{}", json!({ "signature": sig, "out": path.display().to_string() }));
-                }
-                None => println!("{sig}"),
-            }
+            run_sign(&key_file, &digest, out.as_deref())?;
         }
         EvidenceCmd::Attach { checkpoint, signature } => {
             hub.db().write(|tx| checkpoint_attach(tx, &checkpoint, &signature))?;
             println!("{}", json!({ "checkpoint_id": checkpoint, "attached": true }));
         }
-        EvidenceCmd::Verify { checkpoint } => {
-            let verdict = hub.db().read(|c| verify_checkpoint(c, &checkpoint))?;
+        EvidenceCmd::Verify { checkpoint, anchor_key, anchor_key_id } => {
+            let anchor = match (anchor_key, anchor_key_id) {
+                (Some(public_key), Some(key_id)) => Some(TrustAnchor { key_id, public_key }),
+                (Some(_), None) => anyhow::bail!("--anchor-key-id is required with --anchor-key"),
+                (None, Some(_)) => anyhow::bail!("--anchor-key is required with --anchor-key-id"),
+                (None, None) => None,
+            };
+            let verdict = hub.db().read(|c| verify_checkpoint(c, &checkpoint, anchor.as_ref()))?;
             println!("{}", serde_json::to_string_pretty(&verdict)?);
             // A non-valid verdict is not authorship: exit non-zero so a script
             // cannot treat an unverified checkpoint as signed.
             if verdict != CheckpointVerification::Valid {
+                if let CheckpointVerification::ValidInStoreOnly { .. } = verdict {
+                    eprintln!(
+                        "not authorship: the key came from the same database; pass --anchor-key and --anchor-key-id"
+                    );
+                }
                 std::process::exit(2);
             }
         }
+    }
+    Ok(())
+}
+
+/// Generate a key file without opening the hub. This command is offline: it
+/// must not create or migrate a hub database.
+pub fn run_key_generate(out: &Path) -> anyhow::Result<()> {
+    let key = generate_key_file(out)?;
+    println!("{}", json!({ "public_key": key, "key_file": out.display().to_string() }));
+    Ok(())
+}
+
+/// Sign a digest without opening the hub. This command is offline: it must not
+/// create or migrate a hub database.
+pub fn run_sign(key_file: &Path, digest: &str, out: Option<&Path>) -> anyhow::Result<()> {
+    let sig = sign_digest(key_file, digest)?;
+    match out {
+        Some(path) => {
+            write_atomic_file(path, sig.as_bytes(), false)?;
+            println!("{}", json!({ "signature": sig, "out": path.display().to_string() }));
+        }
+        None => println!("{sig}"),
     }
     Ok(())
 }
