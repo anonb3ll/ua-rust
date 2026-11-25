@@ -104,7 +104,7 @@ pub fn authority_labels(cfg: &Config) -> impl Iterator<Item = &str> {
 
 /// The caller's verified label: an authenticated agent or human. Anonymous,
 /// system and internal callers have none.
-fn verified_label(caller: &Caller) -> Option<&str> {
+pub fn verified_label(caller: &Caller) -> Option<&str> {
     matches!(caller.kind, ActorKind::Agent | ActorKind::Human).then_some(caller.label.as_str())
 }
 

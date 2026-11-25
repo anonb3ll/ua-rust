@@ -41,6 +41,8 @@ pub struct Config {
     pub db_path: Option<PathBuf>,
     /// Root that `fs_write`, `run_cmd` and `git_*` are confined to.
     pub workspace: Option<PathBuf>,
+    /// Existing private directory for approval-gated file deliverable releases.
+    pub deliverable_release_root: Option<PathBuf>,
     /// Extra read-only roots for `fs_read`/`fs_list`/`fs_search`.
     #[serde(deserialize_with = "string_or_list")]
     pub read_roots: Vec<PathBuf>,
@@ -697,6 +699,7 @@ impl Default for Config {
             home: default_home(),
             db_path: None,
             workspace: None,
+            deliverable_release_root: None,
             read_roots: Vec::new(),
             vault_path: None,
             vault_write_dirs: DEFAULT_VAULT_WRITE_DIRS.iter().map(|s| s.to_string()).collect(),

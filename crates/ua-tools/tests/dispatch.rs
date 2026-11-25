@@ -1197,3 +1197,60 @@ mod spawn {
         assert_eq!(c["cessation"], "confirmed");
     }
 }
+
+/// A local harness is a process on the hub, the default organization's:
+/// another organization's caller is refused (`org_unsupported`) before the
+/// harness is looked up and before the `worktree_path` it recorded through
+/// `task_claim` is resolved, with one answer whatever that path is (an
+/// existing directory, a missing one, the hub home) and whatever harness it
+/// names. No approval is parked and no run is minted. A recorded path stays
+/// inert data in its own organization: every tool that would treat it as a
+/// path on the hub refuses another organization first.
+#[tokio::test]
+async fn a_local_harness_refuses_another_organization_before_its_worktree() {
+    let h = H::new();
+    h.sql(
+        "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+         ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+    );
+    let b = Caller { org_id: "org-b".into(), ..agent("agent-1") };
+    let real = h.dir.path().join("wt-org-b");
+    std::fs::create_dir_all(&real).unwrap();
+    let home = h.hub.cfg().home.clone();
+    let mut answers = Vec::new();
+    for path in [real.clone(), h.dir.path().join("missing"), home] {
+        let id = h.ok(&b, "task_add", json!({ "title": "Port the widget" })).await["id"].as_i64().unwrap();
+        // The claim records the absolute path as given: data in org-b.
+        let claimed = h
+            .ok(
+                &b,
+                "task_claim",
+                json!({ "id": id, "agent": "agent-1", "worktree_path": path.display().to_string() }),
+            )
+            .await;
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+        for harness in ["env", "no-such-harness"] {
+            let e = h
+                .err(&b, "dispatch_task", json!({ "task_id": id, "agent": "agent-1", "harness": harness }))
+                .await;
+            assert_eq!(reason(&e), "org_unsupported", "{path:?} {harness}: {e}");
+            answers.push(e.to_string());
+        }
+    }
+    assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals"), json!(0), "no approval was parked");
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM dispatch_runs"), json!(0), "no run was minted");
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0, "nothing ran in the recorded worktree");
+
+    // The default organization's dispatch of a harness still parks its
+    // approval, so the refusal above is the organization's.
+    let id = h.task().await;
+    let e = h
+        .err(
+            &agent("agent-1"),
+            "dispatch_task",
+            json!({ "task_id": id, "agent": "agent-1", "harness": "env" }),
+        )
+        .await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e}");
+}

@@ -543,18 +543,18 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(h.snapshot(), before);
     assert_eq!(h.events(), events);
 
-    // Reads in an unknown organization see nothing; a decision finds nothing.
-    assert_eq!(h.queue(&caller("operator", ActorKind::Human, UNKNOWN)).await, (vec![], vec![], vec![]));
-    let e = h
-        .call(
-            &caller("operator", ActorKind::Human, UNKNOWN),
-            "approval_resolve",
-            json!({ "id": a, "decision": "approve" }),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(e.to_string(), UaError::not_found(format!("approval {a}")).to_string());
+    // Through the registry an unknown organization's reads and decisions
+    // are refused before any tool runs.
+    let op = caller("operator", ActorKind::Human, UNKNOWN);
+    for (tool, args) in [
+        ("approval_pending", json!({ "newest_expired": true })),
+        ("approval_resolve", json!({ "id": a, "decision": "approve" })),
+    ] {
+        let e = h.call(&op, tool, args).await.unwrap_err();
+        assert_eq!(reason(&e), "unknown_organization", "{tool}: {e:?}");
+    }
     assert_eq!(h.snapshot(), before);
+    assert_eq!(h.events(), events);
 }
 
 // --- the ledger --------------------------------------------------------------------------------

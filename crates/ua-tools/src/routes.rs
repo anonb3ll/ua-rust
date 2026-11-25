@@ -331,6 +331,9 @@ pub const MANAGERS: &[Manager] = &[
             ("unassign", Own),
             ("resolve", Own),
             ("drift", Own),
+            ("source_add", Own),
+            ("source_revoke", Own),
+            ("source_list", Own),
             ("catalog", Refused),
             ("install", Refused),
             ("team_install", Refused),
@@ -841,7 +844,8 @@ mod tests {
         assert_eq!(gate("observability_manage", "perf_summary").as_deref(), Some("perf_summary"));
         assert_eq!(gate("export_data", "EXPORT_TASKS").as_deref(), Some("export_tasks"));
         assert_eq!(gate("export_data", "manifest"), None, "a nested call is governed by itself");
-        assert_eq!(gate("skill_registry", "source_add"), None);
+        assert_eq!(gate("skill_registry", "source_add").as_deref(), Some("skill_registry:source_add"));
+        assert_eq!(gate("skill_registry", "source_discover"), None);
         assert_eq!(gate("coordination_manage", " agent_list").as_deref(), Some("agent_list"));
         // The standalone payload is `params`; an own key binds the call.
         assert_eq!(r("plan_manage", "delete").unwrap().unwrap().args, json!({ "x": 1 }));

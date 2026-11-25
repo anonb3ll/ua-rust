@@ -367,10 +367,11 @@ async fn cross_org_search_cache_and_eviction_are_isolated() {
     assert_eq!(b2["results"], b1["results"]);
     assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
 
-    // Unknown org cannot poison the cache (trigger aborts write cleanly).
-    let u1 = search(UNKNOWN, "same query", 5).await.unwrap();
-    assert_eq!(u1["cached"], false);
-    assert_eq!(srv.hits.load(Ordering::SeqCst), 3);
+    // An unknown org cannot poison the cache: the registry refuses it before
+    // the tool runs, so nothing reaches upstream either.
+    let u1 = search(UNKNOWN, "same query", 5).await.unwrap_err();
+    assert_eq!(u1.reason_code(), Some("unknown_organization"), "{u1}");
+    assert_eq!(srv.hits.load(Ordering::SeqCst), 2);
 
     // Seed expired rows for both default and org-b.
     hub.db()

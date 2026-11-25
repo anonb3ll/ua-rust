@@ -3,7 +3,11 @@
 //! [`Registry::call`] is the single chokepoint every adapter (MCP, HTTP, CLI,
 //! UI) goes through. In order it:
 //!
-//! 1. finds the tool, refuses any call outside the narrow grant of a
+//! 1. finds the tool, refuses a caller whose organization `orgs` does not
+//!    hold or holds as suspended (one primary-key read, skipped for the
+//!    default organization; nothing runs and nothing is written, not even a
+//!    `tool_calls` row or a decision event), refuses any call outside the
+//!    narrow grant of a
 //!    hub-internal identity that holds one (the GitHub connector's
 //!    `hub-github`: see [`families::github`]), and holds a session-credential
 //!    request to its grant ([`grant`]),
@@ -25,7 +29,9 @@
 //! 6. validates and deserializes the arguments (unknown fields are refused),
 //! 7. runs the tool.
 //!
-//! Refusals are written to the ledger as `agent.gateway.decision` events.
+//! Refusals are written to the ledger as `agent.gateway.decision` events,
+//! except an unknown or suspended organization's (step 1), which writes
+//! nothing.
 
 pub mod approvals;
 pub mod ci;
@@ -219,9 +225,12 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::agents::TENANT_PART.into());
     parts.push(families::agents::ORG_SCOPE.into());
     // The evidence key store and checkpoint table. Public keys only; the hub
-    // never holds a private key (docs/evidence-export.md, S2). Last, so its
-    // foreign key to `evidence_key` is the only order it needs.
+    // never holds a private key (docs/evidence-export.md, S2). Self-contained
+    // beyond its own `evidence_key` foreign key.
     parts.push(ua_store::evidence::KEY_STORE_PART.into());
+    // Org-scoped Git skill source allowlist (born tenant-scoped; D2a).
+    parts.push(families::skill_sources::SCHEMA.into());
+    parts.push(families::skill_sources::TENANT_PART.into());
     parts
 }
 

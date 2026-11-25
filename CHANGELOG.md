@@ -12,6 +12,11 @@ from its commit history.
 
 ### Added
 
+- File deliverables can be submitted from a task worktree, verified by SHA-256
+  and released to a configured directory after an independent human approves
+  the exact revision and destination. The release records approval and
+  completion evidence and moves the task and workflow to done.
+
 - Evidence checkpoint signing and the public-key store (S2 of
   `docs/evidence-export.md`): `evidence_key` holds Ed25519 public keys only,
   `evidence_checkpoint` holds one row per checkpoint with its canonical digest

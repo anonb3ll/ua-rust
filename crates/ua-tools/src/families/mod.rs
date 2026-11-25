@@ -40,6 +40,7 @@ pub mod routines;
 pub mod runs;
 pub mod sessions_lifecycle;
 pub mod skill_registry;
+pub mod skill_sources;
 pub mod skills;
 pub mod slack;
 pub mod tasks;
@@ -86,6 +87,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(relay::SCHEMA);
     parts.push(routines::SCHEMA);
     parts.push(skill_registry::SCHEMA);
+    parts.push(skill_registry::PACKAGES_SCHEMA);
     parts.push(slack::SCHEMA);
     parts.push(slack::SCHEMA_V2);
     parts.push(wake::SCHEMA);

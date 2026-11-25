@@ -129,6 +129,7 @@ const TENANT: &[&str] = &[
     "skill_versions",
     "skill_assignments",
     "skill_publish_staging",
+    "skill_sources",
     "harness_config_bundles",
     "harness_config_proposals",
     "harness_config_drift",
@@ -148,6 +149,8 @@ const TENANT: &[&str] = &[
     // deliverables (`ua-deliverables`): org_id and the triggers from birth
     "deliverables",
     "deliverable_revisions",
+    "deliverable_files",
+    "deliverable_releases",
     // the organization registry (`ua-org`): org_id from birth, the generated
     // triggers from `organization.v1.registry.tenant`
     "offices",

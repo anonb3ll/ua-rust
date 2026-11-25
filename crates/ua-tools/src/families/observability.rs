@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::time::{format_ts, parse_ts};
-use ua_core::{Config, UaError, UaResult};
+use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
@@ -421,7 +421,47 @@ fn mem_available_percent() -> Option<(f64, u64, u64)> {
     (total > 0).then(|| (avail as f64 * 100.0 / total as f64, avail, total))
 }
 
-fn check_anomalies(c: &Connection, org: &str, reader: &EventReader) -> UaResult<Value> {
+/// How old a kept full ledger verify ([`crate::Hub::record_ledger_verify`])
+/// may be for [`hub_ledger_ok`] to reuse it instead of verifying again.
+const LEDGER_STATUS_REUSE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether the hub's ledger verifies, for a reader outside the default
+/// organization, which learns only that (no count, seq or reason). A full
+/// verify reads every ledger row, so it reuses the last one any caller ran
+/// in this process (a default-organization doctor or anomaly check runs one
+/// on every call) when that is at most [`LEDGER_STATUS_REUSE`] old, and
+/// otherwise runs one and keeps it: other organizations together cause at
+/// most one full verify per interval. The answer can therefore be up to that
+/// old.
+fn hub_ledger_ok(c: &Connection, hub: &crate::Hub) -> UaResult<bool> {
+    if let Some(ok) = hub.ledger_verified_within(LEDGER_STATUS_REUSE) {
+        return Ok(ok);
+    }
+    let ok = ledger::verify(c)?.ok;
+    hub.record_ledger_verify(ok);
+    Ok(ok)
+}
+
+/// The `host_low_memory` anomaly for `mem` ([`mem_available_percent`]):
+/// the hub's RAM, so only a default-organization reader (`org`) gets it.
+fn host_low_memory(org: &str, mem: Option<(f64, u64, u64)>) -> Option<Value> {
+    if org != ua_core::DEFAULT_ORG {
+        return None;
+    }
+    let (pct, avail, total) = mem.filter(|(pct, _, _)| *pct < LOW_MEM_PERCENT)?;
+    Some(anomaly(
+        "host_low_memory",
+        "host:memory".into(),
+        format!("{pct:.1}% of RAM available ({avail} of {total} kB), below {LOW_MEM_PERCENT}%"),
+        "warning",
+    ))
+}
+
+/// The anomaly rules over organization `org`. The two hub-wide rules are
+/// the default organization's: `ledger_chain` gives another organization
+/// only whether the hub's ledger is broken ([`hub_ledger_ok`]), never where
+/// or why, and `host_low_memory` (the hub's RAM) never runs for it.
+fn check_anomalies(c: &Connection, org: &str, reader: &EventReader, hub: &crate::Hub) -> UaResult<Value> {
     let mut out: Vec<Value> = Vec::new();
 
     // stale_doing_task
@@ -652,8 +692,9 @@ fn check_anomalies(c: &Connection, org: &str, reader: &EventReader) -> UaResult<
     }
 
     // ledger_chain
-    {
+    if org == ua_core::DEFAULT_ORG {
         let report = ledger::verify(c)?;
+        hub.record_ledger_verify(report.ok);
         if !report.ok {
             out.push(anomaly(
                 "ledger_chain",
@@ -666,18 +707,19 @@ fn check_anomalies(c: &Connection, org: &str, reader: &EventReader) -> UaResult<
                 "critical",
             ));
         }
+    } else if !hub_ledger_ok(c, hub)? {
+        out.push(anomaly(
+            "ledger_chain",
+            "ledger:event_log".into(),
+            "the hub's ledger is broken".into(),
+            "critical",
+        ));
     }
 
-    // host_low_memory
-    if let Some((pct, avail, total)) = mem_available_percent()
-        && pct < LOW_MEM_PERCENT
-    {
-        out.push(anomaly(
-            "host_low_memory",
-            "host:memory".into(),
-            format!("{pct:.1}% of RAM available ({avail} of {total} kB), below {LOW_MEM_PERCENT}%"),
-            "warning",
-        ));
+    // host_low_memory: the hub's own RAM, the default organization's only
+    // (another organization's check never reads it).
+    if org == ua_core::DEFAULT_ORG {
+        out.extend(host_low_memory(org, mem_available_percent()));
     }
 
     Ok(json!({ "anomalies": out, "count": out.len(), "checked_at": ua_core::time::now() }))
@@ -891,7 +933,8 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
             let _: NoArgs = parse_params("observability", act, p)?;
             let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
             let org = ctx.caller.org_id.clone();
-            read(&ctx, move |c| check_anomalies(c, &org, &reader)).await
+            let hub = ctx.hub.clone();
+            read(&ctx, move |c| check_anomalies(c, &org, &reader, &hub)).await
         }
         "performance" => {
             let args: PerfArgs = parse_params("observability", act, p)?;
@@ -921,8 +964,10 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DoctorArgs {
-    /// Run the slower probes too (SQLite `quick_check`). Every report is
-    /// computed fresh; there is no shared cache.
+    /// Run the slower probes too (SQLite `quick_check`; the default
+    /// organization only). Every report is computed fresh, except that
+    /// another organization's ledger line may reuse the hub's last full
+    /// ledger verify, up to five minutes old.
     #[serde(default)]
     pub refresh: bool,
 }
@@ -943,14 +988,19 @@ struct DbFacts {
     page_count: i64,
     page_size: i64,
     freelist: i64,
-    schema_compat: Result<ua_store::backup::SchemaCompatibility, String>,
-    chain: ledger::VerifyReport,
+    /// The default organization's only (`None` for another).
+    schema_compat: Option<Result<ua_store::backup::SchemaCompatibility, String>>,
+    /// The full verify: the default organization's only (`None` for
+    /// another, which reads [`hub_ledger_ok`] instead).
+    chain: Option<ledger::VerifyReport>,
     notes: i64,
     embedded: i64,
     active_tokens: i64,
+    /// The default organization's only.
     last_delivery: Option<(String, Option<String>)>,
     quick_check: Option<String>,
-    /// Registered nodes, or why they could not be read.
+    /// The reader organization's registered nodes, or why they could not be
+    /// read.
     fleet: Result<nodes::Fleet, String>,
     /// Idempotency receipts the `idempotency.v2.tenant_keys` rebuild kept in
     /// the default organization under an organization prefix no single
@@ -964,26 +1014,34 @@ struct DbFacts {
     harness_approvals_expired_at_upgrade: Option<i64>,
 }
 
-/// Database facts for `system_doctor`. The memory counts are organization
-/// `org`'s (the caller's), so another organization learns nothing of the
-/// hub's other notes.
+/// Database facts for `system_doctor`. The memory counts and the fleet are
+/// organization `org`'s (the caller's), so another organization learns
+/// nothing of the hub's other notes or nodes. The hub-wide facts (schema,
+/// the full ledger verify, the webhook's last delivery) are read for the
+/// default organization only.
 fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
-    let schema_compat = ua_store::backup::check_schema_compatibility(
-        c,
-        &crate::schema_parts(),
-        &crate::optional_schema_parts(),
-    )
-    .map_err(|e| e.to_string());
+    let hub_reader = org == ua_core::DEFAULT_ORG;
+    let schema_compat = hub_reader.then(|| {
+        ua_store::backup::check_schema_compatibility(
+            c,
+            &crate::schema_parts(),
+            &crate::optional_schema_parts(),
+        )
+        .map_err(|e| e.to_string())
+    });
     // The hub's webhook is the default organization's destination
     // (`families::notify`): its health is that organization's last delivery.
-    let last_delivery = c
-        .query_row(
+    let last_delivery = if hub_reader {
+        c.query_row(
             "SELECT status, last_error FROM notify_outbox WHERE org_id = ?1 ORDER BY id DESC LIMIT 1",
             [ua_core::DEFAULT_ORG],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()
-        .unwrap_or(None);
+        .unwrap_or(None)
+    } else {
+        None
+    };
     let quick_check =
         if deep { Some(c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))?) } else { None };
     Ok(DbFacts {
@@ -992,7 +1050,7 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         page_size: pragma_i64(c, "page_size")?,
         freelist: pragma_i64(c, "freelist_count")?,
         schema_compat,
-        chain: ledger::verify(c)?,
+        chain: if hub_reader { Some(ledger::verify(c)?) } else { None },
         notes: c.query_row("SELECT COUNT(*) FROM memory WHERE org_id = ?1", [org], |r| r.get(0)).unwrap_or(0),
         embedded: c
             .query_row(
@@ -1009,7 +1067,7 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
             .unwrap_or(0),
         last_delivery,
         quick_check,
-        fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
+        fleet: nodes::fleet(c, org, Timestamp::now()).map_err(|e| e.to_string()),
         idempotency_unplaced: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::idempotency::unplaced_rows(c).ok())
             .flatten(),
@@ -1103,6 +1161,24 @@ fn approval_check(cfg: &Config, reg: &Registry) -> Value {
         LIVE
     };
     finding("approval_gating", status, detail, "UA_APPROVAL_TOOLS, UA_HUMAN_IDENTITIES")
+}
+
+/// A check of the hub's own resources, which belong to the default
+/// organization: its filesystem (the vault, the workspace), the shared
+/// database file (its size, WAL size and page counts) and schema, the
+/// policy file, the notification webhook and the hub's auth configuration.
+/// Another organization's caller gets one neutral line, the same whatever
+/// the hub holds, and the check never runs for it: it learns neither
+/// whether a path exists, whether a directory is writable, how large the
+/// hub's database is or which schema objects drifted, whether a policy file
+/// is configured or broken, where the webhook points or how its last
+/// delivery went, nor how many static tokens or humans are configured
+/// (`docs/organization.md`, hub resources).
+fn hub_resource_check(caller: &Caller, capability: &str, gate: &str, check: impl FnOnce() -> Value) -> Value {
+    if caller.org_id == ua_core::DEFAULT_ORG {
+        return check();
+    }
+    finding(capability, DORMANT, "not available to this organization", gate)
 }
 
 fn vault_check(cfg: &Config) -> Value {
@@ -1251,8 +1327,9 @@ fn embeddings_check(facts: &DbFacts) -> Value {
     }
 }
 
-fn ledger_check(facts: &DbFacts) -> Value {
-    let c = &facts.chain;
+/// The full ledger line, the default organization's; another organization
+/// gets [`neutral_ledger_check`].
+fn ledger_check(c: &ledger::VerifyReport) -> Value {
     let gate = "event_log";
     if !c.ok {
         return finding(
@@ -1280,6 +1357,16 @@ fn ledger_check(facts: &DbFacts) -> Value {
         format!("{} entries verify ({} unhashed legacy prefix)", c.checked, c.unhashed_legacy_prefix),
         gate,
     )
+}
+
+/// The ledger line for another organization: whether the hub's ledger
+/// verifies ([`hub_ledger_ok`]), with no count, seq or reason, so it is no
+/// gauge of the hub's activity.
+fn neutral_ledger_check(ok: bool) -> Value {
+    match ok {
+        true => finding("ledger_chain", LIVE, "the hub's ledger verifies", "event_log"),
+        false => finding("ledger_chain", DEGRADED, "the hub's ledger is broken", "event_log"),
+    }
 }
 
 fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
@@ -1340,10 +1427,10 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }
 
-fn schema_check(facts: &DbFacts) -> Value {
+fn schema_check(schema_compat: &Result<ua_store::backup::SchemaCompatibility, String>) -> Value {
     let expected = crate::schema_parts();
     let gate = "schema_parts";
-    let compat = match &facts.schema_compat {
+    let compat = match schema_compat {
         Ok(c) => c,
         Err(e) => return finding("schema", DEGRADED, format!("schema check failed: {e}"), gate),
     };
@@ -1698,10 +1785,13 @@ fn human_age(secs: i64) -> String {
     }
 }
 
-/// Registered remote nodes: LIVE when every node in service is live,
-/// DEGRADED naming the ones that are not, DORMANT when none is registered.
-/// Retired nodes are not hosts; they are named once and never change the status.
-fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
+/// The reader organization's registered remote nodes: LIVE when every node
+/// in service is live, DEGRADED naming the ones that are not, DORMANT when
+/// none is registered. Retired nodes are not hosts; they are named once and
+/// never change the status. Only a default-organization reader (`hub_reader`)
+/// gets the `other_org_*` counts; another organization sees its own nodes
+/// and nothing of anyone else's.
+fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool, hub_reader: bool) -> Value {
     let gate = "node_register / node_heartbeat (POST /api/node/*)";
     let fleet = match &facts.fleet {
         Ok(f) => f,
@@ -1748,7 +1838,7 @@ fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
             fleet.retired.join(", ")
         ));
     }
-    let blocked = if require_acceptance { fleet.other_org_unaccepted } else { 0 };
+    let blocked = if require_acceptance && hub_reader { fleet.other_org_unaccepted } else { 0 };
     if blocked > 0 {
         parts.push(format!(
             "{blocked} other-organization node(s) in service take no real work: node_require_acceptance is on \
@@ -1766,7 +1856,7 @@ fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     }
     // A hub-wide view lists only the default organization's nodes; the
     // other organizations' are counts, never names or hosts.
-    if fleet.other_org_active + fleet.other_org_retired > 0 {
+    if hub_reader && fleet.other_org_active + fleet.other_org_retired > 0 {
         row["other_org_nodes"] =
             json!({ "active": fleet.other_org_active, "retired": fleet.other_org_retired });
     }
@@ -1777,7 +1867,7 @@ fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     }
     // Another organization's command notices are mailed within it; one still
     // unsent (its delivery keeps failing) is counted here, never named.
-    if fleet.other_org_unsent_notices > 0 {
+    if hub_reader && fleet.other_org_unsent_notices > 0 {
         row["other_org_unsent_command_notices"] = json!(fleet.other_org_unsent_notices);
     }
     row
@@ -1793,9 +1883,27 @@ fn host_name() -> Option<String> {
 
 async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
-    let deep = a.refresh;
+    // The hub's host, its shared database file, schema, ledger, webhook and
+    // auth configuration are the default organization's: another
+    // organization gets neutral lines for them (`docs/organization.md`,
+    // hub resources) and none of those checks runs for it (no deep
+    // `quick_check`, no schema comparison, at most one shared full ledger
+    // verify per interval, see `hub_ledger_ok`). Its own counts (memory
+    // notes, embeddings) and its own fleet stay in their checks.
+    let hub_reader = ctx.caller.org_id == ua_core::DEFAULT_ORG;
+    let deep = a.refresh && hub_reader;
     let org = ctx.caller.org_id.clone();
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
+    let ledger_row = match &facts.chain {
+        Some(chain) => {
+            ctx.hub.record_ledger_verify(chain.ok);
+            ledger_check(chain)
+        }
+        None => {
+            let hub = ctx.hub.clone();
+            neutral_ledger_check(ctx.hub.db().read_async(move |c| hub_ledger_ok(c, &hub)).await?)
+        }
+    };
     let github = {
         let (cfg, caller) = (ctx.hub.cfg().clone(), ctx.caller.clone());
         let shared = ctx.hub.shared_webhook_routes_for_report().await;
@@ -1809,25 +1917,41 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
-    let (db_row, db_stats) = database_check(&facts, path);
+    let (db_row, db_stats) = if hub_reader {
+        database_check(&facts, path)
+    } else {
+        (hub_resource_check(&ctx.caller, "database", "UA_DB_PATH", || Value::Null), Value::Null)
+    };
     let checks = vec![
-        hub_auth_check(cfg, &facts),
+        hub_resource_check(&ctx.caller, "hub_auth", "UA_ENFORCE_AUTH, UA_AGENT_TOKENS", || {
+            hub_auth_check(cfg, &facts)
+        }),
         bind_check(cfg),
         approval_check(cfg, reg),
-        vault_check(cfg),
-        workspace_check(cfg),
+        hub_resource_check(&ctx.caller, "vault", "UA_VAULT_PATH, UA_VAULT_WRITE_DIRS", || vault_check(cfg)),
+        hub_resource_check(&ctx.caller, "workspace_root", "UA_WORKSPACE, UA_AGENT_WORKSPACES", || {
+            workspace_check(cfg)
+        }),
         search_check(reg),
         build_features_check(),
         embeddings_check(&facts),
-        ledger_check(&facts),
+        ledger_row,
         db_row,
-        schema_check(&facts),
-        notify_check(cfg, &facts),
+        match &facts.schema_compat {
+            Some(compat) => schema_check(compat),
+            None => hub_resource_check(&ctx.caller, "schema", "schema_parts", || Value::Null),
+        },
+        hub_resource_check(
+            &ctx.caller,
+            "notify_webhook",
+            "UA_NOTIFY_WEBHOOK_URL, UA_NOTIFY_WEBHOOK_SECRET",
+            || notify_check(cfg, &facts),
+        ),
         zulip_check(cfg),
         slack_check(cfg),
         github,
-        policy_check(cfg),
-        fleet_nodes_check(&facts, cfg.node_require_acceptance),
+        hub_resource_check(&ctx.caller, "policy_file", "UA_POLICY_FILE", || policy_check(cfg)),
+        fleet_nodes_check(&facts, cfg.node_require_acceptance, hub_reader),
         finding("org_registry", registry_status, registry.detail, "org registry"),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
@@ -1843,7 +1967,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     Ok(json!({
         "checks": checks,
         "summary": summary,
-        "host": host_name(),
+        "host": if hub_reader { host_name() } else { None },
         "as_of": ua_core::time::now(),
         "cached": false,
         "refreshing": false,
@@ -2070,7 +2194,8 @@ pub fn register(r: &mut Registry) {
             |ctx: ToolCtx, _a: NoArgs| async move {
                 let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
                 let org = ctx.caller.org_id.clone();
-                read(&ctx, move |c| check_anomalies(c, &org, &reader)).await
+                let hub = ctx.hub.clone();
+                read(&ctx, move |c| check_anomalies(c, &org, &reader, &hub)).await
             },
         )
         .family("observability")
@@ -2104,4 +2229,22 @@ pub fn register(r: &mut Registry) {
         .family("observability")
         .read_only(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hub's RAM is the default organization's: another organization
+    /// never gets the `host_low_memory` anomaly or its kB figures, however
+    /// low memory is.
+    #[test]
+    fn host_low_memory_is_the_default_organizations_only() {
+        let low = Some((1.5, 12_345, 987_654));
+        let row = host_low_memory(ua_core::DEFAULT_ORG, low).expect("the default organization gets it");
+        assert!(row["detail"].as_str().unwrap().contains("12345 of 987654 kB"), "{row}");
+        assert_eq!(host_low_memory("org-b", low), None);
+        assert_eq!(host_low_memory(ua_core::DEFAULT_ORG, Some((50.0, 500, 1000))), None);
+        assert_eq!(host_low_memory(ua_core::DEFAULT_ORG, None), None);
+    }
 }

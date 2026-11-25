@@ -53,6 +53,7 @@ provider_accounts.v1
 relay.v1
 routines.v1
 skill_registry.v1
+skill_registry.v3.packages
 slack.v1
 slack.v2
 wake.v1
@@ -70,6 +71,8 @@ import.v1
 organization.v1.tools.code
 deliverables.v1
 organization.v1.deliverables
+deliverables.v2.files
+organization.v1.deliverable_files
 organization.v1.tools.graph
 organization.v1.tools.web
 skill_registry.v2.tenant_keys
@@ -133,3 +136,5 @@ agents.v2.org_scope
 organization.registry.v1
 organization.v1.registry.tenant
 evidence_key_store.v1
+skill_sources.v1
+organization.v1.tools.skill_sources

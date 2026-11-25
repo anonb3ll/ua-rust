@@ -258,11 +258,21 @@ fn effective(
     bundle: &Bundle,
 ) -> UaResult<(Bundle, Vec<Value>)> {
     let profile = crate::sessions::default_profile(hub, org, agent);
-    let resolved = skill_registry::resolve(c, org, agent, Some(profile.as_str()))?;
+    let (resolved, skipped_attestation) =
+        skill_registry::resolve_with_skips(c, org, agent, Some(profile.as_str()))?;
     let mut out = bundle.clone();
     let mut notes = Vec::new();
     for s in resolved {
-        let mut note = json!({ "name": s.name, "version": s.version, "hash": s.hash, "via": s.via });
+        let mut note = json!({
+            "name": s.name,
+            "version": s.version,
+            "hash": s.hash,
+            "via": s.via,
+            "file_count": s.files.len(),
+        });
+        if let Some(manifest) = &s.package_manifest {
+            note["package_manifest"] = manifest.clone();
+        }
         let description: String = skill_registry::frontmatter(&s.content)
             .and_then(|m| m.get("description").and_then(Value::as_str).map(|d| py_strip(d).to_string()))
             .map(|d| d.chars().take(MAX_DESCRIPTION).collect())
@@ -271,6 +281,46 @@ fn effective(
         if let Some(why) = policy::description_refusal(&description) {
             findings.insert(0, format!("description {why}"));
         }
+        for member in &s.files {
+            if member.path == "SKILL.md" {
+                continue;
+            }
+            let lossy = String::from_utf8_lossy(&member.bytes);
+            if !super::audit::rules::check_secrets("skill-package-payload", &lossy).is_empty()
+                || !super::audit::rules::check_private_key(&member.path, &lossy).is_empty()
+            {
+                findings.push(format!("file {:?}: contains credential material", member.path));
+            }
+            for (line, c) in super::skills::hidden_chars(&lossy) {
+                findings.push(format!(
+                    "file {:?} line {line}: hidden code point U+{:04X}",
+                    member.path, c as u32
+                ));
+            }
+            if member.text().is_none() && !skill_registry::is_allowed_binary_extension(&member.path) {
+                findings.push(format!(
+                    "file {:?}: non-UTF-8 content is only allowed for binary asset extensions",
+                    member.path
+                ));
+            }
+        }
+        let bundle_files: Vec<render::SkillFile> = if s.files.len() > 1 {
+            s.files
+                .iter()
+                .map(|m| {
+                    let wire = m.to_wire_json();
+                    render::SkillFile {
+                        path: m.path.clone(),
+                        bytes: m.bytes.len(),
+                        sha256: m.sha256.clone(),
+                        encoding: wire["encoding"].as_str().unwrap_or("base64").to_string(),
+                        content: wire["content"].as_str().unwrap_or_default().to_string(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let skipped = if out.skills.iter().any(|k| k.name == s.name) {
             Some("bundle_defines")
         } else if out.skills.len() >= MAX_SKILLS {
@@ -279,7 +329,12 @@ fn effective(
             note["findings"] = json!(findings);
             Some("unsafe_skill")
         } else {
-            out.skills.push(Skill { name: s.name.clone(), description, body: s.content.clone() });
+            out.skills.push(Skill {
+                name: s.name.clone(),
+                description,
+                body: s.content.clone(),
+                files: bundle_files,
+            });
             if out.to_json().len() > MAX_BUNDLE_BYTES || policy::check_rendered(&out).is_err() {
                 out.skills.pop();
                 Some("size_limit")
@@ -292,6 +347,16 @@ fn effective(
             note["reason"] = json!(reason);
         }
         notes.push(note);
+    }
+    for bad in skipped_attestation {
+        notes.push(json!({
+            "name": bad.name,
+            "version": bad.version,
+            "via": bad.via,
+            "included": false,
+            "reason": bad.reason,
+            "skipped": bad.reason,
+        }));
     }
     Ok((out, notes))
 }

@@ -629,9 +629,9 @@ async fn publish_refuses_symlinks_extra_files_and_paths_outside_the_workspace() 
     std::os::unix::fs::symlink(outside.path(), ws.join("skills/linked-dir")).unwrap();
     let e = h.call(&ops(), "skill_registry", publish("skills/linked-dir")).await.unwrap_err();
     assert!(e.to_string().contains("symlink"), "{e}");
-    // Supporting files are refused.
+    // Hidden files and symlinked supporting files inside a skill package are refused.
     write_skill(&h, "extra-skill", "");
-    std::fs::write(ws.join("skills/extra-skill/run.sh"), "echo hi\n").unwrap();
+    std::fs::write(ws.join("skills/extra-skill/.env"), "SECRET=1\n").unwrap();
     let e = h
         .call(
             &ops(),
@@ -640,7 +640,19 @@ async fn publish_refuses_symlinks_extra_files_and_paths_outside_the_workspace() 
         )
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("supporting files"), "{e}");
+    assert!(e.to_string().contains("hidden"), "{e}");
+    std::fs::remove_file(ws.join("skills/extra-skill/.env")).unwrap();
+    std::fs::create_dir_all(ws.join("skills/extra-skill/scripts")).unwrap();
+    std::os::unix::fs::symlink(&real, ws.join("skills/extra-skill/scripts/escape.sh")).unwrap();
+    let e = h
+        .call(
+            &ops(),
+            "skill_registry",
+            json!({ "action": "publish", "params": { "name": "extra-skill", "path": "skills/extra-skill" } }),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("symlink"), "{e}");
     // Outside the workspace and missing get the same refusal.
     let out_path = outside.path().to_string_lossy().into_owned();
     let e1 = h.call(&ops(), "skill_registry", publish(&out_path)).await.unwrap_err();

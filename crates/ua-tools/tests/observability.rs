@@ -509,3 +509,274 @@ async fn doctor_reports_slack_without_secrets() {
         assert!(on["detail"].as_str().unwrap().contains("without the slack-socket feature"), "{on}");
     }
 }
+
+/// The vault and the workspace are the hub's filesystem, the default
+/// organization's: another organization's doctor gets one neutral line for
+/// each, the same whether the vault is absent, misconfigured or live, so it
+/// learns neither whether the path exists nor whether a write directory is
+/// writable. The default organization's doctor still reports each state.
+#[tokio::test]
+async fn doctor_tells_another_organization_nothing_about_the_hub_filesystem() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(vault.join("Inbox")).unwrap();
+    let not_a_dir = dir.path().join("vault-file");
+    std::fs::write(&not_a_dir, "fake").unwrap();
+    let reg = builtin_registry();
+    let other = Caller { org_id: "org-b".into(), ..agent("reviewer-1", Profile::Lead) };
+    let mut seen_b = Vec::new();
+    let mut seen_default = Vec::new();
+    for (i, path) in [None, Some(not_a_dir.clone()), Some(vault.clone())].into_iter().enumerate() {
+        let mut cfg = Config::for_home(dir.path().join(format!("home-{i}")));
+        cfg.vault_path = path;
+        cfg.vault_write_dirs = vec!["Inbox".into(), "Missing".into()];
+        let hub = Hub::in_memory(cfg).unwrap();
+        exec(
+            &hub,
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+             ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+        );
+        let line = |report: &Value, cap: &str| {
+            report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == cap).cloned().unwrap()
+        };
+        let b = call(&reg, &hub, &other, "system_doctor", json!({})).await;
+        for cap in ["vault", "workspace_root"] {
+            let row = line(&b, cap);
+            assert_eq!(row["status"], "DORMANT", "{row}");
+            assert_eq!(row["detail"], "not available to this organization", "{row}");
+        }
+        assert!(!b.to_string().contains("write dir"), "{b}");
+        seen_b.push((line(&b, "vault"), line(&b, "workspace_root")));
+        let own = call(&reg, &hub, &agent("reviewer-1", Profile::Lead), "system_doctor", json!({})).await;
+        seen_default.push(line(&own, "vault")["status"].clone());
+    }
+    assert!(seen_b.windows(2).all(|w| w[0] == w[1]), "{seen_b:?}");
+    assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("DEGRADED")]);
+}
+
+/// The hub's host, its shared database file and the policy file are the
+/// default organization's: another organization's doctor gets no host
+/// name, one neutral `database` line with no statistics (no file or WAL
+/// size, page counts or deep `quick_check`) and one neutral `policy_file`
+/// line, the same whether the policy file is absent, missing or present.
+/// Its own lines (here `semantic_search`, over its own counts) stay, and
+/// `hub_auth` is a neutral line. The default organization's doctor still
+/// reports each.
+#[tokio::test]
+async fn doctor_tells_another_organization_nothing_about_the_hub_host_database_or_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("fake-policy.yaml");
+    std::fs::write(&policy, "rules: []\n").unwrap();
+    let reg = builtin_registry();
+    let other = Caller { org_id: "org-b".into(), ..agent("reviewer-1", Profile::Lead) };
+    let line = |report: &Value, cap: &str| {
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == cap).cloned().unwrap()
+    };
+    let mut seen_b = Vec::new();
+    let mut seen_default = Vec::new();
+    for (i, path) in [None, Some(dir.path().join("fake-missing-policy.yaml")), Some(policy.clone())]
+        .into_iter()
+        .enumerate()
+    {
+        let mut cfg = Config::for_home(dir.path().join(format!("home-{i}")));
+        cfg.policy_file = path;
+        let hub = Hub::open(cfg).unwrap();
+        exec(
+            &hub,
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+             ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+        );
+        let b = call(&reg, &hub, &other, "system_doctor", json!({ "refresh": true })).await;
+        assert!(b["host"].is_null(), "{b}");
+        assert!(b["database"].is_null(), "{b}");
+        assert_eq!(b["deep_checks"], false, "{b}");
+        for cap in ["database", "policy_file"] {
+            let row = line(&b, cap);
+            assert_eq!(row["status"], "DORMANT", "{row}");
+            assert_eq!(row["detail"], "not available to this organization", "{row}");
+        }
+        let text = b.to_string();
+        for hidden in ["bytes", "WAL", "journal_mode", "quick_check", "policy file"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+        for cap in ["semantic_search", "hub_auth"] {
+            line(&b, cap);
+        }
+        seen_b.push((line(&b, "database"), line(&b, "policy_file")));
+
+        let own = call(&reg, &hub, &agent("reviewer-1", Profile::Lead), "system_doctor", json!({})).await;
+        assert!(own["database"]["file_bytes"].as_i64().is_some_and(|n| n > 0), "{own}");
+        assert!(line(&own, "database")["detail"].as_str().unwrap().contains("journal_mode="), "{own}");
+        seen_default.push(line(&own, "policy_file")["status"].clone());
+    }
+    assert!(seen_b.windows(2).all(|w| w[0] == w[1]), "{seen_b:?}");
+    assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("LIVE")]);
+}
+
+const ORG_B: &str = "org-b";
+
+fn add_org_b(hub: &Hub) {
+    exec(
+        hub,
+        "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+         ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+    );
+}
+
+fn org_b_lead() -> Caller {
+    Caller { org_id: ORG_B.into(), ..agent("reviewer-1", Profile::Lead) }
+}
+
+fn check(report: &Value, cap: &str) -> Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["capability"] == cap)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {cap} row in {report}"))
+}
+
+/// The fleet row is the reader's own: another organization's doctor names
+/// its own nodes and heartbeats, never the default organization's (live,
+/// retired or their heartbeats), and carries no `other_org_*` counts. The
+/// hub's webhook (scheme, host, secret header, last delivery), schema and
+/// auth configuration are neutral lines for it. The default organization's
+/// doctor still reports each in full.
+#[tokio::test]
+async fn doctor_gives_another_organization_its_own_fleet_and_neutral_hub_lines() {
+    const DEFAULT_NODE: &str = "fake-default-node-osprey";
+    const RETIRED_NODE: &str = "fake-retired-node-heron";
+    const B_NODE: &str = "fake-b-node-kestrel";
+    const HOOK_HOST: &str = "fake-hook.example.test";
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.agent_tokens = Some(SecretString::from(format!("builder-1:{TOKEN}")));
+    cfg.notify_webhook_url = Some(format!("https://{HOOK_HOST}/services/{HOOK_PATH_SECRET}"));
+    cfg.notify_webhook_secret = Some(SecretString::from(HOOK_HEADER_SECRET));
+    cfg.node_require_acceptance = true;
+    let hub = Hub::open(cfg).unwrap();
+    add_org_b(&hub);
+    let (default_beat, b_beat) = (ago(4000), ago(10));
+    exec(
+        &hub,
+        &format!(
+            "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES \
+               ('default', 'fake-agent-a', 't', 't'), ('org-b', 'fake-agent-b', 't', 't'); \
+             INSERT INTO nodes (org_id, node, agent, facts_json, registered_at, last_heartbeat, updated_at) VALUES \
+               ('default', '{DEFAULT_NODE}', 'fake-agent-a', '{{}}', 't', '{default_beat}', 't'), \
+               ('org-b', '{B_NODE}', 'fake-agent-b', '{{}}', 't', '{b_beat}', 't'); \
+             INSERT INTO nodes (org_id, node, agent, facts_json, registered_at, last_heartbeat, updated_at, \
+               retired_at) VALUES ('default', '{RETIRED_NODE}', 'fake-agent-a', '{{}}', 't', 't', 't', 't'); \
+             INSERT INTO notify_outbox (org_id, kind, chars, status, last_error, created_at, updated_at) VALUES \
+               ('default', 'notify', 1, 'failed', 'fake delivery error', 't', 't');"
+        ),
+    );
+    let reg = builtin_registry();
+
+    let b = call(&reg, &hub, &org_b_lead(), "system_doctor", json!({})).await;
+    let fleet = check(&b, "fleet_nodes");
+    assert_eq!(
+        fleet["hosts"],
+        json!([{ "node": B_NODE, "state": "live", "last_heartbeat": b_beat }]),
+        "{fleet}"
+    );
+    assert!(fleet["detail"].as_str().unwrap().contains(B_NODE), "{fleet}");
+    for key in
+        ["other_org_nodes", "other_org_nodes_not_accepted", "other_org_unsent_command_notices", "retired"]
+    {
+        assert!(fleet.get(key).is_none(), "{key} in {fleet}");
+    }
+    let text = b.to_string();
+    for hidden in [
+        DEFAULT_NODE,
+        RETIRED_NODE,
+        default_beat.as_str(),
+        "other-organization",
+        HOOK_HOST,
+        "https://",
+        "secret header",
+        "last delivery",
+        "static tokens",
+        "humans configured",
+        "enforce_auth",
+        "schema parts",
+    ] {
+        assert!(!text.contains(hidden), "{hidden} in {text}");
+    }
+    for cap in ["notify_webhook", "schema", "hub_auth"] {
+        let row = check(&b, cap);
+        assert_eq!(row["status"], "DORMANT", "{row}");
+        assert_eq!(row["detail"], "not available to this organization", "{row}");
+    }
+
+    let own = call(&reg, &hub, &agent("reviewer-1", Profile::Lead), "system_doctor", json!({})).await;
+    let fleet = check(&own, "fleet_nodes");
+    let detail = fleet["detail"].as_str().unwrap();
+    assert!(detail.contains(DEFAULT_NODE) && detail.contains(RETIRED_NODE), "{fleet}");
+    assert!(!fleet.to_string().contains(B_NODE), "{fleet}");
+    assert_eq!(fleet["hosts"][0]["last_heartbeat"], json!(default_beat), "{fleet}");
+    assert_eq!(fleet["other_org_nodes"], json!({ "active": 1, "retired": 0 }), "{fleet}");
+    assert_eq!(fleet["other_org_nodes_not_accepted"], 1, "{fleet}");
+    let notify = check(&own, "notify_webhook");
+    assert_eq!(notify["status"], "DEGRADED", "{notify}");
+    let detail = notify["detail"].as_str().unwrap();
+    assert!(detail.contains(HOOK_HOST) && detail.contains("the last delivery failed"), "{notify}");
+    assert!(check(&own, "schema")["detail"].as_str().unwrap().contains("schema parts applied"), "{own}");
+    assert!(
+        check(&own, "hub_auth")["detail"].as_str().unwrap().contains("static tokens configured: 1"),
+        "{own}"
+    );
+}
+
+/// Another organization's ledger line and `ledger_chain` anomaly say only
+/// whether the hub's ledger verifies: no entry count, seq or reason. It
+/// reuses the hub's last full verify while that is fresh instead of
+/// re-reading the whole ledger on every call (a tampered row goes unseen by
+/// it until the next full verify), and a default-organization doctor's full
+/// verify updates it.
+#[tokio::test]
+async fn another_organizations_ledger_line_is_neutral_and_reuses_the_last_full_verify() {
+    let hub = mem_hub();
+    add_org_b(&hub);
+    let reg = builtin_registry();
+    let who = agent("builder-1", Profile::Developer);
+    call(&reg, &hub, &who, "task_add", json!({ "title": "fake one" })).await;
+    call(&reg, &hub, &who, "task_add", json!({ "title": "fake two" })).await;
+    let b = org_b_lead();
+    let ledger_row = |r: &Value| check(r, "ledger_chain");
+    let b_anomaly =
+        |r: &Value| r["anomalies"].as_array().unwrap().iter().find(|a| a["rule"] == "ledger_chain").cloned();
+
+    let row = ledger_row(&call(&reg, &hub, &b, "system_doctor", json!({})).await);
+    assert_eq!(
+        (row["status"].as_str(), row["detail"].as_str()),
+        (Some("LIVE"), Some("the hub's ledger verifies"))
+    );
+
+    exec(&hub, "DROP TRIGGER event_log_no_update; UPDATE event_log SET payload = '{\"x\":1}' WHERE seq = 1;");
+    // Reused: no new full verify for organization B's calls.
+    let row = ledger_row(&call(&reg, &hub, &b, "system_doctor", json!({})).await);
+    assert_eq!(row["status"], "LIVE", "{row}");
+    assert_eq!(b_anomaly(&call(&reg, &hub, &b, "check_anomalies", json!({})).await), None);
+
+    // The default organization's doctor verifies in full and says where.
+    let row = ledger_row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
+    assert_eq!(row["status"], "DEGRADED", "{row}");
+    assert!(row["detail"].as_str().unwrap().contains("seq 1"), "{row}");
+
+    let report = call(&reg, &hub, &b, "system_doctor", json!({})).await;
+    let row = ledger_row(&report);
+    assert_eq!(
+        (row["status"].as_str(), row["detail"].as_str()),
+        (Some("DEGRADED"), Some("the hub's ledger is broken"))
+    );
+    let anomalies = call(&reg, &hub, &b, "check_anomalies", json!({})).await;
+    let a = b_anomaly(&anomalies).expect("a ledger_chain anomaly");
+    assert_eq!(a["detail"], "the hub's ledger is broken", "{a}");
+    for text in [report.to_string(), anomalies.to_string()] {
+        for hidden in ["seq", "entries", "hash chain", "entry_hash", "prev_hash", "kB", "RAM"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+    }
+}

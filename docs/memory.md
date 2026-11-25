@@ -1,15 +1,20 @@
 # Memory subsystem
 
-Status: **design, not implemented.** This document designs the pieces the
+Status: **design, with step 1 landed.** The ranking, save, lifecycle and
+scoped-tenant pieces already exist; this document designs the pieces the
 memory family does not yet have. It is not a plan to rebuild what exists. It
 depends on the organization model (`docs/organization.md`, PR #39) for
 `org_id`, users, teams, roles, organization settings and agent owners.
+
+Step 1 (evidence) landed as the `ua memory bench` harness in PR #53 (merged
+`e84f4b03`), but **it does not gate merges yet**: the fix round in task #2798
+must land first. Everything from step 2 on is design.
 
 The memory domain now lives in its own crate, `crates/ua-memory` (PR #49,
 merged as `fdb4bad`); `ua-tools/src/families/memory` keeps only the tool
 registration. File paths below name modules of `crates/ua-memory/src`
 (`rank.rs`, `embed.rs`, `search.rs`, `note.rs`, `save.rs`, `lifecycle.rs`,
-`schema.rs`).
+`schema.rs`, `bench.rs`).
 
 ## Correction to the brief
 
@@ -92,9 +97,22 @@ result is "as good as or better than a leading memory system" is currently
 
 ### 1. Evidence
 
-There is no recall-quality evaluation, so the product claim cannot be tested.
-Unit tests prove that the code does what it says; they do not prove that the
-retrieval is good. This lands first and gates everything after it.
+**Landed, not yet gating.** `crates/ua-memory/src/bench.rs`, the fixture corpus
+and `floor.json` are in PR #53 (merged `e84f4b03`), and
+`docs/evals/memory-bench.md` records the runs. The harness does not gate merges
+until task #2798 lands: it still breaks LongMemEval ties nondeterministically,
+leaks a scratch database per question, and has fixture negatives that lexical
+search cannot fail.
+
+Measured on that head, lexical-only, release build, all 470 answerable
+LongMemEval questions: strict recall@5 0.8489 (399/470), MRR@10 0.8389, `as_of`
+accuracy 0.48, search p95 18 ms. The fixture floor is overall recall@5 0.8889,
+with the paraphrase class at 0.5. Multi-session (0.686) and `as_of` (0.48) are
+the weak classes; the chunked-embedding step targets the first.
+
+The product claim still cannot be tested until the harness is deterministic:
+unit tests prove that the code does what it says, not that retrieval is good.
+This step gates everything after it.
 
 **Corpus.** A checked-in fixture corpus (`ua-memory/bench/`): notes, labelled
 queries, and for each query the notes that must appear and those that must
@@ -152,8 +170,9 @@ baseline to beat:
 
 | Configuration | Strict recall@5 |
 |---|---|
-| Hybrid, 120-question stratified sample | 0.883 (106/120); about 0.846 reweighted to all 470 |
-| Lexical legs only, all 470 | 0.826 (388/470) |
+| The predecessor hub, hybrid, 120-question stratified sample | 0.883 (106/120); about 0.846 reweighted to all 470 |
+| The predecessor hub, lexical legs only, all 470 | 0.826 (388/470) |
+| `ua-rust`, lexical only, all 470 (2026-11-20, `1d9a30f`) | 0.8489 (399/470); MRR@10 0.8389 |
 | A leading standalone memory system, same file | 0.955 |
 
 The scorecard also names the cause of most of the gap: notes average about
@@ -301,9 +320,12 @@ ALTER TABLE memory ADD COLUMN team_id TEXT;
 ALTER TABLE memory ADD COLUMN owner_type TEXT
     CHECK (owner_type IS NULL OR owner_type IN ('human','agent','org','team'));
 ALTER TABLE memory ADD COLUMN owner TEXT;          -- users.id, agent label, org id or team id
+ALTER TABLE memory ADD COLUMN owner_verified INTEGER NOT NULL DEFAULT 0
+    CHECK (owner_verified IN (0,1));               -- proof, not inference: see below
 ALTER TABLE memory ADD COLUMN credential_id TEXT;  -- set for session-grant writes
 
--- parity backfill, in the same migration
+-- parity backfill, in the same migration. owner_verified stays 0 for every row:
+-- no historical write carries proof of who made it.
 UPDATE memory SET visibility = 'org';
 UPDATE memory SET owner_type = 'human',
                   owner = (SELECT u.id FROM users u WHERE u.label = memory.author COLLATE NOCASE)
@@ -327,11 +349,30 @@ WHEN (NEW.visibility = 'team') != (NEW.team_id IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'team_id must be set exactly for team visibility, in the same org'); END;
 ```
 
+**Ownership is not verification.** `owner` says who a note belongs to;
+`owner_verified` says the hub can prove it. Only the write path sets it, from
+the caller's identity kind: a verified human caller (`ActorKind::Human`)
+writing a note it owns gets `1`; an agent, a system caller and an anonymous
+caller all get `0`, because an anonymous caller supplies its own `author` text
+and the hub never checked it. A session-grant write is verified only when the
+grant's principal is verified, and it also carries `credential_id`. The value
+is derived, never accepted from a client field.
+
+The backfill sets `0` for every existing note, deliberately. There is no
+historical proof to derive it from: the ledger records the originator label
+but not whether that write was authenticated, and the predecessor's `author`
+was free text. Failing closed costs convenience, not safety: on an upgraded
+hub, `context_pack` injects nothing until an operator attests.
+`ua memory attest-owners --author <label>` is that path — operator-only, one
+`memory.owner_verified` ledger event per note (ids only, never title or
+content), idempotent, and refused for a label that is not a `users` row.
+Nothing else promotes a note to verified.
+
 The column default is the **narrowest** tier, so an insert that forgets
 `visibility` fails closed. The writer always binds `visibility` explicitly from
 the organization's setting; the organization doc's insert-walking test is
-extended so an `INSERT INTO memory` that omits `visibility`, `owner` or
-`org_id` fails.
+extended so an `INSERT INTO memory` that omits `visibility`, `owner`,
+`owner_verified` or `org_id` fails.
 
 **Owners.** `owner` is who the note belongs to; `author` stays the writer
 stamped by `write_author`. They differ for consolidation summaries and
@@ -347,6 +388,12 @@ exists there is no hook and nothing to re-own; the step is idempotent, and it
 runs through `MemoryRepo`, so the authorizer admits it. A consolidation summary of an `org` or
 `team` group is owned by that organization or team (`owner_type = 'org'` or
 `'team'`).
+
+`reown_for_user` moves the owner id and never the proof: a note that was not
+`owner_verified` stays `0` after re-owning, so an anonymous note whose `author`
+happens to name a human does not become injectable later. The importer writes
+`owner_verified = 0` for every note it creates, because a predecessor row
+carries no proof of who wrote it; only `attest-owners` can change that.
 
 **Who sees what.** Comparisons are on `(principal_type, principal)`, with humans
 keyed by `users.id`:
@@ -450,12 +497,27 @@ tokenizer and nothing can drift from the index:
 - **The cap moves after scoring.** Today the lexical leg runs
   `ORDER BY bm25(...) LIMIT FTS_LIMIT` (200) in SQL (`search.rs`), so global
   statistics would still decide which visible notes reach the candidate set.
-  The leg now fetches **every** eligible match, scores it in Rust, and only then
-  keeps the top `FTS_LIMIT`.
+  The leg now fetches every eligible match (up to `MAX_LEXICAL_MATCHES`, below),
+  scores it in Rust, and only then keeps the top `FTS_LIMIT`.
 
-The cost is a scan of eligible matches per query; the bench records p95 latency
-so a regression is visible. No columns are added for this. The per-field
-weights and `RRF_K` are unchanged.
+**The scan is bounded.** Two constants keep a scoped query's cost independent
+of corpus size; neither is a setting:
+
+- `MAX_QUERY_TERMS = 32` distinct indexed terms per query. Terms past the cap
+  are dropped in the order FTS5 returns them, so the same query always scores
+  the same terms.
+- `MAX_LEXICAL_MATCHES = 10_000` eligible matches scored per query. Matches are
+  read in FTS5 match order, then `memory.seq`, so which matches are scored is
+  deterministic and never depends on notes the caller cannot see.
+
+When either cap is hit, the search explanation carries
+`lexical_truncated: true` beside the existing per-leg breakdown, so a caller
+can tell a bounded result from an exhaustive one. A truncated leg is still a
+valid leg: fusion and ranking are unchanged. The cost is a scan of at most
+10,000 eligible matches per query; the bench records p95 latency on a
+100,000-note corpus with a stopword-heavy query against the 100 ms target, so a
+regression is visible. No columns are added for this. The per-field weights and
+`RRF_K` are unchanged.
 
 **Counts and confidence are scoped.** Totals and per-leg explanations are
 computed after eligibility. `note::open_contradictions` counts only disputing
@@ -659,7 +721,7 @@ CREATE TABLE IF NOT EXISTS memory_consolidations (
     org_id          TEXT NOT NULL,
     scope_key       TEXT NOT NULL,      -- visibility, team_id, owner for private
     source_set_sha  TEXT NOT NULL,      -- hash of sorted (note_id, revision)
-    status          TEXT NOT NULL CHECK (status IN ('pending','written','invalidated')),
+    status          TEXT NOT NULL CHECK (status IN ('pending','written','invalidated','expired')),
     summary_note_id TEXT REFERENCES memory(id),
     claimed_by      TEXT,
     claimed_until   TEXT,               -- lease; an expired claim can be retaken
@@ -668,7 +730,7 @@ CREATE TABLE IF NOT EXISTS memory_consolidations (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS memory_consolidations_live_set
     ON memory_consolidations (org_id, source_set_sha)
-    WHERE status != 'invalidated';
+    WHERE status IN ('pending','written');
 CREATE TABLE IF NOT EXISTS memory_consolidation_sources (
     org_id           TEXT NOT NULL,
     consolidation_id TEXT NOT NULL REFERENCES memory_consolidations(id),
@@ -690,6 +752,17 @@ CREATE TABLE IF NOT EXISTS memory_invalidations (
 
 - A source set already consolidated is skipped; a re-run after a failure finds
   the `pending` row. An invalidated row does not block the same set later.
+- **No job without a consolidator.** The grouping pass resolves each group's
+  eligible consolidator (the table above) *before* it inserts a row. A scope
+  with none — a human's `private` notes with no owner agent, a team with no
+  member agent — produces no job, so its sources are never pinned by work
+  nobody can claim.
+- **Unclaimed jobs expire.** A `pending` row older than
+  `memory.consolidation_job_ttl_hours` (default 48) is set to `expired` by the
+  maintenance pass, with `resolved_at` stamped and its sources `live = 0`, so
+  they can be grouped again. The live unique index covers `pending` and
+  `written` only, so an expired row never blocks a fresh job for the same set.
+  A claimed job is governed by its lease, not by this TTL.
 - A note is a live source of at most one consolidation, enforced by the partial
   unique index.
 - A claim takes a lease (`claimed_until`); an abandoned job becomes claimable
@@ -852,16 +925,19 @@ Output, in order until the budget is spent:
 1. notes tied to the task by a `task:<id>` evidence ref (owner-only, §3), then
    by entity match on the task id, branch or project;
 2. **decisions**: notes tagged `decision` with salience ≥ 0.7 at `org` or
-   `team` visibility, limited to notes written by a human or confirmed by one;
+   `team` visibility, limited to notes written by a verified human or confirmed
+   by one;
 3. the caller's own episodes from the last 14 days;
 4. open, accepted contradictions touching anything already included.
 
 **What may be injected.** Anything delivered by a hook into a session is
-limited to notes **owned by a human**, or owned by an agent that is a seat of
-the caller's team (the task's team when a task is given). Other matching notes
-are listed by id and title only, as escaped text, for the agent to fetch
-deliberately. So an arbitrary author cannot plant text into another team's
-session start by naming its task or branch.
+limited to notes **owned by a verified human** (`owner_type = 'human'` and
+`owner_verified = 1`), or owned by an agent that is a seat of the caller's team
+(the task's team when a task is given). Other matching notes are listed by id
+and title only, as escaped text, for the agent to fetch deliberately. So an
+arbitrary author cannot plant text into another team's session start by naming
+its task or branch, and an anonymous note cannot borrow a human's name to get
+in.
 
 **Confirmation is recorded.** `memory_feedback` today only increments counters,
 so "confirmed by a human" could not be evaluated. It now also writes a row:
@@ -1046,18 +1122,24 @@ Scope
 11. **Scoped confidence.** A hidden contradicting note changes neither a visible
     note's rank nor its `confidence_posterior`, and its id appears in no link
     list.
-12. **Defaults fail closed.** An `INSERT INTO memory` omitting `visibility` or
-    `owner` is caught by the insert-walking test; a saved note takes its
-    organization's default; a new organization defaults to `private`;
-    `'default'` is `org` after migration; with a `team` default, a caller in
-    two teams saves `private`; `team` without `team_id`, or with another
-    organization's team, is refused.
+12. **Defaults fail closed.** An `INSERT INTO memory` omitting `visibility`,
+    `owner` or `owner_verified` is caught by the insert-walking test; a saved
+    note takes its organization's default; a new organization defaults to
+    `private`; `'default'` is `org` after migration; with a `team` default, a
+    caller in two teams saves `private`; `team` without `team_id`, or with
+    another organization's team, is refused.
 13. **Owners.** After migration and bootstrap, a note written by a configured
     human is owned by that `users` row; a hub owner bootstrapped after
     `memory.scope.v1` gets their notes re-owned through `reown_for_user`, and so
     does a user the importer creates; re-running bootstrap or import changes
     nothing further; the re-own runs through `MemoryRepo` and is not denied by
     the authorizer; a summary of an `org` group is owned by the organization.
+    **Ownership proof:** every note the migration and the importer write has
+    `owner_verified = 0`; a verified human's write has `1`, and an agent's,
+    system caller's or anonymous caller's write has `0` even when it supplies a
+    human `author`; `reown_for_user` never raises the flag; `attest-owners` is
+    operator-only, refuses a label that is not a `users` row, writes ids only to
+    the ledger, and is idempotent; no tool argument sets the column.
 14. **Visibility changes.** Only the owner widens, and widening into a team
     needs membership; an `org_admin` cannot read, narrow or delete a `private`
     note they cannot see, and can narrow an `org` note; narrowing invalidates
@@ -1098,7 +1180,11 @@ Links and consolidation
 21. **Idempotency.** Running the pass twice produces no duplicate summary and
     no orphaned edges; an expired lease is retaken; a retried commit returns the
     same summary; a commit after any source revision or scope change is
-    refused; a restored identical source set can be consolidated again.
+    refused; a restored identical source set can be consolidated again; a group
+    whose scope has no eligible consolidator creates no job; an unclaimed
+    `pending` row past `consolidation_job_ttl_hours` becomes `expired`, its
+    sources return to groupable, and a fresh job for the same set is created;
+    a claimed job is not expired by the TTL.
 22. **Provenance and trust.** Every summary's evidence names its sources and
     every source has a `derives` link to it; a summary's prior and salience
     never exceed its sources' minimum and it cannot carry `broadcast`; when a
@@ -1125,11 +1211,12 @@ Graph, pack, distillation, import
     a note found only by the graph leg is returned; a note's entities stop at
     64.
 26. **Context pack.** Respects the token budget, includes only eligible notes,
-    takes decisions only from human-written or human-confirmed notes (by a
-    `memory_feedback_events` row), injects only human-owned or own-team notes,
-    does not change access or recall counters, survives a note containing the
-    pack's marker without the block closing early, and is identical for the
-    same state and `as_of`.
+    takes decisions only from verified-human-written or human-confirmed notes
+    (by a `memory_feedback_events` row), injects only verified-human-owned or
+    own-team notes — an anonymous note with a human `author` is listed by id and
+    title only — does not change access or recall counters, survives a note
+    containing the pack's marker without the block closing early, and is
+    identical for the same state and `as_of`.
 27. **Distillation.** Two concurrent first calls for one session leave one
     episode note; a repeat call updates it; an oversized field is refused; a
     caller that does not own the session is refused.
@@ -1140,3 +1227,9 @@ Graph, pack, distillation, import
     mirrors and are all present after the run even when the superseding note
     was imported after the note it supersedes; a manifest compare distinguishes
     a retired edge from a live one.
+29. **Bounded lexical leg.** A query with more than `MAX_QUERY_TERMS` distinct
+    terms scores the first 32 in FTS5 order, identically on repeat; a query
+    matching more than `MAX_LEXICAL_MATCHES` eligible notes scores a
+    deterministic 10,000 and reports `lexical_truncated: true`; hidden notes
+    never change which visible matches are scored; p95 stays under 100 ms on the
+    100,000-note stopword-heavy bench case.

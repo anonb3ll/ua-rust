@@ -93,8 +93,75 @@ END;
 pub const TENANT_PART: Procedure =
     ua_store::org::tenant_part("organization.v1.deliverables", &["deliverables", "deliverable_revisions"]);
 
+/// File revision metadata and a durable handoff from the approval transaction
+/// to the filesystem. Pending bytes are discarded when a release completes.
+pub const FILE_SCHEMA: SchemaPart = SchemaPart {
+    name: "deliverables.v2.files",
+    sql: "
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliverables_file_title
+    ON deliverables (org_id, task_id, title) WHERE kind = 'file';
+CREATE TABLE deliverable_files (
+    revision_id INTEGER PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    source_path TEXT NOT NULL CHECK (length(source_path) BETWEEN 1 AND 1024),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 0 AND 1048576)
+);
+CREATE TRIGGER deliverable_files_revision BEFORE INSERT ON deliverable_files
+WHEN NOT EXISTS (
+    SELECT 1 FROM deliverable_revisions r
+    JOIN deliverables d ON d.id = r.deliverable_id AND d.org_id = r.org_id
+    WHERE r.id = NEW.revision_id AND r.org_id = NEW.org_id AND length(r.identity) = 64
+      AND r.repo IS NULL AND d.kind = 'file'
+)
+BEGIN SELECT RAISE(ABORT, 'a file needs a file revision in its own organization'); END;
+CREATE TRIGGER deliverable_files_no_update BEFORE UPDATE ON deliverable_files
+BEGIN SELECT RAISE(ABORT, 'file revision metadata is immutable'); END;
+CREATE TRIGGER deliverable_files_no_delete BEFORE DELETE ON deliverable_files
+BEGIN SELECT RAISE(ABORT, 'file revision metadata is immutable'); END;
+
+CREATE TABLE deliverable_releases (
+    revision_id INTEGER PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    approval_id INTEGER NOT NULL UNIQUE,
+    requester TEXT NOT NULL,
+    approver TEXT NOT NULL CHECK (approver <> requester COLLATE NOCASE),
+    destination TEXT NOT NULL,
+    root_identity TEXT NOT NULL,
+    staging_id TEXT NOT NULL UNIQUE,
+    workflow_revision INTEGER NOT NULL,
+    ownership_generation INTEGER NOT NULL,
+    payload BLOB,
+    released_at TEXT,
+    CHECK ((payload IS NULL) = (released_at IS NOT NULL)),
+    CHECK (length(payload) <= 1048576),
+    UNIQUE (root_identity, destination COLLATE NOCASE)
+);
+CREATE TRIGGER deliverable_releases_revision BEFORE INSERT ON deliverable_releases
+WHEN NOT EXISTS (
+    SELECT 1 FROM deliverable_files f WHERE f.revision_id = NEW.revision_id AND f.org_id = NEW.org_id
+)
+BEGIN SELECT RAISE(ABORT, 'a release needs a file revision in its own organization'); END;
+CREATE TRIGGER deliverable_releases_fixed BEFORE UPDATE ON deliverable_releases
+WHEN OLD.released_at IS NOT NULL OR NEW.released_at IS NULL OR NEW.payload IS NOT NULL
+     OR NEW.revision_id IS NOT OLD.revision_id OR NEW.org_id IS NOT OLD.org_id
+     OR NEW.approval_id IS NOT OLD.approval_id OR NEW.requester IS NOT OLD.requester
+     OR NEW.approver IS NOT OLD.approver OR NEW.destination IS NOT OLD.destination
+     OR NEW.root_identity IS NOT OLD.root_identity OR NEW.staging_id IS NOT OLD.staging_id
+     OR NEW.workflow_revision IS NOT OLD.workflow_revision
+     OR NEW.ownership_generation IS NOT OLD.ownership_generation
+BEGIN SELECT RAISE(ABORT, 'a release may only advance to completed'); END;
+CREATE TRIGGER deliverable_releases_no_delete BEFORE DELETE ON deliverable_releases
+BEGIN SELECT RAISE(ABORT, 'a release is never deleted'); END;
+",
+};
+
+pub const FILE_TENANT_PART: Procedure = ua_store::org::tenant_part(
+    "organization.v1.deliverable_files",
+    &["deliverable_files", "deliverable_releases"],
+);
+
 /// The crate's schema parts, in application order. They need
 /// `organization.v1.store` applied first.
 pub fn schema_parts() -> Vec<Part> {
-    vec![SCHEMA.into(), TENANT_PART.into()]
+    vec![SCHEMA.into(), TENANT_PART.into(), FILE_SCHEMA.into(), FILE_TENANT_PART.into()]
 }

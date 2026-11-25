@@ -104,6 +104,32 @@ pub const REGISTRY_CHANNEL: &str = "agent.mcp_server";
 /// default organization's, which operates the hub.
 pub(crate) const HUB_SECRETS_ORG: &str = ua_core::DEFAULT_ORG;
 const MAX_TOOLS: usize = 256;
+
+/// Refuse another organization's caller on the MCP server registry
+/// (`mcp_server_list`) and on `mcp_gateway`, every action, static `list`
+/// included. Every downstream server is the hub's, the default
+/// organization's: a stdio server is a process the hub spawns on its own
+/// host, with the hub's filesystem and network; a Streamable HTTP server is
+/// reached from the hub's network position (loopback, tailnet and private
+/// ranges its `address_scope` admits), secrets or not; an injected
+/// credential is the default organization's managed secret; and the
+/// registration itself (URL or command, address scope, secret names and
+/// whether each is stored, review state) is the hub's configuration. Until
+/// servers are per organization, another organization learns none of it.
+///
+/// A [`crate::registry::PreGate`]: it depends on the caller alone, so the
+/// registry refuses before any approval gate can park an approval for the
+/// call. The handlers check it again, first.
+pub(crate) fn require_hub_org(caller: &Caller, _args: &Value) -> UaResult<()> {
+    if caller.org_id == HUB_SECRETS_ORG {
+        return Ok(());
+    }
+    Err(UaError::denied(
+        "org_unsupported",
+        "MCP servers are the hub's: each runs as a process on the hub or is reached from the hub's network, \
+         with the hub's credentials, and serves the default organization only; nothing was read, started or sent",
+    ))
+}
 const MAX_ARGS: usize = 64;
 const MAX_ARG_CHARS: usize = 1024;
 const MAX_ENV: usize = 32;
@@ -1060,6 +1086,7 @@ pub struct ListArgs {
 }
 
 async fn mcp_server_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
+    require_hub_org(&ctx.caller, &Value::Null)?;
     let cfg = ctx.hub.cfg().clone();
     ctx.hub
         .db()
@@ -1140,12 +1167,14 @@ pub fn register(r: &mut Registry) {
             concat!(
                 "List downstream MCP servers (registry and config): status (active, review_expired, review_required, \
                  revoked, misconfigured), transport, URL or command, address scope, secret names and whether each \
-                 is stored, read and write tools, read_profiles and the review window. Never secret values.",
+                 is stored, read and write tools, read_profiles and the review window. Never secret values. The \
+                 servers are the hub's: another organization's caller is refused (org_unsupported).",
                 no_gateway_suffix!()
             ),
             mcp_server_list,
         )
         .read_only()
+        .pre_gate(require_hub_org)
         .family("mcp"),
     );
     #[cfg(feature = "mcp-gateway")]

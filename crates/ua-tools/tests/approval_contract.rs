@@ -175,6 +175,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                 ],
             ),
         ),
+        ("families/deliverables/files.rs", (1, vec![("deliverable_release", json!({}))])),
         ("families/audit/mod.rs", (1, vec![("security_audit", json!({ "remediate": true }))])),
         (
             "families/cycles.rs",
@@ -234,7 +235,17 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
             (2, vec![("node_followup", json!({})), ("node_permission", json!({}))]),
         ),
         ("families/relay/mod.rs", (2, vec![("relay_manage", action("send"))])),
-        ("families/skill_registry.rs", (1, vec![("skill_registry", action("publish"))])),
+        (
+            "families/skill_registry.rs",
+            (
+                1,
+                vec![
+                    ("skill_registry", action("publish")),
+                    ("skill_registry", action("source_add")),
+                    ("skill_registry", action("source_revoke")),
+                ],
+            ),
+        ),
         ("families/tokens.rs", (1, vec![("oauth_device_manage", action("revoke"))])),
         (
             "families/workflows/engine.rs",
