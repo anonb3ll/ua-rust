@@ -19,6 +19,7 @@ ua-store = { path = "crates/ua-store" }
 ua-memory = { path = "crates/ua-memory" }
 ua-org = { path = "crates/ua-org" }
 ua-deliverables = { path = "crates/ua-deliverables" }
+ua-graph = { path = "crates/ua-graph" }
 ua-tools = { path = "crates/ua-tools" }
 ua-server = { path = "crates/ua-server" }
 ua-import = { path = "crates/ua-import" }

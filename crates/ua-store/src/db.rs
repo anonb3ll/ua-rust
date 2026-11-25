@@ -153,7 +153,11 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
     r.busy_timeout(std::time::Duration::from_secs(10))?;
-    r.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    r.execute_batch(
+        "PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -64000;
+         PRAGMA mmap_size = 268435456;",
+    )?;
     Ok(r)
 }
 
@@ -190,7 +194,10 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA temp_store = MEMORY;",
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -64000;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA wal_autocheckpoint = 10000;",
     )
 }
 

@@ -231,6 +231,8 @@ pub fn schema_parts() -> Vec<Part> {
     // Org-scoped Git skill source allowlist (born tenant-scoped; D2a).
     parts.push(families::skill_sources::SCHEMA.into());
     parts.push(families::skill_sources::TENANT_PART.into());
+    // Shared tenant-scoped graph store (`ua-graph`, born tenant-scoped; C1).
+    parts.extend(families::graph_store::schema_parts());
     parts
 }
 

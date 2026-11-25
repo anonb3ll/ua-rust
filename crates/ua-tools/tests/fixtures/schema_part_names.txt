@@ -138,3 +138,5 @@ organization.v1.registry.tenant
 evidence_key_store.v1
 skill_sources.v1
 organization.v1.tools.skill_sources
+graph.v1
+organization.v1.graph

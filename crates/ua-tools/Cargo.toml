@@ -55,6 +55,8 @@ ua-memory.workspace = true
 ua-org.workspace = true
 # Deliverables and their revisions; the tools are registered here.
 ua-deliverables.workspace = true
+# Shared tenant-scoped graph store; the governed tools are registered here.
+ua-graph.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
