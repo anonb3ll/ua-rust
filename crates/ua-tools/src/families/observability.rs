@@ -1758,8 +1758,8 @@ fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     if blocked > 0 {
         row["other_org_nodes_not_accepted"] = json!(blocked);
     }
-    // Another organization's command notices are kept, never sent (the
-    // mailbox has no organization yet); the owner reads node_command_status.
+    // Another organization's command notices are mailed within it; one still
+    // unsent (its delivery keeps failing) is counted here, never named.
     if fleet.other_org_unsent_notices > 0 {
         row["other_org_unsent_command_notices"] = json!(fleet.other_org_unsent_notices);
     }

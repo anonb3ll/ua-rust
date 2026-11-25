@@ -570,14 +570,14 @@ async fn the_same_key_in_each_organization_replays_only_its_own_receipt() {
 
 fn expected_rows() -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
-    for (org, prefix, esc) in [
-        (DEFAULT_ORG, String::new(), String::new()),
-        (ORG_B, "org:org-b/".to_string(), "org:org-b/".to_string()),
-        (ORG_SLASH, "org:acme/ops/".to_string(), "org:acme%2Fops/".to_string()),
-    ] {
+    // Every writer escapes `%` and `/` in the organization id, so the
+    // organization part of a key always ends at the first `/`.
+    for (org, prefix) in
+        [(DEFAULT_ORG, ""), (ORG_B, "org:org-b/"), (ORG_SLASH, "org:acme%2Fops/")]
+    {
         rows.push(format!("{org}|{prefix}delegate:lead-1:same|delegate"));
-        rows.push(format!("{org}|{esc}memory_save/builder-1/same|memory_save"));
-        rows.push(format!("{org}|{esc}message_send/builder-1/same|message_send"));
+        rows.push(format!("{org}|{prefix}memory_save/builder-1/same|memory_save"));
+        rows.push(format!("{org}|{prefix}message_send/builder-1/same|message_send"));
         rows.push(format!("{org}|{prefix}task_add:same|task_add"));
         rows.push(format!("{org}|{prefix}task_update:builder-1:same|task_update"));
     }
@@ -589,9 +589,10 @@ fn expected_rows() -> Vec<String> {
     rows
 }
 
-/// Two organizations whose prefixes spell the same key text (one id is the
-/// other's followed by `/task_add:z`) still keep two receipts: the
-/// organization column, not the prefix, tells them apart.
+/// Two organizations whose interim prefixes spelled the same key text (one
+/// id is the other's followed by `/task_add:z`) keep two receipts: the
+/// organization column tells them apart, and the escaped `/` in the longer
+/// id keeps the key texts apart too.
 #[tokio::test]
 async fn an_organization_id_with_a_slash_never_shares_a_receipt() {
     let h = H::new();
@@ -605,13 +606,60 @@ async fn an_organization_id_with_a_slash_never_shares_a_receipt() {
     assert_eq!(
         h.rows(),
         [
+            "acme/task_add:z|org:acme%2Ftask_add:z/task_add:k|task_add",
             "acme|org:acme/task_add:z/task_add:k|task_add",
-            "acme/task_add:z|org:acme/task_add:z/task_add:k|task_add",
         ]
     );
     for (org, id) in [(ORG_ACME, &a["id"]), (ORG_ACME_LONG, &b["id"])] {
         assert_eq!(h.count(&format!("SELECT COUNT(*) FROM tasks WHERE org_id = '{org}' AND id = {id}")), 1);
     }
+}
+
+/// A receipt an organization with `/` in its id stored before organization
+/// ids were escaped (`org:acme/ops/…`) still replays there, through
+/// `task_add`, `task_update`, `delegate` and the delegation lookup, while new
+/// receipts are stored escaped (`org:acme%2Fops/…`).
+#[tokio::test]
+async fn an_interim_unescaped_receipt_still_replays_in_its_organization() {
+    let h = H::new();
+    let me = agent("builder-1", ORG_SLASH);
+    let lead = agent("lead-1", ORG_SLASH);
+    let task = h.ok(&me, "task_add", json!({ "title": "slash", "idempotency_key": "i1" })).await;
+    let id = task["id"].as_i64().unwrap();
+    let update =
+        h.ok(&me, "task_update", json!({ "id": id, "append_note": "n", "idempotency_key": "i2" })).await;
+    let delegated = h
+        .ok(&lead, "delegate", json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": "i3" }))
+        .await;
+    assert_eq!(
+        h.rows(),
+        [
+            "acme/ops|org:acme%2Fops/delegate:lead-1:i3|delegate",
+            "acme/ops|org:acme%2Fops/task_add:i1|task_add",
+            "acme/ops|org:acme%2Fops/task_update:builder-1:i2|task_update",
+        ]
+    );
+    // Rewrite each receipt to the interim, unescaped form.
+    h.sql("UPDATE idempotency_keys SET key = replace(key, 'org:acme%2Fops/', 'org:acme/ops/')").unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key LIKE 'org:acme/ops/%'"), 3);
+    assert_eq!(h.ok(&me, "task_add", json!({ "title": "other", "idempotency_key": "i1" })).await, task);
+    assert_eq!(
+        h.ok(&me, "task_update", json!({ "id": id, "append_note": "other", "idempotency_key": "i2" })).await,
+        update
+    );
+    assert_eq!(
+        h.ok(&lead, "delegate", json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": "i3" }))
+            .await,
+        delegated
+    );
+    let found = h
+        .ok(&lead, "delegation_manage", json!({ "action": "lookup", "params": { "idempotency_key": "i3" } }))
+        .await;
+    assert_eq!(found["state"], "committed", "{found}");
+    assert_eq!(found["result"]["delegation_id"], delegated["delegation_id"], "{found}");
+    // No second receipt was written: every retry replayed.
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys"), 3);
+    assert_eq!(h.count("SELECT COUNT(*) FROM tasks WHERE org_id = 'acme/ops' AND title = 'other'"), 0);
 }
 
 /// The lifecycle capture key is the caller's organization's too.
@@ -703,4 +751,109 @@ fn every_insert_into_idempotency_keys_names_org_id() {
     }
     // tasks, delegation, messaging, agents (lifecycle) and memory.
     assert!(seen >= 5, "the guard found {seen} inserts");
+}
+
+// --- the read guard ----------------------------------------------------------------------------
+
+// The source scanner shared with `ua-core`'s guard tests.
+#[path = "../../ua-core/tests/support/mod.rs"]
+mod support;
+
+/// The whole-table statements of the `idempotency.v2.tenant_keys` rebuild,
+/// which reads every organization's rows by design (it counts, checks and
+/// copies them). `(file suffix, statement from the table reference to the
+/// end of its string literal)`, whitespace collapsed and lower-cased.
+const UNSCOPED_ALLOWED: &[(&str, &str)] = &[
+    ("ua-tools/src/families/idempotency.rs", "from idempotency_keys"),
+    ("ua-tools/src/families/idempotency.rs", "from idempotency_keys where key is null order by rowid"),
+    ("ua-tools/src/families/idempotency.rs", "from idempotency_keys k;"),
+];
+
+/// Every statement in `src` that reads, updates or deletes `idempotency_keys`
+/// (`FROM`, `JOIN` or `UPDATE`) without naming `org_id`: the text from the
+/// table reference to the end of its string literal, whitespace collapsed
+/// and lower-cased. SQL is matched case-insensitively, and a statement split
+/// over lines with `\` continuations is read as one.
+fn unscoped_reads(src: &str) -> Vec<String> {
+    let lower = src.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for kw in ["from", "join", "update"] {
+        let pat = format!("{kw} idempotency_keys");
+        let mut at = 0;
+        while let Some(i) = lower[at..].find(&pat).map(|i| at + i) {
+            at = i + pat.len();
+            let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
+            let after_ok = lower.as_bytes().get(at).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
+            if !before_ok || !after_ok {
+                continue;
+            }
+            // The rest of the string literal: up to the first unescaped `"`.
+            let bytes = lower.as_bytes();
+            let mut end = i;
+            while end < bytes.len() && !(bytes[end] == b'"' && bytes[end - 1] != b'\\') {
+                end += 1;
+            }
+            let stmt = lower[i..end].replace("\\\n", " ").replace("\\n", " ").replace("\\t", " ");
+            let stmt = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !stmt.contains("org_id") {
+                out.push(stmt);
+            }
+        }
+    }
+    out
+}
+
+/// Review follow-up N4 of the `idempotency_keys` rebuild: every statement in
+/// non-test source that reads, updates or deletes `idempotency_keys` filters
+/// on `org_id`, so no receipt is ever read across organizations. Only the
+/// rebuild's own whole-table statements are exempt, each named above.
+#[test]
+fn every_read_of_idempotency_keys_filters_org_id() {
+    let mut used = vec![0usize; UNSCOPED_ALLOWED.len()];
+    let mut seen = 0;
+    let mut offenders = Vec::new();
+    for (path, src) in support::sources() {
+        let raw = support::without_tests_raw(&src);
+        seen += raw.to_ascii_lowercase().matches("idempotency_keys where org_id").count();
+        let shown = path.display().to_string().replace('\\', "/");
+        for stmt in unscoped_reads(&raw) {
+            match UNSCOPED_ALLOWED.iter().position(|(f, s)| shown.ends_with(f) && *s == stmt) {
+                Some(n) => used[n] += 1,
+                None => offenders.push(format!("{shown}: {stmt}")),
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "reads of idempotency_keys without org_id:\n{}", offenders.join("\n"));
+    for (n, (f, s)) in UNSCOPED_ALLOWED.iter().enumerate() {
+        assert!(used[n] > 0, "stale exemption: {f}: {s}");
+    }
+    // tasks, delegation, messaging, agents (lifecycle) and memory, at least.
+    assert!(seen >= 5, "the guard found {seen} scoped reads");
+}
+
+/// The read guard bites: an unscoped read, join, update or delete is found,
+/// in any case and across `\` line continuations, and a scoped one is not.
+#[test]
+fn the_read_guard_finds_unscoped_statements() {
+    let bad = [
+        r#"c.query_row("SELECT result_json FROM idempotency_keys WHERE key = ?1", [k], f)"#,
+        "c.query_row(\"SELECT result_json FROM idempotency_keys \\\n     WHERE key = ?1 AND tool = ?2\", p, f)",
+        r#"c.execute("select 1 from Idempotency_Keys where key = ?1", [k])"#,
+        r#"c.query_row("SELECT t.id FROM tasks t JOIN idempotency_keys k ON k.key = t.title", [], f)"#,
+        r#"c.execute("UPDATE idempotency_keys SET result_json = ?2 WHERE key = ?1", p)"#,
+        r#"c.execute("DELETE FROM idempotency_keys WHERE created_at < ?1", [t])"#,
+    ];
+    for src in bad {
+        assert_eq!(unscoped_reads(src).len(), 1, "missed: {src}");
+    }
+    let good = [
+        r#"c.query_row("SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2", p, f)"#,
+        "c.query_row(\"SELECT result_json FROM idempotency_keys \\\n     WHERE org_id = ?1 AND key = ?2\", p, f)",
+        r#"c.query_row("SELECT 1 FROM tasks t JOIN idempotency_keys k ON k.org_id = t.org_id AND k.key = t.title", [], f)"#,
+        r#"c.execute("CREATE TABLE idempotency_keys_new (org_id TEXT)", [])"#,
+        r#"c.query_row("SELECT 1 FROM idempotency_keys_new", [], f)"#,
+    ];
+    for src in good {
+        assert!(unscoped_reads(src).is_empty(), "false hit: {src}");
+    }
 }

@@ -60,6 +60,7 @@ use ua_store::{EventInput, Procedure, SchemaPart, ledger};
 use super::agents::verified;
 use super::harness_config::render::{content_hash, py_dumps};
 use crate::approvals::{self, GateOutcome};
+use crate::families::plans::ledger_text;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 use ua_org::authz::{Authority, Authz};
 
@@ -705,6 +706,25 @@ fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
     Ok(who)
 }
 
+/// Append a skill registry event about a row of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization (the
+/// `org_guard` test admits no other value). For another organization the
+/// caller passes the skill name, target, source path and content hash
+/// through [`ledger_text`], so they are `null` there (a content hash is an
+/// unsalted digest of the skill text, which a guess could confirm), and the
+/// originator is the neutral `system`, never the acting label. Only the
+/// version, the target type, the hub-generated staging id and timestamps
+/// reach the default ledger.
+fn emit(tx: &mut ua_store::WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, channel, payload)
+            .by(crate::approvals::ledger_originator(org, by)),
+    )?;
+    Ok(())
+}
+
 /// Evaluate the one-time human approval for `payload` inside `tx`.
 /// `Ok(Some(id))` when it is pending (the caller commits and reports it).
 fn gate(tx: &mut ua_store::WriteTx<'_>, ctx: &ToolCtx, payload: &Value) -> UaResult<Option<i64>> {
@@ -1014,23 +1034,19 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
                 "UPDATE skill_publish_staging SET published_version = ?3 WHERE org_id = ?1 AND id = ?2",
                 params![org, staged.id, next],
             )?;
-            // ORG-EVENT-DEFAULT: use the skill's organization once callers
-            // can resolve to other organizations and org_guard allows it.
-            ledger::append(
+            emit(
                 tx,
-                EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    "skill.published",
-                    json!({
-                        "name": staged.name,
-                        "version": next,
-                        "content_hash": staged.content_hash,
-                        "source": staged.source,
-                        "staging_id": staged.id,
-                        "published_at": now,
-                    }),
-                )
-                .by(who.to_string()),
+                org,
+                "skill.published",
+                json!({
+                    "name": ledger_text(org, &staged.name),
+                    "version": next,
+                    "content_hash": ledger_text(org, &staged.content_hash),
+                    "source": ledger_text(org, &staged.source),
+                    "staging_id": staged.id,
+                    "published_at": now,
+                }),
+                who,
             )?;
             let skill = tx.query_row(
                 &format!(
@@ -1147,15 +1163,17 @@ fn assign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
              assigned_at = excluded.assigned_at",
             params![org, name, ttype, target, pin, who, now],
         )?;
-        // ORG-EVENT-DEFAULT: use the assignment's organization once callers
-        // can resolve to other organizations and org_guard allows it.
-        ledger::append(
+        emit(
             tx,
-            EventInput::new(ua_core::DEFAULT_ORG,
-                "skill.assigned",
-                json!({ "name": name, "target_type": ttype, "target": target, "version": pin }),
-            )
-            .by(who.clone()),
+            org,
+            "skill.assigned",
+            json!({
+                "name": ledger_text(org, &name),
+                "target_type": ttype,
+                "target": ledger_text(org, &target),
+                "version": pin,
+            }),
+            &who,
         )?;
         let row = tx.query_row(
             &format!(
@@ -1223,16 +1241,16 @@ fn unassign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
                 )?;
             }
             if removed > 0 {
-                // ORG-EVENT-DEFAULT: use the assignment's organization once callers
-                // can resolve to other organizations and org_guard allows it.
-                ledger::append(
+                emit(
                     tx,
-                    EventInput::new(
-                        ua_core::DEFAULT_ORG,
-                        "skill.unassigned",
-                        json!({ "name": name, "target_type": ttype, "target": target }),
-                    )
-                    .by(who.clone()),
+                    org,
+                    "skill.unassigned",
+                    json!({
+                        "name": ledger_text(org, &name),
+                        "target_type": ttype,
+                        "target": ledger_text(org, &target),
+                    }),
+                    &who,
                 )?;
             }
             Ok(Ok(json!({ "removed": removed > 0 })))
@@ -1616,5 +1634,64 @@ mod tests {
         assert_eq!(approval(req).1["org_id"], "org-b");
         approve(req);
         assert_eq!(unassign_as(&b, who.into(), params_of("builder-1")).unwrap()["removed"], true);
+
+        // B's registry events reach the default ledger with no name, target,
+        // source or content hash, and the neutral originator.
+        let events: Vec<(String, String, String)> = hub
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT channel, COALESCE(originator, ''), payload FROM event_log \
+                     WHERE channel LIKE 'skill.%' ORDER BY seq",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        let channels: Vec<&str> = events.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(channels, ["skill.published", "skill.assigned", "skill.unassigned"], "{events:?}");
+        let b_hash = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT content_hash FROM skill_versions WHERE org_id = 'org-b'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        for (channel, originator, payload) in &events {
+            assert_eq!(originator, crate::approvals::NEUTRAL_ORIGINATOR, "{channel}");
+            for secret in ["review-diff", "builder-1", "SKILL.md", "ops-bot", b_hash.as_str()] {
+                assert!(!payload.contains(secret), "{channel} carries {secret}: {payload}");
+            }
+            let p: Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(p["name"], Value::Null, "{payload}");
+        }
+        let published: Value = serde_json::from_str(&events[0].2).unwrap();
+        assert_eq!((published["version"].as_i64(), published["content_hash"].is_null()), (Some(1), true));
+        assert_eq!(published["staging_id"], b_staging.as_str());
+        let assigned: Value = serde_json::from_str(&events[1].2).unwrap();
+        assert_eq!((assigned["target_type"].as_str(), assigned["target"].is_null()), (Some("agent"), true));
+
+        // The default organization's own events keep their names.
+        let staged = again["staging_id"].as_str().unwrap().to_string();
+        approve(again["approval_id"].as_i64().unwrap());
+        publish_staged(&a, who, &staged).unwrap();
+        let (originator, payload): (String, String) = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT originator, payload FROM event_log WHERE channel = 'skill.published' \
+                     ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(originator, who);
+        let p: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["name"], "review-diff", "{payload}");
+        assert!(p["content_hash"].is_string(), "{payload}");
     }
 }

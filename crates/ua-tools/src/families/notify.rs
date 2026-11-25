@@ -9,8 +9,10 @@
 //! configured secret header, and retried on network errors, 429 and 5xx up to
 //! `notify_max_attempts` times. Without a URL the row stays in the outbox with
 //! status `not_configured`. A delivered row's text is cleared; failed and
-//! unconfigured rows keep it so an operator can resend. The delivery status
-//! tool never returns message text.
+//! unconfigured rows keep it so an operator can resend, except another
+//! organization's `not_configured` row, which never stores its text (that
+//! organization has no destination to resend to). The delivery status tool
+//! never returns message text.
 //!
 //! `batch_notify` queues messages per category in `pending_notifications`;
 //! `flush_digest` (or reaching `max_batch_size`) sends them as one digest.
@@ -47,7 +49,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_ingress::{Outbound, OutboundError, Request, Url, policy};
 use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
-use crate::families::plans::write_identity;
+use crate::families::plans::{ledger_text, write_identity};
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -294,24 +296,50 @@ fn enqueue(
     let now = ua_core::time::now();
     let status = if configured { "pending" } else { "not_configured" };
     let chars = message.chars().count() as i64;
+    // Another organization has no destination at all (`webhook_for`), so its
+    // unsendable text is not kept: the row records the attempt (kind,
+    // category, size, status) with `message` NULL, as a delivered row does.
+    // The default organization's `not_configured` row keeps its text for an
+    // operator's resend once the hub's webhook is configured.
+    let stored = (configured || org == ua_core::DEFAULT_ORG).then_some(message);
     tx.execute(
         "INSERT INTO notify_outbox (org_id, kind, category, agent, message, chars, status, created_at, \
          updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        params![org, kind, category, agent, message, chars, status, now],
+        params![org, kind, category, agent, stored, chars, status, now],
     )?;
     let id = tx.last_insert_rowid();
-    // ORG-EVENT-DEFAULT: use the row's organization once org_guard allows it.
     // The payload carries ids and counts, never the message.
-    ledger::append(
+    emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            "agent.notify.queued",
-            json!({ "outbox_id": id, "kind": kind, "category": category, "chars": chars, "status": status }),
-        )
-        .by(agent.to_string()),
+        org,
+        "agent.notify.queued",
+        json!({
+            "outbox_id": id,
+            "kind": kind,
+            "category": category.map(|c| ledger_text(org, c)),
+            "chars": chars,
+            "status": status,
+        }),
+        agent,
     )?;
     Ok(id)
+}
+
+/// Append a notification event about a row of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization (the
+/// `org_guard` test admits no other value). For another organization the
+/// caller passes the category, a caller-chosen name, through [`ledger_text`]
+/// (`null` there), and the originator is the neutral `system`, never the
+/// acting label: only ids, kinds, counts, statuses and HTTP codes reach the
+/// default ledger. Message text never does, for any organization.
+fn emit(tx: &mut WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, channel, payload)
+            .by(crate::approvals::ledger_originator(org, by)),
+    )?;
+    Ok(())
 }
 
 /// Write the delivery outcome and its ledger event.
@@ -327,15 +355,12 @@ fn settle(tx: &mut WriteTx<'_>, org: &str, id: i64, agent: &str, d: &Delivery) -
     if changed == 0 {
         return Err(UaError::not_found(format!("no notification {id}")));
     }
-    // ORG-EVENT-DEFAULT: use the row's organization once org_guard allows it.
-    ledger::append(
+    emit(
         tx,
-        EventInput::new(
-            ua_core::DEFAULT_ORG,
-            format!("agent.notify.{status}"),
-            json!({ "outbox_id": id, "attempts": d.attempts, "http_status": d.http_status }),
-        )
-        .by(agent.to_string()),
+        org,
+        &format!("agent.notify.{status}"),
+        json!({ "outbox_id": id, "attempts": d.attempts, "http_status": d.http_status }),
+        agent,
     )?;
     Ok(())
 }
@@ -520,15 +545,12 @@ async fn batch_notify(ctx: ToolCtx, a: BatchArgs) -> UaResult<Value> {
                     params![org, cat, m, who, now],
                 )?;
             }
-            // ORG-EVENT-DEFAULT: use the caller's organization once org_guard allows it.
-            ledger::append(
+            emit(
                 tx,
-                EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    "agent.notify.batched",
-                    json!({ "category": cat, "queued": valid.len() }),
-                )
-                .by(who.clone()),
+                &org,
+                "agent.notify.batched",
+                json!({ "category": ledger_text(&org, &cat), "queued": valid.len() }),
+                &who,
             )?;
             Ok(tx.query_row(
                 "SELECT COUNT(*) FROM pending_notifications WHERE org_id = ?1 AND category = ?2",

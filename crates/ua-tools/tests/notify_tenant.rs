@@ -88,6 +88,8 @@ struct Seen {
     sends: Vec<HashMap<String, String>>,
     /// Status the next Zulip send answers with.
     zulip_status: u16,
+    /// Requests for the bot's own user (the first step of every fetch).
+    me_calls: usize,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -109,8 +111,13 @@ async fn on_send(
     }
 }
 
-async fn on_me() -> Json<Value> {
+async fn on_me(State(s): State<Shared>) -> Json<Value> {
+    s.lock().unwrap().me_calls += 1;
     Json(json!({ "result": "success", "user_id": 99, "email": "bot@example.com" }))
+}
+
+async fn on_fetch() -> Json<Value> {
+    Json(json!({ "result": "success", "messages": [] }))
 }
 
 struct H {
@@ -127,7 +134,7 @@ impl H {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/hook", post(on_hook))
-            .route("/api/v1/messages", post(on_send))
+            .route("/api/v1/messages", post(on_send).get(on_fetch))
             .route("/api/v1/users/me", get(on_me))
             .with_state(seen.clone());
         tokio::spawn(async move {
@@ -382,7 +389,9 @@ async fn notifications_are_isolated_in_both_directions() {
     let (a_id, b_id) = (a["outbox_id"].as_i64().unwrap(), b["outbox_id"].as_i64().unwrap());
     let rows = h.outbox();
     assert_eq!(rows[0].0, DEFAULT_ORG);
-    assert_eq!((rows[1].0.as_str(), rows[1].4.as_deref()), (ORG_B, Some("beta secret")), "kept for a resend");
+    // Organization B has no destination to resend to, so its text is not kept.
+    assert_eq!((rows[1].0.as_str(), rows[1].3.as_str(), rows[1].4.as_deref()), (ORG_B, "not_configured", None));
+    assert_eq!(h.count(&format!("SELECT chars FROM notify_outbox WHERE id = {b_id}")), 11);
 
     let ids = |v: &Value| -> Vec<i64> {
         v["deliveries"].as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect()
@@ -433,8 +442,10 @@ async fn an_identical_digest_category_in_two_organizations_flushes_separately() 
     let digests: Vec<(String, Option<String>)> =
         h.outbox().into_iter().filter(|r| r.1 == "digest").map(|r| (r.0, r.4)).collect();
     assert_eq!(digests.len(), 2, "{digests:?}");
-    let b_text = digests.iter().find(|d| d.0 == ORG_B).and_then(|d| d.1.clone()).unwrap();
-    assert!(b_text.contains("b1") && b_text.contains("b2") && !b_text.contains("a1"), "{b_text}");
+    // B's digest is recorded without its text (B has no destination).
+    assert_eq!(digests.iter().find(|d| d.0 == ORG_B).map(|d| d.1.clone()), Some(None), "{digests:?}");
+    let a_text = digests.iter().find(|d| d.0 == DEFAULT_ORG).map(|d| d.1.clone());
+    assert_eq!(a_text, Some(None), "a delivered digest's text is cleared: {digests:?}");
     let hooks = h.hook_texts();
     assert_eq!(hooks.len(), 1, "{hooks:?}");
     assert!(hooks[0].contains("a1") && hooks[0].contains("a2"), "{hooks:?}");
@@ -478,6 +489,61 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert!(h.hook_texts().is_empty());
 }
 
+/// Review follow-up: notification events of another organization reach the
+/// default ledger with no category (a caller-chosen name) and the neutral
+/// originator; the default organization's keep both. No event carries text.
+#[tokio::test]
+async fn notification_events_of_another_organization_carry_no_names() {
+    let h = H::new().await;
+    let before = h.count("SELECT COALESCE(MAX(seq), 0) FROM event_log");
+    let b_category = "falcon-board-alerts";
+    let b_agent = Caller { label: "kestrel-notifier".into(), ..agent(ORG_B) };
+    h.ok(&b_agent, "notify", json!({ "message": "beta secret one" })).await;
+    h.ok(&b_agent, "batch_notify", json!({ "messages": ["beta secret two"], "category": b_category, "flush_now": true }))
+        .await;
+    h.ok(&agent(DEFAULT_ORG), "batch_notify", json!({ "messages": ["alpha two"], "category": "drift", "flush_now": true }))
+        .await;
+    let events: Vec<(String, String, String)> = h
+        .hub
+        .db()
+        .read(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT channel, COALESCE(originator, ''), payload FROM event_log \
+                 WHERE seq > ?1 AND channel LIKE 'agent.notify.%' ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    let channels: Vec<&str> = events.iter().map(|e| e.0.as_str()).collect();
+    assert_eq!(
+        channels,
+        [
+            "agent.notify.queued",
+            "agent.notify.batched",
+            "agent.notify.queued",
+            "agent.notify.batched",
+            "agent.notify.queued",
+            "agent.notify.delivered",
+        ],
+        "{events:?}"
+    );
+    for (i, (channel, originator, payload)) in events.iter().enumerate() {
+        for secret in ["beta secret", "alpha two", b_category, "kestrel-notifier"] {
+            assert!(!payload.contains(secret), "{channel} carries {secret}: {payload}");
+        }
+        let p: Value = serde_json::from_str(payload).unwrap();
+        if i < 3 {
+            assert_eq!(originator, "system", "{channel}: {payload}");
+            assert!(p.get("category").is_none_or(Value::is_null), "{channel}: {payload}");
+        } else {
+            assert_eq!(originator, if channel == "agent.notify.batched" { "speaker-1" } else { "system" });
+        }
+    }
+    let batched: Value = serde_json::from_str(&events[3].2).unwrap();
+    assert_eq!(batched["category"], "drift", "the default organization keeps its category");
+}
+
 // --- zulip -------------------------------------------------------------------------------------
 
 /// Organization B cannot post through the default organization's Zulip:
@@ -495,6 +561,29 @@ async fn zulip_sends_of_another_organization_are_refused_before_anything_is_reco
     assert_eq!(h.count("SELECT COUNT(*) FROM zulip_sends"), 0);
     assert_eq!(h.count("SELECT COUNT(*) FROM approvals"), 0);
     assert_eq!(h.count("SELECT COUNT(*) FROM event_log"), before);
+}
+
+/// Review follow-up: organization B cannot read the default organization's
+/// Zulip either. A fetch is refused before any request, cursor or event; an
+/// unknown organization is refused the same way. The default organization
+/// still fetches and keeps its cursor.
+#[tokio::test]
+async fn zulip_fetches_of_another_organization_are_refused_before_anything_is_recorded() {
+    let h = H::new().await;
+    let before = h.count("SELECT COUNT(*) FROM event_log");
+    let args = json!({ "agent_label": "speaker-1", "channel": "requests", "anchor": "newest" });
+    let e = h.call(&agent(ORG_B), "zulip_fetch_messages", args.clone()).await.unwrap_err();
+    assert_eq!(reason(&e), "zulip_not_configured", "{e}");
+    let e = h.call(&agent(UNKNOWN), "zulip_fetch_messages", args.clone()).await.unwrap_err();
+    assert!(e.to_string().contains("unknown organization"), "{e}");
+    assert_eq!(h.seen.lock().unwrap().me_calls, 0, "no request reached the Zulip site");
+    assert_eq!(h.count("SELECT COUNT(*) FROM zulip_fetch_cursors"), 0);
+    assert_eq!(h.count("SELECT COUNT(*) FROM event_log"), before);
+
+    let ok = h.ok(&agent(DEFAULT_ORG), "zulip_fetch_messages", args).await;
+    assert_eq!(ok["received"], true, "{ok}");
+    assert_eq!(h.seen.lock().unwrap().me_calls, 1);
+    assert_eq!(h.count("SELECT COUNT(*) FROM event_log WHERE channel = 'agent.zulip.fetched'"), 1);
 }
 
 /// The duplicate check is per organization: organization B's open send of

@@ -1040,9 +1040,15 @@ here for memory columns, owners and defaults.
   default nodes (`org_unsupported`); with `node_require_acceptance` on,
   another organization's nodes therefore take no real work until acceptance
   carries its own evidence store. Command notices go
-  through the mailbox (`message_index`, no `org_id`), so another
-  organization's notice stays recorded on its `node_command_notice` row,
-  unsent; its owner reads the outcome with `node_command_status`.
+  through the mailbox, which the messaging family keyed by organization
+  (`message_index.org_id`), so each notice is mailed within its own
+  organization: to the command's owner, an agent of that organization, in
+  that organization's mailbox (its owner session looked up there), with the
+  message event's content kept out of the default ledger. A notice is never
+  mailed through another organization's mailbox. (Before that follow-up,
+  another organization's notice was only recorded, unsent; such a row is
+  sent by the next sweep.) The doctor counts another organization's notices
+  still unsent.
   **Events.** `agent.node.*` and `agent.dispatch.transition` are
   `ORG-EVENT-DEFAULT` sites through `node_queue::emit`: for another
   organization the payload keeps only ids, states, attempts, fences,

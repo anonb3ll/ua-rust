@@ -392,9 +392,34 @@ async fn organization_b_writes_land_in_organization_b() {
     let replay =
         h.ok(&b, "routine_fire", json!({ "routine_id": id, "idempotency_key": "b-private-key" })).await;
     assert_eq!(replay["replayed"], true, "{replay}");
-    // B's client-chosen fire key reaches the (default organization's) ledger
-    // only as a digest.
+    // B's client-chosen fire key never reaches the (default organization's)
+    // ledger, not even as an unsalted digest a guess could confirm: the
+    // event names B's receipt row, with the neutral originator.
     assert_eq!(h.count("SELECT COUNT(*) FROM event_log WHERE payload LIKE '%b-private-key%' OR dedupe_key LIKE '%b-private-key%'"), 0);
+    let digest = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(b"event:b-private-key"))
+    };
+    let raw_digest = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(b"b-private-key"))
+    };
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%sha256:%' OR payload LIKE '%{digest}%' \
+             OR payload LIKE '%{raw_digest}%' OR dedupe_key LIKE '%sha256:%'"
+        )),
+        0
+    );
+    let row = h.count(&format!("SELECT id FROM routine_runs WHERE routine_id = {id}"));
+    assert_eq!(
+        h.text(&format!(
+            "SELECT originator || '|' || json_extract(payload, '$.fire_key') || '|' || dedupe_key FROM event_log \
+             WHERE channel = 'agent.routine.fired' AND json_extract(payload, '$.routine_id') = {id}"
+        ))
+        .as_deref(),
+        Some(format!("system|run:{row}|routine:{id}:run:{row}:create").as_str())
+    );
 
     // B's workflow runs and checkpoints are B's.
     let run_id = h.run_vet(&agent("builder-1", ORG_B)).await;

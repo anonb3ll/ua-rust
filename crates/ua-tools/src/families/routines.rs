@@ -365,21 +365,21 @@ fn create_fire(
         params![id, fire_key, at_text, status, task_id, now, reason, win, matched, subject_key, org],
     )?;
     let run_row = tx.last_insert_rowid();
-    // ORG-EVENT-DEFAULT: use the routine's organization once org_guard allows
-    // it. Until then another organization's fire key (client text for an
-    // api fire) reaches the default organization's ledger only as a digest.
-    let event_key = if org == ua_core::DEFAULT_ORG {
-        fire_key.to_string()
-    } else {
-        format!("sha256:{}", workflows::engine::sha256_hex(fire_key))
-    };
+    // ORG-EVENT-DEFAULT: the event stays in the default organization's
+    // ledger. Another organization's fire key (client text for an api fire,
+    // a schedule time for a cron one) never reaches it, not even as an
+    // unsalted digest, which a guess could confirm: the event names the
+    // hub-generated receipt row instead (`run:<id>`, unique per fire like the
+    // key), and its originator is the neutral `system`.
+    let event_key =
+        if org == ua_core::DEFAULT_ORG { fire_key.to_string() } else { format!("run:{run_row}") };
     ledger::append(
         tx,
         EventInput::new(ua_core::DEFAULT_ORG,
             "agent.routine.fired",
             json!({ "routine_id": id, "fire_key": event_key, "status": status, "task_id": task_id, "reason": reason }),
         )
-        .by(by.to_string())
+        .by(crate::approvals::ledger_originator(&org, by))
         .dedupe(format!("routine:{id}:{event_key}:create")),
     )?;
     Ok(Fire { status, task_id, reason, created_new: true, run_row: Some(run_row) })
