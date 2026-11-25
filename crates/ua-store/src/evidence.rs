@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn a_wrong_signature_is_invalid() {
         let (_dir, db) = open();
-        let (sk, pk) = keypair();
+        let (_sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
         let digest = db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1"), "now")).unwrap();
         let other = SigningKey::from_bytes(&[9u8; 32]);

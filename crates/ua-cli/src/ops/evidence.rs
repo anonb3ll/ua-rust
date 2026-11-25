@@ -132,7 +132,7 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<()> {
             println!("{}", json!({ "key_id": key_id, "added": true }));
         }
         EvidenceCmd::KeyList => {
-            let keys = hub.db().read(|c| key_list(c))?;
+            let keys = hub.db().read(key_list)?;
             println!("{}", serde_json::to_string_pretty(&keys)?);
         }
         EvidenceCmd::KeyRetire { key_id } => {
