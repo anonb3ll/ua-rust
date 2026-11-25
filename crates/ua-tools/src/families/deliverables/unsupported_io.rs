@@ -29,6 +29,10 @@ impl Destination {
         Err(unsupported())
     }
 
+    pub fn confirm_published(&self, _: &str, _: &str, _: &str) -> UaResult<bool> {
+        Err(unsupported())
+    }
+
     pub fn publish(&self, _: &str, _: &str, _: &[u8], _: &str) -> UaResult<()> {
         Err(unsupported())
     }

@@ -80,10 +80,11 @@ paths are refused. Reusing a title records a new revision when the bytes
 change. Repeating the latest submission with identical metadata returns the
 existing revision. File revisions leave the commit workflow head untouched.
 
-Set `deliverable_release_root` to an existing absolute directory owned by the
-hub user with mode `0700`, separate from workspaces and the vault. Releases
-are disabled when it is unset. The directory and its ancestors are
-operator-managed.
+Set `deliverable_release_root` to an existing canonical absolute directory
+owned by the hub user with mode `0700`. Keep it separate from the hub's
+data directory, workspaces, read roots, the vault and hidden directories
+under the hub user's home. Releases are disabled when it is unset. The
+directory and its ancestors are operator-managed.
 
 1. Move the workflow to `review` and call
    `deliverable_release(revision_id, destination)` with the latest file
@@ -99,9 +100,11 @@ operator-managed.
 
 For an interrupted release, retry the same call as the original requester.
 A saved intent allows the hub to resume from the approved bytes even if the
-source later changes. The task review, ownership and configured directory
-must still match the release intent. The staged inode identifies a
-publication whose completion transaction did not commit. An unrelated existing destination
+source later changes. An unpublished intent still requires the same task
+review, ownership and configured directory. If the staged inode is already
+linked at the approved destination and its bytes match, the retry records
+the release receipt even after the review or ownership changes. It closes
+the task only while the approved review still applies. An unrelated existing destination
 is refused, even when its bytes have the same hash. The approval is consumed
 once, the release is ledgered once, and retries of a completed release verify
 the published bytes before returning its receipt.

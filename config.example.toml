@@ -3,7 +3,7 @@
 
 home = "~/.ua-rust"
 workspace = "~/projects"
-# Existing directory, mode 0700, owned by the hub user and outside workspaces.
+# Canonical directory, mode 0700, owned by the hub user and separate from hub data, workspaces and read roots.
 # deliverable_release_root = "/srv/ua-releases"
 # Extra read-only roots for fs_read / fs_list / fs_search.
 read_roots = []

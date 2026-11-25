@@ -388,19 +388,25 @@ mod file_releases {
 
     impl Files {
         async fn new() -> Self {
+            Self::configured(|_, _| {}).await
+        }
+
+        async fn configured(configure: impl FnOnce(&mut Config, &std::path::Path)) -> Self {
             let home = tempfile::tempdir().unwrap();
-            let workspace = home.path().join("workspace");
+            let root = home.path().canonicalize().unwrap();
+            let workspace = root.join("workspace");
             let worktree = workspace.join("work");
-            let destination = home.path().join("release");
+            let destination = root.join("release");
             fs::create_dir_all(&worktree).unwrap();
             fs::create_dir(&destination).unwrap();
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
             let source = worktree.join("report.txt");
             fs::write(&source, b"reviewed report").unwrap();
-            let mut cfg = Config::for_home(home.path().join("hub"));
+            let mut cfg = Config::for_home(root.join("hub"));
             cfg.workspace = Some(workspace);
             cfg.deliverable_release_root = Some(destination.clone());
             cfg.human_identities = vec!["operator".into(), "editor".into()];
+            configure(&mut cfg, &destination);
             let h = H { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry() };
             h.hub
                 .db()
@@ -578,9 +584,7 @@ mod file_releases {
         assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals"), 0);
     }
 
-    #[tokio::test]
-    async fn durable_intent_survives_a_completion_error_and_can_be_retried() {
-        let f = Files::new().await;
+    async fn pending_intent(f: &Files) -> (i64, Value, PathBuf) {
         let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
         f.review().await;
         let args = json!({"revision_id":rev, "destination":"report.txt"});
@@ -602,9 +606,6 @@ mod file_releases {
         assert!(!f.destination.join("report.txt").exists());
         assert_eq!(f.h.events("agent.deliverable.released").len(), 0);
 
-        fs::write(&f.source, b"changed after the approved bytes were recorded").unwrap();
-
-        // Simulate a crash after the filesystem link but before the SQL commit.
         let stage_id: String =
             f.h.hub
                 .db()
@@ -613,10 +614,20 @@ mod file_releases {
                 })
                 .unwrap();
         let stage = f.destination.join(format!(".ua-release-{stage_id}"));
+        f.h.hub.db().write(|tx| Ok(tx.execute_batch("DROP TRIGGER fail_release_event")?)).unwrap();
+        (id, args, stage)
+    }
+
+    #[tokio::test]
+    async fn durable_intent_recovers_a_published_receipt_after_the_task_moves_on() {
+        let f = Files::new().await;
+        let (id, args, stage) = pending_intent(&f).await;
+        fs::write(&f.source, b"changed after the approved bytes were recorded").unwrap();
+
+        // Simulate a crash after the filesystem link but before the SQL commit.
         fs::write(&stage, b"reviewed report").unwrap();
         let dest = f.destination.join("report.txt");
         fs::hard_link(&stage, &dest).unwrap();
-        f.h.hub.db().write(|tx| Ok(tx.execute_batch("DROP TRIGGER fail_release_event")?)).unwrap();
 
         // Even identical bytes at a different inode are a collision.
         fs::remove_file(&dest).unwrap();
@@ -628,10 +639,63 @@ mod file_releases {
         assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE released_at IS NULL"), 1);
         fs::remove_file(&dest).unwrap();
         fs::hard_link(&stage, &dest).unwrap();
-        let out = f.h.ok(&builder(), "deliverable_release", args).await;
+        assert_eq!(f.submit(&builder()).await["revision"]["rev_no"], 2);
+        f.h.act(&builder(), "task_workflow_set", json!({"task_id": f.task_id, "stage":"verify"})).await;
+        f.h.ok(&builder(), "task_update", json!({"id": f.task_id, "release_claim": true})).await;
+
+        let out = f.h.ok(&builder(), "deliverable_release", args.clone()).await;
         assert_eq!(out["approval_id"], id);
         assert_eq!(fs::read(dest).unwrap(), b"reviewed report");
         assert!(!stage.exists());
         assert_eq!(f.h.events("agent.deliverable.released").len(), 1);
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM deliverable_releases WHERE payload IS NULL"), 1);
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM tasks WHERE status = 'done'"), 0);
+        let workflow = f.h.act(&builder(), "task_workflow_get", json!({"task_id": f.task_id})).await;
+        assert_eq!(workflow["stage"], "verify");
+        assert_eq!(f.h.ok(&builder(), "deliverable_release", args).await["created"], false);
+        assert_eq!(f.h.events("agent.deliverable.released").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_intent_refuses_a_changed_review_revision() {
+        let f = Files::new().await;
+        let (_, args, _) = pending_intent(&f).await;
+        // The task stays in review and the requester remains a writer. Only
+        // the bound revision changes, so the comparison is what refuses it.
+        f.h.act(
+            &builder(),
+            "task_workflow_set",
+            json!({
+                "task_id": f.task_id, "stage":"review", "focus":"review again",
+            }),
+        )
+        .await;
+        assert_eq!(reason(&f.h.err(&builder(), "deliverable_release", args).await), "release_review_changed");
+        assert!(!f.destination.join("report.txt").exists());
+        assert!(f.h.events("agent.deliverable.released").is_empty());
+        assert_eq!(f.h.n("SELECT COUNT(*) FROM tasks WHERE status = 'done'"), 0);
+    }
+
+    #[tokio::test]
+    async fn release_root_rejects_symlinks_hub_home_and_read_roots() {
+        for configure in [
+            (|cfg: &mut Config, path: &std::path::Path| {
+                let alias = path.with_file_name("alias");
+                symlink(path, &alias).unwrap();
+                cfg.deliverable_release_root = Some(alias);
+            }) as fn(&mut Config, &std::path::Path),
+            |cfg, path| cfg.home = path.to_path_buf(),
+            |cfg, path| cfg.read_roots = vec![path.to_path_buf()],
+        ] {
+            let f = Files::configured(configure).await;
+            let rev = f.submit(&builder()).await["revision"]["id"].as_i64().unwrap();
+            f.review().await;
+            let args = json!({"revision_id": rev, "destination": "report.txt"});
+            assert_eq!(
+                reason(&f.h.err(&builder(), "deliverable_release", args).await),
+                "unsafe_release_root"
+            );
+            assert_eq!(f.h.n("SELECT COUNT(*) FROM approvals"), 0);
+        }
     }
 }

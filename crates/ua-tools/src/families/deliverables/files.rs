@@ -11,7 +11,7 @@ use ua_store::WriteTx;
 use super::{FAMILY, caller_task, positive, require_caller_org, require_writer, view, write_capsule};
 use crate::approvals::{self, GateOutcome};
 use crate::families::governance;
-use crate::families::tasks::{complete_after_release, int_field, str_field};
+use crate::families::tasks::{check_release_completion, complete_after_release, int_field, str_field};
 use crate::registry::{Registry, ToolCtx, tool};
 
 #[cfg(unix)]
@@ -177,6 +177,7 @@ fn review_binding(
         )
         .optional()?
         .ok_or_else(|| UaError::denied("review_required", "the task workflow must be in review"))?;
+    check_release_completion(tx, org, task_id, task)?;
     let generation = int_field(task, "ownership_generation")
         .ok_or_else(|| UaError::internal("task ownership generation is missing"))?;
     Ok((workflow_revision, generation))
@@ -206,9 +207,6 @@ fn authorize(tx: &mut WriteTx<'_>, ctx: &ToolCtx, a: &ReleaseArgs) -> UaResult<A
                 "revision_release_bound",
                 "this revision is already bound to a release",
             ));
-        }
-        if release.released_at.is_none() {
-            writable_task(tx, ctx, file.deliverable.task_id)?;
         }
         require_root(&Destination::configured(ctx)?, &release)?;
         return Ok(Admission::Authorized);
@@ -327,32 +325,54 @@ async fn release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult<Value> {
                 }
                 return Ok((release_output(&file, &r, at.clone(), false), dir, staging));
             }
-            let task = writable_task(tx, &ctx, task_id)?;
+            let published = dir.confirm_published(&staging, &r.destination, &file.revision.identity)?;
             let expected = (r.workflow_revision, r.ownership_generation);
-            if review_binding(tx, &ctx, &task, &file)? != expected {
-                return Err(UaError::conflict_code(
-                    "release_review_changed",
-                    "task review or ownership changed after approval",
-                ));
-            }
-            let bytes =
-                r.payload.as_deref().ok_or_else(|| UaError::internal("authorized release has no bytes"))?;
-            if digest(bytes) != file.revision.identity {
-                return Err(UaError::denied("deliverable_tampered", "stored release bytes changed"));
-            }
-            // Write the transactional evidence before publishing. An error
-            // writing either ledger event leaves the filesystem untouched.
+            let current =
+                writable_task(tx, &ctx, task_id).and_then(|task| review_binding(tx, &ctx, &task, &file));
+            let finish_task = match current {
+                Ok(binding) if binding == expected => true,
+                Ok(_) if published => false,
+                Ok(_) => {
+                    return Err(UaError::conflict_code(
+                        "release_review_changed",
+                        "task review or ownership changed after approval",
+                    ));
+                }
+                Err(
+                    UaError::NotFound(_)
+                    | UaError::Denied { .. }
+                    | UaError::InvalidArgument(_)
+                    | UaError::Conflict(_)
+                    | UaError::ConflictCode { .. },
+                ) if published => false,
+                Err(e) => return Err(e),
+            };
+
+            // An authorized file already present at the destination needs
+            // its receipt even if the task moved on. Only an unchanged
+            // review can complete the task or authorize a new publication.
             let at = files::complete(tx, &file, &r)?;
-            write_capsule(
-                tx,
-                &ctx,
-                task_id,
-                &ctx.caller.label,
-                vec![("stage", rusqlite::types::Value::Text("done".into()))],
-                Some(r.workflow_revision),
-            )?;
-            complete_after_release(tx, org, task_id, &ctx.caller.label)?;
-            dir.publish(&staging, &r.destination, bytes, &file.revision.identity)?;
+            if finish_task {
+                write_capsule(
+                    tx,
+                    &ctx,
+                    task_id,
+                    &ctx.caller.label,
+                    vec![("stage", rusqlite::types::Value::Text("done".into()))],
+                    Some(r.workflow_revision),
+                )?;
+                complete_after_release(tx, org, task_id, &ctx.caller.label)?;
+            }
+            if !published {
+                let bytes = r
+                    .payload
+                    .as_deref()
+                    .ok_or_else(|| UaError::internal("authorized release has no bytes"))?;
+                if digest(bytes) != file.revision.identity {
+                    return Err(UaError::denied("deliverable_tampered", "stored release bytes changed"));
+                }
+                dir.publish(&staging, &r.destination, bytes, &file.revision.identity)?;
+            }
             Ok((release_output(&file, &r, at, true), dir, staging))
         })
         .await?;

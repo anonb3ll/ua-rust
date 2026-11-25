@@ -390,6 +390,20 @@ fn require_completion(tx: &rusqlite::Connection, org: &str, id: i64, notes: &str
     Ok(())
 }
 
+/// The task must still be eligible to close at the reviewed revision.
+pub(crate) fn check_release_completion(
+    conn: &rusqlite::Connection,
+    org: &str,
+    id: i64,
+    task: &serde_json::Map<String, Value>,
+) -> UaResult<()> {
+    let status = str_field(task, "status").unwrap_or("open");
+    if is_terminal(status) || str_field(task, "parked_at").is_some() {
+        return Err(UaError::conflict("the reviewed task is closed or parked"));
+    }
+    require_completion(conn, org, id, str_field(task, "notes").unwrap_or_default())
+}
+
 /// Finish a reviewed task inside the transaction that records its file
 /// release. The caller has checked the task writer, workflow and queue hold.
 pub(crate) fn complete_after_release(
@@ -399,11 +413,8 @@ pub(crate) fn complete_after_release(
     who: &str,
 ) -> UaResult<()> {
     let old = require_task(tx, org, id)?;
+    check_release_completion(tx, org, id, &old)?;
     let old_status = str_field(&old, "status").unwrap_or("open");
-    if is_terminal(old_status) || str_field(&old, "parked_at").is_some() {
-        return Err(UaError::conflict("the reviewed task is closed or parked"));
-    }
-    require_completion(tx, org, id, str_field(&old, "notes").unwrap_or_default())?;
     let updated = next_revision(str_field(&old, "updated_at"));
     let ts = now();
     tx.execute(

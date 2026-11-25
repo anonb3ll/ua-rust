@@ -114,23 +114,40 @@ impl Destination {
         let root = configured.canonicalize().map_err(|_| {
             UaError::denied("release_unconfigured", "the configured release directory must exist")
         })?;
-        let mut workspace_roots = vec![cfg.workspace_root()];
+        if configured.as_os_str() != root.as_os_str() {
+            return Err(UaError::denied(
+                "unsafe_release_root",
+                "the configured release directory must be a canonical path without symlinks",
+            ));
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let os_home = home.as_ref().and_then(|path| path.canonicalize().ok());
+        let private_home = os_home.as_ref().is_some_and(|home| {
+            home.starts_with(&root)
+                || root.strip_prefix(home).is_ok_and(|relative| {
+                    relative.components().any(|part| part.as_os_str().as_encoded_bytes().starts_with(b"."))
+                })
+        });
+        let mut workspace_roots = vec![cfg.workspace_root(), cfg.home.clone()];
+        workspace_roots.extend(cfg.read_roots.iter().cloned());
         workspace_roots.extend(cfg.vault_path.iter().cloned());
         workspace_roots.extend(cfg.agent_workspaces.values().filter(|p| p.trim() != "deny").map(|p| {
             let p = p.trim();
             if let Some(rest) = p.strip_prefix("~/")
-                && let Some(home) = std::env::var_os("HOME")
+                && let Some(home) = &home
             {
-                return Path::new(&home).join(rest);
+                return home.join(rest);
             }
             Path::new(p).to_path_buf()
         }));
-        if workspace_roots.iter().any(|p| {
-            safety::canonicalize_lenient(p).is_ok_and(|p| root.starts_with(&p) || p.starts_with(&root))
-        }) {
+        if private_home
+            || workspace_roots.iter().any(|p| {
+                safety::canonicalize_lenient(p).is_ok_and(|p| root.starts_with(&p) || p.starts_with(&root))
+            })
+        {
             return Err(UaError::denied(
                 "unsafe_release_root",
-                "the release directory must be separate from workspaces and the vault",
+                "the release directory must be separate from the hub home, private home directories, workspaces, read roots and the vault",
             ));
         }
         let fd = directory(&root).map_err(file_error)?;
@@ -159,6 +176,34 @@ impl Destination {
     pub fn matches(&self, name: &str, sha256: &str) -> UaResult<bool> {
         let file = fs::openat(&self.fd, name, READ_FILE, Mode::empty()).map_err(file_error)?;
         Ok(digest(&limited_read(&File::from(file), 2)?) == sha256)
+    }
+
+    /// Prove a prior publication using the staged inode and approved digest.
+    /// A file with identical bytes at a different inode is no proof.
+    pub fn confirm_published(&self, staging: &str, name: &str, sha256: &str) -> UaResult<bool> {
+        let destination = match fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(file_error(e)),
+        };
+        if FileType::from_raw_mode(destination.st_mode) != FileType::RegularFile {
+            return Ok(false);
+        }
+        let file = match fs::openat(&self.fd, staging, READ_FILE | OFlags::RDWR, Mode::empty()) {
+            Ok(fd) => File::from(fd),
+            Err(Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(file_error(e)),
+        };
+        let staged = fs::fstat(&file).map_err(file_error)?;
+        if (staged.st_dev, staged.st_ino) != (destination.st_dev, destination.st_ino) {
+            return Ok(false);
+        }
+        if digest(&limited_read(&file, 2)?) != sha256 {
+            return Err(UaError::denied("deliverable_tampered", "published bytes changed before recovery"));
+        }
+        file.sync_all().map_err(|e| UaError::internal(format!("sync recovered release: {e}")))?;
+        fs::fsync(&self.fd).map_err(file_error)?;
+        Ok(true)
     }
 
     pub fn publish(&self, staging: &str, name: &str, bytes: &[u8], sha256: &str) -> UaResult<()> {
