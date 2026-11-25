@@ -55,6 +55,11 @@ async fn server(statuses: Vec<u16>) -> (String, Arc<Mutex<Vec<Seen>>>) {
                     break (head, body);
                 }
             };
+            // Only the hook's own POST is recorded and uses up a scripted
+            // status; a stray connection or request is dropped unanswered.
+            if !head.starts_with("post /hooks/path-secret ") {
+                continue;
+            }
             let status = statuses[n.min(statuses.len() - 1)];
             n += 1;
             log.lock()
@@ -84,6 +89,7 @@ fn caller(label: &str, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some(format!("{label}-key")),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -192,10 +198,10 @@ async fn client_errors_are_not_retried() {
     assert_eq!(outbox_message(&hub, res["outbox_id"].as_i64().unwrap()).as_deref(), Some("bad payload"));
 
     // A dead endpoint fails after every attempt, without leaking the URL.
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = dead.local_addr().unwrap();
-    drop(dead);
-    let hub = hub_with(Some(format!("http://{addr}/hooks/path-secret")));
+    // Port 1 is privileged: it cannot be bound without root and is never
+    // handed out as an ephemeral port, so nothing can come to listen there
+    // (a dropped ephemeral listener's port could be reused before the connect).
+    let hub = hub_with(Some("http://127.0.0.1:1/hooks/path-secret".to_string()));
     let res = call(&reg, &hub, &staff(), "notify", json!({ "message": "nobody home", "timeout_s": 2 })).await;
     assert_eq!(res["status"], "failed");
     assert_eq!(res["attempts"], 3);
@@ -264,4 +270,30 @@ async fn notify_keeps_the_profile_gate() {
     call(&reg, &hub, &staff(), "notify", json!({ "message": "hi" })).await;
     // The read-only status stays visible to developers.
     call(&reg, &hub, &caller("builder-1", Profile::Developer), "notify_delivery_status", json!({})).await;
+}
+
+#[tokio::test]
+async fn credentials_in_the_url_are_sent_as_basic_auth() {
+    let (url, seen) = server(vec![200]).await;
+    let url = url.replacen("http://", "http://hook-user:p%40ss@", 1);
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.notify_webhook_url = Some(url);
+    let hub = Hub::in_memory(cfg).unwrap();
+    let res = call(&builtin_registry(), &hub, &staff(), "notify", json!({ "message": "hi" })).await;
+    assert_eq!(res["delivered"], true, "{res}");
+    let head = seen.lock().unwrap()[0].head.clone();
+    // base64("hook-user:p@ss"), lowercased by the test server.
+    assert!(head.contains("authorization: basic ag9vay11c2vyonbac3m="), "{head}");
+    assert!(!head.contains("hook-user"), "the URL went without its credentials: {head}");
+}
+
+#[tokio::test]
+async fn a_link_local_webhook_is_refused_without_retry() {
+    let hub = hub_with(Some("http://169.254.169.254/hooks/path-secret".to_string()));
+    let res =
+        call(&builtin_registry(), &hub, &staff(), "notify", json!({ "message": "x", "timeout_s": 2 })).await;
+    assert_eq!(res["status"], "failed");
+    assert_eq!(res["attempts"], 1, "a policy refusal is not retried: {res}");
+    assert_eq!(res["error"], "webhook address refused (link-local (includes cloud metadata))");
+    assert!(!res.to_string().contains("path-secret"), "{res}");
 }

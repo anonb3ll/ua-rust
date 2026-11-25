@@ -205,11 +205,15 @@ fn view(cfg: &Config, docset_id: &str, path: &str) -> UaResult<Value> {
     }
     let bytes = std::fs::read(&resolved).map_err(|e| UaError::invalid(format!("cannot read page: {e}")))?;
     let html = String::from_utf8_lossy(&bytes);
-    let (_, md) = crate::families::web::html_to_markdown(&html, None);
-    let content = if md.trim().is_empty() { html.into_owned() } else { md };
+    let (_, md, how) = crate::families::web::html_extract(&html, None);
+    // `raw-html` when the page converts to no Markdown and is returned as is.
+    let (content, extraction) =
+        if md.trim().is_empty() { (html.into_owned(), "raw-html") } else { (md, how.as_str()) };
     let truncated = content.chars().count() > VIEW_MAX_CHARS;
     let content: String = content.chars().take(VIEW_MAX_CHARS).collect();
-    Ok(json!({ "docset_name": d.name, "path": path, "content": content, "truncated": truncated }))
+    Ok(json!({
+        "docset_name": d.name, "path": path, "content": content, "truncated": truncated, "extraction": extraction,
+    }))
 }
 
 pub fn register(r: &mut Registry) {
@@ -245,7 +249,8 @@ pub fn register(r: &mut Registry) {
             "dash_view",
             "Render one docset page (path from dash_search) as Markdown, capped at 60000 characters. \
              Paths outside the docset's Documents directory are refused. Returns {docset_name, path, \
-             content, truncated}.",
+             content, truncated, extraction}; extraction is readability, full-page (no article found, or a \
+             build without the readability feature) or raw-html.",
             |ctx: ToolCtx, a: ViewArgs| async move {
                 let cfg = ctx.hub.cfg().clone();
                 blocking(move || view(&cfg, &a.docset_id, &a.path)).await

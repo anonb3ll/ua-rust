@@ -134,11 +134,25 @@ pub struct PolicyRule {
     pub require_episode: bool,
     pub bind: BTreeMap<String, String>,
     matcher: GlobMatcher,
+    /// The name a plain `tool:action` spelling reads as, when it differs.
+    alias: Option<String>,
 }
 
 impl PolicyRule {
     pub fn matches_tool(&self, tool: &str) -> bool {
         self.matcher.is_match(tool)
+    }
+
+    /// Whether this rule restricts `tool` only through its alias spelling
+    /// (`tool: plan_manage:delete` for `plan_delete`). Such a match takes
+    /// the rule's restrictive effect alone: an `allow` (a `tool` or
+    /// `threshold` allow) is skipped, and no alias match counts as a
+    /// permission rule against `default_action: deny`, so an upgrade that
+    /// reads the alias can tighten a policy but never loosen it.
+    fn restricts_alias(&self, tool: &str) -> bool {
+        self.alias.as_deref() == Some(tool)
+            && !(matches!(self.kind, RuleKind::Tool | RuleKind::Threshold)
+                && self.action == RuleAction::Allow)
     }
 
     /// False only for rules whose match can let a call through: a `tool`,
@@ -373,6 +387,13 @@ fn parse_rule(item: &Value) -> Result<PolicyRule, String> {
     let matcher = Glob::new(&tool)
         .map_err(|e| format!("policy rule {name:?}: invalid tool pattern {tool:?}: {e}"))?
         .compile_matcher();
+    // A plain `tool:action` spelling of an action that has a standalone tool
+    // (`plan_manage:delete` for `plan_delete`) also restricts that tool, so a
+    // deny, approval, role, threshold or limit holds as meant. It never
+    // permits it: see [`PolicyRule::restricts_alias`].
+    let alias = crate::routes::is_plain_name(&tool)
+        .then(|| crate::routes::canonical_gate_name(&tool).into_owned())
+        .filter(|c| *c != tool);
     let roles = match r.get("roles") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(s)) => {
@@ -428,6 +449,7 @@ fn parse_rule(item: &Value) -> Result<PolicyRule, String> {
         require_episode,
         bind,
         matcher,
+        alias,
         name,
     };
     validate_rule(&rule)?;
@@ -544,10 +566,36 @@ pub fn load(path: &Path) -> Result<Arc<Policy>, String> {
         Ok(text) => parse_policy(&text).map(Arc::new).map_err(|e| format!("invalid policy file: {e}")),
         Err(e) => Err(format!("cannot read the policy file: {e}")),
     };
+    if let Ok(p) = &loaded {
+        let unknown = unknown_action_keys(p);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                "policy rules name no known tool action, so they match nothing: {}",
+                unknown.join("; ")
+            );
+        }
+    }
     if let Ok(mut c) = CACHE.lock() {
         c.insert(path.to_path_buf(), CacheEntry { stamp, loaded: loaded.clone() });
     }
     loaded
+}
+
+/// Rules whose `tool` is a plain `tool:action` name that is not a gate key
+/// as written (see [`crate::routes::check_gate_name`]), each with the
+/// reason: a key that matches nothing, or a spelling read as another name
+/// (`plan_manage:delete` matches `plan_delete`). Glob patterns and plain
+/// tool names are not checked, as before.
+pub fn unknown_action_keys(policy: &Policy) -> Vec<String> {
+    policy
+        .rules
+        .iter()
+        .filter(|r| r.tool.contains(':') && crate::routes::is_plain_name(&r.tool))
+        .filter_map(|r| {
+            crate::routes::check_gate_name(&r.tool).err().map(|e| format!("rule {:?}: {e}", r.name))
+        })
+        .collect()
 }
 
 /// Drop the cached parse of `path` (after a write through config revisions).
@@ -692,13 +740,14 @@ fn binding_matches(bind: &BTreeMap<String, String>, scope: &Scope, unclaimed_mat
     })
 }
 
-fn resolve_claims(conn: &Connection, label: &str) -> rusqlite::Result<Vec<Claim>> {
+/// The live claims of `label` in its organization `org`.
+fn resolve_claims(conn: &Connection, org: &str, label: &str) -> rusqlite::Result<Vec<Claim>> {
     let now = ua_core::time::now();
     let mut stmt = conn.prepare(
-        "SELECT id, project FROM tasks WHERE claimed_by = ?1 AND status = 'doing' \
+        "SELECT id, project FROM tasks WHERE org_id = ?3 AND claimed_by = ?1 AND status = 'doing' \
          AND (lock_expires_at IS NULL OR lock_expires_at > ?2)",
     )?;
-    let rows = stmt.query_map(params![label, now], |r| {
+    let rows = stmt.query_map(params![label, now, org], |r| {
         let id: i64 = r.get(0)?;
         let project: Option<String> = r.get(1)?;
         Ok(Claim {
@@ -770,16 +819,25 @@ fn age_seconds(ts: &str) -> Option<f64> {
     Some((ua_core::time::now_ms() - t.as_millisecond()) as f64 / 1000.0)
 }
 
-/// Completed calls of `tool` by `label` inside the last `window` seconds.
-/// Timestamps have second precision: a call counts while `now - start < window`.
-pub fn recent_calls(conn: &Connection, tool: &str, label: &str, window: f64) -> rusqlite::Result<i64> {
+/// Completed calls of `tool` by `label` in organization `org` inside the
+/// last `window` seconds, including calls of a consolidated tool whose action
+/// ran `tool` (`action_tool`). Timestamps have second precision: a call
+/// counts while `now - start < window`.
+pub fn recent_calls(
+    conn: &Connection,
+    org: &str,
+    tool: &str,
+    label: &str,
+    window: f64,
+) -> rusqlite::Result<i64> {
     let cutoff_ms = ua_core::time::now_ms() - (window * 1000.0) as i64;
     let cutoff = jiff::Timestamp::from_millisecond(cutoff_ms)
         .map(ua_core::time::format_ts)
         .unwrap_or_else(|_| ua_core::time::now());
     conn.query_row(
-        "SELECT COUNT(*) FROM tool_calls WHERE tool = ?1 AND caller = ?2 AND started_at > ?3",
-        params![tool, label, cutoff],
+        "SELECT COUNT(*) FROM tool_calls WHERE org_id = ?4 AND caller = ?2 AND (tool = ?1 OR action_tool = ?1) \
+         AND started_at > ?3",
+        params![tool, label, cutoff, org],
         |r| r.get(0),
     )
 }
@@ -793,16 +851,44 @@ pub fn evaluate(
     tool: &str,
     args: &Value,
 ) -> Result<Verdict, Refusal> {
+    evaluate_with(conn, policy, caller, tool, args, policy.default_deny)
+}
+
+/// Evaluate `policy` for the action a consolidated tool's call runs, under
+/// the action's own name (a standalone tool, or `tool:action`; see
+/// [`crate::routes`]) and on the action's arguments. Every rule applies as
+/// for a direct call, except `default_action: deny`: the consolidated tool
+/// itself was already held to it, and a rule allowing that tool must not be
+/// undone because no rule names each of its actions.
+pub fn evaluate_routed(
+    conn: &Connection,
+    policy: &Policy,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+) -> Result<Verdict, Refusal> {
+    evaluate_with(conn, policy, caller, tool, args, false)
+}
+
+fn evaluate_with(
+    conn: &Connection,
+    policy: &Policy,
+    caller: &Caller,
+    tool: &str,
+    args: &Value,
+    default_deny: bool,
+) -> Result<Verdict, Refusal> {
     if !policy.enabled {
         return Ok(Verdict::Allow);
     }
-    let tool_matched: Vec<&PolicyRule> = policy.rules.iter().filter(|r| r.matches_tool(tool)).collect();
-    if tool_matched.is_empty() && !policy.default_deny {
+    let tool_matched: Vec<&PolicyRule> =
+        policy.rules.iter().filter(|r| r.matches_tool(tool) || r.restricts_alias(tool)).collect();
+    if tool_matched.is_empty() && !default_deny {
         return Ok(Verdict::Allow);
     }
     let mut scope = Scope { agent: scope_agent(caller), claims: Vec::new() };
     if caller.kind != ActorKind::Anonymous && tool_matched.iter().any(|r| bind_needs_claims(&r.bind)) {
-        scope.claims = resolve_claims(conn, &caller.label).map_err(|e| unavailable("", e))?;
+        scope.claims = resolve_claims(conn, &caller.org_id, &caller.label).map_err(|e| unavailable("", e))?;
     }
     let who = principals(caller, &scope);
     // `role` rules are allow-lists and still fire for callers outside `roles`;
@@ -814,8 +900,8 @@ pub fn evaluate(
                 && (r.kind == RuleKind::Role || roles_apply(r, &who))
         })
         .collect();
-    let has_permission_rule = matching.iter().any(|r| r.kind != RuleKind::RateLimit);
-    if !has_permission_rule && policy.default_deny {
+    let has_permission_rule = matching.iter().any(|r| r.kind != RuleKind::RateLimit && r.matches_tool(tool));
+    if !has_permission_rule && default_deny {
         return Err(Refusal::new(
             "default_deny",
             "",
@@ -913,8 +999,9 @@ pub fn evaluate(
                         // Per caller: one identity's call must not put every
                         // other identity into cooldown.
                         .query_row(
-                            "SELECT MAX(started_at) FROM tool_calls WHERE tool = ?1 AND caller = ?2",
-                            params![tool, caller.label],
+                            "SELECT MAX(started_at) FROM tool_calls WHERE org_id = ?3 AND caller = ?2 \
+                             AND (tool = ?1 OR action_tool = ?1)",
+                            params![tool, caller.label, caller.org_id],
                             |r| r.get(0),
                         )
                         .optional()
@@ -941,7 +1028,8 @@ pub fn evaluate(
     // Rate limits are checked after every deny and before any approval pass.
     for rule in matching.iter().filter(|r| r.kind == RuleKind::RateLimit) {
         let (Some(max_calls), Some(window)) = (rule.max_calls, rule.window_seconds) else { continue };
-        let used = recent_calls(conn, tool, &caller.label, window).map_err(|e| unavailable(&rule.name, e))?;
+        let used = recent_calls(conn, &caller.org_id, tool, &caller.label, window)
+            .map_err(|e| unavailable(&rule.name, e))?;
         if used >= max_calls {
             return Err(Refusal::new(
                 "rate_limited",
@@ -968,7 +1056,7 @@ pub fn prod_action(tool: &str) -> &str {
         "deploy" => "deploy",
         "fleet_host_action" => "restart",
         "oauth_device_manage" | "mcp_server_revoke" => "revoke",
-        "managed_secret_delete" => "delete",
+        "managed_secret_delete" | "github_credential_clear" => "delete",
         "node_dispatch" | "node_followup" | "acp_permission" | "dispatch_task" | "dispatch_resume" => {
             "dispatch"
         }
@@ -983,7 +1071,9 @@ pub fn prod_action(tool: &str) -> &str {
 pub fn check_prod_action(cfg: &ua_core::Config, caller: &Caller, tool: &str) -> Result<(), Refusal> {
     use ua_core::identity::Transport;
     let action = prod_action(tool);
-    if caller.kind == ActorKind::Anonymous && matches!(caller.transport, Transport::Http | Transport::Mcp) {
+    if caller.kind == ActorKind::Anonymous
+        && matches!(caller.transport, Transport::Http | Transport::Mcp | Transport::Slack)
+    {
         return Err(Refusal::new(
             "anonymous_prod_action",
             "",

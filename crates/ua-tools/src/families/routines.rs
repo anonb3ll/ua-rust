@@ -16,13 +16,25 @@
 //! Cron fires happen only in [`tick`], one transaction per tick, and the
 //! unique `(routine_id, fire_key)` makes a repeated or racing tick harmless.
 //! `ua serve` runs a tick once a minute when `routines_enabled` is set.
+//!
+//! Both tables are tenant data (`org_id`, `organization.v1.tools.routines`,
+//! `routines.v2.org_indexes`). A routine belongs to its owner's organization
+//! (the caller that added it); every receipt takes its routine's
+//! organization, and the tools read and write only the caller's
+//! organization's rows: another organization's routine answers as a missing
+//! one. The scheduler has no caller: it fires every due routine with that
+//! routine's own organization, and creates its task in that organization
+//! (`routines.v3.task_org` keeps a receipt's task in the receipt's
+//! organization). A routine's workflow still runs only in the default
+//! organization (its owner's caller cannot yet be built in another), so a
+//! fire elsewhere records its workflow as `not_run`.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, Caller, UaError, UaResult, identity::Transport};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::families::plans::{row_map, write_identity};
 use crate::families::tasks::check_slug;
@@ -76,12 +88,65 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_task ON routine_runs(task_id);
 ",
 };
 
+/// `organization.v1.tools.routines`: `org_id` on `routines` and
+/// `routine_runs` (existing rows backfilled to the default organization) and
+/// their generated `*_org_exists` / `*_org_immutable` triggers. No key
+/// rebuild: `routines` is keyed by its AUTOINCREMENT id, and the receipts'
+/// `UNIQUE (routine_id, fire_key)` is led by that hub-global id, so two
+/// organizations can never collide on it. Applied after `routines.v1` and
+/// `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.routines", &["routines", "routine_runs"]);
+
+/// `routines.v2.org_indexes`: the indexes the per-organization reads use, and
+/// the same-organization rule between a receipt and its routine (the
+/// existence trigger alone would let a receipt in one organization point at
+/// another's routine). Applied after [`TENANT_PART`], which adds the column.
+pub const ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "routines.v2.org_indexes",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_routines_org ON routines(org_id, id);
+CREATE INDEX IF NOT EXISTS idx_routine_runs_org_routine ON routine_runs(org_id, routine_id, id);
+
+CREATE TRIGGER IF NOT EXISTS routine_runs_same_org
+BEFORE INSERT ON routine_runs
+WHEN NEW.org_id IS NOT (SELECT org_id FROM routines WHERE id = NEW.routine_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must be in its routine''s organization'); END;
+
+CREATE TRIGGER IF NOT EXISTS routine_runs_same_org_update
+BEFORE UPDATE OF routine_id ON routine_runs
+WHEN NEW.org_id IS NOT (SELECT org_id FROM routines WHERE id = NEW.routine_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must be in its routine''s organization'); END;
+",
+};
+
+/// `routines.v3.task_org`: a routine run's `task_id` points at a task in the
+/// run's own organization (the foreign key alone would accept another
+/// organization's task). A missing task is still the foreign key's error.
+/// Applied after `organization.v1.tools.tasks`.
+pub const TASK_ORG_SCHEMA: SchemaPart = SchemaPart {
+    name: "routines.v3.task_org",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org BEFORE INSERT ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+CREATE TRIGGER IF NOT EXISTS routine_runs_task_org_update BEFORE UPDATE OF task_id ON routine_runs
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'a routine run must point at a task in its own organization'); END;
+",
+};
+
 const MAX_DUE_PER_TICK: usize = 100;
 const MAX_RECENT_RUNS: i64 = 100;
 pub const SKIP_OVERLAP: &str = "overlap";
 pub const SKIP_NO_SIGNAL: &str = "no_signal";
 pub const SKIP_SELF_ECHO: &str = "self_echo";
 pub const SKIP_CATCH_UP_NONE: &str = "catch_up_none";
+/// The skip reason older builds recorded for a fire of a routine outside the
+/// default organization, before tasks carried an organization. No fire is
+/// skipped for it any more (each creates its task in its routine's
+/// organization); the value stays so existing receipts still read.
+pub const SKIP_ORG_TASKS: &str = "org_tasks_unavailable";
 const RECENT_RUN_COLUMNS: &str = "id, fire_key, scheduled_for, status, reason, subject_key, task_id, created_at, \
      window_start, gate_matched, workflow_run_id, workflow_status";
 
@@ -155,11 +220,12 @@ struct Fire {
 }
 
 /// The routine's oldest unfinished task.
-fn active_task(c: &Connection, routine_id: i64) -> UaResult<Option<i64>> {
+fn active_task(c: &Connection, org: &str, routine_id: i64) -> UaResult<Option<i64>> {
     Ok(c.query_row(
-        "SELECT t.id FROM routine_runs rr JOIN tasks t ON t.id = rr.task_id \
-         WHERE rr.routine_id = ?1 AND t.status NOT IN ('done','cancelled') ORDER BY rr.id LIMIT 1",
-        [routine_id],
+        "SELECT t.id FROM routine_runs rr JOIN tasks t ON t.id = rr.task_id AND t.org_id = rr.org_id \
+         WHERE rr.routine_id = ?1 AND rr.org_id = ?2 AND t.status NOT IN ('done','cancelled') \
+         ORDER BY rr.id LIMIT 1",
+        params![routine_id, org],
         |r| r.get(0),
     )
     .optional()?)
@@ -170,9 +236,9 @@ fn window_start(c: &Connection, routine: &Map<String, Value>) -> UaResult<String
     let id = routine["id"].as_i64().unwrap_or_default();
     let prior: Option<String> = c
         .query_row(
-            "SELECT created_at FROM routine_runs WHERE routine_id = ?1 \
+            "SELECT created_at FROM routine_runs WHERE routine_id = ?1 AND org_id = ?2 \
              AND status IN ('created','queued','suppressed') ORDER BY id DESC LIMIT 1",
-            [id],
+            params![id, org_of(routine)],
             |r| r.get(0),
         )
         .optional()?;
@@ -181,30 +247,34 @@ fn window_start(c: &Connection, routine: &Map<String, Value>) -> UaResult<String
 
 /// `(matched, echoes)`: activity in the gate's scope at or after `since`.
 /// Tasks any routine created, events about them, routine bookkeeping and the
-/// workflow runs routines started are echoes, never activity.
+/// workflow runs routines started are echoes, never activity. Only the
+/// routine's organization counts: its tasks, its receipts and its ledger
+/// rows.
 fn scope_activity(c: &Connection, routine: &Map<String, Value>, since: &str) -> UaResult<(i64, i64)> {
     let project_scope = i64::from(routine["activity_gate_scope"] == "project");
     let project = routine["project"].as_str().unwrap_or_default();
-    let own = "SELECT task_id FROM routine_runs WHERE task_id IS NOT NULL";
-    let own_runs = "SELECT workflow_run_id FROM routine_runs WHERE workflow_run_id IS NOT NULL";
+    let org = org_of(routine);
+    let own = "SELECT task_id FROM routine_runs WHERE task_id IS NOT NULL AND org_id = ?4";
+    let own_runs =
+        "SELECT workflow_run_id FROM routine_runs WHERE workflow_run_id IS NOT NULL AND org_id = ?4";
     let (tasks, task_echoes): (i64, i64) = c.query_row(
         &format!(
             "SELECT count(*), COALESCE(SUM(id IN ({own})), 0) FROM tasks \
-             WHERE (created_at >= ?1 OR updated_at >= ?1) AND (?2 = 0 OR project = ?3)"
+             WHERE org_id = ?4 AND (created_at >= ?1 OR updated_at >= ?1) AND (?2 = 0 OR project = ?3)"
         ),
-        params![since, project_scope, project],
+        params![since, project_scope, project, org],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let (events, event_echoes): (i64, i64) = c.query_row(
         &format!(
             "WITH ev AS (SELECT dedupe_key, CAST(json_extract(payload, '$.task_id') AS INTEGER) AS task_id, \
-             json_extract(payload, '$.run_id') AS run_id FROM event_log WHERE created_at >= ?1) \
+             json_extract(payload, '$.run_id') AS run_id FROM event_log WHERE created_at >= ?1 AND org_id = ?4) \
              SELECT count(*), COALESCE(SUM((dedupe_key IS NOT NULL AND (dedupe_key LIKE 'routine:%' \
              OR dedupe_key LIKE 'routine-run:%')) OR (task_id IS NOT NULL AND task_id IN ({own})) \
              OR (run_id IS NOT NULL AND run_id IN ({own_runs}))), 0) FROM ev \
-             WHERE (?2 = 0 OR task_id IN (SELECT id FROM tasks WHERE project = ?3))"
+             WHERE (?2 = 0 OR task_id IN (SELECT id FROM tasks WHERE org_id = ?4 AND project = ?3))"
         ),
-        params![since, project_scope, project],
+        params![since, project_scope, project, org],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let echoes = task_echoes + event_echoes;
@@ -219,10 +289,11 @@ fn create_fire(
     by: &str,
 ) -> UaResult<Fire> {
     let id = routine["id"].as_i64().unwrap_or_default();
+    let org = org_of(routine).to_string();
     let prior: Option<(String, Option<i64>)> = tx
         .query_row(
-            "SELECT status, task_id FROM routine_runs WHERE routine_id = ?1 AND fire_key = ?2",
-            params![id, fire_key],
+            "SELECT status, task_id FROM routine_runs WHERE routine_id = ?1 AND fire_key = ?2 AND org_id = ?3",
+            params![id, fire_key, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -235,7 +306,8 @@ fn create_fire(
         };
         return Ok(Fire { status, task_id, reason: None, created_new: false, run_row: None });
     }
-    let active = active_task(tx, id)?;
+    // The fire's task is created in the routine's own organization.
+    let active = active_task(tx, &org, id)?;
     let skip = active.is_some() && routine["concurrency"] == "skip";
     let mut subject_key = format!("routine:{id}");
     let (mut win, mut matched, mut echoes) = (None, None, 0);
@@ -255,7 +327,7 @@ fn create_fire(
         subject_key = if routine["activity_gate_scope"] == "project" {
             format!("project:{}", routine["project"].as_str().unwrap_or_default())
         } else {
-            "org:default".into()
+            format!("org:{org}")
         };
         ("suppressed", None, Some(if echoes > 0 { SKIP_SELF_ECHO } else { SKIP_NO_SIGNAL }))
     } else {
@@ -264,8 +336,8 @@ fn create_fire(
         let marker = format!("[routine: {id}] [scheduled: {at_text}]");
         let notes = if notes.is_empty() { marker } else { format!("{notes}\n{marker}") };
         tx.execute(
-            "INSERT INTO tasks (title, notes, status, priority, created_at, updated_at, project, domain, lane) \
-             VALUES (?1, ?2, ?3, 'med', ?4, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks (title, notes, status, priority, created_at, updated_at, project, domain, lane, \
+             org_id) VALUES (?1, ?2, ?3, 'med', ?4, ?4, ?5, ?6, ?7, ?8)",
             params![
                 routine["title"].as_str().unwrap_or_default(),
                 notes,
@@ -274,54 +346,65 @@ fn create_fire(
                 routine["project"].as_str().unwrap_or("default"),
                 routine["domain"].as_str().unwrap_or("general"),
                 routine["lane"].as_str().unwrap_or("default"),
+                org,
             ],
         )?;
         let task_id = tx.last_insert_rowid();
-        ledger::append(
+        crate::families::tasks::emit(
             tx,
-            EventInput::new(
-                "agent.task.created",
-                json!({ "task_id": task_id, "routine_id": id, "status": if status == "queued" { "blocked" } else { "open" } }),
-            )
-            .by(by.to_string()),
+            &org,
+            "agent.task.created",
+            json!({ "task_id": task_id, "routine_id": id, "status": if status == "queued" { "blocked" } else { "open" } }),
+            by,
         )?;
         (status, Some(task_id), None)
     };
     tx.execute(
-        "INSERT INTO routine_runs (routine_id, fire_key, scheduled_for, status, task_id, created_at, reason, \
-         window_start, gate_matched, subject_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![id, fire_key, at_text, status, task_id, now, reason, win, matched, subject_key],
+        "INSERT INTO routine_runs (org_id, routine_id, fire_key, scheduled_for, status, task_id, created_at, \
+         reason, window_start, gate_matched, subject_key) VALUES (?11, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, fire_key, at_text, status, task_id, now, reason, win, matched, subject_key, org],
     )?;
     let run_row = tx.last_insert_rowid();
+    // ORG-EVENT-DEFAULT: use the routine's organization once org_guard allows
+    // it. Until then another organization's fire key (client text for an
+    // api fire) reaches the default organization's ledger only as a digest.
+    let event_key = if org == ua_core::DEFAULT_ORG {
+        fire_key.to_string()
+    } else {
+        format!("sha256:{}", workflows::engine::sha256_hex(fire_key))
+    };
     ledger::append(
         tx,
-        EventInput::new(
+        EventInput::new(ua_core::DEFAULT_ORG,
             "agent.routine.fired",
-            json!({ "routine_id": id, "fire_key": fire_key, "status": status, "task_id": task_id, "reason": reason }),
+            json!({ "routine_id": id, "fire_key": event_key, "status": status, "task_id": task_id, "reason": reason }),
         )
         .by(by.to_string())
-        .dedupe(format!("routine:{id}:{fire_key}:create")),
+        .dedupe(format!("routine:{id}:{event_key}:create")),
     )?;
     Ok(Fire { status, task_id, reason, created_new: true, run_row: Some(run_row) })
 }
 
 /// Open the oldest queued task of each routine once its earlier work is done.
-/// Returns the released `routine_runs` row ids.
+/// Returns the released `routine_runs` row ids. Runs for every organization;
+/// each receipt is compared only with its own organization's.
 fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
-    let rows: Vec<(i64, i64, i64)> = {
+    let rows: Vec<(i64, String, i64, i64)> = {
         let mut stmt = tx.prepare(
-            "SELECT rr.id, rr.routine_id, rr.task_id FROM routine_runs rr JOIN tasks t ON t.id = rr.task_id \
+            "SELECT rr.id, rr.org_id, rr.routine_id, rr.task_id FROM routine_runs rr \
+             JOIN tasks t ON t.id = rr.task_id AND t.org_id = rr.org_id \
              WHERE rr.status = 'queued' AND t.status = 'blocked' ORDER BY rr.id",
         )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?
     };
     let mut released = Vec::new();
-    for (row_id, routine_id, task_id) in rows {
+    for (row_id, org, routine_id, task_id) in rows {
         let earlier: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM routine_runs old JOIN tasks t ON t.id = old.task_id WHERE old.routine_id = ?1 \
-                 AND old.id < ?2 AND t.status NOT IN ('done','cancelled') LIMIT 1",
-                params![routine_id, row_id],
+                "SELECT 1 FROM routine_runs old JOIN tasks t ON t.id = old.task_id AND t.org_id = old.org_id \
+                 WHERE old.routine_id = ?1 \
+                 AND old.org_id = ?3 AND old.id < ?2 AND t.status NOT IN ('done','cancelled') LIMIT 1",
+                params![routine_id, row_id, org],
                 |r| r.get(0),
             )
             .optional()?;
@@ -329,11 +412,18 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
             continue;
         }
         let now = ua_core::time::now();
-        tx.execute("UPDATE tasks SET status = 'open', updated_at = ?2 WHERE id = ?1", params![task_id, now])?;
-        tx.execute("UPDATE routine_runs SET status = 'created' WHERE id = ?1", [row_id])?;
+        tx.execute(
+            "UPDATE tasks SET status = 'open', updated_at = ?2 WHERE id = ?1 AND org_id = ?3",
+            params![task_id, now, org],
+        )?;
+        tx.execute(
+            "UPDATE routine_runs SET status = 'created' WHERE id = ?1 AND org_id = ?2",
+            params![row_id, org],
+        )?;
         ledger::append(
             tx,
             EventInput::new(
+                ua_core::DEFAULT_ORG,
                 "agent.routine.released",
                 json!({ "routine_id": routine_id, "task_id": task_id, "status": "open" }),
             )
@@ -345,8 +435,25 @@ fn release_queued(tx: &mut WriteTx<'_>) -> UaResult<Vec<i64>> {
     Ok(released)
 }
 
-fn routine_by_id(c: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(c.query_row("SELECT * FROM routines WHERE id = ?1", [id], row_map).optional()?)
+/// A routine of `org` by id; another organization's answers as a missing one.
+fn routine_by_id(c: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(c.query_row("SELECT * FROM routines WHERE id = ?1 AND org_id = ?2", params![id, org], row_map)
+        .optional()?)
+}
+
+/// The organization a stored routine (or receipt) row belongs to.
+fn org_of(row: &Map<String, Value>) -> &str {
+    row.get("org_id").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// Organizations are never deleted, so the check cannot go stale.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; no routine was changed")));
+    }
+    Ok(())
 }
 
 /// Whether `caller` may fire or pause a routine owned by `owner`: the owner
@@ -377,23 +484,28 @@ fn owner_caller(hub: &Hub, owner: &str, attended: bool) -> Caller {
     Caller {
         label: owner.to_string(),
         kind,
-        profile: crate::sessions::default_profile(hub, owner),
+        profile: crate::sessions::default_profile(hub, ua_core::DEFAULT_ORG, owner),
         enforce_profile: true,
         session_key: None,
         transport: Transport::Internal,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
 /// Run the routine's workflow for one created fire and record the outcome.
+/// The run takes the receipt's organization (its routine's), never a
+/// caller's.
 async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Value> {
     let loaded = hub
         .db()
         .read_async(move |c| {
-            let routine_id: Option<i64> = c
-                .query_row("SELECT routine_id FROM routine_runs WHERE id = ?1", [run_row], |r| r.get(0))
+            let receipt: Option<(i64, String)> = c
+                .query_row("SELECT routine_id, org_id FROM routine_runs WHERE id = ?1", [run_row], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .optional()?;
-            Ok(match routine_id {
-                Some(id) => routine_by_id(c, id)?,
+            Ok(match receipt {
+                Some((id, org)) => routine_by_id(c, &org, id)?,
                 None => None,
             })
         })
@@ -401,6 +513,32 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
         .ok()
         .flatten()?;
     let workflow = loaded.get("workflow").and_then(Value::as_str)?.to_string();
+    let org = org_of(&loaded).to_string();
+    if org != ua_core::DEFAULT_ORG {
+        // The owner's caller can only be built in the default organization
+        // until the resolver binds others (`org_guard`), and a workflow must
+        // never run one organization's routine under another's caller. The
+        // fire's task exists in the routine's organization; its workflow is
+        // recorded as not run.
+        let o = org.clone();
+        let _ = hub
+            .db()
+            .write_async(move |tx| {
+                tx.execute(
+                    "UPDATE routine_runs SET workflow_status = 'not_run' WHERE id = ?1 AND org_id = ?2",
+                    params![run_row, o],
+                )?;
+                Ok(())
+            })
+            .await;
+        return Some(json!({
+            "routine_id": loaded.get("id"),
+            "workflow": workflow,
+            "run_id": null,
+            "status": "not_run",
+            "error": format!("routine workflows run only in the {:?} organization", ua_core::DEFAULT_ORG),
+        }));
+    }
     let owner = loaded["owner"].as_str().unwrap_or_default().to_string();
     let inputs: Map<String, Value> = loaded
         .get("workflow_inputs")
@@ -412,14 +550,18 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
     // Mark the fire before its workflow starts, so a hub that stops midway
     // leaves `running` (reconciled as interrupted at the next start), never
     // a fire that looks unstarted and would run twice.
+    let o = org.clone();
     let _ = hub
         .db()
         .write_async(move |tx| {
-            tx.execute("UPDATE routine_runs SET workflow_status = 'running' WHERE id = ?1", [run_row])?;
+            tx.execute(
+                "UPDATE routine_runs SET workflow_status = 'running' WHERE id = ?1 AND org_id = ?2",
+                params![run_row, o],
+            )?;
             Ok(())
         })
         .await;
-    let (status, run_id, error) = match workflows::run_as(hub, &caller, &workflow, inputs).await {
+    let (status, run_id, error) = match workflows::run_as(hub, &caller, &org, &workflow, inputs).await {
         Ok(report) => (report.status.clone(), Some(report.run_id.clone()), report.error.clone()),
         Err(e) => ("error".to_string(), None, Some(e.to_string())),
     };
@@ -428,8 +570,8 @@ async fn run_fire_workflow(hub: &Hub, run_row: i64, attended: bool) -> Option<Va
         .db()
         .write_async(move |tx| {
             tx.execute(
-                "UPDATE routine_runs SET workflow_run_id = ?2, workflow_status = ?3 WHERE id = ?1",
-                params![run_row, rid, st],
+                "UPDATE routine_runs SET workflow_run_id = ?2, workflow_status = ?3 WHERE id = ?1 AND org_id = ?4",
+                params![run_row, rid, st, org],
             )?;
             Ok(())
         })
@@ -472,7 +614,8 @@ pub async fn reconcile_fires(hub: &Hub) -> UaResult<Value> {
             };
             let interrupted =
                 ids(tx, "SELECT id FROM routine_runs WHERE workflow_status = 'running' ORDER BY id", &[])?;
-            let unstarted = "SELECT rr.id FROM routine_runs rr JOIN routines r ON r.id = rr.routine_id \
+            let unstarted = "SELECT rr.id FROM routine_runs rr \
+                 JOIN routines r ON r.id = rr.routine_id AND r.org_id = rr.org_id \
                  WHERE rr.status = 'created' AND rr.workflow_status IS NULL AND r.workflow IS NOT NULL";
             let stale = ids(tx, &format!("{unstarted} AND rr.created_at < ?1 ORDER BY rr.id"), &[&cutoff])?;
             let rerun = ids(tx, &format!("{unstarted} AND rr.created_at >= ?1 ORDER BY rr.id"), &[&cutoff])?;
@@ -485,6 +628,7 @@ pub async fn reconcile_fires(hub: &Hub) -> UaResult<Value> {
                     ledger::append(
                         tx,
                         EventInput::new(
+                            ua_core::DEFAULT_ORG,
                             "agent.routine.fire_reconciled",
                             json!({ "routine_run_id": id, "workflow_status": status }),
                         )
@@ -540,6 +684,8 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
             });
             let mut to_run = release_queued(tx)?;
             result["released"] = json!(to_run.len());
+            // Every organization's due routines; each fire takes its routine's
+            // organization.
             let routines: Vec<Map<String, Value>> = {
                 let mut stmt =
                     tx.prepare("SELECT * FROM routines WHERE trigger = 'cron' AND paused = 0 ORDER BY id")?;
@@ -559,8 +705,8 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
                     } else {
                         let key = format!("cron:{}", ua_core::time::format_ts(latest));
                         let n = tx.execute(
-                            "INSERT INTO routine_runs (routine_id, fire_key, scheduled_for, status, created_at, \
-                             reason, subject_key) VALUES (?1, ?2, ?3, 'skipped', ?4, ?5, ?6) \
+                            "INSERT INTO routine_runs (org_id, routine_id, fire_key, scheduled_for, status, \
+                             created_at, reason, subject_key) VALUES (?7, ?1, ?2, ?3, 'skipped', ?4, ?5, ?6) \
                              ON CONFLICT (routine_id, fire_key) DO NOTHING",
                             params![
                                 id,
@@ -568,7 +714,8 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
                                 ua_core::time::format_ts(latest),
                                 ua_core::time::now(),
                                 SKIP_CATCH_UP_NONE,
-                                format!("routine:{id}")
+                                format!("routine:{id}"),
+                                org_of(&routine),
                             ],
                         )?;
                         if n == 1 {
@@ -615,8 +762,8 @@ pub async fn tick(hub: &Hub, now: jiff::Timestamp, force: bool) -> UaResult<Valu
                     }
                 }
                 tx.execute(
-                    "UPDATE routines SET cursor_at = ?2, updated_at = ?3 WHERE id = ?1",
-                    params![id, ua_core::time::format_ts(cursor), ua_core::time::now()],
+                    "UPDATE routines SET cursor_at = ?2, updated_at = ?3 WHERE id = ?1 AND org_id = ?4",
+                    params![id, ua_core::time::format_ts(cursor), ua_core::time::now(), org_of(&routine)],
                 )?;
             }
             Ok((result, to_run))
@@ -764,14 +911,17 @@ async fn routine_add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
         .await?;
     }
     let inputs_text = a.workflow.as_ref().map(|_| serde_json::to_string(&inputs)).transpose()?;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let now = ua_core::time::now();
             tx.execute(
-                "INSERT INTO routines (title, notes, trigger, schedule, lane, project, domain, concurrency, catch_up, \
-                 cursor_at, activity_gate, activity_gate_scope, workflow, workflow_inputs, owner, created_at, \
-                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+                "INSERT INTO routines (org_id, title, notes, trigger, schedule, lane, project, domain, concurrency, \
+                 catch_up, cursor_at, activity_gate, activity_gate_scope, workflow, workflow_inputs, owner, \
+                 created_at, updated_at) \
+                 VALUES (?17, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
                 params![
                     title,
                     a.notes,
@@ -788,13 +938,14 @@ async fn routine_add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
                     a.workflow,
                     inputs_text,
                     owner,
-                    now
+                    now,
+                    org
                 ],
             )?;
             let id = tx.last_insert_rowid();
             ledger::append(
                 tx,
-                EventInput::new("agent.routine.added", json!({ "routine_id": id, "trigger": a.trigger }))
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.routine.added", json!({ "routine_id": id, "trigger": a.trigger }))
                     .by(owner.clone()),
             )?;
             Ok(json!({ "id": id }))
@@ -818,12 +969,14 @@ fn yes() -> bool {
 
 async fn routine_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     let limit = a.recent_runs.min(MAX_RECENT_RUNS);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
-            let mut stmt = c.prepare("SELECT * FROM routines WHERE (?1 OR paused = 0) ORDER BY id")?;
+            let mut stmt =
+                c.prepare("SELECT * FROM routines WHERE org_id = ?2 AND (?1 OR paused = 0) ORDER BY id")?;
             let mut routines: Vec<Map<String, Value>> =
-                stmt.query_map([a.include_paused], row_map)?.collect::<Result<_, _>>()?;
+                stmt.query_map(params![a.include_paused, org], row_map)?.collect::<Result<_, _>>()?;
             for r in &mut routines {
                 if let Some(text) = r.get("workflow_inputs").and_then(Value::as_str) {
                     let parsed = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
@@ -831,10 +984,13 @@ async fn routine_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
                 }
                 if limit > 0 {
                     let mut s = c.prepare(&format!(
-                        "SELECT {RECENT_RUN_COLUMNS} FROM routine_runs WHERE routine_id = ?1 ORDER BY id DESC LIMIT ?2"
+                        "SELECT {RECENT_RUN_COLUMNS} FROM routine_runs WHERE routine_id = ?1 AND org_id = ?3 \
+                         ORDER BY id DESC LIMIT ?2"
                     ))?;
                     let runs: Vec<Value> = s
-                        .query_map(params![r["id"].as_i64(), limit], |row| Ok(Value::Object(row_map(row)?)))?
+                        .query_map(params![r["id"].as_i64(), limit, org], |row| {
+                            Ok(Value::Object(row_map(row)?))
+                        })?
                         .collect::<Result<_, _>>()?;
                     r.insert("recent_runs".into(), Value::Array(runs));
                 }
@@ -858,19 +1014,21 @@ async fn routine_pause(ctx: ToolCtx, a: PauseArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
+            let org = caller.org_id.as_str();
+            require_org(tx, org)?;
             let routine =
-                routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
+                routine_by_id(tx, org, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
             require_operator(&caller, &routine)?;
             let previous = routine["paused"].as_i64().unwrap_or(0) != 0;
             let now = ua_core::time::now();
             tx.execute(
                 "UPDATE routines SET paused = ?2, updated_at = ?3, \
-                 cursor_at = CASE WHEN paused = 1 AND ?2 = 0 THEN ?3 ELSE cursor_at END WHERE id = ?1",
-                params![a.routine_id, a.paused, now],
+                 cursor_at = CASE WHEN paused = 1 AND ?2 = 0 THEN ?3 ELSE cursor_at END WHERE id = ?1 AND org_id = ?4",
+                params![a.routine_id, a.paused, now, org],
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.routine.paused",
                     json!({ "routine_id": a.routine_id, "paused": a.paused, "previous_paused": previous }),
                 )
@@ -902,16 +1060,18 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
+            let org = caller.org_id.clone();
+            require_org(tx, &org)?;
             let routine =
-                routine_by_id(tx, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
+                routine_by_id(tx, &org, a.routine_id)?.ok_or_else(|| UaError::not_found("unknown routine"))?;
             require_operator(&caller, &routine)?;
             // Human authority only when the human owner fires in person.
             let attended = caller.is_human() && routine["owner"].as_str() == Some(caller.label.as_str());
             let key = format!("event:{}", a.idempotency_key);
             let previous: Option<(String, Option<i64>)> = tx
                 .query_row(
-                    "SELECT status, task_id FROM routine_runs WHERE routine_id = ?1 AND fire_key = ?2",
-                    params![a.routine_id, key],
+                    "SELECT status, task_id FROM routine_runs WHERE routine_id = ?1 AND fire_key = ?2 AND org_id = ?3",
+                    params![a.routine_id, key, org],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -930,7 +1090,11 @@ async fn routine_fire(ctx: ToolCtx, a: FireArgs) -> UaResult<Value> {
             }
             let fire = create_fire(tx, &routine, &key, jiff::Timestamp::now(), &by)?;
             let run = (fire.status == "created").then_some(fire.run_row).flatten();
-            Ok((json!({ "status": fire.status, "task_id": fire.task_id }), run, attended))
+            let mut out = json!({ "status": fire.status, "task_id": fire.task_id });
+            if let Some(reason) = fire.reason {
+                out["reason"] = json!(reason);
+            }
+            Ok((out, run, attended))
         })
         .await?;
     let (mut out, run, attended) = fire;

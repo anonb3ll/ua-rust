@@ -11,7 +11,13 @@
 //! new file under `exports/` in the caller's workspace (capped at 32 MB). The
 //! file name carries a UTC timestamp and a counter, and is created exclusively
 //! so concurrent exports never overwrite each other. Writes are recorded on
-//! `agent.export.written`. No redaction: review an export before sharing it.
+//! `agent.export.written`. The manifest applies the ledger's event visibility
+//! to message, session-handoff and conversation-handoff event rows, which
+//! carry only their id and stored hash when restricted. A file export is
+//! refused (`org_unsupported`) outside the default organization, whose
+//! workspace the file would land in; an inline export works for every
+//! organization, except `export_journal`, which reads the hub's vault and is
+//! refused (`org_unsupported`) outside the default organization.
 //!
 //! A migration manifest is streamed from one read transaction: rows go to
 //! the fingerprint hash and to the output as they are read, the output is
@@ -23,7 +29,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -31,6 +37,7 @@ use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::harness_config::render::py_dumps;
 use super::injection::mark_untrusted;
@@ -94,6 +101,12 @@ fn create_exclusive(dir: &Path, stem: &str, ext: &str, data: &[u8]) -> UaResult<
 }
 
 /// Return the export inline or write it to the workspace.
+///
+/// A file lands in the hub's shared workspace root, which belongs to the
+/// default organization, so another organization's caller is refused a file
+/// (`org_unsupported`, nothing written or ledgered) and asked for an inline
+/// export instead; its export is never silently switched to inline, so the
+/// reply's shape always matches the request.
 async fn deliver(
     ctx: &ToolCtx,
     name: &'static str,
@@ -102,6 +115,14 @@ async fn deliver(
     rows: usize,
     to_file: bool,
 ) -> UaResult<Value> {
+    let org = ctx.caller.org_id.as_str();
+    if to_file && org != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "a file export is written to the hub's shared workspace and is available to the default \
+             organization only; nothing was written. Pass write_to_vault=false for an inline export",
+        ));
+    }
     let cap = if to_file { FILE_MAX_BYTES } else { INLINE_MAX_BYTES };
     if content.len() > cap {
         return Err(UaError::invalid(format!(
@@ -123,13 +144,17 @@ async fn deliver(
         Ok(file.strip_prefix(&root).unwrap_or(&file).to_string_lossy().into_owned())
     })
     .await?;
-    let (by, rel) = (ctx.caller.label.clone(), path.clone());
+    // ORG-EVENT-DEFAULT: only a default-organization file export reaches
+    // here; the originator rule matches the other families' anyway.
+    let by = if org == ua_core::DEFAULT_ORG { ctx.caller.label.clone() } else { "system".to_string() };
+    let rel = path.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": name, "path": rel, "rows": rows, "bytes": bytes }),
                 )
@@ -175,13 +200,15 @@ fn md_cell(v: &Value) -> String {
     s.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
+/// Organization `org`'s tasks.
 fn task_rows(
     c: &Connection,
+    org: &str,
     status: Option<&str>,
     project: Option<&str>,
 ) -> UaResult<Vec<Map<String, Value>>> {
-    let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", TASK_COLUMNS.join(", "));
-    let mut args: Vec<SqlValue> = Vec::new();
+    let mut sql = format!("SELECT {} FROM tasks WHERE org_id = ?", TASK_COLUMNS.join(", "));
+    let mut args: Vec<SqlValue> = vec![SqlValue::Text(org.into())];
     if let Some(s) = status {
         sql.push_str(" AND status = ?");
         args.push(SqlValue::Text(s.into()));
@@ -209,7 +236,9 @@ async fn export_tasks(ctx: ToolCtx, a: TasksArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {TASK_STATUSES:?} or all, got {s:?}")));
     }
     let project = a.project.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let rows = ctx.hub.db().read_async(move |c| task_rows(c, status.as_deref(), project.as_deref())).await?;
+    let org = ctx.caller.org_id.clone();
+    let rows =
+        ctx.hub.db().read_async(move |c| task_rows(c, &org, status.as_deref(), project.as_deref())).await?;
     let n = rows.len();
     let null = Value::Null;
     let cell = |r: &Map<String, Value>, k: &str| -> Value { r.get(k).unwrap_or(&null).clone() };
@@ -267,12 +296,19 @@ fn is_index_id(id: &str) -> bool {
     id.starts_with("masterindex") || id.starts_with("tagindex_")
 }
 
-fn memory_records(c: &Connection, tag: Option<&str>, since_day: Option<&str>) -> UaResult<Vec<Value>> {
+/// Organization `org`'s notes.
+fn memory_records(
+    c: &Connection,
+    org: &str,
+    tag: Option<&str>,
+    since_day: Option<&str>,
+) -> UaResult<Vec<Value>> {
     let mut stmt = c.prepare(
         "SELECT id, title, content, tags, author, created_at, updated_at, salience, confidence, superseded_by, \
-         source_host, epistemic, evidence, valid_from, contradicts, valid_to FROM memory ORDER BY updated_at, id",
+         source_host, epistemic, evidence, valid_from, contradicts, valid_to FROM memory WHERE org_id = ?1 \
+         ORDER BY updated_at, id",
     )?;
-    let rows = stmt.query_map([], row_map)?;
+    let rows = stmt.query_map([org], row_map)?;
     let mut out = Vec::new();
     for row in rows {
         let r = row?;
@@ -323,9 +359,12 @@ async fn export_memory(ctx: ToolCtx, a: MemoryArgs) -> UaResult<Value> {
     }
     let since_day =
         a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?.map(|s| s[..10].to_string());
-    let tag = a.tag.clone();
-    let records =
-        ctx.hub.db().read_async(move |c| memory_records(c, tag.as_deref(), since_day.as_deref())).await?;
+    let (tag, org) = (a.tag.clone(), ctx.caller.org_id.clone());
+    let records = ctx
+        .hub
+        .db()
+        .read_async(move |c| memory_records(c, &org, tag.as_deref(), since_day.as_deref()))
+        .await?;
     let n = records.len();
     let (content, ext) = if format == "jsonl" {
         let mut out = String::new();
@@ -426,6 +465,10 @@ fn journal_entries_in(
 }
 
 async fn export_journal(ctx: ToolCtx, a: JournalArgs) -> UaResult<Value> {
+    // The journal is read from the hub's vault, the default organization's:
+    // another organization's caller is refused before any file is read,
+    // inline or not.
+    crate::families::vault::require_hub_org(&ctx)?;
     let Some(vault) = ctx.hub.cfg().vault_path.clone() else {
         return Err(UaError::invalid("no vault is configured (UA_VAULT_PATH)"));
     };
@@ -734,60 +777,104 @@ pub struct ManifestStats {
 }
 
 /// `{chain_ok, count, entry_hash_mismatches, first_ulid, last_ulid,
-/// rolling_hash}` over the whole event log, ordered by ulid.
+/// rolling_hash}` over the whole event log, ordered by ulid. When `chain_ok`
+/// is `false`, `first_bad_seq` (when available) and `chain_error` report where
+/// and why the chain broke; both are omitted on healthy logs so healthy key
+/// sets and manifest fingerprints stay unchanged.
 ///
-/// Each row's `entry_hash` is recomputed from its contents (as
-/// `event_log_verify` does), never taken as stored: the rolling hash is
-/// SHA-256 over one line per row holding the recomputed hash, or for a row
-/// without one (an imported legacy prefix), the canonical JSON of its
-/// [`ROLLING_ROW_COLUMNS`]. A stored hash that differs from its row is
-/// counted in `entry_hash_mismatches` and clears `chain_ok`.
+/// `chain_ok` is [`ledger::verify`] (seq-order `prev_hash` linkage from
+/// [`ledger::GENESIS_HASH`], no hashless row after a hashed one, and a legacy
+/// prefix exactly as long as `ledger_meta.unhashed_legacy_prefix` records)
+/// plus zero `entry_hash` mismatches. Each row's `entry_hash` is recomputed
+/// from its contents, never taken as stored: the rolling hash is SHA-256 over
+/// one line per row holding the recomputed hash, or for a row without one (an
+/// imported legacy prefix), the canonical JSON of its [`ROLLING_ROW_COLUMNS`].
+/// Stored hashes that differ from their row (or are blank) increment
+/// `entry_hash_mismatches` and clear `chain_ok`. The ulid order used for the
+/// rolling hash is not checked for linkage: an imported hub can hold ULIDs
+/// minted out of write order.
+///
+/// The summary has no anchor: it records count, the ulid range and the
+/// rolling hash, not the head `entry_hash`, so a truncated or rewritten tail
+/// still reports `chain_ok: true`. Only comparing the summary against an
+/// earlier manifest catches that.
 fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let mut hasher = Sha256::new();
     let (mut count, mut mismatches, mut first, mut last) = (0u64, 0u64, Value::Null, Value::Null);
-    let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
-    want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
-    for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
-        let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
-        if count == 0 {
-            first = ulid.clone();
-        }
-        last = ulid;
-        count += 1;
-        let stored = row.remove("entry_hash");
-        let dedupe_key = row.remove("dedupe_key");
-        let prev_hash = row.remove("prev_hash");
-        match stored {
-            Some(Value::String(h)) if !h.is_empty() => {
-                let text = |k: &str| row.get(k).and_then(Value::as_str);
-                let recomputed = ledger::compute_entry_hash(
-                    prev_hash.as_ref().and_then(Value::as_str),
-                    text("ulid").unwrap_or_default(),
-                    text("channel").unwrap_or_default(),
-                    text("payload").unwrap_or_default(),
-                    text("originator"),
-                    text("episode_id"),
-                    text("causal_parent_id"),
-                    text("created_at").unwrap_or_default(),
-                    dedupe_key.as_ref().and_then(Value::as_str),
-                );
-                if recomputed != h {
-                    mismatches += 1;
-                }
-                hasher.update(recomputed.as_bytes());
+    let has_log = has_table(c, "event_log")?;
+    let ledger_report = if has_log { Some(ledger::verify(c)?) } else { None };
+    let ledger_ok = ledger_report.as_ref().is_none_or(|r| r.ok);
+    if has_log {
+        let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
+        want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+        // Separate from ledger::verify (seq order): rolling_hash and ulid bounds follow ulid order, which can differ in imported logs.
+        for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
+            let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
+            if count == 0 {
+                first = ulid.clone();
             }
-            _ => hasher.update(py_dumps(&Value::Object(row), None).as_bytes()),
-        }
-        hasher.update(b"\n");
-        Ok(())
-    })?;
+            last = ulid;
+            count += 1;
+            let stored = row.remove("entry_hash");
+            let dedupe_key = row.remove("dedupe_key");
+            let prev_hash = row.remove("prev_hash");
+            match stored {
+                Some(Value::String(h)) if !h.is_empty() => {
+                    let text = |k: &str| row.get(k).and_then(Value::as_str);
+                    let recomputed = ledger::compute_entry_hash(
+                        prev_hash.as_ref().and_then(Value::as_str),
+                        text("ulid").unwrap_or_default(),
+                        text("channel").unwrap_or_default(),
+                        text("payload").unwrap_or_default(),
+                        text("originator"),
+                        text("episode_id"),
+                        text("causal_parent_id"),
+                        text("created_at").unwrap_or_default(),
+                        dedupe_key.as_ref().and_then(Value::as_str),
+                    );
+                    if recomputed != h {
+                        mismatches += 1;
+                    }
+                    hasher.update(recomputed.as_bytes());
+                }
+                Some(Value::String(_)) => {
+                    // Blank `""` entry_hash is not a NULL legacy prefix row: count it as a
+                    // mismatch and fail `chain_ok`, keeping canonical-row rolling-hash parity.
+                    mismatches += 1;
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+                None | Some(Value::Null) => {
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+                Some(_) => {
+                    mismatches += 1;
+                    hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                }
+            }
+            hasher.update(b"\n");
+            Ok(())
+        })?;
+    }
+    let chain_ok = ledger_ok && mismatches == 0;
     let mut out = Map::new();
-    out.insert("chain_ok".into(), json!(mismatches == 0));
+    out.insert("chain_ok".into(), json!(chain_ok));
     out.insert("count".into(), json!(count));
     out.insert("entry_hash_mismatches".into(), json!(mismatches));
     out.insert("first_ulid".into(), first);
     out.insert("last_ulid".into(), last);
     out.insert("rolling_hash".into(), json!(hex::encode(hasher.finalize())));
+    if !chain_ok {
+        if let Some(rep) = ledger_report.as_ref().filter(|r| !r.ok) {
+            if let Some(seq) = rep.first_bad_seq {
+                out.insert("first_bad_seq".into(), json!(seq));
+            }
+            if let Some(reason) = &rep.reason {
+                out.insert("chain_error".into(), json!(reason));
+            }
+        } else if mismatches > 0 {
+            out.insert("chain_error".into(), json!("entry_hash mismatch"));
+        }
+    }
     Ok(out)
 }
 
@@ -798,6 +885,7 @@ fn write_manifest(
     c: &Connection,
     source_host: &str,
     since_ulid: Option<&str>,
+    reader: &EventReader,
     caps: ManifestCaps,
     out: &mut dyn std::io::Write,
 ) -> UaResult<ManifestStats> {
@@ -822,11 +910,30 @@ fn write_manifest(
         em.hashing = false;
         em.key(false, "rows")?;
         em.array(|item, em| {
-            for_each_row(&tx, "event_log", MANIFEST_EVENT_COLUMNS, "ulid", Some(since), |row| {
-                let mut row = Value::Object(row);
-                label_event_row(&mut row);
-                item(em, &row)
-            })
+            if !has_table(&tx, "event_log")? {
+                return Ok(());
+            }
+            let columns = MANIFEST_EVENT_COLUMNS.join(", ");
+            let sql = format!(
+                "SELECT {columns}, ({VISIBLE_EVENT}) AS _visible FROM event_log WHERE ulid > ? ORDER BY ulid"
+            );
+            let bindings = reader.bindings().into_iter().chain([&since as &dyn ToSql]);
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(bindings))?;
+            while let Some(row) = rows.next()? {
+                let visible: bool = row.get("_visible")?;
+                let mut row = row_map(row)?;
+                let listed = if visible {
+                    row.remove("_visible");
+                    let mut listed = Value::Object(row);
+                    label_event_row(&mut listed);
+                    listed
+                } else {
+                    json!({ "ulid": row["ulid"], "entry_hash": row["entry_hash"], "redacted": true })
+                };
+                item(em, &listed)?;
+            }
+            Ok(())
         })?;
         em.key(false, "since_ulid")?;
         em.put(&py_dumps(&json!(since), None))?;
@@ -928,17 +1035,41 @@ fn parse_cursor(raw: Option<&str>) -> UaResult<Option<String>> {
         .map_err(|_| UaError::invalid(format!("events_since_ulid must be a ulid, got {raw:?}")))
 }
 
+/// The migration manifest is a hub-wide snapshot (every organization's
+/// tasks and notes, the whole event-log summary), so only the default
+/// organization, which operates the hub, may build or compare one. Another
+/// organization's caller is refused before anything is read.
+fn manifest_org_guard(ctx: &ToolCtx, what: &str) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "{what} covers the whole hub and is available to the default organization only; nothing was read"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "the migration manifest")?;
     let source_host = source_host_label(ctx.hub.cfg());
     let since = parse_cursor(a.events_since_ulid.as_deref())?;
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
     if !a.write_to_vault.unwrap_or(false) {
         let (stats, text) = ctx
             .hub
             .db()
             .read_async(move |c| {
                 let mut buf: Vec<u8> = Vec::new();
-                let stats =
-                    write_manifest(c, &source_host, since.as_deref(), ManifestCaps::INLINE, &mut buf)?;
+                let stats = write_manifest(
+                    c,
+                    &source_host,
+                    since.as_deref(),
+                    &reader,
+                    ManifestCaps::INLINE,
+                    &mut buf,
+                )?;
                 Ok((stats, buf))
             })
             .await?;
@@ -962,14 +1093,15 @@ async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Va
                 .map_err(|e| UaError::internal(format!("cannot create {EXPORT_DIR}/: {e}")))?;
             let (file, path) = open_exclusive(&dir, &format!("migration-manifest-{stamp}"), "json")?;
             let mut out = std::io::BufWriter::new(file);
-            let written = write_manifest(c, &source_host, since.as_deref(), ManifestCaps::FILE, &mut out)
-                .and_then(|stats| {
-                    out.write_all(b"\n")
-                        .and_then(|_| out.flush())
-                        .and_then(|_| out.get_ref().sync_all())
-                        .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
-                    Ok(stats)
-                });
+            let written =
+                write_manifest(c, &source_host, since.as_deref(), &reader, ManifestCaps::FILE, &mut out)
+                    .and_then(|stats| {
+                        out.write_all(b"\n")
+                            .and_then(|_| out.flush())
+                            .and_then(|_| out.get_ref().sync_all())
+                            .map_err(|e| UaError::internal(format!("export write failed: {e}")))?;
+                        Ok(stats)
+                    });
             match written {
                 Ok(mut stats) => {
                     stats.bytes += 1;
@@ -992,6 +1124,7 @@ async fn export_migration_manifest(ctx: ToolCtx, a: ManifestArgs) -> UaResult<Va
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.export.written",
                     json!({ "kind": "migration-manifest", "path": path, "rows": rows, "bytes": bytes }),
                 )
@@ -1213,6 +1346,7 @@ async fn side_manifest(
 }
 
 /// One side's event-log summary, checked.
+#[derive(Debug)]
 struct EventLog {
     count: u64,
     first: Option<String>,
@@ -1220,16 +1354,26 @@ struct EventLog {
     rolling_hash: String,
     /// `chain_ok` as the export stated it (absent: not stated).
     chain_ok: Option<bool>,
+    first_bad_seq: Option<i64>,
+    chain_error: Option<String>,
     /// The cursor and, per ulid listed after it, a hash of the row.
     rows: Option<(String, BTreeMap<String, String>)>,
 }
 
-fn opt_ulid(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
+fn opt_str(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<String>> {
     match log.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(UaError::invalid(format!("{side} event_log.{key} must be a string or null"))),
     }
+}
+
+fn opt_i64(side: &str, log: &Map<String, Value>, key: &str) -> UaResult<Option<i64>> {
+    let Some(v) = log.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let Some(n) = v.as_i64() else {
+        return Err(UaError::invalid(format!("{side} event_log.{key} must be an integer or null")));
+    };
+    Ok(Some(n))
 }
 
 fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
@@ -1248,9 +1392,9 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
         .and_then(Value::as_str)
         .ok_or_else(|| UaError::invalid(format!("{side} event_log.rolling_hash must be a string")))?
         .to_string();
-    let first = opt_ulid(side, log, "first_ulid")?;
-    let last = opt_ulid(side, log, "last_ulid")?;
-    let rows = match (log.get("rows"), opt_ulid(side, log, "since_ulid")?) {
+    let first = opt_str(side, log, "first_ulid")?;
+    let last = opt_str(side, log, "last_ulid")?;
+    let rows = match (log.get("rows"), opt_str(side, log, "since_ulid")?) {
         (None, None) => None,
         (Some(rows), Some(since)) => {
             let rows = object_rows(Some(rows), &format!("{side} event_log.rows"))?;
@@ -1279,7 +1423,9 @@ fn event_log_of(side: &str, m: &Value) -> UaResult<Option<EventLog>> {
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(UaError::invalid(format!("{side} event_log.chain_ok must be a boolean"))),
     };
-    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, rows }))
+    let first_bad_seq = opt_i64(side, log, "first_bad_seq")?;
+    let chain_error = opt_str(side, log, "chain_error")?;
+    Ok(Some(EventLog { count, first, last, rolling_hash, chain_ok, first_bad_seq, chain_error, rows }))
 }
 
 /// Compare the two event-log summaries and, when both sides listed rows,
@@ -1340,7 +1486,14 @@ fn compare_event_logs(
     }
     for (name, e) in [("left", &l), ("right", &r)] {
         if e.chain_ok == Some(false) {
-            conflicts.push(json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"}));
+            let mut conflict = json!({"kind": "event_log", "side": name, "type": "event_log_chain_broken"});
+            if let Some(seq) = e.first_bad_seq {
+                conflict["first_bad_seq"] = json!(seq);
+            }
+            if let Some(err) = &e.chain_error {
+                conflict["chain_error"] = json!(err);
+            }
+            conflicts.push(conflict);
         }
     }
     if !(count_match && range_match && rolling_hash_match) || rows_differ {
@@ -1428,6 +1581,7 @@ fn missing_parents(side: &str, tasks: &BTreeMap<String, &Map<String, Value>>, co
 }
 
 async fn compare_migration_manifests(ctx: ToolCtx, a: CompareArgs) -> UaResult<Value> {
+    manifest_org_guard(&ctx, "comparing migration manifests")?;
     let left = side_manifest(&ctx, "left", a.left, a.left_path).await?;
     let right = side_manifest(&ctx, "right", a.right, a.right_path).await?;
     compare_manifests(&left, &right)
@@ -1526,11 +1680,11 @@ fn inner_params(params: Option<Value>) -> Value {
 }
 
 async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
-    match action.as_str() {
-        "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", &action, a.params)?).await,
-        "memory" | "export_memory" => export_memory(ctx, parse_params("export", &action, a.params)?).await,
-        "journal" | "export_journal" => export_journal(ctx, parse_params("export", &action, a.params)?).await,
+    let action = crate::routes::action_of("export_data", Some(&a.action))?;
+    match action {
+        "tasks" | "export_tasks" => export_tasks(ctx, parse_params("export", action, a.params)?).await,
+        "memory" | "export_memory" => export_memory(ctx, parse_params("export", action, a.params)?).await,
+        "journal" | "export_journal" => export_journal(ctx, parse_params("export", action, a.params)?).await,
         // A full governed call under the inner tool's name: its profile entry,
         // policy rules, approval_tools and grants apply, not export_data's.
         "manifest" | "export_migration_manifest" => {
@@ -1546,7 +1700,7 @@ async fn export_data(ctx: ToolCtx, a: DataArgs) -> UaResult<Value> {
         "import" | "rollback" => Err(UaError::invalid(format!(
             "export action {action:?} is not available: migration import and rollback are not implemented"
         ))),
-        _ => Err(UaError::invalid("action must be one of tasks, memory, journal, manifest, compare")),
+        other => Err(crate::routes::unhandled("export_data", other)),
     }
 }
 
@@ -1559,7 +1713,8 @@ pub fn register(r: &mut Registry) {
             "export_tasks",
             "Export tasks as csv (RFC 4180), json or markdown. status is one status or all; project restricts \
              to one stream. write_to_vault (default true) writes exports/tasks-<UTC>.<ext> in the workspace and \
-             returns {path, rows, bytes}; false returns {content, rows}. Inline cap 2 MB; file cap 32 MB.",
+             returns {path, rows, bytes} (default organization only); false returns {content, rows}. Inline cap 2 MB; \
+             file cap 32 MB.",
             export_tasks,
         )
         .family("export"),
@@ -1569,7 +1724,8 @@ pub fn register(r: &mut Registry) {
             "export_memory",
             "Export memory notes as jsonl or json. Index notes are excluded; superseded notes are included and \
              flagged. Optional tag and since (ISO date) filters. write_to_vault (default true) writes a file under \
-             exports/ in the workspace; false returns it inline. Inline cap 2 MB; file cap 32 MB.",
+             exports/ in the workspace (default organization only); false returns it inline. Inline cap 2 MB; file \
+             cap 32 MB.",
             export_memory,
         )
         .family("export"),
@@ -1579,7 +1735,8 @@ pub fn register(r: &mut Registry) {
             "export_journal",
             "Export vault journal lines (`- **HH:MM** [Agent] text #tags`) from Logs/YYYY-MM-DD.md and every \
              Logs/<machine>/ folder as jsonl, each row tagged with machine. Optional agent and since filters. \
-             write_to_vault (default true) writes a file under exports/ in the workspace. Needs UA_VAULT_PATH.",
+             write_to_vault (default true) writes a file under exports/ in the workspace (default organization \
+             only). Needs UA_VAULT_PATH.",
             export_journal,
         )
         .family("export"),
@@ -1598,10 +1755,20 @@ pub fn register(r: &mut Registry) {
             "export_migration_manifest",
             "Read-only migration snapshot of tasks, memory notes and memory graph rows when those tables \
              exist, read in one transaction. The event log is summarised as {chain_ok, count, \
-             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: each row's entry hash is recomputed \
+             entry_hash_mismatches, first_ulid, last_ulid, rolling_hash}: chain_ok covers seq-order prev_hash \
+             linkage from genesis and zero entry-hash mismatches, plus a legacy unhashed prefix whose length \
+             must match the length the import recorded in ledger_meta (stores imported before that record \
+             existed report false, as event_log_verify does); each row's entry hash is recomputed \
              from its contents, and the rolling hash is SHA-256 over the ulid-ordered recomputed hashes (the \
-             canonical row where a row has none). events_since_ulid also lists the rows after that ulid, with \
-             client evidence (sdk. channels) carrying a trust label; the listing and the cursor are outside \
+             canonical row where a row has none). When chain_ok is false, first_bad_seq (when available) \
+             and chain_error report where and why the chain broke (omitted on healthy logs). The summary has \
+             no anchor: compare against an earlier \
+             manifest to detect a truncated or rewritten tail. events_since_ulid also lists the rows after that ulid, with \
+             client evidence (sdk. channels) carrying a trust label. Restricted message, session-handoff and \
+             conversation-handoff rows contain \
+             only their ULID, stored entry hash, and a redacted flag — the accepted integrity exception \
+             that keeps the chain checkable without revealing the rows. Row comparisons compare the \
+             listed views. The listing and cursor are outside \
              the fingerprint. Stable ids, claims, source hosts and provenance are preserved. \
              The manifest's origin is the `source_host` config value (default `local`). Does not import, \
              rewrite or delete anything. The manifest is streamed and refused as soon as it would pass a cap: \
@@ -1638,24 +1805,61 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ua_core::{Caller, Config, identity::Transport};
 
-    /// A bare database with only the columns the manifest reads.
+    /// Minimal manifest DB using the real ledger and ledger_meta schemas.
     fn db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+        let mut c = Connection::open_in_memory().unwrap();
+        ua_store::schema::apply::<ua_store::schema::Part>(
+            &mut c,
+            &[
+                ledger::SCHEMA.into(),
+                ledger::META_SCHEMA.into(),
+                ua_store::org::STORE_PART.into(),
+                super::super::messaging::SCHEMA.into(),
+                super::super::messaging::TENANT_PART.into(),
+            ],
+        )
+        .unwrap();
         c.execute_batch(
-            "CREATE TABLE schema_parts (name TEXT);
-             INSERT INTO schema_parts VALUES ('core.v1');
-             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);
+            "INSERT INTO schema_parts (name, checksum, applied_at)
+             VALUES ('core.v1', 'test', '2026-01-01T00:00:00+00:00');
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, claimed_by TEXT, next_owner TEXT, org_id TEXT NOT NULL DEFAULT 'default');
              CREATE TABLE memory (id TEXT PRIMARY KEY, title TEXT, content TEXT);
-             CREATE TABLE event_log (seq INTEGER PRIMARY KEY, ulid TEXT, channel TEXT, payload TEXT,
-                                     created_at TEXT, entry_hash TEXT);",
+             -- The columns VISIBLE_EVENT joins on, minimal versions of the
+             -- real tables.
+             CREATE TABLE session_handoff_notes (id INTEGER PRIMARY KEY, agent TEXT,
+                 assigned_to TEXT, delivered_to TEXT, org_id TEXT NOT NULL DEFAULT 'default');
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, agent TEXT, org_id TEXT NOT NULL DEFAULT 'default');",
         )
         .unwrap();
         c
     }
 
+    fn insert_chained(c: &Connection, rows: &[(&str, &str, &str, &str)], prev_start: &str) -> Vec<String> {
+        let mut prev = prev_start.to_string();
+        let mut hashes = Vec::with_capacity(rows.len());
+        for &(ulid, channel, payload, ts) in rows {
+            let h =
+                ledger::compute_entry_hash(Some(&prev), ulid, channel, payload, None, None, None, ts, None);
+            c.execute(
+                "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![ulid, channel, payload, ts, prev, h],
+            )
+            .unwrap();
+            prev = h.clone();
+            hashes.push(h);
+        }
+        hashes
+    }
+
     fn caps(bytes: usize, memory_rows: usize) -> ManifestCaps {
         ManifestCaps { bytes, kind: "test", memory_rows }
+    }
+
+    fn reader() -> EventReader {
+        EventReader::new(&Config::default(), &Caller::local("local", Transport::Stdio))
     }
 
     #[test]
@@ -1665,11 +1869,12 @@ mod tests {
             c.execute("INSERT INTO memory VALUES (?1, 't', 'c')", [id]).unwrap();
         }
         let mut out = Vec::new();
-        let err = write_manifest(&c, "local", None, caps(1 << 20, 2), &mut out).unwrap_err().to_string();
+        let err =
+            write_manifest(&c, "local", None, &reader(), caps(1 << 20, 2), &mut out).unwrap_err().to_string();
         assert!(err.contains("memory cap of 2 rows"), "{err}");
         // Index notes do not count: three real notes fit a cap of three.
         let mut out = Vec::new();
-        let stats = write_manifest(&c, "local", None, caps(1 << 20, 3), &mut out).unwrap();
+        let stats = write_manifest(&c, "local", None, &reader(), caps(1 << 20, 3), &mut out).unwrap();
         assert_eq!(stats.memory, 3);
     }
 
@@ -1681,7 +1886,8 @@ mod tests {
             c.execute("INSERT INTO tasks (title) VALUES (?1)", [&title]).unwrap();
         }
         let mut out = Vec::new();
-        let err = write_manifest(&c, "local", None, caps(10_000, 10), &mut out).unwrap_err().to_string();
+        let err =
+            write_manifest(&c, "local", None, &reader(), caps(10_000, 10), &mut out).unwrap_err().to_string();
         assert!(err.contains("over the 10000 byte test cap"), "{err}");
         // Nothing past the cap was produced: about 2 MB of tasks were never serialised.
         assert!(out.len() <= 10_000, "{}", out.len());
@@ -1692,16 +1898,28 @@ mod tests {
         let c = db();
         c.execute("INSERT INTO tasks (title) VALUES ('caf\u{e9}')", []).unwrap();
         c.execute("INSERT INTO memory VALUES ('n1', 'note', 'body')", []).unwrap();
-        let good =
-            ua_store::ledger::compute_entry_hash(None, "01B", "agent.x", "{}", None, None, None, "t1", None);
+        let good = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01B",
+            "agent.x",
+            "{}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
         c.execute(
-            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES
-             ('01A', 'legacy', '{}', 't0', NULL), ('01B', 'agent.x', '{}', 't1', ?1)",
-            [&good],
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash) VALUES
+             ('01A', 'legacy', '{}', 't0', NULL, NULL),
+             ('01B', 'agent.x', '{}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &good],
         )
         .unwrap();
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '1')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
         let mut out = Vec::new();
-        let stats = write_manifest(&c, "hub-a", Some("01A"), caps(1 << 20, 10), &mut out).unwrap();
+        let stats = write_manifest(&c, "hub-a", Some("01A"), &reader(), caps(1 << 20, 10), &mut out).unwrap();
         assert_eq!(stats.bytes, out.len());
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         let m = parsed.as_object().unwrap();
@@ -1713,7 +1931,15 @@ mod tests {
         assert_eq!(log["last_ulid"], "01B");
         assert_eq!(log["chain_ok"], true);
         // The unhashed legacy row is hashed as its canonical JSON, the other by its recomputed hash.
-        let legacy = json!({"ulid": "01A", "channel": "legacy", "payload": "{}", "created_at": "t0"});
+        let legacy = json!({
+            "ulid": "01A",
+            "channel": "legacy",
+            "payload": "{}",
+            "originator": null,
+            "episode_id": null,
+            "causal_parent_id": null,
+            "created_at": "t0",
+        });
         let expected =
             hex::encode(Sha256::digest(format!("{}\n{good}\n", py_dumps(&legacy, None)).as_bytes()));
         assert_eq!(log["rolling_hash"], expected);
@@ -1722,15 +1948,15 @@ mod tests {
 
         // The cursor listing is outside the fingerprint.
         let mut plain = Vec::new();
-        let without = write_manifest(&c, "hub-a", None, caps(1 << 20, 10), &mut plain).unwrap();
+        let without = write_manifest(&c, "hub-a", None, &reader(), caps(1 << 20, 10), &mut plain).unwrap();
         assert_eq!(without.fingerprint, stats.fingerprint);
     }
 
     #[test]
     fn a_tampered_payload_under_its_old_entry_hash_is_reported() {
         let c = db();
-        let hash = ua_store::ledger::compute_entry_hash(
-            None,
+        let hash = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
             "01B",
             "agent.x",
             "{\"n\":1}",
@@ -1741,20 +1967,314 @@ mod tests {
             None,
         );
         c.execute(
-            "INSERT INTO event_log (ulid, channel, payload, created_at, entry_hash) VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1)",
-            [&hash],
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01B', 'agent.x', '{\"n\":1}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &hash],
         )
         .unwrap();
         let summary = |c: &Connection| event_log_summary(c).unwrap();
         let before = summary(&c);
         assert_eq!(before["chain_ok"], true);
         assert_eq!(before["entry_hash_mismatches"], 0);
+        assert!(before.get("first_bad_seq").is_none());
+        assert!(before.get("chain_error").is_none());
         // Rewrite the payload and keep the stored entry_hash.
+        c.execute_batch("DROP TRIGGER event_log_no_update;").unwrap();
         c.execute("UPDATE event_log SET payload = '{\"n\":2}' WHERE ulid = '01B'", []).unwrap();
         let after = summary(&c);
         assert_eq!(after["chain_ok"], false);
         assert_eq!(after["entry_hash_mismatches"], 1);
+        assert_eq!(after["first_bad_seq"], 1);
+        assert!(after["chain_error"].as_str().is_some_and(|s| s.contains("entry_hash")));
         assert_ne!(after["rolling_hash"], before["rolling_hash"]);
         assert_eq!(after["count"], before["count"]);
+    }
+
+    #[test]
+    fn missing_event_log_summarises_gracefully() {
+        let c = Connection::open_in_memory().unwrap();
+        let s = event_log_summary(&c).unwrap();
+        let mut keys: Vec<&str> = s.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["chain_ok", "count", "entry_hash_mismatches", "first_ulid", "last_ulid", "rolling_hash"]
+        );
+        assert_eq!(s["chain_ok"], true);
+        assert_eq!(s["count"], 0);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+        assert_eq!(s["first_ulid"], Value::Null);
+        assert_eq!(s["last_ulid"], Value::Null);
+        assert_eq!(s["rolling_hash"], hex::encode(Sha256::digest(b"")));
+    }
+
+    #[test]
+    fn deleted_middle_row_breaks_chain_ok() {
+        let c = db();
+        insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        assert_eq!(event_log_summary(&c).unwrap()["chain_ok"], true);
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01B'", []).unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+        assert_eq!(s["count"], 2);
+        assert_eq!(s["first_bad_seq"], 3);
+        assert!(s["chain_error"].as_str().is_some_and(|m| m.contains("prev_hash")));
+    }
+
+    #[test]
+    fn seq_inversion_breaks_chain_ok_but_ulid_inversion_does_not() {
+        // Case 1: ulid order is valid, but seq order is inverted (ledger::verify fails).
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h2 = ledger::compute_entry_hash(Some(&h1), "01B", "b", "{}", None, None, None, "t1", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01B', 'b', '{}', 't1', ?1, ?2), (2, '01A', 'a', '{}', 't0', ?3, ?1)",
+            rusqlite::params![&h1, &h2, ledger::GENESIS_HASH],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+
+        // Case 2: seq order is valid (ledger::verify passes), but ulid order is inverted.
+        // The Python hub minted ULIDs outside the write lock, so an inverted ulid order is
+        // not a broken chain: only seq order carries linkage.
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01B",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h2 = ledger::compute_entry_hash(Some(&h1), "01A", "b", "{}", None, None, None, "t1", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01B', 'a', '{}', 't0', ?1, ?2), (2, '01A', 'b', '{}', 't1', ?2, ?3)",
+            rusqlite::params![ledger::GENESIS_HASH, &h1, &h2],
+        )
+        .unwrap();
+        assert!(ledger::verify(&c).unwrap().ok);
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], true);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn hashless_row_after_hashed_row_breaks_chain_ok() {
+        // Case 1: unhashed row appears in the middle (caught by both seq and ulid checks).
+        let c = db();
+        let h1 = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t0",
+            None,
+        );
+        let h3 = ledger::compute_entry_hash(Some(&h1), "01C", "c", "{}", None, None, None, "t2", None);
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01A', 'a', '{}', 't0', ?1, ?2),
+                    (2, '01B', 'b', '{}', 't1', NULL, NULL),
+                    (3, '01C', 'c', '{}', 't2', ?2, ?3)",
+            rusqlite::params![ledger::GENESIS_HASH, &h1, &h3],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn legacy_prefix_row_with_a_later_ulid_is_ok() {
+        // seq=1 is a NULL legacy prefix (ledger::verify passes), but its ulid '01Z'
+        // sorts after seq=2's hashed '01A'. Ulid order is not checked for linkage.
+        let c = db();
+        let h = ledger::compute_entry_hash(
+            Some(ledger::GENESIS_HASH),
+            "01A",
+            "a",
+            "{}",
+            None,
+            None,
+            None,
+            "t1",
+            None,
+        );
+        c.execute(
+            "INSERT INTO event_log (seq, ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES (1, '01Z', 'legacy', '{}', 't0', NULL, NULL),
+                    (2, '01A', 'a', '{}', 't1', ?1, ?2)",
+            rusqlite::params![ledger::GENESIS_HASH, &h],
+        )
+        .unwrap();
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '1')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        assert!(ledger::verify(&c).unwrap().ok);
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], true);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn deleted_first_hashed_row_breaks_chain_ok() {
+        let c = db();
+        insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        assert_eq!(event_log_summary(&c).unwrap()["chain_ok"], true);
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01A'", []).unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 0);
+    }
+
+    #[test]
+    fn truncated_or_rewritten_tail_keeps_chain_ok_without_an_anchor() {
+        // The summary records count, the ulid range and the rolling hash, not the head
+        // entry_hash, so chain_ok alone cannot see a missing or rewritten tail; only
+        // comparing the summary against an earlier manifest catches it.
+        let c = db();
+        let hashes = insert_chained(
+            &c,
+            &[("01A", "a", "{}", "t0"), ("01B", "b", "{}", "t1"), ("01C", "c", "{}", "t2")],
+            ledger::GENESIS_HASH,
+        );
+        let before = event_log_summary(&c).unwrap();
+        assert_eq!(before["chain_ok"], true);
+
+        // A truncated tail.
+        c.execute_batch("DROP TRIGGER event_log_no_delete;").unwrap();
+        c.execute("DELETE FROM event_log WHERE ulid = '01C'", []).unwrap();
+        let truncated = event_log_summary(&c).unwrap();
+        assert_eq!(truncated["chain_ok"], true);
+        assert_eq!(truncated["count"], 2);
+        assert_eq!(truncated["last_ulid"], "01B");
+        assert_ne!(truncated["rolling_hash"], before["rolling_hash"]);
+
+        // A rewritten tail: a different valid row chained from 01B's entry_hash.
+        insert_chained(&c, &[("01D", "d", "{}", "t3")], &hashes[1]);
+        let rewritten = event_log_summary(&c).unwrap();
+        assert_eq!(rewritten["chain_ok"], true);
+        assert_ne!(rewritten["rolling_hash"], before["rolling_hash"]);
+    }
+
+    #[test]
+    fn blank_entry_hash_increments_mismatches_and_keeps_rolling_hash_parity() {
+        let c = db();
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01A', 'agent.x', '{}', 't0', ?1, '')",
+            [ledger::GENESIS_HASH],
+        )
+        .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert_eq!(s["entry_hash_mismatches"], 1);
+        let row = json!({
+            "ulid": "01A",
+            "channel": "agent.x",
+            "payload": "{}",
+            "originator": null,
+            "episode_id": null,
+            "causal_parent_id": null,
+            "created_at": "t0",
+        });
+        let expected = hex::encode(Sha256::digest(format!("{}\n", py_dumps(&row, None)).as_bytes()));
+        assert_eq!(s["rolling_hash"], expected);
+    }
+
+    #[test]
+    fn unrecorded_vs_recorded_legacy_prefix() {
+        let c = db();
+        c.execute(
+            "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash)
+             VALUES ('01A', 'legacy', '{}', 't0', NULL, NULL),
+                    ('01B', 'legacy', '{}', 't1', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        insert_chained(&c, &[("01C", "a", "{}", "t2"), ("01D", "b", "{}", "t3")], ledger::GENESIS_HASH);
+        let unrecorded = event_log_summary(&c).unwrap();
+        assert_eq!(unrecorded["chain_ok"], false);
+        assert_eq!(unrecorded["entry_hash_mismatches"], 0);
+        assert_eq!(unrecorded["first_bad_seq"], 1);
+        assert!(unrecorded["chain_error"].as_str().is_some_and(|s| s.contains("legacy prefix")));
+
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '2')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        let recorded = event_log_summary(&c).unwrap();
+        assert_eq!(recorded["chain_ok"], true);
+        assert_eq!(recorded["entry_hash_mismatches"], 0);
+        assert_eq!(recorded["count"], 4);
+        assert!(recorded.get("first_bad_seq").is_none());
+        assert!(recorded.get("chain_error").is_none());
+    }
+
+    #[test]
+    fn event_log_of_validates_break_fields_and_missing_legacy_prefix_omits_first_bad_seq() {
+        let c = db();
+        insert_chained(&c, &[("01A", "a", "{}", "t0")], ledger::GENESIS_HASH);
+        c.execute("INSERT INTO ledger_meta (key, value) VALUES (?1, '2')", [ledger::LEGACY_PREFIX_KEY])
+            .unwrap();
+        let s = event_log_summary(&c).unwrap();
+        assert_eq!(s["chain_ok"], false);
+        assert!(s.get("first_bad_seq").is_none());
+        assert!(s["chain_error"].as_str().is_some_and(|m| m.contains("legacy prefix")));
+
+        let base = json!({
+            "event_log": {
+                "count": 1,
+                "first_ulid": "01A",
+                "last_ulid": "01A",
+                "rolling_hash": "0".repeat(64),
+                "chain_ok": false,
+                "first_bad_seq": null,
+                "chain_error": null,
+            }
+        });
+        let parsed = event_log_of("left", &base).unwrap().unwrap();
+        assert_eq!(parsed.first_bad_seq, None);
+        assert_eq!(parsed.chain_error, None);
+
+        let mut bad_seq = base.clone();
+        bad_seq["event_log"]["first_bad_seq"] = json!("not-an-int");
+        assert!(event_log_of("left", &bad_seq).unwrap_err().to_string().contains("first_bad_seq"));
+
+        let mut bad_float = base.clone();
+        bad_float["event_log"]["first_bad_seq"] = json!(1.5);
+        assert!(event_log_of("left", &bad_float).unwrap_err().to_string().contains("first_bad_seq"));
+
+        let mut bad_err = base;
+        bad_err["event_log"]["chain_error"] = json!(42);
+        assert!(event_log_of("right", &bad_err).unwrap_err().to_string().contains("chain_error"));
     }
 }

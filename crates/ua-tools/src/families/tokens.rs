@@ -31,6 +31,7 @@ use ua_store::{EventInput, SchemaPart, ledger};
 
 use crate::approvals::{self, GateOutcome};
 use crate::families::managed_secrets::config_fingerprint;
+use crate::families::plans::ledger_text;
 use crate::registry::{Registry, ToolCtx, tool};
 
 pub const OAUTH_SCHEMA: SchemaPart = SchemaPart {
@@ -154,6 +155,58 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 /// SHA-256 hex digest: how every credential in this family is stored.
 pub fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// The identity a presented managed token resolves to: its agent label and
+/// organization (`agent_tokens.org_id`), when the token is active and
+/// unexpired. A token whose organization disagrees with its agent's
+/// (`agents.org_id`) is refused (`None`): an agent belongs to exactly one
+/// organization, and a token never authenticates it into another.
+pub fn resolve_managed_token(
+    c: &rusqlite::Connection,
+    reserved: &crate::families::agents::Reserved,
+    presented: &str,
+) -> UaResult<Option<(String, String)>> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT agent_label, org_id FROM agent_tokens WHERE token_hash = ?1 AND status = 'active' \
+             AND (expires_at IS NULL OR expires_at > ?2)",
+            params![digest(presented), ua_core::time::now()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((label, org)) = row else { return Ok(None) };
+    if crate::families::agents::label_org(c, reserved, &label)?.is_some_and(|held| held != org) {
+        tracing::warn!("a managed token's organization disagrees with its agent's; the token is refused");
+        return Ok(None);
+    }
+    Ok(Some((label, org)))
+}
+
+/// Whether `label`, presented by a credential that always resolves to the
+/// default organization (a static configuration token, an OAuth grant, a
+/// Control Center or Slack human), is held by another organization: such a
+/// credential is refused, so the hub's configuration never authenticates
+/// into another organization.
+///
+/// A configuration-reserved label ([`crate::families::agents::Reserved`]) is
+/// always the default organization's, so the default credential for it
+/// always **authenticates**, and no writer lets another organization
+/// register, bind or hold a token for such a label. A row of another
+/// organization that predates the reservation is not harmless, though: its
+/// managed tokens and session credentials are refused and its own writers
+/// are refused as a taken label, but `agents.label` is the table's key, so
+/// while the row exists the default credential cannot record anything for
+/// the label either (`session_start` is refused `agent_label_blocked`, and
+/// `agent_heartbeat` answers `recorded: false`). A default-organization
+/// lifecycle operator removes it with hub recovery (`agent_retire`, then
+/// `agent_forget`, both with `any_org=true`).
+pub fn held_outside_default(
+    c: &rusqlite::Connection,
+    reserved: &crate::families::agents::Reserved,
+    label: &str,
+) -> UaResult<bool> {
+    crate::families::agents::foreign_label(c, reserved, ua_core::DEFAULT_ORG, label)
 }
 
 /// Minimum length of a caller-supplied agent token.
@@ -287,8 +340,14 @@ fn default_action() -> String {
     "list".into()
 }
 
+/// Insert a managed token for `label`, an agent of organization `org`. A
+/// label another organization's agent holds is refused (the token would
+/// authenticate into the wrong organization), before anything is written.
+#[allow(clippy::too_many_arguments)]
 fn insert_token(
     tx: &rusqlite::Transaction<'_>,
+    reserved: &crate::families::agents::Reserved,
+    org: &str,
     label: &str,
     hash: &str,
     expires: Option<&str>,
@@ -296,6 +355,8 @@ fn insert_token(
     note: Option<&str>,
     rotated_from: Option<i64>,
 ) -> UaResult<(i64, String)> {
+    crate::families::agents::require_org(tx, org)?;
+    crate::families::agents::require_label_free(tx, reserved, org, label)?;
     let now = ua_core::time::now();
     let dup: bool = tx
         .query_row("SELECT 1 FROM agent_tokens WHERE token_hash = ?1", [hash], |_| Ok(true))
@@ -305,9 +366,9 @@ fn insert_token(
         return Err(UaError::conflict("that token value is already registered; choose a new one"));
     }
     tx.execute(
-        "INSERT INTO agent_tokens (agent_label, token_hash, issued_at, expires_at, rotated_from, issued_by, note) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![label, hash, now, expires, rotated_from, by, note],
+        "INSERT INTO agent_tokens (org_id, agent_label, token_hash, issued_at, expires_at, rotated_from, \
+         issued_by, note) VALUES (?8, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![label, hash, now, expires, rotated_from, by, note, org],
     )?;
     Ok((tx.last_insert_rowid(), now))
 }
@@ -322,15 +383,29 @@ async fn issue(ctx: ToolCtx, a: IssueArgs) -> UaResult<Value> {
     let hash = digest(&a.value);
     let expires = expires_at(a.ttl_days)?;
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let (id, issued_at) =
-                insert_token(tx, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), None)?;
-            ledger::append(
+            let (id, issued_at) = insert_token(
                 tx,
-                EventInput::new("agent.token.issued", json!({ "agent": label, "token_id": id }))
-                    .by(by.clone()),
+                &reserved,
+                &org,
+                &label,
+                &hash,
+                expires.as_deref(),
+                &by,
+                a.note.as_deref(),
+                None,
+            )?;
+            crate::families::agents::emit(
+                tx,
+                &org,
+                "agent.token.issued",
+                json!({ "agent": ledger_text(&org, &label), "token_id": id }),
+                &by,
+                None,
             )?;
             Ok(json!({
                 "ok": true,
@@ -354,32 +429,34 @@ async fn rotate(ctx: ToolCtx, a: RotateArgs) -> UaResult<Value> {
     let hash = digest(&a.new_value);
     let expires = expires_at(a.ttl_days)?;
     let by = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             let previous: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' \
+                    "SELECT id FROM agent_tokens WHERE org_id = ?2 AND agent_label = ?1 AND status = 'active' \
                      ORDER BY issued_at DESC, id DESC LIMIT 1",
-                    [&label],
+                    [&label, &org],
                     |r| r.get(0),
                 )
                 .optional()?;
             let (id, issued_at) =
-                insert_token(tx, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), previous)?;
+                insert_token(tx, &reserved, &org, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), previous)?;
             if let Some(prev) = previous {
                 tx.execute(
-                    "UPDATE agent_tokens SET status = 'rotated', rotated_at = ?2 WHERE id = ?1",
-                    params![prev, issued_at],
+                    "UPDATE agent_tokens SET status = 'rotated', rotated_at = ?2 WHERE id = ?1 AND org_id = ?3",
+                    params![prev, issued_at, org],
                 )?;
             }
-            ledger::append(
+            crate::families::agents::emit(
                 tx,
-                EventInput::new(
-                    "agent.token.rotated",
-                    json!({ "agent": label, "previous_token_id": previous, "new_token_id": id }),
-                )
-                .by(by.clone()),
+                &org,
+                "agent.token.rotated",
+                json!({ "agent": ledger_text(&org, &label), "previous_token_id": previous, "new_token_id": id }),
+                &by,
+                None,
             )?;
             Ok(json!({
                 "ok": true,
@@ -401,15 +478,17 @@ async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     {
         return Err(UaError::invalid(format!("status must be one of {}", STATUSES.join(", "))));
     }
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT * FROM agent_tokens WHERE (?1 IS NULL OR agent_label = ?1) AND (?2 IS NULL OR status = ?2) \
-                 ORDER BY issued_at DESC, id DESC",
+                "SELECT * FROM agent_tokens WHERE org_id = ?3 AND (?1 IS NULL OR agent_label = ?1) \
+                 AND (?2 IS NULL OR status = ?2) ORDER BY issued_at DESC, id DESC",
             )?;
-            let rows: Vec<Value> =
-                stmt.query_map(params![a.agent_label, a.status], token_row)?.collect::<Result<_, _>>()?;
+            let rows: Vec<Value> = stmt
+                .query_map(params![a.agent_label, a.status, org], token_row)?
+                .collect::<Result<_, _>>()?;
             Ok(json!({ "count": rows.len(), "tokens": rows }))
         })
         .await
@@ -460,7 +539,7 @@ pub fn revoke_family(tx: &rusqlite::Transaction<'_>, family_id: &str, reason: &s
 }
 
 async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
-    match a.action.trim() {
+    match crate::routes::action_of("oauth_device_manage", Some(&a.action))? {
         "list" => {
             let sessions = ctx.hub.db().read_async(list_oauth_sessions).await?;
             Ok(json!({
@@ -516,7 +595,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                     }
                     ledger::append(
                         tx,
-                        EventInput::new(
+                        EventInput::new(ua_core::DEFAULT_ORG,
                             "agent.oauth.sessions_revoked",
                             json!({ "session_id": session_id, "identity": identity, "sessions": families.len() }),
                         )
@@ -531,7 +610,7 @@ async fn device_manage(ctx: ToolCtx, a: DeviceArgs) -> UaResult<Value> {
                 })
                 .await
         }
-        other => Err(UaError::invalid(format!("action must be list or revoke, not {other:?}"))),
+        other => Err(crate::routes::unhandled("oauth_device_manage", other)),
     }
 }
 

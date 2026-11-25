@@ -11,6 +11,12 @@ stored only as a SHA-256 digest, and every comparison is constant time.
 | Browser session cookie (`ua_session`) | humans in the Control Center | `/ui`, `/api` only, **never `/mcp`** | `ui_sessions` (digest) |
 | Session credential (`uas_…`) | the ACP session a node runs for one claimed item | `/mcp`, `/api/tools`, `/api/whoami` only | `session_credentials` (digest) |
 
+Two routes take no credential and authenticate each request by an HMAC
+signature over its body instead: `POST /api/github/webhook`
+([github.md](github.md#security-model)) and, only when `slack_enabled` is on
+and `UA_SLACK_SIGNING_SECRET` is set, `POST /api/slack/commands` and
+`POST /api/slack/events` ([slack.md](slack.md)).
+
 The auth middleware (`crates/ua-server/src/auth.rs`) checks a `uas_` bearer
 only as a session credential (below). It tries any other bearer token
 first, then (for `/ui` and `/api` only) the session cookie. With
@@ -18,11 +24,51 @@ first, then (for `/ui` and `/api` only) the session cookie. With
 redirected to `/login?next=...` instead). With `enforce_auth` off, a request
 with no credential runs as the local anonymous identity, as stdio does.
 
+### With auth enforcement off
+
+A caller with no verified identity (a stdio process, or an HTTP request when
+`enforce_auth` is off) has the full tool surface. Run a hub this way only
+where every process that can reach it is trusted: `ua doctor` fails a
+non-loopback bind without enforced auth.
+
+There is no identity to scope a read by, so mailboxes and conversations are
+a **message board**:
+
+- **Reads.** Such a caller may read every mailbox (`message_list`,
+  `message_inbox` with `to_agent`) and where any conversation was handed off
+  (`conversation_handoffs`). This is a read grant only. It never counts as
+  operator, lifecycle or human authority, so it approves nothing and
+  administers nothing.
+- **Read state belongs to the mailbox's owner.** A caller started with its
+  own label (`--label`, `UA_AGENT_LABEL`) marks and acknowledges only that
+  label's mail. On another mailbox `message_inbox` lists without marking
+  anything read (the result says so in `read_state`), and `message_ack` or a
+  `session_id` is refused. A caller with only the shared `local` label (an
+  HTTP request, or stdio with no label) has no mailbox of its own: it acts
+  as the mailbox it names, as before.
+- **Senders are claims.** An unverified sender may give any `from_agent`.
+  Every message records `sender_verified`; `false` means the label is only
+  what the caller said. Message bodies are marked untrusted as always.
+- **Wider exposure.** Every agent on such a hub can read text addressed to
+  any other, so a message written to mislead one agent is visible to all of
+  them. Treat message text as data.
+
+With `enforce_auth` on, none of this applies to HTTP requests: a caller
+reads its own mailbox, and reading every mailbox or conversation needs a
+verified human. A stdio MCP process or a local CLI call does not
+authenticate, so these rules apply to it whatever `enforce_auth` says. The
+one exception is a CLI `--label` that names a configured human identity and
+is confirmed on an interactive terminal: that caller acts as the human.
+
 A 401 carries an RFC 9728 challenge when OAuth is on:
 
 ```
 WWW-Authenticate: Bearer realm="ua", resource_metadata="https://hub.example.com/.well-known/oauth-protected-resource/mcp", scope="mcp", error="invalid_token"
 ```
+
+That is a build with the `mcp-server` cargo feature (the default). Without
+it there is no `/mcp`, and `resource_metadata` points at the hub's document,
+`/.well-known/oauth-protected-resource`.
 
 ## Settings
 
@@ -101,7 +147,7 @@ Code: `crates/ua-server/src/oauth/`. It follows the MCP authorization spec
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the MCP endpoint (`resource` = `<public_url>/mcp`). |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the MCP endpoint (`resource` = `<public_url>/mcp`). Served only with the `mcp-server` feature (the default). |
 | `GET /.well-known/oauth-protected-resource` | Metadata for the whole hub (`resource` = `<public_url>`). |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata. |
 | `GET /oauth/authorize` | Authorization request; renders the consent page for a signed-in human. |
@@ -128,7 +174,10 @@ Rules the server enforces:
 - **Resource indicators** (RFC 8707). `resource` may be omitted (the token is
   for `/mcp`), `<public_url>/mcp`, or `<public_url>` (valid on `/mcp` and
   `/api`). Anything else is `invalid_target`. The bearer check enforces the
-  audience.
+  audience. In a build without the `mcp-server` feature there is no `/mcp`:
+  an omitted `resource` gives a hub-wide token (`<public_url>`), and
+  `<public_url>/mcp` is `invalid_target`. The consent page names the
+  resource the grant reaches.
 - **Consent needs a signed-in human.** Without a session the browser goes to
   `/login?next=...` and comes back. The human picks one of
   `oauth_identities`; the grant acts as that identity under its profile

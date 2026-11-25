@@ -14,7 +14,9 @@
 //! (with their hashes), the task row, its approvals and delegations, and the
 //! tool calls its participants made inside the task's lifetime, plus the
 //! ledger's chain verification. Tool calls carry no task id, so they are
-//! attributed by window and caller, and labelled as such.
+//! attributed by window and caller, and labelled as such. A reader who may
+//! read every mailbox counts every participant's calls; anyone else counts
+//! only their own, so another agent's private activity stays invisible.
 //!
 //! An `sdk.` event is whatever its client wrote, `task_id` included, so it
 //! never attributes a task, makes a participant or counts as proof. Events
@@ -31,14 +33,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{ActorKind, UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
+use crate::families::events::{EventReader, VISIBLE_EVENT};
 use crate::families::injection::mark_untrusted;
 use crate::families::observability::{normalize_since, normalize_until};
 use crate::families::plans::row_map;
@@ -199,11 +201,17 @@ fn proof(task: &Map<String, Value>, events: &[Value], chain_ok: bool) -> Value {
 }
 
 /// Rows of `sql` with one bound list of task ids, grouped by the first column.
-fn grouped(c: &Connection, sql: &str, ids: &[i64]) -> UaResult<BTreeMap<i64, Vec<Map<String, Value>>>> {
+fn grouped(
+    c: &Connection,
+    sql: &str,
+    ids: &[i64],
+    extra: &[&dyn ToSql],
+) -> UaResult<BTreeMap<i64, Vec<Map<String, Value>>>> {
     let marks = vec!["?"; ids.len()].join(",");
     let sql = sql.replace("{ids}", &marks);
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(ids.iter()), row_map)?;
+    let params = ids.iter().map(|id| id as &dyn ToSql).chain(extra.iter().copied());
+    let rows = stmt.query_map(params_from_iter(params), row_map)?;
     let mut out: BTreeMap<i64, Vec<Map<String, Value>>> = BTreeMap::new();
     for row in rows {
         let mut m = row?;
@@ -213,20 +221,37 @@ fn grouped(c: &Connection, sql: &str, ids: &[i64]) -> UaResult<BTreeMap<i64, Vec
     Ok(out)
 }
 
-fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, until: &str) -> UaResult<Value> {
-    if callers.is_empty() {
+/// Governed-call counts for `callers` in the window, in the reader's
+/// organization only (another organization's calls never count, whatever
+/// their caller label). A mail-unrestricted reader counts every
+/// participant's calls (`scope: "all"`); anyone else counts only their own
+/// (`scope: "own_calls"`), so another agent's private activity never moves
+/// the numbers. `callers` still lists the participants.
+fn tool_call_window(
+    c: &Connection,
+    reader: &EventReader,
+    callers: &BTreeSet<String>,
+    since: &str,
+    until: &str,
+) -> UaResult<Value> {
+    let scope = if reader.unrestricted() { "all" } else { "own_calls" };
+    let counted: Vec<&String> = callers.iter().filter(|l| reader.counts_calls_of(l)).collect();
+    if counted.is_empty() {
         return Ok(json!({
             "attribution": "caller_and_window",
             "window": { "since": since, "until": until },
-            "callers": [], "total": 0, "errors": 0, "by_tool": {},
+            "callers": callers, "counted_callers": [], "scope": scope,
+            "total": 0, "errors": 0, "by_tool": {},
         }));
     }
-    let marks = vec!["?"; callers.len()].join(",");
+    let marks = vec!["?"; counted.len()].join(",");
     let sql = format!(
         "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
-         WHERE caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 GROUP BY tool ORDER BY tool"
+         WHERE org_id = ? AND caller IN ({marks}) AND started_at >= ? AND started_at <= ? AND page = 0 \
+         GROUP BY tool ORDER BY tool"
     );
-    let mut args: Vec<String> = callers.iter().cloned().collect();
+    let mut args: Vec<String> = vec![reader.org().to_string()];
+    args.extend(counted.iter().map(|l| (*l).clone()));
     args.push(since.to_string());
     args.push(until.to_string());
     let mut stmt = c.prepare(&sql)?;
@@ -245,6 +270,8 @@ fn tool_call_window(c: &Connection, callers: &BTreeSet<String>, since: &str, unt
         "attribution": "caller_and_window",
         "window": { "since": since, "until": until },
         "callers": callers,
+        "counted_callers": counted,
+        "scope": scope,
         "total": total,
         "errors": errors,
         "by_tool": by_tool,
@@ -285,8 +312,10 @@ fn client_asserted(rows: &[Map<String, Value>]) -> Value {
 fn build_report(
     c: &Connection,
     a: &ReportArgs,
+    org: &str,
     caller_label: &str,
     verified_caller: bool,
+    reader: &EventReader,
 ) -> UaResult<Value> {
     let since = a.since.as_deref().map(|s| normalize_since("since", s)).transpose()?;
     let until = a.until.as_deref().map(|s| normalize_until("until", s)).transpose()?;
@@ -304,8 +333,13 @@ fn build_report(
     let chain_ok = chain["verified"].as_bool().unwrap_or(false);
 
     if let Some(pid) = a.project_id {
-        let notes: Option<Option<String>> =
-            c.query_row("SELECT notes FROM tasks WHERE id = ?1", [pid], |r| r.get(0)).optional()?;
+        let notes: Option<Option<String>> = c
+            .query_row(
+                "SELECT notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+                rusqlite::params![org, pid],
+                |r| r.get(0),
+            )
+            .optional()?;
         let Some(notes) = notes else { return Err(UaError::not_found(format!("no task with id {pid}"))) };
         if !has_project_marker(notes.as_deref().unwrap_or("")) {
             return Err(UaError::invalid(format!("task {pid} does not carry [project-spec]")));
@@ -313,38 +347,45 @@ fn build_report(
     }
 
     let mut sql = String::new();
-    let mut args: Vec<SqlValue> = Vec::new();
-    if let Some(pid) = a.project_id {
+    let mut args: Vec<&dyn ToSql> = Vec::new();
+    let visibility = reader.bindings();
+    let claimed_by_marker = a.agent.as_ref().map(|agent| format!("claimed-by: {agent}"));
+    // Only the reader's organization's tasks.
+    let org_s = org.to_string();
+    if let Some(pid) = &a.project_id {
         sql.push_str(
-            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks WHERE id = ? \
+            "WITH RECURSIVE sub(id, depth, path) AS (SELECT id, 0, printf('%020d', id) FROM tasks \
+             WHERE id = ? AND org_id = ? \
              UNION ALL SELECT t.id, s.depth + 1, s.path || '.' || printf('%020d', t.id) \
-             FROM tasks t JOIN sub s ON t.parent_id = s.id) \
-             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id WHERE 1=1",
+             FROM tasks t JOIN sub s ON t.parent_id = s.id WHERE t.org_id = ?) \
+             SELECT tasks.*, sub.depth AS project_depth FROM tasks JOIN sub ON sub.id = tasks.id \
+             WHERE tasks.org_id = ?",
         );
-        args.push(SqlValue::Integer(pid));
+        args.extend([pid as &dyn ToSql, &org_s, &org_s, &org_s]);
     } else {
-        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE 1=1");
+        sql.push_str("SELECT tasks.*, NULL AS project_depth FROM tasks WHERE tasks.org_id = ?");
+        args.push(&org_s);
     }
     if a.item.is_some() {
         sql.push_str(" AND 0");
     }
-    if let Some(t) = a.task_id {
+    if let Some(t) = &a.task_id {
         sql.push_str(" AND tasks.id = ?");
-        args.push(SqlValue::Integer(t));
+        args.push(t);
     }
-    if let Some(p) = a.project.as_deref() {
+    if let Some(p) = &a.project {
         sql.push_str(" AND tasks.project = ?");
-        args.push(SqlValue::Text(p.to_string()));
+        args.push(p);
     }
-    if let Some(agent) = a.agent.as_deref() {
-        sql.push_str(
+    if let Some(agent) = &a.agent {
+        sql.push_str(&format!(
             " AND (tasks.claimed_by = ? OR instr(COALESCE(tasks.notes, ''), ?) > 0 OR EXISTS (\
-             SELECT 1 FROM event_log e WHERE e.originator = ? AND NOT (e.channel >= 'sdk.' AND e.channel < 'sdk/') \
-             AND json_valid(e.payload) AND CAST(json_extract(e.payload, '$.task_id') AS INTEGER) = tasks.id))",
-        );
-        args.push(SqlValue::Text(agent.to_string()));
-        args.push(SqlValue::Text(format!("claimed-by: {agent}")));
-        args.push(SqlValue::Text(agent.to_string()));
+             SELECT 1 FROM event_log WHERE originator = ? AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
+             AND json_valid(payload) AND CAST(json_extract(payload, '$.task_id') AS INTEGER) = tasks.id \
+             AND ({VISIBLE_EVENT})))",
+        ));
+        args.extend([agent as &dyn ToSql, &claimed_by_marker, agent]);
+        args.extend(visibility);
     }
     if since.is_some() || until.is_some() {
         let mut clauses = Vec::new();
@@ -352,27 +393,32 @@ fn build_report(
             let mut parts = vec![format!("tasks.{col} IS NOT NULL")];
             if let Some(s) = &since {
                 parts.push(format!("tasks.{col} >= ?"));
-                args.push(SqlValue::Text(s.clone()));
+                args.push(s);
             }
             if let Some(u) = &until {
                 parts.push(format!("tasks.{col} <= ?"));
-                args.push(SqlValue::Text(u.clone()));
+                args.push(u);
             }
             clauses.push(format!("({})", parts.join(" AND ")));
         }
         sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
     }
-    if let Some(pr) = a.pr.as_deref() {
+    if let Some(pr) = &a.pr {
         sql.push_str(" AND (instr(COALESCE(tasks.evidence_ref, ''), ?) > 0 OR instr(COALESCE(tasks.notes, ''), ?) > 0)");
-        args.push(SqlValue::Text(pr.to_string()));
-        args.push(SqlValue::Text(pr.to_string()));
+        args.extend([pr as &dyn ToSql, pr]);
     }
     sql.push_str(if a.project_id.is_some() { " ORDER BY sub.path" } else { " ORDER BY tasks.id DESC" });
     sql.push_str(&format!(" LIMIT {}", limit + 1));
 
     let mut tasks: Vec<Map<String, Value>> = {
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args.iter()), row_map)?;
+        // A task row keeps the shape it had before tasks carried `org_id`.
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            row_map(r).map(|mut m| {
+                m.remove("org_id");
+                m
+            })
+        })?;
         rows.collect::<Result<_, _>>()?
     };
     let truncated = tasks.len() as i64 > limit;
@@ -385,11 +431,15 @@ fn build_report(
         (
             grouped(
                 c,
-                "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
-                 originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
-                 AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
-                 AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({ids}) ORDER BY seq",
+                &format!(
+                    "SELECT CAST(json_extract(payload, '$.task_id') AS INTEGER) AS _task, seq, ulid, channel, \
+                     originator, created_at, prev_hash, entry_hash FROM event_log WHERE json_valid(payload) \
+                     AND NOT (channel >= 'sdk.' AND channel < 'sdk/') \
+                     AND CAST(json_extract(payload, '$.task_id') AS INTEGER) IN ({{ids}}) \
+                     AND ({VISIBLE_EVENT}) ORDER BY seq"
+                ),
                 &ids,
+                &visibility,
             )?,
             grouped(
                 c,
@@ -402,20 +452,25 @@ fn build_report(
                      ORDER BY seq"
                 ),
                 &ids,
+                &[],
             )?,
             grouped(
                 c,
                 "SELECT CAST(COALESCE(json_extract(payload, '$.task_id'), json_extract(payload, '$.parent_task_id')) \
                  AS INTEGER) AS _task, id, tool, status, requested_by, resolved_by, reason, created_at, resolved_at \
                  FROM approvals WHERE json_valid(payload) AND CAST(COALESCE(json_extract(payload, '$.task_id'), \
-                 json_extract(payload, '$.parent_task_id')) AS INTEGER) IN ({ids}) ORDER BY id",
+                 json_extract(payload, '$.parent_task_id')) AS INTEGER) IN ({ids}) AND org_id = ? ORDER BY id",
                 &ids,
+                // Only the reader's organization's approvals.
+                &[&org],
             )?,
             grouped(
                 c,
                 "SELECT task_id AS _task, id, from_agent, to_agent, status, created_at, completed_at \
-                 FROM delegations WHERE task_id IN ({ids}) ORDER BY id",
+                 FROM delegations WHERE task_id IN ({ids}) AND org_id = ? ORDER BY id",
                 &ids,
+                // Only the reader's organization's delegations.
+                &[&org],
             )?,
         )
     };
@@ -455,7 +510,7 @@ fn build_report(
         }
         let window_since = s("created_at").unwrap_or_default();
         let window_until = s("completed_at").unwrap_or_else(|| now.clone());
-        let calls = tool_call_window(c, &participants, &window_since, &window_until)?;
+        let calls = tool_call_window(c, reader, &participants, &window_since, &window_until)?;
 
         let human = apps
             .iter()
@@ -572,7 +627,9 @@ fn build_report(
 async fn evidence_report(ctx: ToolCtx, a: ReportArgs) -> UaResult<Value> {
     let label = ctx.caller.label.clone();
     let verified = matches!(ctx.caller.kind, ActorKind::Agent | ActorKind::Human);
-    ctx.hub.db().read_async(move |c| build_report(c, &a, &label, verified)).await
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| build_report(c, &a, &org, &label, verified, &reader)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -607,29 +664,82 @@ fn fts_indexes(c: &Connection) -> UaResult<Vec<FtsIndex>> {
     Ok(out)
 }
 
-fn fts_check(c: &Connection, ix: &FtsIndex) -> UaResult<Value> {
-    let count = |sql: String| -> UaResult<i64> { Ok(c.query_row(&sql, [], |r| r.get(0))?) };
+/// One index's sync state, as `org` sees it. When the mirrored table carries
+/// `org_id` (`tasks`), the counts cover only `org`'s rows, so another
+/// organization's caller learns nothing about the hub's other rows. An index
+/// row whose table row is gone has no organization left: it is counted (and
+/// so repaired) only for the default organization.
+fn fts_check(c: &Connection, ix: &FtsIndex, org: &str) -> UaResult<Value> {
+    let count = |sql: String, scoped: bool| -> UaResult<i64> {
+        Ok(if scoped {
+            c.query_row(&sql, [org], |r| r.get(0))?
+        } else {
+            c.query_row(&sql, [], |r| r.get(0))?
+        })
+    };
     let (n, t, k) = (&ix.name, &ix.content, &ix.rowid);
-    let base = count(format!("SELECT COUNT(*) FROM \"{t}\""))?;
-    let indexed = count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""))?;
-    let orphans = count(format!(
-        "SELECT COUNT(*) FROM \"{n}_docsize\" d WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
-    ))?;
-    let missing = count(format!(
-        "SELECT COUNT(*) FROM \"{t}\" b WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
-    ))?;
+    let tenant: bool = c.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{t}') WHERE name = 'org_id')"),
+        [],
+        |r| r.get(0),
+    )?;
+    let (base, indexed, missing) = if tenant {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\" WHERE org_id = ?1"), true)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                     WHERE EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id AND b.org_id = ?1)"
+                ),
+                true,
+            )?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b WHERE b.org_id = ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                true,
+            )?,
+        )
+    } else {
+        (
+            count(format!("SELECT COUNT(*) FROM \"{t}\""), false)?,
+            count(format!("SELECT COUNT(*) FROM \"{n}_docsize\""), false)?,
+            count(
+                format!(
+                    "SELECT COUNT(*) FROM \"{t}\" b \
+                     WHERE NOT EXISTS (SELECT 1 FROM \"{n}_docsize\" d WHERE d.id = b.\"{k}\")"
+                ),
+                false,
+            )?,
+        )
+    };
+    let orphans = if tenant && org != ua_core::DEFAULT_ORG {
+        0
+    } else {
+        count(
+            format!(
+                "SELECT COUNT(*) FROM \"{n}_docsize\" d \
+                 WHERE NOT EXISTS (SELECT 1 FROM \"{t}\" b WHERE b.\"{k}\" = d.id)"
+            ),
+            false,
+        )?
+    };
     Ok(json!({
         "index": n,
         "table": t,
         "table_rows": base,
-        "indexed_rows": indexed,
+        "indexed_rows": indexed + if tenant { orphans } else { 0 },
         "missing_from_index": missing,
         "orphaned_in_index": orphans,
-        "in_sync": missing == 0 && orphans == 0 && base == indexed,
+        "in_sync": missing == 0 && orphans == 0 && (tenant || base == indexed),
     }))
 }
 
-fn dangling(c: &Connection) -> UaResult<Value> {
+/// Dangling references. The memory supersede count covers only organization
+/// `org`'s notes, and a pointer counts as dangling when no note of that
+/// organization holds the id it names.
+fn dangling(c: &Connection, org: &str) -> UaResult<Value> {
     let mut by_ref: BTreeMap<String, i64> = BTreeMap::new();
     {
         let mut stmt = c.prepare("PRAGMA foreign_key_check")?;
@@ -640,9 +750,10 @@ fn dangling(c: &Connection) -> UaResult<Value> {
         }
     }
     let superseded: i64 = c.query_row(
-        "SELECT COUNT(*) FROM memory m WHERE m.superseded_by IS NOT NULL AND m.superseded_by != '' \
-         AND NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = m.superseded_by)",
-        [],
+        "SELECT COUNT(*) FROM memory m WHERE m.org_id = ?1 AND m.superseded_by IS NOT NULL \
+         AND m.superseded_by != '' \
+         AND NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = m.superseded_by AND s.org_id = m.org_id)",
+        [org],
         |r| r.get(0),
     )?;
     if superseded > 0 {
@@ -653,20 +764,23 @@ fn dangling(c: &Connection) -> UaResult<Value> {
 }
 
 async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let (fts, refs, chain, counts) = ctx
         .hub
         .db()
-        .read_async(|c| {
-            let fts: Vec<Value> = fts_indexes(c)?.iter().map(|ix| fts_check(c, ix)).collect::<UaResult<_>>()?;
+        .read_async(move |c| {
+            let fts: Vec<Value> =
+                fts_indexes(c)?.iter().map(|ix| fts_check(c, ix, &org)).collect::<UaResult<_>>()?;
             let counts: (i64, i64) = (
                 c.query_row(
-                    "SELECT COUNT(*) FROM memory WHERE id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",
-                    [],
+                    "SELECT COUNT(*) FROM memory WHERE org_id = ?1 \
+                     AND id NOT LIKE 'masterindex%' AND id NOT LIKE 'tagindex_%'",
+                    [&org],
                     |r| r.get(0),
                 )?,
-                c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM tasks WHERE org_id = ?1", [&org], |r| r.get(0))?,
             );
-            Ok((fts, dangling(c)?, chain_integrity(c)?, counts))
+            Ok((fts, dangling(c, &org)?, chain_integrity(c)?, counts))
         })
         .await?;
     let drifted: Vec<String> = fts
@@ -677,16 +791,21 @@ async fn state_sync_verify(ctx: ToolCtx, _a: VerifyArgs) -> UaResult<Value> {
     let mut resynced = false;
     if !drifted.is_empty() {
         let names = drifted.clone();
-        let by = ctx.caller.label.clone();
+        let (org, by) = (ctx.caller.org_id.clone(), ctx.caller.label.clone());
         ctx.hub
             .db()
             .write_async(move |tx| {
                 for n in &names {
                     tx.execute(&format!("INSERT INTO \"{n}\"(\"{n}\") VALUES ('rebuild')"), [])?;
                 }
-                ledger::append(
+                // ORG-EVENT-DEFAULT: written to the default organization's
+                // ledger, so another organization's caller is `system`.
+                crate::families::tasks::emit(
                     tx,
-                    EventInput::new("agent.state.resynced", json!({ "fts_indexes": names })).by(by),
+                    &org,
+                    "agent.state.resynced",
+                    json!({ "fts_indexes": names }),
+                    &by,
                 )?;
                 Ok(())
             })
@@ -826,7 +945,7 @@ async fn evidence_append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
                     ),
                 ));
             }
-            let mut input = EventInput::new(channel, payload).by(label);
+            let mut input = EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(label);
             if let Some(k) = &stored_key {
                 input = input.dedupe(k.clone());
             }
@@ -848,7 +967,8 @@ pub fn register(r: &mut Registry) {
             "evidence_report",
             "Read-only evidence for task completion: per task, the ledger events that mention it with their \
              hashes, the task row, approvals, delegations, PR/commit references, and tool-call counts by its \
-             participants inside the task's lifetime (attributed by caller and window), plus the ledger chain \
+             participants inside the task's lifetime (attributed by caller and window; a mail-unrestricted \
+             reader counts every participant, anyone else only their own calls), plus the ledger chain \
              verification. Client sdk. events never attribute a task; those naming it are listed apart under \
              client_asserted (payloads marked untrusted). project_id (a [project-spec] root) reports its \
              subtree with a project_chain. limit defaults to 50 (max 500).",

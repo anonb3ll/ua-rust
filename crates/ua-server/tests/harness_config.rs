@@ -20,6 +20,9 @@ fn config() -> Config {
     cfg.agent_tokens =
         Some(SecretString::from(format!("builder-1:{BUILDER},builder-2:{OTHER},ops-bot:{OPS}")));
     cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-bot".into()]);
+    // Harness config publish is human-only: a second human publishes and the
+    // first approves.
+    cfg.human_identities.push("operator-2".into());
     cfg
 }
 
@@ -31,6 +34,7 @@ fn as_caller(label: &str, kind: ActorKind) -> Caller {
         enforce_profile: kind != ActorKind::Human,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -51,7 +55,7 @@ async fn post(hub: &TestHub, path: &str, token: &str, body: Value) -> (StatusCod
 }
 
 async fn publish(hub: &TestHub, bundle: Value) {
-    let ops = as_caller("ops-bot", ActorKind::Agent);
+    let ops = as_caller("operator-2", ActorKind::Human);
     let args = json!({ "bundle": bundle });
     let Err(UaError::ApprovalRequired { approval_id, .. }) =
         tool(hub, &ops, "harness_config_publish", args.clone()).await
@@ -86,7 +90,7 @@ async fn a_node_pulls_reports_and_applies_its_config_over_http() {
     assert_eq!(resp.status(), StatusCode::OK);
     let got = json_body(resp).await;
     assert_eq!(got["version"], "2026.1");
-    assert_eq!(got["published_by"], "ops-bot");
+    assert_eq!(got["published_by"], "operator-2");
     assert_eq!(got["config_root_hint"], "~/.unified_agent/harness-config");
     let claude = got["rendered"]["claude"].clone();
     assert_eq!(claude["content"], "Run the tests.\n");

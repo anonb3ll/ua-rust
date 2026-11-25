@@ -22,6 +22,7 @@ fn agent(label: &str, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some(format!("{label}-key")),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -95,6 +96,26 @@ async fn doctor_reports_every_capability_without_secrets() {
     assert!(["LIVE", "DORMANT"].contains(&status("ledger_chain")));
     // No notes yet, or no embeddings feature: either way nothing to embed.
     assert_eq!(status("semantic_search"), "DORMANT");
+    // Optional Cargo features: the row and build.features follow this build.
+    let all_default = cfg!(feature = "code-intel")
+        && cfg!(feature = "readability")
+        && cfg!(feature = "mcp-gateway")
+        && cfg!(feature = "mcp-server");
+    assert_eq!(status("build_features"), if all_default { "LIVE" } else { "DORMANT" });
+    let features = &report["build"]["features"];
+    assert_eq!(features["code_intel"], cfg!(feature = "code-intel"), "{features}");
+    assert_eq!(features["readability"], cfg!(feature = "readability"), "{features}");
+    assert_eq!(features["mcp_gateway"], cfg!(feature = "mcp-gateway"), "{features}");
+    assert_eq!(features["mcp_server"], cfg!(feature = "mcp-server"), "{features}");
+    assert!(features["embeddings"].is_boolean(), "{features}");
+    let out: Vec<&str> = report["build"]["compiled_out_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(out.contains(&"fs_repo_map"), !cfg!(feature = "code-intel"), "{out:?}");
+    assert_eq!(out.contains(&"mcp_gateway"), !cfg!(feature = "mcp-gateway"), "{out:?}");
     assert_eq!(report["database"]["journal_mode"], "wal");
     assert_eq!(report["database"]["quick_check"], "ok");
 
@@ -118,6 +139,39 @@ async fn doctor_flags_a_tampered_ledger() {
 
     let anomalies = call(&reg, &hub, &who, "check_anomalies", json!({})).await;
     assert!(anomalies["anomalies"].as_array().unwrap().iter().any(|a| a["rule"] == "ledger_chain"));
+
+    // Unexpected table with no corresponding schema_parts entry degrades `schema`.
+    exec(&hub, "CREATE TABLE rogue_table (x INTEGER);");
+    let report = call(&reg, &hub, &who, "system_doctor", json!({})).await;
+    let schema_row =
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(schema_row["status"], "DEGRADED", "{schema_row}");
+
+    // Applying optional `import.v1` must stay LIVE (matching `ua doctor`) AND must NOT mask
+    // unrelated rogue tables added afterwards.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_home(dir.path());
+    std::fs::create_dir_all(cfg.workspace_root()).unwrap();
+    drop(Hub::open(cfg.clone()).unwrap());
+    let mut all_with_import = ua_tools::schema_parts();
+    all_with_import.extend(ua_tools::optional_schema_parts());
+    drop(ua_store::Db::open(&cfg.db_path(), &all_with_import).unwrap());
+    let import_hub = Hub::open(cfg).unwrap();
+
+    let clean_report = call(&reg, &import_hub, &who, "system_doctor", json!({ "refresh": true })).await;
+    let clean_schema =
+        clean_report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(clean_schema["status"], "LIVE", "{clean_schema}");
+    assert!(
+        !clean_schema["detail"].as_str().unwrap_or("").contains("another build"),
+        "import.v1 should be recognized as optional, not extra: {clean_schema}"
+    );
+
+    exec(&import_hub, "CREATE TABLE rogue_after_import (x INTEGER);");
+    let dirty_report = call(&reg, &import_hub, &who, "system_doctor", json!({ "refresh": true })).await;
+    let dirty_schema =
+        dirty_report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "schema").unwrap();
+    assert_eq!(dirty_schema["status"], "DEGRADED", "{dirty_schema}");
 }
 
 fn insert_calls(hub: &Hub, tool: &str, caller: &str, durations: &[i64], errors: usize, started_at: &str) {
@@ -142,7 +196,8 @@ fn insert_calls(hub: &Hub, tool: &str, caller: &str, durations: &[i64], errors: 
 async fn perf_summary_from_tool_calls() {
     let hub = mem_hub();
     let reg = builtin_registry();
-    let who = agent("observer-1", Profile::Developer);
+    // A local-trust reader is unrestricted: it sees every caller's rows.
+    let who = Caller::local("observer-1", Transport::Stdio);
     let durations: Vec<i64> = (1..=100).collect();
     insert_calls(&hub, "synthetic_alpha", "builder-1", &durations, 10, &ua_core::time::now());
     insert_calls(&hub, "synthetic_beta", "builder-2", &[5, 7, 9, 11], 0, &ua_core::time::now());
@@ -250,6 +305,135 @@ async fn activity_metrics_and_task_anomalies() {
 }
 
 #[tokio::test]
+async fn activity_and_metrics_hide_restricted_events_from_outsiders() {
+    let hub = mem_hub();
+    let reg = builtin_registry();
+    let (owner, peer, outsider) = (
+        agent("builder-1", Profile::Developer),
+        agent("builder-2", Profile::Developer),
+        agent("builder-3", Profile::Developer),
+    );
+    let task = call(&reg, &hub, &owner, "task_add", json!({ "title": "review" })).await["id"].clone();
+
+    // One row on each restricted channel, all originated by builder-1.
+    let conv = call(
+        &reg,
+        &hub,
+        &owner,
+        "message_send",
+        json!({ "act": "request", "to_agent": peer.label, "body": "private", "task_id": task }),
+    )
+    .await["conversation_id"]
+        .clone();
+    let sid = call(&reg, &hub, &owner, "session_start", json!({ "kind": "interactive", "task_id": task }))
+        .await["session_id"]
+        .clone();
+    let note = call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "session_handoff_propose",
+                "params": { "session_id": sid, "done": ["a"], "next_steps": ["b"] } }),
+    )
+    .await;
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "session_handoff_seal", "params": { "note_id": note["id"] } }),
+    )
+    .await;
+    call(
+        &reg,
+        &hub,
+        &owner,
+        "coordination_manage",
+        json!({ "action": "conversation_handoff", "params": { "conversation_id": conv, "task_id": task } }),
+    )
+    .await;
+
+    let restricted = ["message", "lifecycle", "conversation"];
+    let kinds = |v: &Value| -> Vec<String> {
+        v["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect()
+    };
+    let activity = json!({ "action": "activity", "params": { "agent": "builder-1" } });
+    let metrics = json!({ "action": "metrics", "params": {} });
+
+    // The outsider's activity and metrics carry none of the restricted rows.
+    let out = call(&reg, &hub, &outsider, "observability_manage", activity.clone()).await;
+    assert!(kinds(&out).iter().all(|k| !restricted.contains(&k.as_str())), "{out}");
+    let out_metrics = call(&reg, &hub, &outsider, "observability_manage", metrics.clone()).await;
+    let out_b1 = &out_metrics["events_last_7_days"]["builder-1"];
+    assert!(restricted.iter().all(|k| out_b1.get(*k).is_none()), "{out_b1}");
+
+    // A party to the rows sees them in both views.
+    let own = call(&reg, &hub, &owner, "observability_manage", activity).await;
+    for k in restricted {
+        assert!(kinds(&own).iter().any(|x| x == k), "{k} missing for the party: {own}");
+    }
+    let own_metrics = call(&reg, &hub, &owner, "observability_manage", metrics.clone()).await;
+    let own_b1 = &own_metrics["events_last_7_days"]["builder-1"];
+    for k in restricted {
+        assert!(own_b1[k].as_i64().unwrap_or(0) >= 1, "{k} missing for the party: {own_b1}");
+    }
+
+    // The message recipient is not the originator: it still sees the message
+    // row it received, and the conversation-handoff link it is a party to,
+    // but not builder-1's private handoff note.
+    let peer_view = json!({ "action": "activity", "params": { "agent": "builder-1" } });
+    let seen = call(&reg, &hub, &peer, "observability_manage", peer_view).await;
+    let seen_kinds = kinds(&seen);
+    assert!(seen_kinds.iter().any(|k| k == "message"), "recipient misses its mail: {seen}");
+    assert!(
+        seen_kinds.iter().any(|k| k == "conversation"),
+        "recipient misses the link it is a party to: {seen}"
+    );
+    assert!(seen_kinds.iter().all(|k| k != "lifecycle"), "recipient sees builder-1's private note: {seen}");
+    let peer_metrics = call(&reg, &hub, &peer, "observability_manage", metrics).await;
+    let peer_b1 = &peer_metrics["events_last_7_days"]["builder-1"];
+    assert!(peer_b1["message"].as_i64().unwrap_or(0) >= 1, "{peer_b1}");
+    assert!(peer_b1["lifecycle"].as_i64().unwrap_or(0) == 0, "{peer_b1}");
+}
+
+#[tokio::test]
+async fn performance_counts_only_the_readers_own_calls() {
+    let hub = mem_hub();
+    let reg = builtin_registry();
+    let (sender, outsider) = (agent("builder-1", Profile::Developer), agent("builder-3", Profile::Developer));
+    call(
+        &reg,
+        &hub,
+        &sender,
+        "message_send",
+        json!({ "act": "inform", "to_agent": "builder-2", "body": "private ping" }),
+    )
+    .await;
+
+    let perf = json!({ "action": "performance", "params": {} });
+
+    // The outsider sees only its own calls: builder-1's message_send is absent.
+    let out = call(&reg, &hub, &outsider, "observability_manage", perf.clone()).await;
+    assert_eq!(out["scope"], "own_calls");
+    assert!(out["by_tool"].get("message_send").is_none(), "{out}");
+    assert!(out["by_caller"].get("builder-1").is_none(), "{out}");
+
+    // The agent sees its own calls.
+    let own = call(&reg, &hub, &sender, "observability_manage", perf.clone()).await;
+    assert_eq!(own["scope"], "own_calls");
+    assert!(own["by_tool"]["message_send"]["calls"].as_i64().unwrap() >= 1, "{own}");
+    assert!(own["by_caller"].get("builder-2").is_none(), "{own}");
+
+    // A mail-unrestricted reader sees them all.
+    let board = Caller::local("local", Transport::Stdio);
+    let all = call(&reg, &hub, &board, "observability_manage", perf).await;
+    assert_eq!(all["scope"], "all");
+    assert!(all["by_tool"]["message_send"]["calls"].as_i64().unwrap() >= 1, "{all}");
+    assert!(all["by_caller"]["builder-1"]["calls"].as_i64().unwrap() >= 1, "{all}");
+}
+
+#[tokio::test]
 async fn remote_assistant_reaches_only_its_actions() {
     let hub = mem_hub();
     let reg = builtin_registry();
@@ -298,5 +482,30 @@ async fn schema_fingerprint_and_call_counts() {
     if let Ok(narrow) = narrow {
         assert_ne!(narrow["schema_fingerprint"], first["schema_fingerprint"]);
         assert_eq!(narrow["registry_schema_fingerprint"], first["registry_schema_fingerprint"]);
+    }
+}
+
+#[tokio::test]
+async fn doctor_reports_slack_without_secrets() {
+    let reg = builtin_registry();
+    let who = agent("builder-1", Profile::Developer);
+    let row = |report: &Value| {
+        report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "slack").unwrap().clone()
+    };
+    let hub = mem_hub();
+    let off = row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
+    assert_eq!(off["status"], "DORMANT", "{off}");
+
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.slack_socket_mode = true;
+    cfg.slack_app_token_value = Some(SecretString::from("xapp-1-doctor-secret".to_string()));
+    let hub = Hub::in_memory(cfg).unwrap();
+    let on = row(&call(&reg, &hub, &who, "system_doctor", json!({})).await);
+    assert!(!on.to_string().contains("doctor-secret"), "{on}");
+    if cfg!(feature = "slack-socket") {
+        assert!(on["detail"].as_str().unwrap().contains("Socket Mode"), "{on}");
+    } else {
+        assert_eq!(on["status"], "MISCONFIGURED", "{on}");
+        assert!(on["detail"].as_str().unwrap().contains("without the slack-socket feature"), "{on}");
     }
 }

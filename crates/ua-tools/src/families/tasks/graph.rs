@@ -59,7 +59,10 @@ pub fn register(r: &mut Registry) {
         tool(
             "dependency_list",
             "List explicit task prerequisite edges ordered by edge id. Returns {dependencies, truncated}.",
-            |ctx: ToolCtx, a: DepListArgs| async move { ctx.hub.db().read_async(move |c| dep_list(c, a)).await },
+            |ctx: ToolCtx, a: DepListArgs| async move {
+                let org = ctx.caller.org_id.clone();
+                ctx.hub.db().read_async(move |c| dep_list(c, &org, a)).await
+            },
         )
         .family("tasks")
         .read_only(),
@@ -86,7 +89,10 @@ pub fn register(r: &mut Registry) {
             "lineage",
             "Per-task execution lineage: delegations, dispatch runs, autonomous cycles and refs \
              (pr_url, worktree_path, branch). Unknown tasks return {empty: true}.",
-            |ctx: ToolCtx, a: LineageArgs| async move { ctx.hub.db().read_async(move |c| lineage(c, a)).await },
+            |ctx: ToolCtx, a: LineageArgs| async move {
+                let org = ctx.caller.org_id.clone();
+                ctx.hub.db().read_async(move |c| lineage(c, &org, a)).await
+            },
         )
         .family("tasks")
         .read_only(),
@@ -102,24 +108,27 @@ pub fn register(r: &mut Registry) {
     );
 }
 
-fn edge(conn: &Connection, id: i64) -> UaResult<Option<Map<String, Value>>> {
+/// Dependency `id` of organization `org`; another organization's edge
+/// answers as a missing one.
+fn edge(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
     Ok(conn
         .query_row(
-            "SELECT id, task_id, depends_on_task_id, created_by, created_at FROM task_dependencies WHERE id = ?1",
-            [id],
+            "SELECT id, task_id, depends_on_task_id, created_by, created_at FROM task_dependencies \
+             WHERE org_id = ?1 AND id = ?2",
+            params![org, id],
             row_object,
         )
         .optional()?)
 }
 
-fn dep_list(conn: &Connection, a: DepListArgs) -> UaResult<Value> {
+fn dep_list(conn: &Connection, org: &str, a: DepListArgs) -> UaResult<Value> {
     let limit = a.limit.unwrap_or(500).clamp(1, 2000);
     let mut stmt = conn.prepare(
         "SELECT id, task_id, depends_on_task_id, created_by, created_at FROM task_dependencies \
-         WHERE (?1 IS NULL OR task_id = ?1) ORDER BY id LIMIT ?2",
+         WHERE org_id = ?3 AND (?1 IS NULL OR task_id = ?1) ORDER BY id LIMIT ?2",
     )?;
     let mut rows: Vec<Map<String, Value>> =
-        stmt.query_map(params![a.task_id, limit + 1], row_object)?.collect::<Result<_, _>>()?;
+        stmt.query_map(params![a.task_id, limit + 1, org], row_object)?.collect::<Result<_, _>>()?;
     let truncated = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
     Ok(json!({ "dependencies": rows, "truncated": truncated }))
@@ -130,20 +139,23 @@ async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
     if a.task_id == a.depends_on_task_id {
         return Err(UaError::invalid("a task cannot depend on itself"));
     }
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            require_task(tx, a.task_id)?;
-            require_task(tx, a.depends_on_task_id)?;
+            require_org(tx, &org)?;
+            require_task(tx, &org, a.task_id)?;
+            require_task(tx, &org, a.depends_on_task_id)?;
             // A cycle exists when the prerequisite already (transitively) waits on the dependent.
             let cycle: Option<i64> = tx
                 .query_row(
                     "WITH RECURSIVE reachable(id) AS (
-                        SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1
+                        SELECT depends_on_task_id FROM task_dependencies WHERE org_id = ?3 AND task_id = ?1
                         UNION
                         SELECT d.depends_on_task_id FROM task_dependencies d JOIN reachable r ON d.task_id = r.id
+                        WHERE d.org_id = ?3
                     ) SELECT 1 FROM reachable WHERE id = ?2 LIMIT 1",
-                    params![a.depends_on_task_id, a.task_id],
+                    params![a.depends_on_task_id, a.task_id, org],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -155,8 +167,8 @@ async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
             }
             let exists: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
-                    params![a.task_id, a.depends_on_task_id],
+                    "SELECT id FROM task_dependencies WHERE org_id = ?3 AND task_id = ?1 AND depends_on_task_id = ?2",
+                    params![a.task_id, a.depends_on_task_id, org],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -164,28 +176,31 @@ async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
                 return Err(UaError::conflict(format!("dependency already exists (id {id})")));
             }
             tx.execute(
-                "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![a.task_id, a.depends_on_task_id, by, now()],
+                "INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![org, a.task_id, a.depends_on_task_id, by, now()],
             )?;
             let id = tx.last_insert_rowid();
             emit(
                 tx,
+                &org,
                 "agent.task.dependency_added",
                 json!({ "dependency_id": id, "task_id": a.task_id, "depends_on_task_id": a.depends_on_task_id }),
                 &by,
             )?;
-            Ok(json!({ "dependency": edge(tx, id)? }))
+            Ok(json!({ "dependency": edge(tx, &org, id)? }))
         })
         .await
 }
 
 async fn dep_remove(ctx: ToolCtx, a: DepRemoveArgs) -> UaResult<Value> {
     let by = acting_identity(&ctx.caller, a.agent.as_deref())?;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = edge(tx, a.dependency_id)?
+            require_org(tx, &org)?;
+            let row = edge(tx, &org, a.dependency_id)?
                 .ok_or_else(|| UaError::not_found(format!("no dependency with id {}", a.dependency_id)))?;
             if str_field(&row, "created_by") != Some(by.as_str()) {
                 return Err(UaError::denied(
@@ -193,9 +208,13 @@ async fn dep_remove(ctx: ToolCtx, a: DepRemoveArgs) -> UaResult<Value> {
                     "only the dependency creator may remove this edge",
                 ));
             }
-            tx.execute("DELETE FROM task_dependencies WHERE id = ?1", [a.dependency_id])?;
+            tx.execute(
+                "DELETE FROM task_dependencies WHERE org_id = ?1 AND id = ?2",
+                params![org, a.dependency_id],
+            )?;
             emit(
                 tx,
+                &org,
                 "agent.task.dependency_removed",
                 json!({ "dependency_id": a.dependency_id, "task_id": row["task_id"],
                         "depends_on_task_id": row["depends_on_task_id"] }),
@@ -206,8 +225,8 @@ async fn dep_remove(ctx: ToolCtx, a: DepRemoveArgs) -> UaResult<Value> {
         .await
 }
 
-fn lineage(conn: &Connection, a: LineageArgs) -> UaResult<Value> {
-    let row = task_object(conn, a.task_id)?;
+fn lineage(conn: &Connection, org: &str, a: LineageArgs) -> UaResult<Value> {
+    let row = task_object(conn, org, a.task_id)?;
     let get = |k: &str| row.as_ref().and_then(|r| str_field(r, k)).map(String::from);
     let worktree_path = get("worktree_path");
     let branch = get("branch");
@@ -233,11 +252,13 @@ async fn project_build(ctx: ToolCtx, a: ProjectBuildArgs) -> UaResult<Value> {
         ));
     }
     let identity = ctx.caller.label.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let id = a.parent_task_id;
-            let row = require_task(tx, id)?;
+            let row = require_task(tx, &org, id)?;
             if !has_marker(str_field(&row, "notes").unwrap_or_default(), PROJECT_SPEC_MARKER) {
                 return Err(UaError::invalid(format!("task {id} does not carry {PROJECT_SPEC_MARKER}")));
             }
@@ -246,13 +267,17 @@ async fn project_build(ctx: ToolCtx, a: ProjectBuildArgs) -> UaResult<Value> {
             {
                 return Err(UaError::conflict(format!("task {id} is claimed by {holder}, not {identity}")));
             }
+            // ORG-EVENT-DEFAULT: as `emit`, another organization's event
+            // carries no label and a neutral originator.
+            let by = if org == ua_core::DEFAULT_ORG { identity.clone() } else { "system".to_string() };
             let event = ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.project.built",
-                    json!({ "parent_task_id": id, "project_id": id, "identity": identity }),
+                    json!({ "parent_task_id": id, "project_id": id, "identity": ledger_text(&org, &identity) }),
                 )
-                .by(identity.clone()),
+                .by(by),
             )?;
             Ok(json!({
                 "project_id": id,

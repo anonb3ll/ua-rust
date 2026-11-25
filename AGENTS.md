@@ -24,8 +24,10 @@ touched; CI runs the whole workspace (`cargo nextest run --workspace`).
 | Crate | Holds | Rule |
 |---|---|---|
 | `ua-core` | Config, identity, session profiles (`profiles.rs`, `profiles.json`), errors, sandbox resolvers | No I/O beyond reading config. |
+| `ua-ingress` | The address classifier (`addr`) and the guarded outbound HTTP client (`Outbound`, one `Policy` per destination class); inbound delivery handling moves here later ([docs/ingress.md](docs/ingress.md)) | Depends only on `ua-core`; only `ua-tools` and `ua-server` depend on it. New `reqwest` clients, address classifiers and delivery tables elsewhere fail its ratchet (`tests/ingress_guard.rs`). |
 | `ua-store` | SQLite access, migrations, the hash-chained ledger | No tool logic. |
 | `ua-memory` | The memory domain: schema parts, note model, save, hybrid search, ranking, embeddings (`embeddings` feature), lifecycle | Depends only on `ua-core` and `ua-store`, never on the registry. The memory tools stay in `ua-tools` (`families/memory`); adapters reach memory only through them (`tests/boundary.rs` enforces that only `ua-tools` depends on it). |
+| `ua-deliverables` | The deliverable domain: schema parts, validation, reads and writes of deliverables and their revisions ([docs/deliverables.md](docs/deliverables.md)) | Depends only on `ua-core` and `ua-store`, never on the registry. The tools stay in `ua-tools` (`families/deliverables.rs`), which resolves the task, its repository binding and the writer before calling it; only `ua-tools` depends on it (`tests/dependencies.rs`). |
 | `ua-tools` | The tool registry, the governed call wrapper (`Registry::call`), policy, approvals, tool families (`src/families/`) | Every tool is registered and runs only through `Registry::call`. |
 | `ua-server` | MCP, HTTP API, OAuth, server-rendered UI | Adapters build a `Caller` and call the registry; they never run tool code directly. |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact | |

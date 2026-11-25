@@ -1,0 +1,19 @@
+# Litestream continuous SQLite WAL replication template for ua-rust.
+#
+# IMPORTANT:
+# 1. Litestream does NOT encrypt SQLite replicas on S3. Backups contain cookie
+#    keys, token hashes, passkey metadata, and ciphertext secrets (managed_secret_key
+#    stays separate). Use server-side/KMS encryption or age/CSE and private buckets.
+# 2. Litestream is NOT coordinated by HubLock (`ua.db.hub.lock`). Always stop
+#    Litestream alongside `ua serve` before running `ua restore`, and expect a
+#    new WAL generation cleanly after restarting Litestream on the restored DB.
+# 3. Verify any restored replica with `ua restore --from <path> --dry-run` before swap.
+
+dbs:
+  - path: /var/lib/ua-rust/ua.db
+    replicas:
+      - url: s3://replace-with-your-bucket/ua-rust/ua.db
+        sync-interval: 1s
+        snapshot-interval: 24h
+        retention: 168h
+        validation-interval: 12h

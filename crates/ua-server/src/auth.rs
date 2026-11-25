@@ -29,7 +29,6 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use secrecy::ExposeSecret;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use ua_core::{ActorKind, Profile};
 use ua_tools::families::node_queue::credentials;
@@ -47,18 +46,35 @@ pub struct AuthIdentity {
     pub verified: bool,
     /// Set for a node session credential: the request runs under this grant.
     pub grant: Option<Arc<SessionGrant>>,
+    /// The organization the credential resolves to: a managed token's
+    /// (`agent_tokens.org_id`, its agent's), a session credential's
+    /// (`session_credentials.org_id`), else the default organization (static
+    /// tokens, OAuth grants, Control Center sessions and anonymous callers).
+    pub org_id: String,
+}
+
+impl AuthIdentity {
+    /// An identity in the default organization.
+    pub fn in_default(label: impl Into<String>, kind: ActorKind, verified: bool) -> Self {
+        Self { label: label.into(), kind, verified, grant: None, org_id: ua_core::DEFAULT_ORG.to_string() }
+    }
 }
 
 /// Label used for unauthenticated local callers.
-pub const LOCAL_LABEL: &str = "local";
+pub use ua_core::identity::LOCAL_LABEL;
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Resolve a presented static or managed token to an identity label.
-/// Blocking: it reads `agent_tokens`.
-pub fn lookup_token(state: &AppState, token: &str) -> Option<String> {
+/// Resolve a presented static or managed token to an identity label and
+/// its organization. Blocking: it reads `agent_tokens` and `agents`.
+///
+/// A static token is hub configuration and always resolves to the default
+/// organization; it is refused while another organization's agent holds
+/// its label. A managed token resolves to its own organization, which must
+/// be its agent's ([`ua_tools::families::tokens::resolve_managed_token`]).
+pub fn lookup_token(state: &AppState, token: &str) -> Option<(String, String)> {
     let presented = token.as_bytes();
     let mut found = None;
     // Check every static entry so timing does not depend on the match position.
@@ -67,29 +83,39 @@ pub fn lookup_token(state: &AppState, token: &str) -> Option<String> {
             found = Some(label);
         }
     }
-    if found.is_some() {
-        return found;
+    let reserved = ua_tools::families::agents::Reserved::of(state.hub.cfg());
+    if let Some(label) = found {
+        let elsewhere = state
+            .hub
+            .db()
+            .read(|c| ua_tools::families::tokens::held_outside_default(c, &reserved, &label))
+            .unwrap_or(true);
+        return (!elsewhere).then(|| (label, ua_core::DEFAULT_ORG.to_string()));
     }
-    let hash = hex::encode(Sha256::digest(presented));
     state
         .hub
         .db()
-        .read(|c| {
-            use rusqlite::OptionalExtension;
-            Ok(c.query_row(
-                "SELECT agent_label FROM agent_tokens WHERE token_hash = ?1 AND status = 'active' \
-                 AND (expires_at IS NULL OR expires_at > ?2)",
-                rusqlite::params![hash, ua_core::time::now()],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?)
-        })
+        .read(|c| ua_tools::families::tokens::resolve_managed_token(c, &reserved, token))
         .ok()
         .flatten()
 }
 
 fn path_is(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a row of another organization holds `label`, for a credential
+/// that always resolves to the default organization (a Control Center
+/// session, a Slack human). Fails closed: an unreadable state refuses.
+pub async fn held_outside_default(state: &AppState, label: &str) -> bool {
+    let label = label.to_string();
+    let reserved = ua_tools::families::agents::Reserved::of(state.hub.cfg());
+    state
+        .hub
+        .db()
+        .read_async(move |c| ua_tools::families::tokens::held_outside_default(c, &reserved, &label))
+        .await
+        .unwrap_or(true)
 }
 
 /// Whether `label` is a retired agent identity. Fails closed: an unreadable
@@ -115,12 +141,17 @@ pub fn resolve_bearer_blocking(state: &AppState, token: &str, path: &str) -> Opt
         return None;
     }
     let cfg = state.hub.cfg();
-    if let Some(label) = lookup_token(state, token) {
-        let kind = if cfg.is_human(&label) { ActorKind::Human } else { ActorKind::Agent };
+    if let Some((label, org_id)) = lookup_token(state, token) {
+        // Human identities are hub configuration, the default organization's.
+        let kind = if org_id == ua_core::DEFAULT_ORG && cfg.is_human(&label) {
+            ActorKind::Human
+        } else {
+            ActorKind::Agent
+        };
         if kind == ActorKind::Agent && retired(state, &label) {
             return None;
         }
-        return Some(AuthIdentity { label, kind, verified: true, grant: None });
+        return Some(AuthIdentity { label, kind, verified: true, grant: None, org_id });
     }
     if !cfg.oauth_enabled || !token.starts_with(oauth::ACCESS_PREFIX) {
         return None;
@@ -132,12 +163,21 @@ pub fn resolve_bearer_blocking(state: &AppState, token: &str, path: &str) -> Opt
     let audience_ok = hub_wide || (access.resource == oauth::mcp_resource(cfg) && path_is(path, "/mcp"));
     // OAuth grants never act as a human, even if the configuration changed,
     // and never fall back to the `developer` default: an identity whose
-    // explicit profile was removed from configuration is refused.
+    // explicit profile was removed from configuration is refused. A grant
+    // carries no organization yet, so it resolves to the default one and is
+    // refused for a subject another organization's agent holds.
+    let reserved = ua_tools::families::agents::Reserved::of(cfg);
+    let elsewhere = state
+        .hub
+        .db()
+        .read(|c| ua_tools::families::tokens::held_outside_default(c, &reserved, &access.subject))
+        .unwrap_or(true);
     (audience_ok
         && !cfg.is_human(&access.subject)
         && cfg.explicit_profile(&access.subject).is_some()
+        && !elsewhere
         && !retired(state, &access.subject))
-    .then_some(AuthIdentity { label: access.subject, kind: ActorKind::Agent, verified: true, grant: None })
+    .then(|| AuthIdentity::in_default(access.subject, ActorKind::Agent, true))
 }
 
 /// The paths a session credential is accepted on: each runs its registry
@@ -168,6 +208,7 @@ async fn resolve_session_credential(
             kind: ActorKind::Agent,
             verified: true,
             grant: Some(Arc::new(v.grant)),
+            org_id: v.org,
         }),
         Ok(Err(refused)) => Err(Box::new(unauthorized(
             state,
@@ -186,8 +227,11 @@ fn is_public_path(path: &str) -> bool {
         || path_is(path, "/oauth")
         || path_is(path, "/login")
         || path == "/logout"
-        // GitHub signs its deliveries instead (see `github_api`).
-        || path == crate::github_api::WEBHOOK_PATH
+        // GitHub signs its deliveries instead (see `github_api`): the default
+        // organization's route and each organization's one segment below it.
+        || crate::github_api::is_webhook_path(path)
+        // Slack signs its requests too (see `slack_api`); 404 unless mounted.
+        || crate::slack_api::is_slack_path(path)
 }
 
 pub async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
@@ -217,12 +261,17 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
                 return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
             }
         }
-        let id = AuthIdentity {
-            label: session.label.clone(),
-            kind: ActorKind::Human,
-            verified: true,
-            grant: None,
-        };
+        // A Control Center session is a configured human, the default
+        // organization's: refused, like a static token, while a row of
+        // another organization holds its label. Defence in depth: it cannot
+        // fire today, because a human identity is a configuration-reserved
+        // label (`agents::Reserved`), which `held_outside_default` always
+        // answers as the default organization's. It stays so a later change
+        // to the reservation cannot quietly let such a session in.
+        if held_outside_default(&state, &session.label).await {
+            return unauthorized(&state, Some("invalid_token"), "session refused");
+        }
+        let id = AuthIdentity::in_default(session.label.clone(), ActorKind::Human, true);
         req.extensions_mut().insert(session);
         id
     } else if state.hub.cfg().enforce_auth && !public {
@@ -240,7 +289,7 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
 }
 
 fn anonymous() -> AuthIdentity {
-    AuthIdentity { label: LOCAL_LABEL.into(), kind: ActorKind::Anonymous, verified: false, grant: None }
+    AuthIdentity::in_default(LOCAL_LABEL, ActorKind::Anonymous, false)
 }
 
 fn unauthorized(state: &AppState, error: Option<&str>, msg: &str) -> Response {
@@ -249,7 +298,9 @@ fn unauthorized(state: &AppState, error: Option<&str>, msg: &str) -> Response {
     (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, challenge)], axum::Json(body)).into_response()
 }
 
-/// Build the governed caller for one request.
+/// Build the governed caller for one request, in the organization the
+/// credential resolved to ([`AuthIdentity::org_id`]): the resolver is the one
+/// source of a caller's organization besides the hub's own jobs.
 pub fn caller_for(
     state: &AppState,
     id: &AuthIdentity,
@@ -266,9 +317,11 @@ pub fn caller_for(
             enforce_profile: true,
             session_key: None,
             transport,
+            org_id: id.org_id.clone(),
         };
     }
-    let profile = ua_tools::sessions::resolve_profile(&state.hub, &id.label, session_key.as_deref());
+    let profile =
+        ua_tools::sessions::resolve_profile(&state.hub, &id.org_id, &id.label, session_key.as_deref());
     ua_core::Caller {
         label: id.label.clone(),
         kind: id.kind,
@@ -278,6 +331,7 @@ pub fn caller_for(
         enforce_profile: id.verified,
         session_key,
         transport,
+        org_id: id.org_id.clone(),
     }
 }
 

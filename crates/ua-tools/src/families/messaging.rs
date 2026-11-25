@@ -31,12 +31,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use ua_core::{Profile, UaError, UaResult};
+use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use super::agents::{self, clean, validate_label};
 use super::{continuity, governance, node_queue, nodes, wake};
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "messaging.v1",
@@ -76,6 +77,59 @@ CREATE TABLE IF NOT EXISTS message_reads (
 ",
 };
 
+/// `organization.v1.tools.messaging`: `org_id` on `message_index` and
+/// `message_reads` and the generated `*_org_exists` / `*_org_immutable`
+/// triggers. Every existing row takes the default organization: every sender
+/// the hub has served was a default-organization caller, so that is where
+/// each message was sent, and a read receipt follows its message. Nothing is
+/// moved or dropped. No key rebuild: a message id and an event ulid are
+/// hub-minted, the receipt key is led by the message id, and a sender's
+/// client message id lives in `idempotency_keys`, keyed by `(org_id, key)`
+/// and prefixed per organization (see [`client_key`]).
+pub const TENANT_PART: ua_store::Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.messaging", &["message_index", "message_reads"]);
+
+/// `messaging.v2.org_scope`: the full payload of a message outside the
+/// default organization (`org_payload`), indexes led by `org_id` for the
+/// mailbox reads, and triggers that keep a read receipt with its message's
+/// organization and a reply with its parent's.
+///
+/// A message's ledger event is still written to the default organization's
+/// ledger (`ORG-EVENT-DEFAULT`), so another organization's event carries no
+/// body, label or client text; the message itself is kept on its index row,
+/// which only that organization reads. A default-organization row leaves
+/// `org_payload` NULL and reads its event, as before.
+///
+/// A message's `task_id` and `delegation_id` get no trigger: they were never
+/// checked (a missing id is accepted), every reader filters on the message's
+/// own organization, and a trigger would answer another organization's id
+/// differently from a missing one.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "messaging.v2.org_scope",
+    sql: "
+ALTER TABLE message_index ADD COLUMN org_payload TEXT;
+CREATE INDEX IF NOT EXISTS idx_message_index_org_recipient_seq ON message_index(org_id, recipient, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_sender_seq ON message_index(org_id, sender, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_conversation ON message_index(org_id, conversation_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_message_index_org_task ON message_index(org_id, task_id) WHERE task_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS message_reads_org_parent BEFORE INSERT ON message_reads
+WHEN EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.message_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'message belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_reads_org_parent_update BEFORE UPDATE OF message_id ON message_reads
+WHEN EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.message_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'message belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_index_org_reply BEFORE INSERT ON message_index
+WHEN NEW.reply_to IS NOT NULL
+ AND EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.reply_to AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'reply_to belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS message_index_org_reply_update BEFORE UPDATE OF reply_to ON message_index
+WHEN NEW.reply_to IS NOT NULL
+ AND EXISTS (SELECT 1 FROM message_index WHERE message_id = NEW.reply_to AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'reply_to belongs to another organization'); END;
+",
+};
+
 /// Speech acts, sorted.
 const ACTS: [&str; 5] = ["done", "handoff", "inform", "query", "request"];
 /// Hop must be in `0..MAX_HOPS`.
@@ -90,7 +144,75 @@ const MAX_LIST_LIMIT: i64 = 200;
 const MAX_ID_LEN: usize = 200;
 /// A `reply_to` in these namespaces points outside the hub and is not checked.
 const EXTERNAL_REPLY_PREFIXES: [&str; 1] = ["ts:"];
+
+/// A `reply_to` naming an external thread, never a hub message.
+fn is_external_reply(id: &str) -> bool {
+    EXTERNAL_REPLY_PREFIXES.iter().any(|p| id.starts_with(p))
+}
 const SEND_TOOL: &str = "message_send";
+
+/// A message's payload as SQL over `message_index i` joined to its event
+/// `e`: the row's own `org_payload` (another organization's message, whose
+/// ledger event carries no content), else the event's payload.
+pub(super) const MESSAGE_PAYLOAD: &str = "COALESCE(i.org_payload, e.payload)";
+/// [`MESSAGE_PAYLOAD`] over `message_index m`.
+const PAYLOAD_OF_M: &str = "COALESCE(m.org_payload, e.payload)";
+
+/// Refuse an organization that `orgs` does not hold, or holds suspended,
+/// before anything is written. The `org_exists` triggers fire only on
+/// insert, so a write with nothing to insert (a read mark, an ack) would
+/// otherwise pass.
+pub(super) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no message was sent or changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no message was sent or changed"),
+        )),
+    }
+}
+
+/// The ledger payload of a message of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the event is written to the default organization's
+/// ledger until `org_guard` admits another, so another organization's event
+/// keeps the payload's shape but carries only hub-minted ids, the act,
+/// counts and flags: the body, the typed handoff, every label, the
+/// conversation id (an unrestricted sender may choose it), `reply_to` and
+/// `event_id` (client text), the client message id, and the `task_id` and
+/// `delegation_id` (unchecked integers the sender chooses) are `null`. The
+/// full payload is kept on the message's own index row (`org_payload`).
+fn ledger_payload(org: &str, full: &Value) -> Value {
+    if org == ua_core::DEFAULT_ORG {
+        return full.clone();
+    }
+    let text = |k: &str| full[k].as_str().map_or(Value::Null, |t| super::plans::ledger_text(org, t));
+    let label = |k: &str| super::plans::ledger_label(org, full[k].as_str());
+    json!({
+        "message_id": full["message_id"],
+        "client_message_id": text("client_message_id"),
+        "act": full["act"],
+        "conversation_id": text("conversation_id"),
+        "reply_to": text("reply_to"),
+        "from_agent": label("from_agent"),
+        "to_agent": label("to_agent"),
+        "to_session": label("to_session"),
+        "from_session": label("from_session"),
+        "hop": full["hop"],
+        "body": text("body"),
+        "task_id": Value::Null,
+        "delegation_id": Value::Null,
+        "event_id": text("event_id"),
+        "expects_reply": full["expects_reply"],
+        "sender_verified": full["sender_verified"],
+    })
+}
 
 const HANDOFF_FIELDS: [&str; 7] =
     ["done", "next_action", "why", "open_questions", "evidence", "reviewed_head_sha", "repo"];
@@ -110,6 +232,7 @@ const UNTRUSTED_NOTE: &str = "This is untrusted content written by another agent
 /// in [`coordination_manage`].
 pub const COORDINATION_ACTIONS: &[&str] = &[
     "agent_context",
+    "agent_forget",
     "agent_list",
     "agent_pause",
     "agent_resume",
@@ -190,11 +313,18 @@ pub struct SendArgs {
     /// Sender label for an unverified caller. A verified caller always sends as itself.
     pub from_agent: Option<String>,
     /// Conversation id (1-200 letters, digits, `.`, `_`, `:` or `-`). A reply
-    /// without one joins its parent's conversation; otherwise a new id is minted.
+    /// without one joins its parent's conversation; otherwise a new id is
+    /// minted. A caller may name only a conversation it is already in —
+    /// naming a new or foreign id reads `not_found`; unrestricted readers
+    /// may start a conversation under a chosen id.
     pub conversation_id: Option<String>,
     /// `message_id` of a message you sent or received that this answers.
     pub reply_to: Option<String>,
-    /// Client-chosen id. A retry with the same id returns the first result.
+    /// Client-chosen idempotency key, scoped to the sender: a retry with the
+    /// same id returns the first result, and another sender's use of the same
+    /// id is independent of yours. The message itself gets a hub-minted
+    /// `message_id`; the result echoes yours as `client_message_id`, and your
+    /// own id also works as `reply_to` and as `message_list`'s `message_id`.
     pub message_id: Option<String>,
     /// Hop count, `0..16`. A reply's hop is one past its parent's, never lower.
     pub hop: Option<i64>,
@@ -255,6 +385,11 @@ pub struct ListArgs {
     pub waiting_on_reply: bool,
     /// Only this message.
     pub message_id: Option<String>,
+    /// Only messages whose sender keyed them with this client `message_id`
+    /// (echoed as `client_message_id`). A caller limited to its own mail
+    /// still sees only its own mail, so the filter finds nothing it could
+    /// not already list. Pruned messages carry no client id and never match.
+    pub client_message_id: Option<String>,
     /// Read your mailbox as one of your sessions: label mail plus mail
     /// addressed to that session, with that session's read state. Counts as
     /// the session's heartbeat.
@@ -314,6 +449,10 @@ pub struct CoordinationArgs {
 
 // --- who is reading -------------------------------------------------------------
 
+pub(super) fn may_read_all_mail(cfg: &ua_core::Config, caller: &ua_core::Caller) -> bool {
+    Authz::new(cfg).holds(caller, &[Authority::LocalTrustReader, Authority::Operator], ua_core::DEFAULT_ORG)
+}
+
 /// The caller as the mailbox sees it.
 #[derive(Debug, Clone)]
 struct Viewer {
@@ -325,23 +464,35 @@ struct Viewer {
     /// The configured label of an unverified caller, used where a mailbox is
     /// required and none was named.
     local_label: String,
+    /// An unverified caller's own mailbox: the label it was configured with.
+    /// Another label's mailbox is a board it reads without changing that
+    /// mailbox's read state. `None` for a verified caller, and for an
+    /// unverified caller with only the shared local label: that one has no
+    /// mailbox of its own and acts as the mailbox it names.
+    own_local: Option<String>,
     /// Human identities: messages to or from them are exempt from loop guards.
     humans: Vec<String>,
+    /// The caller's organization: the only one whose mail it sends or reads.
+    org: String,
 }
 
 impl Viewer {
     fn of(ctx: &ToolCtx) -> Self {
         let identity = agents::verified(&ctx.caller).map(str::to_string);
         let cfg = ctx.hub.cfg();
-        let unrestricted = identity.is_none()
-            || ctx.caller.is_human()
-            || identity.as_deref().is_some_and(|l| cfg.is_human(l))
-            || ctx.caller.profile == Profile::Coordinator;
+        // Every mailbox: an operator (a verified human), or a caller without
+        // a verified label (auth enforcement off: a message board, read
+        // only). A profile grants nothing.
+        let unrestricted = may_read_all_mail(cfg, &ctx.caller);
+        let own_local = (identity.is_none() && ctx.caller.label != ua_core::identity::LOCAL_LABEL)
+            .then(|| ctx.caller.label.clone());
         Self {
             identity,
             unrestricted,
+            own_local,
             local_label: ctx.caller.label.clone(),
             humans: cfg.human_identities.clone(),
+            org: ctx.caller.org_id.clone(),
         }
     }
 }
@@ -550,35 +701,130 @@ struct Parent {
     sender_session: Option<String>,
 }
 
-fn parent(conn: &Connection, message_id: &str) -> UaResult<Option<Parent>> {
+fn parent(conn: &Connection, org: &str, message_id: &str) -> UaResult<Option<Parent>> {
     Ok(conn
         .query_row(
-            "SELECT sender, recipient, conversation_id, sender_session FROM message_index WHERE message_id = ?1",
-            [message_id],
-            |r| Ok(Parent { sender: r.get(0)?, recipient: r.get(1)?, conversation_id: r.get(2)?, sender_session: r.get(3)? }),
+            "SELECT sender, recipient, conversation_id, sender_session FROM message_index \
+             WHERE org_id = ?2 AND message_id = ?1",
+            params![message_id, org],
+            |r| {
+                Ok(Parent {
+                    sender: r.get(0)?,
+                    recipient: r.get(1)?,
+                    conversation_id: r.get(2)?,
+                    sender_session: r.get(3)?,
+                })
+            },
         )
         .optional()?)
 }
 
-/// The committed result for `message_id` when `sender` sent it. A receipt held
-/// by another sender is refused, never echoed.
-fn saved_result(conn: &Connection, message_id: &str, sender: &str) -> UaResult<Option<Value>> {
+/// Sender labels the hub itself sends as. An unverified caller may not claim
+/// one: it could take a hub client id first (`node-command-…` under
+/// `hub-node`) or pass as hub mail. The hub's own sends (`send_system`) carry
+/// the label as their identity and never reach this check.
+pub(crate) const RESERVED_SENDERS: [&str; 3] =
+    [crate::families::node_queue::command::NOTICE_SENDER, "system", "pr-watch"];
+
+/// Every label starting with this prefix is reserved for the hub's own
+/// senders, so a later hub sender (`hub-github`, say) is covered before it ships.
+pub(crate) const RESERVED_SENDER_PREFIX: &str = "hub-";
+
+/// `label`, unless it is a reserved hub sender (compared ignoring ASCII case).
+fn unreserved(label: String) -> UaResult<String> {
+    let lower = label.to_ascii_lowercase();
+    if RESERVED_SENDERS.iter().any(|r| r.eq_ignore_ascii_case(&label))
+        || lower.starts_with(RESERVED_SENDER_PREFIX)
+    {
+        return Err(UaError::denied(
+            "reserved_sender",
+            format!("from_agent {label:?} is reserved for the hub's own messages; send as your own label"),
+        ));
+    }
+    Ok(label)
+}
+
+/// The idempotency key of a client-chosen id, scoped to its organization
+/// and its sender. `idempotency_keys` is keyed by `(org_id, key)` and read
+/// only in the sender's organization; another organization's key text also
+/// keeps its organization prefix (`org:<org>/message_send/<sender>/<id>`) as
+/// defence in depth, byte for byte the form it had before the rebuild, so it
+/// can never replay, probe or occupy the default organization's, or a
+/// third's. Each part has `%` and `/` escaped, so an organization id
+/// containing `/` cannot spell another organization's prefix. The default organization's key is
+/// `message_send/<sender>/<id>`, escaped the same way: byte for byte the
+/// earlier key, so its receipts still replay, for every sender and client id
+/// without `%` or `/` (a client id and a validated label never have one; a
+/// verified identity's label with one gets a new key). No form ever matches
+/// a pre-scoping key (`message_send:<id>`).
+fn client_key(org: &str, sender: &str, client_id: &str) -> String {
+    let (sender, client_id) = (key_part(sender), key_part(client_id));
+    if org == ua_core::DEFAULT_ORG {
+        format!("{SEND_TOOL}/{sender}/{client_id}")
+    } else {
+        format!("org:{}/{SEND_TOOL}/{sender}/{client_id}", key_part(org))
+    }
+}
+
+/// One `/`-delimited part of a stored key: `%` and `/` escaped.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F")
+}
+
+fn saved_send(conn: &Connection, org: &str, key: &str) -> UaResult<Option<Value>> {
     let cached: Option<String> = conn
         .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-            params![format!("{SEND_TOOL}:{message_id}"), SEND_TOOL],
+            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
+            params![org, key, SEND_TOOL],
             |r| r.get(0),
         )
         .optional()?;
-    let Some(text) = cached else { return Ok(None) };
-    let mut saved: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
-    if saved["from_agent"].as_str() != Some(sender) || saved["accepted"] != json!(true) {
-        return Err(UaError::conflict(format!(
-            "message_id {message_id:?} is already used by another message"
-        )));
+    Ok(cached.map(|t| serde_json::from_str(&t).unwrap_or_else(|_| json!({}))))
+}
+
+/// The committed result of `sender`'s earlier send under `client_id`, if any.
+/// Client ids are keyed by `(organization, sender, id)`: another sender's or
+/// another organization's use of the same id is invisible here, so a foreign
+/// id answers exactly like a fresh one.
+///
+/// A receipt is replayed only when the message it names is not another
+/// organization's. The key's organization prefix already rules that out;
+/// this is the backstop, and it fails closed with a refusal that names
+/// nothing, never with the other organization's result.
+fn saved_result(conn: &Connection, org: &str, client_id: &str, sender: &str) -> UaResult<Option<Value>> {
+    // Before ids were scoped, a client id was the message id itself, under a
+    // hub-wide key. The sender's own retry of such a send still finds it.
+    // Every such key was the default organization's.
+    let legacy = || saved_send(conn, ua_core::DEFAULT_ORG, &format!("{SEND_TOOL}:{client_id}"));
+    let found = match saved_send(conn, org, &client_key(org, sender, client_id))? {
+        Some(v) => Some(v),
+        None if org == ua_core::DEFAULT_ORG => legacy()?.filter(|v| v["from_agent"].as_str() == Some(sender)),
+        None => None,
+    };
+    let Some(found) = found.filter(|v| v["accepted"] == json!(true)) else { return Ok(None) };
+    if let Some(mid) = found["message_id"].as_str()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE message_id = ?1 AND org_id <> ?2)",
+            params![mid, org],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Err(UaError::conflict(
+            "message_id is already used as a client id and cannot be replayed here; choose another message_id",
+        ));
     }
-    saved["duplicate"] = json!(true);
-    Ok(Some(saved))
+    let mut v = found;
+    v["duplicate"] = json!(true);
+    Ok(Some(v))
+}
+
+/// `id` as a message id for `sender`: the hub id of the sender's own send
+/// under client id `id` when there is one, else `id` unchanged. Only the
+/// sender's own keys are consulted, so this reveals nothing about others.
+fn own_message_id(conn: &Connection, org: &str, sender: &str, id: String) -> UaResult<String> {
+    Ok(saved_send(conn, org, &client_key(org, sender, &id))?
+        .and_then(|v| v["message_id"].as_str().map(str::to_string))
+        .unwrap_or(id))
 }
 
 /// The session a reply goes to when the caller names none: the parent's
@@ -586,16 +832,17 @@ fn saved_result(conn: &Connection, message_id: &str, sender: &str) -> UaResult<O
 /// sender and that session is still open and live.
 fn reply_default_session(
     conn: &Connection,
+    org: &str,
     reply_to: &str,
     sender: &str,
     to_agent: Option<&str>,
 ) -> UaResult<Option<String>> {
-    let Some(p) = parent(conn, reply_to)? else { return Ok(None) };
+    let Some(p) = parent(conn, org, reply_to)? else { return Ok(None) };
     let Some(session) = p.sender_session else { return Ok(None) };
     if p.recipient != sender || to_agent.is_some_and(|t| t != p.sender) {
         return Ok(None);
     }
-    Ok(match agents::session_ref(conn, &session)? {
+    Ok(match agents::session_ref(conn, org, &session)? {
         Some(s) if s.agent == p.sender && !s.ended() && s.live => Some(session),
         _ => None,
     })
@@ -603,12 +850,22 @@ fn reply_default_session(
 
 /// Validate `reply_to` and return the parent's conversation. One error covers
 /// "no such message" and "not yours", so a probe learns nothing.
-fn check_reply(conn: &Connection, reply_to: Option<&str>, sender: &str) -> UaResult<Option<String>> {
+///
+/// Unlike naming a `conversation_id`, the recipient of session-targeted mail
+/// counts as a party here: answering through `reply_to` is how it joins that
+/// thread (docs/organization.md, The ledger).
+fn check_reply(
+    conn: &Connection,
+    org: &str,
+    reply_to: Option<&str>,
+    sender: &str,
+) -> UaResult<Option<String>> {
     let Some(reply) = reply_to else { return Ok(None) };
-    if EXTERNAL_REPLY_PREFIXES.iter().any(|p| reply.starts_with(p)) {
+    if is_external_reply(reply) {
         return Ok(None);
     }
-    match parent(conn, reply)? {
+    // Another organization's message answers exactly as a missing one.
+    match parent(conn, org, reply)? {
         Some(p) if p.sender == sender || p.recipient == sender => Ok(Some(p.conversation_id)),
         _ => Err(UaError::invalid(format!(
             "reply_to {reply:?} is not a message you sent or received; reply_to must name an existing message you were party to"
@@ -625,12 +882,16 @@ struct ChainRow {
     body: Option<String>,
 }
 
-fn chain_row(conn: &Connection, message_id: &str) -> UaResult<Option<ChainRow>> {
+fn chain_row(conn: &Connection, org: &str, message_id: &str) -> UaResult<Option<ChainRow>> {
     Ok(conn
         .query_row(
-            "SELECT m.sender, m.recipient, m.reply_to, json_extract(e.payload, '$.hop'), json_extract(e.payload, '$.body') \
-             FROM message_index m LEFT JOIN event_log e ON e.ulid = m.event_ulid WHERE m.message_id = ?1",
-            [message_id],
+            &format!(
+                "SELECT m.sender, m.recipient, m.reply_to, json_extract({p}, '$.hop'), json_extract({p}, '$.body') \
+                 FROM message_index m LEFT JOIN event_log e ON e.ulid = m.event_ulid \
+                 WHERE m.org_id = ?2 AND m.message_id = ?1",
+                p = PAYLOAD_OF_M
+            ),
+            params![message_id, org],
             |r| {
                 Ok(ChainRow {
                     sender: r.get(0)?,
@@ -645,9 +906,9 @@ fn chain_row(conn: &Connection, message_id: &str) -> UaResult<Option<ChainRow>> 
 }
 
 /// A reply's hop: one past its parent's, or the requested hop when higher.
-fn reply_hop(conn: &Connection, reply_to: Option<&str>, requested: i64) -> UaResult<i64> {
+fn reply_hop(conn: &Connection, org: &str, reply_to: Option<&str>, requested: i64) -> UaResult<i64> {
     let Some(reply) = reply_to else { return Ok(requested) };
-    Ok(match chain_row(conn, reply)? {
+    Ok(match chain_row(conn, org, reply)? {
         Some(p) => requested.max(p.hop.unwrap_or(0) + 1),
         None => requested,
     })
@@ -657,6 +918,7 @@ fn reply_hop(conn: &Connection, reply_to: Option<&str>, requested: i64) -> UaRes
 /// warn on the last one allowed.
 fn check_pair_streak(
     conn: &Connection,
+    org: &str,
     reply_to: Option<&str>,
     sender: &str,
     recipient: &str,
@@ -674,7 +936,7 @@ fn check_pair_streak(
         if streak >= PAIR_STREAK_MAX {
             break;
         }
-        let Some(row) = chain_row(conn, &id)? else { break };
+        let Some(row) = chain_row(conn, org, &id)? else { break };
         if !same_pair(&row.sender, &row.recipient) || row.sender == speaker {
             break;
         }
@@ -696,7 +958,10 @@ fn check_pair_streak(
     }))
 }
 
-fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
+fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> UaResult<Value> {
+    let org = v.org.as_str();
+    // An unknown or suspended organization is refused before anything else.
+    require_org(tx, org)?;
     let act = a.act.trim().to_string();
     if !ACTS.contains(&act.as_str()) {
         return Err(UaError::invalid(format!("act must be one of {}", ACTS.join(", "))));
@@ -716,42 +981,60 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     }
     let sender = match &v.identity {
         Some(id) => id.clone(),
-        None => validate_label(
+        None => unreserved(validate_label(
             Some(clean(a.from_agent.as_deref()).as_deref().unwrap_or(&v.local_label)),
             "from_agent",
-        )?,
+        )?)?,
     };
+    let sender_session = clean(a.from_session.as_deref());
     agents::reap(tx)?;
     // The sender's own session is checked and heartbeated first, so a session
-    // that only retries a committed send stays live.
-    let sender_session = clean(a.from_session.as_deref());
+    // that only retries a committed send stays live. A session is its
+    // agent's organization's: another organization's session answers as a
+    // missing one, here and as `to_session` below, so a message is never
+    // delivered across an organization.
     if let Some(s) = &sender_session {
-        agents::own_session(tx, s, &sender, true)?;
+        agents::own_session(tx, org, s, &sender, true)?;
     }
     let given_id = clean(a.message_id.as_deref());
     if let Some(m) = &given_id {
         if !is_id_safe(m) {
             return Err(UaError::invalid("message_id must be 1-200 letters, digits, '.', '_', ':' or '-'"));
         }
+        if is_external_reply(m) {
+            return Err(UaError::invalid(format!(
+                "message_id may not start with {}: that prefix names an external thread",
+                EXTERNAL_REPLY_PREFIXES.join(" or ")
+            )));
+        }
         // A retry returns its saved result before anything that can change
         // after the first attempt (the target session may have ended since).
-        if let Some(saved) = saved_result(tx, m, &sender)? {
+        if let Some(saved) = saved_result(tx, org, m, &sender)? {
             return Ok(saved);
         }
     }
 
-    let reply = clean(a.reply_to.as_deref());
+    // A sender may thread under its own client id.
+    let reply = match clean(a.reply_to.as_deref()) {
+        Some(r) if !is_external_reply(&r) => Some(own_message_id(tx, org, &sender, r)?),
+        other => other,
+    };
+    // Party-check reply_to before it can default the recipient, so a missing
+    // and a foreign parent answer alike.
+    let inherited = check_reply(tx, org, reply.as_deref(), &sender)?;
     let mut to_agent = clean(a.to_agent.as_deref());
     let mut target = clean(a.to_session.as_deref());
+    // An external reply_to skips the party check, so it never looks up a
+    // hub message to default the session or the recipient.
     if target.is_none()
-        && let Some(r) = &reply
+        && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
     {
-        target = reply_default_session(tx, r, &sender, to_agent.as_deref())?;
+        target = reply_default_session(tx, org, r, &sender, to_agent.as_deref())?;
     }
     let mut target_live: Option<bool> = None;
     let mut fallback: Option<Value> = None;
     if let Some(t) = target.clone() {
-        let s = agents::session_ref(tx, &t)?
+        let s = agents::session_ref(tx, org, &t)?
             .ok_or_else(|| UaError::not_found(format!("unknown session {t:?}")))?;
         if s.ended() {
             return Err(UaError::invalid(format!(
@@ -779,8 +1062,8 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         }
     }
     if to_agent.is_none()
-        && let Some(r) = &reply
-        && let Some(p) = parent(tx, r)?
+        && let Some(r) = reply.as_deref().filter(|r| !is_external_reply(r))
+        && let Some(p) = parent(tx, org, r)?
     {
         // A reply with no address answers the other party of its parent.
         to_agent = Some(if p.sender == sender { p.recipient } else { p.sender });
@@ -789,7 +1072,12 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     if sender == recipient {
         return Err(UaError::invalid("from_agent and to_agent must differ"));
     }
-    let (availability, delivery_warning) = agents::availability(tx, &recipient)?;
+    // A message is its sender's organization's: mail to a label is stored
+    // in the sender's organization and read only there, whatever else the
+    // label is. Its availability reads only the sender's organization's
+    // agent and sessions, so a label another organization holds answers
+    // exactly as an unregistered one (`unknown`, `no_liveness_record`).
+    let (availability, delivery_warning) = agents::availability(tx, org, &recipient)?;
 
     let requested_hop = a.hop.unwrap_or(0);
     if !(0..MAX_HOPS).contains(&requested_hop) {
@@ -802,27 +1090,47 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         return Err(UaError::invalid(format!("body exceeds {MAX_BODY_BYTES} bytes")));
     }
 
-    let mid = given_id.unwrap_or_else(new_id);
-    if parent(tx, &mid)?.is_some() {
-        return Err(UaError::conflict(format!("message_id {mid:?} is already used by another message")));
+    // Always hub-minted: a client id is the sender's idempotency key, never
+    // the message's global id, so it cannot collide with another sender's.
+    let mid = new_id();
+    if let Some(cid) = &explicit_conversation
+        && !v.unrestricted
+        // A gated crew_intervene delivery may open or join the session's
+        // crew thread; a direct message_send never gets this grant.
+        && !crew.is_some_and(|s| *cid == format!("{}{s}", super::sessions_lifecycle::CREW_CONVERSATION_PREFIX))
+        && !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_index WHERE org_id = ?3 AND conversation_id = ?1 \
+             AND (sender = ?2 OR (recipient = ?2 AND target_session IS NULL)))",
+            params![cid, sender, org],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        // A restricted caller may name only a conversation it is already in:
+        // a new or foreign id answers like a missing one.
+        return Err(UaError::not_found(
+            "conversation not found; to start one omit conversation_id (the hub mints an id), \
+             or answer a message you received with reply_to",
+        ));
     }
-    let inherited = check_reply(tx, reply.as_deref(), &sender)?;
     let conversation = explicit_conversation.or(inherited).unwrap_or_else(new_id);
     let mut hop = requested_hop;
     let mut loop_warning = None;
     let human = |l: &str| v.humans.iter().any(|h| h == l);
     if !(human(&sender) || human(&recipient)) {
-        hop = reply_hop(tx, reply.as_deref(), hop)?;
+        // An external reply_to names no hub message to chain from.
+        let chained = reply.as_deref().filter(|r| !is_external_reply(r));
+        hop = reply_hop(tx, org, chained, hop)?;
         if hop >= MAX_HOPS {
             return Err(UaError::invalid(format!(
                 "reply chain reached hop {hop} (limit {MAX_HOPS}); stop replying here, or send without reply_to if this is new work"
             )));
         }
-        loop_warning = check_pair_streak(tx, reply.as_deref(), &sender, &recipient, &body)?;
+        loop_warning = check_pair_streak(tx, org, chained, &sender, &recipient, &body)?;
     }
     let event_id = clean(a.event_id.as_deref());
     let mut payload = json!({
         "message_id": mid,
+        "client_message_id": given_id,
         "act": act,
         "conversation_id": conversation,
         "reply_to": reply,
@@ -836,26 +1144,36 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         "delegation_id": a.delegation_id,
         "event_id": event_id,
         "expects_reply": a.expects_reply,
+        // Whether `from_agent` is an authenticated identity or only what an
+        // unverified caller said it was.
+        "sender_verified": v.identity.is_some(),
     });
     if let Some(h) = &typed {
         payload["handoff"] = h.clone();
     }
+    let default = org == ua_core::DEFAULT_ORG;
+    // ORG-EVENT-DEFAULT: another organization's message event carries no
+    // content (`ledger_payload`), the neutral originator, and no
+    // conversation or parent pointer; the message is kept on its own row.
     let event = ledger::append(
         tx,
         EventInput {
             channel: format!("agent.message.{act}"),
-            payload,
-            originator: Some(sender.clone()),
-            episode_id: Some(conversation.clone()),
-            causal_parent_id: reply.clone().or_else(|| event_id.clone()),
+            payload: ledger_payload(org, &payload),
+            originator: Some(crate::approvals::ledger_originator(org, &sender)),
+            episode_id: default.then(|| conversation.clone()),
+            causal_parent_id: if default { reply.clone().or_else(|| event_id.clone()) } else { None },
             dedupe_key: None,
+            org_id: ua_core::DEFAULT_ORG.into(),
         },
     )?
     .ok_or_else(|| UaError::internal("message event was not appended"))?;
+    let org_payload = (!default).then(|| payload.to_string());
     tx.execute(
-        "INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, reply_to, expects_reply, \
-         task_id, delegation_id, event_ulid, event_seq, created_at, target_session, sender_session) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO message_index (org_id, message_id, recipient, sender, act, conversation_id, reply_to, \
+         expects_reply, task_id, delegation_id, event_ulid, event_seq, created_at, target_session, sender_session, \
+         org_payload) \
+         VALUES (?15, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16)",
         params![
             mid,
             recipient,
@@ -870,13 +1188,16 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
             event.seq,
             event.created_at,
             target,
-            sender_session
+            sender_session,
+            org,
+            org_payload
         ],
     )?;
     let mut result = json!({
         "accepted": true,
         "duplicate": false,
         "message_id": mid,
+        "client_message_id": given_id,
         "event_ulid": event.ulid,
         "seq": event.seq,
         "act": act,
@@ -891,6 +1212,7 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
         "reply_to": reply,
         "expects_reply": a.expects_reply,
         "availability": availability,
+        "sender_verified": v.identity.is_some(),
     });
     if let Some(live) = target_live {
         result["target_live"] = json!(live);
@@ -915,40 +1237,48 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs) -> UaResult<Value> {
     if !handoff_warnings.is_empty() {
         result["handoff_warnings"] = json!(handoff_warnings);
     }
-    tx.execute(
-        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![format!("{SEND_TOOL}:{mid}"), SEND_TOOL, result.to_string(), ua_core::time::now()],
-    )?;
+    if let Some(client_id) = &given_id {
+        tx.execute(
+            "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org, client_key(org, &sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
+        )?;
+    }
     Ok(result)
 }
 
 // --- list -----------------------------------------------------------------------
 
 /// A reply counts as an answer only when it goes from the message's recipient
-/// back to its sender.
-const ANSWERED_BY: &str = "(SELECT a.message_id FROM message_index a WHERE a.reply_to = i.message_id \
+/// back to its sender, in the message's own organization.
+const ANSWERED_BY: &str = "(SELECT a.message_id FROM message_index a WHERE a.org_id = i.org_id \
+                           AND a.reply_to = i.message_id \
                            AND a.sender = i.recipient AND a.recipient = i.sender ORDER BY a.event_seq LIMIT 1)";
-const ANSWERED_AT: &str = "(SELECT a.created_at FROM message_index a WHERE a.reply_to = i.message_id \
+const ANSWERED_AT: &str = "(SELECT a.created_at FROM message_index a WHERE a.org_id = i.org_id \
+                           AND a.reply_to = i.message_id \
                            AND a.sender = i.recipient AND a.recipient = i.sender ORDER BY a.event_seq LIMIT 1)";
 /// Label mail plus mail to the given session, unread by both the label and
-/// the session. Binds `(session_id, agent, session_id)`.
+/// the session, in one organization. Binds `(session_id, agent, session_id,
+/// org)`.
 const UNREAD_SQL: &str = "SELECT COUNT(*) FROM message_index i \
                           LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ?1 \
-                          WHERE i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
+                          WHERE i.org_id = ?4 AND i.recipient = ?2 AND i.read_at IS NULL AND r.read_at IS NULL \
                           AND (i.target_session IS NULL OR i.target_session = ?3)";
 
-fn unread_count(conn: &Connection, agent: &str, session: Option<&str>) -> UaResult<i64> {
-    Ok(conn.query_row(UNREAD_SQL, params![session, agent, session], |r| r.get(0))?)
+fn unread_count(conn: &Connection, org: &str, agent: &str, session: Option<&str>) -> UaResult<i64> {
+    Ok(conn.query_row(UNREAD_SQL, params![session, agent, session, org], |r| r.get(0))?)
 }
 
 #[derive(Debug, Default)]
 struct Filters {
+    /// The reader's organization: every row is filtered on it.
+    org: String,
     recipient: Option<String>,
     sender: Option<String>,
     party: Option<String>,
     conversation_id: Option<String>,
     act: Option<String>,
     message_id: Option<String>,
+    client_message_id: Option<String>,
     after_seq: Option<i64>,
     unread_only: bool,
     waiting_on_reply: bool,
@@ -962,8 +1292,9 @@ impl Filters {
     /// The WHERE clause and its arguments, after the receipt-join session.
     fn sql(&self) -> (String, Vec<SqlValue>) {
         let text = |s: &str| SqlValue::Text(s.to_string());
-        let mut clauses: Vec<String> = vec!["1=1".into()];
-        let mut args: Vec<SqlValue> = vec![self.session_id.as_deref().map_or(SqlValue::Null, text)];
+        let mut clauses: Vec<String> = vec!["i.org_id = ?".into()];
+        let mut args: Vec<SqlValue> =
+            vec![self.session_id.as_deref().map_or(SqlValue::Null, text), text(&self.org)];
         for (column, value) in [
             ("i.recipient", &self.recipient),
             ("i.sender", &self.sender),
@@ -975,6 +1306,10 @@ impl Filters {
                 clauses.push(format!("{column} = ?"));
                 args.push(text(v));
             }
+        }
+        if let Some(c) = &self.client_message_id {
+            clauses.push(format!("json_extract({MESSAGE_PAYLOAD}, '$.client_message_id') = ?"));
+            args.push(text(c));
         }
         if let Some(p) = &self.party {
             clauses.push("(i.recipient = ? OR i.sender = ?)".into());
@@ -1046,10 +1381,15 @@ fn public_row(r: &Row<'_>) -> rusqlite::Result<Value> {
         "channel": channel.unwrap_or_else(|| format!("agent.message.{act}")),
         "created_at": created_at,
         "message_id": r.get::<_, String>("message_id")?,
+        // The sender's own idempotency key, when it chose one.
+        "client_message_id": payload.get("client_message_id").cloned().unwrap_or(Value::Null),
         "act": act,
         "conversation_id": r.get::<_, String>("conversation_id")?,
         "reply_to": r.get::<_, Option<String>>("reply_to")?,
         "from_agent": r.get::<_, String>("sender")?,
+        // `false`: the sender was not authenticated, so `from_agent` is only
+        // a claim. `null`: sent before the hub recorded this.
+        "sender_verified": payload.get("sender_verified").cloned().unwrap_or(Value::Null),
         "to_agent": r.get::<_, String>("recipient")?,
         "hop": payload.get("hop").cloned().unwrap_or(Value::Null),
         "body": payload.get("body").cloned().unwrap_or(Value::Null),
@@ -1087,7 +1427,7 @@ fn query_rows(conn: &Connection, f: &Filters, limit: i64) -> UaResult<Vec<Value>
     args.push(SqlValue::Integer(limit.clamp(1, MAX_LIST_LIMIT)));
     let sql = format!(
         "SELECT i.*, COALESCE(i.read_at, r.read_at) AS eff_read_at, COALESCE(i.acked_at, r.acked_at) AS eff_acked_at, \
-         e.channel AS channel, e.payload AS payload, {ANSWERED_BY} AS answered_by, {ANSWERED_AT} AS answered_at \
+         e.channel AS channel, {MESSAGE_PAYLOAD} AS payload, {ANSWERED_BY} AS answered_by, {ANSWERED_AT} AS answered_at \
          {FROM_INDEX}{filter} ORDER BY i.event_seq {order} LIMIT ?"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1110,6 +1450,7 @@ fn count_rows(conn: &Connection, f: &Filters) -> UaResult<i64> {
 /// mail to the session is marked on its row, label mail gets a receipt.
 fn mark_read(
     conn: &Connection,
+    org: &str,
     owner: &str,
     ids: &[String],
     session: Option<&str>,
@@ -1119,20 +1460,20 @@ fn mark_read(
     for id in ids {
         total += match session {
             None => conn.execute(
-                "UPDATE message_index SET read_at = ?1 WHERE message_id = ?2 AND recipient = ?3 \
+                "UPDATE message_index SET read_at = ?1 WHERE org_id = ?4 AND message_id = ?2 AND recipient = ?3 \
                  AND read_at IS NULL AND target_session IS NULL",
-                params![stamp, id, owner],
+                params![stamp, id, owner, org],
             )?,
             Some(s) => {
                 conn.execute(
-                    "UPDATE message_index SET read_at = ?1 WHERE message_id = ?2 AND recipient = ?3 \
+                    "UPDATE message_index SET read_at = ?1 WHERE org_id = ?5 AND message_id = ?2 AND recipient = ?3 \
                      AND read_at IS NULL AND target_session = ?4",
-                    params![stamp, id, owner, s],
+                    params![stamp, id, owner, s, org],
                 )? + conn.execute(
-                    "INSERT OR IGNORE INTO message_reads (message_id, session_id, read_at) \
-                     SELECT message_id, ?1, ?2 FROM message_index WHERE message_id = ?3 AND recipient = ?4 \
-                     AND read_at IS NULL AND target_session IS NULL",
-                    params![s, stamp, id, owner],
+                    "INSERT OR IGNORE INTO message_reads (org_id, message_id, session_id, read_at) \
+                     SELECT org_id, message_id, ?1, ?2 FROM message_index WHERE org_id = ?5 AND message_id = ?3 \
+                     AND recipient = ?4 AND read_at IS NULL AND target_session IS NULL",
+                    params![s, stamp, id, owner, org],
                 )?
             }
         };
@@ -1195,20 +1536,38 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     if own_inbox {
         recipient = mailbox.clone();
     }
+    // Auth enforcement off: another label's mailbox is a board. It is read,
+    // and its read state stays its owner's.
+    let board = match (&v.own_local, &mailbox) {
+        (Some(own), Some(m)) => own != m,
+        _ => false,
+    };
+    if board && sid.is_some() {
+        return Err(UaError::invalid(format!(
+            "session_id reads as one of your own sessions; the {:?} mailbox is not yours",
+            mailbox.as_deref().unwrap_or_default()
+        )));
+    }
     if let (Some(s), Some(owner)) = (&sid, &mailbox) {
-        agents::own_session(conn, s, owner, false)?;
+        agents::own_session(conn, &v.org, s, owner, false)?;
     }
     let scope = mailbox
         .as_ref()
         .filter(|m| recipient.is_none() || recipient.as_ref() == Some(*m))
         .map(|m| (m.clone(), sid.clone()));
     let filters = Filters {
+        org: v.org.clone(),
         recipient,
         sender,
         party,
         conversation_id: clean(q.conversation_id.as_deref()),
         act,
-        message_id: clean(q.message_id.as_deref()),
+        // The caller's own client id finds the message it keyed.
+        message_id: match clean(q.message_id.as_deref()) {
+            Some(m) => Some(own_message_id(conn, &v.org, me.as_deref().unwrap_or(&v.local_label), m)?),
+            None => None,
+        },
+        client_message_id: clean(q.client_message_id.as_deref()),
         after_seq: q.after_seq,
         unread_only: q.unread_only,
         waiting_on_reply: q.waiting_on_reply,
@@ -1220,14 +1579,17 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
     } else {
         let mut rows = query_rows(conn, &filters, q.limit.unwrap_or(50))?;
         let mut marked = 0;
-        if mark && let Some(owner) = &mailbox {
+        if mark
+            && !board
+            && let Some(owner) = &mailbox
+        {
             let own: Vec<String> = rows
                 .iter()
                 .filter(|r| r["to_agent"].as_str() == Some(owner) && r["read_at"].is_null())
                 .filter_map(|r| r["message_id"].as_str().map(str::to_string))
                 .collect();
             if !own.is_empty() {
-                let (n, stamp) = mark_read(conn, owner, &own, sid.as_deref())?;
+                let (n, stamp) = mark_read(conn, &v.org, owner, &own, sid.as_deref())?;
                 marked = n;
                 for row in rows.iter_mut() {
                     if row["message_id"].as_str().is_some_and(|id| own.iter().any(|o| o == id)) {
@@ -1247,11 +1609,14 @@ fn list_messages(conn: &Connection, v: &Viewer, q: ListArgs, mark: bool) -> UaRe
         if mark {
             out["marked_read"] = json!(marked);
             out["mailbox"] = json!(mailbox);
+            if board {
+                out["read_state"] = json!("unchanged: this is not your mailbox, so nothing was marked read");
+            }
         }
         out
     };
     if let Some(owner) = &mailbox {
-        result["unread"] = json!(unread_count(conn, owner, sid.as_deref())?);
+        result["unread"] = json!(unread_count(conn, &v.org, owner, sid.as_deref())?);
     }
     if let Some(s) = sid {
         result["session_id"] = json!(s);
@@ -1279,6 +1644,8 @@ fn mark_untrusted(result: &mut Value, caller: Option<&str>) {
 // --- ack ------------------------------------------------------------------------
 
 fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
+    let org = v.org.as_str();
+    require_org(tx, org)?;
     let mid = clean(a.message_id.as_deref());
     let (seq_cursor, id_cursor) = match a.through {
         Some(Through::Seq(n)) if n < 0 => return Err(UaError::invalid("through must be a non-negative seq")),
@@ -1297,19 +1664,30 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
             }
             me.clone()
         }
-        None => validate_label(Some(named.as_deref().unwrap_or(&v.local_label)), "to_agent")?,
+        None => {
+            if let (Some(own), Some(n)) = (&v.own_local, &named)
+                && n != own
+            {
+                return Err(UaError::invalid(format!(
+                    "you can ack only your own mailbox ({own:?}); another label's mailbox is read-only for you"
+                )));
+            }
+            validate_label(Some(named.as_deref().unwrap_or(&v.local_label)), "to_agent")?
+        }
     };
     let sid = clean(a.session_id.as_deref());
     if let Some(s) = &sid {
-        agents::own_session(tx, s, &mailbox, false)?;
+        agents::own_session(tx, org, s, &mailbox, false)?;
     }
-    let in_reach = "recipient = ?1 AND message_id = ?2 AND (target_session IS NULL OR target_session = ?3)";
+    // Another organization's message answers exactly as a missing one.
+    let in_reach = "org_id = ?4 AND recipient = ?1 AND message_id = ?2 \
+                    AND (target_session IS NULL OR target_session = ?3)";
     let mut through_seq = seq_cursor;
     if let Some(m) = &mid {
         let found = tx
             .query_row(
                 &format!("SELECT 1 FROM message_index WHERE {in_reach}"),
-                params![mailbox, m, sid],
+                params![mailbox, m, sid, org],
                 |_| Ok(()),
             )
             .optional()?;
@@ -1322,7 +1700,7 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
         let seq: Option<i64> = tx
             .query_row(
                 &format!("SELECT event_seq FROM message_index WHERE {in_reach}"),
-                params![mailbox, c, sid],
+                params![mailbox, c, sid, org],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1344,12 +1722,12 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
         None => ("target_session IS NULL", vec![]),
         Some(s) => ("target_session = ?", vec![text(s)]),
     };
-    let mut args = vec![text(&stamp), text(&stamp), text(&mailbox), key.clone()];
+    let mut args = vec![text(&stamp), text(&stamp), text(org), text(&mailbox), key.clone()];
     args.append(&mut scope_args);
     let mut acked = tx.execute(
         &format!(
             "UPDATE message_index SET acked_at = COALESCE(acked_at, ?), read_at = COALESCE(read_at, ?) \
-             WHERE recipient = ? AND {pick} AND acked_at IS NULL AND {scope}"
+             WHERE org_id = ? AND recipient = ? AND {pick} AND acked_at IS NULL AND {scope}"
         ),
         params_from_iter(args),
     )?;
@@ -1359,32 +1737,32 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
             let mut stmt = tx.prepare(&format!(
                 "SELECT i.message_id FROM message_index i \
                  LEFT JOIN message_reads r ON r.message_id = i.message_id AND r.session_id = ? \
-                 WHERE i.recipient = ? AND i.target_session IS NULL AND i.acked_at IS NULL \
+                 WHERE i.org_id = ? AND i.recipient = ? AND i.target_session IS NULL AND i.acked_at IS NULL \
                  AND r.acked_at IS NULL AND i.{pick}"
             ))?;
-            stmt.query_map(params_from_iter([text(s), text(&mailbox), key]), |r| r.get(0))?
+            stmt.query_map(params_from_iter([text(s), text(org), text(&mailbox), key]), |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
         for id in &pending {
             tx.execute(
-                "INSERT INTO message_reads (message_id, session_id, read_at, acked_at) VALUES (?1, ?2, ?3, ?3) \
+                "INSERT INTO message_reads (org_id, message_id, session_id, read_at, acked_at) \
+                 VALUES (?4, ?1, ?2, ?3, ?3) \
                  ON CONFLICT(message_id, session_id) DO UPDATE SET acked_at = excluded.acked_at",
-                params![id, s, stamp],
+                params![id, s, stamp, org],
             )?;
         }
         acked += pending.len();
     }
     if acked > 0 {
-        ledger::append(
+        mailbox_event(
             tx,
-            EventInput::new(
-                "agent.mailbox.acked",
-                json!({ "mailbox": mailbox, "session_id": sid, "message_id": mid, "through_seq": through_seq, "count": acked }),
-            )
-            .by(mailbox.clone()),
+            org,
+            "agent.mailbox.acked",
+            &mailbox,
+            json!({ "session_id": sid, "message_id": mid, "through_seq": through_seq, "count": acked }),
         )?;
     }
-    let unread = unread_count(tx, &mailbox, sid.as_deref())?;
+    let unread = unread_count(tx, org, &mailbox, sid.as_deref())?;
     Ok(json!({
         "acked": acked,
         "mailbox": mailbox,
@@ -1396,11 +1774,44 @@ fn ack(tx: &mut WriteTx<'_>, v: &Viewer, a: AckArgs) -> UaResult<Value> {
     }))
 }
 
+/// Append a mailbox receipt event (`agent.mailbox.read` / `.acked`) about
+/// `mailbox` in organization `org`, with `payload`'s fields after the
+/// mailbox.
+///
+/// ORG-EVENT-DEFAULT: the event is written to the default organization's
+/// ledger, so another organization's receipt names no mailbox and no
+/// client-chosen message id (`plans::ledger_label` / `ledger_text`), and its
+/// originator is the neutral `system`.
+fn mailbox_event(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    mailbox: &str,
+    payload: Value,
+) -> UaResult<()> {
+    let mut p = json!({ "mailbox": super::plans::ledger_label(org, Some(mailbox)) });
+    if let (Some(out), Value::Object(fields)) = (p.as_object_mut(), payload) {
+        out.extend(fields);
+    }
+    if org != ua_core::DEFAULT_ORG
+        && let Some(m) = p.get("message_id").and_then(Value::as_str).map(str::to_string)
+    {
+        p["message_id"] = super::plans::ledger_text(org, &m);
+    }
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, channel, p)
+            .by(crate::approvals::ledger_originator(org, mailbox)),
+    )?;
+    Ok(())
+}
+
 // --- tools ----------------------------------------------------------------------
 
 /// Send mail as a hub service (`from`, for example `hub-node`), in the
 /// caller's transaction: to one session of `to_agent` when `to_session` is
-/// given, else label mail. `message_id` makes a retry return the first result.
+/// given, else label mail. `message_id` is the service's client id: a retry
+/// under it returns the first result. The result's `message_id` is the hub's.
 pub(crate) fn send_system(
     tx: &mut WriteTx<'_>,
     from: &str,
@@ -1410,11 +1821,15 @@ pub(crate) fn send_system(
     body: &str,
     task_id: Option<i64>,
 ) -> UaResult<Value> {
+    // The hub's own senders (node notices) serve the default organization,
+    // as every session they notify is its.
     let v = Viewer {
         identity: Some(from.to_string()),
         unrestricted: true,
+        own_local: None,
         local_label: from.to_string(),
         humans: Vec::new(),
+        org: ua_core::DEFAULT_ORG.into(),
     };
     send(
         tx,
@@ -1438,23 +1853,51 @@ pub(crate) fn send_system(
             to_session: to_session.map(str::to_string),
             from_session: None,
         },
+        None,
     )
 }
 
 async fn message_send(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
     let v = Viewer::of(&ctx);
-    ctx.hub.db().write_async(move |tx| send(tx, &v, a)).await
+    let crew = CREW_DELIVERY.try_with(Clone::clone).ok();
+    ctx.hub.db().write_async(move |tx| send(tx, &v, a, crew.as_deref())).await
+}
+
+tokio::task_local! {
+    /// The session a `crew_intervene` call is delivering to. Only that tool
+    /// binds it, after its own profile and approval gates, never a client.
+    static CREW_DELIVERY: String;
+}
+
+/// Run `f` (a registry `message_send` call) as a `crew_intervene` delivery
+/// to `session_id`: the sender may name that session's `crew:<session>`
+/// thread without already being a party to it.
+pub(super) async fn as_crew_delivery<F: std::future::Future>(session_id: String, f: F) -> F::Output {
+    CREW_DELIVERY.scope(session_id, f).await
 }
 
 async fn message_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
     let v = Viewer::of(&ctx);
     let caller = v.identity.clone();
     // A session_id counts as that session's heartbeat, which needs the writer;
-    // the mailbox itself is only read.
+    // the mailbox itself is only read. An unknown or suspended organization
+    // is refused before either.
     let mut out = if clean(a.session_id.as_deref()).is_some() {
-        ctx.hub.db().write_async(move |tx| list_messages(tx, &v, a, false)).await?
+        ctx.hub
+            .db()
+            .write_async(move |tx| {
+                require_org(tx, &v.org)?;
+                list_messages(tx, &v, a, false)
+            })
+            .await?
     } else {
-        ctx.hub.db().read_async(move |c| list_messages(c, &v, a, false)).await?
+        ctx.hub
+            .db()
+            .read_async(move |c| {
+                require_org(c, &v.org)?;
+                list_messages(c, &v, a, false)
+            })
+            .await?
     };
     mark_untrusted(&mut out, caller.as_deref());
     Ok(out)
@@ -1479,17 +1922,17 @@ async fn message_inbox(ctx: ToolCtx, a: InboxArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &v.org)?;
             let out = list_messages(tx, &v, q, true)?;
             let marked = out["marked_read"].as_u64().unwrap_or(0);
             if marked > 0 {
                 let mailbox = out["mailbox"].as_str().unwrap_or(&v.local_label).to_string();
-                ledger::append(
+                mailbox_event(
                     tx,
-                    EventInput::new(
-                        "agent.mailbox.read",
-                        json!({ "mailbox": mailbox, "session_id": out.get("session_id"), "count": marked }),
-                    )
-                    .by(mailbox.clone()),
+                    &v.org,
+                    "agent.mailbox.read",
+                    &mailbox,
+                    json!({ "session_id": out.get("session_id"), "count": marked }),
                 )?;
             }
             Ok(out)
@@ -1562,6 +2005,7 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "agent_resume" => governance::agent_resume(ctx, action_params(action, params)?).await,
         "agent_terminate" => governance::agent_terminate(ctx, action_params(action, params)?).await,
         "agent_retire" => governance::agent_retire(ctx, action_params(action, params)?).await,
+        "agent_forget" => governance::agent_forget(ctx, action_params(action, params)?).await,
         "agent_unretire" => governance::agent_unretire(ctx, action_params(action, params)?).await,
         "task_hold" => governance::task_hold(ctx, action_params(action, params)?).await,
         "task_holds" => governance::task_holds(ctx, action_params(action, params)?).await,
@@ -1610,10 +2054,7 @@ async fn coordination_manage(ctx: ToolCtx, a: CoordinationArgs) -> UaResult<Valu
         "queue_fold" => continuity::queue_fold(ctx, action_params(action, params)?).await,
         "queue_close_merged" => continuity::queue_close_merged(ctx, action_params(action, params)?).await,
         "queue_unpark" => continuity::queue_unpark(ctx, action_params(action, params)?).await,
-        other => Err(UaError::invalid(format!(
-            "unknown coordination_manage action {other:?}; supported actions: {}",
-            COORDINATION_ACTIONS.join(", ")
-        ))),
+        other => Err(crate::routes::unhandled("coordination_manage", other)),
     }
 }
 
@@ -1621,7 +2062,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "message_send",
-            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction; a repeated message_id returns the first result. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents.",
+            "Send a typed inter-agent message (request, inform, query, done, handoff) to an agent label (to_agent) or one live session (to_session). Stored as a ledger event with a mailbox index row in one transaction. The hub mints every message_id; a client message_id is the sender's own idempotency key (a retry with it returns the first result, another sender's use of the same id is independent), echoed as client_message_id and usable as the sender's reply_to. reply_to threads a reply into its parent's conversation; expects_reply tracks it in waiting_on_reply. Hop and short-reply loop guards apply between agents. A verified caller may name a conversation_id it is already a party to; any other id answers not_found like a missing one, while a mail-unrestricted reader may name a new one. Of the restricted callers, only crew_intervene may open or join a session's crew:<session> thread.",
             message_send,
         )
         .family("messaging"),
@@ -1640,7 +2081,7 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "coordination_manage",
-            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch) and project_repo_unbind (params project) are for a verified lifecycle operator or human; project_repo_get (params project) and project_repo_list read. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Task workflow: task_workflow_get (params task_id, head_sha) returns the stage, resume capsule (goal, done, focus) and every check graded at a head: verified (the hub looked its CI run up), attested (an agent's word, or a reference that contradicted it) or unknown (nothing recorded at that head); task_workflow_set (params task_id, stage plan|implement|verify|review|merge|deploy|prove|done, goal, done, focus, head_sha, expected_checks: names or {name, job} binding a check to one CI job, expected_revision) and task_check_record (params task_id, name, outcome pass|fail, head_sha, ref {kind: ci_run, ref, repo, job}, detail, verify) are for the claimant, next owner, a lifecycle operator or a human; a ref needs the full 40-hex head_sha, its repo must be the task project's bound repo (repo_mismatch; without a binding it cannot be verified) and its job the check's bound job (job_mismatch); task_check_verify (params task_id, name, head_sha) looks a stored check up again. Report mode: nothing gates on it. Session handoff: session_handoff_propose (params session_id, done, next_steps, open_questions, task_id, supersede) writes a draft note for a session you own (done and next_steps need one item each; one pending note per session, a 5-minute cooldown and 5 proposals per hour); session_handoff_update (params note_id, done, next_steps, open_questions) edits the draft; session_handoff_seal (params note_id) is the commit point; session_handoff_discard (params note_id) drops a draft; session_handoff_recover (params session_id) returns the latest sealed note, never a draft, to the session's owner, the note's receiver, a lifecycle operator or a human (anyone else reads not_found); session_handoff_ack (params note_id) is the receiver acknowledging a note handed to it. conversation_handoff (params conversation_id, task_id or title, project, priority) links an existing task or creates one that references a conversation you can see, without copying its messages; conversation_handoffs (params conversation_id, same caller rule) lists the handoffs a ledger event records, and notes-only links as unaudited. Queue closure: queue_health (params stale_days) counts open, parked, stale and review-ready milestones; queue_stale (params stale_days, limit) lists stale tasks; queue_sweep (params stale_days) proposes parks and folds and writes nothing; queue_park (params task_id, reason, approved_by, fold_children, dry_run; a protected row needs a verified human or lifecycle operator, and approved_by is only that caller's note) parks a task (it keeps its status, leaves task_list unless parked=true, and refuses claims with task_parked) and folds its open descendants into it; queue_fold (params task_id, into, reason) folds a later child into its parked root; queue_unpark (params task_id, reason) restores a parked root and everything folded into it. Park, fold and unpark need a verified caller; a task someone holds (claimant or next owner) needs that holder, a lifecycle operator or a human. queue_close_merged (params dry_run default true, repo) looks up on GitHub every pull request an unfinished task in a bound project links (evidence_ref or notes) and closes the tasks whose PR merged through task_update with the merge commit as evidence_ref; ambiguous (two PRs), live, human-gated, tracking-lane or parent-of-open-work tasks are reported, never closed; a real run needs the same callers as queue_park. Idle-session wakes: session_wake_opt_in (params session_id, wake, node: your own session asks for, or withdraws from, wakes delivered by one of your own nodes: the node named, else your one node on its host), session_wake_grant (params session_id, grant: verified humans only), session_wake_decline (params session_id, reason: any verified human, a lifecycle operator or the session's own agent; kept until a later grant), session_wake_status (params session_id). Action arguments go in params.",
+            "Consolidated coordination actions. action is one of: message_inbox (list your unread mail and mark it read; params like message_list plus unread_only default true), message_ack (params message_id or through=<seq|message_id>, session_id), agent_list (params include_configured), agent_context (no params), node_retire / node_unretire (params node, reason: retire takes a node out of the listing and refuses its registration and heartbeats until node_unretire), node_reassign (params node, to_agent, reason: move a node name to another agent label), node_forget (params node, reason: delete a retired node's row so the name can be registered again). Those four are for lifecycle operators only, ledgered, and refused while the node has queued or claimed work; node_reassign refuses a to_agent of another organization (agent_org_mismatch). node_retire and node_forget take any_org=true for hub recovery by the default organization's lifecycle operators: the node of whichever organization holds the name is retired or forgotten in that organization, and another organization's node answers with only {node, org_id, changed, retired or forgotten, event_ulid, hub_recovery}. node_item_cancel (params item_id, reason: cancel a queued node work item, or ask the node to stop a claimed one) and node_item_restart (params item_id: queue a finished item again, behind a new approval) and node_item_reconcile (params item_id, status, note: record the real outcome of an item whose lease lapsed) are for the item's requester, the node's agent or an operator. node_command_start (params node, argv, cwd, timeout_s, task_id, session_id: run an argv, never a shell string, on a node that allowlists argv[0], behind a one-time human approval showing the argv; its owner gets one message from hub-node when it ends), node_command_status (params item_id) and node_command_adopt (params item_id, session_id: rebind which of the owner's sessions is notified). Agent lifecycle: agent_state (params agent) and agent_states read; agent_pause / agent_terminate (params agent, reason) and agent_resume (params agent, reason) change state: an operator may change any agent, an agent only itself (and resume only from a stop it imposed itself: an operator's stop stays the operator's to lift, even after the agent terminates itself). A paused, terminated or retired agent takes no work (claims, renewals, dispatch, node work: reason codes agent_paused, agent_terminated, agent_retired); pause stops in-flight runs, terminate also returns its doing claims to open. agent_retire (params agent, reason, owner, any_org) and agent_unretire (params agent, reason) are for lifecycle operators only: retire is refused while the agent holds doing claims and revokes its managed tokens and OAuth sign-ins; resume cannot undo it. agent_forget (params agent, reason, any_org, lifecycle operators only) deletes a retired agent's row so its label can be registered again. Agent labels are one hub namespace: a label another organization holds is refused (agent_label_taken), and agent_retire and agent_forget take any_org=true for hub recovery by the default organization's lifecycle operators, acting in the agent's own organization and answering only {agent, org_id, changed, retired or forgotten, hub_recovery}. task_hold (params root_task_id, mode pause|cancel|resume|restore, reason, release_policy manual|after_active_runs_finish, hold_id): hold a task and its subtree; held tasks refuse new claims, dispatch and node work (task_held) while a live renewal passes; cancel also cancels the members' live runs and node items; restore releases once those runs have closed. task_holds (params root_task_id, status active|released|all, limit) and task_hold_get (params hold_id) read. task_claim_release (params task_id, expected_claimant, reason, expected_run_id, expected_claimed_at): an operator releases another agent's live claim, fenced on the claimant, run and claim generation; doing returns to open, done/cancelled is refused. project_repo_bind (params project, repo, default_branch) and project_repo_unbind (params project) are for a verified lifecycle operator or human; project_repo_get (params project) and project_repo_list read. Work proposals: work_proposal_file (params title, items: 1-50 {title, notes, scope {repo, files}, priority}, reporting_mode), work_proposal_decide (params proposal_id, decisions [{index, approve, edits}]: verified human callers only; each approved item becomes one task whose notes start with a frozen contract block ending in [end contract], re-checked by task_claim, dispatch and node enqueues; text appended after the block is not part of the work order), work_proposal_withdraw (params proposal_id, reason: the proposer, before any decision), work_proposal_get (params proposal_id), work_proposal_list (params status, proposer, limit), work_proposal_recover (params older_than_s). Task workflow: task_workflow_get (params task_id, head_sha) returns the stage, resume capsule (goal, done, focus) and every check graded at a head: verified (the hub looked its CI run up), attested (an agent's word, or a reference that contradicted it) or unknown (nothing recorded at that head); task_workflow_set (params task_id, stage plan|implement|verify|review|merge|deploy|prove|done, goal, done, focus, head_sha, expected_checks: names or {name, job} binding a check to one CI job, expected_revision) and task_check_record (params task_id, name, outcome pass|fail, head_sha, ref {kind: ci_run, ref, repo, job}, detail, verify) are for the claimant, next owner, a lifecycle operator or a human; a ref needs the full 40-hex head_sha, its repo must be the task project's bound repo (repo_mismatch; without a binding it cannot be verified) and its job the check's bound job (job_mismatch); task_check_verify (params task_id, name, head_sha) looks a stored check up again. Report mode: nothing gates on it. Session handoff: session_handoff_propose (params session_id, done, next_steps, open_questions, task_id, supersede) writes a draft note for a session you own (done and next_steps need one item each; one pending note per session, a 5-minute cooldown and 5 proposals per hour); session_handoff_update (params note_id, done, next_steps, open_questions) edits the draft; session_handoff_seal (params note_id) is the commit point; session_handoff_discard (params note_id) drops a draft; session_handoff_recover (params session_id) returns the latest sealed note, never a draft, to the session's owner, the note's receiver, a lifecycle operator or a human (anyone else reads not_found); session_handoff_ack (params note_id) is the receiver acknowledging a note handed to it. conversation_handoff (params conversation_id, task_id or title, project, priority) links an existing task or creates one for a conversation you can see, recording only the audited ledger event: no message is copied and no conversation id reaches the task; conversation_handoffs (params conversation_id, same caller rule) lists the handoffs a ledger event records, and notes-only links as unaudited. Queue closure: queue_health (params stale_days) counts open, parked, stale and review-ready milestones; queue_stale (params stale_days, limit) lists stale tasks; queue_sweep (params stale_days) proposes parks and folds and writes nothing; queue_park (params task_id, reason, approved_by, fold_children, dry_run; a protected row needs a verified human or lifecycle operator, and approved_by is only that caller's note) parks a task (it keeps its status, leaves task_list unless parked=true, and refuses claims with task_parked) and folds its open descendants into it; queue_fold (params task_id, into, reason) folds a later child into its parked root; queue_unpark (params task_id, reason) restores a parked root and everything folded into it. Park, fold and unpark need a verified caller; a task someone holds (claimant or next owner) needs that holder, a lifecycle operator or a human. queue_close_merged (params dry_run default true, repo) looks up on GitHub every pull request an unfinished task in a bound project links (evidence_ref or notes) and closes the tasks whose PR merged through task_update with the merge commit as evidence_ref; ambiguous (two PRs), live, human-gated, tracking-lane or parent-of-open-work tasks are reported, never closed; a real run needs the same callers as queue_park. Idle-session wakes: session_wake_opt_in (params session_id, wake, node: your own session asks for, or withdraws from, wakes delivered by one of your own nodes: the node named, else your one node on its host), session_wake_grant (params session_id, grant: verified humans only), session_wake_decline (params session_id, reason: any verified human, a lifecycle operator or the session's own agent; kept until a later grant), session_wake_status (params session_id); each reads and writes only the caller's organization's sessions and nodes. Action arguments go in params.",
             coordination_manage,
         )
         .handler_may_gate(crate::HandlerGate::Actions(&["node_command_start", "node_item_restart"]))

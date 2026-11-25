@@ -45,12 +45,13 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::{SchemaPart, WriteTx};
 
 use super::{
-    Item, NodeRow, TERMINAL, cancel_item, insert_item, is_operator, load_item, load_node, now, record,
-    validate_new, verified_caller,
+    Item, NodeRow, TERMINAL, cancel_item, insert_item, load_item, load_node, now, record, validate_new,
+    verified_caller,
 };
 use crate::families::nodes;
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "node_acceptance.v1",
@@ -128,6 +129,8 @@ pub fn receipt_text(run: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct Row {
+    /// The node's organization.
+    org_id: String,
     node: String,
     run_id: String,
     agent: String,
@@ -146,7 +149,7 @@ struct Row {
 }
 
 const ROW_COLS: &str = "node, run_id, agent, state, complete_item_id, cancel_item_id, checks_json, reason, code_sha, \
-    started_by, started_at, evaluated_at, accepted_at, attested_by, attestation_ref";
+    started_by, started_at, evaluated_at, accepted_at, attested_by, attestation_ref, org_id";
 
 fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let checks: String = r.get(6)?;
@@ -169,12 +172,18 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         accepted_at: r.get(12)?,
         attested_by: r.get(13)?,
         attestation_ref: r.get(14)?,
+        org_id: r.get(15)?,
     })
 }
 
-fn load_row(c: &Connection, node: &str) -> UaResult<Option<Row>> {
-    Ok(c.query_row(&format!("SELECT {ROW_COLS} FROM node_acceptance WHERE node = ?1"), [node], row_from)
-        .optional()?)
+/// `node`'s acceptance run in organization `org` (the node's).
+fn load_row(c: &Connection, org: &str, node: &str) -> UaResult<Option<Row>> {
+    Ok(c.query_row(
+        &format!("SELECT {ROW_COLS} FROM node_acceptance WHERE node = ?1 AND org_id = ?2"),
+        params![node, org],
+        row_from,
+    )
+    .optional()?)
 }
 
 fn age_s(ts: &str) -> Option<i64> {
@@ -443,11 +452,12 @@ fn outcome(row: &Row, checks: &Map<String, Value>) -> (String, Option<String>) {
 /// Compute the run's current view without writing anything.
 fn compute(c: &Connection, row: &Row) -> UaResult<Row> {
     let run = row.run_id.as_str();
-    let complete = row.complete_item_id.as_deref().map(|id| load_item(c, id)).transpose()?.flatten();
-    let cancel = row.cancel_item_id.as_deref().map(|id| load_item(c, id)).transpose()?.flatten();
+    let org = row.org_id.as_str();
+    let complete = row.complete_item_id.as_deref().map(|id| load_item(c, org, id)).transpose()?.flatten();
+    let cancel = row.cancel_item_id.as_deref().map(|id| load_item(c, org, id)).transpose()?.flatten();
     let complete_evs = item_events(c, row.complete_item_id.as_deref())?;
     let cancel_evs = item_events(c, row.cancel_item_id.as_deref())?;
-    let node = load_node(c, &row.node)?;
+    let node = load_node(c, org, &row.node)?;
     let (launch, progress) = launch_and_progress(complete.as_ref(), &complete_evs, run);
     let mut checks = Map::new();
     checks.insert("launch".into(), launch);
@@ -483,21 +493,23 @@ fn compute(c: &Connection, row: &Row) -> UaResult<Row> {
 /// Re-evaluate `node`'s latest run and record the outcome, in the caller's
 /// transaction. Cancels the run's cancel item first if it is running and the
 /// event-time cancel was missed, and the run's open items once it fails.
-pub(crate) fn evaluate_tx(tx: &mut WriteTx<'_>, cfg: &Config, node: &str) -> UaResult<Value> {
-    let Some(row) = load_row(tx, node)? else { return Ok(not_run(node, cfg)) };
+///
+/// `org` is the node's organization.
+pub(crate) fn evaluate_tx(tx: &mut WriteTx<'_>, cfg: &Config, org: &str, node: &str) -> UaResult<Value> {
+    let Some(row) = load_row(tx, org, node)? else { return Ok(not_run(node, cfg)) };
     if row.state == "pending"
         && let Some(id) = row.cancel_item_id.as_deref()
-        && let Some(item) = load_item(tx, id)?
+        && let Some(item) = load_item(tx, org, id)?
         && item.status == "claimed"
         && !item.cancel_requested
         && !of_run(&item_events(tx, Some(id))?, "acceptance_progress", &row.run_id).is_empty()
     {
-        cancel_item(tx, id, ACTOR, "device acceptance: cancel the running job")?;
+        cancel_item(tx, org, id, ACTOR, "device acceptance: cancel the running job")?;
     }
     let out = compute(tx, &row)?;
     tx.execute(
         "UPDATE node_acceptance SET state = ?3, checks_json = ?4, reason = ?5, code_sha = ?6, evaluated_at = ?7, \
-         accepted_at = ?8, updated_at = ?7 WHERE node = ?1 AND run_id = ?2 AND state = ?9",
+         accepted_at = ?8, updated_at = ?7 WHERE node = ?1 AND run_id = ?2 AND state = ?9 AND org_id = ?10",
         params![
             node,
             row.run_id,
@@ -508,18 +520,20 @@ pub(crate) fn evaluate_tx(tx: &mut WriteTx<'_>, cfg: &Config, node: &str) -> UaR
             out.evaluated_at,
             out.accepted_at,
             row.state,
+            org,
         ],
     )?;
     if out.state == "failed" {
         for id in [&row.complete_item_id, &row.cancel_item_id].into_iter().flatten() {
-            if load_item(tx, id)?.is_some_and(|i| matches!(i.status.as_str(), "queued" | "claimed")) {
-                cancel_item(tx, id, ACTOR, "device acceptance run ended")?;
+            if load_item(tx, org, id)?.is_some_and(|i| matches!(i.status.as_str(), "queued" | "claimed")) {
+                cancel_item(tx, org, id, ACTOR, "device acceptance run ended")?;
             }
         }
     }
     if out.state != row.state {
         record(
             tx,
+            org,
             &format!("acceptance_{}", out.state),
             json!({ "node": node, "run_id": row.run_id, "reason": out.reason, "code_sha": out.code_sha }),
             ACTOR,
@@ -533,31 +547,40 @@ pub(crate) fn evaluate_tx(tx: &mut WriteTx<'_>, cfg: &Config, node: &str) -> UaR
 /// different code or harness/backend facts. A pending or accepted run is
 /// marked `failed` with `voided: <why>` (its open items cancelled); with
 /// `forget` the row is deleted as well. Returns whether a run was ended.
-pub(crate) fn void_tx(tx: &mut WriteTx<'_>, node: &str, why: &str, forget: bool) -> UaResult<bool> {
-    let Some(row) = load_row(tx, node)? else { return Ok(false) };
+///
+/// `org` is the node's organization.
+pub(crate) fn void_tx(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    node: &str,
+    why: &str,
+    forget: bool,
+) -> UaResult<bool> {
+    let Some(row) = load_row(tx, org, node)? else { return Ok(false) };
     let live = row.state != "failed";
     if live {
         let reason = format!("voided: {why}; start a fresh run");
         let ts = now();
         tx.execute(
             "UPDATE node_acceptance SET state = 'failed', reason = ?2, accepted_at = NULL, updated_at = ?3 \
-             WHERE node = ?1",
-            params![node, reason, ts],
+             WHERE node = ?1 AND org_id = ?4",
+            params![node, reason, ts, org],
         )?;
         for id in [&row.complete_item_id, &row.cancel_item_id].into_iter().flatten() {
-            if load_item(tx, id)?.is_some_and(|i| matches!(i.status.as_str(), "queued" | "claimed")) {
-                cancel_item(tx, id, ACTOR, "device acceptance voided")?;
+            if load_item(tx, org, id)?.is_some_and(|i| matches!(i.status.as_str(), "queued" | "claimed")) {
+                cancel_item(tx, org, id, ACTOR, "device acceptance voided")?;
             }
         }
         record(
             tx,
+            org,
             "acceptance_failed",
             json!({ "node": node, "run_id": row.run_id, "reason": reason, "previous_state": row.state }),
             ACTOR,
         )?;
     }
     if forget {
-        tx.execute("DELETE FROM node_acceptance WHERE node = ?1", [node])?;
+        tx.execute("DELETE FROM node_acceptance WHERE node = ?1 AND org_id = ?2", [node, org])?;
     }
     Ok(live)
 }
@@ -570,12 +593,13 @@ pub(crate) fn on_events(tx: &mut WriteTx<'_>, item: &Item, kinds: &[String]) -> 
     if item.backend != BACKEND || !kinds.iter().any(|k| k == "acceptance_progress") {
         return Ok(());
     }
-    let Some(row) = load_row(tx, &item.node)? else { return Ok(()) };
+    let org = item.org_id.as_str();
+    let Some(row) = load_row(tx, org, &item.node)? else { return Ok(()) };
     if row.state != "pending" || row.cancel_item_id.as_deref() != Some(item.id.as_str()) {
         return Ok(());
     }
-    if load_item(tx, &item.id)?.is_some_and(|i| i.status == "claimed" && !i.cancel_requested) {
-        cancel_item(tx, &item.id, ACTOR, "device acceptance: cancel the running job")?;
+    if load_item(tx, org, &item.id)?.is_some_and(|i| i.status == "claimed" && !i.cancel_requested) {
+        cancel_item(tx, org, &item.id, ACTOR, "device acceptance: cancel the running job")?;
     }
     Ok(())
 }
@@ -585,12 +609,12 @@ pub(crate) fn on_receipt(tx: &mut WriteTx<'_>, cfg: &Config, item: &Item) -> UaR
     if item.backend != BACKEND {
         return Ok(());
     }
-    if let Some(row) = load_row(tx, &item.node)?
+    if let Some(row) = load_row(tx, &item.org_id, &item.node)?
         && [&row.complete_item_id, &row.cancel_item_id]
             .iter()
             .any(|id| id.as_deref() == Some(item.id.as_str()))
     {
-        evaluate_tx(tx, cfg, &item.node)?;
+        evaluate_tx(tx, cfg, &item.org_id, &item.node)?;
     }
     Ok(())
 }
@@ -603,7 +627,7 @@ pub(crate) struct ClaimGate {
 }
 
 pub(crate) fn claim_gate(c: &Connection, cfg: &Config, node: &NodeRow) -> UaResult<ClaimGate> {
-    let row = load_row(c, &node.node)?;
+    let row = load_row(c, &node.org_id, &node.node)?;
     let real = !cfg.node_require_acceptance || accepted(row.as_ref(), &node.agent);
     let acceptance_ids = row
         .filter(|r| r.state == "pending" && r.agent == node.agent && !past_deadline(r))
@@ -624,7 +648,7 @@ pub(crate) fn require_accepted(c: &Connection, cfg: &Config, node: &NodeRow, bac
     if backend == BACKEND || !cfg.node_require_acceptance {
         return Ok(());
     }
-    let row = load_row(c, &node.node)?;
+    let row = load_row(c, &node.org_id, &node.node)?;
     if accepted(row.as_ref(), &node.agent) {
         return Ok(());
     }
@@ -666,12 +690,36 @@ pub struct AttestArgs {
     pub evidence_ref: String,
 }
 
-/// The node's own agent or an operator may start or evaluate a run.
+/// Device acceptance reads its evidence (the acceptance items' ACP events)
+/// back from the ledger, and another organization's node events keep no
+/// event data in the default organization's ledger (`ledger_payload`), so a
+/// run can only be evaluated for the default organization's nodes. Another
+/// organization is refused before anything is queued.
+fn default_only(org: &str) -> UaResult<()> {
+    if org == ua_core::DEFAULT_ORG {
+        Ok(())
+    } else {
+        Err(UaError::denied(
+            "org_unsupported",
+            "device acceptance runs only in the default organization: its evidence is read from the hub ledger",
+        ))
+    }
+}
+
+/// The node's own agent or an operator may start or evaluate a run, on a
+/// node of the caller's organization (another's answers as unregistered).
 fn authorize(c: &Connection, hub: &Hub, ctx: &ToolCtx, who: &str, node: &str) -> UaResult<NodeRow> {
-    let Some(row) = load_node(c, node)? else {
+    super::require_org(c, &ctx.caller.org_id)?;
+    let Some(row) = load_node(c, &ctx.caller.org_id, node)? else {
         return Err(UaError::not_found(format!("node {node:?} is not registered")));
     };
-    if row.agent != who && !is_operator(hub, &ctx.caller, who) {
+    if row.agent != who
+        && !Authz::new(hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        )
+    {
         return Err(UaError::denied(
             "not_node_agent",
             format!(
@@ -704,9 +752,11 @@ pub(crate) async fn node_acceptance_start(ctx: ToolCtx, a: NodeArgs) -> UaResult
         .db()
         .write_async(move |tx| {
             let node = authorize(tx, &hub, &c2, &who, &name)?;
+            default_only(&node.org_id)?;
+            let org = node.org_id.clone();
             // Expire an abandoned run before reserving a new one.
-            evaluate_tx(tx, hub.cfg(), &name)?;
-            if let Some(existing) = load_row(tx, &name)?
+            evaluate_tx(tx, hub.cfg(), &org, &name)?;
+            if let Some(existing) = load_row(tx, &org, &name)?
                 && existing.state == "pending"
             {
                 return Err(UaError::conflict_code(
@@ -752,7 +802,9 @@ pub(crate) async fn node_acceptance_start(ctx: ToolCtx, a: NodeArgs) -> UaResult
                     None,
                     None,
                 )?;
-                let queued = insert_item(tx, &hub, &n, &node, &who)?;
+                // An acceptance item binds no task; it is the node's
+                // organization's.
+                let queued = insert_item(tx, &hub, &org, &n, &node, &who)?;
                 items.push(queued["item_id"].as_str().unwrap_or_default().to_string());
             }
             let ts = now();
@@ -761,12 +813,12 @@ pub(crate) async fn node_acceptance_start(ctx: ToolCtx, a: NodeArgs) -> UaResult
             let code_sha = node.facts.get("code_sha").and_then(Value::as_str).map(str::to_string);
             tx.execute(
                 "INSERT OR REPLACE INTO node_acceptance (node, run_id, agent, state, complete_item_id, cancel_item_id, \
-                 checks_json, reason, code_sha, started_by, started_at, updated_at) \
-                 VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9)",
-                params![name, run_id, node.agent, items[0], items[1], Value::Object(checks).to_string(), code_sha, who, ts],
+                 checks_json, reason, code_sha, started_by, started_at, updated_at, org_id) \
+                 VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9, ?10)",
+                params![name, run_id, node.agent, items[0], items[1], Value::Object(checks).to_string(), code_sha, who, ts, org],
             )?;
-            record(tx, "acceptance_started", json!({ "node": name, "run_id": run_id, "items": items }), &who)?;
-            let row = load_row(tx, &name)?.ok_or_else(|| UaError::internal("acceptance row vanished"))?;
+            record(tx, &org, "acceptance_started", json!({ "node": name, "run_id": run_id, "items": items }), &who)?;
+            let row = load_row(tx, &org, &name)?.ok_or_else(|| UaError::internal("acceptance row vanished"))?;
             Ok(public(&row, hub.cfg()))
         })
         .await
@@ -782,8 +834,8 @@ pub(crate) async fn node_acceptance_evaluate(ctx: ToolCtx, a: NodeArgs) -> UaRes
     ctx.hub
         .db()
         .write_async(move |tx| {
-            authorize(tx, &hub, &c2, &who, &name)?;
-            evaluate_tx(tx, hub.cfg(), &name)
+            let node = authorize(tx, &hub, &c2, &who, &name)?;
+            evaluate_tx(tx, hub.cfg(), &node.org_id, &name)
         })
         .await
 }
@@ -817,13 +869,15 @@ fn summary(row: &Row) -> Value {
     })
 }
 
-/// Every node in service's stored summary (no event reads).
-pub(crate) fn read_states(c: &Connection) -> UaResult<Map<String, Value>> {
+/// Every in-service node of organization `org`: its stored summary (no
+/// event reads).
+pub(crate) fn read_states(c: &Connection, org: &str) -> UaResult<Map<String, Value>> {
     let mut stmt = c.prepare(&format!(
-        "SELECT {} FROM node_acceptance a JOIN nodes n ON n.node = a.node WHERE n.retired_at IS NULL ORDER BY a.node",
+        "SELECT {} FROM node_acceptance a JOIN nodes n ON n.node = a.node AND n.org_id = a.org_id \
+         WHERE a.org_id = ?1 AND n.retired_at IS NULL ORDER BY a.node",
         ROW_COLS.split(", ").map(|col| format!("a.{col}")).collect::<Vec<_>>().join(", ")
     ))?;
-    let rows: Vec<Row> = stmt.query_map([], row_from)?.collect::<Result<_, _>>()?;
+    let rows: Vec<Row> = stmt.query_map([org], row_from)?.collect::<Result<_, _>>()?;
     Ok(rows.iter().map(|r| (r.node.clone(), summary(r))).collect())
 }
 
@@ -833,14 +887,18 @@ pub(crate) fn read_states(c: &Connection) -> UaResult<Map<String, Value>> {
 pub(crate) async fn node_acceptance_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
     let hub = ctx.hub.clone();
     let node = a.node.map(|n| nodes::validate_node_name(&n)).transpose()?;
+    // Only the caller's organization's nodes; another's answers as never run.
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| match node {
-            Some(name) => match load_row(c, &name)? {
+            Some(name) => match load_row(c, &org, &name)? {
                 None => Ok(not_run(&name, hub.cfg())),
                 Some(row) => Ok(public(&compute(c, &row)?, hub.cfg())),
             },
-            None => Ok(json!({ "nodes": read_states(c)?, "required": hub.cfg().node_require_acceptance })),
+            None => {
+                Ok(json!({ "nodes": read_states(c, &org)?, "required": hub.cfg().node_require_acceptance }))
+            }
         })
         .await
 }
@@ -851,7 +909,11 @@ pub(crate) async fn node_acceptance_status(ctx: ToolCtx, a: StatusArgs) -> UaRes
 /// decision; the node's self-report alone never accepts a node.
 pub(crate) async fn node_acceptance_attest(ctx: ToolCtx, a: AttestArgs) -> UaResult<Value> {
     let who = verified_caller(&ctx.caller, "attesting device acceptance")?;
-    if !is_operator(&ctx.hub, &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) {
         return Err(UaError::denied(
             "not_operator",
             "only an independent operator may attest device acceptance",
@@ -865,21 +927,23 @@ pub(crate) async fn node_acceptance_attest(ctx: ToolCtx, a: AttestArgs) -> UaRes
     }
     let name = nodes::validate_node_name(&a.node)?;
     let run_id = a.run_id.trim().to_string();
+    default_only(&ctx.caller.org_id)?;
+    let org = ctx.caller.org_id.clone();
     let hub = ctx.hub.clone();
     // Record the latest evaluation first, whatever the attestation decides.
-    let n2 = name.clone();
-    ctx.hub.db().write_async(move |tx| evaluate_tx(tx, hub.cfg(), &n2)).await?;
+    let (n2, o2) = (name.clone(), org.clone());
+    ctx.hub.db().write_async(move |tx| evaluate_tx(tx, hub.cfg(), &o2, &n2)).await?;
     let hub = ctx.hub.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let Some(node) = load_node(tx, &name)? else {
+            let Some(node) = load_node(tx, &org, &name)? else {
                 return Err(UaError::not_found(format!("node {name:?} is not registered")));
             };
             if node.agent == who {
                 return Err(UaError::denied("self_attestation", "a node's own agent cannot attest its acceptance"));
             }
-            let row = load_row(tx, &name)?;
+            let row = load_row(tx, &org, &name)?;
             let Some(row) = row.filter(|r| r.run_id == run_id && r.state == "pending") else {
                 return Err(UaError::conflict_code(
                     "acceptance_not_pending",
@@ -898,16 +962,17 @@ pub(crate) async fn node_acceptance_attest(ctx: ToolCtx, a: AttestArgs) -> UaRes
             let ts = now();
             tx.execute(
                 "UPDATE node_acceptance SET state = 'accepted', reason = NULL, accepted_at = ?3, attested_by = ?4, \
-                 attestation_ref = ?5, updated_at = ?3 WHERE node = ?1 AND run_id = ?2",
-                params![name, run_id, ts, who, evidence],
+                 attestation_ref = ?5, updated_at = ?3 WHERE node = ?1 AND run_id = ?2 AND org_id = ?6",
+                params![name, run_id, ts, who, evidence, org],
             )?;
             record(
                 tx,
+                &org,
                 "acceptance_attested",
                 json!({ "node": name, "run_id": run_id, "attested_by": who, "evidence_ref": evidence }),
                 &who,
             )?;
-            let row = load_row(tx, &name)?.ok_or_else(|| UaError::internal("acceptance row vanished"))?;
+            let row = load_row(tx, &org, &name)?.ok_or_else(|| UaError::internal("acceptance row vanished"))?;
             Ok(public(&row, hub.cfg()))
         })
         .await

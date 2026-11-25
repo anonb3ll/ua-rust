@@ -8,9 +8,12 @@
 //! can plug in a fake.
 //!
 //! The default verifier, [`GitHubCiVerifier`], looks the run up through the
-//! native GitHub client in the repository the task's project is bound to.
-//! Without a configured token it answers [`Verdict::Unverifiable`] and makes
-//! no request. An unverifiable check keeps its `attested` grade; nothing is
+//! native GitHub client in the repository the task's project is bound to, in
+//! the task's organization and with that organization's own token
+//! ([`crate::families::github::credentials::github_credential_for`]). When
+//! that organization has no token (credential off) it answers
+//! [`Verdict::Unverifiable`] and makes no request; it never uses another
+//! organization's token or the hub's for a non-default organization. An unverifiable check keeps its `attested` grade; nothing is
 //! lowered and nothing is refused.
 //!
 //! Verdicts mean:
@@ -58,6 +61,9 @@ use crate::families::github::client::{BoundRepo, GhError, GitHub, full_sha};
 /// One CI run a check points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiRun {
+    /// The organization of the task whose check this is. The run is looked
+    /// up with this organization's token, in its bound repository.
+    pub org: String,
     /// `owner/name`.
     pub repo: String,
     /// The forge's numeric run id, as text.
@@ -134,9 +140,11 @@ pub trait CiVerifier: Send + Sync {
 /// native client ([`crate::families::github`]).
 ///
 /// The run id is tried as an Actions workflow run first, then as a check
-/// run. Without a token (`github_token_env`) every lookup is
-/// [`Verdict::Unverifiable`] and nothing touches the network. The
-/// repository must still be bound to a project when the lookup runs.
+/// run. Without a token for the task's organization (`github_token_env` for
+/// the default organization, `github_credential_set` for another) every
+/// lookup is [`Verdict::Unverifiable`] and nothing touches the network. The
+/// repository must still be bound to a project of that organization when
+/// the lookup runs.
 #[derive(Clone)]
 pub struct GitHubCiVerifier {
     cfg: Config,
@@ -150,15 +158,31 @@ impl GitHubCiVerifier {
 
     async fn client(&self, run: &CiRun) -> Result<(GitHub, BoundRepo), CiOutcome> {
         let seen = json!({ "forge": "github", "repo": run.repo, "run_id": run.run_id });
-        let client = match GitHub::from_config(&self.cfg) {
+        let (cfg, org, repo) = (self.cfg.clone(), run.org.clone(), run.repo.clone());
+        // The task's organization's token and binding, together: never the
+        // hub's token for another organization, nor another's binding.
+        let found = self
+            .db
+            .read_async(move |c| {
+                let client = GitHub::for_org(c, &cfg, &org);
+                let bound = BoundRepo::check(c, &org, &repo);
+                Ok((client, bound))
+            })
+            .await;
+        let (client, bound) = match found {
+            Ok(f) => f,
+            Err(e) => return Err(CiOutcome::new(Verdict::Unverifiable, e.to_string()).observed(seen)),
+        };
+        let client = match client {
             Ok(Some(c)) => c,
             Ok(None) => {
-                return Err(CiOutcome::new(Verdict::Unverifiable, NO_TOKEN).observed(seen));
+                let why = GhError::CredentialOff(run.org == ua_core::DEFAULT_ORG).detail();
+                return Err(
+                    CiOutcome::new(Verdict::Unverifiable, format!("{why}; {NO_TOKEN}")).observed(seen)
+                );
             }
             Err(e) => return Err(CiOutcome::new(Verdict::Unverifiable, e.detail()).observed(seen)),
         };
-        let repo = run.repo.clone();
-        let bound = self.db.read_async(move |c| BoundRepo::check(c, &repo)).await;
         match bound {
             Ok(b) => Ok((client, b)),
             Err(e) => Err(CiOutcome::new(Verdict::Unverifiable, e.to_string()).observed(seen)),
@@ -166,7 +190,7 @@ impl GitHubCiVerifier {
     }
 }
 
-const NO_TOKEN: &str = "no GitHub token is configured (github_token_env), so CI runs cannot be looked up; the check stays attested";
+const NO_TOKEN: &str = "CI runs cannot be looked up (credential off); the check stays attested";
 
 /// What one run lookup found.
 struct RunSeen {
@@ -366,7 +390,11 @@ fn text(v: &Value, key: &str) -> String {
 
 fn lookup_failed(e: &GhError) -> Verdict {
     match e {
-        GhError::NotConfigured(_) | GhError::Unauthorized | GhError::Forbidden => Verdict::Unverifiable,
+        GhError::NotConfigured(_)
+        | GhError::CredentialOff(_)
+        | GhError::Unusable(_)
+        | GhError::Unauthorized
+        | GhError::Forbidden => Verdict::Unverifiable,
         _ => Verdict::Insufficient,
     }
 }

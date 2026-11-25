@@ -20,7 +20,7 @@ event in the same transaction.
 | `session_handoff_recover` | The session's owner, the note's receiver, lifecycle operator, human | The session's latest sealed note |
 | `session_handoff_ack` | The agent the note was handed to | Acknowledge it |
 | `conversation_handoff` | A participant (or a human) | Link or create a task that points at a conversation |
-| `conversation_handoffs` | A verified participant (or a human) | Where a conversation was handed off |
+| `conversation_handoffs` | A verified participant, a human, or any caller when auth enforcement is off | Where a conversation was handed off |
 | `queue_health` | Anyone (the research profile too) | Open, parked, stale and milestone counts |
 | `queue_stale` | Anyone | Stale tasks, oldest first |
 | `queue_sweep` | Anyone | Proposed parks and folds; writes nothing |
@@ -66,7 +66,10 @@ listed in `summary.verified_run_only`), since a green run can contain a
 skipped job.
 
 A lookup that contradicts the claim leaves the grade `attested` and lists the
-check in `summary.contradicted`. Nothing here gates a claim or a merge.
+check in `summary.contradicted`. When `"review"` is listed in `expected_checks`,
+`git_merge_task` requires a passing, uncontradicted `review` check at the exact
+head being merged (and refuses a self-review by the commit deliverable
+revision's producer); other checks remain advisory.
 
 The caller does not choose what the hub looks up:
 
@@ -152,16 +155,32 @@ draft --seal--> sealed --> assigned --> delivered
 
 `conversation_handoff` (`conversation_id`, then `task_id` to link or `title`,
 `project`, `priority` to create) ties a mailbox conversation to a task. The
-task gets one notes line, `[conversation: <id>] handed off from the agent
-conversation`; no message is copied. The caller must have sent or received a
-message in the conversation (a human, or the coordinator profile, sees every
-conversation). The task write goes through the registry as `task_add` or
-`task_update`, so the caller's profile, the policy file and the approval gate
-apply as they do to a direct call. Creating is idempotent per conversation,
-title, project and priority.
+link is one `agent.conversation.handoff` ledger event; no message is copied
+and no conversation id is written into the task (whose notes and updates
+every caller can read). Tasks handed off by older or imported hubs may carry
+a notes line, `[conversation: <id>] handed off from the agent conversation`;
+`conversation_handoffs` still reports those as `unaudited`, and a ledgered
+handoff reports whether the line is still there (`note_reference`). The
+caller must have sent or received a
+message in the conversation (an operator, a verified human, sees every
+conversation; a profile grants nothing). Linking applies `task_update`'s
+read gate — the profile allow-list and the policy file, with the same
+refusal codes a call would get — before it checks the task exists; the
+`coordination_manage` call itself already passed the registry's policy and
+approval gate. Creating goes through
+the registry as `task_add`, so the caller's profile, the policy file and the
+approval gate apply as they do to a direct call. Creating is idempotent per
+conversation, title, project and priority.
+
+The ledger event is also readable by the linked task's holders — its
+`claimed_by` or `next_owner` — because a task that was handed a conversation
+needs the link (`conversation_id`, `task_id`, `created`, `by`) to reach it;
+the row stays invisible to everyone else outside the conversation.
 
 `conversation_handoffs` has the same caller rule (a verified caller that can
-see the conversation; anyone else reads `not_found`). The handoff ledger
+see the conversation; anyone else reads `not_found`), and is also open to a
+caller with no verified identity, for whom conversations are a message board
+([auth.md](auth.md#with-auth-enforcement-off)). The handoff ledger
 event is the audited record: `handoffs` lists the tasks an
 `agent.conversation.handoff` event links, with who handed off, when, and
 `note_reference` (whether the notes line is still there). A task whose
@@ -252,10 +271,18 @@ vault page is written.
 
 ## Import
 
-`ua import python-hub` copies `task_workflow`, `task_checks` and
-`session_handoff_notes` by column name. A Python task parked the old way
-(archived, with a `[parked @ ...]` or `[folded-into: #N @ ...]` notes line)
-moves to the parking columns and is un-archived; its notes are kept.
+`ua import python-hub` copies `task_workflow`, `task_checks`,
+`session_handoff_notes`, `work_proposals`, `work_proposal_items`, `task_holds`,
+`task_hold_members`, and `project_repo_bindings` by column name. Since
+`dispatch_runs` are not imported, any non-NULL `tasks.current_run_id` and
+`tasks.current_run_agent` pointers are cleared to NULL on import and reported in
+`task_runs_cleared`. A Python task parked the old way (archived, with a
+`[parked @ ...]` or `[folded-into: #N @ ...]` notes line) moves to the parking
+columns and is un-archived; its notes are kept.
+
+Take a target database snapshot before importing into an existing database:
+post-import ledger verification runs after the batch transactions commit, so if
+verification ever fails, the imported rows remain in place without rollback.
 
 ## Differences from the Python hub
 

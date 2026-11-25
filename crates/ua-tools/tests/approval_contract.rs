@@ -122,7 +122,13 @@ fn every_secret_bearing_tool_is_marked_and_projected() {
     marked.sort_unstable();
     assert_eq!(
         marked,
-        ["agent_token_issue", "agent_token_rotate", "managed_secret_set", "mcp_server_register"],
+        [
+            "agent_token_issue",
+            "agent_token_rotate",
+            "github_credential_set",
+            "managed_secret_set",
+            "mcp_server_register"
+        ],
         "update this list (and the tool's projection) when a secret argument is added"
     );
 }
@@ -142,7 +148,9 @@ async fn no_tool_parks_a_plaintext_secret_through_the_request_route() {
         if !args.to_string().contains("PLAINTEXT-SECRET") {
             continue;
         }
-        if let Ok(ApprovalRequest::Payload(p)) = reg.approval_request(&hub, &human, def.name, args).await {
+        if let Ok(ApprovalRequest::Payload { payload: p, .. }) =
+            reg.approval_request(&hub, &human, def.name, args).await
+        {
             assert!(!p.to_string().contains("PLAINTEXT-SECRET"), "{} parks a secret: {p}", def.name);
         }
     }
@@ -179,16 +187,20 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
             ),
         ),
         (
-            "families/delegation.rs",
-            (1, vec![("delegation_manage", action("create")), ("handoff", json!({}))]),
-        ),
-        (
             "families/dispatch/tools.rs",
             (2, vec![("dispatch_task", json!({})), ("dispatch_resume", json!({}))]),
         ),
         (
             "families/managed_secrets.rs",
-            (2, vec![("managed_secret_set", json!({})), ("managed_secret_delete", json!({}))]),
+            (
+                2,
+                vec![
+                    ("managed_secret_set", json!({})),
+                    ("managed_secret_delete", json!({})),
+                    ("github_credential_set", json!({})),
+                    ("github_credential_clear", json!({})),
+                ],
+            ),
         ),
         (
             "families/harness_config/mod.rs",
@@ -237,6 +249,7 @@ fn handler_gate_sites() -> BTreeMap<&'static str, (usize, Vec<GatedCall>)> {
                 ],
             ),
         ),
+        ("families/workspace/git.rs", (1, vec![("git_merge_task", json!({ "task_id": 1 }))])),
         ("families/workspace/shell.rs", (1, vec![("run_cmd", json!({}))])),
         ("families/zulip.rs", (1, vec![("zulip_send_message", json!({}))])),
     ])
@@ -278,8 +291,14 @@ fn every_tool_that_gates_in_its_handler_is_marked() {
          those tools (gates_in_handler, handler_gates_with or handler_may_gate)"
     );
     let reg = builtin_registry();
+    // The scan reads every source file, compiled or not; a tool whose feature
+    // is off in this build is not registered and has nothing to check.
+    let compiled_out: Vec<&str> = ua_tools::compiled_out_tools().map(|(t, _)| t).collect();
     for (file, (_, calls)) in &sites {
         for (tool, args) in calls {
+            if compiled_out.contains(tool) {
+                continue;
+            }
             let def = reg.get(tool).unwrap_or_else(|| panic!("{file}: no tool {tool}"));
             assert!(
                 def.handler_decides(args),
@@ -288,7 +307,7 @@ fn every_tool_that_gates_in_its_handler_is_marked() {
         }
     }
     // A tool nothing in its handler gates stays requestable.
-    for tool in ["task_add", "task_update", "crew_intervene", "delegate"] {
+    for tool in ["task_add", "task_update", "crew_intervene", "delegate", "handoff"] {
         assert!(!reg.get(tool).unwrap().handler_decides(&json!({})), "{tool}");
     }
 }

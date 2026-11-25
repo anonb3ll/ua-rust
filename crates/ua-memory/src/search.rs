@@ -150,11 +150,11 @@ fn gather(
         Some(v) => {
             let outside: Vec<String> =
                 ids.iter().filter(|id| !semantic.iter().any(|(s, _)| s == *id)).cloned().collect();
-            index.similarities(conn, model, v, &outside)?
+            index.similarities(conn, &elig.org, model, v, &outside)?
         }
         None => HashMap::new(),
     };
-    let contradictions = note::open_contradictions(conn, elig.as_of.as_deref())?;
+    let contradictions = note::open_contradictions(conn, &elig.org, elig.as_of.as_deref())?;
     Ok(Gathered { lexical, semantic, sims, notes, contradictions })
 }
 
@@ -183,9 +183,16 @@ struct Candidate {
     semantic_hit: bool,
 }
 
-/// Hybrid search: returns `{results, retrieval}` (and `as_of` when given).
-/// Hits get their access and recall counters bumped, best effort.
-pub async fn search(db: &Db, cfg: &Config, a: SearchRequest) -> UaResult<Value> {
+/// Hybrid search over organization `org`'s notes: returns `{results,
+/// retrieval}` (and `as_of` when given). Hits get their access and recall
+/// counters bumped, best effort.
+///
+/// Both legs filter on `org` inside their query, so another organization's
+/// notes never take a candidate slot, a rank or a result. The lexical score
+/// is FTS5's bm25 over the one hub-wide `memory_fts` index, whose corpus
+/// statistics count every organization's notes (`docs/organization.md`,
+/// accepted leak candidates).
+pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaResult<Value> {
     let cleaned = a.query.replace('"', " ");
     let tokens: Vec<String> = cleaned.split_whitespace().map(str::to_string).collect();
     if tokens.is_empty() {
@@ -195,6 +202,7 @@ pub async fn search(db: &Db, cfg: &Config, a: SearchRequest) -> UaResult<Value> 
     let limit = a.limit.unwrap_or(10).clamp(1, 50) as usize;
     let now = ua_core::time::now();
     let elig = Eligibility {
+        org: org.to_string(),
         tags: a
             .tags
             .unwrap_or_default()
@@ -346,14 +354,14 @@ pub async fn search(db: &Db, cfg: &Config, a: SearchRequest) -> UaResult<Value> 
     let hit_ids: Vec<String> = cands.iter().map(|c| c.note.id.clone()).collect();
     let ts = ua_core::time::now();
     if !hit_ids.is_empty() {
-        let (ids, ts2) = (json_text(&hit_ids), ts.clone());
+        let (ids, ts2, org) = (json_text(&hit_ids), ts.clone(), org.to_string());
         let res = db
             .write_async(move |tx| {
                 tx.execute(
                     "UPDATE memory SET access_count = access_count + 1, last_accessed = ?1, \
                      recalled_count = recalled_count + 1, last_recalled_at = ?1 \
-                     WHERE id IN (SELECT value FROM json_each(?2))",
-                    params![ts2, ids],
+                     WHERE org_id = ?3 AND id IN (SELECT value FROM json_each(?2))",
+                    params![ts2, ids, org],
                 )?;
                 Ok(())
             })
@@ -431,8 +439,8 @@ pub struct ListRequest {
     pub tags: Option<Vec<String>>,
 }
 
-/// Live notes newest first: returns `{items}`.
-pub async fn list(db: &Db, a: ListRequest) -> UaResult<Value> {
+/// Organization `org`'s live notes newest first: returns `{items}`.
+pub async fn list(db: &Db, org: &str, a: ListRequest) -> UaResult<Value> {
     let limit = a.limit.unwrap_or(50).clamp(1, 200);
     let mut wanted: Vec<String> = a.tags.unwrap_or_default();
     if let Some(t) = a.tag {
@@ -441,6 +449,7 @@ pub async fn list(db: &Db, a: ListRequest) -> UaResult<Value> {
     wanted.sort();
     wanted.dedup();
     let elig = Eligibility {
+        org: org.to_string(),
         tags: wanted,
         author: a.author,
         include_expired: a.include_expired,
@@ -483,12 +492,12 @@ pub struct GetRequest {
 
 const MAX_VERSIONS_SHOWN: usize = 20;
 
-fn versions(conn: &Connection, id: &str, as_of: Option<&str>) -> UaResult<(Vec<Value>, usize)> {
+fn versions(conn: &Connection, org: &str, id: &str, as_of: Option<&str>) -> UaResult<(Vec<Value>, usize)> {
     let mut stmt = conn.prepare(
         "SELECT version, content, tags, updated_at, actor, recorded_at FROM memory_versions \
-         WHERE note_id = ?1 ORDER BY version DESC",
+         WHERE note_id = ?1 AND org_id = ?2 ORDER BY version DESC",
     )?;
-    let rows = stmt.query_map([id], |r| {
+    let rows = stmt.query_map(params![id, org], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -520,8 +529,14 @@ fn versions(conn: &Connection, id: &str, as_of: Option<&str>) -> UaResult<(Vec<V
     Ok((out, total))
 }
 
-fn compose(conn: &Connection, id: &str, as_of: Option<&str>, include_versions: bool) -> UaResult<Value> {
-    let n = note::require(conn, id)?;
+fn compose(
+    conn: &Connection,
+    org: &str,
+    id: &str,
+    as_of: Option<&str>,
+    include_versions: bool,
+) -> UaResult<Value> {
+    let n = note::require(conn, org, id)?;
     if let Some(at) = as_of
         && !n.valid_at(at)
     {
@@ -546,42 +561,41 @@ fn compose(conn: &Connection, id: &str, as_of: Option<&str>, include_versions: b
     if n.is_deleted() {
         res["deleted"] = json!(true);
     }
-    let replaced: Vec<String> = {
-        let mut stmt =
-            conn.prepare("SELECT id FROM memory WHERE superseded_by = ?1 ORDER BY created_at, id")?;
-        stmt.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?
-    };
+    let replaced = note::superseded_notes(conn, org, id)?;
     if !replaced.is_empty() {
         res["supersedes"] = json!(replaced);
     }
-    res["links"] = note::note_links(conn, &n)?;
-    let open = note::open_contradictions(conn, as_of)?.get(id).copied().unwrap_or(0);
+    res["links"] = note::note_links(conn, org, &n)?;
+    let open = note::open_contradictions(conn, org, as_of)?.get(id).copied().unwrap_or(0);
     res["confidence_posterior"] = n.confidence_block(open);
     if include_versions {
-        let (v, total) = versions(conn, id, as_of)?;
+        let (v, total) = versions(conn, org, id, as_of)?;
         res["versions"] = json!(v);
         res["versions_total"] = json!(total);
     }
     Ok(res)
 }
 
-/// One note with its content, revision, links and confidence posterior,
-/// including a superseded or deleted one.
-pub async fn get(db: &Db, a: GetRequest) -> UaResult<Value> {
+/// One note of organization `org` with its content, revision, links and
+/// confidence posterior, including a superseded or deleted one. Another
+/// organization's note answers `not_found`, exactly like a missing one.
+pub async fn get(db: &Db, org: &str, a: GetRequest) -> UaResult<Value> {
     let as_of = a.as_of.as_deref().map(|v| note::parse_instant(v, "as_of", false)).transpose()?;
     let (id, include_versions) = (a.id, a.include_versions);
-    let read_id = id.clone();
-    let mut res = db.read_async(move |c| compose(c, &read_id, as_of.as_deref(), include_versions)).await?;
+    let (read_id, read_org) = (id.clone(), org.to_string());
+    let mut res =
+        db.read_async(move |c| compose(c, &read_org, &read_id, as_of.as_deref(), include_versions)).await?;
     if a.count_access {
         // Access telemetry, best effort (see the module docs): it never
         // fails the read.
         let ts = ua_core::time::now();
-        let ts2 = ts.clone();
+        let (ts2, org) = (ts.clone(), org.to_string());
         let counted = db
             .write_async(move |tx| {
                 Ok(tx.execute(
-                    "UPDATE memory SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
-                    params![ts2, id],
+                    "UPDATE memory SET access_count = access_count + 1, last_accessed = ?1 \
+                     WHERE id = ?2 AND org_id = ?3",
+                    params![ts2, id, org],
                 )?)
             })
             .await;

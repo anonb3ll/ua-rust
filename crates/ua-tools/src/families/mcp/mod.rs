@@ -11,7 +11,8 @@
 //!
 //! Tools: `mcp_server_register`, `mcp_server_review` (renew the review
 //! window), `mcp_server_revoke` (all three need a one-time human approval),
-//! `mcp_server_list`, and `mcp_gateway` (see [`gateway`]).
+//! `mcp_server_list`, and `mcp_gateway` (see the `gateway` module; it needs
+//! the `mcp-gateway` feature, and without it `mcp_server_register` refuses).
 //!
 //! A server is usable only while it is registered, unrevoked and inside its
 //! review window. A config entry's window is its `review_expires_at`, or a
@@ -32,6 +33,7 @@
 //! and the approved revocation deletes them. A re-registration starts with no
 //! credential; the operator sets it again for the new spec.
 
+#[cfg(feature = "mcp-gateway")]
 pub mod gateway;
 pub mod redact;
 pub mod scope;
@@ -51,6 +53,28 @@ use super::dispatch::executor::looks_secret;
 use super::managed_secrets::{self, mcp_consumer};
 use crate::approvals::{self, GateOutcome};
 use crate::registry::{Registry, ToolCtx, tool};
+
+/// Whether this build has the downstream MCP client (`mcp-gateway`).
+pub const GATEWAY_COMPILED_IN: bool = cfg!(feature = "mcp-gateway");
+
+/// What a build without `mcp-gateway` says in descriptions and results.
+pub const NO_GATEWAY_NOTE: &str = "this build has no MCP gateway (the mcp-gateway feature is off): \
+    mcp_gateway is not registered and mcp_server_register refuses";
+
+/// Appended to the registry tools' descriptions: empty with the gateway.
+#[cfg(feature = "mcp-gateway")]
+macro_rules! no_gateway_suffix {
+    () => {
+        ""
+    };
+}
+#[cfg(not(feature = "mcp-gateway"))]
+macro_rules! no_gateway_suffix {
+    () => {
+        " Note: this build has no MCP gateway (the mcp-gateway feature is off): mcp_gateway is not \
+         registered and mcp_server_register refuses."
+    };
+}
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "mcp_servers.v1",
@@ -74,6 +98,11 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 
 /// Ledger channel of registry changes.
 pub const REGISTRY_CHANNEL: &str = "agent.mcp_server";
+/// The organization whose managed secrets a downstream MCP server's
+/// credentials are. MCP servers are hub-scoped (`mcp_servers` is a hub
+/// table and only hub operators register them), so their secrets are the
+/// default organization's, which operates the hub.
+pub(crate) const HUB_SECRETS_ORG: &str = ua_core::DEFAULT_ORG;
 const MAX_TOOLS: usize = 256;
 const MAX_ARGS: usize = 64;
 const MAX_ARG_CHARS: usize = 1024;
@@ -564,7 +593,8 @@ impl Server {
             .iter()
             .map(|s| {
                 let stored =
-                    managed_secrets::bound_to(conn, &s.secret, &mcp_consumer(&self.name)).unwrap_or(false);
+                    managed_secrets::bound_to(conn, HUB_SECRETS_ORG, &s.secret, &mcp_consumer(&self.name))
+                        .unwrap_or(false);
                 json!({ "secret": s.secret, "inject": s.inject, "stored": stored })
             })
             .collect();
@@ -774,7 +804,12 @@ fn gate(
 }
 
 fn pending(tool: &str, r: Result<Value, i64>) -> UaResult<Value> {
-    r.map_err(|approval_id| UaError::ApprovalRequired { tool: tool.into(), approval_id })
+    let mut v = r.map_err(|approval_id| UaError::ApprovalRequired { tool: tool.into(), approval_id })?;
+    if !GATEWAY_COMPILED_IN {
+        v["gateway_compiled_in"] = json!(false);
+        v["note"] = json!(NO_GATEWAY_NOTE);
+    }
+    Ok(v)
 }
 
 fn review_days(cfg: &Config, asked: Option<u32>) -> UaResult<u32> {
@@ -807,6 +842,14 @@ pub struct RegisterArgs {
 
 async fn mcp_server_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
     require_operator(&ctx, "mcp_server_register")?;
+    if !GATEWAY_COMPILED_IN {
+        // Nothing here could call the server: refuse before any approval is
+        // parked for it.
+        return Err(UaError::denied(
+            "gateway_not_built",
+            format!("mcp_server_register refused: {NO_GATEWAY_NOTE}; rebuild with the mcp-gateway feature"),
+        ));
+    }
     let mut spec = a.server;
     spec.normalize(&a.name)?;
     let days = review_days(ctx.hub.cfg(), a.review_days)?;
@@ -851,7 +894,7 @@ async fn mcp_server_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "registered", "name": name, "spec_sha256": sha, "review_expires_at": expires,
                             "approval_id": approval_id }),
@@ -922,7 +965,7 @@ async fn mcp_server_review(ctx: ToolCtx, a: ReviewArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "reviewed", "name": name, "spec_sha256": server.spec_sha256,
                             "review_expires_at": expires, "approval_id": approval_id }),
@@ -953,7 +996,7 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
             // The secrets this revocation orphans, bound into the approval: a
             // secret set or rotated after the request needs a new approval.
             let consumer = mcp_consumer(&name);
-            let orphans: Vec<Value> = managed_secrets::bound_secrets(tx, &consumer)?
+            let orphans: Vec<Value> = managed_secrets::bound_secrets(tx, HUB_SECRETS_ORG, &consumer)?
                 .into_iter()
                 .map(|(secret, fingerprint)| json!({ "secret": secret, "fingerprint": fingerprint }))
                 .collect();
@@ -965,7 +1008,14 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
                 Err(id) => return Ok(Err(id)),
             };
             let orphaned =
-                managed_secrets::orphan_consumer(tx, &consumer, &caller.label, approval_id, "mcp_server_revoked")?;
+                managed_secrets::orphan_consumer(
+                tx,
+                HUB_SECRETS_ORG,
+                &consumer,
+                &caller.label,
+                approval_id,
+                "mcp_server_revoked",
+            )?;
             let now = ua_core::time::now();
             match server.source {
                 Source::Registry => {
@@ -987,7 +1037,7 @@ async fn mcp_server_revoke(ctx: ToolCtx, a: NameArgs) -> UaResult<Value> {
             }
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     REGISTRY_CHANNEL,
                     json!({ "op": "revoked", "name": name, "spec_sha256": server.spec_sha256, "approval_id": approval_id,
                             "orphaned_secrets": orphaned }),
@@ -1019,10 +1069,18 @@ async fn mcp_server_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
                 match resolve(c, &cfg, &name) {
                     Ok(s) if s.revoked_at.is_some() && !a.include_revoked => {}
                     Ok(s) => servers.push(s.public(c)),
-                    Err(e) => servers.push(json!({ "name": name, "status": "misconfigured", "error": e.to_string() })),
+                    Err(e) => servers
+                        .push(json!({ "name": name, "status": "misconfigured", "error": e.to_string() })),
                 }
             }
-            Ok(json!({ "servers": servers, "count": servers.len(), "review_ttl_days": cfg.mcp_review_ttl_days }))
+            let mut out = json!({
+                "servers": servers, "count": servers.len(), "review_ttl_days": cfg.mcp_review_ttl_days,
+                "gateway_compiled_in": GATEWAY_COMPILED_IN,
+            });
+            if !GATEWAY_COMPILED_IN {
+                out["note"] = json!(NO_GATEWAY_NOTE);
+            }
+            Ok(out)
         })
         .await
 }
@@ -1031,13 +1089,16 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "mcp_server_register",
-            "Register a downstream MCP server for mcp_gateway. For a human or an operator, and needs a one-time \
-             human approval bound to the whole spec: transport (stdio command/args, or a streamable_http URL with \
-             its address_scope), managed secrets injected by name (consumer mcp:<name>), the read/write \
-             classification of every downstream tool it may call, read_profiles (empty: humans and configured \
-             operator identities only) and timeout. The review lasts review_days (default mcp_review_ttl_days). \
-             A revoked name may be registered again; its old secrets were deleted at revocation and must be set \
-             again.",
+            concat!(
+                "Register a downstream MCP server for mcp_gateway. For a human or an operator, and needs a one-time \
+                 human approval bound to the whole spec: transport (stdio command/args, or a streamable_http URL with \
+                 its address_scope), managed secrets injected by name (consumer mcp:<name>), the read/write \
+                 classification of every downstream tool it may call, read_profiles (empty: humans and configured \
+                 operator identities only) and timeout. The review lasts review_days (default mcp_review_ttl_days). \
+                 A revoked name may be registered again; its old secrets were deleted at revocation and must be set \
+                 again.",
+                no_gateway_suffix!()
+            ),
             mcp_server_register,
         )
         .secret_args()
@@ -1047,8 +1108,11 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "mcp_server_review",
-            "Renew a downstream MCP server's review window (registry or config entry) for review_days from now. \
-             For a human or an operator; needs a one-time human approval bound to the server's current spec.",
+            concat!(
+                "Renew a downstream MCP server's review window (registry or config entry) for review_days from now. \
+                 For a human or an operator; needs a one-time human approval bound to the server's current spec.",
+                no_gateway_suffix!()
+            ),
             mcp_server_review,
         )
         .gates_in_handler()
@@ -1057,10 +1121,13 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "mcp_server_revoke",
-            "Revoke a downstream MCP server so mcp_gateway refuses it. For a human or an operator; needs a \
-             one-time human approval, whose payload lists the managed secrets bound to mcp:<name>: the approved \
-             revocation deletes them, so a later registration of the name never inherits a credential. A \
-             revoked config entry stays revoked until its spec changes.",
+            concat!(
+                "Revoke a downstream MCP server so mcp_gateway refuses it. For a human or an operator; needs a \
+                 one-time human approval, whose payload lists the managed secrets bound to mcp:<name>: the approved \
+                 revocation deletes them, so a later registration of the name never inherits a credential. A \
+                 revoked config entry stays revoked until its spec changes.",
+                no_gateway_suffix!()
+            ),
             mcp_server_revoke,
         )
         .always_gated()
@@ -1070,14 +1137,18 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "mcp_server_list",
-            "List downstream MCP servers (registry and config): status (active, review_expired, review_required, \
-             revoked, misconfigured), transport, URL or command, address scope, secret names and whether each \
-             is stored, read and write tools, read_profiles and the review window. Never secret values.",
+            concat!(
+                "List downstream MCP servers (registry and config): status (active, review_expired, review_required, \
+                 revoked, misconfigured), transport, URL or command, address scope, secret names and whether each \
+                 is stored, read and write tools, read_profiles and the review window. Never secret values.",
+                no_gateway_suffix!()
+            ),
             mcp_server_list,
         )
         .read_only()
         .family("mcp"),
     );
+    #[cfg(feature = "mcp-gateway")]
     gateway::register(r);
 }
 

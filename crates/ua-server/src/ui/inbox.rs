@@ -19,6 +19,9 @@ pub struct ApprovalView {
     pub created_at: String,
     pub resolved_by: String,
     pub resolved_at: String,
+    /// The adapter the decision came through (`ui`, `slack`, ...); `unknown`
+    /// for a row resolved before it was recorded.
+    pub resolved_via: String,
     pub expires_at: String,
     pub payload: String,
     /// The change the approval is for, as the approver reads it (a
@@ -40,6 +43,10 @@ impl ApprovalView {
             created_at: text(v, "created_at"),
             resolved_by: text(v, "resolved_by"),
             resolved_at: text(v, "resolved_at"),
+            resolved_via: match v.get("resolved_transport").and_then(Value::as_str) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => "unknown".into(),
+            },
             expires_at: text(v, "expires_at"),
             payload: pretty(v.get("payload").unwrap_or(&Value::Null)),
             change: v.get("display").map(|d| text(d, "diff")).unwrap_or_default(),

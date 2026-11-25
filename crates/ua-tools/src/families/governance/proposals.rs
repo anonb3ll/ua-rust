@@ -36,6 +36,16 @@
 //! An approval creates its task and marks the item approved in one write
 //! transaction. Every transition appends an `agent.work_proposal.*` event in
 //! the same transaction; payloads carry ids, statuses and digests only.
+//!
+//! **Organizations.** A proposal and its items carry the `org_id` of the
+//! caller that filed them, and every read and write is the caller's
+//! organization's: another organization's proposal answers exactly as a
+//! missing one. An approved item's task is created in the proposal's
+//! organization, and the contract check reads only the task organization's
+//! items. Deciding also needs the organization half of authority
+//! (`ua_org::authz`), which admits only the default organization today, so
+//! another organization's proposals can be filed, read and withdrawn but not
+//! yet decided (`org_mismatch`).
 
 use std::collections::BTreeSet;
 
@@ -46,12 +56,63 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_org::authz::{Authority, Authz};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use super::now;
 use crate::families::agents::verified;
-use crate::families::tasks::{NewTask, PRIORITIES, insert_task};
+use crate::families::tasks::{NewTask, PRIORITIES, insert_task, ledger_text, require_org};
 use crate::registry::ToolCtx;
+
+/// `organization.v1.tools.proposals`: `org_id` on `work_proposals` and
+/// `work_proposal_items` (existing rows filled with the default organization,
+/// whose proposals they all were) and their generated `*_org_exists` /
+/// `*_org_immutable` triggers. No key rebuild: a proposal id is a
+/// hub-generated `wp_<uuid12>`, never chosen by a caller, and an item's key
+/// `(proposal_id, idx)` is led by it. Applied after the governance parts and
+/// `tasks.v2.org_scope`.
+pub const PROPOSALS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.proposals", &["work_proposals", "work_proposal_items"]);
+
+/// `governance.v4.proposals_org_scope`: items move to their proposal's
+/// organization (every proposal stays in the default organization); indexes
+/// led by `org_id` for the proposal list and for the contract check's lookup
+/// of the item that spawned a task; and triggers that keep an item's
+/// proposal and its spawned task inside the item's organization
+/// (`task_id` has no foreign key, and the proposal's foreign key alone would
+/// accept another organization's proposal). The backfill drops the generated
+/// `work_proposal_items_org_immutable` trigger for its one `UPDATE` and puts
+/// the same trigger back, in this part's transaction.
+pub const PROPOSALS_ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "governance.v4.proposals_org_scope",
+    sql: concat!(
+        "
+DROP TRIGGER work_proposal_items_org_immutable;
+UPDATE work_proposal_items
+SET org_id = (SELECT p.org_id FROM work_proposals p WHERE p.id = work_proposal_items.proposal_id)
+WHERE EXISTS (
+    SELECT 1 FROM work_proposals p
+    WHERE p.id = work_proposal_items.proposal_id AND p.org_id IS NOT work_proposal_items.org_id
+);
+",
+        crate::families::continuity::org_immutable!("work_proposal_items"),
+        "
+CREATE INDEX IF NOT EXISTS idx_work_proposals_org_status ON work_proposals(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_proposal_items_org_task ON work_proposal_items(org_id, task_id)
+    WHERE task_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS work_proposal_items_org_parent BEFORE INSERT ON work_proposal_items
+WHEN EXISTS (SELECT 1 FROM work_proposals WHERE id = NEW.proposal_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'proposal or task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS work_proposal_items_org_parent_update
+BEFORE UPDATE OF proposal_id, task_id ON work_proposal_items
+WHEN EXISTS (SELECT 1 FROM work_proposals WHERE id = NEW.proposal_id AND org_id IS NOT NEW.org_id)
+  OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'proposal or task belongs to another organization'); END;
+"
+    ),
+};
 
 const STATUSES: [&str; 5] = ["pending", "approving", "approved", "rejected", "withdrawn"];
 const REPORTING_MODES: [&str; 2] = ["final_only", "milestones"];
@@ -271,19 +332,27 @@ fn valid_id(id: &str) -> bool {
     id.len() == 15 && id.starts_with("wp_") && id[3..].bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn load(c: &Connection, id: &str) -> UaResult<Proposal> {
+/// Proposal `id` of organization `org`. Another organization's proposal
+/// answers exactly as a missing one.
+fn load(c: &Connection, org: &str, id: &str) -> UaResult<Proposal> {
     let id = id.trim();
     let row = if valid_id(id) {
-        c.query_row("SELECT * FROM work_proposals WHERE id = ?1", [id], proposal_from).optional()?
+        c.query_row(
+            "SELECT * FROM work_proposals WHERE org_id = ?1 AND id = ?2",
+            params![org, id],
+            proposal_from,
+        )
+        .optional()?
     } else {
         None
     };
     row.ok_or_else(|| UaError::not_found(format!("unknown work proposal {id:?}")))
 }
 
-fn items(c: &Connection, id: &str) -> UaResult<Vec<Item>> {
-    let mut stmt = c.prepare("SELECT * FROM work_proposal_items WHERE proposal_id = ?1 ORDER BY idx")?;
-    let rows = stmt.query_map([id], item_from)?.collect::<Result<_, _>>()?;
+fn items(c: &Connection, org: &str, id: &str) -> UaResult<Vec<Item>> {
+    let mut stmt =
+        c.prepare("SELECT * FROM work_proposal_items WHERE org_id = ?1 AND proposal_id = ?2 ORDER BY idx")?;
+    let rows = stmt.query_map(params![org, id], item_from)?.collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
@@ -299,12 +368,12 @@ fn rollup(statuses: &[String]) -> &'static str {
     "rejected"
 }
 
-fn refresh(tx: &WriteTx<'_>, id: &str) -> UaResult<&'static str> {
-    let statuses: Vec<String> = items(tx, id)?.into_iter().map(|i| i.status).collect();
+fn refresh(tx: &WriteTx<'_>, org: &str, id: &str) -> UaResult<&'static str> {
+    let statuses: Vec<String> = items(tx, org, id)?.into_iter().map(|i| i.status).collect();
     let status = rollup(&statuses);
     tx.execute(
-        "UPDATE work_proposals SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, status, now()],
+        "UPDATE work_proposals SET status = ?2, updated_at = ?3 WHERE org_id = ?4 AND id = ?1",
+        params![id, status, now(), org],
     )?;
     Ok(status)
 }
@@ -328,8 +397,8 @@ fn public_item(i: &Item) -> Value {
     })
 }
 
-fn public(c: &Connection, p: &Proposal, with_items: bool) -> UaResult<Value> {
-    let its = items(c, &p.id)?;
+fn public(c: &Connection, org: &str, p: &Proposal, with_items: bool) -> UaResult<Value> {
+    let its = items(c, org, &p.id)?;
     let mut out = json!({
         "id": p.id,
         "title": p.title,
@@ -353,8 +422,18 @@ fn public(c: &Connection, p: &Proposal, with_items: bool) -> UaResult<Value> {
     Ok(out)
 }
 
-fn emit(tx: &mut WriteTx<'_>, kind: &str, by: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(format!("agent.work_proposal.{kind}"), payload).by(by.to_string()))?;
+/// Append an `agent.work_proposal.<kind>` event. Events stay in the default
+/// organization's ledger (`ORG-EVENT-DEFAULT`), so for a proposal of another
+/// organization the originator is the neutral `system` and the caller passes
+/// its labels and free text through [`ledger_text`]: only ids, indexes,
+/// statuses, modes and digests reach the ledger.
+fn emit(tx: &mut WriteTx<'_>, org: &str, kind: &str, by: &str, payload: Value) -> UaResult<()> {
+    let by = if org == ua_core::DEFAULT_ORG { by } else { "system" };
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, format!("agent.work_proposal.{kind}"), payload)
+            .by(by.to_string()),
+    )?;
     Ok(())
 }
 
@@ -375,10 +454,13 @@ pub struct FileArgs {
 
 /// `coordination_manage(action="work_proposal_file")`.
 pub(crate) async fn work_proposal_file(ctx: ToolCtx, a: FileArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let named = a.proposer.as_deref().map(str::trim).filter(|p| !p.is_empty());
     let who = match verified(&ctx.caller) {
         Some(v) => {
-            let human = ctx.caller.is_human() || ctx.hub.cfg().is_human(v);
+            // Filing for another identity is operator authority in the
+            // caller's organization (the default organization only, today).
+            let human = Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], &org);
             match named {
                 Some(p) if !p.eq_ignore_ascii_case(v) && !human => {
                     return Err(UaError::denied(
@@ -408,33 +490,35 @@ pub(crate) async fn work_proposal_file(ctx: ToolCtx, a: FileArgs) -> UaResult<Va
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let ts = now();
             tx.execute(
-                "INSERT INTO work_proposals (id, title, proposer, status, reporting_mode, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5)",
-                params![id, title, who, mode, ts],
+                "INSERT INTO work_proposals (org_id, id, title, proposer, status, reporting_mode, created_at, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6)",
+                params![org, id, title, who, mode, ts],
             )?;
             for (i, it) in clean.iter().enumerate() {
                 tx.execute(
-                    "INSERT INTO work_proposal_items (proposal_id, idx, title, notes, scope_json, priority, status, \
-                     filed_digest, contract_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
-                    params![id, i as i64, it.title, it.notes, canonical(&it.scope), it.priority, it.digest],
+                    "INSERT INTO work_proposal_items (org_id, proposal_id, idx, title, notes, scope_json, priority, \
+                     status, filed_digest, contract_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
+                    params![org, id, i as i64, it.title, it.notes, canonical(&it.scope), it.priority, it.digest],
                 )?;
             }
             emit(
                 tx,
+                &org,
                 "filed",
                 &who,
                 json!({
                     "proposal_id": id,
-                    "proposer": who,
+                    "proposer": ledger_text(&org, &who),
                     "status": "pending",
                     "items": clean.len(),
                     "digests": clean.iter().map(|c| c.digest.clone()).collect::<Vec<_>>(),
                     "reporting_mode": mode,
                 }),
             )?;
-            Ok(json!({ "ok": true, "proposal": public(tx, &load(tx, &id)?, true)? }))
+            Ok(json!({ "ok": true, "proposal": public(tx, &org, &load(tx, &org, &id)?, true)? }))
         })
         .await
 }
@@ -526,7 +610,13 @@ fn apply_edits(i: &Item, edits: Option<&ItemEdits>) -> UaResult<(Clean, bool)> {
 
 /// `coordination_manage(action="work_proposal_decide")`.
 pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let who = approver(&ctx, a.approver.as_deref())?;
+    // The organization half of authority: a decision acts on the caller's
+    // organization's proposal, which `authz` admits only for the default
+    // organization today, so another organization's human is refused
+    // (`org_mismatch`) before anything is read.
+    Authz::new(ctx.hub.cfg()).require(&ctx.caller, &[Authority::TransitionalHuman], &org)?;
     if a.decisions.is_empty() {
         return Err(UaError::invalid("decide needs at least one decision {index, approve, edits?}"));
     }
@@ -546,11 +636,12 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let p = load(tx, &pid)?;
+            require_org(tx, &org)?;
+            let p = load(tx, &org, &pid)?;
             if p.status == "withdrawn" {
                 return Err(UaError::conflict(format!("work proposal {pid} is withdrawn")));
             }
-            let rows = items(tx, &pid)?;
+            let rows = items(tx, &org, &pid)?;
             for d in &a.decisions {
                 let Some(row) = rows.iter().find(|r| r.idx == d.index) else {
                     return Err(UaError::invalid(format!("work proposal {pid} has no item {}", d.index)));
@@ -564,11 +655,12 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                 let Some(row) = rows.iter().find(|r| r.idx == d.index) else { continue };
                 tx.execute(
                     "UPDATE work_proposal_items SET status = 'rejected', decided_by = ?3, decided_at = ?4 \
-                     WHERE proposal_id = ?1 AND idx = ?2 AND status = 'pending'",
-                    params![pid, d.index, who, ts],
+                     WHERE org_id = ?5 AND proposal_id = ?1 AND idx = ?2 AND status = 'pending'",
+                    params![pid, d.index, who, ts, org],
                 )?;
                 emit(
                     tx,
+                    &org,
                     "item_rejected",
                     &who,
                     json!({ "proposal_id": pid, "index": d.index, "status": "rejected",
@@ -581,12 +673,18 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                 let scope_json = canonical(&frozen.scope);
                 let notes =
                     compose_task_notes(&frozen.notes, &scope_json, &pid, d.index, &frozen.digest, &p.reporting_mode);
-                let task_id = insert_task(tx, NewTask::simple(frozen.title.clone(), notes, &frozen.priority), &who)?;
+                // The task is created in the proposal's organization.
+                let task_id = insert_task(
+                    tx,
+                    &org,
+                    NewTask::simple(frozen.title.clone(), notes, &frozen.priority),
+                    &who,
+                )?;
                 tx.execute(
                     "UPDATE work_proposal_items SET title = ?3, notes = ?4, scope_json = ?5, priority = ?6, \
                      contract_digest = ?7, edited = ?8, status = 'approved', approving_by = ?9, approving_at = ?10, \
                      decided_by = ?9, decided_at = ?10, task_id = ?11 \
-                     WHERE proposal_id = ?1 AND idx = ?2 AND status = 'pending'",
+                     WHERE org_id = ?12 AND proposal_id = ?1 AND idx = ?2 AND status = 'pending'",
                     params![
                         pid,
                         d.index,
@@ -598,19 +696,21 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                         edited as i64,
                         who,
                         ts,
-                        task_id
+                        task_id,
+                        org
                     ],
                 )?;
                 emit(
                     tx,
+                    &org,
                     "item_approved",
                     &who,
                     json!({ "proposal_id": pid, "index": d.index, "status": "approved",
                             "contract_digest": frozen.digest, "edited": edited, "task_id": task_id }),
                 )?;
             }
-            refresh(tx, &pid)?;
-            Ok(json!({ "ok": true, "proposal": public(tx, &load(tx, &pid)?, true)? }))
+            refresh(tx, &org, &pid)?;
+            Ok(json!({ "ok": true, "proposal": public(tx, &org, &load(tx, &org, &pid)?, true)? }))
         })
         .await
 }
@@ -630,13 +730,15 @@ pub struct WithdrawArgs {
 
 /// `coordination_manage(action="work_proposal_withdraw")`.
 pub(crate) async fn work_proposal_withdraw(ctx: ToolCtx, a: WithdrawArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let who = crate::families::tasks::acting_identity(&ctx.caller, a.actor.as_deref())?;
     let reason = super::clean_reason(a.reason.as_deref(), None)?;
     let pid = a.proposal_id.trim().to_string();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let p = load(tx, &pid)?;
+            require_org(tx, &org)?;
+            let p = load(tx, &org, &pid)?;
             if !who.eq_ignore_ascii_case(&p.proposer) {
                 return Err(UaError::denied(
                     "not_proposer",
@@ -646,7 +748,7 @@ pub(crate) async fn work_proposal_withdraw(ctx: ToolCtx, a: WithdrawArgs) -> UaR
             if p.status == "withdrawn" {
                 return Err(UaError::conflict(format!("work proposal {pid} is already withdrawn")));
             }
-            let statuses: Vec<String> = items(tx, &pid)?.into_iter().map(|i| i.status).collect();
+            let statuses: Vec<String> = items(tx, &org, &pid)?.into_iter().map(|i| i.status).collect();
             if statuses.iter().any(|s| s == "approving") {
                 return Err(UaError::conflict(format!("work proposal {pid} has an approval in progress")));
             }
@@ -658,18 +760,22 @@ pub(crate) async fn work_proposal_withdraw(ctx: ToolCtx, a: WithdrawArgs) -> UaR
             let ts = now();
             tx.execute(
                 "UPDATE work_proposal_items SET status = 'withdrawn', decided_by = ?2, decided_at = ?3 \
-                 WHERE proposal_id = ?1 AND status = 'pending'",
-                params![pid, who, ts],
+                 WHERE org_id = ?4 AND proposal_id = ?1 AND status = 'pending'",
+                params![pid, who, ts, org],
             )?;
-            tx.execute("UPDATE work_proposals SET withdrawn_at = ?2 WHERE id = ?1", params![pid, ts])?;
-            refresh(tx, &pid)?;
+            tx.execute(
+                "UPDATE work_proposals SET withdrawn_at = ?2 WHERE org_id = ?3 AND id = ?1",
+                params![pid, ts, org],
+            )?;
+            refresh(tx, &org, &pid)?;
             emit(
                 tx,
+                &org,
                 "withdrawn",
                 &who,
-                json!({ "proposal_id": pid, "status": "withdrawn", "reason": reason }),
+                json!({ "proposal_id": pid, "status": "withdrawn", "reason": ledger_text(&org, &reason) }),
             )?;
-            Ok(json!({ "ok": true, "proposal": public(tx, &load(tx, &pid)?, true)? }))
+            Ok(json!({ "ok": true, "proposal": public(tx, &org, &load(tx, &org, &pid)?, true)? }))
         })
         .await
 }
@@ -696,14 +802,18 @@ pub struct ListArgs {
 
 /// `coordination_manage(action="work_proposal_get")`.
 pub(crate) async fn work_proposal_get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
-        .read_async(move |c| Ok(json!({ "proposal": public(c, &load(c, &a.proposal_id)?, true)? })))
+        .read_async(move |c| {
+            Ok(json!({ "proposal": public(c, &org, &load(c, &org, &a.proposal_id)?, true)? }))
+        })
         .await
 }
 
 /// `coordination_manage(action="work_proposal_list")`.
 pub(crate) async fn work_proposal_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     if let Some(s) = &a.status
         && !STATUSES.contains(&s.as_str())
     {
@@ -717,12 +827,13 @@ pub(crate) async fn work_proposal_list(ctx: ToolCtx, a: ListArgs) -> UaResult<Va
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT * FROM work_proposals WHERE (?1 IS NULL OR status = ?1) \
+                "SELECT * FROM work_proposals WHERE org_id = ?4 AND (?1 IS NULL OR status = ?1) \
                  AND (?2 IS NULL OR proposer = ?2 COLLATE NOCASE) ORDER BY created_at DESC, rowid DESC LIMIT ?3",
             )?;
-            let rows: Vec<Proposal> =
-                stmt.query_map(params![a.status, a.proposer, limit], proposal_from)?.collect::<Result<_, _>>()?;
-            let out = rows.iter().map(|p| public(c, p, false)).collect::<UaResult<Vec<_>>>()?;
+            let rows: Vec<Proposal> = stmt
+                .query_map(params![a.status, a.proposer, limit, org], proposal_from)?
+                .collect::<Result<_, _>>()?;
+            let out = rows.iter().map(|p| public(c, &org, p, false)).collect::<UaResult<Vec<_>>>()?;
             Ok(json!({ "proposals": out }))
         })
         .await
@@ -737,20 +848,24 @@ pub struct RecoverArgs {
     pub older_than_s: Option<i64>,
 }
 
-/// The task spawned for this item's current contract, if one exists.
-fn find_task(c: &Connection, pid: &str, idx: i64, digest: &str) -> UaResult<Option<i64>> {
+/// The task spawned for this item's current contract, if one exists. A
+/// proposal's task is in the proposal's organization `org`.
+fn find_task(c: &Connection, org: &str, pid: &str, idx: i64, digest: &str) -> UaResult<Option<i64>> {
     let marker = format!("[proposal: {pid}#{idx}]");
     let contract = format!("[contract: {digest}]");
-    let mut stmt = c.prepare("SELECT id, notes FROM tasks WHERE instr(notes, ?1) > 0 ORDER BY id")?;
+    let mut stmt =
+        c.prepare("SELECT id, notes FROM tasks WHERE org_id = ?2 AND instr(notes, ?1) > 0 ORDER BY id")?;
     let rows: Vec<(i64, Option<String>)> =
-        stmt.query_map([&marker], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        stmt.query_map(params![&marker, org], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     Ok(rows.into_iter().find(|(_, n)| n.as_deref().unwrap_or("").contains(&contract)).map(|(id, _)| id))
 }
 
 /// `coordination_manage(action="work_proposal_recover")`: settle items left
 /// in `approving`: forward to `approved` when the task for the item's current
-/// contract exists, else back to `pending`. Idempotent.
+/// contract exists, else back to `pending`. Idempotent. Only the caller's
+/// organization's items are settled.
 pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
     let older = a.older_than_s.unwrap_or(DEFAULT_STALE_S);
     if older < 0 {
         return Err(UaError::invalid("older_than_s must be a non-negative number"));
@@ -763,32 +878,35 @@ pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaRes
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let mut stmt = tx.prepare(
-                "SELECT proposal_id, idx FROM work_proposal_items WHERE status = 'approving' \
+                "SELECT proposal_id, idx FROM work_proposal_items WHERE org_id = ?2 AND status = 'approving' \
                  AND (approving_at IS NULL OR approving_at <= ?1) ORDER BY proposal_id, idx",
             )?;
-            let stale: Vec<(String, i64)> =
-                stmt.query_map([&cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            let stale: Vec<(String, i64)> = stmt
+                .query_map(params![&cutoff, &org], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
             drop(stmt);
             let mut forward = Vec::new();
             let mut back = Vec::new();
             let mut touched = BTreeSet::new();
             for (pid, idx) in stale {
                 let digest: String = tx.query_row(
-                    "SELECT contract_digest FROM work_proposal_items WHERE proposal_id = ?1 AND idx = ?2",
-                    params![pid, idx],
+                    "SELECT contract_digest FROM work_proposal_items WHERE org_id = ?3 AND proposal_id = ?1 AND idx = ?2",
+                    params![pid, idx, org],
                     |r| r.get(0),
                 )?;
-                match find_task(tx, &pid, idx, &digest)? {
+                match find_task(tx, &org, &pid, idx, &digest)? {
                     Some(task_id) => {
                         tx.execute(
                             "UPDATE work_proposal_items SET status = 'approved', task_id = ?3, \
                              decided_by = approving_by, decided_at = ?4 \
-                             WHERE proposal_id = ?1 AND idx = ?2 AND status = 'approving'",
-                            params![pid, idx, task_id, now()],
+                             WHERE org_id = ?5 AND proposal_id = ?1 AND idx = ?2 AND status = 'approving'",
+                            params![pid, idx, task_id, now(), org],
                         )?;
                         emit(
                             tx,
+                            &org,
                             "item_recovered",
                             &actor,
                             json!({ "proposal_id": pid, "index": idx, "status": "approved",
@@ -799,11 +917,12 @@ pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaRes
                     None => {
                         tx.execute(
                             "UPDATE work_proposal_items SET status = 'pending', approving_by = NULL, approving_at = NULL \
-                             WHERE proposal_id = ?1 AND idx = ?2 AND status = 'approving'",
-                            params![pid, idx],
+                             WHERE org_id = ?3 AND proposal_id = ?1 AND idx = ?2 AND status = 'approving'",
+                            params![pid, idx, org],
                         )?;
                         emit(
                             tx,
+                            &org,
                             "item_rolled_back",
                             &actor,
                             json!({ "proposal_id": pid, "index": idx, "status": "pending", "contract_digest": digest }),
@@ -814,7 +933,7 @@ pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaRes
                 touched.insert(pid);
             }
             for pid in touched {
-                refresh(tx, &pid)?;
+                refresh(tx, &org, &pid)?;
             }
             Ok(json!({ "recovered_forward": forward, "rolled_back": back }))
         })
@@ -835,12 +954,16 @@ fn mismatch(msg: String) -> UaError {
 /// [`check_contract`] over the task's stored title and notes. `None` for a
 /// task that does not exist (the caller reports that) or carries no
 /// contract.
-pub(crate) fn task_contract(c: &Connection, task_id: i64) -> UaResult<Option<String>> {
+pub(crate) fn task_contract(c: &Connection, org: &str, task_id: i64) -> UaResult<Option<String>> {
     let row: Option<(String, Option<String>)> = c
-        .query_row("SELECT title, notes FROM tasks WHERE id = ?1", [task_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(
+            "SELECT title, notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+            params![org, task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     match row {
-        Some((title, notes)) => check_contract(c, task_id, &title, notes.as_deref().unwrap_or("")),
+        Some((title, notes)) => check_contract(c, org, task_id, &title, notes.as_deref().unwrap_or("")),
         None => Ok(None),
     }
 }
@@ -849,8 +972,14 @@ pub(crate) fn task_contract(c: &Connection, task_id: i64) -> UaResult<Option<Str
 /// contract. A task with neither a proposal nor a contract marker passes
 /// (`None`). For a task that matches, returns its contract block: the
 /// approved work order, without anything appended after [`CONTRACT_END`].
+///
+/// `org` is the task's organization, and only its proposals and items are
+/// read: a marker naming another organization's proposal answers as an
+/// unknown item, and another organization's approved item never claims the
+/// task.
 pub(crate) fn check_contract(
     c: &Connection,
+    org: &str,
     task_id: i64,
     title: &str,
     notes: &str,
@@ -866,8 +995,9 @@ pub(crate) fn check_contract(
         // notes away does not take it out of its contract.
         let owner: Option<(String, i64)> = c
             .query_row(
-                "SELECT proposal_id, idx FROM work_proposal_items WHERE task_id = ?1 AND status = 'approved' LIMIT 1",
-                [task_id],
+                "SELECT proposal_id, idx FROM work_proposal_items \
+                 WHERE org_id = ?2 AND task_id = ?1 AND status = 'approved' LIMIT 1",
+                params![task_id, org],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -893,13 +1023,17 @@ pub(crate) fn check_contract(
         raw_idx.parse().map_err(|_| mismatch(format!("task {task_id} names a malformed item index")))?;
     let row = c
         .query_row(
-            "SELECT * FROM work_proposal_items WHERE proposal_id = ?1 AND idx = ?2",
-            params![pid, idx],
+            "SELECT * FROM work_proposal_items WHERE org_id = ?3 AND proposal_id = ?1 AND idx = ?2",
+            params![pid, idx, org],
             item_from,
         )
         .optional()?;
     let mode: Option<String> = c
-        .query_row("SELECT reporting_mode FROM work_proposals WHERE id = ?1", [&pid], |r| r.get(0))
+        .query_row(
+            "SELECT reporting_mode FROM work_proposals WHERE org_id = ?2 AND id = ?1",
+            params![&pid, org],
+            |r| r.get(0),
+        )
         .optional()?;
     let (Some(row), Some(mode)) = (row, mode) else {
         return Err(mismatch(format!("task {task_id} names unknown work proposal item {pid}#{idx}")));

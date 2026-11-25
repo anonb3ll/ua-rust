@@ -427,14 +427,14 @@ INSERT INTO task_dependencies (task_id, depends_on_task_id, created_by, created_
 INSERT INTO task_comment_threads (task_id, revision, updated_at) VALUES (1, 1, '{T0}');
 INSERT INTO task_comments (task_id, author, body, thread_revision, created_at) VALUES
   (1, 'agent-1', 'first comment', 1, '{T0}');
-INSERT INTO goals (id, title, created_at, updated_at) VALUES (1, 'Ship it', '{T0}', '{T0}');
+INSERT INTO goals (id, title, created_at, updated_at, org_id) VALUES (1, 'Ship it', '{T0}', '{T0}', 'org-a');
 INSERT INTO task_goal_links (task_id, goal_id, linked_at) VALUES (1, 1, '{T0}');
 INSERT INTO plans (id, goal, created_at, updated_at) VALUES ('p1', 'Plan the work', '{T0}', '{T0}');
 INSERT INTO plan_steps (plan_id, step_idx, description, created_at, updated_at) VALUES
   ('p1', 0, 'step zero', '{T0}', '{T0}'), ('p1', 1, 'step one', '{T0}', '{T0}');
 INSERT INTO plan_checkpoints (plan_id, seq, created_at) VALUES ('p1', 1, '{T0}');
-INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, created_at, updated_at) VALUES
-  ('agent-1', 'agent-2', 1, '{{}}', '{T0}', '{T0}');
+INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, created_at, updated_at, org_id) VALUES
+  ('agent-1', 'agent-2', 1, '{{}}', '{T0}', '{T0}', 'org-a');
 INSERT INTO memory (id, title, content, tags, author, created_at, updated_at) VALUES
   ('note-a', 'Wombat facts', 'wombats have cube shaped droppings', '[\"zoo\"]', 'agent-1', '{T0}', '{T0}'),
   ('note-b', 'Other', 'nothing to see', '[]', 'agent-2', '{T0}', '{T0}');
@@ -502,6 +502,7 @@ fn operator() -> Caller {
         enforce_profile: false,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -528,14 +529,34 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comment_threads"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM goals"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_goal_links"), 1);
+    // Goals and their links land in the default organization, with their
+    // tasks: the source `org_id` is never copied.
+    for t in ["goals", "task_goal_links"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plans"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_steps"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plan_checkpoints"), 1);
+    // Plans, steps and checkpoints land in the default organization.
+    for t in ["plans", "plan_steps", "plan_checkpoints"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations"), 1);
+    // Delegations land in the default organization, with their tasks: the
+    // source `org_id` is never copied.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations WHERE org_id <> 'default'"), 0);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);
+    // Notes and their versions land in the default organization.
+    for t in ["memory", "memory_versions"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_reads"), 1);
+    // Messages and their read receipts land in the default organization.
+    for t in ["message_index", "message_reads"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
     assert_eq!(table(&r, "tasks").copied, 4);
 
     // Nodes: owner, version and retirement move across; host facts do not,
@@ -544,8 +565,15 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE facts_json = '{}'"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'old-box' AND retired_by = 'operator'"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE node = 'mac-1' AND version = '0.9.1'"), 1);
+    // Legacy nodes land in the default organization.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM nodes WHERE org_id <> 'default'"), 0);
+    // So do legacy agents, their tokens and their handoff notes.
+    for t in ["agents", "agent_tokens", "session_handoff_notes"] {
+        assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
+    }
+    assert!(n(&db, "SELECT COUNT(*) FROM agents") > 0);
     assert_eq!(r.unmapped_columns["nodes"]["device_node"], 1);
-    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = 'default'"), 1);
 
     // Self references: a forward parent is restored, a dangling one is NULL.
     assert_eq!(n(&db, "SELECT parent_id FROM tasks WHERE id = 2"), 4);
@@ -565,6 +593,8 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals WHERE status IN ('pending','approved')"), 0);
     assert_eq!(table(&r, "approvals").skipped.get("live_approval"), Some(&2));
+    // Approval history lands in the default organization.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM approvals WHERE org_id <> 'default'"), 0);
 
     // Memory keeps ids, and the rebuilt index finds the note.
     let hit: String = db
@@ -603,13 +633,20 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(v["checked"], json!(3));
 
     // New native events chain onto the imported head.
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.test.after_import", json!({})).by("tester")))
-        .unwrap();
+    db.write(|tx| {
+        ledger::append(
+            tx,
+            EventInput::new(ua_core::DEFAULT_ORG, "agent.test.after_import", json!({})).by("tester"),
+        )
+    })
+    .unwrap();
     let after = db.read(ledger::verify).unwrap();
     assert!(after.ok && after.checked == 4, "{after:?}");
 
     // Unmapped columns are reported, with how many values they held.
     assert_eq!(r.unmapped_columns["tasks"]["org_id"], 1);
+    assert_eq!(r.unmapped_columns["delegations"]["org_id"], 1);
+    assert_eq!(r.unmapped_columns["goals"]["org_id"], 1);
     assert!(r.unmapped_tables.contains(&"zulip_cursors".to_string()));
     assert!(r.unmapped_tables.contains(&"memory_embeddings".to_string()));
     assert!(r.derived_tables.contains(&"memory_fts".to_string()));
@@ -716,7 +753,8 @@ fn counts(db: &Db) -> Vec<i64> {
 fn a_target_with_its_own_events_refuses_before_any_write() {
     let f = fixture();
     let db = target();
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.native.event", json!({}))))
+        .unwrap();
     let before = counts(&db);
     let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
     let msg = format!("{err:#}");
@@ -729,7 +767,8 @@ fn a_catch_up_after_the_target_wrote_its_own_events_is_refused_up_front() {
     let f = fixture();
     let db = target();
     ua_import::import(&db, &f.path, &opts()).unwrap();
-    db.write(|tx| ledger::append(tx, EventInput::new("agent.native.event", json!({})))).unwrap();
+    db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "agent.native.event", json!({}))))
+        .unwrap();
     let c = Connection::open(&f.path).unwrap();
     c.execute("INSERT INTO tasks (id, title, created_at, updated_at) VALUES (5, 'Later', ?1, ?1)", [T0])
         .unwrap();
@@ -761,6 +800,106 @@ fn an_id_collision_refuses_before_any_write() {
 }
 
 #[test]
+fn canvas_import_checks_for_collisions_in_the_default_organization() {
+    let f = fixture();
+    for org in [ua_core::DEFAULT_ORG, "other"] {
+        let db = target();
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at)
+                 VALUES ('other', 'other', 'Other', ?1)",
+                [T0],
+            )?;
+            tx.execute(
+                "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at)
+                 VALUES (?1, 'default', '{}', 'builder-1', ?2)",
+                [org, T0],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let before = counts(&db);
+        let result = ua_import::import(&db, &f.path, &opts());
+        if org == ua_core::DEFAULT_ORG {
+            let err = result.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("graph_canvas_scenes already holds a row")
+                    && msg.contains("nothing was written"),
+                "{msg}"
+            );
+            assert_eq!(counts(&db), before);
+        } else {
+            assert_eq!(table(&result.unwrap(), "graph_canvas_scenes").copied, 1);
+            assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_canvas_scenes WHERE board_id = 'default'"), 2);
+        }
+    }
+}
+
+/// Legacy skill versions and assignments land in the default organization,
+/// keeping their ids. A source `org_id` is never copied by name, even when the
+/// target holds an organization of that id, and another organization's row
+/// with the same name and version does not collide.
+#[test]
+fn skill_rows_import_into_the_default_organization() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute_batch(&format!(
+        "
+CREATE TABLE skill_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, version INTEGER NOT NULL,
+  content_hash TEXT NOT NULL, source TEXT NOT NULL, content TEXT NOT NULL, published_by TEXT,
+  published_at TEXT NOT NULL, package_manifest TEXT, package_payload TEXT, org_id TEXT, UNIQUE(name, version));
+CREATE TABLE skill_assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL,
+  target_type TEXT NOT NULL, target TEXT NOT NULL, pinned_version INTEGER, assigned_by TEXT,
+  assigned_at TEXT NOT NULL, UNIQUE(skill_name, target_type, target));
+INSERT INTO skill_versions (id, name, version, content_hash, source, content, published_at, org_id) VALUES
+  (7, 'review-diff', 1, 'h1', 'skills/review-diff/SKILL.md', 'body', '{T0}', 'org-a');
+INSERT INTO skill_assignments (id, skill_name, target_type, target, pinned_version, assigned_at) VALUES
+  (3, 'review-diff', 'agent', 'agent-1', 1, '{T0}');
+"
+    ))
+    .unwrap();
+    drop(c);
+
+    let db = target();
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('org-a', 'org-a', 'Org A', ?1)",
+            [T0],
+        )?;
+        tx.execute(
+            "INSERT INTO skill_versions (id, org_id, name, version, content_hash, source, content, published_at)
+             VALUES (100, 'org-a', 'review-diff', 1, 'other', 's', 'theirs', ?1)",
+            [T0],
+        )?;
+        tx.execute(
+            "INSERT INTO skill_assignments (id, org_id, skill_name, target_type, target, pinned_version, assigned_at)
+             VALUES (100, 'org-a', 'review-diff', 'agent', 'agent-1', 1, ?1)",
+            [T0],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(r.org_scoped_rows.get("skill_versions"), Some(&1), "{:?}", r.org_scoped_rows);
+    assert_eq!(table(&r, "skill_versions").copied, 1);
+    assert_eq!(table(&r, "skill_assignments").copied, 1);
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM skill_versions WHERE id = 7 AND org_id = 'default' AND content = 'body'"
+        ),
+        1
+    );
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_assignments WHERE id = 3 AND org_id = 'default'"), 1);
+    // Organization A keeps exactly its own rows.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_versions WHERE org_id = 'org-a'"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_assignments WHERE org_id = 'org-a'"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM skill_versions WHERE id = 100 AND content = 'theirs'"), 1);
+}
+
+#[test]
 fn org_scoped_rows_refuse_unless_the_scope_is_dropped() {
     let f = fixture();
     let db = target();
@@ -774,12 +913,37 @@ fn org_scoped_rows_refuse_unless_the_scope_is_dropped() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 4);
 }
 
+/// The target `event_log` has an `org_id` column (`organization.v1.store`),
+/// but a source ledger row's `org_id` is still refused, never copied by name.
+#[test]
+fn a_source_ledger_org_id_is_refused_and_never_copied() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    c.execute("UPDATE event_log SET org_id = 'org-a' WHERE rowid = (SELECT MIN(rowid) FROM event_log)", [])
+        .unwrap();
+    drop(c);
+    let r = ua_import::dry_run(&f.path).unwrap();
+    assert_eq!(r.org_scoped_rows.get("event_log"), Some(&1), "{:?}", r.org_scoped_rows);
+
+    let db = target();
+    let err = ua_import::import(&db, &f.path, &Options::default()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("event_log: 1") && msg.contains("nothing was written"), "{msg}");
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log"), 0);
+
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log WHERE org_id <> 'default' OR hash_v <> 1"), 0);
+    assert!(n(&db, "SELECT COUNT(*) FROM event_log") > 0);
+}
+
 #[test]
 fn the_dry_run_reports_org_scope_either_way() {
     let f = fixture();
     let r = ua_import::dry_run(&f.path).unwrap();
     assert_eq!(r.org_scoped_rows.get("tasks"), Some(&1));
-    assert_eq!(r.org_scoped_rows.len(), 1);
+    assert_eq!(r.org_scoped_rows.get("delegations"), Some(&1));
+    assert_eq!(r.org_scoped_rows.get("goals"), Some(&1));
+    assert_eq!(r.org_scoped_rows.len(), 3, "{:?}", r.org_scoped_rows);
 }
 
 #[test]
@@ -956,4 +1120,123 @@ INSERT INTO session_handoff_notes (session_id, agent, task_id, done, next_steps,
     // A second run changes nothing.
     let again = ua_import::import(&db, &f.path, &opts()).unwrap();
     assert!(!again.notes.iter().any(|n| n.contains("parked task(s)")), "{:?}", again.notes);
+}
+
+#[tokio::test]
+async fn imported_legacy_prefix_and_hashed_chain_export_manifest_chain_ok() {
+    let f = fixture();
+    let c = Connection::open(&f.path).unwrap();
+    for (rowid, ulid) in [(1, "01HZZZZZZZZZZZZZZZZZZZZZZ1"), (2, "01HZZZZZZZZZZZZZZZZZZZZZZ2")] {
+        c.execute(
+            "INSERT INTO event_log (rowid, ulid, channel, payload, created_at) \
+             VALUES (?1, ?2, 'agent.legacy', '{}', '2025-12-31T00:00:00+00:00')",
+            params![rowid, ulid],
+        )
+        .unwrap();
+    }
+    drop(c);
+
+    let db = target();
+    let r = ua_import::import(&db, &f.path, &opts()).unwrap();
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3 && tl.unhashed_legacy_prefix == 2, "{tl:?}");
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db);
+    let caller = Caller {
+        label: "builder-1".into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some("builder-1-key".into()),
+        transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
+    };
+    let reg = builtin_registry();
+    let exported = reg.call(&hub, &caller, "export_migration_manifest", json!({})).await.unwrap();
+    let log = &exported["manifest"]["event_log"];
+    assert_eq!(log["chain_ok"], json!(true), "{log}");
+    assert_eq!(log["entry_hash_mismatches"], json!(0), "{log}");
+    assert_eq!(log["count"], json!(5), "{log}");
+    assert_eq!(log["first_ulid"], json!("01HZZZZZZZZZZZZZZZZZZZZZZ1"));
+    assert_eq!(log["last_ulid"], json!(EVENTS[2].ulid));
+}
+
+#[tokio::test]
+async fn an_out_of_order_ulid_keeps_manifest_chain_ok() {
+    // The Python hub minted ULIDs outside the write lock, so a later rowid can
+    // carry a ULID that sorts between two earlier rows. The hash chain is in
+    // rowid order and stays valid.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch(PY_SCHEMA).unwrap();
+    let events = [
+        PyEvent {
+            rowid: 5,
+            ulid: "01J0000000000000000000000",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: T0,
+            dedupe_key: None,
+        },
+        PyEvent {
+            rowid: 6,
+            ulid: "01J0000000000000000000002",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: "2026-01-01T00:00:01+00:00",
+            dedupe_key: None,
+        },
+        PyEvent {
+            rowid: 7,
+            ulid: "01J0000000000000000000001",
+            channel: "agent.task.updated",
+            payload: "{}",
+            originator: None,
+            episode_id: None,
+            created_at: "2026-01-01T00:00:02+00:00",
+            dedupe_key: None,
+        },
+    ];
+    let mut prev: Option<String> = None;
+    for e in &events {
+        prev = Some(insert_event(&c, e, prev.as_deref()));
+    }
+    // The last rowid's ULID really sorts between the first two.
+    let by_ulid: Vec<String> = c
+        .prepare("SELECT ulid FROM event_log ORDER BY ulid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(by_ulid, [events[0].ulid, events[2].ulid, events[1].ulid]);
+    drop(c);
+
+    let db = target();
+    let r = ua_import::import(&db, &path, &opts()).unwrap();
+    let tl = r.target_ledger.as_ref().unwrap();
+    assert!(tl.ok && tl.checked == 3, "{tl:?}");
+
+    let hub = Hub::new(Config::for_home(std::env::temp_dir()), db);
+    let caller = Caller {
+        label: "builder-1".into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some("builder-1-key".into()),
+        transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
+    };
+    let reg = builtin_registry();
+    let verified = reg.call(&hub, &operator(), "event_log_verify", json!({})).await.unwrap();
+    assert_eq!(verified["ok"], json!(true), "{verified}");
+    let exported = reg.call(&hub, &caller, "export_migration_manifest", json!({})).await.unwrap();
+    let log = &exported["manifest"]["event_log"];
+    assert_eq!(log["chain_ok"], json!(true), "{log}");
+    assert_eq!(log["entry_hash_mismatches"], json!(0), "{log}");
 }

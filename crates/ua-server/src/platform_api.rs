@@ -21,7 +21,7 @@
 //!
 //! Not built: the provenance graph (`/api/platform/provenance-graph`) and the
 //! evidence export (`/api/evidence/export`) answer `501`. Work products are
-//! not ported pending an explicit product decision (hub task #2658);
+//! not ported pending an explicit product decision;
 //! `/api/work-products*` answers `501` and says so.
 //!
 //! Every route is behind the same middleware as the rest of `/api` (bearer or
@@ -64,13 +64,13 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Work products are not part of this hub until a product decision says
-/// otherwise (hub task #2658).
+/// otherwise.
 fn not_ported() -> Response {
     let body = json!({
         "error": "not_implemented",
         "capability": "work_products",
         "message": "work products (submit, review and release) are not ported to this hub pending a \
-                    product decision (hub task #2658); use the Python hub for them",
+                    product decision; use the Python hub for them",
     });
     (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
 }

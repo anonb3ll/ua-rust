@@ -12,6 +12,7 @@ pub mod continuity;
 pub mod core_schema;
 pub mod cycles;
 pub mod delegation;
+pub mod deliverables;
 pub mod dispatch;
 pub mod events;
 pub mod evidence;
@@ -20,6 +21,7 @@ pub mod github;
 pub mod governance;
 pub mod graph;
 pub mod harness_config;
+pub mod idempotency;
 pub mod injection;
 pub mod managed_secrets;
 pub mod mcp;
@@ -53,7 +55,8 @@ use ua_store::SchemaPart;
 use crate::registry::Registry;
 
 pub fn schema_parts() -> Vec<SchemaPart> {
-    let mut parts = vec![core_schema::SCHEMA, core_schema::SCHEMA_V2, core_schema::SCHEMA_V3];
+    let mut parts =
+        vec![core_schema::SCHEMA, core_schema::SCHEMA_V2, core_schema::SCHEMA_V3, core_schema::SCHEMA_V4];
     // family schema parts (alphabetical)
     parts.extend(code::schema_parts());
     parts.extend(continuity::schema_parts());
@@ -82,6 +85,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     parts.push(routines::SCHEMA);
     parts.push(skill_registry::SCHEMA);
     parts.push(slack::SCHEMA);
+    parts.push(slack::SCHEMA_V2);
     parts.push(wake::SCHEMA);
     parts.push(wake::SCHEMA_V2);
     parts.push(web::SCHEMA);
@@ -98,6 +102,7 @@ pub fn register(r: &mut Registry) {
     code::register(r);
     cycles::register(r);
     delegation::register(r);
+    deliverables::register(r);
     dispatch::register(r);
     events::register(r);
     evidence::register(r);

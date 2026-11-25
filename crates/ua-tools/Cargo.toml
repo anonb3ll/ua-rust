@@ -8,16 +8,50 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+# The five below are on by default, so a build with no feature flags matches a
+# build from before they were optional. `--no-default-features` drops them.
+# `build_features()` reports which are compiled in (system_doctor,
+# capability_catalog), and `BUILD_FEATURES` lists the tools each one adds.
+default = ["code-intel", "readability", "mcp-gateway", "mcp-server", "slack-socket"]
 # Local semantic memory search with fastembed. Off by default: without it,
 # memory search is lexical (FTS5) only. The feature lives in ua-memory.
 embeddings = ["ua-memory/embeddings"]
+# Symbol indexing with tree-sitter: `fs_index_symbols`, `fs_list_symbols`,
+# `fs_search_symbols`, `fs_repo_map`.
+code-intel = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+]
+# Readability article extraction (dom_smoothie) inside `web_fetch` and
+# `dash_view`. Without it those tools still run and convert the whole HTML
+# page, and say so with `extraction: "full-page"`.
+readability = ["dep:dom_smoothie"]
+# The downstream MCP client (rmcp): the `mcp_gateway` tool. Without it the
+# `mcp_server_*` registry tools stay, but `mcp_server_register` refuses.
+mcp-gateway = ["dep:rmcp"]
+# Pulls in nothing here. The hub's own MCP server (`/mcp`, `ua mcp`) lives in
+# ua-server, whose `mcp-server` feature turns this on, so capability_catalog
+# and system_doctor report the MCP surface the binary actually serves.
+mcp-server = []
+# Pulls in nothing here either. The Slack Socket Mode transport (an outbound
+# WebSocket) lives in ua-server, whose `slack-socket` feature turns this on so
+# system_doctor and capability_catalog report whether the binary has it.
+slack-socket = []
 
 [dependencies]
 subtle.workspace = true
 ua-core = { workspace = true, features = ["rusqlite"] }
+# The address classifier and the guarded outbound client.
+ua-ingress.workspace = true
 ua-store.workspace = true
 ua-memory.workspace = true
+ua-org.workspace = true
+# Deliverables and their revisions; the tools are registered here.
+ua-deliverables.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
@@ -53,7 +87,7 @@ uuid = { workspace = true, features = ["v4"] }
 # toolchain (aws-lc-sys) needed.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query", "charset", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-dom_smoothie = "0.19"
+dom_smoothie = { version = "0.19", optional = true }
 htmd = "0.6"
 dom_query = "0.29"
 base64 = "0.22"
@@ -66,12 +100,12 @@ icu_normalizer = { version = "2.4", default-features = false, features = ["compi
 html-escape = "0.2"
 encoding_rs = "0.8"
 toml = "0.8"
-tree-sitter = "0.27"
-tree-sitter-rust = "0.24"
-tree-sitter-python = "0.25"
-tree-sitter-javascript = "0.25"
-tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.25"
+tree-sitter = { version = "0.27", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
 
 # Managed secrets: AES-256-GCM at rest and an HMAC-SHA256 fingerprint. Both
 # RustCrypto crates were already in the dependency tree (cookie, webauthn-rs).
@@ -79,7 +113,7 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 hmac = "0.13"
 # MCP gateway: the client side of the official SDK (the server side is in
 # ua-server), over a child's stdio or Streamable HTTP through our reqwest.
-rmcp = { version = "=3.11.0", default-features = false, features = [
+rmcp = { version = "=3.11.0", optional = true, default-features = false, features = [
     "client",
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
@@ -100,3 +134,4 @@ rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-s
 [[test]]
 name = "mcp_gateway"
 harness = false
+required-features = ["mcp-gateway"]

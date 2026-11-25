@@ -6,7 +6,10 @@
 //! 1. resolves the server (registry or config) and refuses it when it is
 //!    revoked, past its review window, or misconfigured;
 //! 2. refuses a tool the registration does not classify;
-//! 3. for a read, refuses an anonymous caller when the server injects secrets
+//! 3. refuses another organization's caller for a server that injects the
+//!    hub's secrets or runs as a stdio process on the hub (a static `list`
+//!    reads neither and is not refused);
+//!    for a read, refuses an anonymous caller when the server injects secrets
 //!    and checks the caller against `read_profiles` (empty: humans and
 //!    configured operator identities); for a write, needs an authenticated
 //!    caller who passes the prod-action checks;
@@ -162,7 +165,7 @@ async fn mcp_gateway(ctx: ToolCtx, a: GatewayArgs) -> UaResult<Value> {
         .hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new(CALL_CHANNEL, payload).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CALL_CHANNEL, payload).by(by))?;
             Ok(())
         })
         .await;
@@ -173,15 +176,18 @@ async fn mcp_gateway(ctx: ToolCtx, a: GatewayArgs) -> UaResult<Value> {
 }
 
 async fn execute(ctx: &ToolCtx, a: GatewayArgs, t: &mut Trace) -> UaResult<Value> {
-    t.action = match a.action.as_deref().unwrap_or("call") {
+    t.action = match crate::routes::action_of("mcp_gateway", a.action.as_deref())? {
         "call" => "call",
         "list" => "list",
-        other => return Err(UaError::invalid(format!("action must be call or list, not {other:?}"))),
+        other => return Err(crate::routes::unhandled("mcp_gateway", other)),
     };
     check_server_name(&a.server)?;
     let (cfg, name) = (ctx.hub.cfg().clone(), a.server.clone());
     let server = ctx.hub.db().read_async(move |c| resolve(c, &cfg, &name)).await?;
     server.usable()?;
+    if t.action == "call" || a.live {
+        require_hub_org_for_server(ctx, &server)?;
+    }
     if t.action == "list" {
         return list(ctx, &server, a.live, t).await;
     }
@@ -378,7 +384,7 @@ fn check_reader(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
         ));
     }
     let allowed = if server.spec.read_profiles.is_empty() {
-        "humans and configured operator identities (read_profiles is empty)".to_string()
+        "operators, that is verified humans (read_profiles is empty)".to_string()
     } else {
         server.spec.read_profiles.join(", ")
     };
@@ -455,6 +461,41 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 
 // --- secrets ----------------------------------------------------------------------
 
+/// A downstream server's credentials are the hub's (the default
+/// organization's managed secrets): another organization's caller never has
+/// them injected on its behalf. A stdio server is a process the hub spawns
+/// on its own host, with the hub's filesystem and network, so it too serves
+/// the default organization only, secrets or not. A Streamable HTTP server
+/// with no injected secret is not refused here. Checked before the policy
+/// check, the slot, any approval and any spawn or connection. Fail closed
+/// until servers are per organization.
+fn require_hub_org_for_server(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
+    if ctx.caller.org_id == super::HUB_SECRETS_ORG {
+        return Ok(());
+    }
+    if !server.spec.secrets.is_empty() {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "MCP server {:?} injects the hub's credentials, which serve the default organization only; \
+                 nothing was read or sent",
+                server.name
+            ),
+        ));
+    }
+    if server.spec.transport == TransportKind::Stdio {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "MCP server {:?} runs as a process on the hub, which serves the default organization only; \
+                 nothing was started or sent",
+                server.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The injected secrets, and each one's keyed fingerprint by name.
 type Loaded = (Vec<(Inject, SecretString)>, BTreeMap<String, String>);
 
@@ -467,7 +508,9 @@ async fn load_secrets(ctx: &ToolCtx, server: &Server) -> UaResult<Loaded> {
             let (mut out, mut fingerprints) = (Vec::new(), BTreeMap::new());
             for r in refs {
                 let inject = r.parse()?;
-                let (value, fp) = managed_secrets::load_for_consumer(c, &cfg, &r.secret, &consumer).map_err(|e| {
+                let loaded =
+                    managed_secrets::load_for_consumer(c, &cfg, super::HUB_SECRETS_ORG, &r.secret, &consumer);
+                let (value, fp) = loaded.map_err(|e| {
                     UaError::denied(
                         "secret_unavailable",
                         format!(

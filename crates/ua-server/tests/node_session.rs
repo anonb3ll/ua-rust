@@ -29,6 +29,7 @@ fn human() -> Caller {
         enforce_profile: false,
         session_key: None,
         transport: Transport::Http,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -143,8 +144,11 @@ async fn a_minted_credential_reaches_only_its_paths_and_tools() {
         ("accept", "application/json, text/event-stream"),
         ("host", "localhost"),
     ];
-    let resp = hub.send(post_json("/mcp", &init, &headers)).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    // (A build without the mcp-server feature has no /mcp.)
+    if ua_server::MCP_SERVER {
+        let resp = hub.send(post_json("/mcp", &init, &headers)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 
     // The receipt ends it, on every path.
     let receipt =
@@ -153,8 +157,10 @@ async fn a_minted_credential_reaches_only_its_paths_and_tools() {
     assert_eq!(status, StatusCode::CREATED, "{v}");
     let resp = hub.send(get("/api/whoami", None, Some(&cred))).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let resp = hub.send(post_json("/mcp", &init, &headers)).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    if ua_server::MCP_SERVER {
+        let resp = hub.send(post_json("/mcp", &init, &headers)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
     let (status, v, _) = post(&hub, "/api/node/session_credential", BUILDER, mint).await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["reason"], "item_not_claimed");

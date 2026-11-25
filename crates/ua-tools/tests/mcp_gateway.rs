@@ -165,6 +165,7 @@ fn caller(label: &str, kind: ActorKind, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -174,8 +175,9 @@ fn human() -> Caller {
 }
 
 /// An operator agent: requests registrations, deletes and reviews.
+/// A second human operator (secret and registry admin is human-only).
 fn ops() -> Caller {
-    caller("ops-1", ActorKind::Agent, Profile::Operator)
+    caller("ops-1", ActorKind::Human, Profile::Operator)
 }
 
 fn dev() -> Caller {
@@ -206,8 +208,10 @@ impl H {
     fn with(f: impl FnOnce(&mut Config)) -> Self {
         let mut cfg = Config::for_home(std::env::temp_dir());
         cfg.human_identities = vec!["operator".into()];
-        // Secret and registry admin is by identity: ops-1 is a configured operator.
-        cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-1".into()]);
+        // Secret and registry admin is by identity: ops-1 is a second human
+        // (an operator); fleet-bot is a lifecycle operator only.
+        cfg.human_identities.push("ops-1".into());
+        cfg.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]);
         cfg.managed_secret_key = Some(KEY.to_string().into());
         f(&mut cfg);
         Self { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry() }
@@ -435,9 +439,22 @@ async fn secret_admin_is_an_identity_not_a_profile() {
     let e =
         h.err(&as_operator, "mcp_server_register", json!({ "name": "fake", "server": stdio_spec() })).await;
     assert_eq!(reason(&e), "operator_only");
-    // A configured operator identity is, whatever its profile.
-    let ops_dev = caller("ops-1", ActorKind::Agent, Profile::Coordinator);
+    // A human is, whatever its profile.
+    let ops_dev = caller("ops-1", ActorKind::Human, Profile::Coordinator);
     h.ok(&ops_dev, "managed_secret_set", json!({ "name": "x", "consumer": "mcp:x", "value": "v" })).await;
+    // An unattended routine running under that human's label is not.
+    let routine = caller("ops-1", ActorKind::Agent, Profile::Coordinator);
+    let e = h
+        .err(&routine, "managed_secret_set", json!({ "name": "z", "consumer": "mcp:x", "value": "v" }))
+        .await;
+    assert_eq!(reason(&e), "operator_only");
+    // A lifecycle operator is not: secret and registry admin is human-only.
+    let fleet = caller("fleet-bot", ActorKind::Agent, Profile::Coordinator);
+    let e =
+        h.err(&fleet, "managed_secret_set", json!({ "name": "y", "consumer": "mcp:x", "value": "v" })).await;
+    assert_eq!(reason(&e), "operator_only");
+    let e = h.err(&fleet, "mcp_server_register", json!({ "name": "fake2", "server": stdio_spec() })).await;
+    assert_eq!(reason(&e), "operator_only");
 }
 
 async fn registration_needs_an_operator_and_a_human_approval() {
@@ -629,8 +646,10 @@ async fn empty_read_profiles_mean_humans_and_operators_only() {
     assert_eq!(reason(&h.err(&reviewer(), "mcp_gateway", echo.clone()).await), "read_profile_denied");
     let anon = Caller::local("someone", Transport::Stdio);
     assert_eq!(reason(&h.err(&anon, "mcp_gateway", echo.clone()).await), "identity_required");
-    // The configured operator identity reads, in a profile that has the gateway.
-    h.ok(&caller("ops-1", ActorKind::Agent, Profile::Developer), "mcp_gateway", echo.clone()).await;
+    // A human reads; an unattended routine under a human's label does not.
+    let routine = caller("ops-1", ActorKind::Agent, Profile::Developer);
+    assert_eq!(reason(&h.err(&routine, "mcp_gateway", echo.clone()).await), "read_profile_denied");
+    h.ok(&caller("ops-1", ActorKind::Human, Profile::Developer), "mcp_gateway", echo.clone()).await;
     h.ok(&human(), "mcp_gateway", echo).await;
 }
 

@@ -10,7 +10,7 @@ use ua_store::WriteTx;
 
 use super::{
     acceptance, check_item_id, clip, close_linked_run, command, credentials, device_agent, evidence_ref,
-    load_item, now, owned_node, record, relay,
+    load_item, now, owned_node, record, relay, require_org,
 };
 use crate::families::audit::rules::redact_secrets;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -78,17 +78,21 @@ pub(crate) fn bounded(m: &Map<String, Value>, node: &str) -> Value {
 /// `Ok(Err(refusal))` is a refusal whose ledger record must still commit.
 type Posted = UaResult<Result<Value, UaError>>;
 
+/// `org` is the node token's organization: the node and the item must be
+/// its, so another organization's item answers as not queued for the node.
 fn post(
     tx: &mut WriteTx<'_>,
     cfg: &ua_core::Config,
+    org: &str,
     agent: &str,
     node: &str,
     id: &str,
     receipt: &Map<String, Value>,
 ) -> Posted {
-    let row = owned_node(tx, node, agent)?;
+    require_org(tx, org)?;
+    let row = owned_node(tx, org, node, agent)?;
     let node = row.node;
-    let Some(item) = load_item(tx, id)?.filter(|i| i.node == node) else {
+    let Some(item) = load_item(tx, org, id)?.filter(|i| i.node == node) else {
         return Err(UaError::not_found(format!("item {id} is not queued for node {node:?}")));
     };
     let status = receipt.get("status").and_then(Value::as_str).unwrap_or("");
@@ -127,6 +131,7 @@ fn post(
         if let Err(e) = command::check_fence(tx, &item, token) {
             record(
                 tx,
+                org,
                 "stale_fence",
                 json!({ "node": node, "item_id": id, "attempt": item.attempts }),
                 agent,
@@ -140,8 +145,8 @@ fn post(
     let n = tx.execute(
         "UPDATE node_dispatch SET status = ?2, receipt_json = ?3, completed_at = ?4, \
          session_id = COALESCE(?5, session_id), lease_expires_at = NULL, updated_at = ?4 \
-         WHERE id = ?1 AND receipt_json IS NULL AND status = 'claimed' AND attempts = ?6",
-        params![id, status, stored.to_string(), ts, session, item.attempts],
+         WHERE id = ?1 AND org_id = ?7 AND receipt_json IS NULL AND status = 'claimed' AND attempts = ?6",
+        params![id, status, stored.to_string(), ts, session, item.attempts, org],
     )?;
     if n != 1 {
         return Err(UaError::conflict(format!("item {id} changed under this receipt")));
@@ -151,12 +156,13 @@ fn post(
     }
     let event_id = record(
         tx,
+        org,
         "receipt",
         json!({ "node": node, "item_id": id, "status": status, "task_id": item.task_id, "attempt": item.attempts }),
         agent,
     )?;
-    relay::drop_open_followups(tx, id, "session_ended_before_delivery")?;
-    credentials::revoke_for_item(tx, id, "session_end", agent)?;
+    relay::drop_open_followups(tx, org, id, "session_ended_before_delivery")?;
+    credentials::revoke_for_item(tx, org, id, "session_end", agent)?;
     let run = close_linked_run(tx, &item, status, stored["reason"].as_str(), agent, true)?;
     acceptance::on_receipt(tx, cfg, &item)?;
     Ok(Ok(json!({
@@ -176,12 +182,13 @@ fn post(
 /// its receipt. `None` when the run is not node-routed.
 pub(crate) fn cancel_for_run(
     tx: &mut WriteTx<'_>,
+    org: &str,
     evidence: &str,
     actor: &str,
 ) -> UaResult<Option<&'static str>> {
     let Some(rest) = evidence.strip_prefix("node:") else { return Ok(None) };
     let Some((_, id)) = rest.rsplit_once(':') else { return Ok(None) };
-    let Some(item) = load_item(tx, id)? else { return Ok(Some("already_gone")) };
+    let Some(item) = load_item(tx, org, id)? else { return Ok(Some("already_gone")) };
     if item.is_terminal() {
         // A lapsed lease ended the item, not the node: nothing proves it stopped.
         return Ok(Some(if item.outcome_unknown() { "outcome_unknown" } else { "already_gone" }));
@@ -190,31 +197,33 @@ pub(crate) fn cancel_for_run(
         let ts = now();
         tx.execute(
             "UPDATE node_dispatch SET status = 'cancelled', cancel_requested = 1, completed_at = ?2, updated_at = ?2 \
-             WHERE id = ?1 AND status = 'queued'",
-            params![item.id, ts],
+             WHERE id = ?1 AND org_id = ?3 AND status = 'queued'",
+            params![item.id, ts, org],
         )?;
         record(
             tx,
+            org,
             "cancelled",
             json!({ "node": item.node, "item_id": item.id, "actor": actor, "reason": "dispatch_cancel" }),
             actor,
         )?;
-        relay::drop_open_followups(tx, &item.id, "item_cancelled")?;
+        relay::drop_open_followups(tx, org, &item.id, "item_cancelled")?;
         return Ok(Some("already_gone"));
     }
     if !item.cancel_requested {
         tx.execute(
-            "UPDATE node_dispatch SET cancel_requested = 1, updated_at = ?2 WHERE id = ?1",
-            params![item.id, now()],
+            "UPDATE node_dispatch SET cancel_requested = 1, updated_at = ?2 WHERE id = ?1 AND org_id = ?3",
+            params![item.id, now(), org],
         )?;
         record(
             tx,
+            org,
             "cancel_requested",
             json!({ "node": item.node, "item_id": item.id, "actor": actor, "reason": "dispatch_cancel" }),
             actor,
         )?;
     }
-    credentials::revoke_for_item(tx, &item.id, "cancelled", actor)?;
+    credentials::revoke_for_item(tx, org, &item.id, "cancelled", actor)?;
     Ok(Some("node_cancel_requested"))
 }
 
@@ -248,10 +257,13 @@ async fn node_receipt(ctx: ToolCtx, a: ReceiptArgs) -> UaResult<Value> {
     if !receipt.get("attempt").is_some_and(Value::is_i64) {
         return Err(UaError::invalid("receipt.attempt is required"));
     }
-    let id2 = id.clone();
+    let (id2, org) = (id.clone(), ctx.caller.org_id.clone());
     let hub = ctx.hub.clone();
-    let out =
-        ctx.hub.db().write_async(move |tx| post(tx, hub.cfg(), &agent, &a.node, &id2, &receipt)).await??;
+    let out = ctx
+        .hub
+        .db()
+        .write_async(move |tx| post(tx, hub.cfg(), &org, &agent, &a.node, &id2, &receipt))
+        .await??;
     let hub = ctx.hub.clone();
     let _ =
         tokio::task::spawn_blocking(move || command::deliver_pending(&hub, command::NoticeScope::Item(&id)))

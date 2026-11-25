@@ -34,12 +34,17 @@ a rule is written once and holds for every client.
 | Crate | Holds |
 |---|---|
 | `ua-core` | Config, identity, session profiles, errors, sandbox resolvers |
-| `ua-store` | SQLite storage, migrations, repositories, the event ledger |
+| `ua-ingress` | The boundary to other systems: the address classifier and the guarded outbound HTTP client with named destination policies ([docs/ingress.md](docs/ingress.md)) |
+| `ua-store` | SQLite storage: the writer and reader connections, named schema parts, the event ledger, and backup, restore and database checks |
 | `ua-memory` | Memory notes: schema, note model, save, hybrid search, ranking, embeddings, lifecycle |
+| `ua-deliverables` | Deliverables: what a task produces, and its immutable, ordered revisions ([docs/deliverables.md](docs/deliverables.md)) |
 | `ua-tools` | Tool registry, the call wrapper and the tool families |
 | `ua-server` | axum HTTP API, MCP adapter, auth, server-rendered UI |
 | `ua-import` | `ua import python-hub`: copies a Python hub database, ledger chain intact |
 | `ua-cli` | The `ua` binary |
+
+The TypeScript SDK (protocol and client packages) is in `sdk/typescript`, and
+the Slack routes and Socket Mode are described in [docs/slack.md](docs/slack.md).
 
 Library choices and the reasons for them are in [docs/stack.md](docs/stack.md).
 
@@ -68,6 +73,31 @@ is unset). Configuration is read from defaults, then `$UA_HOME/config.toml`
 (or `$UA_CONFIG`), then `UA_*` environment variables. See
 [config.example.toml](config.example.toml) and [.env.example](.env.example).
 Every value in those files is a placeholder.
+
+### Build options
+
+`cargo build --release` builds everything in the table below except
+`embeddings`. To leave the heavy dependencies out, build without default
+features and add back what you want:
+
+```sh
+cargo build --release --no-default-features                          # smallest build
+cargo build --release --no-default-features --features mcp-server    # MCP clients can still connect
+cargo build --release --features embeddings                          # add semantic memory search
+```
+
+| Feature | Default | Enables | Without it |
+|---|---|---|---|
+| `code-intel` | on | tree-sitter symbol tools: `fs_index_symbols`, `fs_list_symbols`, `fs_search_symbols`, `fs_repo_map` | Those tools are not registered. |
+| `readability` | on | dom_smoothie article extraction in `web_fetch` and `dash_view` | The whole page is converted (`extraction: "full-page"`). |
+| `mcp-gateway` | on | `mcp_gateway`, the client for downstream MCP servers | `mcp_server_register` refuses. |
+| `mcp-server` | on | The hub's own MCP server: `/mcp` and `ua mcp` | `ua serve` serves the JSON API and UI only, and warns at startup. |
+| `slack-socket` | on | Slack Socket Mode: Slack over an outbound WebSocket, no public URL | `slack_socket_mode = true` is reported as not compiled in. |
+| `embeddings` | off | Semantic memory search with fastembed | Memory search is lexical (FTS5). |
+
+`system_doctor` and `capability_catalog` report which features a build has
+and which tools a missing feature leaves out. See
+[docs/stack.md](docs/stack.md#cargo-features).
 
 ## First run
 
@@ -114,6 +144,10 @@ over stdio with `ua mcp --label agent-1`. Remote MCP clients can use OAuth
   variable the config names and is never stored or logged; only
   repositories bound to a project are ever requested
   ([docs/github.md](docs/github.md#security-model)).
+- The Slack routes are off by default. When enabled they check Slack's
+  signature over the raw body before parsing or touching the database, act
+  only for Slack users mapped to a human identity, and run commands through the
+  same governed path ([docs/slack.md](docs/slack.md#threat-model)).
 - Managed secrets are encrypted at rest with a key the database never holds,
   and no tool returns a value. Downstream MCP servers get them by reference
   and see only what their registration names.
@@ -137,29 +171,37 @@ vulnerability.
 | Provider accounts | Operator registry of provider accounts (`provider_account_*`), quota observed from harness-declared signals (`quota_patterns` on stderr, Pi's JSON error events; `provider_quota_status`), `dispatch_task` refusals or same-provider, same-billing fallback on a disabled or rate-limited account; Pi as an ordinary harness (`env`, `env_denylist`, `path_prepend`, `stdin`) | [dispatch](docs/dispatch.md#provider-accounts) |
 | Governance | One claim gate for every path that hands out work; agent lifecycle (pause, resume, terminate, retire with token revocation); task subtree holds; fenced operator claim release; work proposals whose approved items become tasks with a frozen contract; project repo bindings; `cleanup_stale_worktrees` and `audit_triage_tasks` | [policy](docs/policy.md#governance-controls) |
 | Continuity | Task workflow record (stage, resume capsule, checks graded `verified` / `attested` / `unknown` at a head through a pluggable CI verifier); session handoff notes with `seal` as the commit point; conversation handoff to a task without copying messages; queue closure in its own task columns (`queue_park`, `queue_fold`, `queue_unpark`, a dry-run `queue_sweep`, `queue_health`, `task_list(parked=true)`), close-on-merge (`queue_close_merged`); the review queue (`task_list(stage="review")`) and a `review_ready` notification; delegation stats in `observability_manage` | [continuity](docs/continuity.md) |
+| Deliverables | A task's deliverable (`deliverable_create`, kind `commit`: a commit in the project's bound repository) and its immutable, ordered revisions (`deliverable_revise`: the full commit SHA, which also becomes the task's workflow head), read with `deliverable_get` and `deliverable_list`; the task workflow record's writers, one ledger event per change | [deliverables](docs/deliverables.md) |
 | GitHub | Native REST client scoped to bound repositories (no redirects, bounded, rate-limit aware); CI runs and jobs verify task checks; signed webhook `POST /api/github/webhook` with replay protection (merges close tasks, completed runs re-verify checks); ETag polling fallback; `policy_authorization_record` / `policy_authorization_list`, accepted by `git_merge_task` in place of a one-time approval for one exact head | [github](docs/github.md) |
 | Planning and capability | Planning canvas (`graph_canvas_read` / `graph_canvas_write`: Excalidraw boards parsed into task and dependency suggestions, optimistic writes, per-agent and hub board caps; `graph_canvas_history` / `graph_canvas_restore`: every overwrite keeps the replaced scene, newest `graph_canvas_history_max` per board within `graph_canvas_history_max_bytes`; deleted elements are not parsed), `check_agent_capability` (a task's `[requires: ...]` against the agent's profile) and `capability_catalog` (agents, tools by family, programs, harnesses, workflows, skills, MCP surface; health, boundaries, agent hosts and the program allowlist for operators only; with a task and agent, readiness from tools, identity and an executor) | |
 | Downstream MCP | `mcp_gateway` calls a catalogued tool on a registered MCP server (stdio or Streamable HTTP) with hub-held credentials: reads per profile, every write behind a one-time human approval bound to its arguments, address-scope and origin pinning, secrets injected by name and redacted from results, bounded size and time, one ledger event per call. `mcp_server_register` / `_review` / `_revoke` (approval-gated, with a review window) and `mcp_server_list`; servers may also be declared in `config.toml` | [mcp](docs/mcp.md) |
-| Managed secrets | `managed_secret_set` (human or configured operator identity; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one consumer, no read path | [mcp](docs/mcp.md#managed-secrets) |
+| Managed secrets | `managed_secret_set` (a verified human of the caller's organization; replacing a value is approval-gated), `managed_secret_list` (metadata and a keyed fingerprint only), `managed_secret_delete` (approval-gated): AES-256-GCM at rest under `managed_secret_key`, each secret bound to one organization and one consumer, no read path; `github_credential_set`, `github_credential_clear` and `github_credential_status` hold another organization's GitHub token and webhook secret | [mcp](docs/mcp.md#managed-secrets) |
 | Public relay | `relay_manage`: an agent drafts a comment for an issue or pull request in an allowlisted GitHub repository; gates refuse secrets, hidden or bidirectional Unicode, private addresses and internal host names, home paths, personal data, over-long text and a private denylist, never rewriting the text; a human approves the exact text and target, the send repeats it byte for byte, and the token is a managed secret | [relay](docs/relay.md) |
+| Slack | Off by default. Signed slash commands (`POST /api/slack/commands`) and Events API callbacks (`POST /api/slack/events`) behind `slack_enabled` and `UA_SLACK_SIGNING_SECRET`: the nine coordination commands run as the human identity a (`team_id`, `user_id`) pair is mapped to, through the governed call path (transport `slack`); `/approve` only for mappings with `can_approve`, as a verified human other than the requester; commands with no recorded outcome ledgered at startup; messages run only when marked (`!task`); replay and retry dedupe; slash-command results posted to `hooks.slack.com` only. Or, for a hub with no public URL, Socket Mode (`slack_socket_mode`, `UA_SLACK_APP_TOKEN`): the same admission and execution over an outbound WebSocket to Slack | [slack](docs/slack.md) |
 | Zulip | `zulip_send_message`: the relay's gates plus Zulip wildcard, group and unlisted mentions and unlisted link hosts, then a human approval of the exact stream, topic and text; an uncertain send blocks a duplicate until a human runs `zulip_resolve_send`. `zulip_fetch_messages`: forward-only cursor, messages labelled untrusted. Off until configured; sending retired by default | [zulip](docs/zulip.md) |
 | Quality | Security audit (with approved remediation), skill review, injection triage, observability, evidence and export | |
 | Adapters | MCP (stdio, Streamable HTTP 2026-07-28 plus legacy sessions), HTTP/JSON and compatibility API, CLI | |
-| TypeScript SDK | The `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
+| TypeScript SDK | The SDK itself is in [`sdk/typescript`](sdk/typescript/README.md) (protocol and client packages; not published). The hub serves its `ControlCenterClient` platform routes: runs (`run_list` / `run_get`: dispatch runs, sessions, workflow runs and node items as one row shape), the platform object model (`platform_manifest` / `platform_object_get`, each kind gated by its own profile tool) and evidence (`evidence_append`: `sdk.` channels, caller-attributed, deduplicated per caller; `evidence_report`) | [sdk](docs/sdk.md) |
 | Control Center | Server-rendered UI at `/ui`: inbox, work board, plans, agents, messages, memory, live activity | [ui](docs/ui.md) |
 | Auth | OAuth 2.1 authorization server, passkeys, browser sessions, node session credentials | [auth](docs/auth.md) |
 | Migration | `ua import python-hub` with a dry run, resumable and chain-verified | |
 
 ## Not yet ported
 
-Native-session resume and adopt, cloud executors, ACP, the Slack connector,
-role workflows, GitHub writes (comments, labels, held PRs, the GitHub App
-installation flow), session-handoff failover, the SDK's
-queue-health and node-session routes (`/api/queue-health`,
-`/api/action/node-session`), the provenance graph and evidence export, billing
-and usage ledgers, and tenancy (`org_id`). Work products
-(`/api/work-products*`) are not ported pending an explicit product decision
-(hub task #2658) and answer 501.
+Native-session resume and adopt, cloud executors, Slack interactions,
+bot-token posting and live chat (slash commands and events are in),
+role workflows, GitHub writes other than the relay's approved comments
+(labels, held PRs, the GitHub App installation flow), session-handoff
+failover, the SDK's queue-health and node-session routes
+(`/api/queue-health`, `/api/action/node-session`, which no route serves), the
+provenance graph and evidence export (`/api/platform/*` paths other than the
+manifest and objects, and `/api/evidence/export`, answer 501), discovered
+native sessions (`/api/nodes/*` other than `/api/nodes/acceptance`, 501),
+billing and usage ledgers, and tenancy (`org_id`). The older hub's work
+products are replaced by [deliverables](docs/deliverables.md) (deliverables
+and revisions of the commit kind are in; handoff binding, release through
+approval and file deliverables are not yet); the work-product routes
+(`/api/work-products*`) still answer 501.
 
 ## License
 

@@ -17,6 +17,10 @@
 //! between. A note whose front matter says `locked: true` takes no agent
 //! writes; `force` overrides that for a verified human only.
 //!
+//! The vault is the default organization's: every tool here, the
+//! `obsidian_*` client included, refuses another organization's caller
+//! (`org_unsupported`) before touching the filesystem or the plugin.
+//!
 //! State changes append a ledger event with the vault-relative path and a
 //! content hash, never the content.
 
@@ -93,10 +97,30 @@ pub(crate) struct Vault {
     /// Vault-relative inbox directory.
     pub inbox: String,
     pub caller: Caller,
+    /// Whether the caller is an operator (a verified human).
+    pub operator: bool,
 }
 
-/// The caller's vault, or `vault_not_configured`.
+/// The vault, and the Obsidian app that serves it, are the hub's: the
+/// default organization's (`docs/organization.md`, Scoping per subsystem).
+/// Another organization's caller is refused (`org_unsupported`) before any
+/// path is resolved, any note read or written, or any request sent to the
+/// Obsidian plugin, until per-organization vaults exist.
+pub(crate) fn require_hub_org(ctx: &ToolCtx) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "the vault belongs to the default organization, and this organization has no vault \
+             configured; no note was read or written",
+        ));
+    }
+    Ok(())
+}
+
+/// The caller's vault, `org_unsupported` for another organization's caller
+/// (see [`require_hub_org`]), or `vault_not_configured`.
 pub(crate) fn vault(ctx: &ToolCtx) -> UaResult<Vault> {
+    require_hub_org(ctx)?;
     let cfg = ctx.hub.cfg();
     let Some(path) = cfg.vault_path.as_ref().filter(|p| !p.as_os_str().is_empty()) else {
         return Err(UaError::denied(
@@ -117,6 +141,11 @@ pub(crate) fn vault(ctx: &ToolCtx) -> UaResult<Vault> {
         write_dirs: cfg.vault_write_dirs.clone(),
         inbox: cfg.vault_inbox_dir.trim().trim_matches('/').to_string(),
         caller: ctx.caller.clone(),
+        operator: ua_org::authz::Authz::new(cfg).holds(
+            &ctx.caller,
+            &[ua_org::authz::Authority::Operator],
+            ua_core::DEFAULT_ORG,
+        ),
     })
 }
 
@@ -370,7 +399,7 @@ pub(crate) async fn record(ctx: &ToolCtx, channel: &'static str, payload: Value)
     ctx.hub
         .db()
         .write_async(move |tx| {
-            ledger::append(tx, EventInput::new(channel, payload).by(by))?;
+            ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by))?;
             Ok(())
         })
         .await

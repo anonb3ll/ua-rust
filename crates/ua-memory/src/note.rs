@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, UaError, UaResult};
+use ua_store::{EventInput, WriteTx, ledger};
 
 use super::rank;
 
@@ -219,17 +220,24 @@ pub(crate) fn text_sha(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-pub(crate) fn fetch(conn: &Connection, id: &str) -> UaResult<Option<Note>> {
+/// Note `id` of organization `org`. Another organization's note answers
+/// exactly like a missing one.
+pub(crate) fn fetch(conn: &Connection, org: &str, id: &str) -> UaResult<Option<Note>> {
     Ok(conn
-        .query_row(&format!("SELECT {NOTE_COLS} FROM memory m WHERE m.id = ?1"), [id], Note::from_row)
+        .query_row(
+            &format!("SELECT {NOTE_COLS} FROM memory m WHERE m.id = ?1 AND m.org_id = ?2"),
+            params![id, org],
+            Note::from_row,
+        )
         .optional()?)
 }
 
-pub(crate) fn require(conn: &Connection, id: &str) -> UaResult<Note> {
-    fetch(conn, id)?.ok_or_else(|| UaError::not_found(format!("no memory note with id {id:?}")))
+pub(crate) fn require(conn: &Connection, org: &str, id: &str) -> UaResult<Note> {
+    fetch(conn, org, id)?.ok_or_else(|| UaError::not_found(format!("no memory note with id {id:?}")))
 }
 
-/// Fetch the given notes (any order) that also pass `filter`.
+/// Fetch the given notes (any order) that also pass `filter` (which names
+/// the organization).
 pub(crate) fn fetch_many(conn: &Connection, ids: &[String], filter: &Filter) -> UaResult<Vec<Note>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -304,10 +312,6 @@ pub(crate) fn verified(caller: &Caller) -> Option<&str> {
     }
 }
 
-pub(crate) fn is_human(caller: &Caller) -> bool {
-    caller.kind == ActorKind::Human
-}
-
 /// The author to stamp: the verified identity, or the claimed one when the
 /// caller has none. A claim that contradicts the verified identity is refused.
 pub(crate) fn write_author(caller: &Caller, claimed: Option<String>) -> UaResult<Option<String>> {
@@ -337,7 +341,7 @@ pub(crate) fn has_broadcast(tags: &[String]) -> bool {
 pub(crate) fn assert_privileged(caller: &Caller, tags: &[String], salience: Option<f64>) -> UaResult<()> {
     let broadcast = has_broadcast(tags);
     let high = salience.is_some_and(|s| s.is_finite() && s > HUMAN_SALIENCE_CEILING);
-    if (!broadcast && !high) || is_human(caller) {
+    if (!broadcast && !high) || ua_org::authz::human(caller) {
         return Ok(());
     }
     let mut reasons = Vec::new();
@@ -379,6 +383,9 @@ pub struct Filter {
 /// What makes a note eligible for search, listing or a contradiction count.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Eligibility {
+    /// The organization whose notes are eligible. Always set: the default
+    /// (empty) matches no note.
+    pub org: String,
     /// Notes must carry all of these (`untagged` selects notes without tags).
     pub tags: Vec<String>,
     pub author: Option<String>,
@@ -392,8 +399,14 @@ pub(crate) struct Eligibility {
 
 impl Eligibility {
     pub(crate) fn filter(&self) -> Filter {
-        let mut sql = vec!["NOT EXISTS (SELECT 1 FROM json_each(m.tags) WHERE value = ?)".to_string()];
-        let mut p = vec![SqlValue::Text(DELETED_TAG.into())];
+        // The organization comes first, so every query built on this filter
+        // (the FTS leg, the vector scan, listing) ranks and caps only the
+        // caller's organization's notes.
+        let mut sql = vec![
+            "m.org_id = ?".to_string(),
+            "NOT EXISTS (SELECT 1 FROM json_each(m.tags) WHERE value = ?)".to_string(),
+        ];
+        let mut p = vec![SqlValue::Text(self.org.clone()), SqlValue::Text(DELETED_TAG.into())];
         match &self.as_of {
             None => sql.push("m.superseded_by IS NULL".into()),
             Some(at) => {
@@ -438,9 +451,17 @@ impl Eligibility {
 /// Open `contradicts` links against each note: the disputing note is live
 /// (not deleted, not superseded or valid at `as_of`, not expired). Capped
 /// per note at [`rank::MAX_COUNTED_CONTRADICTIONS`].
-pub(crate) fn open_contradictions(conn: &Connection, as_of: Option<&str>) -> UaResult<HashMap<String, i64>> {
-    let elig =
-        Eligibility { as_of: as_of.map(str::to_string), now: ua_core::time::now(), ..Default::default() };
+pub(crate) fn open_contradictions(
+    conn: &Connection,
+    org: &str,
+    as_of: Option<&str>,
+) -> UaResult<HashMap<String, i64>> {
+    let elig = Eligibility {
+        org: org.to_string(),
+        as_of: as_of.map(str::to_string),
+        now: ua_core::time::now(),
+        ..Default::default()
+    };
     let f = elig.filter();
     let sql = format!(
         "SELECT j.value, COUNT(*) FROM memory m, json_each(m.contradicts) j \
@@ -459,10 +480,10 @@ pub(crate) fn open_contradictions(conn: &Connection, as_of: Option<&str>) -> UaR
     Ok(out)
 }
 
-/// A note another note points at (supersedes / contradicts): must exist and
-/// not be deleted.
-pub(crate) fn linked_note(conn: &Connection, id: &str, field: &str) -> UaResult<Note> {
-    let note = fetch(conn, id)?
+/// A note another note points at (supersedes / contradicts): must exist in
+/// organization `org` and not be deleted.
+pub(crate) fn linked_note(conn: &Connection, org: &str, id: &str, field: &str) -> UaResult<Note> {
+    let note = fetch(conn, org, id)?
         .ok_or_else(|| UaError::invalid(format!("{field}: no memory note with id {id:?}")))?;
     if note.is_deleted() {
         return Err(UaError::invalid(format!("{field}: memory note {id:?} is deleted")));
@@ -471,20 +492,20 @@ pub(crate) fn linked_note(conn: &Connection, id: &str, field: &str) -> UaResult<
 }
 
 /// The note's typed links, derived from its supersede pointer, its
-/// `contradicts` list and its `memory:<id>` evidence refs.
-pub(crate) fn note_links(conn: &Connection, note: &Note) -> UaResult<Value> {
+/// `contradicts` list and its `memory:<id>` evidence refs. Only organization
+/// `org`'s notes are followed: a ref naming another organization's note
+/// shows no title, and that note's inbound links are never listed.
+pub(crate) fn note_links(conn: &Connection, org: &str, note: &Note) -> UaResult<Value> {
     let title_of = |id: &str| -> UaResult<Option<String>> {
         Ok(conn
-            .query_row("SELECT title FROM memory WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .query_row("SELECT title FROM memory WHERE id = ?1 AND org_id = ?2", params![id, org], |r| {
+                r.get::<_, Option<String>>(0)
+            })
             .optional()?
             .flatten())
     };
     let mut out = Vec::new();
-    let replaced: Vec<String> = {
-        let mut stmt =
-            conn.prepare("SELECT id FROM memory WHERE superseded_by = ?1 ORDER BY created_at, id")?;
-        stmt.query_map([&note.id], |r| r.get(0))?.collect::<Result<_, _>>()?
-    };
+    let replaced = superseded_notes(conn, org, &note.id)?;
     for id in &replaced {
         out.push(json!({ "id": id, "rel": "supersedes", "title": title_of(id)? }));
     }
@@ -505,11 +526,12 @@ pub(crate) fn note_links(conn: &Connection, note: &Note) -> UaResult<Value> {
            EXISTS (SELECT 1 FROM json_each(m.contradicts) WHERE value = ?1), \
            EXISTS (SELECT 1 FROM json_each(m.evidence) WHERE value = ?2) \
          FROM memory m \
-         WHERE (m.contradicts IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(m.contradicts) WHERE value = ?1)) \
-            OR (m.evidence IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(m.evidence) WHERE value = ?2)) \
+         WHERE m.org_id = ?3 AND ( \
+            (m.contradicts IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(m.contradicts) WHERE value = ?1)) \
+            OR (m.evidence IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(m.evidence) WHERE value = ?2))) \
          ORDER BY m.created_at, m.id LIMIT 200",
     )?;
-    let rows = stmt.query_map(params![note.id, format!("memory:{}", note.id)], |r| {
+    let rows = stmt.query_map(params![note.id, format!("memory:{}", note.id), org], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -529,6 +551,76 @@ pub(crate) fn note_links(conn: &Connection, note: &Note) -> UaResult<Value> {
     out.truncate(100);
     inbound.truncate(100);
     Ok(json!({ "out": out, "in": inbound }))
+}
+
+/// The ids of organization `org`'s notes that `id` superseded, oldest first.
+pub(crate) fn superseded_notes(conn: &Connection, org: &str, id: &str) -> UaResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM memory WHERE superseded_by = ?1 AND org_id = ?2 ORDER BY created_at, id")?;
+    Ok(stmt.query_map(params![id, org], |r| r.get(0))?.collect::<Result<_, _>>()?)
+}
+
+/// Refuse an organization `orgs` does not hold, or holds as suspended,
+/// before anything is written. The `org_exists` triggers fire only on
+/// insert and do not read the status, so a write with nothing to insert (an
+/// update, a soft delete) or a suspended organization's insert would
+/// otherwise pass.
+pub(crate) fn require_org(conn: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        conn.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no memory note was changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no memory note was changed"),
+        )),
+    }
+}
+
+// ── ledger ─────────────────────────────────────────────────────────────────
+
+/// Append a memory event about a note of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization until
+/// `org_guard` admits another (the same rule as the task family's `emit`).
+/// So another organization's event carries no free text and no
+/// caller-supplied label (callers pass titles, tags, revisions and labels
+/// through [`ledger_text`] / [`ledger_label`]), and its originator is the
+/// neutral `system`, never the acting agent. Every `agent.memory.*` channel
+/// is an ordinary visible one (`VISIBLE_EVENT` restricts none of them).
+pub(crate) fn emit(tx: &mut WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+    let by = ledger_originator(org, by);
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by.to_string()))?;
+    Ok(())
+}
+
+/// The originator of a memory event: the acting label in the default
+/// organization, the neutral `system` for another one's (see [`emit`]).
+/// The same rule as `ua_tools::families::tasks::emit`; `ua-tools` tests that
+/// the two never drift.
+pub fn ledger_originator<'a>(org: &str, by: &'a str) -> &'a str {
+    if org == ua_core::DEFAULT_ORG { by } else { "system" }
+}
+
+/// A value for a memory event's payload: kept for the default organization,
+/// `null` for another one's (whose event is written to the default
+/// organization's ledger), so the payload keeps its shape. The same rule as
+/// `ua_tools::families::plans::ledger_text`, which this crate cannot call;
+/// `ua-tools` tests that the two never drift.
+pub fn ledger_text(org: &str, v: Value) -> Value {
+    if org == ua_core::DEFAULT_ORG { v } else { Value::Null }
+}
+
+/// An optional label (an author, an actor) under the [`ledger_text`] rule.
+pub fn ledger_label(org: &str, label: Option<&str>) -> Value {
+    match label {
+        Some(l) => ledger_text(org, json!(l)),
+        None => Value::Null,
+    }
 }
 
 /// Validate `<kind>:<id>` evidence refs; de-duplicate, keep order.
@@ -600,7 +692,11 @@ pub(crate) fn tombstone_block(
 /// The host to stamp on a new note: the caller's registered host, else this machine.
 pub(crate) fn source_host(conn: &Connection, caller: &Caller) -> Option<String> {
     let registered: Option<String> = conn
-        .query_row("SELECT host FROM agents WHERE label = ?1", [&caller.label], |r| r.get(0))
+        .query_row(
+            "SELECT host FROM agents WHERE label = ?1 AND org_id = ?2",
+            [&caller.label, &caller.org_id],
+            |r| r.get(0),
+        )
         .optional()
         .ok()
         .flatten()

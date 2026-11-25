@@ -19,6 +19,7 @@ fn agent(label: &str, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -126,14 +127,23 @@ async fn profile_activation_rules() {
     // Downgrading is allowed and binds to this session only.
     let lead = agent("lead-1", Profile::Coordinator);
     reg.call(&hub, &lead, "profile_activate", json!({"profile": "research"})).await.unwrap();
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s1")), Profile::Research);
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("other")), Profile::Coordinator);
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("s1")),
+        Profile::Research
+    );
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("other")),
+        Profile::Coordinator
+    );
 
     // A legacy profile name activates the profile it names.
     let other = Caller { session_key: Some("s2".into()), ..lead.clone() };
     let out = reg.call(&hub, &other, "profile_activate", json!({"profile": "steward"})).await.unwrap();
     assert_eq!(out["profile"], "reviewer");
-    assert_eq!(ua_tools::sessions::resolve_profile(&hub, "lead-1", Some("s2")), Profile::Reviewer);
+    assert_eq!(
+        ua_tools::sessions::resolve_profile(&hub, ua_core::DEFAULT_ORG, "lead-1", Some("s2")),
+        Profile::Reviewer
+    );
 }
 
 #[tokio::test]
@@ -222,4 +232,30 @@ async fn an_approval_binds_arguments_whatever_their_key_order() {
     reg.call(&hub, &human(), "approval_resolve", json!({"id": id, "decision": "approve"})).await.unwrap();
     let ok = reg.call(&hub, &lead_agent, "event_log_query", rev).await.unwrap();
     assert!(ok["events"].is_array(), "{ok}");
+}
+
+#[tokio::test]
+async fn the_mcp_registry_says_whether_a_gateway_is_compiled_in() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let built = cfg!(feature = "mcp-gateway");
+    assert_eq!(reg.get("mcp_gateway").is_some(), built);
+    let list = reg.call(&hub, &human(), "mcp_server_list", json!({})).await.unwrap();
+    assert_eq!(list["gateway_compiled_in"], built, "{list}");
+    assert_eq!(list["note"].is_string(), !built, "{list}");
+    for name in ["mcp_server_register", "mcp_server_review", "mcp_server_revoke", "mcp_server_list"] {
+        let d = reg.get(name).unwrap().description;
+        assert_eq!(d.contains("no MCP gateway"), !built, "{name}: {d}");
+    }
+    if !built {
+        // Refused before any approval is parked.
+        let args = json!({
+            "name": "fake",
+            "server": { "transport": "stdio", "command": "true", "tools": { "echo": "read" } },
+        });
+        let err = reg.call(&hub, &human(), "mcp_server_register", args).await.unwrap_err();
+        assert_eq!(err.reason_code(), Some("gateway_not_built"), "{err}");
+        let pending = reg.call(&hub, &human(), "approval_pending", json!({})).await.unwrap();
+        assert_eq!(pending["pending"], json!([]), "{pending}");
+    }
 }

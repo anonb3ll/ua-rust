@@ -20,17 +20,19 @@
 //!
 //! An `sdk.` evidence event's payload is client-written: its read carries a
 //! `trust` label marking it untrusted.
+//! Restricted event rows use the same visibility as the ledger query.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
 
+use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::injection;
 use super::memory::mark_untrusted;
@@ -39,7 +41,7 @@ use super::runs;
 use crate::approvals;
 use crate::hub::Hub;
 use crate::policy::{self, Verdict};
-use crate::registry::{Registry, ToolCtx, record_decision_rule, tool};
+use crate::registry::{Registry, ToolCtx, record_decision_routed, tool};
 
 /// Bumped when a manifest field changes meaning or disappears.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
@@ -227,7 +229,12 @@ pub static OBJECT_TYPES: &[ObjectType] = &[
         id_pattern: Some(INT_ID),
         lifecycle: &["pending", "approved", "denied", "consumed", "revoked", "expired"],
         terminal_states: &["denied", "consumed", "revoked", "expired"],
-        event_kinds: &["agent.approval.requested", "agent.approval.resolved", "agent.approval.consumed"],
+        event_kinds: &[
+            "agent.approval.requested",
+            "agent.approval.resolved",
+            "agent.approval.consumed",
+            "agent.approval.refused",
+        ],
         envelope: "approval",
         required: &["id", "tool", "status"],
         writers: &[("resolve", "approval_resolve")],
@@ -408,7 +415,7 @@ pub static OBJECT_TYPES: &[ObjectType] = &[
         envelope: "work_product",
         required: &["id", "title", "status"],
         writers: &[],
-        notes: "Not ported to ua-rust pending an explicit product decision (hub task #2658), so this kind is \
+        notes: "Not ported to ua-rust pending an explicit product decision, so this kind is \
                 never served and /api/work-products answers 501.",
     },
 ];
@@ -459,12 +466,22 @@ pub fn may_read(caller: &Caller, tool: &str) -> bool {
 /// that tool, evaluated as the caller with no arguments. The refusal codes are
 /// the ones a direct call of `tool` would get. A tool the policy or
 /// `approval_tools` sends through the approval gate cannot be read around it.
-/// A refusal is recorded as a gateway decision on `platform_object_get`.
-pub async fn check_read(hub: &Hub, caller: &Caller, kind: &str, tool: &'static str) -> UaResult<()> {
+/// A refusal is recorded as a gateway decision on the tool called
+/// (`recorded_tool`, `platform_object_get` for the kind reader) and, for a
+/// consolidated tool's action, the action it ran (`action_tool`, as the
+/// registry records it).
+pub async fn check_read(
+    hub: &Hub,
+    caller: &Caller,
+    kind: &str,
+    tool: &'static str,
+    recorded_tool: &'static str,
+    action_tool: Option<&str>,
+) -> UaResult<()> {
     match read_gate(hub, caller, kind, tool).await {
         Ok(()) => Ok(()),
         Err((err, rule)) => {
-            record_decision_rule(hub, caller, "platform_object_get", &err, &rule).await;
+            record_decision_routed(hub, caller, recorded_tool, action_tool, &err, &rule).await;
             Err(err)
         }
     }
@@ -484,6 +501,20 @@ async fn read_gate(
             format!("{kind} objects need {tool} permission, which profile {} does not have", caller.profile),
         ));
     }
+    // A kind read through a consolidated tool is read as that tool's `get`
+    // action: the standalone tool it runs (`plan_get` for `plan_manage`) is
+    // checked too, as a call of the action would be (see `crate::routes`).
+    let routed =
+        crate::routes::route(tool, &json!({ "action": "get" })).ok().flatten().and_then(|r| r.standalone());
+    if let Some(s) = routed
+        && caller.enforce_profile
+        && !caller.profile.allows_routed(s)
+    {
+        return Err(refuse(
+            "profile_denied",
+            format!("{kind} objects need {s} permission, which profile {} does not have", caller.profile),
+        ));
+    }
     let gated = |why: String| {
         refuse(
             "approval_required",
@@ -496,7 +527,23 @@ async fn read_gate(
         let c = caller.clone();
         let verdict = hub
             .db()
-            .read_async(move |conn| Ok(policy::evaluate(conn, &p, &c, tool, &json!({}))))
+            .read_async(move |conn| {
+                Ok(policy::evaluate(conn, &p, &c, tool, &json!({})).and_then(|door| match routed {
+                    Some(s) => {
+                        policy::evaluate_routed(conn, &p, &c, s, &json!({})).map(|own| match (door, own) {
+                            (Verdict::RequireApproval(mut a), Verdict::RequireApproval(b)) => {
+                                a.extend(b);
+                                Verdict::RequireApproval(a)
+                            }
+                            (Verdict::RequireApproval(a), _) | (_, Verdict::RequireApproval(a)) => {
+                                Verdict::RequireApproval(a)
+                            }
+                            _ => Verdict::Allow,
+                        })
+                    }
+                    None => Ok(door),
+                }))
+            })
             .await
             .map_err(|e| refuse("policy_unavailable", format!("policy gate failed closed: {e}")))?;
         match verdict {
@@ -516,8 +563,13 @@ async fn read_gate(
             }
         }
     }
-    if hub.cfg().approval_tools.iter().any(|t| t == tool) {
+    if crate::routes::listed(hub.cfg(), tool) {
         return Err(gated("is in approval_tools".into()));
+    }
+    if let Some(s) = routed
+        && crate::routes::listed(hub.cfg(), s)
+    {
+        return Err(gated(format!("runs {s}, which is in approval_tools")));
     }
     Ok(())
 }
@@ -556,19 +608,27 @@ fn decode(row: &mut Map<String, Value>, cols: &[&str]) {
     }
 }
 
-fn one_row(c: &Connection, sql: &str, id: &str) -> UaResult<Option<Map<String, Value>>> {
-    Ok(c.query_row(sql, [id], row_map).optional()?)
+/// One row of organization `org` (`sql` binds the id then the
+/// organization), without its `org_id`.
+fn org_row(c: &Connection, sql: &str, id: &str, org: &str) -> UaResult<Option<Map<String, Value>>> {
+    Ok(c.query_row(sql, [id, org], row_map).optional()?.map(|mut m| {
+        m.remove("org_id");
+        m
+    }))
 }
 
-fn board(c: &Connection) -> UaResult<Value> {
+/// The reader's organization `org`'s open board.
+fn board(c: &Connection, org: &str) -> UaResult<Value> {
     let mut stmt = c.prepare(
         "SELECT id, title, status, priority, parent_id, project, domain, lane, claimed_by, claimed_at, \
          lock_expires_at, created_at, updated_at, due_at, evidence_ref FROM tasks \
-         WHERE status IN ('open','doing','waiting_review','blocked') AND archived_at IS NULL \
+         WHERE org_id = ?2 AND status IN ('open','doing','waiting_review','blocked') AND archived_at IS NULL \
          ORDER BY id LIMIT ?1",
     )?;
-    let mut tasks: Vec<Value> =
-        stmt.query_map([BOARD_CAP + 1], row_map)?.map(|r| r.map(Value::Object)).collect::<Result<_, _>>()?;
+    let mut tasks: Vec<Value> = stmt
+        .query_map(rusqlite::params![BOARD_CAP + 1, org], row_map)?
+        .map(|r| r.map(Value::Object))
+        .collect::<Result<_, _>>()?;
     let truncated = tasks.len() as i64 > BOARD_CAP;
     tasks.truncate(BOARD_CAP as usize);
     for t in &mut tasks {
@@ -582,11 +642,13 @@ fn board(c: &Connection) -> UaResult<Value> {
 /// The object itself (without the `uri`), or `None` when no row has the id.
 fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaResult<Option<Value>> {
     let obj = match kind {
-        "task" => one_row(c, "SELECT * FROM tasks WHERE id = ?1", id)?.map(Value::Object),
+        // A task or comment of the reader's organization, without `org_id`.
+        "task" => org_row(c, "SELECT * FROM tasks WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(Value::Object),
         "run" => runs::read_one(hub, caller, c, id)?,
         "approval" => {
             let Ok(n) = id.parse::<i64>() else { return Ok(None) };
-            match approvals::get(c, n) {
+            match approvals::get(c, &caller.org_id, n) {
                 Ok(row) => {
                     let mut v = serde_json::to_value(row)?;
                     v["payload"] = redact(&v["payload"]);
@@ -597,14 +659,13 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             }
         }
         "evidence_event" => {
-            let row = c
-                .query_row(
-                    "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
-                     prev_hash, entry_hash FROM event_log WHERE ulid = ?1",
-                    [id],
-                    row_map,
-                )
-                .optional()?;
+            let reader = EventReader::new(hub.cfg(), caller);
+            let sql = format!(
+                "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
+                 prev_hash, entry_hash FROM event_log WHERE ulid = ? AND ({VISIBLE_EVENT})"
+            );
+            let bindings = std::iter::once(&id as &dyn ToSql).chain(reader.bindings());
+            let row = c.query_row(&sql, params_from_iter(bindings), row_map).optional()?;
             row.map(|mut r| {
                 let parsed = r.get("payload").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok());
                 r.insert("payload_parsed".into(), parsed.unwrap_or(Value::Null));
@@ -617,14 +678,21 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
                 v
             })
         }
-        "plan" => match one_row(c, "SELECT * FROM plans WHERE id = ?1", id)? {
+        // The caller's organization's plan only: another organization's
+        // answers as a missing one.
+        "plan" => match c
+            .query_row("SELECT * FROM plans WHERE org_id = ?1 AND id = ?2", params![caller.org_id, id], row_map)
+            .optional()?
+        {
             None => None,
             Some(mut p) => {
                 let escalated = p.get("escalated").and_then(Value::as_i64).unwrap_or(0) != 0;
                 p.insert("needs_human".into(), json!(escalated));
-                let mut stmt = c.prepare("SELECT * FROM plan_steps WHERE plan_id = ?1 ORDER BY step_idx, id")?;
+                let mut stmt = c.prepare(
+                    "SELECT * FROM plan_steps WHERE org_id = ?1 AND plan_id = ?2 ORDER BY step_idx, id",
+                )?;
                 let steps: Vec<Value> = stmt
-                    .query_map([id], row_map)?
+                    .query_map(params![caller.org_id, id], row_map)?
                     .map(|r| {
                         r.map(|mut s| {
                             decode(&mut s, &["depends_on", "outputs"]);
@@ -636,21 +704,32 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
                 Some(Value::Object(p))
             }
         },
-        "delegation" => one_row(c, "SELECT * FROM delegations WHERE id = ?1", id)?.map(Value::Object),
-        "agent" => one_row(c, "SELECT * FROM agents WHERE label = ?1", id)?.map(|mut a| {
-            decode(&mut a, &["meta"]);
-            Value::Object(a)
-        }),
-        "session" => one_row(c, "SELECT * FROM agent_sessions WHERE id = ?1", id)?.map(|mut s| {
-            decode(&mut s, &["meta"]);
-            Value::Object(s)
-        }),
-        "memory_note" => one_row(
+        // A delegation of the reader's organization, without `org_id`.
+        "delegation" => org_row(c, "SELECT * FROM delegations WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(Value::Object),
+        // An agent or session of the reader's organization, without `org_id`.
+        "agent" => org_row(c, "SELECT * FROM agents WHERE label = ?1 AND org_id = ?2", id, &caller.org_id)?.map(
+            |mut a| {
+                decode(&mut a, &["meta"]);
+                Value::Object(a)
+            },
+        ),
+        "session" => {
+            org_row(c, "SELECT * FROM agent_sessions WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?.map(
+                |mut s| {
+                    decode(&mut s, &["meta"]);
+                    Value::Object(s)
+                },
+            )
+        }
+        // A note of the reader's organization, without `org_id`.
+        "memory_note" => org_row(
             c,
             "SELECT id, title, content, tags, author, updated_by, created_at, updated_at, salience, confidence, \
              source_host, superseded_by, expires_at, epistemic, evidence, valid_from, valid_to FROM memory \
-             WHERE id = ?1",
+             WHERE id = ?1 AND org_id = ?2",
             id,
+            &caller.org_id,
         )?
         .map(|mut m| {
             decode(&mut m, &["tags"]);
@@ -658,8 +737,12 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
             mark_untrusted(&mut v);
             v
         }),
-        "goal" => one_row(c, "SELECT * FROM goals WHERE id = ?1", id)?.map(Value::Object),
-        "comment" => one_row(c, "SELECT * FROM task_comments WHERE id = ?1", id)?.map(|mut m| {
+        // A goal of the reader's organization, without `org_id`.
+        "goal" => {
+            org_row(c, "SELECT * FROM goals WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?.map(Value::Object)
+        }
+        "comment" => org_row(c, "SELECT * FROM task_comments WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
+            .map(|mut m| {
             decode(&mut m, &["mentions", "refs"]);
             Value::Object(m)
         }),
@@ -677,13 +760,14 @@ pub async fn read_object(hub: &Hub, caller: &Caller, kind: &str, id: Option<&str
     if !t.served {
         return Err(UaError::not_found(format!("object kind {kind:?} is not served by this hub")));
     }
-    check_read(hub, caller, kind, t.profile_tool).await?;
+    check_read(hub, caller, kind, t.profile_tool, "platform_object_get", None).await?;
     let id = id.map(str::to_string).filter(|i| !i.is_empty());
     if t.collection {
         if id.is_some() {
             return Err(UaError::invalid(format!("object kind {kind:?} is a collection and takes no id")));
         }
-        let mut v = hub.db().read_async(board).await?;
+        let org = caller.org_id.clone();
+        let mut v = hub.db().read_async(move |c| board(c, &org)).await?;
         v["uri"] = json!(t.uri);
         return Ok(v);
     }

@@ -481,6 +481,8 @@ pub(crate) fn terminate(run: &Run) -> &'static str {
 /// Everything a launch needs.
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchSpec {
+    /// The run's organization.
+    pub org: String,
     pub run_id: String,
     pub task_id: i64,
     pub agent: String,
@@ -530,16 +532,16 @@ pub fn resolve_program(h: &HarnessConfig, workdir: Option<&Path>) -> Option<Path
 }
 
 /// Move a claimed run to `launched` without a process (no harness).
-pub(crate) async fn launch_stub(hub: &Hub, run_id: String, actor: String) -> UaResult<Value> {
+pub(crate) async fn launch_stub(hub: &Hub, org: String, run_id: String, actor: String) -> UaResult<Value> {
     hub.db()
         .write_async(move |tx| {
-            let Some(run) = load_run(tx, &run_id)? else {
+            let Some(run) = load_run(tx, &org, &run_id)? else {
                 return Ok(refusal("unknown_run", &run_id, json!({})));
             };
             if let Err(why) = transition(tx, &run, Edge::to("launched"))? {
                 return Ok(refusal(why, &run_id, json!({ "state": run.state })));
             }
-            record_transition(tx, &run_id, "launched", &actor, json!({ "stub": true }))?;
+            record_transition(tx, &org, &run_id, "launched", &actor, json!({ "stub": true }))?;
             Ok(json!({
                 "ok": true, "run_id": run_id, "state": "launched", "fence": run.fence,
                 "spawned": false, "stub": true,
@@ -556,10 +558,11 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
     // claimed -> launched, under the fence.
     let (rid, fence, actor, name) =
         (spec.run_id.clone(), spec.fence, spec.actor.clone(), spec.harness_name.clone());
+    let org = spec.org.clone();
     let started = hub
         .db()
         .write_async(move |tx| {
-            let Some(run) = load_run(tx, &rid)? else {
+            let Some(run) = load_run(tx, &org, &rid)? else {
                 return Ok(Err(refusal("unknown_run", &rid, json!({}))));
             };
             if run.fence != fence {
@@ -568,7 +571,7 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
             if let Err(why) = transition(tx, &run, Edge::to("launched"))? {
                 return Ok(Err(refusal(why, &rid, json!({ "state": run.state }))));
             }
-            record_transition(tx, &rid, "launched", &actor, json!({ "harness": name }))?;
+            record_transition(tx, &org, &rid, "launched", &actor, json!({ "harness": name }))?;
             Ok(Ok(()))
         })
         .await?;
@@ -617,13 +620,14 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
             // refuses, will fail the same way on every retry.
             let (state, class) =
                 if spawn_error_is_config(&e) { ("failed", "config") } else { ("retryable", "launch") };
-            let (rid, actor) = (spec.run_id.clone(), spec.actor.clone());
+            let (rid, actor, org) = (spec.run_id.clone(), spec.actor.clone(), spec.org.clone());
             let res = hub
                 .db()
                 .write_async(move |tx| {
                     super::record_outcome(
                         tx,
                         Outcome {
+                            org: &org,
                             run_id: &rid,
                             fence: Some(fence),
                             state,
@@ -660,10 +664,11 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
     // refuses this write; the launcher then stops its own child.
     let lease = hub.cfg().dispatch_lease_seconds.max(1);
     let (rid, actor, log_s) = (spec.run_id.clone(), spec.actor.clone(), log.display().to_string());
+    let org = spec.org.clone();
     let persisted = hub
         .db()
         .write_async(move |tx| {
-            let Some(run) = load_run(tx, &rid)? else { return Ok(false) };
+            let Some(run) = load_run(tx, &org, &rid)? else { return Ok(false) };
             if run.fence != fence {
                 return Ok(false);
             }
@@ -679,7 +684,7 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
             if transition(tx, &run, edge)?.is_err() {
                 return Ok(false);
             }
-            record_transition(tx, &rid, "running", &actor, json!({ "pid": pid }))?;
+            record_transition(tx, &org, &rid, "running", &actor, json!({ "pid": pid }))?;
             Ok(true)
         })
         .await?;
@@ -687,15 +692,16 @@ pub(crate) async fn launch(hub: &Hub, spec: LaunchSpec) -> UaResult<Value> {
         kill_group(pid);
         let _ = child.kill().await;
         live_remove(&spec.run_id, spec.fence);
-        let (rid, actor) = (spec.run_id.clone(), spec.actor.clone());
+        let (rid, actor, org) = (spec.run_id.clone(), spec.actor.clone(), spec.org.clone());
         let res = hub
             .db()
             .write_async(move |tx| {
-                let run = load_run(tx, &rid)?;
+                let run = load_run(tx, &org, &rid)?;
                 match run {
                     Some(r) if r.termination_outcome.as_deref() == Some("requested") && r.fence == fence => {
                         super::finalize_cancellation(
                             tx,
+                            &org,
                             &rid,
                             &actor,
                             "launcher",
@@ -901,12 +907,13 @@ async fn supervise(
                 break child.wait().await.ok();
             }
             _ = tokio::time::sleep(renew_every) => {
-                let (rid, fence) = (spec.run_id.clone(), spec.fence);
+                let (rid, fence, org) = (spec.run_id.clone(), spec.fence, spec.org.clone());
                 let res = hub.db().write_async(move |tx| {
                     tx.execute(
                         "UPDATE dispatch_runs SET lease_expires_at = ?3, updated_at = ?4 WHERE run_id = ?1 \
-                         AND fence = ?2 AND state IN ('claimed','launched','running') AND termination_outcome IS NULL",
-                        rusqlite::params![rid, fence, after_seconds(lease), now()],
+                         AND org_id = ?5 AND fence = ?2 AND state IN ('claimed','launched','running') \
+                         AND termination_outcome IS NULL",
+                        rusqlite::params![rid, fence, after_seconds(lease), now(), org],
                     )?;
                     Ok(())
                 }).await;
@@ -991,17 +998,18 @@ async fn supervise(
             None => ("failed", Some(why), Some("exit".to_string()), None),
         }
     };
-    let (rid, fence) = (spec.run_id.clone(), spec.fence);
+    let (rid, fence, org) = (spec.run_id.clone(), spec.fence, spec.org.clone());
     let res = hub
         .db()
         .write_async(move |tx| {
-            super::record_exit(tx, &rid, fence, &exit)?;
+            super::record_exit(tx, &org, &rid, fence, &exit)?;
             if !still_ours {
                 return Ok(json!({ "ok": false, "reason": "not_supervised" }));
             }
             super::record_outcome(
                 tx,
                 Outcome {
+                    org: &org,
                     run_id: &rid,
                     fence: Some(fence),
                     state,

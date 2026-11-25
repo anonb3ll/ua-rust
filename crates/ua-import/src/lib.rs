@@ -7,10 +7,11 @@
 //!
 //! What is copied (see [`map::MAPS`]): tasks with dependencies, comments,
 //! goals, workflow records and checks, session handoff notes, plans,
-//! delegations, memory notes and their versions (ids kept, the
-//! full-text index rebuilt), the message index, agents, agent token hashes,
-//! approval history, remote nodes, skill versions and assignments, harness
-//! config bundles, and the event ledger.
+//! delegations, work proposals and items, task holds and members, project repo
+//! bindings, memory notes and their versions (ids kept, the full-text index
+//! rebuilt), the message index, agents, agent token hashes, approval history,
+//! remote nodes, skill versions and assignments, harness config bundles, and
+//! the event ledger.
 //!
 //! Parking: the Python hub parked a task by archiving it and appending a
 //! `[parked @ <ts> by <actor>] <reason>` (or `[folded-into: #<root> ...]`)
@@ -23,17 +24,23 @@
 //! ULIDs, `prev_hash` and `entry_hash`. The whole source chain is verified
 //! before anything is written; a row that does not verify, or cannot be stored
 //! byte-exactly (a non-text value in a hashed column), stops the import with an
-//! error instead of rewriting history. The target chain is verified after.
+//! error instead of rewriting history. The target chain is verified after;
+//! because batches commit as they go, take a target snapshot first when
+//! importing into a non-empty database (a failed post-import verification leaves
+//! imported rows in place without rollback).
 //!
 //! Runs are idempotent and resumable: `import_runs` records, per source (a
 //! SHA-256 of its canonical path) and table, the rows copied and skipped and
 //! the last source `rowid` copied. Each batch and its progress row commit
 //! together, so a re-run continues after the last committed batch.
 
-mod lock;
 mod map;
 
-pub use lock::{HubLock, lock_path};
+/// The database locks, which live in `ua_store::lock` (opening the database
+/// needs the serve lock); re-exported so the names here keep working.
+pub use ua_store::lock::{
+    HubLock, ServeLock, canonical_db_path, lock_path, refuse_if_served, serve_lock_path,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -45,31 +52,19 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
 use ua_store::ledger::{self, GENESIS_HASH, VerifyReport};
-use ua_store::{Db, SchemaPart};
+use ua_store::{Db, Part, SchemaPart};
+use ua_tools::families::governance::{check_default_branch, normalize_repo};
+use ua_tools::families::tasks::check_slug;
 
 use map::{Kind, LEDGER_COLUMNS, MAPS, Ref, TableMap};
 
 /// Import progress, per source and table.
-pub const SCHEMA: SchemaPart = SchemaPart {
-    name: "import.v1",
-    sql: "
-CREATE TABLE IF NOT EXISTS import_runs (
-    source_hash TEXT NOT NULL,
-    table_name TEXT NOT NULL,
-    copied INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0,
-    last_key INTEGER NOT NULL DEFAULT 0,
-    started_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (source_hash, table_name)
-);
-",
-};
+pub const SCHEMA: SchemaPart = ua_store::schema::IMPORT_SCHEMA;
 
 /// Every ua-rust schema part plus the import bookkeeping table.
-pub fn schema_parts() -> Vec<SchemaPart> {
+pub fn schema_parts() -> Vec<Part> {
     let mut parts = ua_tools::schema_parts();
-    parts.push(SCHEMA);
+    parts.push(SCHEMA.into());
     parts
 }
 
@@ -124,6 +119,9 @@ pub struct SourceLedgerReport {
     pub reason: Option<String>,
 }
 
+/// Maximum task IDs listed in [`Report::task_runs_cleared_ids`].
+pub const MAX_REPORTED_TASK_RUN_IDS: usize = 50;
+
 /// What a run did, or (dry run) would do.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -143,6 +141,15 @@ pub struct Report {
     /// Rows per table whose source `org_id` is non-NULL. ua-rust has no tenant
     /// scope: a real import refuses unless `drop_org_scope` is set.
     pub org_scoped_rows: BTreeMap<String, u64>,
+    /// Tasks whose `current_run_id` or `current_run_agent` was cleared
+    /// because `dispatch_runs` are not imported.
+    pub task_runs_cleared: u64,
+    /// Sample of task IDs (capped at [`MAX_REPORTED_TASK_RUN_IDS`]) whose run
+    /// pointers were cleared.
+    pub task_runs_cleared_ids: Vec<i64>,
+    /// `project_repo_bindings` rows whose invalid `default_branch` was
+    /// cleared to `NULL` rather than dropping the binding.
+    pub binding_branches_cleared: u64,
     /// Verification of the target chain after the import (not in a dry run).
     pub target_ledger: Option<VerifyReport>,
     pub notes: Vec<String>,
@@ -167,14 +174,24 @@ pub fn source_hash(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(Sha256::digest(canon.to_string_lossy().as_bytes())))
 }
 
-/// Report counts, unmapped tables and columns and the source chain's
-/// verification without writing anything anywhere.
+/// Report counts, unmapped tables and columns, source-only conflict checks
+/// and the source chain's verification without writing anything anywhere.
 pub fn dry_run(source: &Path) -> anyhow::Result<Report> {
     let src = open_source(source)?;
     src.execute_batch("BEGIN")?;
     // An empty in-memory ua-rust database describes the target columns.
     let shape = Db::open_in_memory(&schema_parts())?;
     let mut report = survey(&src, &shape, source_hash(source)?, true)?;
+    for map in MAPS {
+        if !report.tables.iter().any(|t| t.table == map.source && t.present) {
+            continue;
+        }
+        match map.kind {
+            Kind::TaskHolds => check_source_active_holds(&src, 0)?,
+            Kind::ProjectRepoBindings => check_source_bindings_overlap(&src, &shape, map, 0)?,
+            _ => {}
+        }
+    }
     for map in MAPS {
         if map.kind == Kind::Ledger {
             continue;
@@ -189,15 +206,40 @@ pub fn dry_run(source: &Path) -> anyhow::Result<Report> {
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let vals = row_values(r, 0, plan.cols.len())?;
-            match filter(map.kind, &plan.cols, &vals) {
-                Some(reason) => *rep.skipped.entry(reason.into()).or_default() += 1,
-                None => rep.copied += 1,
+            if let Some(reason) = filter(map.kind, &plan.cols, &vals) {
+                *rep.skipped.entry(reason.into()).or_default() += 1;
+                continue;
+            }
+            rep.copied += 1;
+            match map.kind {
+                Kind::Tasks => {
+                    let has_run = col_value(&plan.cols, &vals, "current_run_id")
+                        .is_some_and(|v| *v != SqlValue::Null)
+                        || col_value(&plan.cols, &vals, "current_run_agent")
+                            .is_some_and(|v| *v != SqlValue::Null);
+                    if has_run {
+                        record_cleared_task_run(
+                            &mut report.task_runs_cleared,
+                            &mut report.task_runs_cleared_ids,
+                            col_value(&plan.cols, &vals, "id"),
+                        );
+                    }
+                }
+                Kind::ProjectRepoBindings => {
+                    if let Some(v) = col_value(&plan.cols, &vals, "default_branch")
+                        && matches!(normalize_binding_branch(v), BranchNorm::ClearedInvalid)
+                    {
+                        report.binding_branches_cleared += 1;
+                    }
+                }
+                _ => {}
             }
         }
     }
     if let Some(rep) = report.tables.iter_mut().find(|t| t.table == "event_log") {
         rep.copied = if report.source_ledger.ok { rep.source_rows } else { 0 };
     }
+    append_clear_notes(&mut report);
     report.notes.push("dry run: nothing was written; missing references are counted on a real run".into());
     src.execute_batch("COMMIT")?;
     Ok(report)
@@ -223,6 +265,10 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
         report.notes.push("org_id dropped (--drop-org-scope): tenant boundaries are not kept".into());
     }
     let mut copied_any = false;
+    let mut cleared_runs = 0u64;
+    let mut cleared_run_ids = Vec::new();
+    let mut cleared_branches = 0u64;
+    let src_has_sqlite_sequence = has_sqlite_sequence(&src)?;
     for map in MAPS {
         let idx = report
             .tables
@@ -237,14 +283,29 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             copy_ledger(&src, db, &hash, batch, rep)?;
         } else {
             let plan = plan_table(&src, db, map)?;
-            copy_table(&src, db, &hash, &plan, batch, rep)?;
+            let eff = copy_table(&src, db, &hash, &plan, batch, rep)?;
+            cleared_runs += eff.task_runs_cleared;
+            for id in eff.task_runs_cleared_ids {
+                if cleared_run_ids.len() < MAX_REPORTED_TASK_RUN_IDS {
+                    cleared_run_ids.push(id);
+                }
+            }
+            cleared_branches += eff.binding_branches_cleared;
             if let Some(sr) = map.self_ref {
                 fix_self_ref(&src, db, map, sr)?;
+            }
+            if src_has_sqlite_sequence {
+                carry_sqlite_sequence(&src, db, map)?;
             }
         }
         copied_any |= rep.copied > 0;
     }
     src.execute_batch("COMMIT")?;
+
+    report.task_runs_cleared = cleared_runs;
+    report.task_runs_cleared_ids = cleared_run_ids;
+    report.binding_branches_cleared = cleared_branches;
+    append_clear_notes(&mut report);
 
     let parked = translate_parked(db)?;
     if parked > 0 {
@@ -305,15 +366,16 @@ fn closure_line(notes: &str) -> Option<(&'static str, Option<i64>, String, Strin
 }
 
 /// Move Python-style parked rows to the parking columns. Idempotent: a row
-/// already parked, finished or not archived is left alone.
+/// already parked, finished or not archived is left alone. Imported tasks
+/// are all the default organization's, so only its rows are read.
 fn translate_parked(db: &Db) -> anyhow::Result<usize> {
     db.write(|tx| {
         let rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, notes FROM tasks WHERE archived_at IS NOT NULL AND parked_at IS NULL \
+                "SELECT id, notes FROM tasks WHERE org_id = ?1 AND archived_at IS NOT NULL AND parked_at IS NULL \
                  AND status NOT IN ('done','cancelled') AND notes IS NOT NULL",
             )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+            stmt.query_map([ua_core::DEFAULT_ORG], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
         };
         let mut moved = 0;
         for (id, notes) in rows {
@@ -322,15 +384,17 @@ fn translate_parked(db: &Db) -> anyhow::Result<usize> {
                 continue;
             }
             let root = root.filter(|r| {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [r], |row| {
-                    row.get::<_, bool>(0)
-                })
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?2 AND id = ?1)",
+                    params![r, ua_core::DEFAULT_ORG],
+                    |row| row.get::<_, bool>(0),
+                )
                 .unwrap_or(false)
             });
             moved += tx.execute(
                 "UPDATE tasks SET parked_at = ?1, parked_by = ?2, parked_reason = ?3, folded_into = ?4, \
-                 archived_at = NULL WHERE id = ?5",
-                params![at, by, reason, root, id],
+                 archived_at = NULL WHERE id = ?5 AND org_id = ?6",
+                params![at, by, reason, root, id, ua_core::DEFAULT_ORG],
             )?;
         }
         Ok(moved)
@@ -428,6 +492,9 @@ fn survey(src: &Connection, target: &Db, source_hash: String, dry_run: bool) -> 
         unmapped_columns,
         source_ledger,
         org_scoped_rows,
+        task_runs_cleared: 0,
+        task_runs_cleared_ids: Vec::new(),
+        binding_branches_cleared: 0,
         target_ledger: None,
         notes: Vec::new(),
     })
@@ -452,8 +519,9 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     if dst_cols.is_empty() {
         bail!("target table {} does not exist; open the target with ua_import::schema_parts()", map.target);
     }
-    let (cols, unmapped): (Vec<String>, Vec<String>) =
-        src_cols.into_iter().partition(|c| dst_cols.contains(c) && Some(c.as_str()) != map.rowid_to);
+    let (cols, unmapped): (Vec<String>, Vec<String>) = src_cols
+        .into_iter()
+        .partition(|c| c != "org_id" && dst_cols.contains(c) && Some(c.as_str()) != map.rowid_to);
     let mut insert_cols = cols.clone();
     if let Some(r) = map.rowid_to {
         insert_cols.push(r.to_string());
@@ -461,6 +529,9 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     let append_event_seq = map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_seq");
     if append_event_seq {
         insert_cols.push("event_seq".into());
+    }
+    if map.kind.writes_default_org() {
+        insert_cols.push("org_id".into());
     }
     if map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_ulid") {
         bail!("source message_index has no event_ulid column; cannot link messages to the ledger");
@@ -528,6 +599,65 @@ fn as_text(v: Option<&SqlValue>) -> Option<&str> {
     }
 }
 
+enum BranchNorm {
+    Keep(SqlValue),
+    ClearedInvalid,
+}
+
+fn normalize_binding_branch(v: &SqlValue) -> BranchNorm {
+    match v {
+        SqlValue::Null => BranchNorm::Keep(SqlValue::Null),
+        SqlValue::Text(s) => match check_default_branch(Some(s)) {
+            Ok(Some(b)) => BranchNorm::Keep(SqlValue::Text(b)),
+            Ok(None) => BranchNorm::Keep(SqlValue::Null),
+            Err(_) => BranchNorm::ClearedInvalid,
+        },
+        _ => BranchNorm::ClearedInvalid,
+    }
+}
+
+fn record_cleared_task_run(count: &mut u64, ids: &mut Vec<i64>, id_val: Option<&SqlValue>) {
+    *count += 1;
+    if ids.len() < MAX_REPORTED_TASK_RUN_IDS
+        && let Some(SqlValue::Integer(tid)) = id_val
+    {
+        ids.push(*tid);
+    }
+}
+
+fn append_clear_notes(report: &mut Report) {
+    if report.task_runs_cleared > 0 {
+        let n = report.task_runs_cleared;
+        let ids: Vec<String> = report.task_runs_cleared_ids.iter().map(|id| format!("#{id}")).collect();
+        let note = if (n as usize) > ids.len() && !ids.is_empty() {
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported (first {} of {n} task ids: {})",
+                ids.len(),
+                ids.join(", ")
+            )
+        } else if !ids.is_empty() {
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported (task ids: {})",
+                ids.join(", ")
+            )
+        } else {
+            format!(
+                "{n} task(s) had current_run_id/current_run_agent cleared because dispatch_runs are not \
+                 imported"
+            )
+        };
+        report.notes.push(note);
+    }
+    if report.binding_branches_cleared > 0 {
+        report.notes.push(format!(
+            "{} project_repo_bindings row(s) had an invalid default_branch cleared to NULL",
+            report.binding_branches_cleared
+        ));
+    }
+}
+
 /// A reason to leave a row out, decided from the row alone.
 fn filter(kind: Kind, cols: &[String], vals: &[SqlValue]) -> Option<&'static str> {
     match kind {
@@ -542,6 +672,20 @@ fn filter(kind: Kind, cols: &[String], vals: &[SqlValue]) -> Option<&'static str
             let hash = as_text(col_value(cols, vals, "token_hash")).unwrap_or("");
             let hex64 = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
             if algo == Some("sha256") && hex64 { None } else { Some("unsupported_token_hash") }
+        }
+        Kind::TaskHolds => match as_text(col_value(cols, vals, "status")) {
+            Some("active") | Some("released") => None,
+            _ => Some("invalid_status"),
+        },
+        Kind::ProjectRepoBindings => {
+            if as_text(col_value(cols, vals, "project")).and_then(|s| check_slug("project", s).ok()).is_none()
+            {
+                Some("invalid_project")
+            } else if as_text(col_value(cols, vals, "repo")).and_then(|r| normalize_repo(r).ok()).is_none() {
+                Some("invalid_repo")
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -574,10 +718,64 @@ fn check_target(src: &Connection, db: &Db, report: &Report, opts: &Options) -> a
         let Some(rep) = report.tables.iter().find(|t| t.table == map.source).filter(|t| t.present) else {
             continue;
         };
-        if map.kind == Kind::Ledger {
-            check_ledger_target(src, db, rep.last_key)?;
-        } else {
-            check_key_overlap(src, db, map, rep.last_key)?;
+        match map.kind {
+            Kind::Ledger => check_ledger_target(src, db, rep.last_key)?,
+            Kind::TaskHolds => {
+                check_source_active_holds(src, rep.last_key)?;
+                check_key_overlap(src, db, map, rep.last_key)?;
+            }
+            Kind::ProjectRepoBindings => {
+                check_source_bindings_overlap(src, db, map, rep.last_key)?;
+                check_key_overlap(src, db, map, rep.last_key)?;
+            }
+            _ => check_key_overlap(src, db, map, rep.last_key)?,
+        }
+    }
+    Ok(())
+}
+
+fn check_source_active_holds(src: &Connection, last: i64) -> anyhow::Result<()> {
+    let cols = columns(src, "task_holds")?;
+    if !cols.iter().any(|c| c == "root_task_id") || !cols.iter().any(|c| c == "status") {
+        return Ok(());
+    }
+    let sql = "SELECT root_task_id, COUNT(*) FROM task_holds \
+               WHERE rowid > ?1 AND root_task_id IS NOT NULL AND status = 'active' \
+               GROUP BY root_task_id HAVING COUNT(*) > 1 LIMIT 1";
+    if let Some((root_id, n)) =
+        src.query_row(sql, [last], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).optional()?
+    {
+        bail!(
+            "source task_holds has {n} active holds for root_task_id {root_id}; ua-rust allows at most one active \
+             hold per root (nothing was written)"
+        );
+    }
+    Ok(())
+}
+
+fn check_source_bindings_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> anyhow::Result<()> {
+    let plan = plan_table(src, db, map)?;
+    if !plan.cols.iter().any(|c| c == "project") {
+        return Ok(());
+    }
+    let sel =
+        format!("SELECT {} FROM {} WHERE rowid > ?1 ORDER BY rowid", select_list(&plan.cols), q(map.source));
+    let mut stmt = src.prepare(&sel)?;
+    let mut rows = stmt.query([last])?;
+    let mut seen = BTreeSet::new();
+    while let Some(r) = rows.next()? {
+        let vals = row_values(r, 0, plan.cols.len())?;
+        if filter(map.kind, &plan.cols, &vals).is_some() {
+            continue;
+        }
+        if let Some(slug) =
+            as_text(col_value(&plan.cols, &vals, "project")).and_then(|s| check_slug("project", s).ok())
+            && !seen.insert(slug.clone())
+        {
+            bail!(
+                "source project_repo_bindings has duplicate project slug {slug:?} after trimming \
+                 (nothing was written)"
+            );
         }
     }
     Ok(())
@@ -627,15 +825,22 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
         let rows = stmt.query_map([map.target], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     })?;
-    // A key made only of copied columns, or the `rowid` mapped to a column.
+    // A key whose values come from copied columns, the default org, or the source rowid.
     let mut keys: Vec<Vec<String>> = Vec::new();
-    if !pk.is_empty() && pk.iter().all(|c| plan.cols.contains(c)) {
+    if !pk.is_empty()
+        && pk.iter().all(|c| plan.cols.contains(c) || (map.kind.writes_default_org() && c == "org_id"))
+    {
         keys.push(pk);
     }
     if let Some(r) = map.rowid_to {
         keys.push(vec![r.to_string()]);
     }
-    if keys.is_empty() {
+    // Hub-wide on purpose: the one-active-hold index is keyed by the
+    // hub-global root task id across every organization, so a clash in any
+    // organization would fail the copy.
+    let active_hold_probe_sql = (map.kind == Kind::TaskHolds)
+        .then_some("SELECT 1 FROM task_holds WHERE root_task_id = ?1 AND status = 'active' LIMIT 1");
+    if keys.is_empty() && active_hold_probe_sql.is_none() {
         return Ok(());
     }
     let sel = format!(
@@ -658,8 +863,10 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
     let mut stmt = src.prepare(&sel)?;
     let mut rows = stmt.query([last])?;
     let mut clash: Option<(String, Vec<SqlValue>)> = None;
+    let mut active_hold_clash: Option<SqlValue> = None;
     db.read(|c| {
         let mut prepared = probes.iter().map(|p| c.prepare(p)).collect::<Result<Vec<_>, _>>()?;
+        let mut active_hold_probe = active_hold_probe_sql.map(|p| c.prepare(p)).transpose()?;
         'rows: while let Some(r) = rows.next()? {
             let rowid: i64 = r.get(0)?;
             let vals = row_values(r, 1, plan.cols.len())?;
@@ -671,7 +878,20 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                     vec![SqlValue::Integer(rowid)]
                 } else {
                     key.iter()
-                        .map(|k| col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null))
+                        .map(|k| {
+                            if map.kind.writes_default_org() && k == "org_id" {
+                                return SqlValue::Text(ua_core::DEFAULT_ORG.into());
+                            }
+                            let raw = col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null);
+                            if map.kind == Kind::ProjectRepoBindings
+                                && k == "project"
+                                && let Some(norm) =
+                                    as_text(Some(&raw)).and_then(|s| check_slug("project", s).ok())
+                            {
+                                return SqlValue::Text(norm);
+                            }
+                            raw
+                        })
                         .collect()
                 };
                 // A NULL key part never collides.
@@ -680,6 +900,17 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                 }
                 if probe.exists(params_from_iter(kv.iter()))? {
                     clash = Some((key.join(", "), kv));
+                    break 'rows;
+                }
+            }
+            if let Some(probe) = active_hold_probe.as_mut() {
+                let eff_status = as_text(col_value(&plan.cols, &vals, "status"));
+                if eff_status == Some("active")
+                    && let Some(root_val) = col_value(&plan.cols, &vals, "root_task_id")
+                    && *root_val != SqlValue::Null
+                    && probe.exists([root_val])?
+                {
+                    active_hold_clash = Some(root_val.clone());
                     break 'rows;
                 }
             }
@@ -693,7 +924,20 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
             map.target
         );
     }
+    if let Some(root) = active_hold_clash {
+        bail!(
+            "task_holds already holds an active hold for root_task_id = {root:?} that this import would copy; \
+             the target must not hold rows with imported active holds. Import into a fresh database (nothing was written)"
+        );
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct CopyEffects {
+    task_runs_cleared: u64,
+    task_runs_cleared_ids: Vec<i64>,
+    binding_branches_cleared: u64,
 }
 
 fn copy_table(
@@ -703,7 +947,7 @@ fn copy_table(
     plan: &Plan<'_>,
     batch: usize,
     rep: &mut TableReport,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CopyEffects> {
     let map = plan.map;
     let select = format!(
         "SELECT rowid, {} FROM {} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
@@ -715,7 +959,14 @@ fn copy_table(
         format!("INSERT INTO {} ({}) VALUES ({marks})", q(map.target), select_list(&plan.insert_cols));
     let seq_idx = plan.insert_cols.iter().position(|c| c == "event_seq");
     let ulid_idx = plan.insert_cols.iter().position(|c| c == "event_ulid");
+    let id_idx = plan.cols.iter().position(|c| c == "id");
+    let run_id_idx = plan.cols.iter().position(|c| c == "current_run_id");
+    let run_agent_idx = plan.cols.iter().position(|c| c == "current_run_agent");
+    let proj_idx = plan.cols.iter().position(|c| c == "project");
+    let repo_idx = plan.cols.iter().position(|c| c == "repo");
+    let branch_idx = plan.cols.iter().position(|c| c == "default_branch");
     let mut last_key = rep.last_key;
+    let mut effects = CopyEffects::default();
     loop {
         let rows: Vec<(i64, Vec<SqlValue>)> = {
             let mut stmt = src.prepare_cached(&select)?;
@@ -725,12 +976,15 @@ fn copy_table(
             rows.collect::<Result<_, _>>()?
         };
         let Some(&(batch_last, _)) = rows.last() else { break };
-        let (copied, skipped, nulled) = db
+        let (copied, skipped, nulled, batch_runs_cleared, batch_run_ids, batch_branches_cleared) = db
             .write(|tx| {
                 tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
                 let mut copied = 0u64;
                 let mut skipped: BTreeMap<String, u64> = BTreeMap::new();
                 let mut nulled = 0u64;
+                let mut batch_runs_cleared = 0u64;
+                let mut batch_run_ids = Vec::new();
+                let mut batch_branches_cleared = 0u64;
                 'rows: for (rowid, mut vals) in rows {
                     if let Some(reason) = filter(map.kind, &plan.cols, &vals) {
                         bump(&mut skipped, reason);
@@ -755,16 +1009,59 @@ fn copy_table(
                         }
                         vals[i] = SqlValue::Null;
                     }
+                    if map.kind == Kind::Tasks {
+                        let has_run = run_id_idx.is_some_and(|ri| vals[ri] != SqlValue::Null)
+                            || run_agent_idx.is_some_and(|ai| vals[ai] != SqlValue::Null);
+                        if has_run {
+                            if let Some(ri) = run_id_idx {
+                                vals[ri] = SqlValue::Null;
+                            }
+                            if let Some(ai) = run_agent_idx {
+                                vals[ai] = SqlValue::Null;
+                            }
+                            let id_val = id_idx.map(|ii| vals[ii].clone());
+                            record_cleared_task_run(
+                                &mut batch_runs_cleared,
+                                &mut batch_run_ids,
+                                id_val.as_ref(),
+                            );
+                        }
+                    }
                     if map.kind == Kind::Nodes
                         && let Some(i) = plan.cols.iter().position(|c| c == "facts_json")
                     {
                         vals[i] = SqlValue::Text("{}".into());
+                    }
+                    if map.kind == Kind::ProjectRepoBindings {
+                        if let Some(pi) = proj_idx
+                            && let Some(slug) =
+                                as_text(Some(&vals[pi])).and_then(|s| check_slug("project", s).ok())
+                        {
+                            vals[pi] = SqlValue::Text(slug);
+                        }
+                        if let Some(ri) = repo_idx
+                            && let Some(repo) = as_text(Some(&vals[ri])).and_then(|r| normalize_repo(r).ok())
+                        {
+                            vals[ri] = SqlValue::Text(repo);
+                        }
+                        if let Some(bi) = branch_idx {
+                            match normalize_binding_branch(&vals[bi]) {
+                                BranchNorm::Keep(v) => vals[bi] = v,
+                                BranchNorm::ClearedInvalid => {
+                                    vals[bi] = SqlValue::Null;
+                                    batch_branches_cleared += 1;
+                                }
+                            }
+                        }
                     }
                     if map.rowid_to.is_some() {
                         vals.push(SqlValue::Integer(rowid));
                     }
                     if plan.append_event_seq {
                         vals.push(SqlValue::Null);
+                    }
+                    if map.kind.writes_default_org() {
+                        vals.push(SqlValue::Text(ua_core::DEFAULT_ORG.into()));
                     }
                     if let (Some(si), Some(ui)) = (seq_idx, ulid_idx)
                         && map.kind == Kind::MessageIndex
@@ -791,20 +1088,27 @@ fn copy_table(
                 }
                 let n_skipped: u64 = skipped.values().sum();
                 save_state(tx, source_hash, map.source, batch_last, copied, n_skipped)?;
-                Ok((copied, skipped, nulled))
+                Ok((copied, skipped, nulled, batch_runs_cleared, batch_run_ids, batch_branches_cleared))
             })
             .with_context(|| format!("importing {}", map.source))?;
         rep.copied += copied;
         rep.total_copied += copied;
         rep.total_skipped += skipped.values().sum::<u64>();
         rep.dangling_refs_nulled += nulled;
+        effects.task_runs_cleared += batch_runs_cleared;
+        for id in batch_run_ids {
+            if effects.task_runs_cleared_ids.len() < MAX_REPORTED_TASK_RUN_IDS {
+                effects.task_runs_cleared_ids.push(id);
+            }
+        }
+        effects.binding_branches_cleared += batch_branches_cleared;
         for (k, v) in skipped {
             *rep.skipped.entry(k).or_default() += v;
         }
         last_key = batch_last;
         rep.last_key = batch_last;
     }
-    Ok(())
+    Ok(effects)
 }
 
 /// Restore self-references that pointed forward when their row was copied.
@@ -831,6 +1135,72 @@ fn fix_self_ref(src: &Connection, db: &Db, map: &TableMap, sr: Ref) -> anyhow::R
         Ok(())
     })
     .with_context(|| format!("restoring {}.{}", map.target, sr.col))
+}
+
+fn has_sqlite_sequence(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// Raise a non-ledger target AUTOINCREMENT table's `sqlite_sequence` counter
+/// to at least the source's counter so post-cutover inserts never reuse a
+/// deleted or skipped id (for example, a deleted task id still referenced by
+/// an active `task_holds.root_task_id`, or a skipped approval id).
+///
+/// Never touches `event_log`, never lowers an existing target sequence or
+/// `MAX(rowid)`, never creates duplicate `sqlite_sequence` rows, and skips
+/// target tables that do not use `AUTOINCREMENT`.
+fn carry_sqlite_sequence(src: &Connection, db: &Db, map: &TableMap) -> anyhow::Result<()> {
+    let source_seq: Option<i64> = src.query_row(
+        "SELECT MAX(seq) FROM sqlite_sequence WHERE name = ?1 AND typeof(seq) = 'integer'",
+        [map.source],
+        |r| r.get(0),
+    )?;
+    let Some(source_seq) = source_seq.filter(|&s| s > 0) else {
+        return Ok(());
+    };
+    db.write(|tx| {
+        let target_is_autoinc: bool = tx
+            .query_row(
+                "SELECT COALESCE(upper(sql), '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [map.target],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|sql| sql.contains("AUTOINCREMENT") && !sql.contains("WITHOUT ROWID"));
+        if !target_is_autoinc {
+            return Ok(());
+        }
+        let max_rowid: i64 =
+            tx.query_row(&format!("SELECT COALESCE(MAX(rowid), 0) FROM {}", q(map.target)), [], |r| {
+                r.get(0)
+            })?;
+        let (existing_seq, row_count): (Option<i64>, i64) = tx.query_row(
+            "SELECT MAX(seq), COUNT(*) FROM sqlite_sequence WHERE name = ?1",
+            [map.target],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let floor = existing_seq.unwrap_or(0).max(max_rowid);
+        if source_seq > floor {
+            if row_count == 0 {
+                tx.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                    params![map.target, source_seq],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = ?2",
+                    params![source_seq, map.target],
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .with_context(|| format!("carrying sqlite_sequence for {}", map.target))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

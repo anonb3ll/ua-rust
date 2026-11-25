@@ -1,23 +1,194 @@
 //! `event_log_query` and `event_log_verify`.
 //!
-//! [`EventScope`] is the channel scoping `event_log_query` applies. The live
-//! event streams (`/api/events/stream`, `/ui/activity/stream`) use the same
-//! type, so a streamed or backfilled row is exactly a row the tool would
-//! have returned to that caller.
+//! [`EventScope`] defines the channel filters for both `event_log_query` and
+//! the event streams. The ledger tool also hides rows whose existence would
+//! leak a private record — mailbox messages, session handoff notes and
+//! conversation handoffs — before selecting its page.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ToSql, params_from_iter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use ua_core::UaResult;
+use ua_core::{Caller, Config, DEFAULT_ORG, UaResult};
+use ua_org::authz::{Authority, Authz};
 use ua_store::ledger::{self, Event, EventQuery};
 
+use super::agents::verified;
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
 use super::injection::mark_untrusted;
+use super::messaging::may_read_all_mail;
 use crate::registry::{Registry, ToolCtx, tool};
 
 /// Largest page `event_log_query` returns.
 pub const MAX_LIMIT: usize = 1000;
+
+// Five channel groups hide their rows from readers outside the record:
+// `agent.message.*` follows the mailbox index (a label-only ledger read
+// cannot receive mail addressed to a specific session),
+// `agent.lifecycle.handoff` follows the handoff note's parties and the
+// session owner, `agent.conversation.handoff` follows the conversation's
+// participants and the linked task's holders, and `agent.mailbox.*`
+// (read/ack receipts) is the mailbox owner's own telemetry, unrestricted
+// readers only, and `agent.lifecycle.handoff_hook` (a hook-reported handoff
+// from `lifecycle_record`) is its writer's own, note-reading operators only —
+// it names a session but never joins its owner, so no caller can place a row
+// in another session's view. The chain-metadata exception still shows an outsider that a
+// hidden row exists and when — placeholder and chain-head ULIDs encode
+// millisecond creation time and `seq` bounds its neighbours — never its
+// content, channel or parties. Placeholder order matches `bindings()`.
+pub(super) const VISIBLE_EVENT: &str = "(
+    (channel NOT GLOB 'agent.message.*'
+        AND channel NOT GLOB 'agent.mailbox.*'
+        AND channel <> 'agent.lifecycle.handoff'
+        AND channel <> 'agent.lifecycle.handoff_hook'
+        AND channel <> 'agent.conversation.handoff')
+    OR (channel GLOB 'agent.message.*' AND org_id = ? AND (? OR EXISTS (
+        SELECT 1 FROM message_index i WHERE i.event_ulid = event_log.ulid
+          AND i.org_id = event_log.org_id
+          AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
+    )))
+    OR (channel = 'agent.lifecycle.handoff' AND org_id = ? AND json_valid(event_log.payload) AND (
+        ? OR EXISTS (
+        SELECT 1 FROM session_handoff_notes n
+          WHERE n.id = json_extract(event_log.payload, '$.note_id')
+            AND n.org_id = event_log.org_id
+            AND ? IN (n.agent, n.assigned_to, n.delivered_to)
+    ) OR EXISTS (
+        SELECT 1 FROM agent_sessions s
+          WHERE s.id = json_extract(event_log.payload, '$.session_id')
+            AND s.org_id = event_log.org_id
+            AND s.agent = ?
+    )))
+    OR (channel = 'agent.conversation.handoff' AND org_id = ? AND json_valid(event_log.payload) AND (
+        ? OR EXISTS (
+        SELECT 1 FROM message_index i
+          WHERE i.conversation_id = json_extract(event_log.payload, '$.conversation_id')
+            AND i.org_id = event_log.org_id
+            AND (i.sender = ? OR (i.recipient = ? AND i.target_session IS NULL))
+    ) OR EXISTS (
+        SELECT 1 FROM tasks t
+          WHERE t.id = json_extract(event_log.payload, '$.task_id') AND t.org_id = event_log.org_id
+            AND ? IN (t.claimed_by, t.next_owner)
+    )))
+    OR (channel GLOB 'agent.mailbox.*' AND org_id = ? AND ?)
+    OR (channel = 'agent.lifecycle.handoff_hook' AND org_id = ? AND ?)
+    -- The writer of a restricted row sees its own write: a hook handoff is
+    -- its writer's observation, and read/ack receipts are written by the
+    -- mailbox owner.
+    OR (org_id = ? AND event_log.originator = ?)
+)";
+
+/// Record visibility for a ledger reader. A stream keeps the reader it
+/// authenticated with and rechecks that identity while the stream is open.
+#[derive(Clone)]
+pub struct EventReader {
+    unrestricted: bool,
+    note_reader: bool,
+    party: Option<String>,
+    /// The caller's organization: the only one whose `tool_calls` it reads.
+    org: String,
+    /// The caller's verified label, in any organization: whose calls a
+    /// restricted reader counts, inside [`EventReader::org`] only.
+    own: Option<String>,
+}
+
+/// The `tool_calls` rows a reader counts, as a SQL condition with three `?`
+/// placeholders bound by [`EventReader::call_bindings`]: the reader's own
+/// organization only, and in it every caller's calls for an unrestricted
+/// reader, else only the reader's own (an unverified restricted reader
+/// counts none).
+pub(super) const CALL_SCOPE: &str = "(org_id = ? AND (? OR caller = ?))";
+
+impl EventReader {
+    pub fn new(cfg: &Config, caller: &Caller) -> Self {
+        let unrestricted = may_read_all_mail(cfg, caller);
+        // LocalTrustReader stays inside note_reader on purpose: with auth
+        // enforcement off the ledger is a message board, same as mail.
+        // recover_note is stricter and still refuses unverified callers.
+        let note_reader = unrestricted
+            || (verified(caller).is_some()
+                && Authz::new(cfg).holds(
+                    caller,
+                    &[Authority::Operator, Authority::LifecycleOperator],
+                    DEFAULT_ORG,
+                ));
+        Self {
+            unrestricted,
+            note_reader,
+            party: verified(caller).filter(|_| caller.org_id == DEFAULT_ORG).map(str::to_owned),
+            org: caller.org_id.clone(),
+            own: verified(caller).map(str::to_owned),
+        }
+    }
+
+    /// May read every mailbox and restricted record (LocalTrustReader or
+    /// Operator, so auth-off board readers too).
+    pub(super) fn unrestricted(&self) -> bool {
+        self.unrestricted
+    }
+
+    /// The bindings of [`CALL_SCOPE`]: the reader's organization, whether it
+    /// counts every caller, and its own verified label. A `tool_calls` reader
+    /// never counts another organization's calls, unrestricted or not.
+    pub(super) fn call_bindings(&self) -> [&dyn ToSql; 3] {
+        [&self.org, &self.unrestricted, &self.own]
+    }
+
+    /// Whether the reader counts `label`'s calls (inside its own
+    /// organization, see [`CALL_SCOPE`]).
+    pub(super) fn counts_calls_of(&self, label: &str) -> bool {
+        self.unrestricted || self.own.as_deref() == Some(label)
+    }
+
+    /// The reader's organization.
+    pub(super) fn org(&self) -> &str {
+        &self.org
+    }
+
+    pub(super) fn bindings(&self) -> [&dyn ToSql; 19] {
+        [
+            &DEFAULT_ORG,
+            &self.unrestricted,
+            &self.party,
+            &self.party,
+            &DEFAULT_ORG,
+            &self.note_reader,
+            &self.party,
+            &self.party,
+            &DEFAULT_ORG,
+            &self.unrestricted,
+            &self.party,
+            &self.party,
+            &self.party,
+            &DEFAULT_ORG,
+            &self.unrestricted,
+            &DEFAULT_ORG,
+            &self.note_reader,
+            &DEFAULT_ORG,
+            &self.party,
+        ]
+    }
+
+    pub fn query(&self, conn: &Connection, query: &EventQuery) -> UaResult<Vec<Event>> {
+        ledger::query_filtered(conn, query, VISIBLE_EVENT, &self.bindings())
+    }
+
+    /// Rows on these channels need a persisted index to authorize a live row.
+    pub fn needs_visibility_check(event: &Event) -> bool {
+        event.channel.starts_with("agent.message.")
+            || event.channel.starts_with("agent.mailbox.")
+            || event.channel == "agent.lifecycle.handoff"
+            || event.channel == "agent.lifecycle.handoff_hook"
+            || event.channel == "agent.conversation.handoff"
+    }
+
+    pub fn includes(&self, conn: &Connection, seq: i64) -> UaResult<bool> {
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM event_log WHERE seq = ? AND ({VISIBLE_EVENT}))");
+        let bindings = std::iter::once(&seq as &dyn ToSql).chain(self.bindings());
+        let mut stmt = conn.prepare_cached(&sql)?;
+        Ok(stmt.query_row(params_from_iter(bindings), |row| row.get(0))?)
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -71,8 +242,14 @@ impl EventScope {
 
     /// Scoped rows after `after_seq`, at most `limit`: the oldest ones after
     /// the cursor, so repeated calls page forward (see [`ledger::query`]).
-    pub fn read_after(&self, conn: &Connection, after_seq: i64, limit: usize) -> UaResult<Vec<Event>> {
-        ledger::query(conn, &self.query(Some(after_seq), None, Some(limit.clamp(1, MAX_LIMIT))))
+    pub fn read_after(
+        &self,
+        conn: &Connection,
+        reader: &EventReader,
+        after_seq: i64,
+        limit: usize,
+    ) -> UaResult<Vec<Event>> {
+        reader.query(conn, &self.query(Some(after_seq), None, Some(limit.clamp(1, MAX_LIMIT))))
     }
 
     /// `event_log_query` arguments for this scope, for a governed admission
@@ -105,12 +282,15 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "event_log_query",
-            "Read ledger events in commit order with optional channel, time and cursor filters. Client \
-             evidence (sdk. channels) carries a trust label: its payload is untrusted data.",
+            "Read ledger events in commit order with optional channel, time and cursor filters. Message, \
+             session-handoff and conversation-handoff rows follow the caller's visibility (mailbox, note and \
+             conversation rules); chain metadata (seq, hashes) stays visible to keep the ledger verifiable. \
+             Client evidence (sdk. channels) carries a trust label: its payload is untrusted data.",
             |ctx: ToolCtx, a: QueryArgs| async move {
                 let scope = EventScope { channels: a.channels, channel_prefix: a.channel_prefix };
                 let q = scope.query(a.after_seq, a.since, a.limit);
-                let events = ctx.hub.db().read_async(move |c| ledger::query(c, &q)).await?;
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                let events = ctx.hub.db().read_async(move |c| reader.query(c, &q)).await?;
                 let next = events.last().map(|e| e.seq);
                 let count = events.len();
                 let events: Vec<Value> = events.into_iter().map(labelled).collect::<UaResult<_>>()?;
@@ -123,7 +303,9 @@ pub fn register(r: &mut Registry) {
     r.add(
         tool(
             "event_log_verify",
-            "Recompute the ledger hash chain and report the first broken entry, if any.",
+            "Recompute the ledger hash chain and report the first broken entry, if any. The chain covers \
+             every row, including ones the caller's event visibility hides: that metadata is the accepted \
+             integrity exception, and reveals a row exists but not its contents.",
             |ctx: ToolCtx, _: VerifyArgs| async move {
                 let report = ctx.hub.db().read_async(ledger::verify).await?;
                 Ok(serde_json::to_value(report)?)

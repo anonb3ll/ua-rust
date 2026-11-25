@@ -9,12 +9,14 @@
 mod dash;
 mod devservers;
 mod format;
+#[cfg(feature = "code-intel")]
 mod index;
+#[cfg(feature = "code-intel")]
 pub mod lang;
 pub mod lint;
 pub mod media;
 
-use ua_store::SchemaPart;
+use ua_store::{Procedure, SchemaPart};
 
 use crate::registry::Registry;
 
@@ -42,6 +44,13 @@ CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(workspace, symb
 ",
 };
 
+/// `organization.v1.tools.code`: `code_symbols.org_id` (existing rows
+/// backfilled to the default organization) and the generated
+/// `code_symbols_org_exists` / `code_symbols_org_immutable` triggers. Applied
+/// after `code.v1` and `organization.v1.store` (see `ua_tools::schema_parts`).
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.code", &["code_symbols"]);
+
 pub fn schema_parts() -> Vec<SchemaPart> {
     vec![SCHEMA]
 }
@@ -50,6 +59,7 @@ pub fn register(r: &mut Registry) {
     dash::register(r);
     devservers::register(r);
     format::register(r);
+    #[cfg(feature = "code-intel")]
     index::register(r);
     lint::register(r);
     media::register(r);

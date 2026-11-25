@@ -13,12 +13,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_store::{EventInput, WriteTx, ledger};
+use ua_store::WriteTx;
 
 use super::{
-    CHANNEL, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip, command,
-    credentials, device_agent, evidence_ref, items_where, load_item, now, owned_node, record, renew_run,
-    run_gate, run_running, sweep_tx,
+    CHANNEL, Dedupe, Item, LEASE_GRACE_S, acceptance, after, before, cancel_item, check_item_id, clip,
+    command, credentials, device_agent, emit, evidence_ref, items_where, load_item, now, owned_node, record,
+    renew_run, require_org, run_gate, run_running, sweep_tx,
 };
 use crate::families::{governance, nodes};
 use crate::hub::Hub;
@@ -87,12 +87,12 @@ struct OpRow {
     fence_expires_at: i64,
 }
 
-fn load_op(tx: &WriteTx<'_>, node: &str, id: &str) -> UaResult<Option<OpRow>> {
+fn load_op(tx: &WriteTx<'_>, org: &str, node: &str, id: &str) -> UaResult<Option<OpRow>> {
     Ok(tx
         .query_row(
             "SELECT identity, issued_at, state, reason, item_id, attempt, snapshot_json, fence_expires_at \
-             FROM node_claim_ops WHERE node = ?1 AND op_id = ?2",
-            params![node, id],
+             FROM node_claim_ops WHERE node = ?1 AND op_id = ?2 AND org_id = ?3",
+            params![node, id, org],
             |r| {
                 Ok(OpRow {
                     identity: r.get(0)?,
@@ -109,19 +109,19 @@ fn load_op(tx: &WriteTx<'_>, node: &str, id: &str) -> UaResult<Option<OpRow>> {
         .optional()?)
 }
 
-fn close_op(tx: &WriteTx<'_>, node: &str, op: &OpRow, id: &str, reason: &str) -> UaResult<()> {
+fn close_op(tx: &WriteTx<'_>, org: &str, node: &str, op: &OpRow, id: &str, reason: &str) -> UaResult<()> {
     let fence = op.fence_expires_at.max(unix_now() + OP_TOMBSTONE_S);
     tx.execute(
         "UPDATE node_claim_ops SET state = 'no_claim', reason = ?3, fence_expires_at = ?4, updated_at = ?5 \
-         WHERE node = ?1 AND op_id = ?2 AND state = 'pending'",
-        params![node, id, reason, fence, now()],
+         WHERE node = ?1 AND op_id = ?2 AND org_id = ?6 AND state = 'pending'",
+        params![node, id, reason, fence, now(), org],
     )?;
     Ok(())
 }
 
 /// Why a bound operation's claim may no longer run, if it may not.
-fn bound_refusal(tx: &WriteTx<'_>, item_id: &str, attempt: i64) -> UaResult<Option<String>> {
-    let Some(item) = load_item(tx, item_id)? else { return Ok(Some("item_missing".into())) };
+fn bound_refusal(tx: &WriteTx<'_>, org: &str, item_id: &str, attempt: i64) -> UaResult<Option<String>> {
+    let Some(item) = load_item(tx, org, item_id)? else { return Ok(Some("item_missing".into())) };
     if item.receipt_json.is_some() {
         return Ok(Some("receipt_stored".into()));
     }
@@ -145,13 +145,13 @@ fn bound_refusal(tx: &WriteTx<'_>, item_id: &str, attempt: i64) -> UaResult<Opti
 
 /// The answer for a settled (not pending) operation: its disposition, and
 /// the stored snapshot while the binding still holds.
-fn settled(tx: &WriteTx<'_>, op_id: &str, row: &OpRow) -> UaResult<(Value, Option<Value>)> {
+fn settled(tx: &WriteTx<'_>, org: &str, op_id: &str, row: &OpRow) -> UaResult<(Value, Option<Value>)> {
     let mut refusal = None;
     let mut item = None;
     if row.state == "bound"
         && let (Some(id), Some(attempt)) = (&row.item_id, row.attempt)
     {
-        refusal = bound_refusal(tx, id, attempt)?;
+        refusal = bound_refusal(tx, org, id, attempt)?;
         if refusal.is_none() {
             match row.snapshot.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                 Some(snap) => item = Some(snap),
@@ -171,11 +171,14 @@ fn settled(tx: &WriteTx<'_>, op_id: &str, row: &OpRow) -> UaResult<(Value, Optio
 }
 
 /// Remove expired operations, keeping a bound one whose claim is still live.
+/// A hub job (the sweep): it spans every organization, and an operation's
+/// item is matched in the operation's own organization.
 pub(crate) fn cleanup_ops(tx: &WriteTx<'_>, node: Option<&str>) -> UaResult<()> {
     tx.execute(
         "DELETE FROM node_claim_ops WHERE rowid IN (SELECT o.rowid FROM node_claim_ops o \
          WHERE o.fence_expires_at < ?1 AND (?2 IS NULL OR o.node = ?2) AND NOT (o.state = 'bound' AND EXISTS ( \
-           SELECT 1 FROM node_dispatch d WHERE d.id = o.item_id AND d.status = 'claimed' AND d.attempts = o.attempt)) \
+           SELECT 1 FROM node_dispatch d WHERE d.id = o.item_id AND d.org_id = o.org_id \
+           AND d.status = 'claimed' AND d.attempts = o.attempt)) \
          LIMIT ?3)",
         params![unix_now(), node, OP_CLEANUP_LIMIT],
     )?;
@@ -224,32 +227,42 @@ fn payload(hub: &Hub, item: &Item, lease: &str, attempt: i64, command: Option<Va
     p
 }
 
+/// One claim by the node's own token: `org` is that token's organization,
+/// so the node must be `org`'s and only `org`'s work is chosen. A node token
+/// of another organization finds no such node.
 fn claim_once(
     tx: &mut WriteTx<'_>,
     hub: &Hub,
+    org: &str,
     agent: &str,
     node: &str,
     op: Option<&ClaimOp>,
     last: bool,
 ) -> UaResult<ClaimOutcome> {
-    let row = owned_node(tx, node, agent)?;
+    require_org(tx, org)?;
+    let row = owned_node(tx, org, node, agent)?;
     let node = row.node.clone();
     sweep_tx(tx, Some(&node), "node-queue-claim")?;
     // Queued work whose run went away is cancelled before it can be chosen.
-    for item in items_where(tx, "node = ?1 AND status = 'queued' AND run_id IS NOT NULL", [&node])? {
+    for item in items_where(
+        tx,
+        "org_id = ?1 AND node = ?2 AND status = 'queued' AND run_id IS NOT NULL",
+        params![org, node],
+    )? {
         if run_gate(tx, &item)?.is_some() {
-            cancel_item(tx, &item.id, "node-queue-claim", "dispatch run is no longer live")?;
+            cancel_item(tx, org, &item.id, "node-queue-claim", "dispatch run is no longer live")?;
         }
     }
     // A paused, terminated or retired owner claims nothing, whatever is
     // queued. Checked after the sweep above, which commits despite the
     // refusal; the queued items stay queued for a resume.
-    if let Some(refused) = governance::claim_block(tx, Some(agent), None, false)? {
+    // No task: only the agent half of the gate runs.
+    if let Some(refused) = governance::claim_block(tx, org, Some(agent), None, false)? {
         return Ok(ClaimOutcome { item: None, disposition: None, pending: false, refused: Some(refused) });
     }
 
     if let Some(op) = op {
-        let existing = load_op(tx, &node, &op.id)?;
+        let existing = load_op(tx, org, &node, &op.id)?;
         if let Some(e) = &existing
             && (e.identity != agent || e.issued_at != op.issued_at)
         {
@@ -260,16 +273,25 @@ fn claim_once(
             None if op.reconcile => {
                 tx.execute(
                     "INSERT INTO node_claim_ops (node, op_id, identity, issued_at, state, reason, created_at, \
-                     updated_at, fence_expires_at) VALUES (?1, ?2, ?3, ?4, 'no_claim', 'reconciled_unknown', ?5, ?5, ?6)",
-                    params![node, op.id, agent, op.issued_at, ts, unix_now().max(op.issued_at) + OP_TOMBSTONE_S],
+                     updated_at, fence_expires_at, org_id) \
+                     VALUES (?1, ?2, ?3, ?4, 'no_claim', 'reconciled_unknown', ?5, ?5, ?6, ?7)",
+                    params![
+                        node,
+                        op.id,
+                        agent,
+                        op.issued_at,
+                        ts,
+                        unix_now().max(op.issued_at) + OP_TOMBSTONE_S,
+                        org
+                    ],
                 )?;
-                return reconciled(tx, &node, op);
+                return reconciled(tx, org, &node, op);
             }
             Some(e) if op.reconcile => {
                 if e.state == "pending" {
-                    close_op(tx, &node, &e, &op.id, "reconciled_pending")?;
+                    close_op(tx, org, &node, &e, &op.id, "reconciled_pending")?;
                 }
-                return reconciled(tx, &node, op);
+                return reconciled(tx, org, &node, op);
             }
             None => {
                 if (unix_now() - op.issued_at).abs() > OP_MAX_AGE_S {
@@ -277,10 +299,11 @@ fn claim_once(
                         "claim_op is outside its admission window; issue a new operation id",
                     ));
                 }
-                let held: i64 =
-                    tx.query_row("SELECT COUNT(*) FROM node_claim_ops WHERE node = ?1", [&node], |r| {
-                        r.get(0)
-                    })?;
+                let held: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM node_claim_ops WHERE node = ?1 AND org_id = ?2",
+                    params![node, org],
+                    |r| r.get(0),
+                )?;
                 if held >= OP_MAX_PER_NODE {
                     return Err(UaError::conflict(
                         "claim operation store is at capacity for this node; retry later",
@@ -288,12 +311,20 @@ fn claim_once(
                 }
                 tx.execute(
                     "INSERT INTO node_claim_ops (node, op_id, identity, issued_at, state, created_at, updated_at, \
-                     fence_expires_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5, ?6)",
-                    params![node, op.id, agent, op.issued_at, ts, unix_now().max(op.issued_at) + OP_TOMBSTONE_S],
+                     fence_expires_at, org_id) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5, ?6, ?7)",
+                    params![
+                        node,
+                        op.id,
+                        agent,
+                        op.issued_at,
+                        ts,
+                        unix_now().max(op.issued_at) + OP_TOMBSTONE_S,
+                        org
+                    ],
                 )?;
             }
             Some(e) if e.state != "pending" => {
-                let (disposition, item) = settled(tx, &op.id, &e)?;
+                let (disposition, item) = settled(tx, org, &op.id, &e)?;
                 return Ok(ClaimOutcome {
                     item,
                     disposition: Some(disposition),
@@ -303,10 +334,10 @@ fn claim_once(
             }
             Some(e) => {
                 if unix_now() - e.issued_at > OP_MAX_AGE_S {
-                    close_op(tx, &node, &e, &op.id, "operation_expired")?;
-                    let e =
-                        load_op(tx, &node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
-                    let (disposition, item) = settled(tx, &op.id, &e)?;
+                    close_op(tx, org, &node, &e, &op.id, "operation_expired")?;
+                    let e = load_op(tx, org, &node, &op.id)?
+                        .ok_or_else(|| UaError::internal("claim op vanished"))?;
+                    let (disposition, item) = settled(tx, org, &op.id, &e)?;
                     return Ok(ClaimOutcome {
                         item,
                         disposition: Some(disposition),
@@ -321,8 +352,9 @@ fn claim_once(
     // The oldest runnable item.
     let candidates = items_where(
         tx,
-        "node = ?1 AND status = 'queued' AND cancel_requested = 0 ORDER BY created_at, rowid LIMIT 50",
-        [&node],
+        "org_id = ?1 AND node = ?2 AND status = 'queued' AND cancel_requested = 0 \
+         ORDER BY created_at, rowid LIMIT 50",
+        params![org, node],
     )?;
     // Acceptance items run only for the node's live acceptance run; real
     // work waits while acceptance is required and not yet passed.
@@ -334,8 +366,10 @@ fn claim_once(
         }
         // A held task keeps its item queued: skipped now, claimable once the
         // hold is released.
+        // The item's task is the item's organization's (the
+        // `node_dispatch_org_parent` trigger).
         if let Some(task_id) = item.task_id
-            && governance::claim_block(tx, None, Some(task_id), false)?.is_some()
+            && governance::claim_block(tx, org, None, Some(task_id), false)?.is_some()
         {
             continue;
         }
@@ -347,13 +381,13 @@ fn claim_once(
         let mut pending = op.is_some();
         if let Some(op) = op {
             if last {
-                if let Some(e) = load_op(tx, &node, &op.id)? {
-                    close_op(tx, &node, &e, &op.id, "no_item")?;
+                if let Some(e) = load_op(tx, org, &node, &op.id)? {
+                    close_op(tx, org, &node, &e, &op.id, "no_item")?;
                 }
                 pending = false;
             }
-            let e = load_op(tx, &node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
-            disposition = Some(settled(tx, &op.id, &e)?.0);
+            let e = load_op(tx, org, &node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
+            disposition = Some(settled(tx, org, &op.id, &e)?.0);
         }
         return Ok(ClaimOutcome { item: None, disposition, pending, refused: None });
     };
@@ -363,23 +397,23 @@ fn claim_once(
     let lease = after(item.timeout_s + LEASE_GRACE_S);
     let n = tx.execute(
         "UPDATE node_dispatch SET status = 'claimed', attempts = ?2, claimed_at = ?3, lease_expires_at = ?4, \
-         updated_at = ?3 WHERE id = ?1 AND status = 'queued' AND attempts = ?5",
-        params![item.id, attempt, ts, lease, item.attempts],
+         updated_at = ?3 WHERE id = ?1 AND org_id = ?6 AND status = 'queued' AND attempts = ?5",
+        params![item.id, attempt, ts, lease, item.attempts, org],
     )?;
     if n != 1 {
         return Err(UaError::conflict(format!("node item {} changed during the claim; retry", item.id)));
     }
     run_running(tx, &item, &lease)?;
     let command =
-        if item.backend == "command" { Some(command::mint_fence(tx, &item.id, attempt)?) } else { None };
+        if item.backend == "command" { Some(command::mint_fence(tx, org, &item.id, attempt)?) } else { None };
     let snapshot = payload(hub, &item, &lease, attempt, command);
     let mut ev = json!({ "node": node, "item_id": item.id, "attempt": attempt });
     let mut disposition = None;
     if let Some(op) = op {
         tx.execute(
             "UPDATE node_claim_ops SET state = 'bound', item_id = ?3, attempt = ?4, snapshot_json = ?5, \
-             fence_expires_at = ?6, updated_at = ?7 WHERE node = ?1 AND op_id = ?2",
-            params![node, op.id, item.id, attempt, snapshot.to_string(), unix_now() + OP_BOUND_S, ts],
+             fence_expires_at = ?6, updated_at = ?7 WHERE node = ?1 AND op_id = ?2 AND org_id = ?8",
+            params![node, op.id, item.id, attempt, snapshot.to_string(), unix_now() + OP_BOUND_S, ts, org],
         )?;
         ev["claim_op"] = json!(op.id);
         disposition = Some(json!({
@@ -387,15 +421,16 @@ fn claim_once(
             "attempt": attempt, "executable": true,
         }));
     }
-    record(tx, "claim", ev, agent)?;
+    record(tx, org, "claim", ev, agent)?;
     Ok(ClaimOutcome { item: Some(snapshot), disposition, pending: false, refused: None })
 }
 
-fn reconciled(tx: &mut WriteTx<'_>, node: &str, op: &ClaimOp) -> UaResult<ClaimOutcome> {
-    let e = load_op(tx, node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
-    let (disposition, item) = settled(tx, &op.id, &e)?;
+fn reconciled(tx: &mut WriteTx<'_>, org: &str, node: &str, op: &ClaimOp) -> UaResult<ClaimOutcome> {
+    let e = load_op(tx, org, node, &op.id)?.ok_or_else(|| UaError::internal("claim op vanished"))?;
+    let (disposition, item) = settled(tx, org, &op.id, &e)?;
     record(
         tx,
+        org,
         "claim_reconciled",
         json!({
             "node": node, "claim_op": op.id, "state": disposition["state"], "item_id": disposition["item_id"],
@@ -410,8 +445,12 @@ fn reconciled(tx: &mut WriteTx<'_>, node: &str, op: &ClaimOp) -> UaResult<ClaimO
 
 /// Called inside a node heartbeat's transaction: renew the running item's
 /// lease (and its run's), and return the claimed items the node must stop.
+///
+/// `org` is the node's organization (its token's): only that organization's
+/// items are renewed or relayed.
 pub(crate) fn on_heartbeat(
     tx: &mut WriteTx<'_>,
+    org: &str,
     node: &str,
     agent: &str,
     running: Option<&str>,
@@ -419,22 +458,27 @@ pub(crate) fn on_heartbeat(
 ) -> UaResult<Vec<String>> {
     // A malformed id names no item; the heartbeat itself still counts.
     if let Some(id) = running.and_then(|r| check_item_id(r).ok())
-        && let Some(item) = load_item(tx, &id)?.filter(|i| i.node == node && i.status == "claimed")
+        && let Some(item) = load_item(tx, org, &id)?.filter(|i| i.node == node && i.status == "claimed")
     {
         let lease = after(item.timeout_s + LEASE_GRACE_S);
         tx.execute(
-            "UPDATE node_dispatch SET lease_expires_at = ?2, updated_at = ?3 WHERE id = ?1 AND status = 'claimed'",
-            params![item.id, lease, now()],
+            "UPDATE node_dispatch SET lease_expires_at = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND org_id = ?4 AND status = 'claimed'",
+            params![item.id, lease, now(), org],
         )?;
         renew_run(tx, &item, &lease)?;
-        credentials::slide_idle(tx, &item.id, node)?;
+        credentials::slide_idle(tx, org, &item.id, node)?;
         if !item.cancel_requested
             && let Some(why) = run_gate(tx, &item)?
         {
-            tx.execute("UPDATE node_dispatch SET cancel_requested = 1 WHERE id = ?1", [&item.id])?;
-            credentials::revoke_for_item(tx, &item.id, "cancelled", "node-queue")?;
+            tx.execute(
+                "UPDATE node_dispatch SET cancel_requested = 1 WHERE id = ?1 AND org_id = ?2",
+                params![item.id, org],
+            )?;
+            credentials::revoke_for_item(tx, org, &item.id, "cancelled", "node-queue")?;
             record(
                 tx,
+                org,
                 "cancel_requested",
                 json!({ "node": node, "item_id": item.id, "actor": "node-queue", "reason": why }),
                 "node-queue",
@@ -443,21 +487,30 @@ pub(crate) fn on_heartbeat(
         if let Some(p) = progress.map(str::trim).filter(|p| !p.is_empty()) {
             record(
                 tx,
+                org,
                 "progress",
                 json!({ "node": node, "item_id": item.id, "note": clip(p, 2000) }),
                 agent,
             )?;
         }
     }
-    let cancel: Vec<Item> =
-        items_where(tx, "node = ?1 AND status = 'claimed' AND cancel_requested = 1", [node])?;
+    let cancel: Vec<Item> = items_where(
+        tx,
+        "org_id = ?1 AND node = ?2 AND status = 'claimed' AND cancel_requested = 1",
+        params![org, node],
+    )?;
     for item in &cancel {
         // Once per claim, however many heartbeats it takes the node to stop.
-        ledger::append(
+        emit(
             tx,
-            EventInput::new(CHANNEL, json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }))
-                .by(agent.to_string())
-                .dedupe(format!("cancel_relayed:{}:{}", item.id, item.attempts)),
+            org,
+            CHANNEL,
+            json!({ "kind": "cancel_relayed", "node": node, "item_id": item.id }),
+            agent,
+            Some(Dedupe {
+                named: format!("cancel_relayed:{}:{}", item.id, item.attempts),
+                hub: format!("cancel_relayed:{}:{}", item.id, item.attempts),
+            }),
         )?;
     }
     Ok(cancel.into_iter().map(|i| i.id).collect())
@@ -491,14 +544,15 @@ async fn node_claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         // Between the first and last attempt, take the write lock only when
         // there is something queued for this node.
         if !first && !last {
-            let node = a.node.trim().to_string();
+            let (node, org) = (a.node.trim().to_string(), ctx.caller.org_id.clone());
             let queued: bool = ctx
                 .hub
                 .db()
                 .read_async(move |c| {
                     Ok(c.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM node_dispatch WHERE node = ?1 AND status = 'queued')",
-                        [&node],
+                        "SELECT EXISTS(SELECT 1 FROM node_dispatch WHERE org_id = ?1 AND node = ?2 \
+                         AND status = 'queued')",
+                        params![org, node],
                         |r| r.get(0),
                     )?)
                 })
@@ -510,10 +564,11 @@ async fn node_claim(ctx: ToolCtx, a: ClaimArgs) -> UaResult<Value> {
         }
         first = false;
         let (hub, agent2, node, op2) = (ctx.hub.clone(), agent.clone(), a.node.clone(), op.clone());
+        let org = ctx.caller.org_id.clone();
         let out = ctx
             .hub
             .db()
-            .write_async(move |tx| claim_once(tx, &hub, &agent2, &node, op2.as_ref(), last))
+            .write_async(move |tx| claim_once(tx, &hub, &org, &agent2, &node, op2.as_ref(), last))
             .await?;
         if let Some(refused) = out.refused {
             return Err(refused.error());

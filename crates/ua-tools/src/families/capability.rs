@@ -35,6 +35,7 @@ use ua_core::{Config, Profile, UaError, UaResult};
 use super::agents;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
+use ua_org::authz::{Authority, Authz};
 
 const MAX_SKILLS: usize = 100;
 
@@ -59,21 +60,24 @@ pub fn required_tools(notes: &str) -> BTreeSet<String> {
     out
 }
 
-/// Whether `label` is an identity this hub knows: a registered agent, an
-/// issued token, a configured profile, or a human.
-fn known_label(c: &Connection, cfg: &Config, label: &str) -> UaResult<bool> {
-    if cfg.is_human(label) || cfg.profiles.contains_key(label) {
+/// Whether `label` is an identity organization `org` knows: a registered
+/// agent or an issued token there, or (in the default organization, whose
+/// configuration the hub's is) a configured profile or a human. Another
+/// organization's agent is not known here, exactly as an unknown label.
+fn known_label(c: &Connection, cfg: &Config, org: &str, label: &str) -> UaResult<bool> {
+    if org == ua_core::DEFAULT_ORG && (cfg.is_human(label) || cfg.profiles.contains_key(label)) {
         return Ok(true);
     }
-    let known: Option<i64> =
-        c.query_row("SELECT known FROM agents WHERE label = ?1", [label], |r| r.get(0)).optional()?;
+    let known: Option<i64> = c
+        .query_row("SELECT known FROM agents WHERE org_id = ?1 AND label = ?2", [org, label], |r| r.get(0))
+        .optional()?;
     if known == Some(1) {
         return Ok(true);
     }
     let token: Option<i64> = c
         .query_row(
-            "SELECT 1 FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' LIMIT 1",
-            [label],
+            "SELECT 1 FROM agent_tokens WHERE org_id = ?1 AND agent_label = ?2 AND status = 'active' LIMIT 1",
+            [org, label],
             |r| r.get(0),
         )
         .optional()?;
@@ -88,18 +92,25 @@ fn allowed_tools(reg: &Registry, profile: Profile) -> Option<BTreeSet<String>> {
     Some(reg.all().filter(|t| profile.allows_tool(t.name)).map(|t| t.name.to_string()).collect())
 }
 
-fn check(c: &Connection, hub: &Hub, reg: &Registry, task_id: i64, agent: &str) -> UaResult<Value> {
+/// `task_id` is read in the caller's organization `org`; another
+/// organization's task answers as a missing one.
+fn check(c: &Connection, hub: &Hub, reg: &Registry, org: &str, task_id: i64, agent: &str) -> UaResult<Value> {
     let agent = agent.trim();
-    if agent.is_empty() || !known_label(c, hub.cfg(), agent)? {
+    if agent.is_empty() || !known_label(c, hub.cfg(), org, agent)? {
         return Err(UaError::invalid(format!("agent_label {agent:?} is not a known agent")));
     }
-    let notes: Option<Option<String>> =
-        c.query_row("SELECT notes FROM tasks WHERE id = ?1", [task_id], |r| r.get(0)).optional()?;
+    let notes: Option<Option<String>> = c
+        .query_row(
+            "SELECT notes FROM tasks WHERE org_id = ?1 AND id = ?2",
+            rusqlite::params![org, task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let Some(notes) = notes else { return Err(UaError::not_found(format!("no task with id {task_id}"))) };
     let required = required_tools(notes.as_deref().unwrap_or(""));
     let registered: BTreeSet<String> = reg.all().map(|t| t.name.to_string()).collect();
     let unknown: Vec<&String> = required.iter().filter(|t| !registered.contains(*t)).collect();
-    let profile = crate::sessions::default_profile(hub, agent);
+    let profile = crate::sessions::default_profile(hub, org, agent);
     let allowed = allowed_tools(reg, profile);
     let missing: Vec<&String> = match &allowed {
         None => Vec::new(),
@@ -128,9 +139,12 @@ pub struct CheckArgs {
 
 async fn check_agent_capability(ctx: ToolCtx, a: CheckArgs) -> UaResult<Value> {
     let hub = ctx.hub.clone();
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
-        .read_async(move |c| check(c, &hub, crate::builtin_registry_shared(), a.task_id, &a.agent_label))
+        .read_async(move |c| {
+            check(c, &hub, crate::builtin_registry_shared(), &org, a.task_id, &a.agent_label)
+        })
         .await
 }
 
@@ -175,6 +189,19 @@ fn mcp_surface() -> Value {
         ("agy", "Google Antigravity", "Agentic IDE and terminal orchestration client"),
         ("cursor", "Cursor", "IDE pair programmer client"),
     ];
+    if !cfg!(feature = "mcp-server") {
+        // Built without the hub's MCP server: no /mcp route, no `ua mcp`.
+        return json!({
+            "server": {
+                "transports": [],
+                "endpoint": null,
+                "status": "not_built",
+                "note": "built without the mcp-server feature: this hub serves no MCP (no /mcp route, no `ua mcp`); \
+                    tools are reachable through the JSON API at /api/tools",
+            },
+            "clients": [],
+        });
+    }
     json!({
         "server": {
             "transports": ["stdio", "streamable_http"],
@@ -189,6 +216,12 @@ fn mcp_surface() -> Value {
             "capabilities": caps,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Tools a disabled Cargo feature leaves out of this build, and why:
+/// `[{tool, feature}]`, empty in a default build.
+fn compiled_out() -> Value {
+    crate::compiled_out_tools().map(|(tool, feature)| json!({ "tool": tool, "feature": feature })).collect()
 }
 
 /// Configuration-gated health, from configuration alone (no probes).
@@ -206,18 +239,21 @@ fn health(cfg: &Config) -> Value {
 
 /// What dispatching work to `agent` needs besides tools, as
 /// `{gate, action, detail}` entries; empty when nothing is missing.
-fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Value>> {
+/// `org` is the reader's organization: only its nodes count as an executor.
+fn missing_config(c: &Connection, cfg: &Config, org: &str, agent: &str) -> UaResult<Vec<Value>> {
     let mut missing = Vec::new();
     let token: Option<i64> = c
         .query_row(
-            "SELECT 1 FROM agent_tokens WHERE agent_label = ?1 AND status = 'active' \
+            "SELECT 1 FROM agent_tokens WHERE org_id = ?3 AND agent_label = ?1 AND status = 'active' \
              AND (expires_at IS NULL OR expires_at > ?2) LIMIT 1",
-            rusqlite::params![agent, ua_core::time::now()],
+            rusqlite::params![agent, ua_core::time::now(), org],
             |r| r.get(0),
         )
         .optional()?;
-    let static_token = cfg.static_tokens().iter().any(|(l, _)| l == agent);
-    if token.is_none() && !static_token && !cfg.profiles.contains_key(agent) {
+    // Static tokens and configured profiles are the default organization's.
+    let configured = org == ua_core::DEFAULT_ORG
+        && (cfg.static_tokens().iter().any(|(l, _)| l == agent) || cfg.profiles.contains_key(agent));
+    if token.is_none() && !configured {
         missing.push(json!({
             "gate": "agent_identity",
             "action": format!("issue {agent} a token (`ua token issue` or agent_token_issue) or give it a profile in [profiles]"),
@@ -227,12 +263,12 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
     if cfg.harnesses.is_empty() {
         let now = jiff::Timestamp::now();
         let mut stmt = c.prepare(
-            "SELECT last_heartbeat, heartbeat_floor FROM nodes WHERE agent = ?1 AND retired_at IS NULL",
+            "SELECT last_heartbeat, heartbeat_floor FROM nodes WHERE agent = ?1 AND org_id = ?2 AND retired_at IS NULL",
         )?;
         let mut live = false;
-        for row in
-            stmt.query_map([agent], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))?
-        {
+        for row in stmt.query_map([agent, org], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+        })? {
             let (last, floor) = row?;
             if super::nodes::liveness(last.as_deref(), floor.as_deref(), false, now).live {
                 live = true;
@@ -252,11 +288,9 @@ fn missing_config(c: &Connection, cfg: &Config, agent: &str) -> UaResult<Vec<Val
 
 /// Whether `caller` sees the catalog's hub map (boundaries, health, hosts).
 /// Whether `caller` may see hub boundaries (the program allowlist among them).
+/// An operator (a verified human); a profile grants nothing.
 pub(crate) fn is_operator(caller: &ua_core::Caller, cfg: &Config) -> bool {
-    if caller.is_human() || matches!(caller.profile, Profile::Coordinator | Profile::Operator) {
-        return true;
-    }
-    agents::verified(caller).is_some_and(|l| cfg.is_human(l) || cfg.is_lifecycle_operator(l))
+    Authz::new(cfg).holds(caller, &[Authority::Operator], ua_core::DEFAULT_ORG)
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -302,11 +336,12 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         g.sort_unstable();
         g
     };
+    let org = ctx.caller.org_id.clone();
     let (agents_list, prerequisites) = ctx
         .hub
         .db()
         .read_async(move |c| {
-            let agents: Vec<Value> = agents::list_agents(c)?
+            let agents: Vec<Value> = agents::list_agents(c, &org)?
                 .into_iter()
                 .map(|a| {
                     let mut row = json!({
@@ -321,8 +356,8 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
             let pre = match check_pair {
                 None => None,
                 Some((t, l)) => {
-                    let mut m = check(c, &hub, crate::builtin_registry_shared(), t, &l)?;
-                    let missing = missing_config(c, hub.cfg(), &l)?;
+                    let mut m = check(c, &hub, crate::builtin_registry_shared(), &org, t, &l)?;
+                    let missing = missing_config(c, hub.cfg(), &org, &l)?;
                     m["ready"] = json!(m["capable"] == json!(true) && missing.is_empty());
                     m["missing_config"] = json!(missing);
                     Some(m)
@@ -332,12 +367,14 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         })
         .await?;
     let cfg2 = cfg.clone();
+    // Skills are read from the hub workspace, the default organization's.
+    let hub_workspace = ctx.caller.org_id == ua_core::DEFAULT_ORG;
     let (workflows, skills_found) = blocking(move || {
         let wf: Vec<Value> = super::workflows::engine::list_definitions(&cfg2)
             .into_iter()
             .map(|w| json!({ "name": w["name"], "description": w["description"] }))
             .collect();
-        Ok((wf, skills(&cfg2.workspace_root())))
+        Ok((wf, if hub_workspace { skills(&cfg2.workspace_root()) } else { Vec::new() }))
     })
     .await?;
     let clis = cfg.shell_allowlist();
@@ -360,6 +397,8 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         "install_is_explicit": true,
         "approval_gated": true,
         "versions": { "ua_rust": env!("CARGO_PKG_VERSION") },
+        "build_features": crate::build_features(),
+        "compiled_out_tools": compiled_out(),
         "agents": agents_list,
         "mcp_tools": tools,
         "tool_families": families,
@@ -393,7 +432,9 @@ pub fn register(r: &mut Registry) {
             "capability_catalog",
             "Read-only inventory of this hub: agents, every tool by family, allowlisted programs, harnesses, \
              workflows, workspace skills, configuration health, boundaries (workspace, vault write dirs, \
-             approval-gated tools) and what the MCP server supports per client. Boundaries, health, agent \
+             approval-gated tools), what the MCP server supports per client, the optional Cargo features this \
+             build has (build_features: code_intel, readability, mcp_gateway, mcp_server, embeddings) and the \
+             tools a disabled feature leaves out (compiled_out_tools: [{tool, feature}]). Boundaries, health, agent \
              hosts and the allowlisted programs (clis) are shown to operators only; for everyone else they \
              are null or absent and named in `redacted`. With task_id and agent_label it also reports whether \
              that agent is ready for that task: prerequisites {capable, ready, missing_config: [{gate, action, \

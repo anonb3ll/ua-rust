@@ -1,0 +1,17 @@
+target/
+.git/
+.worktrees/
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.bak
+.claude/
+.codex/
+.cursor/

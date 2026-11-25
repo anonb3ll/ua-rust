@@ -18,14 +18,14 @@ pub use spec::{SpecCheck, TextOrList};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{UaError, UaResult};
-use ua_store::{SchemaPart, WriteTx};
+use ua_store::{Procedure, SchemaPart, WriteTx};
 
-use super::plans::{emit, parse_params, row_map, write_identity};
-use crate::approvals::{self, GateOutcome};
+use super::plans::{emit, ledger_label, ledger_text, parse_params, row_map, write_identity};
+use crate::approvals;
 use crate::registry::{Registry, ToolCtx, blocking, tool};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
@@ -53,6 +53,46 @@ CREATE TABLE IF NOT EXISTS delegations (
 CREATE INDEX IF NOT EXISTS idx_delegations_task ON delegations(task_id);
 CREATE INDEX IF NOT EXISTS idx_delegations_to_agent ON delegations(to_agent, status);
 CREATE INDEX IF NOT EXISTS idx_delegations_status ON delegations(status, created_at);
+",
+};
+
+/// `organization.v1.tools.delegation`: `org_id` on `delegations` (existing
+/// rows take the default organization; [`ORG_SCOPE`] then moves each to its
+/// task's) and the generated `delegations_org_exists` /
+/// `delegations_org_immutable` triggers. No key rebuild: a delegation id is a
+/// hub-global AUTOINCREMENT id and no other key exists. Applied after the
+/// tasks parts (`tasks.v2.org_scope`).
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.delegation", &["delegations"]);
+
+/// `delegation.v2.org_scope`: each existing delegation moves to its task's
+/// organization (the generated immutability trigger is dropped for that one
+/// update and recreated exactly as [`TENANT_PART`] made it; a delegation whose
+/// task is gone stays the default organization's), then indexes led by
+/// `org_id` for the assignee queue, the status list and the stats window, and
+/// triggers that keep a delegation's `task_id` inside its own organization
+/// (the foreign key alone would accept another organization's task). A
+/// missing task is still the foreign key's error.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "delegation.v2.org_scope",
+    sql: "
+DROP TRIGGER IF EXISTS delegations_org_immutable;
+UPDATE delegations SET org_id = (SELECT t.org_id FROM tasks t WHERE t.id = delegations.task_id)
+WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id AND t.org_id IS NOT delegations.org_id);
+CREATE TRIGGER delegations_org_immutable BEFORE UPDATE OF org_id ON delegations \
+WHEN OLD.org_id IS NOT NULL AND NEW.org_id IS NOT OLD.org_id \
+BEGIN SELECT RAISE(ABORT, 'org_id cannot change'); END;
+
+CREATE INDEX IF NOT EXISTS idx_delegations_org_to_agent ON delegations(org_id, to_agent, status);
+CREATE INDEX IF NOT EXISTS idx_delegations_org_status ON delegations(org_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_delegations_org_created ON delegations(org_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS delegations_org_parent BEFORE INSERT ON delegations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS delegations_org_parent_update BEFORE UPDATE OF task_id ON delegations
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'task belongs to another organization'); END;
 ",
 };
 
@@ -165,22 +205,76 @@ fn derive_title(task_spec: &str) -> String {
     if t.is_empty() { "untitled delegation".into() } else { t }
 }
 
-fn delegation_row(c: &Connection, id: i64) -> UaResult<Value> {
-    c.query_row("SELECT * FROM delegations WHERE id = ?1", [id], |r| row_map(r).map(Value::Object))
-        .optional()?
-        .ok_or_else(|| UaError::not_found(format!("no delegation with id {id}")))
+/// A delegation row as a reply: the row without its `org_id` (replies keep
+/// their shape, owner decision (d)).
+fn delegation_reply(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Map<String, Value>> {
+    let mut m = row_map(r)?;
+    m.remove("org_id");
+    Ok(m)
 }
 
-fn receipt_key(from_agent: &str, key: &str) -> String {
-    format!("delegate:{from_agent}:{key}")
+/// Delegation `id` of organization `org`; another organization's answers
+/// exactly as a missing one.
+fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    c.query_row("SELECT * FROM delegations WHERE org_id = ?1 AND id = ?2", params![org, id], |r| {
+        delegation_reply(r).map(Value::Object)
+    })
+    .optional()?
+    .ok_or_else(|| UaError::not_found(format!("no delegation with id {id}")))
 }
 
-/// A stored receipt: (request digest, committed result).
-fn read_receipt(c: &Connection, key: &str) -> UaResult<Option<(String, Value)>> {
+/// The stored idempotency key of a delegation: per delegating agent, with
+/// `%`, `:` and `/` in its label percent-escaped (as `task_update`'s keys are),
+/// so the label ends at the first `:` after the tool name and two agents
+/// never share a stored key. Receipts are keyed by `(org_id, key)` and read
+/// only in the caller's organization; another organization's key text also
+/// keeps its organization prefix (`crate::families::tasks::idem_key`), and
+/// the default keeps the `delegate:<label>:<key>` form. Only a label holding `:` is stored
+/// differently from before; [`legacy_receipt_key`] names its old form.
+fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
+    crate::families::tasks::idem_key(org, "delegate", &format!("{}:{key}", escape_label(from_agent)))
+}
+
+fn escape_label(label: &str) -> String {
+    label.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
+}
+
+/// The key a receipt was stored under before labels were escaped, when that
+/// differs from [`receipt_key`] (a label holding `:`). That form is ambiguous
+/// (`a:b` with key `k` and `a` with key `b:k` share it), so a receipt found
+/// there counts only once it is shown to be this agent's: by the request
+/// digest, which covers `from_agent`, or by its delegation's `from_agent`.
+fn legacy_receipt_key(org: &str, from_agent: &str, key: &str) -> Option<String> {
+    (escape_label(from_agent) != from_agent)
+        .then(|| crate::families::tasks::idem_key(org, "delegate", &format!("{from_agent}:{key}")))
+}
+
+/// A delegation event about a delegation of organization `org`, through the
+/// shared [`emit`]. ORG-EVENT-DEFAULT: callers pass another organization's
+/// free text and labels (title, project, lane, agents, reasons, results,
+/// deadline, callback) through [`ledger_text`] / [`ledger_label`], so only
+/// ids, statuses and generations reach the default ledger, and the
+/// originator is the neutral `system`, never the acting agent.
+fn org_emit(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    caller: &ua_core::Caller,
+    channel: &str,
+    payload: Value,
+) -> UaResult<()> {
+    if org == ua_core::DEFAULT_ORG {
+        return emit(tx, caller, channel, payload);
+    }
+    let neutral = ua_core::Caller { label: "system".into(), ..ua_core::Caller::system() };
+    emit(tx, &neutral, channel, payload)
+}
+
+/// A stored receipt of organization `org`: (request digest, committed result).
+fn read_receipt(c: &Connection, org: &str, key: &str) -> UaResult<Option<(String, Value)>> {
     let raw: Option<String> = c
         .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = 'delegate'",
-            [key],
+            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = 'delegate'",
+            [org, key],
             |r| r.get(0),
         )
         .optional()?;
@@ -192,14 +286,39 @@ fn read_receipt(c: &Connection, key: &str) -> UaResult<Option<(String, Value)>> 
     }))
 }
 
-fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Value>> {
+fn replay(existing: Option<(String, Value)>, digests: &[String]) -> UaResult<Option<Value>> {
     match existing {
-        Some((d, result)) if d == digest => Ok(Some(result)),
+        Some((d, result)) if digests.contains(&d) => Ok(Some(result)),
         Some(_) => {
             Err(UaError::conflict("idempotency_key was already used for a different delegation request"))
         }
         None => Ok(None),
     }
+}
+
+/// The committed result of this request, if any: its receipt under the
+/// current key (a different request there is a conflict), else under the old
+/// unescaped key when its digest is this request's. `digests` are this
+/// request's digests: over the registered spelling of `to_agent` (what a
+/// receipt stores) and over the spelling sent. The digest covers
+/// `from_agent`, so the old key never replays another agent's receipt; any
+/// other receipt there reads as none, and the request runs fresh.
+fn find_receipt(
+    c: &Connection,
+    org: &str,
+    keys: &(String, Option<String>),
+    digests: &[String],
+) -> UaResult<Option<Value>> {
+    if let Some(done) = replay(read_receipt(c, org, &keys.0)?, digests)? {
+        return Ok(Some(done));
+    }
+    if let Some(old) = &keys.1
+        && let Some((d, result)) = read_receipt(c, org, old)?
+        && digests.contains(&d)
+    {
+        return Ok(Some(result));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +445,7 @@ pub struct LookupArgs {
     pub from_agent: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffArgs {
     /// The work, written to the Delegation Spec Standard.
@@ -385,9 +504,38 @@ pub struct ManageArgs {
 // ---------------------------------------------------------------------------
 // Create.
 
-/// `entry_tool` is the registered tool the call came through; the registry
-/// has already gated it if it is listed in `approval_tools`.
-fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
+/// The registered spelling of the delegation target `label` in `org`: an
+/// agent whose label matches exactly, else the one agent whose label matches
+/// without regard to case (the label namespace is case-insensitive).
+/// `Ok(None)` when no agent of `org` matches. Two or more case variants and
+/// no exact match are refused (`agent_label_ambiguous`), as `agent_forget`
+/// refuses them, rather than silently picking one.
+fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<String>> {
+    let spellings: Vec<String> = c
+        .prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
+        .query_map(params![org, label], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if spellings.iter().any(|s| s == label) {
+        return Ok(Some(label.to_string()));
+    }
+    match spellings.len() {
+        0 => Ok(None),
+        1 => Ok(spellings.into_iter().next()),
+        n => Err(UaError::conflict_code(
+            "agent_label_ambiguous",
+            format!(
+                "{n} agents in this organization spell {label:?} in different letter cases; name one exactly. \
+                 Nothing was created"
+            ),
+        )),
+    }
+}
+
+/// Every door to this (`delegate`, `delegation_manage` create, `handoff`)
+/// passes `delegate`'s profile entry, policy rules and approval gate in the
+/// registry first, on the arguments of a `delegate` call (see
+/// `crate::routes`), so nothing here gates again.
+fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let task_spec = a.task_spec.trim().to_string();
     if task_spec.is_empty() {
         return Err(UaError::invalid("task_spec must not be empty"));
@@ -420,65 +568,82 @@ fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
         )));
     }
 
-    let request = json!({
-        "task_spec": task_spec,
-        "from_agent": from_agent,
-        "to_agent": to_agent,
-        "deadline": deadline,
-        "callback": callback,
-        "priority": priority,
-        "parent_task_id": a.parent_task_id,
-        "project": project,
-    });
-    let digest = hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()));
-    let rkey = idem.as_deref().map(|k| receipt_key(&from_agent, k));
+    // The receipt digest is over the target's registered spelling, so a
+    // retry that spells `to_agent` in other letter cases is the same request
+    // and replays. The spelling sent is hashed too, as a fallback for a
+    // retry whose target no longer resolves (forgotten since): that retry
+    // replays only when it sends the registered spelling.
+    let digest_for = |to: &str| {
+        let request = json!({
+            "task_spec": task_spec,
+            "from_agent": from_agent,
+            "to_agent": to,
+            "deadline": deadline,
+            "callback": callback,
+            "priority": priority,
+            "parent_task_id": a.parent_task_id,
+            "project": project,
+        });
+        hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()))
+    };
+    let digests_for = |c: &Connection, org: &str| -> Vec<String> {
+        let mut out = vec![digest_for(&to_agent)];
+        if let Ok(Some(reg)) = registered_target(c, org, &to_agent)
+            && reg != to_agent
+        {
+            out.insert(0, digest_for(&reg));
+        }
+        out
+    };
+    let org = ctx.caller.org_id.clone();
+    let rkeys = idem
+        .as_deref()
+        .map(|k| (receipt_key(&org, &from_agent, k), legacy_receipt_key(&org, &from_agent, k)));
+    let rkey = rkeys.as_ref().map(|k| k.0.clone());
 
     // A committed retry replays before any gate: no second approval, no effect.
-    if let Some(k) = rkey.clone() {
-        let existing = ctx.hub.db().read(|c| read_receipt(c, &k))?;
-        if let Some(done) = replay(existing, &digest)? {
+    if let Some(k) = rkeys.clone() {
+        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digests_for(c, &org)))?;
+        if let Some(done) = found {
             return Ok(done);
-        }
-    }
-
-    // `delegate` listed in approval_tools gates every path that creates a
-    // delegation, not only the `delegate` tool itself.
-    let cfg = ctx.hub.cfg();
-    let listed = |t: &str| cfg.approval_tools.iter().any(|x| x == t);
-    if listed("delegate") && !listed(entry_tool) {
-        let mut payload = request.clone();
-        if let Some(o) = payload.as_object_mut() {
-            o.remove("project");
-        }
-        let outcome = ctx.hub.db().write(|tx| approvals::gate(tx, cfg, &ctx.caller, "delegate", &payload))?;
-        match outcome {
-            GateOutcome::Pass { .. } => {}
-            GateOutcome::Pending { approval_id } => {
-                return Err(UaError::ApprovalRequired { tool: "delegate".into(), approval_id });
-            }
-            GateOutcome::Denied { approval_id, reason } => {
-                return Err(UaError::denied(
-                    "approval_denied",
-                    format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
-                ));
-            }
         }
     }
 
     let caller = ctx.caller.clone();
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
-        if let Some(k) = rkey.as_deref()
-            && let Some(done) = replay(read_receipt(tx, k)?, &digest)?
+        if let Some(k) = rkeys.as_ref()
+            && let Some(done) = find_receipt(tx, &org, k, &digests_for(tx, &org))?
         {
             return Ok(done);
+        }
+        crate::families::tasks::require_org(tx, &org)?;
+        // A delegation targets only a registered agent of the delegator's
+        // own organization (owner decision): see `registered_target` (an
+        // exact spelling, else the one case-insensitive match; several case
+        // variants are ambiguous). The registered spelling is what is
+        // stored as `to_agent` and hashed into the receipt, since that is
+        // the spelling the agent's claims and lists match. A label no agent
+        // has registered and a label another organization's agent holds get
+        // the same answer, built from the requested label alone, so neither
+        // reveals whether the label exists elsewhere.
+        let Some(to_agent) = registered_target(tx, &org, &to_agent)? else {
+            return Err(UaError::not_found(format!(
+                "no agent {to_agent:?} in this organization; a delegation targets a registered agent of the \
+                 delegator's organization. Nothing was created"
+            )));
+        };
+        if to_agent.eq_ignore_ascii_case(&from_agent) {
+            return Err(UaError::invalid("from_agent and to_agent must differ: you cannot delegate to yourself"));
         }
         let ts = ua_core::time::now();
         let (parent_untrusted, parent_project) = match a.parent_task_id {
             Some(pid) => tx
-                .query_row("SELECT untrusted, project FROM tasks WHERE id = ?1", [pid], |r| {
-                    Ok((r.get::<_, i64>(0)? != 0, Some(r.get::<_, String>(1)?)))
-                })
+                .query_row(
+                    "SELECT untrusted, project FROM tasks WHERE org_id = ?1 AND id = ?2",
+                    params![org, pid],
+                    |r| Ok((r.get::<_, i64>(0)? != 0, Some(r.get::<_, String>(1)?))),
+                )
                 .optional()?
                 .ok_or_else(|| UaError::not_found(format!("no task with id {pid}")))?,
             None => (false, None),
@@ -492,33 +657,52 @@ fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
         notes.push_str(&format!("\n\ntask-spec:\n{task_spec}"));
         tx.execute(
             "INSERT INTO tasks (title, notes, status, priority, parent_id, created_at, updated_at, untrusted, \
-             project, lane) VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
-            params![title, notes, priority, a.parent_task_id, ts, i64::from(parent_untrusted), project, to_agent],
+             project, lane, org_id) VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                title,
+                notes,
+                priority,
+                a.parent_task_id,
+                ts,
+                i64::from(parent_untrusted),
+                project,
+                to_agent,
+                org
+            ],
         )?;
         let task_id = tx.last_insert_rowid();
+        // The delegation and its task are both the caller's organization's.
         tx.execute(
-            "INSERT INTO delegations (from_agent, to_agent, task_id, task_spec, deadline, callback, status, \
-             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
-            params![from_agent, to_agent, task_id, task_spec, deadline, callback, ts],
+            "INSERT INTO delegations (org_id, from_agent, to_agent, task_id, task_spec, deadline, callback, \
+             status, created_at, updated_at) VALUES (?8, ?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+            params![from_agent, to_agent, task_id, task_spec, deadline, callback, ts, org],
         )?;
         let delegation_id = tx.last_insert_rowid();
-        emit(
+        org_emit(
             tx,
+            &org,
             &caller,
             "agent.task.created",
-            json!({ "task_id": task_id, "title": title, "project": project, "lane": to_agent, "via": "delegate" }),
+            json!({
+                "task_id": task_id,
+                "title": ledger_text(&org, &title),
+                "project": ledger_text(&org, &project),
+                "lane": ledger_text(&org, &to_agent),
+                "via": "delegate",
+            }),
         )?;
-        emit(
+        org_emit(
             tx,
+            &org,
             &caller,
             "agent.delegation.created",
             json!({
                 "delegation_id": delegation_id,
                 "task_id": task_id,
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-                "deadline": deadline,
-                "callback": callback,
+                "from_agent": ledger_text(&org, &from_agent),
+                "to_agent": ledger_text(&org, &to_agent),
+                "deadline": ledger_label(&org, deadline.as_deref()),
+                "callback": ledger_text(&org, &callback),
             }),
         )?;
         let mut result = json!({ "delegation_id": delegation_id, "task_id": task_id, "memory_id": null });
@@ -526,9 +710,11 @@ fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
             result["spec_warnings"] = json!(warnings);
         }
         if let Some(k) = rkey.as_deref() {
+            let digest = digest_for(&to_agent);
             tx.execute(
-                "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, 'delegate', ?2, ?3)",
-                params![k, json!({ "digest": digest, "result": result }).to_string(), ts],
+                "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
+                 VALUES (?1, ?2, 'delegate', ?3, ?4)",
+                params![org, k, json!({ "digest": digest, "result": result }).to_string(), ts],
             )?;
         }
         Ok(result)
@@ -538,8 +724,28 @@ fn create(ctx: &ToolCtx, a: DelegateArgs, entry_tool: &str) -> UaResult<Value> {
 fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let actor = validate_label(&write_identity(&ctx.caller, a.from_agent.as_deref())?, "from_agent")?;
     let key = validate_idempotency_key(&a.idempotency_key)?;
-    let rkey = receipt_key(&actor, &key);
-    let found = ctx.hub.db().read(|c| read_receipt(c, &rkey))?;
+    let org = ctx.caller.org_id.clone();
+    let rkey = receipt_key(&org, &actor, &key);
+    let old = legacy_receipt_key(&org, &actor, &key);
+    let found = ctx.hub.db().read(|c| {
+        if let Some(hit) = read_receipt(c, &org, &rkey)? {
+            return Ok(Some(hit));
+        }
+        // A receipt under the old unescaped key counts only when its
+        // delegation is this agent's: that key is shared with another label.
+        let Some(old) = old else { return Ok(None) };
+        let Some((d, result)) = read_receipt(c, &org, &old)? else { return Ok(None) };
+        let Some(id) = result["delegation_id"].as_i64() else { return Ok(None) };
+        let mine = c
+            .query_row(
+                "SELECT 1 FROM delegations WHERE org_id = ?1 AND id = ?2 AND from_agent = ?3",
+                params![org, id, actor],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(mine.then_some((d, result)))
+    })?;
     Ok(match found {
         Some((_, result)) => json!({ "idempotency_key": key, "state": "committed", "result": result }),
         None => json!({ "idempotency_key": key, "state": "not_found" }),
@@ -561,13 +767,16 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
     }
     let limit = a.limit.unwrap_or(50).clamp(1, 200);
     let now = jiff::Timestamp::now();
+    let org = ctx.caller.org_id.clone();
     ctx.hub.db().read(|c| {
+        // Only the caller's organization's delegations.
         let mut stmt = c.prepare(
-            "SELECT * FROM delegations WHERE (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR to_agent = ?2) \
+            "SELECT * FROM delegations WHERE org_id = ?5 \
+             AND (?1 = 'all' OR status = ?1) AND (?2 IS NULL OR to_agent = ?2) \
              AND (?3 IS NULL OR task_id = ?3) ORDER BY created_at DESC, id DESC LIMIT ?4",
         )?;
         let rows: Vec<_> = stmt
-            .query_map(params![status, a.to_agent, a.task_id, limit + 1], row_map)?
+            .query_map(params![status, a.to_agent, a.task_id, limit + 1, org], delegation_reply)?
             .collect::<Result<_, _>>()?;
         let truncated = rows.len() as i64 > limit;
         let out: Vec<Value> = rows
@@ -588,7 +797,7 @@ fn list(ctx: &ToolCtx, a: ListArgs) -> UaResult<Value> {
 }
 
 fn get(ctx: &ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ctx.hub.db().read(|c| Ok(json!({ "delegation": delegation_row(c, a.id)? })))
+    ctx.hub.db().read(|c| Ok(json!({ "delegation": delegation_row(c, &ctx.caller.org_id, a.id)? })))
 }
 
 // ---------------------------------------------------------------------------
@@ -615,8 +824,10 @@ fn run_guard(
     if run.trim().is_empty() || run.len() > 256 {
         return Err(UaError::invalid("expected_run_id must be a nonempty bounded string"));
     }
-    let mut sql =
-        String::from(" AND to_agent = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id");
+    let mut sql = String::from(
+        " AND to_agent = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
+             AND t.org_id = delegations.org_id",
+    );
     let mut p = vec![SqlValue::Text(agent.into())];
     if let Some(t) = task_id {
         sql.push_str(" AND t.id = ?");
@@ -648,10 +859,17 @@ fn transition(
     detail: Value,
 ) -> UaResult<bool> {
     let caller = ctx.caller.clone();
+    let org = caller.org_id.clone();
+    // Only a delegation of the caller's organization moves; another
+    // organization's changes nothing and answers as a missing one would.
+    let sql = format!("{sql} AND org_id = ?");
+    let mut params = params;
+    params.push(SqlValue::Text(org.clone()));
     ctx.hub.db().write(move |tx: &mut WriteTx<'_>| {
+        crate::families::tasks::require_org(tx, &org)?;
         let n = tx.execute(&sql, params_from_iter(params))?;
         if n > 0 {
-            let row = delegation_row(tx, id)?;
+            let row = delegation_row(tx, &org, id)?;
             let mut payload = json!({
                 "delegation_id": id,
                 "task_id": row["task_id"],
@@ -661,7 +879,7 @@ fn transition(
             if let (Some(p), Value::Object(d)) = (payload.as_object_mut(), detail) {
                 p.extend(d);
             }
-            emit(tx, &caller, channel, payload)?;
+            org_emit(tx, &org, &caller, channel, payload)?;
         }
         Ok(n > 0)
     })
@@ -670,26 +888,29 @@ fn transition(
 fn claim(ctx: &ToolCtx, a: ClaimArgs) -> UaResult<Value> {
     let agent = caller_label(ctx, a.agent.as_deref())?;
     let caller = ctx.caller.clone();
+    let org = caller.org_id.clone();
     ctx.hub.db().write(|tx| {
+        crate::families::tasks::require_org(tx, &org)?;
         let ts = ua_core::time::now();
         let n = tx.execute(
             "UPDATE delegations SET status = 'in_flight', attempts = attempts + 1, \
              claim_generation = claim_generation + 1, last_attempt_at = ?3, updated_at = ?3 \
-             WHERE id = ?1 AND status = 'pending' AND to_agent = ?2",
-            params![a.id, agent, ts],
+             WHERE id = ?1 AND status = 'pending' AND to_agent = ?2 AND org_id = ?4",
+            params![a.id, agent, ts, org],
         )?;
         // Read inside the same transaction so a later release and reclaim
         // cannot swap a successor's generation into this response.
-        let row = delegation_row(tx, a.id)?;
+        let row = delegation_row(tx, &org, a.id)?;
         if n > 0 {
-            emit(
+            org_emit(
                 tx,
+                &org,
                 &caller,
                 "agent.delegation.claimed",
                 json!({
                     "delegation_id": a.id,
                     "task_id": row["task_id"],
-                    "agent": agent,
+                    "agent": ledger_text(&org, &agent),
                     "claim_generation": row["claim_generation"],
                 }),
             )?;
@@ -721,7 +942,14 @@ fn release(ctx: &ToolCtx, a: FencedArgs) -> UaResult<Value> {
         SqlValue::Integer(generation),
     ];
     p.extend(gp);
-    let changed = transition(ctx, a.id, sql, p, "agent.delegation.released", json!({ "agent": agent }))?;
+    let changed = transition(
+        ctx,
+        a.id,
+        sql,
+        p,
+        "agent.delegation.released",
+        json!({ "agent": ledger_text(&ctx.caller.org_id, &agent) }),
+    )?;
     Ok(transition_result("released", changed, a.expected_run_id.as_deref()))
 }
 
@@ -760,13 +988,14 @@ fn cancel(ctx: &ToolCtx, a: CancelArgs) -> UaResult<Value> {
         // cancelled or superseded, never after a newer attempt took over.
         sql.push_str(
             " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
-             AND (t.current_run_id IS NOT ? OR t.cancel_requested = 1))",
+             AND t.org_id = delegations.org_id AND (t.current_run_id IS NOT ? OR t.cancel_requested = 1))",
         );
         p.push(SqlValue::Text(run.into()));
     }
     if a.require_no_run {
         sql.push_str(
-            " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id AND t.current_run_id IS NULL)",
+            " AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = delegations.task_id \
+             AND t.org_id = delegations.org_id AND t.current_run_id IS NULL)",
         );
     }
     let changed = transition(
@@ -775,7 +1004,10 @@ fn cancel(ctx: &ToolCtx, a: CancelArgs) -> UaResult<Value> {
         sql,
         p,
         "agent.delegation.cancelled",
-        json!({ "agent": agent, "reason": reason }),
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "reason": ledger_text(&ctx.caller.org_id, &reason),
+        }),
     )?;
     Ok(json!({ "cancelled": changed }))
 }
@@ -813,7 +1045,17 @@ fn finish(
         g,
     ];
     p.extend(gp);
-    let changed = transition(ctx, a.id, sql, p, channel, json!({ "agent": agent, "result": text }))?;
+    let changed = transition(
+        ctx,
+        a.id,
+        sql,
+        p,
+        channel,
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "result": ledger_text(&ctx.caller.org_id, &text),
+        }),
+    )?;
     Ok(transition_result(key, changed, a.expected_run_id.as_deref()))
 }
 
@@ -871,7 +1113,10 @@ fn retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
         sql,
         p,
         "agent.delegation.retried",
-        json!({ "agent": agent, "reason": reason }),
+        json!({
+            "agent": ledger_text(&ctx.caller.org_id, &agent),
+            "reason": ledger_text(&ctx.caller.org_id, &reason),
+        }),
     )?;
     Ok(transition_result("retried", changed, a.expected_run_id.as_deref()))
 }
@@ -879,19 +1124,34 @@ fn retry(ctx: &ToolCtx, a: RetryArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // Handoff (lifecycle metadata only) and spec tools.
 
-fn handoff(ctx: &ToolCtx, a: HandoffArgs, entry_tool: &str) -> UaResult<Value> {
-    let d = DelegateArgs {
-        task_spec: a.task_spec,
-        from_agent: a.agent,
-        to_agent: a.to_agent,
-        deadline: a.deadline,
-        callback: Some("none".into()),
-        priority: a.priority,
-        parent_task_id: a.parent_task_id,
-        project: None,
-        idempotency_key: None,
-    };
-    let r = create(ctx, d, entry_tool)?;
+/// A `handoff` call's arguments as the `delegate` call it makes: the same
+/// fields, `agent` as `from_agent`, `callback: "none"`; absent fields are
+/// left out, so a direct `delegate` call with these arguments binds the same
+/// approval. The registry gates `handoff` under `delegate` on this mapping
+/// (`crate::routes::DOORS`), and [`handoff`] builds its delegation from it.
+pub(crate) fn handoff_as_delegate(args: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for (from, to) in [
+        ("task_spec", "task_spec"),
+        ("agent", "from_agent"),
+        ("to_agent", "to_agent"),
+        ("deadline", "deadline"),
+        ("priority", "priority"),
+        ("parent_task_id", "parent_task_id"),
+    ] {
+        if let Some(v) = args.get(from).filter(|v| !v.is_null()) {
+            out.insert(to.to_string(), v.clone());
+        }
+    }
+    out.insert("callback".into(), json!("none"));
+    Value::Object(out)
+}
+
+fn handoff(ctx: &ToolCtx, a: HandoffArgs) -> UaResult<Value> {
+    let raw = serde_json::to_value(&a).map_err(|e| UaError::internal(e.to_string()))?;
+    let d: DelegateArgs =
+        serde_json::from_value(handoff_as_delegate(&raw)).map_err(|e| UaError::invalid(e.to_string()))?;
+    let r = create(ctx, d)?;
     Ok(json!({ "handoff_id": r["delegation_id"], "task_id": r["task_id"], "status": "pending" }))
 }
 
@@ -952,7 +1212,7 @@ fn spec_build(a: SpecBuildArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // The consolidated entry point and registration.
 
-const ACTIONS: [&str; 13] = [
+pub(crate) const ACTIONS: [&str; 13] = [
     "create",
     "list",
     "claim",
@@ -990,7 +1250,8 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
     let p = params;
     let f = "delegation";
     match act {
-        "create" => create(ctx, parse_params(f, act, p)?, "delegation_manage"),
+        // The registry gated this action as `delegate` (see `crate::routes`).
+        "create" => create(ctx, parse_params(f, act, p)?),
         "list" => list(ctx, parse_params(f, act, p)?),
         "claim" => claim(ctx, parse_params(f, act, p)?),
         "release" => release(ctx, parse_params(f, act, p)?),
@@ -1006,7 +1267,7 @@ fn dispatch(ctx: &ToolCtx, action: &str, params: Option<Value>) -> UaResult<Valu
             Ok(spec_template())
         }
         "spec_build" => spec_build(parse_params(f, act, p)?),
-        other => Err(UaError::invalid(format!("unknown delegation action {other:?}"))),
+        other => Err(crate::routes::unhandled("delegation_manage", other)),
     }
 }
 
@@ -1018,16 +1279,16 @@ pub fn register(r: &mut Registry) {
              lookup, spec_check, spec_template, spec_build. `params` holds the action's arguments.",
             |ctx: ToolCtx, a: ManageArgs| blocking(move || dispatch(&ctx, &a.action, a.params)),
         )
-        .handler_may_gate(crate::HandlerGate::Actions(&["create"]))
         .family("delegation"),
     );
     r.add(
         tool(
             "delegate",
             "Delegate work to another agent: creates a child task addressed to to_agent and a pending \
-             delegations row. The spec must meet the Delegation Spec Standard. Grants the receiver no extra \
+             delegations row. to_agent must be a registered agent of your organization (not_found \
+             otherwise). The spec must meet the Delegation Spec Standard. Grants the receiver no extra \
              tools. Returns {delegation_id, task_id, memory_id}.",
-            |ctx: ToolCtx, a: DelegateArgs| blocking(move || create(&ctx, a, "delegate")),
+            |ctx: ToolCtx, a: DelegateArgs| blocking(move || create(&ctx, a)),
         )
         .family("delegation"),
     );
@@ -1073,9 +1334,8 @@ pub fn register(r: &mut Registry) {
             "handoff",
             "Hand work to another agent as the verified sender: a delegation with callback none. Returns only \
              lifecycle ids: {handoff_id, task_id, status}.",
-            |ctx: ToolCtx, a: HandoffArgs| blocking(move || handoff(&ctx, a, "handoff")),
+            |ctx: ToolCtx, a: HandoffArgs| blocking(move || handoff(&ctx, a)),
         )
-        .handler_may_gate(crate::HandlerGate::Always)
         .family("delegation"),
     );
     r.add(

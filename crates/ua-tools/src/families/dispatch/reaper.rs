@@ -33,6 +33,8 @@ use crate::hub::Hub;
 const ACTOR: &str = "lease-reaper";
 
 /// Run one reaper sweep. Blocking: call it off the async runtime.
+/// A hub job with no caller: it spans every organization, and each run is
+/// cancelled, renewed or settled in its own organization (`run.org_id`).
 pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
     let db = hub.db();
 
@@ -43,7 +45,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
         // A node-routed run is stopped through its node work item.
         let termination = match run.evidence_ref.as_deref().filter(|e| e.starts_with("node:")) {
             Some(ev) => db
-                .write(|tx| crate::families::node_queue::cancel_for_run(tx, ev, ACTOR))?
+                .write(|tx| crate::families::node_queue::cancel_for_run(tx, &run.org_id, ev, ACTOR))?
                 .unwrap_or("unknown"),
             None => executor::terminate(&run),
         };
@@ -51,6 +53,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
         let res = db.write(|tx| {
             finalize_cancellation(
                 tx,
+                &run.org_id,
                 &run.run_id,
                 ACTOR,
                 "reaper",
@@ -84,8 +87,8 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
             db.write(|tx| {
                 tx.execute(
                     "UPDATE dispatch_runs SET lease_expires_at = ?3, updated_at = ?4 \
-                     WHERE run_id = ?1 AND fence = ?2 AND termination_outcome IS NULL",
-                    rusqlite::params![rid, fence, after_seconds(lease), now()],
+                     WHERE run_id = ?1 AND org_id = ?5 AND fence = ?2 AND termination_outcome IS NULL",
+                    rusqlite::params![rid, fence, after_seconds(lease), now(), run.org_id],
                 )?;
                 Ok(())
             })?;
@@ -103,6 +106,7 @@ pub fn reap_expired_leases(hub: &Hub) -> UaResult<Value> {
             super::record_outcome(
                 tx,
                 Outcome {
+                    org: &run.org_id,
                     run_id: &run.run_id,
                     fence: Some(run.fence),
                     state,

@@ -15,6 +15,14 @@
 //! additionally stays retired unless `zulip_retired` is `0`, `false`, `no` or
 //! `off`. There is no poll timer: a caller drives every send and fetch.
 //!
+//! `zulip_sends` is tenant data (`org_id`, `organization.v1.tools.zulip`):
+//! the duplicate check, the outcome record and `zulip_resolve_send` see only
+//! the caller's organization's sends, and another organization's send answers
+//! exactly as a missing one. The Zulip site, account and channels in the hub
+//! configuration are the default organization's, so a caller of any other
+//! organization is refused before anything is recorded: its text is never
+//! posted to the default organization's Zulip.
+//!
 //! Fetched messages are labelled untrusted. The fetch position is one row
 //! in `zulip_fetch_cursors` per agent, channel and topic, and only moves
 //! forward.
@@ -31,14 +39,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::{ActorKind, Caller, Config, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::approvals::{self, GateOutcome};
 use crate::families::audit::rules::redact_secrets;
 use crate::families::injection;
 use crate::families::plans::write_identity;
 use crate::families::relay::gates::{self, Gates};
-use crate::families::web::{error_chain, http_client, vet_url};
+use crate::families::web::{hooked, outbound_error};
 use crate::registry::{Registry, ToolCtx, tool};
 
 /// The tool name send approvals are recorded under.
@@ -76,6 +85,15 @@ CREATE INDEX IF NOT EXISTS idx_zulip_sends_content ON zulip_sends(stream, topic,
 ",
 };
 
+/// `organization.v1.tools.zulip`: `zulip_sends.org_id` (existing rows
+/// backfilled to the default organization) and its generated
+/// `zulip_sends_org_exists` / `zulip_sends_org_immutable` triggers. The table
+/// has no key beyond its AUTOINCREMENT id, so no rebuild is needed; the
+/// duplicate check filters on `org_id`. `zulip_fetch_cursors` is a hub table.
+/// Applied after `zulip.v1` and `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.zulip", &["zulip_sends"]);
+
 const MAX_CONTENT_CHARS: usize = 4000;
 /// Zulip's own topic limit.
 const MAX_TOPIC_CHARS: usize = 60;
@@ -110,6 +128,28 @@ fn clip(s: &str) -> String {
 fn require_identity(caller: &Caller) -> UaResult<()> {
     if caller.kind == ActorKind::Anonymous {
         return Err(UaError::denied("identity_required", "Zulip tools require an authenticated identity"));
+    }
+    Ok(())
+}
+
+/// Refuse a caller whose organization `orgs` does not hold, before anything
+/// is written (organizations are never deleted, so the check cannot go stale).
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; nothing was recorded")));
+    }
+    Ok(())
+}
+
+/// The Zulip configuration is the default organization's destination: a
+/// caller of another organization never posts through it.
+fn require_destination(org: &str) -> UaResult<()> {
+    if org != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "zulip_not_configured",
+            "Zulip is configured for the hub's default organization only; nothing was sent or recorded",
+        ));
     }
     Ok(())
 }
@@ -362,27 +402,42 @@ fn categories(findings: &[Value]) -> Value {
 
 // --- HTTP -----------------------------------------------------------------------------------
 
-/// Read at most `max` bytes; `None` when the body is longer.
-async fn read_capped(mut resp: reqwest::Response, max: usize) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                body.extend_from_slice(&chunk);
-                if body.len() > max {
-                    return None;
-                }
-            }
-            Ok(None) => return Some(body),
-            Err(_) => return None,
-        }
-    }
+/// Read at most `max` bytes; `None` when the body is longer (or the read
+/// fails).
+async fn read_capped(resp: Response, max: usize) -> Option<Vec<u8>> {
+    resp.bytes_within(max).await.ok()
 }
 
-async fn api_url(cfg: &Config, creds: &Creds, path: &str) -> UaResult<Url> {
-    let url = creds.site.join(path).map_err(|_| UaError::internal("could not build the Zulip URL"))?;
-    vet_url(&url, cfg.fetch_allow_loopback).await?;
-    Ok(url)
+fn api_url(creds: &Creds, path: &str) -> UaResult<Url> {
+    creds.site.join(path).map_err(|_| UaError::internal("could not build the Zulip URL"))
+}
+
+/// The client: the `zulip.api` policy (under the loopback test hook when
+/// `fetch_allow_loopback` is on).
+fn client(cfg: &Config) -> Result<Outbound, OutboundError> {
+    Outbound::new(hooked(cfg, policy::ZULIP_API))
+}
+
+/// `email:key` as an HTTP basic-auth header value.
+fn basic_auth(creds: &Creds) -> String {
+    use base64::Engine;
+    let pair = format!("{}:{}", creds.email, creds.key.expose_secret());
+    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))
+}
+
+/// A refusal before anything was sent (an address outside the class, a
+/// failed lookup, a URL outside the policy), as the hub error the old
+/// address check gave; `None` for every other failure, including a peer
+/// refused after the request went out.
+fn refusal(url: &Url, e: &OutboundError) -> Option<UaError> {
+    match e {
+        OutboundError::AddressRefused { .. }
+        | OutboundError::Lookup { .. }
+        | OutboundError::UrlRefused { .. } => {
+            Some(outbound_error(url.host_str().unwrap_or_default(), e.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// GET a JSON API path; `Err` is a generic, key-free reason.
@@ -393,15 +448,18 @@ async fn zulip_get(
     query: &[(&str, String)],
     max: usize,
 ) -> Result<Value, String> {
-    let url = api_url(cfg, creds, path).await.map_err(|e| clip(&e.to_string()))?;
-    let client = http_client(cfg).map_err(|_| HTTP_FAILED.to_string())?;
-    let resp = client
-        .get(url)
-        .basic_auth(&creds.email, Some(creds.key.expose_secret()))
-        .query(query)
-        .send()
-        .await
+    let mut url = api_url(creds, path).map_err(|e| clip(&e.to_string()))?;
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+    }
+    let client = client(cfg).map_err(|_| HTTP_FAILED.to_string())?;
+    let req = Request::get(url.clone())
+        .secret_header("Authorization", &basic_auth(creds))
         .map_err(|_| HTTP_FAILED.to_string())?;
+    let resp = client.send(req).await.map_err(|e| match refusal(&url, &e) {
+        Some(why) => clip(&why.to_string()),
+        None => HTTP_FAILED.to_string(),
+    })?;
     if !resp.status().is_success() {
         return Err(format!("{HTTP_FAILED} (HTTP {})", resp.status().as_u16()));
     }
@@ -436,11 +494,11 @@ enum Outcome {
 
 async fn post_message(cfg: &Config, creds: &Creds, stream: &str, topic: &str, content: &str) -> Outcome {
     let failed = |error: String| Outcome::Failed { http_status: None, error: clip(&error) };
-    let url = match api_url(cfg, creds, "api/v1/messages").await {
+    let url = match api_url(creds, "api/v1/messages") {
         Ok(u) => u,
         Err(e) => return failed(e.to_string()),
     };
-    let client = match http_client(cfg) {
+    let client = match client(cfg) {
         Ok(c) => c,
         Err(e) => return failed(e.to_string()),
     };
@@ -450,21 +508,25 @@ async fn post_message(cfg: &Config, creds: &Creds, stream: &str, topic: &str, co
         .append_pair("topic", topic)
         .append_pair("content", content)
         .finish();
-    let sent = client
-        .post(url)
-        .basic_auth(&creds.email, Some(creds.key.expose_secret()))
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(encoded)
-        .send()
-        .await;
-    let resp = match sent {
+    let req = Request::post(url.clone())
+        .secret_header("Authorization", &basic_auth(creds))
+        .and_then(|r| r.body("application/x-www-form-urlencoded", encoded.into_bytes()));
+    let req = match req {
+        Ok(r) => r,
+        Err(e) => return failed(e.to_string()),
+    };
+    let resp = match client.send(req).await {
         Ok(r) => r,
         Err(e) => {
-            let error = clip(&error_chain(&e));
-            return if e.is_connect() || e.is_builder() {
-                Outcome::Failed { http_status: None, error }
-            } else {
-                Outcome::Uncertain { http_status: None, error }
+            if let Some(why) = refusal(&url, &e) {
+                return failed(why.to_string());
+            }
+            return match e {
+                // Nothing left the hub: no connection, or no request built.
+                OutboundError::NotSent { why, .. } => {
+                    Outcome::Failed { http_status: None, error: clip(&why) }
+                }
+                other => Outcome::Uncertain { http_status: None, error: clip(&other.to_string()) },
             };
         }
     };
@@ -595,7 +657,10 @@ fn begin_send(
         // A blocked topic may hold what the gates refused: keep it out.
         checked["topic"] = Value::Null;
     }
-    ledger::append(tx, EventInput::new("agent.zulip.send_checked", checked).by(caller.label.clone()))?;
+    ledger::append(
+        tx,
+        EventInput::new(ua_core::DEFAULT_ORG, "agent.zulip.send_checked", checked).by(caller.label.clone()),
+    )?;
     if !p.findings.is_empty() {
         let shown: Vec<&Value> = p.findings.iter().take(gates::MAX_FINDINGS_SHOWN).collect();
         return Ok(Err(UaError::denied(
@@ -608,9 +673,9 @@ fn begin_send(
     }
     let open: Option<i64> = tx
         .query_row(
-            "SELECT id FROM zulip_sends WHERE stream = ?1 AND topic = ?2 AND content_sha256 = ?3 \
-             AND status IN ('sending','uncertain') LIMIT 1",
-            params![p.stream, p.topic, p.sha],
+            "SELECT id FROM zulip_sends WHERE org_id = ?1 AND stream = ?2 AND topic = ?3 \
+             AND content_sha256 = ?4 AND status IN ('sending','uncertain') LIMIT 1",
+            params![caller.org_id, p.stream, p.topic, p.sha],
             |r| r.get(0),
         )
         .optional()?;
@@ -637,14 +702,27 @@ fn begin_send(
     };
     let now = ua_core::time::now();
     tx.execute(
-        "INSERT INTO zulip_sends (agent_label, channel, stream, topic, content_sha256, chars, bytes, approval_id, \
-         status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'sending', ?9, ?9)",
-        params![p.agent, p.channel, p.stream, p.topic, p.sha, p.chars as i64, p.bytes as i64, approval_id, now],
+        "INSERT INTO zulip_sends (org_id, agent_label, channel, stream, topic, content_sha256, chars, bytes, \
+         approval_id, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sending', ?10, ?10)",
+        params![
+            caller.org_id,
+            p.agent,
+            p.channel,
+            p.stream,
+            p.topic,
+            p.sha,
+            p.chars as i64,
+            p.bytes as i64,
+            approval_id,
+            now
+        ],
     )?;
     let send_id = tx.last_insert_rowid();
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.zulip.sending",
             p.event(json!({ "send_id": send_id, "approval_id": approval_id })),
         )
@@ -655,6 +733,9 @@ fn begin_send(
 
 async fn zulip_send_message(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &org)).await?;
+    require_destination(&ctx.caller.org_id)?;
     let cfg = ctx.hub.cfg();
     let agent = write_identity(&ctx.caller, Some(&clean_label(&a.agent_label)?))?;
     let (logical, stream) = channel(cfg, &a.channel)?;
@@ -705,12 +786,12 @@ async fn zulip_send_message(ctx: ToolCtx, a: SendArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             tx.execute(
                 "UPDATE zulip_sends SET status = ?2, message_id = ?3, http_status = ?4, error = ?5, updated_at = ?6 \
-                 WHERE id = ?1",
-                params![send_id, status, message_id, http_status, err, ua_core::time::now()],
+                 WHERE id = ?1 AND org_id = ?7",
+                params![send_id, status, message_id, http_status, err, ua_core::time::now(), caller.org_id],
             )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     channel,
                     pp.event(json!({
                         "send_id": send_id, "approval_id": approval_id, "http_status": http_status,
@@ -786,10 +867,12 @@ async fn zulip_resolve_send(ctx: ToolCtx, a: ResolveArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &caller.org_id)?;
+            // Another organization's send answers exactly as a missing one.
             let row: Option<(String, String, String)> = tx
                 .query_row(
-                    "SELECT status, updated_at, content_sha256 FROM zulip_sends WHERE id = ?1",
-                    params![a.send_id],
+                    "SELECT status, updated_at, content_sha256 FROM zulip_sends WHERE org_id = ?1 AND id = ?2",
+                    params![caller.org_id, a.send_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
@@ -816,12 +899,14 @@ async fn zulip_resolve_send(ctx: ToolCtx, a: ResolveArgs) -> UaResult<Value> {
             }
             let reason = a.reason.as_deref().map(clip);
             tx.execute(
-                "UPDATE zulip_sends SET status = ?2, error = COALESCE(?3, error), updated_at = ?4 WHERE id = ?1",
-                params![a.send_id, status, reason, ua_core::time::now()],
+                "UPDATE zulip_sends SET status = ?2, error = COALESCE(?3, error), updated_at = ?4 \
+                 WHERE id = ?1 AND org_id = ?5",
+                params![a.send_id, status, reason, ua_core::time::now(), caller.org_id],
             )?;
+            // ORG-EVENT-DEFAULT: use the send's organization once org_guard allows it.
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.zulip.resolved",
                     json!({
                         "send_id": a.send_id, "previous_status": previous, "outcome": a.outcome.trim(),
@@ -1001,6 +1086,7 @@ async fn zulip_fetch_messages(ctx: ToolCtx, a: FetchArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.zulip.fetched",
                     json!({
                         "agent": &by,

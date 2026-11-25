@@ -13,12 +13,13 @@ use ua_core::{UaError, UaResult};
 use ua_store::WriteTx;
 
 use super::{
-    Item, check_item_id, clip, is_operator, load_item, now, record, request_dispatch, validate_new,
+    Item, check_item_id, clip, load_item, now, record, request_dispatch, require_org, validate_new,
     verified_caller,
 };
 use crate::families::{agents, messaging};
 use crate::hub::Hub;
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 /// The sender of command notices.
 pub const NOTICE_SENDER: &str = "hub-node";
@@ -83,20 +84,22 @@ pub(crate) fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-pub(crate) fn insert(tx: &WriteTx<'_>, item_id: &str, c: &NewCommand, ts: &str) -> UaResult<()> {
+/// `org` is the item's organization.
+pub(crate) fn insert(tx: &WriteTx<'_>, org: &str, item_id: &str, c: &NewCommand, ts: &str) -> UaResult<()> {
     tx.execute(
-        "INSERT INTO node_command (item_id, argv_json, owner_agent, owner_session, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![item_id, serde_json::to_string(&c.argv)?, c.owner_agent, c.owner_session, ts],
+        "INSERT INTO node_command (item_id, argv_json, owner_agent, owner_session, created_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+        params![item_id, serde_json::to_string(&c.argv)?, c.owner_agent, c.owner_session, ts, org],
     )?;
     Ok(())
 }
 
-pub(crate) fn load(c: &Connection, item_id: &str) -> UaResult<Option<CommandRow>> {
+/// The command of item `item_id` in organization `org`.
+pub(crate) fn load(c: &Connection, org: &str, item_id: &str) -> UaResult<Option<CommandRow>> {
     Ok(c.query_row(
         "SELECT item_id, argv_json, owner_agent, owner_session, fence_attempt, fence_token, exit_code, log_path \
-         FROM node_command WHERE item_id = ?1",
-        [item_id],
+         FROM node_command WHERE item_id = ?1 AND org_id = ?2",
+        params![item_id, org],
         |r| {
             let argv: String = r.get(1)?;
             Ok(CommandRow {
@@ -115,21 +118,22 @@ pub(crate) fn load(c: &Connection, item_id: &str) -> UaResult<Option<CommandRow>
 }
 
 /// A fresh fence for this claim: the payload's `command` object.
-pub(crate) fn mint_fence(tx: &WriteTx<'_>, item_id: &str, attempt: i64) -> UaResult<Value> {
-    let Some(row) = load(tx, item_id)? else {
+pub(crate) fn mint_fence(tx: &WriteTx<'_>, org: &str, item_id: &str, attempt: i64) -> UaResult<Value> {
+    let Some(row) = load(tx, org, item_id)? else {
         return Err(UaError::internal(format!("command item {item_id} has no command row")));
     };
     let token = uuid::Uuid::new_v4().simple().to_string();
     tx.execute(
-        "UPDATE node_command SET fence_attempt = ?2, fence_token = ?3, updated_at = ?4 WHERE item_id = ?1",
-        params![item_id, attempt, token, now()],
+        "UPDATE node_command SET fence_attempt = ?2, fence_token = ?3, updated_at = ?4 \
+         WHERE item_id = ?1 AND org_id = ?5",
+        params![item_id, attempt, token, now(), org],
     )?;
     Ok(json!({ "argv": row.argv, "fence_token": token, "log_name": LOG_NAME }))
 }
 
 /// The receipt's token must be this attempt's fence token.
 pub(crate) fn check_fence(tx: &WriteTx<'_>, item: &Item, token: &str) -> UaResult<()> {
-    let Some(row) = load(tx, &item.id)? else {
+    let Some(row) = load(tx, &item.org_id, &item.id)? else {
         return Err(UaError::conflict(format!("command item {} has no command row", item.id)));
     };
     let ok = row.fence_attempt == Some(item.attempts)
@@ -146,13 +150,13 @@ pub(crate) fn check_fence(tx: &WriteTx<'_>, item: &Item, token: &str) -> UaResul
 
 /// Store the exit code and log path, and queue the owner's notice.
 pub(crate) fn record_completion(tx: &WriteTx<'_>, item: &Item, status: &str, stored: &Value) -> UaResult<()> {
-    let Some(row) = load(tx, &item.id)? else { return Ok(()) };
+    let Some(row) = load(tx, &item.org_id, &item.id)? else { return Ok(()) };
     let ts = now();
     let exit = stored["exit_code"].as_i64();
     let log = stored["log_path"].as_str();
     tx.execute(
-        "UPDATE node_command SET exit_code = ?2, log_path = ?3, updated_at = ?4 WHERE item_id = ?1",
-        params![item.id, exit, log, ts],
+        "UPDATE node_command SET exit_code = ?2, log_path = ?3, updated_at = ?4 WHERE item_id = ?1 AND org_id = ?5",
+        params![item.id, exit, log, ts, item.org_id],
     )?;
     let duration =
         match (item.claimed_at.as_deref().and_then(ua_core::time::parse_ts), ua_core::time::parse_ts(&ts)) {
@@ -174,9 +178,18 @@ pub(crate) fn record_completion(tx: &WriteTx<'_>, item: &Item, status: &str, sto
     }
     body.push_str(&format!("\nDetails: coordination_manage node_command_status item_id={}", item.id));
     tx.execute(
-        "INSERT OR IGNORE INTO node_command_notice (item_id, attempt, terminal, owner_agent, body, task_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![item.id, item.attempts, status, row.owner_agent, clip(&body, 3500), item.task_id, ts],
+        "INSERT OR IGNORE INTO node_command_notice (item_id, attempt, terminal, owner_agent, body, task_id, \
+         created_at, org_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            item.id,
+            item.attempts,
+            status,
+            row.owner_agent,
+            clip(&body, 3500),
+            item.task_id,
+            ts,
+            item.org_id
+        ],
     )?;
     Ok(())
 }
@@ -195,6 +208,12 @@ pub(crate) enum NoticeScope<'a> {
 /// Send owed notices in `scope` (up to 50), each in its own transaction
 /// under a stable message id, so a retry never sends twice. Returns how
 /// many were delivered now.
+///
+/// Only the default organization's notices are sent: the mailbox
+/// (`message_index`) carries no `org_id` yet, so another organization's
+/// notice stays recorded on its `node_command_notice` row, unsent, and its
+/// owner reads the outcome with `node_command_status` (the notification
+/// family's rule for destinations a second organization does not have).
 pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usize> {
     let (item, node) = match scope {
         NoticeScope::Item(i) => (Some(i.to_string()), None),
@@ -204,12 +223,12 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
     let owed: Vec<(String, i64, String, String, String, Option<i64>)> = hub.db().read(|c| {
         let mut stmt = c.prepare(
             "SELECT item_id, attempt, terminal, owner_agent, body, task_id FROM node_command_notice \
-             WHERE sent_at IS NULL AND (?1 IS NULL OR item_id = ?1) \
-             AND (?2 IS NULL OR item_id IN (SELECT id FROM node_dispatch WHERE node = ?2)) \
+             WHERE org_id = ?3 AND sent_at IS NULL AND (?1 IS NULL OR item_id = ?1) \
+             AND (?2 IS NULL OR item_id IN (SELECT id FROM node_dispatch WHERE org_id = ?3 AND node = ?2)) \
              ORDER BY created_at LIMIT 50",
         )?;
         let rows = stmt
-            .query_map(params![item, node], |r| {
+            .query_map(params![item, node, ua_core::DEFAULT_ORG], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -221,19 +240,24 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
         // The owner's chosen session (node_command_adopt) first; label mail
         // when that session can no longer take it.
         let session: Option<String> = hub.db().read(|c| {
-            Ok(c.query_row("SELECT owner_session FROM node_command WHERE item_id = ?1", [&item_id], |r| {
-                r.get(0)
-            })
+            Ok(c.query_row(
+                "SELECT owner_session FROM node_command WHERE item_id = ?1 AND org_id = ?2",
+                params![item_id, ua_core::DEFAULT_ORG],
+                |r| r.get(0),
+            )
             .optional()?
             .flatten())
         })?;
         let send = |to_session: Option<&str>| {
             hub.db().write(|tx| {
-                messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                let sent =
+                    messaging::send_system(tx, NOTICE_SENDER, &owner, to_session, &mid, &body, task_id)?;
+                // `mid` is hub-node's client id; the message's own id is the hub's.
+                let message_id = sent["message_id"].as_str().unwrap_or(&mid).to_string();
                 tx.execute(
                     "UPDATE node_command_notice SET sent_at = ?4, message_id = ?5, last_error = NULL \
-                     WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3",
-                    params![item_id, attempt, terminal, now(), mid],
+                     WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3 AND org_id = ?6",
+                    params![item_id, attempt, terminal, now(), message_id, ua_core::DEFAULT_ORG],
                 )?;
                 Ok(())
             })
@@ -249,8 +273,8 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
                 hub.db().write(|tx| {
                     tx.execute(
                         "UPDATE node_command_notice SET last_error = ?4 \
-                         WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3",
-                        params![item_id, attempt, terminal, msg],
+                         WHERE item_id = ?1 AND attempt = ?2 AND terminal = ?3 AND org_id = ?5",
+                        params![item_id, attempt, terminal, msg, ua_core::DEFAULT_ORG],
                     )?;
                     Ok(())
                 })?;
@@ -285,8 +309,8 @@ pub(crate) async fn node_command_start(ctx: ToolCtx, a: StartArgs) -> UaResult<V
     let argv = validate_argv(&a.argv)?;
     let session = a.session_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if let Some(s) = session.clone() {
-        let who2 = who.clone();
-        ctx.hub.db().read_async(move |c| agents::own_session(c, &s, &who2, false).map(|_| ())).await?;
+        let (who2, org) = (who.clone(), ctx.caller.org_id.clone());
+        ctx.hub.db().read_async(move |c| agents::own_session(c, &org, &s, &who2, false).map(|_| ())).await?;
     }
     let prompt = clip(&format!("command: {}", shell_join(&argv)), 2000);
     let mut n =
@@ -316,9 +340,16 @@ pub(crate) async fn node_command_status(ctx: ToolCtx, a: StatusArgs) -> UaResult
         .db()
         .read_async(move |c| {
             let hidden = || UaError::not_found(format!("no command item {id} visible to you"));
-            let item = load_item(c, &id)?.ok_or_else(hidden)?;
-            let cmd = load(c, &id)?.ok_or_else(hidden)?;
-            if !(cmd.owner_agent == who || item.created_by == who || is_operator(&hub, &caller, &who)) {
+            let item = load_item(c, &caller.org_id, &id)?.ok_or_else(hidden)?;
+            let cmd = load(c, &caller.org_id, &id)?.ok_or_else(hidden)?;
+            if !(cmd.owner_agent == who
+                || item.created_by == who
+                || Authz::new(hub.cfg()).holds(
+                    &caller,
+                    &[Authority::Operator, Authority::LifecycleOperator],
+                    ua_core::DEFAULT_ORG,
+                ))
+            {
                 return Err(hidden());
             }
             let receipt = item.receipt().unwrap_or(Value::Null);
@@ -364,14 +395,16 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &caller.org_id)?;
+            let org = caller.org_id.clone();
             let hidden = || UaError::not_found(format!("no command item {id} visible to you"));
-            let item = load_item(tx, &id)?.ok_or_else(hidden)?;
-            let cmd = load(tx, &id)?.ok_or_else(hidden)?;
-            let operator = hub.cfg().is_lifecycle_operator(&who) || caller.is_human();
+            let item = load_item(tx, &org, &id)?.ok_or_else(hidden)?;
+            let cmd = load(tx, &org, &id)?.ok_or_else(hidden)?;
+            let operator = Authz::new(hub.cfg()).holds(&caller, &[Authority::Operator], ua_core::DEFAULT_ORG);
             if cmd.owner_agent != who && !operator {
                 return Err(UaError::denied(
                     "not_command_owner",
-                    format!("only {:?} or a lifecycle operator may adopt {id}", cmd.owner_agent),
+                    format!("only {:?} or an operator (a verified human) may adopt {id}", cmd.owner_agent),
                 ));
             }
             if !matches!(item.status.as_str(), "queued" | "claimed") {
@@ -381,16 +414,17 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
                 )));
             }
             if let Some(s) = &session {
-                agents::own_session(tx, s, &cmd.owner_agent, false).map_err(|_| {
+                agents::own_session(tx, &org, s, &cmd.owner_agent, false).map_err(|_| {
                     UaError::invalid(format!("session {s:?} does not belong to {:?}", cmd.owner_agent))
                 })?;
             }
             tx.execute(
-                "UPDATE node_command SET owner_session = ?2, updated_at = ?3 WHERE item_id = ?1",
-                params![id, session, now()],
+                "UPDATE node_command SET owner_session = ?2, updated_at = ?3 WHERE item_id = ?1 AND org_id = ?4",
+                params![id, session, now(), org],
             )?;
             record(
                 tx,
+                &org,
                 "command_adopted",
                 json!({
                     "item_id": id, "owner_agent": cmd.owner_agent, "from_session": cmd.owner_session,
@@ -398,7 +432,7 @@ pub(crate) async fn node_command_adopt(ctx: ToolCtx, a: AdoptArgs) -> UaResult<V
                 }),
                 &who,
             )?;
-            let mut v = load(tx, &id)?.map(|c| c.public()).unwrap_or(Value::Null);
+            let mut v = load(tx, &org, &id)?.map(|c| c.public()).unwrap_or(Value::Null);
             v["item_id"] = json!(id);
             v["status"] = json!(item.status);
             v["adopted"] = json!(true);

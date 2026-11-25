@@ -32,12 +32,136 @@ an edit takes effect on the next call without a restart.
 Every refusal appends an `agent.gateway.decision` ledger event with
 `decision: deny`, a `reason_code`, and `rule` naming the rule that fired.
 
+A call of a tool that takes an `action` (`plan_manage`, `delegation_manage`,
+...) runs steps 1-4 twice: under the tool's own name, and under the name of
+the action it runs (see [Consolidated tools](#consolidated-tools)).
+
+## Consolidated tools
+
+Several tools dispatch on an `action` argument. Many of their actions run
+the same handler as a standalone tool: `plan_manage` with
+`{"action": "delete", "params": {"plan_id": ...}}` deletes exactly what
+`plan_delete {"plan_id": ...}` deletes. A gate names a tool, so a gate on
+`plan_delete` holds whichever of the two the caller uses:
+
+- **Profile.** Besides the consolidated tool (and its action, for the
+  profiles with action lists), the profile must allow the standalone tool.
+  An allow-list profile may instead name it in its action list
+  (`RESEARCH_ALLOWED_ACTIONS` lists `plan_create`, so `research` creates
+  plans through `plan_manage` without seeing `plan_create`).
+- **Policy rules.** Rules are evaluated for the consolidated tool's name on
+  the call's arguments, and again for the standalone name on the action's
+  `params` (so a `threshold` field path is the standalone tool's). Either
+  refusal refuses the call. A rate limit or cooldown on the standalone name
+  counts calls through the consolidated tool too. `default_action: deny` is
+  applied to the consolidated tool's name only: a rule allowing
+  `plan_manage` does not need one for each of its actions.
+- **Approvals.** `approval_tools`, a `require_approval` rule and an
+  always-gated flag on the standalone name gate the call. The approval binds
+  the standalone tool's name and the action's `params` (through the
+  standalone tool's `gate_payload` projection, when it has one): exactly
+  what a direct call binds. A pass approved for `plan_delete {"plan_id":
+  "p-1"}` therefore runs that delete once, through either tool, and nothing
+  else. When the consolidated tool's own name is gated as well, the one
+  approval covers the call; every other action still parks under the
+  consolidated tool's name, as before.
+- **Prod-action check.** An always-gated standalone tool's identity check
+  applies to the consolidated call as well.
+
+`handoff` is a door to `delegate` in the same way: it creates a delegation
+with `callback: "none"`, so it is held to `delegate`'s profile entry, policy
+rules and approval gate, on the arguments of the equivalent `delegate` call
+(`agent` as `from_agent`, plus `callback: "none"`). A pass for that
+`delegate` call serves the handoff, once.
+
+An action with no standalone tool is gated under the key `tool:action`, for
+example `plan_manage:close` or `coordination_manage:queue_park`. List it in
+`approval_tools` or name it in a rule's `tool` (a glob such as
+`plan_manage:step_*` works too); its approval binds the whole call
+(`{action, params}`). An action of `export_data` that makes a governed call
+itself (`manifest`, `compare`) is gated once, by that inner call, under its
+own name. For a tool whose handler binds its own approval (`relay_manage`), its keys
+take policy rules; an `approval_tools` entry adds nothing, since the handler
+already asks a human for every send. The same holds for the own actions
+whose handler always asks a human itself (`oauth_device_manage:revoke`,
+`coordination_manage:node_command_start`,
+`coordination_manage:node_item_restart`, `config_revision_manage:commit`
+and `:rollback`): the call takes that one approval, and a request ahead
+answers `409` as for the tool itself. Any other own key the registry binds
+can be requested ahead under its key.
+
+A call with no `action` is the tool's default action (`list` for
+`oauth_device_manage` and `config_revision_manage`, `call` for
+`mcp_gateway`, `get` for `node_config`) and is gated as that action. Each
+consolidated tool's handler dispatches on the action the table resolves, so
+the registry and the handler always agree on which action runs.
+
+An `action` that the routing table does not know is refused
+(`invalid_argument`) before the tool runs. The `agent.gateway.decision`
+event of a refused call names the tool called in `tool` and the action in
+`action_tool`; an approval's `agent.approval.requested` and
+`agent.approval.consumed` events carry `via` (the tool called) when it binds
+a different name; the call's `tool_calls` row carries `action_tool`.
+
+An `approval_tools` entry or a plain-named policy rule written
+`tool:action` for an action that has a standalone tool also restricts that
+tool (`plan_manage:delete` gates `plan_delete`, through either door), and an
+alias spelling of an own action restricts its key. The reading only ever
+restricts: a `deny`, `require_approval`, `role`, `threshold`, rate limit or
+cooldown applies to the standalone tool too, while an `allow` stays literal
+(it allows the `plan_manage` door's `delete` key, nothing else), and an
+alias match never counts as a permission under `default_action: deny`. `system_doctor` still reports
+such a spelling, and a `tool:action` name that matches nothing, as
+`DEGRADED` (the policy file also logs a warning when it loads), naming the
+name to write.
+
+A platform object read through a consolidated tool (`platform_object_get`
+for a `plan`, whose `profile_tool` is `plan_manage`) is also checked as that
+tool's `get` action: `plan_get`'s profile entry, policy rules and
+`approval_tools` entry apply to the read.
+
+Other tools that share a handler or a creation path with a differently
+named tool were checked: `handoff` (above) is the only second door to
+another tool's operation. The rest are distinct operations with their own
+names and gates: `graph_canvas_restore` writes a stored revision back and is
+gated as itself, separately from `graph_canvas_write`. The scene it writes
+once passed `graph_canvas_write`, but a deny on `graph_canvas_write` does
+not stop a restore, so to freeze canvases deny both (`tool:
+"graph_canvas_*"` covers them); `workflow_run`,
+`langgraph_run`, `langgraph_workflow_run` and `routine_fire` start
+different run kinds, and every step of a run is itself a governed call;
+`dispatch_resume` and `dispatch_task` gate in their handlers under their own
+names; agent lifecycle actions (`agent_terminate`, `agent_retire`) cancel
+node items and runs and revoke credentials as consequences of the lifecycle
+change, not as calls of `dispatch_cancel` or the revoke tools;
+`profile_reset` and `profile_activate` share a binding helper only.
+
+The table (`crates/ua-tools/src/routes.rs`) decides every action of every
+such tool; a test fails when a tool or an action has no entry.
+
+| Tool | Action → standalone tool | Gated as `tool:action` |
+|---|---|---|
+| `plan_manage` | `create` → `plan_create`, `update` → `plan_update`, `get` → `plan_get`, `list` → `plan_list`, `checkpoint` → `plan_checkpoint`, `resume` → `plan_resume`, `step_retry` → `plan_step_retry`, `step_claim` → `plan_step_claim`, `handoff` → `plan_handoff`, `delete` → `plan_delete` | `close`, `step_add`, `step_edit`, `step_remove`, `step_reorder`, `edit` |
+| `delegation_manage` | `create` → `delegate`, `list` → `delegate_list`, `claim` → `delegate_claim`, `release` → `delegate_release`, `cancel` → `delegate_cancel`, `spec_check` → `delegation_spec_check`, `spec_template` → `delegation_spec_template`, `spec_build` → `delegation_spec_build` | `fail`, `complete`, `retry`, `get`, `lookup` |
+| `observability_manage` | `activity` → `agent_activity`, `metrics` → `metrics_snapshot`, `anomalies` → `check_anomalies`, `performance` → `perf_summary`, `agents` → `agent_list`, `context` → `agent_context` | `delegation_stats` |
+| `coordination_manage` | `agent_list` → `agent_list`, `agent_context` → `agent_context` | every other action (61) |
+| `autonomous_cycle_manage` | `start`, `get`, `transition`, `kill`, `record_usage`, `list` → `autonomous_cycle_<action>` | `get_for_task` |
+| `export_data` | `tasks` → `export_tasks`, `memory` → `export_memory`, `journal` → `export_journal`; `manifest` and `compare` call `export_migration_manifest` and `compare_migration_manifests` as governed calls | (`import` and `rollback` are refused) |
+| `config_revision_manage`, `relay_manage`, `oauth_device_manage`, `mcp_gateway`, `skill_registry`, `node_config`, `task_comment`, `goal_manage` | none | every action |
+
+Legacy spellings the tools accept (`plan_delete` as a `plan_manage` action,
+`delegate_claim` for `delegation_manage`, `perf_summary` for
+`observability_manage`) resolve to the same entry.
+
 ### Requesting an approval ahead of a call
 
 `POST /api/approvals/request` runs steps 1-3 for the named tool and its
 arguments (a refusal is the same `403` a call would get), checks the
 arguments against the tool's typed argument struct, and parks the payload
 the tool's gate would bind, without running anything or consuming a pass.
+For a consolidated tool's action that is gated under its own name, the
+request parks that name and payload, and the response's `tool` says so
+(`plan_delete` for `plan_manage` action `delete`).
 It answers `409` for a tool step 4 would not gate: only approval-gated tools
 can be requested. It also answers `409` for a tool whose handler asks the
 gate itself on values it resolves (marked `gates_in_handler`,
@@ -48,17 +172,133 @@ projection; without one, gating it is refused (`secret_args_unprojected`)
 rather than store the secret. The full status table is in
 [sdk.md](sdk.md#not-supported).
 
+## Approvals in the audit record
+
+A one-time approval binds one exact payload: the tool, the canonical form
+of the payload its gate builds (sorted keys, no whitespace, as
+`ua_core::canonical` writes it) and the requester. The payload is the
+call's arguments unless the tool's handler resolves more: `dispatch_task`
+binds the resolved harness, working directory and prompt hash, the relay
+binds the exact text and target, and `git_merge_task` binds the head,
+branch, target branch and bound repository it resolves at the call. A pass
+expires `approval_pass_ttl_hours` after it was approved.
+
+`git_merge_task` without `policy_authorization_id` checks the task, its
+worktree and the workspace repository first, then asks for a one-time
+approval of `{task_id, force, dry_run, allow_in_flight, branch, head,
+target, repo, summary}`, where `head` is the full commit SHA of the task's
+branch, `target` the branch merged into, `repo` the task project's bound
+`owner/name` (`null` when unbound) and `summary` one line naming the commit
+and the target for the approver ("Merge task 7 branch task-7 at commit
+0123456789ab into main of example/widgets"). A call whose head, target or
+repository differs from a live pass for the same task is refused with
+`approval_binding_changed`, naming the changed fields; the refusal is
+ledgered as `binding_changed`, the old pass stays unspent and a new
+request for the current values is parked. Because the payload is resolved
+by the handler, the merge cannot be requested ahead through
+`POST /api/approvals/request` (`409`), and a call bound to fail (an unknown
+task, a dirty worktree) is refused before a human is asked.
+
+Each approval event carries `payload_sha256`, the SHA-256 of that canonical
+payload, so the request, the decision, the use and any refusal can be tied
+to one payload without the ledger holding it:
+
+| Event | Carries |
+| --- | --- |
+| `agent.approval.requested` | `approval_id`, `tool`, `requested_by`, `payload_sha256`, `via` |
+| `agent.approval.resolved` | `approval_id`, `tool`, `decision`, `resolved_by`, `transport`, `payload_sha256`; `expires_at` when approved (the expiry under the TTL configured at that moment; a later TTL change applies to the pass from then on) |
+| `agent.approval.consumed` | `approval_id`, `tool`, `payload_sha256`, `via` |
+| `agent.approval.refused` | see below |
+
+The relay drops a message's text from its approval once decided; its hash
+is taken over the payload without the text fields, which still binds the
+text through `text_sha256`, so it is the same before and after the
+decision. A policy authorization's `recorded` and `consumed` events carry
+`payload_sha256` over what it binds: `{"head_sha", "repo", "task_id"}`
+(repository in lower case).
+
+A gated call refused because of its approval state appends one
+`agent.approval.refused` event. Its `reason` is one of:
+
+| `reason` | When |
+| --- | --- |
+| `expired` | The pass or policy authorization that covered the call has expired. A one-time pass is reported once, when the gate first finds it expired; the call parks a new request as before. |
+| `binding_changed` | An approval exists for this action but the call's arguments, revision or target differ from what it bound (`dispatch_task`, `dispatch_resume`, the relay's send, a policy authorization's task, repository or head). |
+| `no_matching_approval` | The call names an approval that does not exist or can no longer be used (`approval_status`: `consumed`, `revoked`), or a resume has no consumed `dispatch_task` approval. |
+| `denied` | A human denied exactly this call (or revoked the relay draft's approval). |
+| `not_covered` | A policy authorization binds the merge but not this mode of it (`detail`: `force`, `in_flight`). |
+| `not_eligible` | The caller may not spend the authorization, or its author is no longer a human identity (`detail`: `self_spend`, `authorizer_not_human`). |
+
+The event names what was refused without carrying it: `tool`,
+`requested_by`, and where they apply `approval_id` or `authorization_id`,
+`task_id`, `approved_payload_sha256`, `presented_payload_sha256`,
+`changed_fields` (the top-level field names that differ, never their
+values), `approval_status`, `expired_at`, `detail` and `via`. It never
+holds payload content. Every event is still written to the default
+organization's ledger (`ORG-EVENT-DEFAULT`); when the approval belongs to
+another organization, `requested_by` is `null` there and the event's
+`originator` is `system`, never the requester's label. The same holds for
+the `requested`, `resolved` and `consumed` events: another organization's
+requester or resolver label is in neither the payload nor the originator.
+
+## The approval queue and organizations
+
+An approval belongs to its requester's organization (the gate caller's
+`org_id`), and the queue is scoped to it (`docs/organization.md`, the
+approvals family). A gate matches a denial, pass or pending request only
+within the caller's organization, so a pass granted in one organization
+never satisfies an identical call (same tool, payload and requester label)
+in another, and expiry runs per organization. `approval_pending`, the
+approval detail and list routes, the Control Center inbox, the session
+packet, the evidence report, `platform_object_get` and the anomaly check
+show only the reader's organization's approvals. `approval_resolve`, on
+every transport (MCP, HTTP, UI, CLI, Slack), answers another
+organization's approval exactly as a missing id. Approving needs a human in
+the approval's organization; until memberships exist `ua_org::authz` admits
+only the default organization's humans (`org_mismatch` otherwise), and the
+requester may still deny or revoke its own request in its organization.
+
+A refusal is often decided inside the refused call's write transaction,
+which then fails and rolls back. The event is appended with
+`ledger::append_surviving`: when the transaction commits it is committed
+once with it, and when it rolls back the store appends it again in a
+separate small transaction on the same writer before the call returns its
+error. The error the caller sees is unchanged.
+
+A call that parks a new request because nothing was decided for it yet is
+not a refusal; its record is the `requested` event.
+
 ## Profiles
 
 A profile is a capability tier bound to the verified identity and the client
 session. `profiles` in the hub config sets each identity's default
 (unlisted identities get `developer`, OAuth identities get `oauth_profile`);
+**A profile is a permission set, never authority.** It decides which tools a
+session sees. Who may act on another agent's work, read every mailbox or
+conversation, see the hub's boundaries, or move vault notes comes from
+identity (`ua_org::authz`): an operator is a verified caller of kind human
+(a `human_identities` label that authenticated as itself), and an agent
+explicitly listed in `lifecycle_operators` holds a separate fleet-maintenance
+grant (closing, parking and folding tasks, releasing claims and holds,
+worktree cleanup, handoff recovery, workflow records, wake handling, skill
+registry changes, harness config status, node-queue administration including
+node acceptance, and agent and node lifecycle), never operator authority.
+Secret and provider-account administration, project repo bindings, harness
+config publish, session credential revocation and node command adoption are
+for an operator. An unattended routine runs as an agent under its owner's
+label and so holds no operator authority; list its label in
+`lifecycle_operators` to give it fleet-maintenance rights. An unset
+`lifecycle_operators` defaults to `human_identities` for humans only. The
+Python hub let the coordinator and operator profiles carry authority; ua-rust
+does not. A coordinator agent that read every mailbox to route work cannot do
+so any more; organization roles (`docs/organization.md`) are what replace it.
+
 `profile_activate` moves a session to a profile no more privileged than that
 default, and a `profile_defaults` overlay (below) can only lower it.
 
 | Profile | Rank | Surface |
 |---|---|---|
-| `coordinator` | 8 | Every tool. Holds config authority: a profile overlay may not demote the last identity configured with it. Moves vault notes, reads every mailbox. |
+| `coordinator` | 8 | Every tool. A profile overlay may not demote the last identity configured with it (a lockout guard for config revisions). It grants no authority: moving vault notes and reading every mailbox need an operator (a verified human). |
 | `lead` | 7 | The developer surface plus `LEAD_EXTRA_TOOLS` (today all of those are already visible to developer), ranked above it. |
 | `developer` | 6 | Every tool except approval resolution, config revisions, dispatch cancellation confirm/retry, commits and merges, `notify`, routines, vault moves and archive plans, migration manifests (`export_migration_manifest`, `compare_migration_manifests`, also through `export_data`), and profile switching (deny list: new tools are visible). |
 | `reviewer` | 5 | Reads and reviews (deny list): no file writes, commits, merges, worktrees, task claims or deletes, delegation, plan management, coordination, cycles, workflows, memory deletes or approvals. May update another agent's claimed task only to release an expired claim. |
@@ -150,7 +390,7 @@ rules:
 | `tool` | `tool`, `action` | Applies `action` to matching tools. `action` defaults to `deny`. |
 | `role` | `tool`, `roles` | Allow-list: callers whose identity label or profile is not in `roles` are refused (`role_denied`). An entry `agent:<label>` names an identity, `profile:<name>` a profile; a bare entry is a profile when it is a profile name (current or legacy), else an identity label, so a label that equals a profile name never stands in for that profile. |
 | `threshold` | `tool`, `field`, `max` and/or `min`, `action` | Applies `action` when the argument at `field` is above `max` or below `min` (`threshold_breached`). A missing or non-numeric value refuses the call (`threshold_invalid`). |
-| `rate_limit` | `tool`, `max_calls`, `window_seconds` | At most `max_calls` completed calls of the tool by the same caller within the window, counted from the `tool_calls` table (`rate_limited`). Checked after every deny and before any approval is parked. Rule names must be unique among rate-limit rules. |
+| `rate_limit` | `tool`, `max_calls`, `window_seconds` | At most `max_calls` completed calls of the tool by the same caller within the window, counted from the `tool_calls` table (`rate_limited`), including calls of a consolidated tool whose action runs it. Checked after every deny and before any approval is parked. Rule names must be unique among rate-limit rules. |
 | `cooldown` | `tool`, `cooldown_seconds` | Minimum gap between two calls of the tool by the same caller (`episode_limited`). |
 | `max_calls_per_episode`, `fatigue_band_cap` | `bands`, ... | Accepted and validated, but callers carry no episode here, so a matching rule refuses the call (`episode_limited`). A `cooldown` with `require_episode: true` does the same. |
 
@@ -160,7 +400,8 @@ hub; always set `type` explicitly.
 ### Common fields
 
 - `name`: shown in refusals and ledger events.
-- `tool`: glob, default `*`.
+- `tool`: glob, default `*`. It matches tool names and the `tool:action`
+  keys of [consolidated tools](#consolidated-tools).
 - `roles`: on kinds other than `role`, a filter; the rule applies only to
   callers whose label or profile is listed.
 - `bind`: restricts the rule to a scope. Keys: `agent`, `project`, `task`,
@@ -234,6 +475,14 @@ a held task's items, which stay queued until the hold is released.
 | `agent_terminate` (`agent`, `reason`) | An operator, or the agent itself | As pause, and the agent's `doing` claims return to `open` and its queued node items are cancelled. |
 | `agent_retire` (`agent`, `reason`, `owner`) | Lifecycle operators only | Refused while the agent holds `doing` claims. Revokes its `agent_tokens` rows and OAuth sign-ins; the HTTP adapter refuses its static token too. |
 | `agent_unretire` (`agent`) | Lifecycle operators only | Back to `active`; re-issues nothing. |
+| `agent_forget` (`agent`, `reason`) | Lifecycle operators only | Refused unless the agent is retired. Deletes its agent row, lifecycle row and profile bindings so the label can be registered again; its sessions, notes and revoked tokens stay as history in its organization. |
+
+Every action works in the caller's organization; a label another
+organization holds is refused (`agent_label_taken`). `agent_retire` and
+`agent_forget` take `any_org=true` for hub recovery by the default
+organization's lifecycle operators: the agent of whichever organization holds
+the label is retired or forgotten there, and the answer is only `{agent,
+org_id, changed, retired or forgotten, hub_recovery}`.
 
 An operator is a `lifecycle_operators` identity (default: the human
 identities) or a human. Each result lists `stops` with an honest `control`
@@ -282,9 +531,10 @@ decision), `work_proposal_get`, `work_proposal_list` and
 `project_repo_bind`, `project_repo_unbind`, `project_repo_get` and
 `project_repo_list` bind a project stream to a normalized `owner/name`
 repository on an allowed forge host. The binding is the repository a task's
-CI checks are verified against, so bind and unbind are for a verified
-lifecycle operator or human (`not_lifecycle_operator` otherwise) and are
-attributed to that caller; `bound_by` / `unbound_by`, when given, must name
+CI checks are verified against and the repository merges and policy
+authorizations name, and it is not approval-gated, so bind and unbind are for
+an operator, a verified human (`operator_required` otherwise; a lifecycle
+operator does not qualify), and are attributed to that caller; `bound_by` / `unbound_by`, when given, must name
 it. Get and list are open.
 
 ### Maintenance tools

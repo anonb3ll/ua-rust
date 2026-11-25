@@ -2,7 +2,7 @@
 //!
 //! - Agent lifecycle ([`lifecycle`]): `agent_state`, `agent_states`,
 //!   `agent_pause`, `agent_resume`, `agent_terminate`, `agent_retire`,
-//!   `agent_unretire`.
+//!   `agent_unretire`, `agent_forget`.
 //! - Task subtree holds ([`holds`]): `task_hold`, `task_holds`,
 //!   `task_hold_get`.
 //! - Operator claim release ([`claim_release`]): `task_claim_release`.
@@ -29,26 +29,31 @@ mod holds;
 mod lifecycle;
 mod procscan;
 mod proposals;
+mod tenant_keys;
 mod worktrees;
 
-use ua_core::{Caller, Config, UaError, UaResult};
+use ua_core::{Caller, UaError, UaResult};
 use ua_store::SchemaPart;
 
 pub(crate) use bindings::{
-    bound_repo, normalize_repo, project_repo_bind, project_repo_get, project_repo_list, project_repo_unbind,
+    bound_repo, project_repo_bind, project_repo_get, project_repo_list, project_repo_unbind,
 };
+pub use bindings::{check_default_branch, normalize_repo};
 pub(crate) use block::{Blocked, check_claim, claim_block};
 pub(crate) use claim_release::task_claim_release;
+pub use holds::{HOLDS_ORG_SCOPE, HOLDS_TENANT_PART};
 pub(crate) use holds::{task_hold, task_hold_get, task_holds};
 pub use lifecycle::is_retired;
 pub(crate) use lifecycle::{
-    agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate, agent_unretire,
-    stopped,
+    agent_forget, agent_pause, agent_resume, agent_retire, agent_state, agent_states, agent_terminate,
+    agent_unretire, stopped,
 };
+pub use proposals::{PROPOSALS_ORG_SCOPE, PROPOSALS_TENANT_PART};
 pub(crate) use proposals::{
     check_contract, task_contract, work_proposal_decide, work_proposal_file, work_proposal_get,
     work_proposal_list, work_proposal_recover, work_proposal_withdraw,
 };
+pub use tenant_keys::{PROJECT_BINDINGS_TENANT_KEYS, PROJECT_BINDINGS_TENANT_PART};
 
 use super::agents::verified;
 use crate::registry::Registry;
@@ -167,12 +172,6 @@ pub(crate) fn verified_actor(caller: &Caller, verb: &str) -> UaResult<String> {
     verified(caller).map(str::to_string).ok_or_else(|| {
         UaError::denied("identity_required", format!("{verb} requires an authenticated identity"))
     })
-}
-
-/// Whether the verified `who` holds operator authority over other agents'
-/// work: a human identity or a configured lifecycle operator.
-pub(crate) fn is_operator(cfg: &Config, caller: &Caller, who: &str) -> bool {
-    verified(caller).is_some() && (caller.is_human() || cfg.is_human(who) || cfg.is_lifecycle_operator(who))
 }
 
 pub(crate) fn now() -> String {

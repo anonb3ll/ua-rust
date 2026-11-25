@@ -25,6 +25,7 @@ use ua_core::{Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
+use crate::families::events::{CALL_SCOPE, EventReader, VISIBLE_EVENT};
 use crate::families::nodes;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -158,7 +159,7 @@ pub struct ActivityArgs {
     pub limit: Option<i64>,
 }
 
-fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
+fn agent_activity(c: &Connection, reader: &EventReader, a: ActivityArgs) -> UaResult<Value> {
     let mut sql =
         String::from("SELECT seq, originator, created_at, channel, payload FROM event_log WHERE 1=1");
     let mut args: Vec<String> = Vec::new();
@@ -177,10 +178,12 @@ fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
         args.push(prefix);
         args.push(format!("agent.{kind}"));
     }
+    sql.push_str(&format!(" AND ({VISIBLE_EVENT})"));
     let capped = a.limit.unwrap_or(200).clamp(1, ACTIVITY_LIMIT_CAP);
     sql.push_str(&format!(" ORDER BY created_at DESC, seq DESC LIMIT {}", capped + 1));
     let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
+    let args = args.iter().map(|s| s as &dyn rusqlite::ToSql).chain(reader.bindings());
+    let rows = stmt.query_map(params_from_iter(args), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, Option<String>>(1)?,
@@ -214,15 +217,23 @@ fn agent_activity(c: &Connection, a: ActivityArgs) -> UaResult<Value> {
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
-fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
+/// `org` is the reader's organization: the task counts are its own.
+fn metrics_snapshot(
+    c: &Connection,
+    org: &str,
+    reader: &EventReader,
+    db_path: Option<&Path>,
+) -> UaResult<Value> {
     let week = agents::ago(7 * 86_400);
     let mut events: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     {
-        let mut stmt = c.prepare(
+        let sql = format!(
             "SELECT COALESCE(originator, '(unattributed)'), channel, COUNT(*) FROM event_log \
-             WHERE created_at >= ?1 GROUP BY 1, 2",
-        )?;
-        let rows = stmt.query_map([&week], |r| {
+             WHERE created_at >= ?1 AND ({VISIBLE_EVENT}) GROUP BY 1, 2"
+        );
+        let mut stmt = c.prepare(&sql)?;
+        let args = std::iter::once(&week as &dyn rusqlite::ToSql).chain(reader.bindings());
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
         })?;
         for row in rows {
@@ -232,8 +243,8 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
     }
     let mut by_status = Map::new();
     {
-        let mut stmt = c.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut stmt = c.prepare("SELECT status, COUNT(*) FROM tasks WHERE org_id = ?1 GROUP BY status")?;
+        let rows = stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (s, n) = row?;
             by_status.insert(s, json!(n));
@@ -242,9 +253,10 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
     let mut cycle: Vec<f64> = Vec::new();
     {
         let mut stmt = c.prepare(
-            "SELECT created_at, completed_at FROM tasks WHERE status = 'done' AND completed_at IS NOT NULL",
+            "SELECT created_at, completed_at FROM tasks WHERE org_id = ?1 AND status = 'done' \
+             AND completed_at IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (created, completed) = row?;
             if let (Some(a), Some(b)) = (parse_ts(&created), parse_ts(&completed)) {
@@ -252,9 +264,15 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
             }
         }
     }
+    // The call totals carry the same rule as perf_summary: the reader's
+    // organization only, and in it restricted readers count only their own
+    // calls.
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
-        [&week],
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 AND {CALL_SCOPE}"
+        ),
+        params_from_iter(std::iter::once(&week as &dyn rusqlite::ToSql).chain(reader.call_bindings())),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let size = match db_file_sizes(db_path) {
@@ -272,7 +290,12 @@ fn metrics_snapshot(c: &Connection, db_path: Option<&Path>) -> UaResult<Value> {
             "min": stat(|v| v.iter().copied().fold(f64::INFINITY, f64::min)),
             "max": stat(|v| v.iter().copied().fold(0.0, f64::max)),
         },
-        "tool_calls_last_7_days": { "calls": calls, "errors": errors, "error_rate": rate(errors, calls) },
+        "tool_calls_last_7_days": {
+            "calls": calls,
+            "errors": errors,
+            "error_rate": rate(errors, calls),
+            "scope": if reader.unrestricted() { "all" } else { "own_calls" },
+        },
         "db_size_bytes": size,
     }))
 }
@@ -336,14 +359,18 @@ fn rss_bytes() -> Option<u64> {
     Some(pages * 4096)
 }
 
-fn perf_summary(c: &Connection, a: PerfArgs) -> UaResult<Value> {
+fn perf_summary(c: &Connection, reader: &EventReader, a: PerfArgs) -> UaResult<Value> {
     let hours = a.since_hours.filter(|h| h.is_finite() && *h > 0.0).unwrap_or(PERF_WINDOW_HOURS_DEFAULT);
     let cutoff = agents::ago((hours * 3600.0).min(1e12) as i64);
-    let mut stmt = c.prepare(
-        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-         ORDER BY id DESC",
-    )?;
-    let rows = stmt.query_map([&cutoff], |r| {
+    // Other callers' governed calls are private activity: a reader counts
+    // only its own organization's calls, and a restricted reader's buckets
+    // count only its own calls, like evidence's tool_call_window.
+    let mut stmt = c.prepare(&format!(
+        "SELECT tool, caller, duration_ms, outcome FROM tool_calls WHERE started_at >= ? AND page = 0 \
+         AND {CALL_SCOPE} ORDER BY id DESC"
+    ))?;
+    let args = std::iter::once(&cutoff as &dyn rusqlite::ToSql).chain(reader.call_bindings());
+    let rows = stmt.query_map(params_from_iter(args), |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
     })?;
     let mut by_tool: BTreeMap<String, Bucket> = BTreeMap::new();
@@ -365,6 +392,7 @@ fn perf_summary(c: &Connection, a: PerfArgs) -> UaResult<Value> {
         "window_hours": hours,
         "since": cutoff,
         "source": "tool_calls",
+        "scope": if reader.unrestricted() { "all" } else { "own_calls" },
         "by_tool": by_tool.into_iter().map(|(k, b)| (k, b.summary(true))).collect::<Map<_, _>>(),
         "by_caller": by_caller.into_iter().map(|(k, b)| (k, b.summary(false))).collect::<Map<_, _>>(),
         "total": total.summary(true),
@@ -393,7 +421,7 @@ fn mem_available_percent() -> Option<(f64, u64, u64)> {
     (total > 0).then(|| (avail as f64 * 100.0 / total as f64, avail, total))
 }
 
-fn check_anomalies(c: &Connection) -> UaResult<Value> {
+fn check_anomalies(c: &Connection, org: &str, reader: &EventReader) -> UaResult<Value> {
     let mut out: Vec<Value> = Vec::new();
 
     // stale_doing_task
@@ -401,9 +429,9 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
         let cutoff = agents::ago(STALE_DOING_DAYS * 86_400);
         let mut stmt = c.prepare(
             "SELECT id, title, updated_at, claimed_by FROM tasks \
-             WHERE status = 'doing' AND archived_at IS NULL AND updated_at < ?1 ORDER BY id",
+             WHERE org_id = ?2 AND status = 'doing' AND archived_at IS NULL AND updated_at < ?1 ORDER BY id",
         )?;
-        let rows = stmt.query_map([&cutoff], |r| {
+        let rows = stmt.query_map([cutoff.as_str(), org], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -429,11 +457,12 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
     {
         let cutoff = agents::ago(REVIEW_WAIT_HOURS * 3600);
         let mut stmt = c.prepare(
-            "SELECT id, updated_at FROM tasks WHERE status NOT IN ('done','cancelled') AND archived_at IS NULL \
-             AND instr(COALESCE(notes, ''), '[waiting-for: review]') > 0 \
+            "SELECT id, updated_at FROM tasks WHERE org_id = ?2 AND status NOT IN ('done','cancelled') \
+             AND archived_at IS NULL AND instr(COALESCE(notes, ''), '[waiting-for: review]') > 0 \
              AND instr(COALESCE(notes, ''), '[review:') = 0 AND updated_at < ?1 ORDER BY id",
         )?;
-        let rows = stmt.query_map([&cutoff], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows =
+            stmt.query_map([cutoff.as_str(), org], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, updated) = row?;
             out.push(anomaly(
@@ -465,8 +494,26 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
             claims.push((task, agent, at));
         }
     }
+    // Claims of another organization's tasks are not this reader's (a
+    // deleted task has no organization left and stays counted, as before).
+    {
+        let mut foreign = BTreeSet::new();
+        for (task, _, _) in &claims {
+            let owner: Option<String> =
+                c.query_row("SELECT org_id FROM tasks WHERE id = ?1", [task], |r| r.get(0)).optional()?;
+            if owner.is_some_and(|o| o != org) {
+                foreign.insert(*task);
+            }
+        }
+        claims.retain(|(task, _, _)| !foreign.contains(task));
+    }
     let task_status = |id: i64| -> UaResult<Option<String>> {
-        Ok(c.query_row("SELECT status FROM tasks WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+        Ok(c.query_row(
+            "SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2",
+            rusqlite::params![org, id],
+            |r| r.get(0),
+        )
+        .optional()?)
     };
 
     // task_reassignment_thrash
@@ -536,8 +583,9 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
     {
         let cutoff = agents::ago(APPROVAL_AGE_HOURS * 3600);
         let (n, oldest): (i64, Option<String>) = c.query_row(
-            "SELECT COUNT(*), MIN(created_at) FROM approvals WHERE status = 'pending' AND created_at < ?1",
-            [&cutoff],
+            "SELECT COUNT(*), MIN(created_at) FROM approvals WHERE org_id = ?2 AND status = 'pending' \
+             AND created_at < ?1",
+            rusqlite::params![cutoff, org],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if n > 0 {
@@ -556,13 +604,13 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
     // unverified_done
     {
         let mut stmt = c.prepare(
-            "SELECT id FROM tasks WHERE status = 'done' AND archived_at IS NULL \
+            "SELECT id FROM tasks WHERE org_id = ?1 AND status = 'done' AND archived_at IS NULL \
              AND instr(COALESCE(notes, ''), '[code-task]') > 0 \
              AND COALESCE(trim(evidence_ref), '') = '' \
              AND instr(COALESCE(notes, ''), '[review:') = 0 \
              AND instr(COALESCE(notes, ''), '[merged commit:') = 0 ORDER BY id",
         )?;
-        let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let ids = stmt.query_map([org], |r| r.get::<_, i64>(0))?;
         for id in ids {
             let id = id?;
             out.push(anomaly(
@@ -574,14 +622,19 @@ fn check_anomalies(c: &Connection) -> UaResult<Value> {
         }
     }
 
-    // tool_error_rate (from tool_calls, last 24 h)
+    // tool_error_rate (from tool_calls, last 24 h): the reader's
+    // organization only, and a restricted reader's rule counts only its own
+    // calls, same as perf_summary.
     {
         let cutoff = agents::ago(86_400);
-        let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY tool HAVING COUNT(*) >= ?2 ORDER BY tool",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![cutoff, TOOL_ERROR_MIN_CALLS], |r| {
+        let mut stmt = c.prepare(&format!(
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ? AND page = 0 \
+             AND {CALL_SCOPE} GROUP BY tool HAVING COUNT(*) >= ? ORDER BY tool"
+        ))?;
+        let args = std::iter::once(&cutoff as &dyn rusqlite::ToSql)
+            .chain(reader.call_bindings())
+            .chain(std::iter::once(&TOOL_ERROR_MIN_CALLS as &dyn rusqlite::ToSql));
+        let rows = stmt.query_map(params_from_iter(args), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
         })?;
         for row in rows {
@@ -679,8 +732,9 @@ fn latency(mut v: Vec<i64>) -> Value {
 /// Per-agent delegation counts, states and latencies over a window, read
 /// from the `delegations` table. Latencies are in seconds: `completion` from
 /// creation to a terminal state (`completed_at`), `first_claim` from creation
-/// to the claim of delegations claimed exactly once.
-fn delegation_stats(c: &Connection, a: DelegationStatsArgs) -> UaResult<Value> {
+/// to the claim of delegations claimed exactly once. Only the reader's
+/// organization `org`'s delegations are counted.
+fn delegation_stats(c: &Connection, org: &str, a: DelegationStatsArgs) -> UaResult<Value> {
     let now = Timestamp::now();
     let since = match a.since.as_deref() {
         Some(raw) => normalize_since("since", raw)?,
@@ -694,11 +748,11 @@ fn delegation_stats(c: &Connection, a: DelegationStatsArgs) -> UaResult<Value> {
     let agent = a.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let mut sql = String::from(
         "SELECT from_agent, to_agent, status, created_at, completed_at, attempts, last_attempt_at \
-         FROM delegations WHERE created_at >= ?1",
+         FROM delegations WHERE org_id = ?1 AND created_at >= ?2",
     );
-    let mut args = vec![since.clone()];
+    let mut args = vec![org.to_string(), since.clone()];
     if let Some(ag) = &agent {
-        sql.push_str(" AND (from_agent = ?2 OR to_agent = ?2)");
+        sql.push_str(" AND (from_agent = ?3 OR to_agent = ?3)");
         args.push(ag.clone());
     }
     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", DELEGATION_ROW_CAP + 1));
@@ -788,7 +842,7 @@ pub struct ManageArgs {
     pub params: Option<Value>,
 }
 
-const ACTIONS: [&str; 7] =
+pub(crate) const ACTIONS: [&str; 7] =
     ["activity", "metrics", "anomalies", "performance", "agents", "context", "delegation_stats"];
 
 pub(crate) fn canonical_action(action: &str) -> UaResult<&'static str> {
@@ -823,20 +877,26 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
     match act {
         "activity" => {
             let args: ActivityArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| agent_activity(c, args)).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| agent_activity(c, &reader, args)).await
         }
         "metrics" => {
             let _: NoArgs = parse_params("observability", act, p)?;
             let path = ctx.hub.db().path().map(Path::to_path_buf);
-            read(&ctx, move |c| metrics_snapshot(c, path.as_deref())).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| metrics_snapshot(c, &org, &reader, path.as_deref())).await
         }
         "anomalies" => {
             let _: NoArgs = parse_params("observability", act, p)?;
-            read(&ctx, check_anomalies).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| check_anomalies(c, &org, &reader)).await
         }
         "performance" => {
             let args: PerfArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| perf_summary(c, args)).await
+            let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+            read(&ctx, move |c| perf_summary(c, &reader, args)).await
         }
         "agents" => {
             let args: AgentListArgs = parse_params("observability", act, p)?;
@@ -848,9 +908,10 @@ async fn manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
         }
         "delegation_stats" => {
             let args: DelegationStatsArgs = parse_params("observability", act, p)?;
-            read(&ctx, move |c| delegation_stats(c, args)).await
+            let org = ctx.caller.org_id.clone();
+            read(&ctx, move |c| delegation_stats(c, &org, args)).await
         }
-        other => Err(UaError::invalid(format!("unknown observability action {other:?}"))),
+        other => Err(crate::routes::unhandled("observability_manage", other)),
     }
 }
 
@@ -882,7 +943,7 @@ struct DbFacts {
     page_count: i64,
     page_size: i64,
     freelist: i64,
-    applied_parts: BTreeMap<String, String>,
+    schema_compat: Result<ua_store::backup::SchemaCompatibility, String>,
     chain: ledger::VerifyReport,
     notes: i64,
     embedded: i64,
@@ -891,23 +952,31 @@ struct DbFacts {
     quick_check: Option<String>,
     /// Registered nodes, or why they could not be read.
     fleet: Result<nodes::Fleet, String>,
+    /// Idempotency receipts the `idempotency.v2.tenant_keys` rebuild kept in
+    /// the default organization under an organization prefix no single
+    /// organization held (`families::idempotency::unplaced_rows`). A
+    /// hub-wide count, so only a default-organization reader gets it.
+    idempotency_unplaced: Option<i64>,
 }
 
-fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
-    let mut applied = BTreeMap::new();
-    {
-        let mut stmt = c.prepare("SELECT name, checksum FROM schema_parts")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (n, s) = row?;
-            applied.insert(n, s);
-        }
-    }
-    let count = |sql: &str| -> UaResult<i64> { Ok(c.query_row(sql, [], |r| r.get(0)).unwrap_or(0)) };
+/// Database facts for `system_doctor`. The memory counts are organization
+/// `org`'s (the caller's), so another organization learns nothing of the
+/// hub's other notes.
+fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
+    let schema_compat = ua_store::backup::check_schema_compatibility(
+        c,
+        &crate::schema_parts(),
+        &crate::optional_schema_parts(),
+    )
+    .map_err(|e| e.to_string());
+    // The hub's webhook is the default organization's destination
+    // (`families::notify`): its health is that organization's last delivery.
     let last_delivery = c
-        .query_row("SELECT status, last_error FROM notify_outbox ORDER BY id DESC LIMIT 1", [], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-        })
+        .query_row(
+            "SELECT status, last_error FROM notify_outbox WHERE org_id = ?1 ORDER BY id DESC LIMIT 1",
+            [ua_core::DEFAULT_ORG],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
         .optional()
         .unwrap_or(None);
     let quick_check =
@@ -917,14 +986,28 @@ fn db_facts(c: &Connection, deep: bool) -> UaResult<DbFacts> {
         page_count: pragma_i64(c, "page_count")?,
         page_size: pragma_i64(c, "page_size")?,
         freelist: pragma_i64(c, "freelist_count")?,
-        applied_parts: applied,
+        schema_compat,
         chain: ledger::verify(c)?,
-        notes: count("SELECT COUNT(*) FROM memory")?,
-        embedded: count("SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id")?,
-        active_tokens: count("SELECT COUNT(*) FROM agent_tokens WHERE status = 'active'")?,
+        notes: c.query_row("SELECT COUNT(*) FROM memory WHERE org_id = ?1", [org], |r| r.get(0)).unwrap_or(0),
+        embedded: c
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
+                 WHERE e.org_id = ?1",
+                [org],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+        active_tokens: c
+            .query_row("SELECT COUNT(*) FROM agent_tokens WHERE org_id = ?1 AND status = 'active'", [org], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0),
         last_delivery,
         quick_check,
-        fleet: nodes::fleet(c, Timestamp::now()).map_err(|e| e.to_string()),
+        fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
+        idempotency_unplaced: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::idempotency::unplaced_rows(c).ok())
+            .flatten(),
     })
 }
 
@@ -972,7 +1055,11 @@ fn bind_check(cfg: &Config) -> Value {
         }
         (false, false) => (
             MISCONFIGURED,
-            format!("listening beyond loopback on port {} without enforced auth", cfg.bind.port()),
+            format!(
+                "listening beyond loopback on port {} without enforced auth: anyone who can reach it can read \
+                 every mailbox and conversation",
+                cfg.bind.port()
+            ),
         ),
     };
     finding("http_bind", status, detail, "UA_BIND, UA_ENFORCE_AUTH")
@@ -980,8 +1067,17 @@ fn bind_check(cfg: &Config) -> Value {
 
 fn approval_check(cfg: &Config, reg: &Registry) -> Value {
     let always: Vec<&str> = reg.all().filter(|t| t.always_gated).map(|t| t.name).collect();
-    let unknown: Vec<&str> =
-        cfg.approval_tools.iter().map(String::as_str).filter(|t| reg.get(t).is_none()).collect();
+    // A `tool:action` key names an action of a consolidated tool with no
+    // standalone tool (see `crate::routes`); any other name must be a tool.
+    let unknown: Vec<String> = cfg
+        .approval_tools
+        .iter()
+        .filter(|t| reg.get(t).is_none())
+        .filter_map(|t| match t.contains(':') {
+            true => crate::routes::check_gate_name(t).err(),
+            false => Some(t.clone()),
+        })
+        .collect();
     let configured = cfg.approval_tools.len();
     let mut detail = format!("{configured} configured gated tool(s); {} always-gated tool(s)", always.len());
     let status = if configured == 0 && always.is_empty() {
@@ -1100,6 +1196,23 @@ fn search_check(reg: &Registry) -> Value {
     }
 }
 
+/// The default Cargo features this build left out, and what each one's
+/// absence costs. `embeddings` is off by default and has its own row
+/// (semantic_search).
+fn build_features_check() -> Value {
+    let gate = "cargo features code-intel, readability, mcp-gateway, mcp-server, slack-socket (all default)";
+    let off: Vec<String> = crate::BUILD_FEATURES
+        .iter()
+        .filter(|f| !f.enabled && f.feature != "embeddings")
+        .map(|f| format!("{}: {}", f.feature, f.without))
+        .collect();
+    if off.is_empty() {
+        finding("build_features", LIVE, "every default feature is compiled in", gate)
+    } else {
+        finding("build_features", DORMANT, format!("built without {}", off.join("; ")), gate)
+    }
+}
+
 fn embeddings_check(facts: &DbFacts) -> Value {
     let gate = "cargo feature `embeddings`, UA_EMBED_MODEL";
     if !ua_memory::EMBEDDINGS_ENABLED {
@@ -1189,6 +1302,14 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         }
         detail.push_str(&format!("; quick_check={q}"));
     }
+    // Informational: such a receipt never replays to anyone, it is kept
+    // rather than dropped (`docs/organization.md`, idempotency keys).
+    if let Some(n) = facts.idempotency_unplaced.filter(|n| *n > 0) {
+        detail.push_str(&format!(
+            "; {n} idempotency key(s) kept in the default organization under an organization prefix no \
+             organization holds"
+        ));
+    }
     let stats = json!({
         "file_bytes": main,
         "wal_bytes": wal,
@@ -1197,37 +1318,83 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         "freelist_count": facts.freelist,
         "journal_mode": facts.journal_mode,
         "quick_check": facts.quick_check,
+        "idempotency_keys_unplaced": facts.idempotency_unplaced,
     });
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }
 
 fn schema_check(facts: &DbFacts) -> Value {
     let expected = crate::schema_parts();
-    let mut missing = Vec::new();
-    let mut drifted = Vec::new();
-    for part in &expected {
-        let sum = hex::encode(Sha256::digest(part.sql.as_bytes()));
-        match facts.applied_parts.get(part.name) {
-            None => missing.push(part.name),
-            Some(s) if *s != sum => drifted.push(part.name),
-            Some(_) => {}
-        }
-    }
-    let known: BTreeSet<&str> = expected.iter().map(|p| p.name).collect();
-    let extra = facts.applied_parts.keys().filter(|k| !known.contains(k.as_str())).count();
     let gate = "schema_parts";
-    if !missing.is_empty() {
-        finding("schema", MISCONFIGURED, format!("schema parts not applied: {}", missing.join(", ")), gate)
-    } else if !drifted.is_empty() {
+    let compat = match &facts.schema_compat {
+        Ok(c) => c,
+        Err(e) => return finding("schema", DEGRADED, format!("schema check failed: {e}"), gate),
+    };
+    if compat.has_tampering_or_unowned_objects() {
+        let mut issues = Vec::new();
+        if let Some(ref err) = compat.reference_error {
+            issues.push(format!("reference schema error: {err}"));
+        }
+        if !compat.drifted.is_empty() {
+            issues.push(format!("applied parts differ from this build: {}", compat.drifted.join(", ")));
+        }
+        if !compat.missing_objects.is_empty() {
+            issues.push(format!("missing objects: {}", compat.missing_objects.join(", ")));
+        }
+        if !compat.modified_objects.is_empty() {
+            issues.push(format!("modified DDL: {}", compat.modified_objects.join(", ")));
+        }
+        if !compat.conflicting_objects.is_empty() {
+            issues.push(format!("conflicting objects: {}", compat.conflicting_objects.join(", ")));
+        }
+        if !compat.unexpected_indexes_on_known_tables.is_empty() {
+            issues.push(format!(
+                "unexpected indexes on known tables: {}",
+                compat.unexpected_indexes_on_known_tables.join(", ")
+            ));
+        }
+        if !compat.reserved_name_objects.is_empty() {
+            issues.push(format!("reserved sqlite_ names: {}", compat.reserved_name_objects.join(", ")));
+        }
+        if !compat.unexpected_foreign_keys_to_known_tables.is_empty() {
+            issues.push(format!(
+                "foreign keys into known tables: {}",
+                compat.unexpected_foreign_keys_to_known_tables.join(", ")
+            ));
+        }
+        if !compat.unexpected_tables.is_empty() {
+            issues.push(format!("unexpected tables/views: {}", compat.unexpected_tables.join(", ")));
+        }
+        if !compat.unexpected_indexes.is_empty() {
+            issues.push(format!("unexpected indexes: {}", compat.unexpected_indexes.join(", ")));
+        }
+        if !compat.unexpected_triggers.is_empty() {
+            issues.push(format!("unexpected triggers: {}", compat.unexpected_triggers.join(", ")));
+        }
+        finding("schema", DEGRADED, issues.join("; "), gate)
+    } else if !compat.missing.is_empty() {
+        finding(
+            "schema",
+            MISCONFIGURED,
+            format!("schema parts not applied: {}", compat.missing.join(", ")),
+            gate,
+        )
+    } else if !compat.extra.is_empty() {
+        // Only reachable with the override: a fenced open refuses this database.
         finding(
             "schema",
             DEGRADED,
-            format!("applied parts differ from this build: {}", drifted.join(", ")),
+            format!(
+                "all {} schema parts applied, and {} part(s) from a newer build ({}) that this build ignores; \
+                 it opened the database only because --allow-newer-schema or UA_ALLOW_NEWER_SCHEMA is set",
+                expected.len(),
+                compat.extra.len(),
+                compat.extra.join(", ")
+            ),
             gate,
         )
     } else {
-        let note = if extra > 0 { format!("; {extra} part(s) from another build") } else { String::new() };
-        finding("schema", LIVE, format!("all {} schema parts applied{note}", expected.len()), gate)
+        finding("schema", LIVE, format!("all {} schema parts applied", expected.len()), gate)
     }
 }
 
@@ -1263,6 +1430,172 @@ fn notify_check(cfg: &Config, facts: &DbFacts) -> Value {
         }
         _ => finding("notify_webhook", LIVE, base, gate),
     }
+}
+
+/// Organizations the GitHub credential line names at most.
+const GITHUB_ORGS_SHOWN: usize = 50;
+
+/// Each organization's GitHub credentials: `configured`, `off` or
+/// `unusable` and where from, never a value. Only a hub operator (a
+/// verified human of the default organization) sees each organization by
+/// name; any other caller sees counts only, over every organization for a
+/// default-organization caller and over its own for any other. The
+/// automation runs per organization, so the line also counts, over the same
+/// organizations, repositories whose last poll failed (no values, no
+/// names): only those still bound, in an organization whose token is still
+/// usable. It also counts, over the same organizations, webhook routes
+/// refused because another route shares their secret (`shared`, from
+/// [`crate::Hub::shared_webhook_routes_for_report`]; `None` when that check
+/// failed and every route is refused). LIVE when one is configured,
+/// DEGRADED when a stored one is unusable, a poll is failing or a webhook
+/// route is refused, DORMANT when all are off.
+fn github_credentials_check(
+    c: &Connection,
+    cfg: &Config,
+    caller: &ua_core::Caller,
+    shared: Option<&crate::families::github::credentials::SharedWebhookRoutes>,
+) -> UaResult<Value> {
+    use crate::families::github::credentials::{self, CredentialKind, CredentialSource, CredentialState};
+    let gate = "github_token_env, github_webhook_secret_env (default organization); github_credential_set \
+                (another organization)";
+    let caller_org = caller.org_id.as_str();
+    let orgs: Vec<String> = if caller_org == ua_core::DEFAULT_ORG {
+        let mut stmt = c.prepare("SELECT id FROM orgs ORDER BY id = ?1 DESC, id")?;
+        stmt.query_map([ua_core::DEFAULT_ORG], |r| r.get(0))?.collect::<Result<_, _>>()?
+    } else {
+        vec![caller_org.to_string()]
+    };
+    let full_view =
+        caller_org == ua_core::DEFAULT_ORG && crate::families::managed_secrets::is_secret_admin(cfg, caller);
+    let (mut lines, mut configured, mut unusable) = (Vec::new(), false, false);
+    // Per kind: configured, unusable, off.
+    let mut counts = [[0usize; 3]; 2];
+    for (i, org) in orgs.iter().enumerate() {
+        let mut parts = Vec::new();
+        for (k, kind) in CredentialKind::ALL.into_iter().enumerate() {
+            let s = credentials::credential_status(c, cfg, org, kind)?;
+            configured |= s.state == CredentialState::Configured;
+            unusable |= s.state == CredentialState::Unusable;
+            let slot = match s.state {
+                CredentialState::Configured => 0,
+                CredentialState::Unusable => 1,
+                CredentialState::Off => 2,
+            };
+            counts[k][slot] += 1;
+            if !full_view || i >= GITHUB_ORGS_SHOWN {
+                continue;
+            }
+            let state = match (s.state, s.source) {
+                (CredentialState::Configured, Some(CredentialSource::HubConfig)) => "configured (hub config)",
+                (CredentialState::Configured, _) => "configured (managed secret)",
+                (CredentialState::Unusable, _) => {
+                    "unusable (its key is not configured or its form is refused)"
+                }
+                (CredentialState::Off, _) => "off",
+            };
+            parts.push(format!("{} {state}", kind.as_str()));
+        }
+        if full_view && i < GITHUB_ORGS_SHOWN {
+            lines.push(format!("{org}: {}", parts.join(", ")));
+        }
+    }
+    if full_view && orgs.len() > GITHUB_ORGS_SHOWN {
+        lines.push(format!("and {} more organization(s)", orgs.len() - GITHUB_ORGS_SHOWN));
+    }
+    if !full_view {
+        let per_kind = CredentialKind::ALL.into_iter().zip(counts).map(|(kind, [ok, bad, off])| {
+            format!("{} {ok} configured, {bad} unusable, {off} off", kind.as_str())
+        });
+        lines.push(format!("{} organization(s): {}", orgs.len(), per_kind.collect::<Vec<_>>().join(", ")));
+    }
+    // Only repositories the poller still polls: bound now, in an
+    // organization whose token is still usable. A row left by a repository
+    // since unbound, or by a token since cleared, is history, not a failure.
+    let mut failing = 0i64;
+    for org in &orgs {
+        if credentials::credential_status(c, cfg, org, CredentialKind::Token)?.state
+            != CredentialState::Configured
+        {
+            continue;
+        }
+        failing += c.query_row(
+            "SELECT count(*) FROM github_poll_repos p WHERE p.org_id = ?1 AND p.last_error IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM project_repo_bindings b WHERE b.org_id = p.org_id AND lower(b.repo) = p.repo)",
+            [org],
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    // Counted over the organizations this caller sees; never which value.
+    let refused = match shared {
+        Some(shared) => format!(
+            "{} webhook route(s) refused because another route shares their secret",
+            orgs.iter().filter(|o| shared.contains(o.as_str())).count()
+        ),
+        None => "every webhook route refused because the webhook secret sharing check failed".to_string(),
+    };
+    let detail = format!(
+        "{}; automation runs per organization under its own credentials; {failing} bound repositor{} whose \
+         last poll failed; {refused}",
+        lines.join("; "),
+        if failing == 1 { "y" } else { "ies" }
+    );
+    let status = if unusable || failing > 0 || !refused.starts_with("0 ") {
+        DEGRADED
+    } else if configured {
+        LIVE
+    } else {
+        DORMANT
+    };
+    Ok(finding("github_credentials", status, detail, gate))
+}
+
+/// Slack: the HTTP routes (mounted or why not) and the Socket Mode
+/// transport (off, not compiled, connecting, connected, auth failed). The
+/// signing secret and the app token are only checked for presence.
+fn slack_check(cfg: &Config) -> Value {
+    use crate::families::slack;
+    let gate = "slack_enabled, UA_SLACK_SIGNING_SECRET, slack_socket_mode, UA_SLACK_APP_TOKEN, slack_identities, \
+                cargo feature slack-socket";
+    if !cfg.slack_enabled && !cfg.slack_socket_mode {
+        return finding(
+            "slack",
+            DORMANT,
+            "Slack is off (slack_enabled and slack_socket_mode are false)",
+            gate,
+        );
+    }
+    if cfg.check_slack_identities().is_err() {
+        return finding("slack", MISCONFIGURED, "slack_identities is invalid; Slack is not served", gate);
+    }
+    let http = match (cfg.slack_enabled, cfg.slack_signing_secret().is_some()) {
+        (false, _) => "HTTP routes off",
+        (true, true) => "HTTP routes mounted",
+        (true, false) => "HTTP routes not mounted (UA_SLACK_SIGNING_SECRET unset)",
+    };
+    let socket = match (cfg.slack_socket_mode, slack::socket_status(cfg)) {
+        (false, _) => "Socket Mode off".to_string(),
+        (true, Err(why)) => why.to_string(),
+        (true, Ok(_)) => match slack::socket_state() {
+            Some(s) => match slack::socket_busy_count() {
+                0 => format!("Socket Mode {}", s.as_str()),
+                n => format!("Socket Mode {} ({n} envelope(s) turned away busy since start)", s.as_str()),
+            },
+            None => "Socket Mode configured (its state is known only inside ua serve)".to_string(),
+        },
+    };
+    let mappings = cfg.slack_identities.len();
+    let detail = format!("{http}; {socket}; {mappings} mapped Slack user(s)");
+    let broken = (cfg.slack_enabled && cfg.slack_signing_secret().is_none())
+        || (cfg.slack_socket_mode && slack::socket_status(cfg).is_err());
+    let failed = matches!(slack::socket_state(), Some(slack::SocketState::AuthFailed));
+    let status = if failed {
+        DEGRADED
+    } else if broken {
+        MISCONFIGURED
+    } else {
+        LIVE
+    };
+    finding("slack", status, detail, gate)
 }
 
 /// Zulip: DORMANT until site, email and key are all set; the API key's value
@@ -1323,7 +1656,17 @@ fn policy_check(cfg: &Config) -> Value {
     let gate = "UA_POLICY_FILE";
     match &cfg.policy_file {
         None => finding("policy_file", DORMANT, "no policy file is configured", gate),
-        Some(p) if p.is_file() => finding("policy_file", LIVE, "policy file present", gate),
+        Some(p) if p.is_file() => {
+            match crate::policy::load(p).map(|p| crate::policy::unknown_action_keys(&p)) {
+                Ok(unknown) if !unknown.is_empty() => finding(
+                    "policy_file",
+                    DEGRADED,
+                    format!("policy file present; rules name no known tool action: {}", unknown.join("; ")),
+                    gate,
+                ),
+                _ => finding("policy_file", LIVE, "policy file present", gate),
+            }
+        }
         Some(_) => finding("policy_file", MISCONFIGURED, "the configured policy file does not exist", gate),
     }
 }
@@ -1341,7 +1684,7 @@ fn human_age(secs: i64) -> String {
 /// Registered remote nodes: LIVE when every node in service is live,
 /// DEGRADED naming the ones that are not, DORMANT when none is registered.
 /// Retired nodes are not hosts; they are named once and never change the status.
-fn fleet_nodes_check(facts: &DbFacts) -> Value {
+fn fleet_nodes_check(facts: &DbFacts, require_acceptance: bool) -> Value {
     let gate = "node_register / node_heartbeat (POST /api/node/*)";
     let fleet = match &facts.fleet {
         Ok(f) => f,
@@ -1388,6 +1731,13 @@ fn fleet_nodes_check(facts: &DbFacts) -> Value {
             fleet.retired.join(", ")
         ));
     }
+    let blocked = if require_acceptance { fleet.other_org_unaccepted } else { 0 };
+    if blocked > 0 {
+        parts.push(format!(
+            "{blocked} other-organization node(s) in service take no real work: node_require_acceptance is on \
+             and device acceptance runs only for the default organization's nodes"
+        ));
+    }
     let mut row = finding("fleet_nodes", status, parts.join("; "), gate);
     row["hosts"] = fleet
         .active
@@ -1396,6 +1746,22 @@ fn fleet_nodes_check(facts: &DbFacts) -> Value {
         .collect();
     if !fleet.retired.is_empty() {
         row["retired"] = json!(fleet.retired);
+    }
+    // A hub-wide view lists only the default organization's nodes; the
+    // other organizations' are counts, never names or hosts.
+    if fleet.other_org_active + fleet.other_org_retired > 0 {
+        row["other_org_nodes"] =
+            json!({ "active": fleet.other_org_active, "retired": fleet.other_org_retired });
+    }
+    // Device acceptance runs only for default nodes, so with acceptance
+    // required another organization's node takes no real work.
+    if blocked > 0 {
+        row["other_org_nodes_not_accepted"] = json!(blocked);
+    }
+    // Another organization's command notices are kept, never sent (the
+    // mailbox has no organization yet); the owner reads node_command_status.
+    if fleet.other_org_unsent_notices > 0 {
+        row["other_org_unsent_command_notices"] = json!(fleet.other_org_unsent_notices);
     }
     row
 }
@@ -1411,7 +1777,13 @@ fn host_name() -> Option<String> {
 async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let clock = std::time::Instant::now();
     let deep = a.refresh;
-    let facts = ctx.hub.db().read_async(move |c| db_facts(c, deep)).await?;
+    let org = ctx.caller.org_id.clone();
+    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
+    let github = {
+        let (cfg, caller) = (ctx.hub.cfg().clone(), ctx.caller.clone());
+        let shared = ctx.hub.shared_webhook_routes_for_report().await;
+        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller, shared.as_ref())).await?
+    };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
@@ -1423,14 +1795,17 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         vault_check(cfg),
         workspace_check(cfg),
         search_check(reg),
+        build_features_check(),
         embeddings_check(&facts),
         ledger_check(&facts),
         db_row,
         schema_check(&facts),
         notify_check(cfg, &facts),
         zulip_check(cfg),
+        slack_check(cfg),
+        github,
         policy_check(cfg),
-        fleet_nodes_check(&facts),
+        fleet_nodes_check(&facts, cfg.node_require_acceptance),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
     let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]
@@ -1455,7 +1830,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         "build": {
             "name": "ua-rust",
             "version": env!("CARGO_PKG_VERSION"),
-            "features": { "embeddings": ua_memory::EMBEDDINGS_ENABLED },
+            "features": crate::build_features(),
+            "compiled_out_tools": crate::compiled_out_tools()
+                .map(|(tool, feature)| json!({ "tool": tool, "feature": feature }))
+                .collect::<Vec<_>>(),
             "tool_count": reg.len(),
         },
     }))
@@ -1505,25 +1883,35 @@ pub(crate) fn semantic_fingerprint<'a>(tools: impl Iterator<Item = &'a crate::To
     hex::encode(h.finalize())
 }
 
-fn call_counts(c: &Connection) -> UaResult<Value> {
+fn call_counts(c: &Connection, reader: &EventReader) -> UaResult<Value> {
+    // Every bucket is fed by the same scoped rows as perf_summary: the
+    // reader's organization only, and a restricted reader counts only its
+    // own calls.
+    let scope = format!("AND {CALL_SCOPE}");
     let day = agents::ago(86_400);
-    let (total, last_call): (i64, Option<String>) =
-        c.query_row("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    let windowed = || std::iter::once(&day as &dyn rusqlite::ToSql).chain(reader.call_bindings());
+    let (total, last_call): (i64, Option<String>) = c.query_row(
+        &format!("SELECT COUNT(*), MAX(started_at) FROM tool_calls WHERE page = 0 {scope}"),
+        params_from_iter(reader.call_bindings()),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     let (calls, errors): (i64, i64) = c.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls WHERE started_at >= ?1 AND page = 0",
-        [&day],
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(outcome != 'ok'), 0) FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope}"
+        ),
+        params_from_iter(windowed()),
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let mut by_transport = Map::new();
     {
-        let mut stmt = c.prepare(
-            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY transport ORDER BY transport",
-        )?;
-        let rows = stmt
-            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT transport, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope} GROUP BY transport ORDER BY transport"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(windowed()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
         for row in rows {
             let (t, n, e) = row?;
             by_transport.insert(t, json!({ "calls": n, "errors": e }));
@@ -1531,12 +1919,13 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
     }
     let mut top = Vec::new();
     {
-        let mut stmt = c.prepare(
-            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls WHERE started_at >= ?1 AND page = 0 \
-             GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20",
-        )?;
-        let rows = stmt
-            .query_map([&day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT tool, COUNT(*), SUM(outcome != 'ok') FROM tool_calls \
+             WHERE started_at >= ? AND page = 0 {scope} GROUP BY tool ORDER BY COUNT(*) DESC, tool LIMIT 20"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(windowed()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
         for row in rows {
             let (t, n, e) = row?;
             top.push(json!({ "tool": t, "calls": n, "errors": e }));
@@ -1545,6 +1934,7 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
     Ok(json!({
         "total_calls": total,
         "last_call_at": last_call,
+        "scope": if reader.unrestricted() { "all" } else { "own_calls" },
         "last_24h": { "calls": calls, "errors": errors, "error_rate": rate(errors, calls) },
         "by_transport_24h": by_transport,
         "top_tools_24h": top,
@@ -1553,7 +1943,8 @@ fn call_counts(c: &Connection) -> UaResult<Value> {
 
 async fn mcp_health_telemetry(ctx: ToolCtx, _a: NoArgs) -> UaResult<Value> {
     let reg = crate::builtin_registry_shared();
-    let calls = ctx.hub.db().read_async(call_counts).await?;
+    let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+    let calls = ctx.hub.db().read_async(move |c| call_counts(c, &reader)).await?;
     let callable = || reg.visible_to(&ctx.caller);
     let callable_count = callable().count();
     let schema = schema_fingerprint(callable());
@@ -1591,7 +1982,8 @@ pub fn register(r: &mut Registry) {
             "observability_manage",
             "Agent visibility, metrics, anomalies and performance in one tool. action: activity (ledger activity, \
              newest first), metrics (cluster snapshot), anomalies (deterministic health rules), performance \
-             (p50/p95 latency and error rates per tool and caller from tool_calls), agents (agent_list), \
+             (p50/p95 latency and error rates per tool and caller from tool_calls; a restricted reader's \
+             buckets count only its own calls), agents (agent_list), \
              context (agent_context), delegation_stats (params agent, window_days, since: per-agent delegation \
              counts sent and received, states, completion rate, and completion and first-claim latencies in \
              seconds, plus per-pair state counts). `params` holds the action's arguments. Read-only.",
@@ -1606,7 +1998,10 @@ pub fn register(r: &mut Registry) {
             "Ledger activity newest first, filtered by agent label, since (ISO-8601) and kind (the channel noun: \
              task, memory, plan...). limit defaults to 200, max 1000. Returns {events: [{id, agent, ts, kind, \
              ref_id, summary}], truncated}.",
-            |ctx: ToolCtx, a: ActivityArgs| async move { read(&ctx, move |c| agent_activity(c, a)).await },
+            |ctx: ToolCtx, a: ActivityArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| agent_activity(c, &reader, a)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1615,10 +2010,13 @@ pub fn register(r: &mut Registry) {
         tool(
             "metrics_snapshot",
             "Cluster snapshot: per-agent ledger event counts by kind for the last 7 days, tasks by status, \
-             done-task cycle time in days, tool-call totals and the database size.",
+             done-task cycle time in days, tool-call totals (own calls only for a restricted reader) \
+             and the database size.",
             |ctx: ToolCtx, _a: NoArgs| async move {
                 let path = ctx.hub.db().path().map(Path::to_path_buf);
-                read(&ctx, move |c| metrics_snapshot(c, path.as_deref())).await
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                let org = ctx.caller.org_id.clone();
+                read(&ctx, move |c| metrics_snapshot(c, &org, &reader, path.as_deref())).await
             },
         )
         .family("observability")
@@ -1628,8 +2026,12 @@ pub fn register(r: &mut Registry) {
         tool(
             "perf_summary",
             "Latency and error rates from tool_calls over the last since_hours (default 24): per tool (calls, \
-             errors, error_rate, avg/min/max/p50/p95 latency in ms, outcome codes), per caller, and in total.",
-            |ctx: ToolCtx, a: PerfArgs| async move { read(&ctx, move |c| perf_summary(c, a)).await },
+             errors, error_rate, avg/min/max/p50/p95 latency in ms, outcome codes), per caller, and in total. \
+             scope is all for a mail-unrestricted reader and own_calls otherwise.",
+            |ctx: ToolCtx, a: PerfArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                read(&ctx, move |c| perf_summary(c, &reader, a)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1639,9 +2041,14 @@ pub fn register(r: &mut Registry) {
             "check_anomalies",
             "Run the deterministic anomaly rules (no LLM): stale_doing_task, review_wait, \
              task_reassignment_thrash, agent_never_completes, approval_queue_age, unverified_done, \
-             tool_error_rate, ledger_chain, host_low_memory. Returns {anomalies: [{rule, subject, detail, \
+             tool_error_rate (counting only the caller's own calls unless it may read every mailbox), \
+             ledger_chain, host_low_memory. Returns {anomalies: [{rule, subject, detail, \
              severity}]}; empty when healthy.",
-            |ctx: ToolCtx, _a: NoArgs| async move { read(&ctx, check_anomalies).await },
+            |ctx: ToolCtx, _a: NoArgs| async move {
+                let reader = EventReader::new(ctx.hub.cfg(), &ctx.caller);
+                let org = ctx.caller.org_id.clone();
+                read(&ctx, move |c| check_anomalies(c, &org, &reader)).await
+            },
         )
         .family("observability")
         .read_only(),
@@ -1651,8 +2058,11 @@ pub fn register(r: &mut Registry) {
             "system_doctor",
             "Read-only LIVE/DORMANT/DEGRADED/MISCONFIGURED/UNKNOWN report over every config-gated capability of \
              this build: hub auth and token sources, HTTP bind, approval gating, vault, workspace root, search \
-             provider, semantic search (embeddings feature), ledger chain, database size and WAL, schema parts, \
-             notification webhook and policy file. Each finding names the setting that gates it. Never returns \
+             provider, optional Cargo features left out of this build (build_features; build.features lists \
+             code_intel, readability, mcp_gateway, mcp_server, slack_socket and embeddings, build.compiled_out_tools \
+             the tools a disabled feature removes), semantic search (embeddings feature), ledger chain, database \
+             size and WAL, schema parts, notification webhook, Slack ingress (HTTP routes and Socket Mode state) \
+             and policy file. Each finding names the setting that gates it. Never returns \
              secret values. refresh=true adds SQLite quick_check.",
             system_doctor,
         )
@@ -1664,7 +2074,8 @@ pub fn register(r: &mut Registry) {
             "mcp_health_telemetry",
             "Tool-surface health: schema_fingerprint (16 hex over the callable tools' names and argument keys; \
              re-list tools when it changes), registry and semantic (full input-schema) fingerprints, tool counts, \
-             and tool-call counts and error rates from tool_calls. No secrets.",
+             and tool-call counts and error rates from tool_calls (own calls only for a restricted \
+             reader). No secrets.",
             mcp_health_telemetry,
         )
         .family("observability")

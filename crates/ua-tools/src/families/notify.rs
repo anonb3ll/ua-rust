@@ -16,16 +16,36 @@
 //! `flush_digest` (or reaching `max_batch_size`) sends them as one digest.
 //! `notify` is denied to the developer and reviewer profiles by the profile
 //! lists, as in the original hub.
+//!
+//! Both tables are tenant data (`org_id`, `organization.v1.tools.notify`).
+//! Every row, read and write is scoped to one organization: the caller's for
+//! the tools, and for a hub-originated notification the organization of the
+//! row it is about. The webhook in the hub configuration is the default
+//! organization's destination, so it only ever receives the default
+//! organization's notifications: another organization's are kept in its own
+//! outbox as `not_configured` until organizations configure their own
+//! destinations. A caller whose organization `orgs` does not hold is refused
+//! before anything is written.
+//!
+//! Deliveries go through `ua_ingress::Outbound` under `notify.webhook`. The
+//! URL is the operator's, so it may name a private network or this host,
+//! over http or https; link-local (cloud metadata), multicast and reserved
+//! addresses are refused. No redirect is followed (the secret header would
+//! go with it) and no proxy is used. The secret header, and credentials in
+//! the URL (sent as basic auth), are bound to the URL's origin.
 
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use base64::Engine;
+
+use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
-use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
+use ua_ingress::{Outbound, OutboundError, Request, Url, policy};
+use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
 use crate::families::plans::write_identity;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -61,6 +81,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_notifications_cat ON pending_notification
 ",
 };
 
+/// `organization.v1.tools.notify`: `org_id` on `notify_outbox` and
+/// `pending_notifications` (existing rows backfilled to the default
+/// organization) and their generated `*_org_exists` / `*_org_immutable`
+/// triggers. Neither table has a key beyond its AUTOINCREMENT id, so no
+/// rebuild is needed. Applied after `notify.v1` and `organization.v1.store`.
+pub const TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.notify", &["notify_outbox", "pending_notifications"]);
+
+/// `notify.v2.org_indexes`: the indexes the per-organization reads use.
+/// Applied after [`TENANT_PART`], which adds the column.
+pub const ORG_INDEXES: SchemaPart = SchemaPart {
+    name: "notify.v2.org_indexes",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_notify_outbox_org ON notify_outbox(org_id, id);
+CREATE INDEX IF NOT EXISTS idx_pending_notifications_org_cat ON pending_notifications(org_id, category, id);
+",
+};
+
 const MAX_CHARS: usize = 8000;
 const TRUNCATED: &str = "\n…(truncated)";
 const MAX_ATTEMPTS_CAP: u32 = 10;
@@ -72,32 +110,90 @@ const ERROR_CHARS: usize = 300;
 
 /// The configured webhook, or `None` when notifications are not configured.
 struct Webhook {
-    url: reqwest::Url,
-    header: Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    /// The POST without its body: URL and secret headers.
+    request: Request,
     attempts: u32,
+}
+
+/// `%XX` escapes decoded, as the URL's user name and password are written.
+fn percent_decode(s: &str) -> Option<String> {
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(h), Some(l)) =
+                (b.get(i + 1).and_then(|c| hex(*c)), b.get(i + 2).and_then(|c| hex(*c)))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Credentials in the URL (`user:password@host`), taken out of it as a
+/// basic-auth header value. The HTTP client this replaced sent them so.
+fn take_basic_auth(url: &mut Url) -> UaResult<Option<String>> {
+    if url.username().is_empty() && url.password().is_none() {
+        return Ok(None);
+    }
+    let bad = || UaError::invalid("notify_webhook_url carries credentials that are not valid UTF-8");
+    let user = percent_decode(url.username()).ok_or_else(bad)?;
+    let pass = url.password().map(|p| percent_decode(p).ok_or_else(bad)).transpose()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let pair = format!("{user}:{}", pass.unwrap_or_default());
+    Ok(Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))))
+}
+
+/// Refuse an organization `orgs` does not hold, before anything is written.
+/// Organizations are never deleted, so the check cannot go stale.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let known = c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; no notification was recorded")));
+    }
+    Ok(())
+}
+
+/// The webhook that may carry `org`'s notifications. The hub configuration's
+/// webhook is the default organization's destination: another organization's
+/// content is never sent to it.
+fn webhook_for(cfg: &Config, org: &str) -> UaResult<Option<Webhook>> {
+    if org != ua_core::DEFAULT_ORG {
+        return Ok(None);
+    }
+    webhook(cfg)
 }
 
 fn webhook(cfg: &Config) -> UaResult<Option<Webhook>> {
     let Some(raw) = cfg.notify_webhook_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let url = reqwest::Url::parse(raw)
-        .map_err(|_| UaError::invalid("notify_webhook_url does not parse as a URL"))?;
+    let mut url =
+        Url::parse(raw).map_err(|_| UaError::invalid("notify_webhook_url does not parse as a URL"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UaError::invalid("notify_webhook_url must be http or https"));
     }
-    let header = match &cfg.notify_webhook_secret {
-        None => None,
-        Some(secret) => {
-            let name = reqwest::header::HeaderName::from_bytes(cfg.notify_webhook_header.trim().as_bytes())
-                .map_err(|_| UaError::invalid("notify_webhook_header is not a valid header name"))?;
-            let mut value = reqwest::header::HeaderValue::from_str(secret.expose_secret().trim())
-                .map_err(|_| UaError::invalid("notify_webhook_secret is not a valid header value"))?;
-            value.set_sensitive(true);
-            Some((name, value))
-        }
-    };
-    Ok(Some(Webhook { url, header, attempts: cfg.notify_max_attempts.clamp(1, MAX_ATTEMPTS_CAP) }))
+    let basic = take_basic_auth(&mut url)?;
+    let mut request = Request::post(url);
+    if let Some(value) = basic {
+        request = request.secret_header("authorization", &value).map_err(|_| {
+            UaError::invalid("notify_webhook_url carries credentials that are not a valid header")
+        })?;
+    }
+    if let Some(secret) = &cfg.notify_webhook_secret {
+        let name = reqwest::header::HeaderName::from_bytes(cfg.notify_webhook_header.trim().as_bytes())
+            .map_err(|_| UaError::invalid("notify_webhook_header is not a valid header name"))?;
+        let bad_value = || UaError::invalid("notify_webhook_secret is not a valid header value");
+        reqwest::header::HeaderValue::from_str(secret.expose_secret().trim()).map_err(|_| bad_value())?;
+        request =
+            request.secret_header(name.as_str(), secret.expose_secret().trim()).map_err(|_| bad_value())?;
+    }
+    Ok(Some(Webhook { request, attempts: cfg.notify_max_attempts.clamp(1, MAX_ATTEMPTS_CAP) }))
 }
 
 /// Outcome of the delivery attempts for one outbox row.
@@ -112,16 +208,30 @@ fn clip(s: &str) -> String {
     s.chars().take(ERROR_CHARS).collect()
 }
 
+/// The outbox error for a failed attempt, and whether to try again. Never
+/// quotes the URL, which may embed a credential.
+fn failure(e: &OutboundError) -> (String, bool) {
+    match e {
+        OutboundError::Timeout | OutboundError::NotSent { timed_out: true, .. } => {
+            ("webhook timed out".into(), true)
+        }
+        OutboundError::NotSent { .. } | OutboundError::Lookup { .. } => {
+            ("webhook connection failed".into(), true)
+        }
+        // Refused by the policy: the same answer every time.
+        OutboundError::AddressRefused { reason, .. } | OutboundError::PeerRefused { reason, .. } => {
+            (format!("webhook address refused ({reason})"), false)
+        }
+        OutboundError::UrlRefused { why, .. } => (format!("webhook URL refused ({why})"), false),
+        OutboundError::Unverified => ("webhook peer address could not be checked".into(), false),
+        _ => ("webhook request failed".into(), true),
+    }
+}
+
 async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
-    // rustls is built without a default provider; install ring once.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = match reqwest::Client::builder()
-        .timeout(timeout)
-        // Never follow redirects: a custom secret header would be replayed to
-        // whatever host the redirect names.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // The policy never follows a redirect: the secret header would go with it.
+    // The client is pinned to the configured URL's origin.
+    let client = match Outbound::pinned(policy::NOTIFY_WEBHOOK, hook.request.url()) {
         Ok(c) => c,
         Err(e) => {
             return Delivery {
@@ -133,13 +243,18 @@ async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
         }
     };
     let mut last = Delivery { delivered: false, attempts: 0, http_status: None, error: None };
-    for attempt in 1..=hook.attempts {
-        let mut req = client.post(hook.url.clone()).json(body);
-        if let Some((name, value)) = &hook.header {
-            req = req.header(name.clone(), value.clone());
+    let req = match hook.request.clone().json(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Delivery { error: Some(clip(&format!("webhook request failed: {e}"))), ..last };
         }
+    };
+    for attempt in 1..=hook.attempts {
         last.attempts = attempt;
-        let retry = match req.send().await {
+        let sent = tokio::time::timeout(timeout, client.send(req.clone()))
+            .await
+            .unwrap_or(Err(OutboundError::Timeout));
+        let retry = match sent {
             Ok(resp) => {
                 let status = resp.status();
                 last.http_status = Some(status.as_u16());
@@ -152,16 +267,9 @@ async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
                 status.is_server_error() || status.as_u16() == 429
             }
             Err(e) => {
-                // Errors can echo the URL, which may embed a credential.
-                let kind = if e.is_timeout() {
-                    "timed out"
-                } else if e.is_connect() {
-                    "connection failed"
-                } else {
-                    "request failed"
-                };
-                last.error = Some(format!("webhook {kind}"));
-                true
+                let (error, retry) = failure(&e);
+                last.error = Some(clip(&error));
+                retry
             }
         };
         if !retry || attempt == hook.attempts {
@@ -175,24 +283,29 @@ async fn post(hook: &Webhook, body: &Value, timeout: Duration) -> Delivery {
 /// A new outbox row plus its ledger event, in one transaction.
 fn enqueue(
     tx: &mut WriteTx<'_>,
+    org: &str,
     kind: &str,
     category: Option<&str>,
     agent: &str,
     message: &str,
     configured: bool,
 ) -> UaResult<i64> {
+    require_org(tx, org)?;
     let now = ua_core::time::now();
     let status = if configured { "pending" } else { "not_configured" };
     let chars = message.chars().count() as i64;
     tx.execute(
-        "INSERT INTO notify_outbox (kind, category, agent, message, chars, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![kind, category, agent, message, chars, status, now],
+        "INSERT INTO notify_outbox (org_id, kind, category, agent, message, chars, status, created_at, \
+         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![org, kind, category, agent, message, chars, status, now],
     )?;
     let id = tx.last_insert_rowid();
+    // ORG-EVENT-DEFAULT: use the row's organization once org_guard allows it.
+    // The payload carries ids and counts, never the message.
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             "agent.notify.queued",
             json!({ "outbox_id": id, "kind": kind, "category": category, "chars": chars, "status": status }),
         )
@@ -202,18 +315,23 @@ fn enqueue(
 }
 
 /// Write the delivery outcome and its ledger event.
-fn settle(tx: &mut WriteTx<'_>, id: i64, agent: &str, d: &Delivery) -> UaResult<()> {
+fn settle(tx: &mut WriteTx<'_>, org: &str, id: i64, agent: &str, d: &Delivery) -> UaResult<()> {
     let now = ua_core::time::now();
     let status = if d.delivered { "delivered" } else { "failed" };
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE notify_outbox SET status = ?1, attempts = attempts + ?2, http_status = ?3, last_error = ?4, \
          updated_at = ?5, delivered_at = CASE WHEN ?1 = 'delivered' THEN ?5 ELSE delivered_at END, \
-         message = CASE WHEN ?1 = 'delivered' THEN NULL ELSE message END WHERE id = ?6",
-        params![status, d.attempts, d.http_status, d.error, now, id],
+         message = CASE WHEN ?1 = 'delivered' THEN NULL ELSE message END WHERE org_id = ?6 AND id = ?7",
+        params![status, d.attempts, d.http_status, d.error, now, org, id],
     )?;
+    if changed == 0 {
+        return Err(UaError::not_found(format!("no notification {id}")));
+    }
+    // ORG-EVENT-DEFAULT: use the row's organization once org_guard allows it.
     ledger::append(
         tx,
         EventInput::new(
+            ua_core::DEFAULT_ORG,
             format!("agent.notify.{status}"),
             json!({ "outbox_id": id, "attempts": d.attempts, "http_status": d.http_status }),
         )
@@ -222,25 +340,32 @@ fn settle(tx: &mut WriteTx<'_>, id: i64, agent: &str, d: &Delivery) -> UaResult<
     Ok(())
 }
 
-/// Record a message in the outbox and deliver it when a webhook is configured.
+/// Record a message in `org`'s outbox and deliver it when a webhook is
+/// configured for `org` ([`webhook_for`]).
 async fn send(
     hub: &crate::Hub,
+    org: String,
     kind: &'static str,
     category: Option<String>,
     agent: String,
     message: String,
     timeout: Duration,
 ) -> UaResult<Value> {
-    let hook = webhook(hub.cfg())?;
+    let hook = webhook_for(hub.cfg(), &org)?;
     let configured = hook.is_some();
     let chars = message.chars().count();
-    let (a, m, c) = (agent.clone(), message.clone(), category.clone());
-    let id = hub.db().write_async(move |tx| enqueue(tx, kind, c.as_deref(), &a, &m, configured)).await?;
+    let (o, a, m, c) = (org.clone(), agent.clone(), message.clone(), category.clone());
+    let id = hub.db().write_async(move |tx| enqueue(tx, &o, kind, c.as_deref(), &a, &m, configured)).await?;
     let Some(hook) = hook else {
+        let error = if org == ua_core::DEFAULT_ORG {
+            "no notification webhook is configured (UA_NOTIFY_WEBHOOK_URL)"
+        } else {
+            "no notification webhook is configured for this organization"
+        };
         return Ok(json!({
             "delivered": false,
             "chars": chars,
-            "error": "no notification webhook is configured (UA_NOTIFY_WEBHOOK_URL)",
+            "error": error,
             "status": "not_configured",
             "outbox_id": id,
             "attempts": 0,
@@ -265,21 +390,25 @@ async fn send(
         "attempts": d.attempts,
         "http_status": d.http_status,
     });
-    hub.db().write_async(move |tx| settle(tx, id, &agent, &d)).await?;
+    hub.db().write_async(move |tx| settle(tx, &org, id, &agent, &d)).await?;
     Ok(out)
 }
 
 /// A hub-originated notification (for example `review_ready`): the same
-/// outbox and webhook as `notify`, with `category` naming the event.
+/// outbox and webhook as `notify`, with `category` naming the event. `org`
+/// is the organization of the row the notification is about, never a
+/// caller's: it picks the outbox row's organization and its destination.
 pub(crate) async fn send_event(
     hub: &crate::Hub,
+    org: &str,
     category: &str,
     agent: &str,
     message: &str,
 ) -> UaResult<Value> {
     let message = prepare_message(message)?;
     let category = clean_category(Some(category))?;
-    send(hub, "notify", Some(category), agent.to_string(), message, timeout_of(Some(20))).await
+    send(hub, org.to_string(), "notify", Some(category), agent.to_string(), message, timeout_of(Some(20)))
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +443,8 @@ fn timeout_of(raw: Option<i64>) -> Duration {
 async fn notify(ctx: ToolCtx, a: NotifyArgs) -> UaResult<Value> {
     let message = prepare_message(&a.message)?;
     let agent = ctx.caller.label.clone();
-    send(&ctx.hub, "notify", None, agent, message, timeout_of(a.timeout_s)).await
+    let org = ctx.caller.org_id.clone();
+    send(&ctx.hub, org, "notify", None, agent, message, timeout_of(a.timeout_s)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -376,26 +506,35 @@ async fn batch_notify(ctx: ToolCtx, a: BatchArgs) -> UaResult<Value> {
     let agent = write_identity(&ctx.caller, a.agent.as_deref())?;
     let max_batch = a.max_batch_size.unwrap_or(5).clamp(1, 100);
     let queued = valid.len();
-    let (cat, who) = (category.clone(), agent.clone());
+    let (cat, who, org) = (category.clone(), agent.clone(), ctx.caller.org_id.clone());
     let total: i64 = ctx
         .hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let now = ua_core::time::now();
             for m in &valid {
                 tx.execute(
-                    "INSERT INTO pending_notifications (category, message, agent, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![cat, m, who, now],
+                    "INSERT INTO pending_notifications (org_id, category, message, agent, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![org, cat, m, who, now],
                 )?;
             }
+            // ORG-EVENT-DEFAULT: use the caller's organization once org_guard allows it.
             ledger::append(
                 tx,
-                EventInput::new("agent.notify.batched", json!({ "category": cat, "queued": valid.len() }))
-                    .by(who.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.notify.batched",
+                    json!({ "category": cat, "queued": valid.len() }),
+                )
+                .by(who.clone()),
             )?;
-            Ok(tx.query_row("SELECT COUNT(*) FROM pending_notifications WHERE category = ?1", [&cat], |r| {
-                r.get(0)
-            })?)
+            Ok(tx.query_row(
+                "SELECT COUNT(*) FROM pending_notifications WHERE org_id = ?1 AND category = ?2",
+                params![org, cat],
+                |r| r.get(0),
+            )?)
         })
         .await?;
     let flush = a.flush_now || total >= max_batch;
@@ -430,19 +569,21 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
         Some(c) => Some(clean_category(Some(c))?),
         None => None,
     };
-    let cat = category.clone();
+    let (cat, org) = (category.clone(), ctx.caller.org_id.clone());
     // Take the rows in the same transaction that removes them, so two
-    // concurrent flushes never send the same message twice.
+    // concurrent flushes never send the same message twice. Only the
+    // caller's organization's rows: one digest never mixes organizations.
     let rows: Vec<PendingRow> = ctx
         .hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let rows = {
                 let mut stmt = tx.prepare(
                     "SELECT id, category, message, agent FROM pending_notifications \
-                     WHERE ?1 IS NULL OR category = ?1 ORDER BY id",
+                     WHERE org_id = ?1 AND (?2 IS NULL OR category = ?2) ORDER BY id",
                 )?;
-                let mapped = stmt.query_map([&cat], |r| {
+                let mapped = stmt.query_map(params![org, cat], |r| {
                     Ok(PendingRow {
                         id: r.get(0)?,
                         category: r.get(1)?,
@@ -453,7 +594,10 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
                 mapped.collect::<Result<Vec<_>, _>>()?
             };
             for r in &rows {
-                tx.execute("DELETE FROM pending_notifications WHERE id = ?1", [r.id])?;
+                tx.execute(
+                    "DELETE FROM pending_notifications WHERE org_id = ?1 AND id = ?2",
+                    params![org, r.id],
+                )?;
             }
             Ok(rows)
         })
@@ -468,7 +612,8 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
         text = text.chars().take(MAX_CHARS).collect::<String>() + TRUNCATED;
     }
     // The digest is a system send: entries were attributed when queued.
-    let res = send(&ctx.hub, "digest", category, "system".into(), text, timeout_of(None)).await?;
+    let org = ctx.caller.org_id.clone();
+    let res = send(&ctx.hub, org, "digest", category, "system".into(), text, timeout_of(None)).await?;
     Ok(json!({
         "flushed_count": rows.len(),
         "delivered": res["delivered"],
@@ -481,13 +626,13 @@ async fn flush_digest(ctx: ToolCtx, a: FlushArgs) -> UaResult<Value> {
 // ---------------------------------------------------------------------------
 // notify_delivery_status
 
-fn delivery_status(c: &Connection, limit: i64, configured: bool) -> UaResult<Value> {
+fn delivery_status(c: &Connection, org: &str, limit: i64, configured: bool) -> UaResult<Value> {
     let lim = limit.clamp(1, 200);
     let mut stmt = c.prepare(
         "SELECT id, kind, category, agent, status, chars, attempts, http_status, last_error, created_at, \
-         delivered_at FROM notify_outbox ORDER BY id DESC LIMIT ?1",
+         delivered_at FROM notify_outbox WHERE org_id = ?1 ORDER BY id DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map([lim], |r| {
+    let rows = stmt.query_map(params![org, lim], |r| {
         let status: String = r.get(4)?;
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
@@ -508,8 +653,10 @@ fn delivery_status(c: &Connection, limit: i64, configured: bool) -> UaResult<Val
     let success = deliveries.iter().filter(|d| d["delivered"] == true).count();
     let mut pending = serde_json::Map::new();
     {
-        let mut stmt = c.prepare("SELECT category, COUNT(*) FROM pending_notifications GROUP BY category")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut stmt = c.prepare(
+            "SELECT category, COUNT(*) FROM pending_notifications WHERE org_id = ?1 GROUP BY category",
+        )?;
+        let rows = stmt.query_map([org], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (cat, n) = row?;
             pending.insert(cat, json!(n));
@@ -527,9 +674,12 @@ fn delivery_status(c: &Connection, limit: i64, configured: bool) -> UaResult<Val
 }
 
 async fn notify_delivery_status(ctx: ToolCtx, a: StatusArgs) -> UaResult<Value> {
-    let configured = ctx.hub.cfg().notify_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty());
+    let org = ctx.caller.org_id.clone();
+    // The hub's webhook is the default organization's destination.
+    let configured = org == ua_core::DEFAULT_ORG
+        && ctx.hub.cfg().notify_webhook_url.as_deref().is_some_and(|u| !u.trim().is_empty());
     let limit = a.limit.unwrap_or(20);
-    ctx.hub.db().read_async(move |c| delivery_status(c, limit, configured)).await
+    ctx.hub.db().read_async(move |c| delivery_status(c, &org, limit, configured)).await
 }
 
 // ---------------------------------------------------------------------------

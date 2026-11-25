@@ -14,7 +14,7 @@
 //!
 //! Bounds: a scene is at most [`SCENE_MAX_BYTES`] and [`SCENE_MAX_ELEMENTS`].
 //! Creating a new board is refused (`canvas_limit`) once its creator holds
-//! `graph_canvas_max_boards_per_agent` boards or the hub holds
+//! `graph_canvas_max_boards_per_agent` boards or its organization holds
 //! `graph_canvas_max_boards`; updating an existing board is never capped.
 //! Every overwrite first copies the scene it replaces into
 //! `graph_canvas_revisions`, keeping the newest `graph_canvas_history_max`
@@ -57,6 +57,53 @@ CREATE TABLE IF NOT EXISTS graph_canvas_revisions (
 );
 ",
 };
+
+// Both tables are rebuilt together. The original schema has no inbound
+// references, triggers or views, so the rebuild can use the normal schema
+// transaction with foreign keys enabled.
+pub const TENANT_KEYS: SchemaPart = SchemaPart {
+    name: "graph_canvas.v2.tenant_keys",
+    sql: "
+CREATE TABLE graph_canvas_scenes_new (
+    org_id TEXT NOT NULL DEFAULT 'default',
+    board_id TEXT,
+    scene_json TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    PRIMARY KEY (org_id, board_id)
+);
+INSERT INTO graph_canvas_scenes_new (org_id, board_id, scene_json, updated_by, updated_at, created_by)
+SELECT 'default', board_id, scene_json, updated_by, updated_at, created_by FROM graph_canvas_scenes;
+DROP TABLE graph_canvas_scenes;
+ALTER TABLE graph_canvas_scenes_new RENAME TO graph_canvas_scenes;
+CREATE INDEX idx_graph_canvas_scenes_org_creator ON graph_canvas_scenes(org_id, created_by);
+
+CREATE TABLE graph_canvas_revisions_new (
+    org_id TEXT NOT NULL DEFAULT 'default',
+    board_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    scene_json TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    replaced_at TEXT NOT NULL,
+    replaced_by TEXT NOT NULL,
+    PRIMARY KEY (org_id, board_id, revision),
+    FOREIGN KEY (org_id, board_id) REFERENCES graph_canvas_scenes(org_id, board_id)
+);
+INSERT INTO graph_canvas_revisions_new
+    (org_id, board_id, revision, scene_json, updated_by, updated_at, replaced_at, replaced_by)
+SELECT 'default', board_id, revision, scene_json, updated_by, updated_at, replaced_at, replaced_by
+FROM graph_canvas_revisions;
+DROP TABLE graph_canvas_revisions;
+ALTER TABLE graph_canvas_revisions_new RENAME TO graph_canvas_revisions;
+",
+};
+
+pub const TENANT_PART: ua_store::schema::Procedure = ua_store::org::tenant_part(
+    "organization.v1.tools.graph",
+    &["graph_canvas_scenes", "graph_canvas_revisions"],
+);
 
 /// A stored scene is at most this many bytes of JSON.
 pub const SCENE_MAX_BYTES: usize = 2_000_000;
@@ -189,13 +236,14 @@ fn stored_scene(raw: &str) -> (Value, bool) {
 
 async fn graph_canvas_read(ctx: ToolCtx, a: ReadArgs) -> UaResult<Value> {
     let board = board_id(a.board_id.as_deref())?;
+    let org = ctx.caller.org_id;
     ctx.hub
         .db()
         .read_async(move |c| {
             let row: Option<(String, String, String)> = c
                 .query_row(
-                    "SELECT scene_json, updated_by, updated_at FROM graph_canvas_scenes WHERE board_id = ?1",
-                    [&board],
+                    "SELECT scene_json, updated_by, updated_at FROM graph_canvas_scenes WHERE org_id = ?1 AND board_id = ?2",
+                    params![org, board],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
@@ -298,11 +346,20 @@ struct Stored {
     kept_revision: Option<i64>,
 }
 
+fn require_org(tx: &WriteTx<'_>, org: &str) -> UaResult<()> {
+    let known = tx.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(UaError::invalid(format!("unknown organization {org:?}; no canvas was changed")));
+    }
+    Ok(())
+}
+
 /// Store `text` as `board`'s scene inside `tx`: check the precondition, cap
 /// new boards, keep the replaced scene as a revision, and upsert.
 fn store(
     tx: &mut WriteTx<'_>,
     lim: Limits,
+    org: &str,
     board: &str,
     text: &str,
     actor: &str,
@@ -310,8 +367,8 @@ fn store(
 ) -> UaResult<Stored> {
     let current: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT updated_at, scene_json, updated_by FROM graph_canvas_scenes WHERE board_id = ?1",
-            [board],
+            "SELECT updated_at, scene_json, updated_by FROM graph_canvas_scenes WHERE org_id = ?1 AND board_id = ?2",
+            params![org, board],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
@@ -328,20 +385,23 @@ fn store(
         ));
     }
     if current.is_none() {
-        let total: i64 = tx.query_row("SELECT COUNT(*) FROM graph_canvas_scenes", [], |r| r.get(0))?;
+        let total: i64 =
+            tx.query_row("SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = ?1", [org], |r| r.get(0))?;
         if total >= lim.total {
+            let scope = if org == ua_core::DEFAULT_ORG { "hub" } else { "organization" };
             return Err(UaError::denied(
                 "canvas_limit",
                 format!(
-                    "the hub holds {total} canvas boards (graph_canvas_max_boards = {}); reuse a board",
+                    "the {scope} holds {total} canvas boards (graph_canvas_max_boards = {}); reuse a board",
                     lim.total
                 ),
             ));
         }
-        let mine: i64 =
-            tx.query_row("SELECT COUNT(*) FROM graph_canvas_scenes WHERE created_by = ?1", [actor], |r| {
-                r.get(0)
-            })?;
+        let mine: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM graph_canvas_scenes WHERE org_id = ?1 AND created_by = ?2",
+            params![org, actor],
+            |r| r.get(0),
+        )?;
         if mine >= lim.per_agent {
             return Err(UaError::denied(
                 "canvas_limit",
@@ -365,46 +425,46 @@ fn store(
         && lim.history > 0
     {
         let rev: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(revision), 0) + 1 FROM graph_canvas_revisions WHERE board_id = ?1",
-            [board],
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2",
+            params![org, board],
             |r| r.get(0),
         )?;
         tx.execute(
             "INSERT INTO graph_canvas_revisions \
-             (board_id, revision, scene_json, updated_by, updated_at, replaced_at, replaced_by) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![board, rev, prev_scene, prev_by, prev_at, now, actor],
+             (org_id, board_id, revision, scene_json, updated_by, updated_at, replaced_at, replaced_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![org, board, rev, prev_scene, prev_by, prev_at, now, actor],
         )?;
         tx.execute(
-            "DELETE FROM graph_canvas_revisions WHERE board_id = ?1 AND revision <= ?2",
-            params![board, rev - lim.history],
+            "DELETE FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 AND revision <= ?3",
+            params![org, board, rev - lim.history],
         )?;
         // The byte budget: keep the newest revisions whose scenes fit in it
         // together; drop the rest, oldest first.
         tx.execute(
-            "DELETE FROM graph_canvas_revisions WHERE board_id = ?1 AND revision IN ( \
+            "DELETE FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 AND revision IN ( \
                SELECT revision FROM ( \
                  SELECT revision, SUM(length(CAST(scene_json AS BLOB))) OVER (ORDER BY revision DESC) AS kept \
-                 FROM graph_canvas_revisions WHERE board_id = ?1 \
-               ) WHERE kept > ?2 \
+                 FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 \
+               ) WHERE kept > ?3 \
              )",
-            params![board, lim.history_bytes],
+            params![org, board, lim.history_bytes],
         )?;
         let still: Option<i64> = tx
             .query_row(
-                "SELECT revision FROM graph_canvas_revisions WHERE board_id = ?1 AND revision = ?2",
-                params![board, rev],
+                "SELECT revision FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 AND revision = ?3",
+                params![org, board, rev],
                 |r| r.get(0),
             )
             .optional()?;
         kept_revision = still;
     }
     tx.execute(
-        "INSERT INTO graph_canvas_scenes (board_id, scene_json, updated_by, updated_at, created_by) \
-         VALUES (?1, ?2, ?3, ?4, ?3) \
-         ON CONFLICT(board_id) DO UPDATE SET scene_json = excluded.scene_json, \
+        "INSERT INTO graph_canvas_scenes (org_id, board_id, scene_json, updated_by, updated_at, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?4) \
+         ON CONFLICT(org_id, board_id) DO UPDATE SET scene_json = excluded.scene_json, \
          updated_by = excluded.updated_by, updated_at = excluded.updated_at",
-        params![board, text, actor, now],
+        params![org, board, text, actor, now],
     )?;
     Ok(Stored { updated_at: now, created: current.is_none(), kept_revision })
 }
@@ -412,17 +472,22 @@ fn store(
 async fn graph_canvas_write(ctx: ToolCtx, a: WriteArgs) -> UaResult<Value> {
     let actor = writer(&ctx, a.agent.as_deref(), "writing a canvas")?;
     let board = board_id(a.board_id.as_deref())?;
+    let org = ctx.caller.org_id;
     let (parsed, text) = checked_scene(&a.scene)?;
     let expected = a.expected_updated_at.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let lim = Limits::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let st = store(tx, lim, &board, &text, &actor, expected.as_deref())?;
+            require_org(tx, &org)?;
+            let st = store(tx, lim, &org, &board, &text, &actor, expected.as_deref())?;
             // Counts only: the scene itself stays in its table.
+            // ORG-EVENT-DEFAULT: use the board's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.graph.canvas_write",
                     json!({
                         "board_id": board,
@@ -460,6 +525,7 @@ pub struct HistoryArgs {
 
 async fn graph_canvas_history(ctx: ToolCtx, a: HistoryArgs) -> UaResult<Value> {
     let board = board_id(a.board_id.as_deref())?;
+    let org = ctx.caller.org_id;
     let keep = ctx.hub.cfg().graph_canvas_history_max;
     let keep_bytes = ctx.hub.cfg().graph_canvas_history_max_bytes;
     ctx.hub
@@ -469,8 +535,8 @@ async fn graph_canvas_history(ctx: ToolCtx, a: HistoryArgs) -> UaResult<Value> {
                 let row: Option<(String, String, String, String, String)> = c
                     .query_row(
                         "SELECT scene_json, updated_by, updated_at, replaced_at, replaced_by \
-                         FROM graph_canvas_revisions WHERE board_id = ?1 AND revision = ?2",
-                        params![board, rev],
+                         FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 AND revision = ?3",
+                        params![org, board, rev],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
@@ -493,16 +559,18 @@ async fn graph_canvas_history(ctx: ToolCtx, a: HistoryArgs) -> UaResult<Value> {
                 }));
             }
             let current: Option<String> = c
-                .query_row("SELECT updated_at FROM graph_canvas_scenes WHERE board_id = ?1", [&board], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT updated_at FROM graph_canvas_scenes WHERE org_id = ?1 AND board_id = ?2",
+                    params![org, board],
+                    |r| r.get(0),
+                )
                 .optional()?;
             let mut stmt = c.prepare(
                 "SELECT revision, updated_by, updated_at, replaced_at, replaced_by, length(scene_json) \
-                 FROM graph_canvas_revisions WHERE board_id = ?1 ORDER BY revision DESC",
+                 FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 ORDER BY revision DESC",
             )?;
             let revisions = stmt
-                .query_map([&board], |r| {
+                .query_map(params![org, board], |r| {
                     Ok(json!({
                         "revision": r.get::<_, i64>(0)?,
                         "updated_by": r.get::<_, String>(1)?,
@@ -540,16 +608,18 @@ pub struct RestoreArgs {
 async fn graph_canvas_restore(ctx: ToolCtx, a: RestoreArgs) -> UaResult<Value> {
     let actor = writer(&ctx, None, "restoring a canvas")?;
     let board = board_id(a.board_id.as_deref())?;
+    let org = ctx.caller.org_id;
     let expected = a.expected_updated_at.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let lim = Limits::of(ctx.hub.cfg());
     let rev = a.revision;
     ctx.hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &org)?;
             let raw: Option<String> = tx
                 .query_row(
-                    "SELECT scene_json FROM graph_canvas_revisions WHERE board_id = ?1 AND revision = ?2",
-                    params![board, rev],
+                    "SELECT scene_json FROM graph_canvas_revisions WHERE org_id = ?1 AND board_id = ?2 AND revision = ?3",
+                    params![org, board, rev],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -563,10 +633,13 @@ async fn graph_canvas_restore(ctx: ToolCtx, a: RestoreArgs) -> UaResult<Value> {
                 )));
             }
             let (parsed, text) = checked_scene(&scene)?;
-            let st = store(tx, lim, &board, &text, &actor, expected.as_deref())?;
+            let st = store(tx, lim, &org, &board, &text, &actor, expected.as_deref())?;
+            // ORG-EVENT-DEFAULT: use the board's organization once callers
+            // can resolve to other organizations and org_guard allows it.
             ledger::append(
                 tx,
                 EventInput::new(
+                    ua_core::DEFAULT_ORG,
                     "agent.graph.canvas_restore",
                     json!({
                         "board_id": board,

@@ -18,6 +18,7 @@ fn caller() -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -46,7 +47,13 @@ impl Env {
     async fn seen_rows(&self) -> i64 {
         self.hub
             .db()
-            .read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM slack_seen_signatures", [], |r| r.get(0))?))
+            .read_async(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'request_sha'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
             .await
             .unwrap()
     }
@@ -335,4 +342,399 @@ fn parser_validates_task_and_approval_ids() {
         slack::parse_slack_command("/approve 42 looks good").unwrap()["args"],
         json!(["42", "looks good"])
     );
+}
+
+// --- admission, dedupe, dispatch ---------------------------------------------------
+
+fn slack_env() -> Env {
+    let home = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(home.path());
+    cfg.human_identities = vec!["operator".into(), "reviewer-1".into()];
+    cfg.slack_identities = vec![
+        ua_core::SlackIdentity {
+            team_id: "T0TEAM1".into(),
+            user_id: "U0HUMAN".into(),
+            identity: "operator".into(),
+            can_approve: true,
+        },
+        ua_core::SlackIdentity {
+            team_id: "T0TEAM1".into(),
+            user_id: "U0DEV".into(),
+            identity: "reviewer-1".into(),
+            can_approve: false,
+        },
+    ];
+    Env { hub: Hub::in_memory(cfg).unwrap(), reg: builtin_registry(), _home: home }
+}
+
+fn delivery(user: &str, id: &str) -> slack::Delivery {
+    slack::Delivery {
+        kind: slack::DeliveryKind::Trigger,
+        delivery_id: id.into(),
+        team_id: "T0TEAM1".into(),
+        user_id: user.into(),
+        command: Some("task".into()),
+        refusal: None,
+    }
+}
+
+impl Env {
+    async fn admit(
+        &self,
+        ts: &str,
+        body: &str,
+        now: i64,
+        d: slack::Delivery,
+    ) -> Result<slack::Admission, UaError> {
+        let (hub, ts, body) = (self.hub.clone(), ts.to_string(), body.as_bytes().to_vec());
+        let db = self.hub.db().clone();
+        db.write_async(move |tx| slack::admit(tx, hub.cfg(), &ts, &body, now, &d)).await
+    }
+}
+
+#[tokio::test]
+async fn admission_maps_identity_dedupes_and_ledgers() {
+    let e = slack_env();
+    let now = 1_700_000_000;
+    let a = e.admit("1700000000", "a", now, delivery("U0HUMAN", "1.2.a")).await.unwrap();
+    assert_eq!(a, slack::Admission::Accepted { identity: "operator".into() });
+    let a = e.admit("1700000001", "b", now, delivery("U0DEV", "1.2.b")).await.unwrap();
+    assert_eq!(a, slack::Admission::Accepted { identity: "reviewer-1".into() });
+    // Same trigger id, new signature: deduped.
+    let a = e.admit("1700000002", "c", now, delivery("U0DEV", "1.2.b")).await.unwrap();
+    assert_eq!(a, slack::Admission::Deduped { identity: "reviewer-1".into() });
+    // Same signed bytes: replayed, and the transaction rolls back.
+    let err = e.admit("1700000002", "c", now, delivery("U0DEV", "1.2.z")).await.unwrap_err();
+    assert_eq!(err.reason_code(), Some("replayed"));
+    // Unmapped: refused, no delivery recorded.
+    let a = e.admit("1700000003", "d", now, delivery("U0OTHER", "1.2.c")).await.unwrap();
+    assert_eq!(a, slack::Admission::Refused { reason: "unmapped_identity", identity: None });
+    let mut other_team = delivery("U0HUMAN", "1.2.d");
+    other_team.team_id = "T0OTHER".into();
+    assert!(matches!(
+        e.admit("1700000004", "e", now, other_team).await.unwrap(),
+        slack::Admission::Refused { .. }
+    ));
+    let deliveries: i64 = e
+        .hub
+        .db()
+        .read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind IN ('event', 'trigger')", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(deliveries, 2);
+    let accepted = e
+        .hub
+        .db()
+        .read_async(|c| {
+            ledger::query(
+                c,
+                &EventQuery {
+                    channels: Some(vec!["agent.slack.request.accepted".into()]),
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap();
+    let by: Vec<_> = accepted.iter().map(|e| e.originator.clone().unwrap_or_default()).collect();
+    assert_eq!(by, ["operator", "reviewer-1"]);
+}
+
+#[tokio::test]
+async fn a_route_refusal_is_ledgered_under_the_identity() {
+    let e = slack_env();
+    let mut d = delivery("U0DEV", "1.2.a");
+    d.refusal = Some("invalid_command");
+    let a = e.admit("1700000000", "a", 1_700_000_000, d).await.unwrap();
+    assert_eq!(
+        a,
+        slack::Admission::Refused { reason: "invalid_command", identity: Some("reviewer-1".into()) }
+    );
+}
+
+#[tokio::test]
+async fn delivery_ids_are_pruned_after_a_day() {
+    let e = slack_env();
+    let t0 = 1_700_000_000;
+    let fresh = |id: &'static str, now: i64| {
+        let db = e.hub.db().clone();
+        async move {
+            db.write_async(move |tx| slack::remember_delivery(tx, slack::DeliveryKind::Event, id, now)).await
+        }
+    };
+    assert!(fresh("Ev01", t0).await.unwrap());
+    assert!(!fresh("Ev01", t0 + 10).await.unwrap());
+    assert!(fresh("Ev02", t0 + slack::DELIVERY_RETENTION_S + 1).await.unwrap());
+    assert!(fresh("Ev01", t0 + slack::DELIVERY_RETENTION_S + 1).await.unwrap(), "pruned, so new again");
+    assert!(fresh("bad id", t0).await.is_err());
+    // Kinds are separate namespaces.
+    let db = e.hub.db().clone();
+    assert!(
+        db.write_async(move |tx| slack::remember_delivery(
+            tx,
+            slack::DeliveryKind::Trigger,
+            "Ev02",
+            t0 + slack::DELIVERY_RETENTION_S + 1
+        ))
+        .await
+        .unwrap()
+    );
+}
+
+#[test]
+fn response_urls_are_limited_to_the_slack_hooks_host() {
+    assert!(slack::response_url("https://hooks.slack.com/commands/T0/1/abc").is_some());
+    for bad in [
+        "http://hooks.slack.com/commands/T0/1/abc",
+        "https://hooks.slack.com.example.com/x",
+        "https://evil.example.com/hooks.slack.com",
+        "https://hooks.slack.com:8443/x",
+        "https://user@hooks.slack.com/x",
+        "https://HOOKS.slack.com@evil.example.com/x",
+        "https://hooks.slack.com/x#frag",
+        "https://127.0.0.1/x",
+        "",
+        "not a url",
+    ] {
+        assert!(slack::response_url(bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn replies_escape_slack_markup() {
+    let ok = Ok(json!({ "task": { "id": 7, "status": "open", "title": "<!channel> & <@U1>" } }));
+    let text = slack::reply_text("status", "operator", &ok);
+    assert_eq!(text, "task-7 [open] &lt;!channel&gt; &amp; &lt;@U1&gt;");
+    let err: Result<Value, UaError> = Err(UaError::internal("secret detail"));
+    assert!(!slack::reply_text("task", "operator", &err).contains("secret"));
+}
+
+#[tokio::test]
+async fn each_command_maps_to_a_call_its_tool_accepts() {
+    let e = slack_env();
+    let coordinator = Caller { profile: Profile::Coordinator, ..caller() };
+    let task = e.call("task_add", json!({ "title": "existing" })).await.unwrap();
+    let id = task["id"].as_i64().unwrap();
+    // `/assign` delegates, and a delegation targets a registered agent of
+    // the delegator's organization: an unregistered target is refused with
+    // a reply that says so.
+    let parsed = slack::parse_slack_command("assign builder-2 review the slack route").unwrap();
+    let call = slack::command_call(&parsed, "1.2.u").unwrap().unwrap();
+    let out = e.reg.call(&e.hub, &coordinator, call.tool, call.args.clone()).await;
+    let reply = slack::reply_text("assign", "operator", &out);
+    assert!(reply.starts_with("Refused (not_found):") && reply.contains("no agent"), "{reply}");
+    assert!(reply.contains("builder-2") && reply.contains("registered agent"), "{reply}");
+    // Register the target, as its first heartbeat does.
+    let target = Caller { label: "builder-2".into(), session_key: Some("s2".into()), ..caller() };
+    e.reg.call(&e.hub, &target, "agent_heartbeat", json!({})).await.unwrap();
+    for text in [
+        "task write the report".to_string(),
+        format!("progress task-{id} halfway"),
+        format!("blocker task-{id} waiting on access"),
+        format!("status task-{id}"),
+        "plan ship the slack route".into(),
+        "assign builder-2 review the slack route".into(),
+    ] {
+        let parsed = slack::parse_slack_command(&text).unwrap();
+        let call = slack::command_call(&parsed, "1.2.a").unwrap().unwrap();
+        let out = e.reg.call(&e.hub, &coordinator, call.tool, call.args.clone()).await;
+        assert!(out.is_ok(), "{text}: {:?} -> {:?}", call.args, out.err());
+    }
+    let parsed = slack::parse_slack_command("approve 12").unwrap();
+    let call = slack::command_call(&parsed, "1.2.a").unwrap().unwrap();
+    assert_eq!(call.tool, "approval_resolve");
+    assert_eq!(call.args, json!({ "id": 12, "decision": "approve", "reason": "approved from Slack" }));
+    assert!(slack::command_call(&slack::parse_slack_command("contact").unwrap(), "1.2.a").unwrap().is_none());
+    let check = e
+        .call("delegation_spec_check", json!({ "task_spec": slack::assign_spec("do it", "1.2.a") }))
+        .await
+        .unwrap();
+    assert_eq!(check["ok"], true, "{check}");
+}
+
+#[tokio::test]
+async fn approve_needs_the_mapping_opt_in() {
+    let e = slack_env();
+    let approve =
+        |user: &str, id: &str| slack::Delivery { command: Some("approve".into()), ..delivery(user, id) };
+    // U0DEV's mapping has can_approve = false.
+    let a = e.admit("1700000000", "a", 1_700_000_000, approve("U0DEV", "1.2.a")).await.unwrap();
+    assert_eq!(
+        a,
+        slack::Admission::Refused { reason: "approve_not_enabled", identity: Some("reviewer-1".into()) }
+    );
+    let a = e.admit("1700000001", "b", 1_700_000_000, approve("U0HUMAN", "1.2.b")).await.unwrap();
+    assert_eq!(a, slack::Admission::Accepted { identity: "operator".into() });
+}
+
+async fn abandoned_events(e: &Env) -> Vec<Value> {
+    e.hub
+        .db()
+        .read_async(|c| {
+            ledger::query(
+                c,
+                &EventQuery {
+                    channels: Some(vec!["agent.slack.request.abandoned".into()]),
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ev| ev.payload)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_accepted_but_unfinished_delivery_is_ledgered_abandoned_once() {
+    let e = slack_env();
+    let t0 = 1_700_000_000;
+    // Accepted, never finished: the hub stopped while it ran.
+    e.admit("1700000000", "a", t0, delivery("U0HUMAN", "1.2.lost")).await.unwrap();
+    // Accepted and finished.
+    e.admit("1700000001", "b", t0, delivery("U0DEV", "1.2.done")).await.unwrap();
+    let db = e.hub.db().clone();
+    db.write_async(|tx| {
+        slack::record_executed(
+            tx,
+            "reviewer-1",
+            slack::DeliveryKind::Trigger,
+            "1.2.done",
+            "task",
+            None,
+            &Ok(json!({})),
+        )
+    })
+    .await
+    .unwrap();
+    // Two startups.
+    for (startup, expected) in [(1, 1), (2, 0)] {
+        let db = e.hub.db().clone();
+        let n = db.write_async(move |tx| slack::sweep_abandoned(tx, t0 + 60 * startup)).await.unwrap();
+        assert_eq!(n, expected, "startup {startup}");
+    }
+    let events = abandoned_events(&e).await;
+    assert_eq!(events.len(), 1, "ledgered exactly once");
+    assert_eq!(
+        events[0],
+        json!({
+            "identity": "operator",
+            "kind": "command",
+            "delivery_id": "1.2.lost",
+            "age_s": 60,
+            "outcome": "unknown",
+            "detail": "admitted, no outcome recorded; check tool_calls",
+        })
+    );
+    // An abandoned row is pruned like any other; an accepted one never is.
+    let db = e.hub.db().clone();
+    let far = t0 + slack::DELIVERY_RETENTION_S + 100;
+    db.write_async(move |tx| slack::remember_delivery(tx, slack::DeliveryKind::Event, "Ev0X", far))
+        .await
+        .unwrap();
+    let left: i64 = e
+        .hub
+        .db()
+        .read_async(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM inbound_deliveries WHERE source = 'slack' AND kind = 'trigger'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn an_accepted_row_is_not_pruned_before_the_sweep() {
+    let e = slack_env();
+    let t0 = 1_700_000_000;
+    e.admit("1700000000", "a", t0, delivery("U0HUMAN", "1.2.lost")).await.unwrap();
+    let db = e.hub.db().clone();
+    let far = t0 + slack::DELIVERY_RETENTION_S + 100;
+    db.write_async(move |tx| slack::remember_delivery(tx, slack::DeliveryKind::Event, "Ev0X", far))
+        .await
+        .unwrap();
+    let db = e.hub.db().clone();
+    assert_eq!(db.write_async(move |tx| slack::sweep_abandoned(tx, far)).await.unwrap(), 1);
+}
+
+// --- Socket Mode -------------------------------------------------------------------
+
+#[test]
+fn socket_urls_are_limited_to_slack_over_wss() {
+    for ok in ["wss://wss-primary.slack.com/link/?ticket=1&app_id=A0", "wss://slack.com/link"] {
+        assert!(slack::socket_url(ok, false).is_ok(), "{ok}");
+    }
+    for (bad, why) in [
+        ("ws://wss-primary.slack.com/link", "not_wss"),
+        ("https://wss-primary.slack.com/link", "not_wss"),
+        ("wss://evil.example.com/link", "not_slack_host"),
+        ("wss://slack.com.example.com/link", "not_slack_host"),
+        ("wss://evilslack.com/link", "not_slack_host"),
+        ("wss://wss.slack.com:8443/link", "non_default_port"),
+        ("wss://user@wss.slack.com/link", "userinfo_or_fragment"),
+        ("wss://wss.slack.com/link#x", "userinfo_or_fragment"),
+        ("wss://127.0.0.1/link", "not_slack_host"),
+        ("ws://127.0.0.1:9/link", "not_wss"),
+        ("", "bad_length"),
+    ] {
+        assert_eq!(slack::socket_url(bad, false).unwrap_err(), why, "{bad}");
+    }
+    // Only the test hook admits a loopback ws URL.
+    assert!(slack::socket_url("ws://127.0.0.1:9/link", true).is_ok());
+    assert!(slack::socket_url("ws://example.com/link", true).is_err());
+}
+
+#[test]
+fn socket_mode_needs_the_gate_an_xapp_token_and_the_feature() {
+    use secrecy::SecretString;
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    assert!(slack::socket_status(&cfg).unwrap_err().contains("slack_socket_mode is false"));
+    cfg.slack_socket_mode = true;
+    if !slack::SOCKET_COMPILED {
+        assert!(slack::socket_status(&cfg).unwrap_err().contains("without the slack-socket feature"));
+        return;
+    }
+    assert!(slack::socket_status(&cfg).unwrap_err().contains("UA_SLACK_APP_TOKEN is not set"));
+    cfg.slack_app_token_value = Some(SecretString::from("xoxb-not-an-app-token".to_string()));
+    let why = slack::socket_status(&cfg).unwrap_err();
+    assert!(why.contains("not an app-level token") && !why.contains("xoxb"), "{why}");
+    cfg.slack_app_token_value = Some(SecretString::from("xapp-1-test".to_string()));
+    assert!(slack::socket_status(&cfg).is_ok());
+}
+
+#[tokio::test]
+async fn an_envelope_is_admitted_once_and_shares_the_delivery_dedupe() {
+    let e = slack_env();
+    let now = 1_700_000_000;
+    let admit = |key: &'static str, id: &'static str| {
+        let (hub, db) = (e.hub.clone(), e.hub.db().clone());
+        async move {
+            db.write_async(move |tx| {
+                slack::admit_keyed(
+                    tx,
+                    hub.cfg(),
+                    slack::ReplayKey::Envelope { envelope_id: key },
+                    now,
+                    &delivery("U0HUMAN", id),
+                )
+            })
+            .await
+        }
+    };
+    assert_eq!(
+        admit("env-1", "9.9.a").await.unwrap(),
+        slack::Admission::Accepted { identity: "operator".into() }
+    );
+    assert_eq!(admit("env-1", "9.9.a").await.unwrap_err().reason_code(), Some("replayed"));
+    assert_eq!(
+        admit("env-2", "9.9.a").await.unwrap(),
+        slack::Admission::Deduped { identity: "operator".into() }
+    );
+    // The envelope key never matches an HTTP key.
+    assert_ne!(slack::envelope_sha("x"), slack::signed_request_sha("x", b""));
 }

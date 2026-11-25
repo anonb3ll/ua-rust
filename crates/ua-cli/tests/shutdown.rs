@@ -12,48 +12,66 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+/// Start `ua serve` on a port picked just before the spawn. The binary logs
+/// the configured address rather than the bound one, so it cannot be asked for
+/// port 0 and read back; instead a bind clash (another process took the port
+/// between the pick and the bind: the server exits with "Address already in
+/// use") is retried with a new port, up to five times. Returns the child, its
+/// port, the log thread and the channel that signals "hub listening".
+fn spawn_serve(
+    home: &std::path::Path,
+    extra: &[(&str, &str)],
+) -> (std::process::Child, u16, std::thread::JoinHandle<String>, mpsc::Receiver<()>) {
+    for attempt in 1..=5 {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ua"));
+        cmd.arg("serve")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home)
+            .env("UA_HOME", home)
+            .env("UA_BIND", format!("127.0.0.1:{port}"))
+            .env("NO_COLOR", "1");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut log = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if line.contains("hub listening") {
+                    let _ = tx.send(());
+                }
+                log.push_str(&line);
+                log.push('\n');
+            }
+            log
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => return (child, port, reader, rx),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let log = reader.join().unwrap();
+                if attempt < 5 && log.contains("Address already in use") {
+                    continue;
+                }
+                panic!("the hub did not start:\n{log}");
+            }
+        }
+    }
+    unreachable!()
 }
 
 #[test]
 fn sigterm_drains_and_checkpoints_the_wal() {
     let home = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ua"))
-        .arg("serve")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home.path())
-        .env("UA_HOME", home.path())
-        .env("UA_BIND", format!("127.0.0.1:{port}"))
-        .env("UA_ENFORCE_AUTH", "false")
-        .env("UA_ROUTINES_ENABLED", "true")
-        .env("UA_LOG", "info")
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    // Collect the log on a thread; signal when the hub is listening.
-    let (tx, rx) = mpsc::channel::<String>();
-    let stderr = child.stderr.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut log = String::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.contains("hub listening") {
-                let _ = tx.send(line.clone());
-            }
-            log.push_str(&line);
-            log.push('\n');
-        }
-        log
-    });
-    if rx.recv_timeout(Duration::from_secs(60)).is_err() {
-        let _ = child.kill();
-        panic!("the hub did not start:\n{}", reader.join().unwrap());
-    }
+    let (mut child, port, reader, _listening) = spawn_serve(
+        home.path(),
+        &[("UA_ENFORCE_AUTH", "false"), ("UA_ROUTINES_ENABLED", "true"), ("UA_LOG", "info")],
+    );
 
     // Hold an event stream open across the shutdown.
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -92,6 +110,10 @@ fn sigterm_drains_and_checkpoints_the_wal() {
     assert!(log.contains("signal=\"SIGTERM\"") || log.contains("signal=SIGTERM"), "{log}");
     assert!(log.contains("WAL checkpointed and truncated"), "{log}");
     assert!(log.contains("hub stopped"), "{log}");
+    // A build without the mcp-server feature says at startup that it serves
+    // no MCP.
+    let warned = log.contains("built without the mcp-server feature");
+    assert_eq!(warned, !cfg!(feature = "mcp-server"), "{log}");
     assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0, "the WAL was truncated\n{log}");
 }
 
@@ -128,37 +150,7 @@ fn start_hub() -> Hub {
         work.path().display()
     );
     std::fs::write(home.path().join("config.toml"), config).unwrap();
-    let port = free_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ua"))
-        .arg("serve")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home.path())
-        .env("UA_HOME", home.path())
-        .env("UA_BIND", format!("127.0.0.1:{port}"))
-        .env("UA_LOG", "info")
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (tx, rx) = mpsc::channel::<()>();
-    let stderr = child.stderr.take().unwrap();
-    let log = std::thread::spawn(move || {
-        let mut log = String::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.contains("hub listening") {
-                let _ = tx.send(());
-            }
-            log.push_str(&line);
-            log.push('\n');
-        }
-        log
-    });
-    if rx.recv_timeout(Duration::from_secs(60)).is_err() {
-        let _ = child.kill();
-        panic!("the hub did not start:\n{}", log.join().unwrap());
-    }
+    let (child, port, log, _listening) = spawn_serve(home.path(), &[("UA_LOG", "info")]);
     Hub { child, port, home, work, log: Some(log) }
 }
 

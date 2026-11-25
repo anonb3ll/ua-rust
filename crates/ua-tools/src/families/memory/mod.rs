@@ -9,7 +9,8 @@
 //! the registrations with their descriptions and read-only and side-effect
 //! flags, and the glue from a [`ToolCtx`] (hub and verified caller) to the
 //! `ua_memory` functions. Storage, ranking, embeddings and every rule about
-//! who may change a note live in `ua_memory`.
+//! who may change a note live in `ua_memory`. Every tool reads and writes
+//! only the caller's organization's notes (`ctx.caller.org_id`).
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -25,7 +26,7 @@ pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
 };
 pub(crate) use ua_memory::mark_untrusted;
-pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, SCHEMA, VERSIONS_SCHEMA};
+pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA};
 
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -257,15 +258,15 @@ impl From<GetArgs> for GetRequest {
 }
 
 async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
-    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), a.into()).await
+    ua_memory::search::search(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    ua_memory::search::list(ctx.hub.db(), a.into()).await
+    ua_memory::search::list(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ua_memory::search::get(ctx.hub.db(), a.into()).await
+    ua_memory::search::get(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_search(r: &mut Registry) {
@@ -427,11 +428,11 @@ impl From<MaintenanceArgs> for MaintenanceRequest {
 }
 
 async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
-    ua_memory::maintenance::prune_candidates(ctx.hub.db(), a.into()).await
+    ua_memory::maintenance::prune_candidates(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), a.into()).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_maintenance(r: &mut Registry) {
@@ -455,4 +456,54 @@ fn register_maintenance(r: &mut Registry) {
         .family("memory")
         .read_only(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Hub;
+    use crate::families::{plans, tasks};
+
+    /// `ua-memory` keeps its own copy of the ORG-EVENT-DEFAULT rule (it cannot
+    /// call this crate); it must answer exactly as the plan and task
+    /// families do, for the default organization and another one.
+    #[test]
+    fn memory_ledger_rule_matches_the_plan_and_task_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::in_memory(ua_core::Config::for_home(dir.path())).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-drift', 'org-drift', 'Org drift', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        for org in [ua_core::DEFAULT_ORG, "org-drift"] {
+            for text in ["fake-title-not-real", ""] {
+                assert_eq!(ua_memory::ledger_text(org, json!(text)), plans::ledger_text(org, text), "{org}");
+            }
+            for label in [Some("fake-agent-not-real"), None] {
+                assert_eq!(ua_memory::ledger_label(org, label), plans::ledger_label(org, label), "{org}");
+            }
+            let by = "fake-agent-not-real";
+            let written: Option<String> = hub
+                .db()
+                .write(|tx| {
+                    tasks::emit(tx, org, "agent.task.updated", json!({ "id": 1 }), by)?;
+                    Ok(tx.query_row(
+                        "SELECT originator FROM event_log ORDER BY seq DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(written.as_deref(), Some(ua_memory::ledger_originator(org, by)), "{org}");
+            let want = if org == ua_core::DEFAULT_ORG { by } else { "system" };
+            assert_eq!(written.as_deref(), Some(want), "{org}");
+        }
+    }
 }

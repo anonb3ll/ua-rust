@@ -1,8 +1,11 @@
 # TypeScript SDK
 
-The TypeScript SDK in the Python repository (`packages/client`, package
-`@unified-agent/client` 0.2.1, with `@unified-agent/protocol` 0.2.1) runs
-against ua-rust. It has two halves:
+The TypeScript SDK lives in this repository under
+[`sdk/typescript`](../sdk/typescript/README.md): `@unified-agent/client`
+0.2.1 and `@unified-agent/protocol` 0.2.1, an npm workspace that is not
+published. The old repository's approval bot (`@unified-agent/approval-client`)
+was not imported: an approval notifier is planned as notify-only, linking to
+the hub's approval page where the human signs in to decide. The client has two halves:
 
 - `UnifiedAgentClient` calls tools over MCP Streamable HTTP at `/mcp`.
 - `ControlCenterClient` calls the Control Center's HTTP/JSON routes under
@@ -159,7 +162,7 @@ events the same way.
 
 | SDK method or route | Status |
 |---|---|
-| `queueHealth` (`GET /api/queue-health`) | not served (404) |
+| `queueHealth` (`GET /api/queue-health`) | not served (404); legacy hub only, not carried into this repository's SDK |
 | `startNodeSession`, `cancelNodeSession`, `restartNodeSession` (`POST /api/action/node-session`) | not served; queue node work with the `node_dispatch` tool |
 | `submitWorkProduct`, `releaseWorkProduct` (`/api/work-products*`) | `501`: not ported (see below) |
 | `GET /api/evidence?format=csv\|markdown\|text\|pdf`, `cursor` | `400`: JSON only, no keyset paging |
@@ -167,7 +170,7 @@ events the same way.
 | `org_unit`, `org_proposal`, `agent_token` platform objects | not declared |
 
 Work products (submit, named-reviewer approval, release) are not ported
-pending an explicit product decision; hub task #2658 lists the options.
+pending an explicit product decision.
 Until that decision, `/api/work-products*` answers `501` and the manifest
 lists `work_product` with `served: false`.
 
@@ -177,7 +180,7 @@ settled contract:
 
 | Status | When |
 |---|---|
-| `202 {approval_id, status: "pending", tool, payload}` | A new or identical open request for a gated tool. |
+| `202 {approval_id, status: "pending", tool, payload}` | A new or identical open request for a gated tool. For a consolidated tool's action gated under its own name, `tool` and `payload` are that name and the action's arguments (see [policy](policy.md#consolidated-tools)). |
 | `200` with `status` `approved` or `denied` | An identical request already decided (a live pass is reported, never consumed). |
 | `400` | A malformed body, or a `payload` the tool's typed arguments refuse (unknown or missing fields). A caller without a profile limit also gets `400` for an unknown tool. |
 | `401` | No verified identity. |
@@ -193,8 +196,9 @@ never the value). An approved request is a one-time pass that the
 requester's next identical call consumes within `approval_pass_ttl_hours`;
 the requester cannot approve its own request.
 
-The SDK's live write suite is being changed (separately) to request
-approval for a gated tool. `crew_intervene` is one: always approval-gated
+The SDK's live write suite requests approval for `crew_intervene`, checks
+that the agent token is refused when it tries to resolve it (`403`), and, with
+a human token, denies it as the human. `crew_intervene` is always approval-gated
 with no configuration, gated by the registry rather than its handler (so it
 is requestable here), and callable with a developer-profile token. Its
 payload is `{session_id, message}`.
@@ -206,11 +210,17 @@ payload is `{session_id, message}`.
 a running hub, the SDK's own live suite runs with:
 
 ```sh
-cd packages/client
+cd sdk/typescript
 UA_SDK_CONFORMANCE_URL=http://127.0.0.1:8765/mcp UA_SDK_CONFORMANCE_TOKEN=... \
 UA_SDK_WRITE_CONFORMANCE_URL=http://127.0.0.1:8765 UA_SDK_WRITE_CONFORMANCE_TOKEN=... \
 UA_SDK_WRITE_CONFORMANCE_HUMAN_TOKEN=... npm run test:conformance:live
 ```
 
 Use a disposable hub: the write suite creates a task, queues an approval and
-appends evidence.
+appends evidence. `ua token issue` for a `human_identities` label needs an
+interactive terminal, so on a throwaway hub give the human a static token
+instead: `agent_tokens` pointing at a file of `label:token` lines, with the
+label in `human_identities`. The `sdk-live` workflow
+(`.github/workflows/sdk-live.yml`) does exactly that against a `ua serve` it
+builds from the commit under test; the current results are in
+[sdk/typescript/docs/known-gaps.md](../sdk/typescript/docs/known-gaps.md).

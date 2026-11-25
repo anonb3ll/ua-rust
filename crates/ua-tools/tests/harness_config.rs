@@ -87,6 +87,7 @@ fn caller(label: &str, kind: ActorKind) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -98,9 +99,16 @@ fn other_agent() -> Caller {
     caller("builder-2", ActorKind::Agent)
 }
 
-/// A lifecycle operator that is an agent: it publishes, a human approves.
+/// A lifecycle operator that is an agent: it changes the skill registry, a
+/// human approves. It may not publish harness config.
 fn ops() -> Caller {
     caller("ops-bot", ActorKind::Agent)
+}
+
+/// A second human: harness config publish is human-only, and a human other
+/// than the publisher approves it.
+fn publisher() -> Caller {
+    Caller { profile: Profile::Operator, enforce_profile: false, ..caller("operator-2", ActorKind::Human) }
 }
 
 fn human() -> Caller {
@@ -121,7 +129,7 @@ impl H {
     fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(std::env::temp_dir());
-        cfg.human_identities = vec!["operator".into()];
+        cfg.human_identities = vec!["operator".into(), "operator-2".into()];
         cfg.lifecycle_operators = Some(vec!["operator".into(), "ops-bot".into()]);
         cfg.workspace = Some(ws.path().to_path_buf());
         tweak(&mut cfg);
@@ -145,12 +153,12 @@ impl H {
 
     async fn publish(&self, bundle: Value) -> Value {
         let args = json!({ "bundle": bundle });
-        let parked = self.call(&ops(), "harness_config_publish", args.clone()).await.unwrap_err();
+        let parked = self.call(&publisher(), "harness_config_publish", args.clone()).await.unwrap_err();
         let UaError::ApprovalRequired { approval_id, .. } = parked else {
             panic!("expected an approval: {parked:?}")
         };
         self.approve(approval_id).await;
-        self.ok(&ops(), "harness_config_publish", args).await
+        self.ok(&publisher(), "harness_config_publish", args).await
     }
 
     async fn register(&self) {
@@ -248,33 +256,37 @@ async fn publish_needs_an_operator_and_a_human_approval_bound_to_the_content() {
     let h = H::new();
     let bundle = json!({ "version": "1.0.0", "rules": { "claude": "be careful\n" } });
 
-    // A plain agent is not an operator.
+    // A plain agent is not an operator, nor is a lifecycle operator:
+    // publishing harness config is human-only.
     let e = h.call(&device(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    assert_eq!(reason(&e), "operator_required", "{e:?}");
+    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     assert_eq!(reason(&e), "operator_required", "{e:?}");
     // A bearer MCP server is refused before any approval is asked.
     let bad = json!({ "version": "2", "mcp_servers": [{ "name": "x", "url": "https://x.example.com", "auth": "bearer" }] });
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bad })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": bad })).await.unwrap_err();
     assert!(matches!(e, UaError::InvalidArgument(_)), "{e:?}");
 
     // The pass binds the content: a different bundle under the same version
     // is a new request, not the approved one.
-    let parked = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    let parked =
+        h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("{parked:?}") };
     h.approve(approval_id).await;
     let changed = json!({ "version": "1.0.0", "rules": { "claude": "be reckless\n" } });
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": changed })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": changed })).await.unwrap_err();
     assert!(
         matches!(e, UaError::ApprovalRequired { approval_id: other, .. } if other != approval_id),
         "{e:?}"
     );
 
-    let out = h.ok(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await;
+    let out = h.ok(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await;
     assert_eq!(out["version"], "1.0.0");
     assert_eq!(out["surfaces"], json!(["agents", "claude", "codex", "cursor", "opencode"]));
     assert_eq!(h.events("harness_config_publish"), 1);
 
     // A version is published once; the refusal comes before any approval.
-    let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+    let e = h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
     assert_eq!(reason(&e), "version_published", "{e:?}");
 
     let status = h.ok(&device(), "harness_config_status", json!({})).await;
@@ -349,14 +361,15 @@ async fn a_node_gets_reports_drift_and_applies_only_with_an_approved_pass() {
     assert_eq!(h.scalar("SELECT COUNT(*) FROM harness_config_drift"), json!(2));
     assert_eq!(h.events("harness_config_report"), 1);
 
-    // The approval binds node, surface, path, version, hash and the base the
-    // change starts from (nothing applied yet), all deterministic; the
-    // approver is shown the hub's own diff beside it (all added).
+    // The approval binds the organization, node, surface, path, version,
+    // hash and the base the change starts from (nothing applied yet), all
+    // deterministic; the approver is shown the hub's own diff beside it (all
+    // added).
     let approval_id = r1["proposals"][0]["approval_id"].as_i64().unwrap();
     assert_eq!(
         h.approval_payload(approval_id),
         json!({
-            "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
+            "org_id": "default", "node": NODE, "surface": "claude", "path": "CLAUDE.md", "bundle_version": "v1",
             "desired_hash": claude["hash"],
             "change_summary": { "base": "none", "from_bundle_version": null, "from_hash": null, "from_text_sha256": null },
         })
@@ -743,7 +756,8 @@ async fn unsafe_paths_and_mcp_urls_are_refused() {
         json!({ "version": "v1", "rules": { "codex": "x\n\"\"\"\n[mcp_servers.x]\ncommand = \"sh\"\n" } }),
         json!({ "version": "v1", "rules": { "agents": "x\"\"\"" } }),
     ] {
-        let e = h.call(&ops(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
+        let e =
+            h.call(&publisher(), "harness_config_publish", json!({ "bundle": bundle })).await.unwrap_err();
         assert!(matches!(e, UaError::InvalidArgument(_)), "{bundle}: {e:?}");
     }
     assert_eq!(h.scalar("SELECT COUNT(*) FROM approvals"), json!(0), "nothing was asked for");
@@ -1074,7 +1088,7 @@ async fn an_apply_pass_does_not_depend_on_how_long_the_diff_took() {
     assert_eq!(applied["approval_id"], id, "{applied}");
 }
 
-// --- permission front matter in rules text (hub #2687) ------------------------------
+// --- permission front matter in rules text -------------------------------------------
 
 fn refusal(raw: Value) -> String {
     match policy::validate(&raw) {
@@ -1299,11 +1313,16 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path());
     cfg.workspace = Some(dir.path().to_path_buf());
-    let parts: Vec<_> =
-        ua_tools::schema_parts().into_iter().filter(|p| p.name != "harness_config.v2").collect();
+    // A database from before `harness_config.v2` (and so before the later
+    // harness config parts, which need it).
+    let later =
+        ["harness_config.v2", "harness_config.v3.tenant_keys", "organization.v1.tools.harness_config"];
+    let parts: Vec<_> = ua_tools::schema_parts().into_iter().filter(|p| !later.contains(&p.name)).collect();
     let old =
         json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "diff": "+x\n" } });
     let new = json!({ "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    let scoped = json!({ "org_id": "default", "node": NODE, "surface": "claude", "change_summary": { "base": "none", "from_text_sha256": null } });
+    let scoped_publish = json!({ "org_id": "default", "version": "v1", "bundle_sha256": "ab" });
     {
         let db = ua_store::Db::open(&cfg.db_path(), &parts).unwrap();
         db.write(|tx| {
@@ -1313,6 +1332,8 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
                 ("harness_config_apply", &old, "consumed"),
                 ("harness_config_apply", &new, "pending"),
                 ("harness_config_publish", &old, "pending"),
+                ("harness_config_apply", &scoped, "pending"),
+                ("harness_config_publish", &scoped_publish, "approved"),
             ] {
                 tx.execute(
                     "INSERT INTO approvals (tool, payload, requested_by, status, created_at, updated_at) \
@@ -1325,14 +1346,23 @@ async fn apply_approvals_in_the_old_payload_shape_are_expired_by_the_migration()
         .unwrap();
     }
     let hub = Hub::open(cfg).unwrap();
-    let statuses: Vec<String> = hub
+    let rows: Vec<(String, Option<String>)> = hub
         .db()
         .read(|c| {
-            let mut stmt = c.prepare("SELECT status FROM approvals ORDER BY id")?;
-            Ok(stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            let mut stmt = c.prepare("SELECT status, reason FROM approvals ORDER BY id")?;
+            Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
         })
         .unwrap();
-    assert_eq!(statuses, ["expired", "expired", "consumed", "pending", "pending"]);
+    let statuses: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    // `harness_config.v2` expires the diff-binding apply shape; then
+    // `harness_config.v3.tenant_keys` expires every open apply or publish
+    // approval that does not bind `org_id`. A consumed one is history, and
+    // an approval that binds `org_id` stays open.
+    assert_eq!(statuses, ["expired", "expired", "consumed", "expired", "expired", "pending", "approved"]);
+    let reasons: Vec<Option<&str>> = rows.iter().map(|r| r.1.as_deref()).collect();
+    assert!(reasons[0].unwrap().contains("changed shape"), "{reasons:?}");
+    assert!(reasons[3].unwrap().contains("bind org_id"), "{reasons:?}");
+    assert!(reasons[4].unwrap().contains("bind org_id"), "{reasons:?}");
 }
 
 #[test]

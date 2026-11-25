@@ -131,3 +131,38 @@ pub const SCHEMA_V3: SchemaPart = SchemaPart {
 ALTER TABLE tool_calls ADD COLUMN page INTEGER NOT NULL DEFAULT 0;
 ",
 };
+
+/// `tool_calls.action_tool`: for a call of a tool that dispatches on an
+/// `action` ([`crate::routes`]), the standalone tool its action ran, or the
+/// `tool:action` key of an action with no standalone tool. Rate limits and
+/// cooldowns on that name count these rows too.
+pub const SCHEMA_V4: SchemaPart = SchemaPart {
+    name: "core.v4",
+    sql: "
+ALTER TABLE tool_calls ADD COLUMN action_tool TEXT;
+CREATE INDEX IF NOT EXISTS idx_tool_calls_action_tool ON tool_calls(action_tool, started_at);
+",
+};
+
+/// `organization.v1.tools.tool_calls`: `org_id` on `tool_calls` and the
+/// generated `tool_calls_org_exists` / `tool_calls_org_immutable` triggers.
+/// Every existing row takes the default organization. Before this part the
+/// only caller outside it could be #121's `github` system caller (on a hub
+/// with a second organization added by hand); its rows, if any, hold only
+/// a tool name, the `github` label, timing and outcome, and stay in
+/// `default`. Nothing is dropped. No key rebuild: the only key is an
+/// AUTOINCREMENT id.
+pub const TOOL_CALLS_TENANT_PART: ua_store::Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.tool_calls", &["tool_calls"]);
+
+/// `core.v5.tool_calls_org_scope`: indexes led by `org_id` for the readers'
+/// windows (`started_at`) and for the per-caller policy counts, cooldowns and
+/// evidence windows. Every reader filters on `org_id`. Two indexes only: the
+/// registry writes a row for every call.
+pub const TOOL_CALLS_ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "core.v5.tool_calls_org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_tool_calls_org_started ON tool_calls(org_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_org_caller ON tool_calls(org_id, caller, started_at);
+",
+};

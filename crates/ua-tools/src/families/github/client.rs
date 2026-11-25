@@ -4,43 +4,51 @@
 //!   `https://api.github.com`; a GitHub Enterprise Server API root works the
 //!   same). The URL must be `https` without credentials, query or fragment
 //!   (plain `http` only to loopback under the `fetch_allow_loopback` test
-//!   hook). For the public API the connection goes through the same guarded
-//!   resolver as `web_fetch`, so a DNS answer pointing at a private address
-//!   is refused. A GHES host is the operator's choice and may be private.
+//!   hook). Requests go through `ua_ingress::Outbound`: the public API under
+//!   the `github.rest` policy (that one host, public addresses only, checked
+//!   at connect time and again on the connection's peer), any other base
+//!   under `github.enterprise` (the operator's GHES host may be on a private
+//!   network or this host; link-local, multicast and reserved addresses are
+//!   still refused). No proxy is used.
 //! - **No redirects.** A 3xx other than 304 is an error, never followed, so
-//!   the token is never sent anywhere else.
+//!   the token is never sent anywhere else. The token is a secret header,
+//!   bound to the API base's origin.
 //! - **Bound repositories only.** Every call takes a [`BoundRepo`], which
 //!   exists only for a repository some project is bound to
 //!   (`project_repo_bind`). Paths are built from the normalized `owner/name`
 //!   and numeric ids, never from caller text.
 //! - **Bounded.** 20 seconds per request, 8 MiB per body, JSON only.
-//! - **One connection pool per API base.** The HTTP client for a base URL
+//! - **One connection pool per API base.** The `Outbound` client for a base URL
 //!   is built once and reused by every later request (connections and TLS
 //!   sessions are kept), never rebuilt per call.
 //! - **Rate-limit aware.** `x-ratelimit-remaining: 0` (or a 403/429 that says
 //!   so) blocks further requests to that host until `x-ratelimit-reset`
 //!   (or `retry-after`), without touching the network.
-//! - **The token** comes from [`Config::github_token`] (the variable
-//!   `github_token_env` names). It is sent as a sensitive header and never
-//!   stored, returned or logged. A GitHub App installation token can stand
-//!   in for it later; once the managed-secret store lands, it becomes the
-//!   token's source.
+//! - **The token** is one organization's ([`super::credentials::github_credential_for`]):
+//!   the default organization's is the hub configuration (`github_token_env`),
+//!   another's is its own managed secret. A client is built per call for
+//!   one organization ([`GitHub::for_org`]) and holds only that
+//!   organization's token; nothing here reads the hub configuration's token
+//!   directly, so another organization can never reach it. It is sent as a
+//!   sensitive header and never stored, returned or logged. A rate-limit
+//!   block is kept per (host, organization), so one organization's
+//!   exhausted token does not stop another's.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use reqwest::header::{ACCEPT, AUTHORIZATION, ETAG, HeaderValue, IF_NONE_MATCH};
+use reqwest::header::ETAG;
 use reqwest::{StatusCode, Url};
 use rusqlite::Connection;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use ua_core::{Config, UaError, UaResult};
+use ua_ingress::{Outbound, OutboundError, Request, policy};
 
-use crate::families::web::{GuardedResolver, USER_AGENT, error_chain, install_crypto_provider};
+use super::credentials::{CredentialKind, github_credential_for};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_BODY: usize = 8 * 1024 * 1024;
+/// The policies' body cap (both GitHub policies have the same).
+const MAX_BODY: usize = policy::GITHUB_REST.max_body_bytes;
 const API_VERSION: &str = "2022-11-28";
 /// Longest a rate-limit block is honoured, whatever the server says.
 const MAX_BLOCK_S: i64 = 3600;
@@ -48,8 +56,13 @@ const MAX_BLOCK_S: i64 = 3600;
 /// Why a GitHub request did not produce a usable answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GhError {
-    /// No token configured, or the base URL is unusable.
+    /// The base URL is unusable, or the client could not be built.
     NotConfigured(String),
+    /// The organization has no GitHub token (`true`: the default
+    /// organization, whose token is the hub configuration).
+    CredentialOff(bool),
+    /// The organization's stored token cannot be used (its reason code).
+    Unusable(String),
     NotFound,
     /// 401: the token is missing, expired or wrong.
     Unauthorized,
@@ -71,6 +84,13 @@ impl GhError {
     pub(crate) fn detail(&self) -> String {
         match self {
             GhError::NotConfigured(why) => why.clone(),
+            GhError::CredentialOff(true) => {
+                "no GitHub token is configured (github_token_env names an unset variable)".into()
+            }
+            GhError::CredentialOff(false) => {
+                "the organization has no GitHub token (github_credential_set kind token)".into()
+            }
+            GhError::Unusable(code) => format!("the organization's GitHub token is unusable ({code})"),
             GhError::NotFound => "GitHub answered 404 (missing, or the token cannot see it)".into(),
             GhError::Unauthorized => "GitHub refused the token (401)".into(),
             GhError::Forbidden => "the token may not read this (403)".into(),
@@ -85,21 +105,44 @@ impl GhError {
             GhError::Decode(e) => format!("GitHub response is not the expected JSON: {e}"),
         }
     }
+
+    /// A fixed code for a stored record (`github_poll_repos.last_error`):
+    /// never library error text, a URL or a value.
+    pub(crate) fn code(&self) -> String {
+        match self {
+            GhError::NotConfigured(_) => "not_configured".into(),
+            GhError::CredentialOff(_) => "credential_off".into(),
+            GhError::Unusable(_) => "unusable".into(),
+            GhError::NotFound => "not_found".into(),
+            GhError::Unauthorized => "unauthorized".into(),
+            GhError::Forbidden => "forbidden".into(),
+            GhError::RateLimited(_) => "rate_limited".into(),
+            GhError::Status(s) => format!("http_{s}"),
+            GhError::Redirect(s) => format!("redirect_{s}"),
+            GhError::Network(_) => "network".into(),
+            GhError::TooLarge => "too_large".into(),
+            GhError::Decode(_) => "decode".into(),
+        }
+    }
 }
 
 /// A repository some project is bound to, normalized `owner/name`. The only
 /// way to name a repository to [`GitHub`].
+///
+/// Bindings are per organization: every GitHub path checks the binding in
+/// the organization it acts for, and a client only ever pairs a binding
+/// with the same organization's token.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BoundRepo(String);
 
 impl BoundRepo {
-    /// `repo` if a project is bound to it.
-    pub(crate) fn check(conn: &Connection, repo: &str) -> UaResult<BoundRepo> {
+    /// `repo` if a project of organization `org` is bound to it.
+    pub(crate) fn check(conn: &Connection, org: &str, repo: &str) -> UaResult<BoundRepo> {
         let want = repo.trim().to_ascii_lowercase();
         let found: Option<String> = conn
             .query_row(
-                "SELECT repo FROM project_repo_bindings WHERE lower(repo) = ?1 LIMIT 1",
-                [&want],
+                "SELECT repo FROM project_repo_bindings WHERE org_id = ?1 AND lower(repo) = ?2 LIMIT 1",
+                [org, want.as_str()],
                 |r| r.get(0),
             )
             .ok();
@@ -112,10 +155,11 @@ impl BoundRepo {
         }
     }
 
-    /// Every bound repository, once each.
-    pub(crate) fn all(conn: &Connection) -> UaResult<Vec<BoundRepo>> {
-        let mut stmt = conn.prepare("SELECT DISTINCT lower(repo) FROM project_repo_bindings ORDER BY 1")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    /// Every repository organization `org` binds, once each.
+    pub(crate) fn all(conn: &Connection, org: &str) -> UaResult<Vec<BoundRepo>> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT lower(repo) FROM project_repo_bindings WHERE org_id = ?1 ORDER BY 1")?;
+        let rows = stmt.query_map([org], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(BoundRepo).collect())
     }
 
@@ -134,38 +178,43 @@ pub(crate) enum Got {
 /// A GitHub REST client pinned to one API host.
 pub(crate) struct GitHub {
     base: Url,
-    http: reqwest::Client,
+    http: Arc<Outbound>,
+    /// The organization whose token this is.
+    org: String,
     token: SecretString,
 }
 
-/// The HTTP clients built so far, one per (API base, loopback test hook).
-fn clients() -> &'static Mutex<HashMap<(String, bool), reqwest::Client>> {
-    static CLIENTS: OnceLock<Mutex<HashMap<(String, bool), reqwest::Client>>> = OnceLock::new();
+/// The clients built so far, one per (API base, loopback test hook).
+type Clients = Mutex<HashMap<(String, bool), Arc<Outbound>>>;
+
+fn clients() -> &'static Clients {
+    static CLIENTS: OnceLock<Clients> = OnceLock::new();
     CLIENTS.get_or_init(Mutex::default)
+}
+
+/// The policy for `base`: `github.rest` for the public API, else
+/// `github.enterprise`; under the loopback test hook when it is on.
+fn policy_for(base: &Url, allow_loopback: bool) -> ua_ingress::Policy {
+    let public_api = base
+        .host_str()
+        .is_some_and(|h| h.strip_suffix('.').unwrap_or(h).eq_ignore_ascii_case("api.github.com"));
+    let p = if public_api { policy::GITHUB_REST } else { policy::GITHUB_ENTERPRISE };
+    if allow_loopback { p.loopback_test_hook() } else { p }
 }
 
 /// The shared client for `base`, built on first use. The second value says
 /// whether this call built it.
-fn shared_client(base: &Url, allow_loopback: bool) -> Result<(reqwest::Client, bool), GhError> {
+fn shared_client(base: &Url, allow_loopback: bool) -> Result<(Arc<Outbound>, bool), GhError> {
     let key = (base.as_str().to_string(), allow_loopback);
     let mut map =
         clients().lock().map_err(|_| GhError::NotConfigured("HTTP client cache poisoned".into()))?;
     if let Some(c) = map.get(&key) {
         return Ok((c.clone(), false));
     }
-    install_crypto_provider();
-    let public_api = base.host_str().is_some_and(|h| h.eq_ignore_ascii_case("api.github.com"));
-    let mut builder = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(Duration::from_secs(10));
-    if public_api {
-        builder = builder.dns_resolver(GuardedResolver { allow_loopback });
-    }
-    let http =
-        builder.build().map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
+    // Pinned to the base's origin: `github.enterprise` builds no other client.
+    let http = Outbound::pinned(policy_for(base, allow_loopback), base)
+        .map(Arc::new)
+        .map_err(|e| GhError::NotConfigured(format!("cannot build the HTTP client: {e}")))?;
     if map.len() >= 16 {
         // Only a reconfigured base adds entries; keep the cache bounded anyway.
         map.clear();
@@ -178,6 +227,15 @@ fn shared_client(base: &Url, allow_loopback: bool) -> Result<(reqwest::Client, b
 fn blocks() -> &'static Mutex<HashMap<String, i64>> {
     static BLOCKS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
     BLOCKS.get_or_init(Mutex::default)
+}
+
+/// Forget every rate-limit block of organization `org`'s token, on every
+/// host: its token was set or cleared, and a new token has its own limit.
+pub(crate) fn clear_blocks(org: &str) {
+    let suffix = format!(" {org}");
+    if let Ok(mut map) = blocks().lock() {
+        map.retain(|key, _| !key.ends_with(&suffix));
+    }
 }
 
 fn now_s() -> i64 {
@@ -211,31 +269,54 @@ pub(crate) fn api_base(cfg: &Config) -> Result<Url, GhError> {
     if url.host_str().is_none_or(str::is_empty) {
         return Err(bad("it has no host"));
     }
+    // One spelling for the public API (the parser lowercases):
+    // `api.github.com.` is the public API too, and must get its policy. Any
+    // other host keeps the spelling the operator wrote: a trailing dot there
+    // can be deliberate (it stops the resolver from trying search domains).
+    if url.host_str() == Some("api.github.com.") {
+        url.set_host(Some("api.github.com")).map_err(|_| bad("it has no host"))?;
+    }
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(&path);
     Ok(url)
 }
 
 impl GitHub {
-    /// The client for `cfg`, `Ok(None)` when no token is configured.
-    pub(crate) fn from_config(cfg: &Config) -> Result<Option<GitHub>, GhError> {
-        let Some(token) = cfg.github_token() else { return Ok(None) };
+    /// A client for organization `org` with that organization's `token`.
+    fn with_token(cfg: &Config, org: &str, token: SecretString) -> Result<GitHub, GhError> {
         let base = api_base(cfg)?;
         let (http, _) = shared_client(&base, cfg.fetch_allow_loopback)?;
-        Ok(Some(GitHub { base, http, token }))
+        Ok(GitHub { base, http, org: org.to_string(), token })
     }
 
-    /// The client, or an error saying why there is none.
-    pub(crate) fn require(cfg: &Config) -> Result<GitHub, GhError> {
-        GitHub::from_config(cfg)?.ok_or_else(|| {
-            GhError::NotConfigured(
-                "no GitHub token is configured (github_token_env names an unset variable)".into(),
-            )
-        })
+    /// The client for organization `org`, with its own token
+    /// ([`github_credential_for`]): `Ok(None)` when it has none. Never another
+    /// organization's token, and never the hub configuration's for an
+    /// organization other than the default.
+    pub(crate) fn for_org(conn: &Connection, cfg: &Config, org: &str) -> Result<Option<GitHub>, GhError> {
+        match github_credential_for(conn, cfg, org, CredentialKind::Token) {
+            Ok(Some(cred)) => GitHub::with_token(cfg, org, cred.secret().clone()).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                Err(GhError::Unusable(e.reason_code().unwrap_or("github_credential_unusable").to_string()))
+            }
+        }
     }
 
+    /// [`GitHub::for_org`], or an error saying why there is none.
+    pub(crate) fn require_for(conn: &Connection, cfg: &Config, org: &str) -> Result<GitHub, GhError> {
+        GitHub::for_org(conn, cfg, org)?.ok_or_else(|| GhError::CredentialOff(org == ua_core::DEFAULT_ORG))
+    }
+
+    /// The organization whose token this client sends.
+    pub(crate) fn org(&self) -> &str {
+        &self.org
+    }
+
+    /// The rate-limit block key: the host and the organization, since each
+    /// organization's token has its own limit.
     fn host_key(&self) -> String {
-        self.base.origin().ascii_serialization()
+        format!("{} {}", self.base.origin().ascii_serialization(), self.org)
     }
 
     fn url(&self, repo: &BoundRepo, path: &str) -> Result<Url, GhError> {
@@ -265,21 +346,17 @@ impl GitHub {
             return Err(GhError::RateLimited(Some(until)));
         }
         let url = self.url(repo, path)?;
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.token.expose_secret()))
-            .map_err(|_| GhError::NotConfigured("the GitHub token is not a valid header value".into()))?;
-        auth.set_sensitive(true);
-        let mut req = self
-            .http
-            .get(url)
-            .header(AUTHORIZATION, auth)
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("x-github-api-version", API_VERSION);
-        if let Some(tag) = etag
-            && let Ok(v) = HeaderValue::from_str(tag)
-        {
-            req = req.header(IF_NONE_MATCH, v);
+        let mut req = Request::get(url)
+            .secret_header("authorization", &format!("Bearer {}", self.token.expose_secret()))
+            .map_err(|_| GhError::NotConfigured("the GitHub token is not a valid header value".into()))?
+            .header("accept", "application/vnd.github+json")
+            .and_then(|r| r.header("x-github-api-version", API_VERSION))
+            .map_err(|e| GhError::Network(e.to_string()))?;
+        if let Some(tag) = etag {
+            // An unusable stored tag is skipped, as before.
+            req = req.clone().header("if-none-match", tag).unwrap_or(req);
         }
-        let mut resp = req.send().await.map_err(|e| GhError::Network(error_chain(&e)))?;
+        let resp = self.http.send(req).await.map_err(network)?;
         let status = resp.status();
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         let remaining = header("x-ratelimit-remaining").and_then(|v| v.trim().parse::<i64>().ok());
@@ -313,13 +390,7 @@ impl GitHub {
             _ => {}
         }
         let etag = header(ETAG.as_str());
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| GhError::Network(error_chain(&e)))? {
-            if body.len() + chunk.len() > MAX_BODY {
-                return Err(GhError::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = resp.bytes().await.map_err(network)?;
         let body: Value = serde_json::from_slice(&body).map_err(|e| GhError::Decode(e.to_string()))?;
         Ok(Got::Fresh { etag, body })
     }
@@ -330,6 +401,15 @@ impl GitHub {
             Got::Fresh { body, .. } => Ok(body),
             Got::NotModified => Err(GhError::Status(304)),
         }
+    }
+}
+
+/// A failed send or body read. A body past the cap is [`GhError::TooLarge`];
+/// everything else is a network failure, as before.
+fn network(e: OutboundError) -> GhError {
+    match e {
+        OutboundError::TooLarge { .. } => GhError::TooLarge,
+        other => GhError::Network(other.to_string()),
     }
 }
 
@@ -373,15 +453,58 @@ mod tests {
             let (_, built) = shared_client(&base, false).unwrap();
             assert!(!built, "later requests reuse it");
         }
-        let mut cfg = Config { github_api_url: base.to_string(), ..Config::default() };
-        cfg.github_token_value = Some("t".to_string().into());
-        GitHub::from_config(&cfg).unwrap().unwrap();
+        let cfg = Config { github_api_url: base.to_string(), ..Config::default() };
+        GitHub::with_token(&cfg, ua_core::DEFAULT_ORG, "fake-token-not-real".to_string().into()).unwrap();
         let (_, built) = shared_client(&api_base(&cfg).unwrap(), false).unwrap();
-        assert!(!built, "from_config shares the cached client");
+        assert!(!built, "a client for an organization shares the cached client");
     }
 
     #[test]
-    fn no_token_means_no_client() {
-        assert!(GitHub::from_config(&Config::default()).unwrap().is_none());
+    fn the_public_api_and_an_enterprise_host_get_their_own_policies() {
+        let public = Url::parse("https://api.github.com").unwrap();
+        let ghe = Url::parse("https://ghe.example.com/api/v3").unwrap();
+        assert_eq!(policy_for(&public, false).name, "github.rest");
+        assert_eq!(policy_for(&ghe, false).name, "github.enterprise");
+        // Case and a trailing dot do not turn the public API into an
+        // enterprise host.
+        for spelling in ["https://API.GitHub.com", "https://api.github.com.", "https://Api.Github.Com./"] {
+            let cfg = Config { github_api_url: spelling.into(), ..Config::default() };
+            let base = api_base(&cfg).unwrap();
+            assert_eq!(base.host_str(), Some("api.github.com"), "{spelling}");
+            assert_eq!(policy_for(&base, false).name, "github.rest", "{spelling}");
+            assert!(policy_for(&base, false).check_url(&base).is_ok(), "{spelling}");
+            assert_eq!(policy_for(&Url::parse(spelling).unwrap(), false).name, "github.rest", "{spelling}");
+        }
+        // An enterprise host keeps the spelling the operator wrote.
+        let cfg = Config { github_api_url: "https://ghe.example.com./api/v3".into(), ..Config::default() };
+        let base = api_base(&cfg).unwrap();
+        assert_eq!(base.host_str(), Some("ghe.example.com."));
+        assert_eq!(policy_for(&base, false).name, "github.enterprise");
+        let hooked = policy_for(&Url::parse("http://127.0.0.1:9").unwrap(), true);
+        assert!(hooked.check_url(&Url::parse("http://127.0.0.1:9/repos/a/b").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_blocks_are_kept_per_organization() {
+        let cfg = Config::default();
+        let a = GitHub::with_token(&cfg, "default", "fake-a-not-real".to_string().into()).unwrap();
+        let b = GitHub::with_token(&cfg, "org-b", "fake-b-not-real".to_string().into()).unwrap();
+        assert_ne!(a.host_key(), b.host_key());
+        assert_eq!(b.org(), "org-b");
+    }
+
+    #[test]
+    fn clearing_an_organizations_blocks_leaves_the_others() {
+        let cfg =
+            Config { github_api_url: "https://ghe-clear-blocks.example.com".into(), ..Config::default() };
+        let a = GitHub::with_token(&cfg, "default", "fake-a-not-real".to_string().into()).unwrap();
+        let b = GitHub::with_token(&cfg, "org-clear-b", "fake-b-not-real".to_string().into()).unwrap();
+        let until = now_s() + 600;
+        blocks().lock().unwrap().insert(a.host_key(), until);
+        blocks().lock().unwrap().insert(b.host_key(), until);
+        clear_blocks("org-clear-b");
+        let map = blocks().lock().unwrap();
+        assert_eq!(map.get(&a.host_key()), Some(&until));
+        assert!(!map.contains_key(&b.host_key()));
     }
 }

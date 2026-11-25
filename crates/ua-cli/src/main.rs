@@ -1,6 +1,9 @@
 //! The `ua` command.
 
+mod ops;
+
 use std::io::Read;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -13,13 +16,33 @@ use ua_core::{ActorKind, Caller, Config};
 use ua_server::AppState;
 use ua_tools::{Hub, builtin_registry};
 
+/// `ua --version`: the version and the optional Cargo features compiled in,
+/// the same list system_doctor and capability_catalog report as
+/// `build_features`.
+fn version_text() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let names = |on: bool| -> String {
+            let v: Vec<&str> =
+                ua_tools::BUILD_FEATURES.iter().filter(|f| f.enabled == on).map(|f| f.feature).collect();
+            if v.is_empty() { "none".into() } else { v.join(", ") }
+        };
+        format!("{} (features: {}; without: {})", env!("CARGO_PKG_VERSION"), names(true), names(false))
+    })
+}
+
 /// ua: agent-operations hub.
 #[derive(Parser)]
-#[command(version, about, propagate_version = true)]
+#[command(version = version_text(), about, propagate_version = true)]
 struct Cli {
     /// Config file (default: $UA_CONFIG, then $UA_HOME/config.toml).
     #[arg(long, global = true, env = "UA_CONFIG")]
     config: Option<std::path::PathBuf>,
+    /// Open a database written by a newer build anyway, ignoring the schema
+    /// parts this build does not know (also `UA_ALLOW_NEWER_SCHEMA=1`). For
+    /// recovery only: logged at every open; see docs/operations.md.
+    #[arg(long, global = true)]
+    allow_newer_schema: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -28,7 +51,8 @@ struct Cli {
 enum Cmd {
     /// Run the HTTP hub (MCP at /mcp, JSON API at /api).
     Serve,
-    /// Serve MCP over stdin/stdout for one local client.
+    /// Serve MCP over stdin/stdout for one local client (needs the
+    /// mcp-server feature, on by default).
     Mcp {
         /// Identity label to act as.
         #[arg(long, env = "UA_AGENT_LABEL")]
@@ -66,12 +90,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
+    /// Initialize `$UA_HOME` with a starter config.toml, optional policy.yaml,
+    /// and local harness MCP setup snippets.
+    Init(ops::init::InitArgs),
+    /// Run read-only health, security, permission, database, and ledger checks.
+    Doctor(ops::doctor::DoctorArgs),
+    /// Take a verified, consistent SQLite snapshot of the hub database (safe while serving).
+    Backup(ops::backup::BackupArgs),
+    /// Verify and atomically restore a hub database snapshot (requires hub to be stopped).
+    Restore(ops::backup::RestoreArgs),
 }
 
 #[derive(Subcommand)]
 enum ImportCmd {
     /// Import a Python hub database (opened read-only). Re-running resumes
-    /// and skips rows already copied. Prints a JSON report.
+    /// and skips rows already copied. Prints a JSON report. Take a target
+    /// snapshot first when importing into a non-empty database: post-import
+    /// ledger verification runs after batches commit, so a failed verification
+    /// leaves imported rows in place without rollback.
     PythonHub {
         /// Path to the Python hub's SQLite database.
         #[arg(long = "from")]
@@ -99,12 +135,58 @@ enum TokenCmd {
     Revoke { label: String },
 }
 
-fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+pub(crate) fn load_config(explicit: Option<&std::path::Path>) -> anyhow::Result<Config> {
     let _ = dotenvy::dotenv();
-    match &cli.config {
+    match explicit {
         Some(p) => Config::load_from(p),
         None => Config::load(),
     }
+}
+
+pub(crate) fn issue_agent_token(
+    cfg: &Config,
+    hub: &Hub,
+    label: &str,
+    note: Option<&str>,
+    by: &str,
+) -> anyhow::Result<String> {
+    // A token for a human identity grants approval rights over HTTP;
+    // mint one only on an operator's explicit confirmation.
+    if cfg.is_human(label) && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(label)) {
+        anyhow::bail!("issuing a token for human {label:?} needs an operator at an interactive terminal");
+    }
+    let mut raw = [0u8; 32];
+    rand::rng().fill_bytes(&mut raw);
+    let token = format!("ua_{}", hex::encode(raw));
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let now = ua_core::time::now();
+    let reserved = ua_tools::families::agents::Reserved::of(hub.cfg());
+    hub.db().write(|tx| {
+        // The CLI runs on the hub host and issues default-organization
+        // tokens; a label another organization's agent holds is refused.
+        if ua_tools::families::tokens::held_outside_default(tx, &reserved, label)? {
+            return Err(ua_core::UaError::conflict_code(
+                "agent_label_taken",
+                format!("agent label {label:?} is taken; agent labels are one hub-wide namespace"),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO agent_tokens (org_id, agent_label, token_hash, issued_at, issued_by, note) \
+             VALUES (?6, ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![label, hash, now, by, note, ua_core::DEFAULT_ORG],
+        )?;
+        ua_store::ledger::append(
+            tx,
+            ua_store::EventInput::new(
+                ua_core::DEFAULT_ORG,
+                "agent.token.issued",
+                serde_json::json!({ "agent": label }),
+            )
+            .by(by),
+        )?;
+        Ok(())
+    })?;
+    Ok(token)
 }
 
 /// The caller for a local CLI invocation.
@@ -132,24 +214,29 @@ fn local_caller_with(
     confirm: impl FnOnce(&str) -> bool,
 ) -> Caller {
     let explicit = label.is_some() && agent_env.is_none();
-    let mut c = Caller::local(label.unwrap_or_else(|| "local".into()), Transport::Cli);
+    let mut c = Caller::local(label.unwrap_or_else(|| ua_core::identity::LOCAL_LABEL.into()), Transport::Cli);
     if explicit && cfg.is_human(&c.label) && confirm(&c.label) {
         c.kind = ActorKind::Human;
     }
     c
 }
 
-/// Whether rmcp at `level` is dropped. rmcp logs whole requests and
-/// responses at debug and trace: tool arguments (a managed_secret_set value)
-/// and downstream MCP results (a reflected credential).
-fn rmcp_capped(target: &str, level: &tracing::Level) -> bool {
-    (target == "rmcp" || target.starts_with("rmcp::"))
+/// Crates whose debug and trace logs are always dropped. rmcp logs whole
+/// requests and responses: tool arguments (a managed_secret_set value) and
+/// downstream MCP results (a reflected credential). tungstenite and
+/// tokio-tungstenite (Slack Socket Mode) log the WebSocket handshake
+/// request, whose URL carries Slack's one-time connection ticket.
+const CAPPED_TARGETS: [&str; 3] = ["rmcp", "tungstenite", "tokio_tungstenite"];
+
+/// Whether a log at `level` from `target` is dropped ([`CAPPED_TARGETS`]).
+fn capped(target: &str, level: &tracing::Level) -> bool {
+    CAPPED_TARGETS.iter().any(|c| target == *c || target.strip_prefix(c).is_some_and(|r| r.starts_with("::")))
         && matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE)
 }
 
 /// The log layer: `filter` (from UA_LOG), then a cap no directive can lift
-/// (not even a more specific one such as `rmcp::service=debug`): rmcp never
-/// logs below info.
+/// (not even a more specific one such as `rmcp::service=debug`): rmcp,
+/// tungstenite and tokio-tungstenite never log below info.
 fn log_layer<S, W>(
     filter: tracing_subscriber::EnvFilter,
     writer: W,
@@ -160,7 +247,7 @@ where
 {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::{FilterExt, filter_fn};
-    let cap = filter_fn(|meta| !rmcp_capped(meta.target(), meta.level()));
+    let cap = filter_fn(|meta| !capped(meta.target(), meta.level()));
     tracing_subscriber::fmt::layer().with_writer(writer).with_filter(filter.and(cap))
 }
 
@@ -298,20 +385,46 @@ async fn serve_until_shutdown(
     served
 }
 
-/// Build the runtime, run the command, then give the runtime
-/// [`RUNTIME_SHUTDOWN`] for what is still running. The shared hub lock is
-/// released only after that, so an import cannot start while this process's
-/// tasks may still write.
-fn main() -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let mut hub_lock = None;
-    let result = rt.block_on(run(&mut hub_lock));
-    rt.shutdown_timeout(RUNTIME_SHUTDOWN);
-    drop(hub_lock);
-    result
+/// The locks a command holds until the process is about to exit.
+#[derive(Default)]
+struct Held {
+    /// The shared hub lock (every command that opens the hub).
+    hub: Option<ua_import::HubLock>,
+    /// The one-serving-process lock (`ua serve` only).
+    serve: Option<ua_import::ServeLock>,
 }
 
-async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
+/// Build the runtime, run the command, then give the runtime
+/// [`RUNTIME_SHUTDOWN`] for what is still running. The locks are released
+/// only after that, so an import (or a second `ua serve`) cannot start while
+/// this process's tasks may still write.
+fn main() -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut held = Held::default();
+    let result = rt.block_on(run(&mut held));
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN);
+    drop(held);
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// What `ua mcp` answers in a build without the `mcp-server` feature.
+#[cfg(not(feature = "mcp-server"))]
+const NO_MCP_SERVER: &str = "ua mcp: this ua was built without the mcp-server feature, so it serves no MCP. \
+Rebuild with default features (or `--features mcp-server`), or call tools with `ua call` or the JSON API.";
+
+async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_from_env("UA_LOG").unwrap_or_else(|_| "info".into());
     {
@@ -319,212 +432,319 @@ async fn run(hub_lock: &mut Option<ua_import::HubLock>) -> anyhow::Result<()> {
         use tracing_subscriber::util::SubscriberInitExt;
         tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
     }
-    let cfg = load_config(&cli)?;
 
-    if let Cmd::Config = cli.cmd {
-        println!("{}", serde_json::to_string_pretty(&cfg)?);
-        return Ok(());
-    }
-
-    if let Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } = &cli.cmd {
-        let report = if *dry_run {
-            ua_import::dry_run(from)?
-        } else {
-            // Held until the import ends: no hub may run on this database.
-            let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
-            let db = ua_store::Db::open(&cfg.db_path(), &ua_import::schema_parts())?;
-            let opts = ua_import::Options { drop_org_scope: *drop_org_scope, ..Default::default() };
-            ua_import::import(&db, from, &opts)?
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-
-    // Every command that opens the hub holds a shared lock while it runs, so an
-    // import (which takes it exclusively) refuses while any of them is live.
-    *hub_lock = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
-    let hub = Hub::open(cfg.clone())?;
-    let registry = Arc::new(builtin_registry());
-    let state = AppState::new(hub.clone(), registry.clone());
-
+    let explicit_config = cli.config.clone();
+    // Read before any `.env` file is loaded (`load_config`): the override comes
+    // only from the command line or the real process environment.
+    let allow_newer_var = std::env::var_os(ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV);
+    let allow_newer_flag = cli.allow_newer_schema;
+    let allow_newer = || allow_newer_schema(allow_newer_flag, allow_newer_var.clone());
     match cli.cmd {
-        Cmd::Serve => {
-            warn_if_locked_out(&state).await;
-            // One token for the server and every background loop: a signal
-            // cancels it, then `serve_until_shutdown` drains them.
-            let ct = CancellationToken::new();
-            let mut background = Vec::new();
-            if cfg.routines_enabled {
-                background
-                    .push(tokio::spawn(ua_tools::families::routines::run_ticker(hub.clone(), ct.clone())));
+        Cmd::Init(args) => {
+            ops::init::run(args, explicit_config.as_deref(), allow_newer()?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
+        cmd => {
+            let cfg = load_config(explicit_config.as_deref())?;
+
+            // Refused before the hub lock and Hub::open, which may migrate the
+            // database: a build that cannot serve MCP touches nothing.
+            #[cfg(not(feature = "mcp-server"))]
+            if let Cmd::Mcp { .. } = cmd {
+                anyhow::bail!("{NO_MCP_SERVER}");
             }
-            if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
-                tracing::warn!("{w}");
-            }
-            match ua_server::oauth::register::prune_unused_clients(&hub).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::info!(pruned = n, "removed registered OAuth clients that never got a grant")
+
+            match cmd {
+                Cmd::Config => {
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
+                    Ok(ExitCode::SUCCESS)
                 }
-                Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
-            }
-            ua_tools::families::workspace::sweep_run_homes();
-            if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
-                tracing::warn!("{w}");
-            }
-            // One toolchain lookup in the background, so cargo started by a
-            // build tool or script finds the toolchain on a fresh hub.
-            ua_tools::families::workspace::warm_host_rust(&cfg.home);
-            let pruned = ua_tools::families::workspace::prune_run_caches(
-                &cfg.home,
-                ua_tools::families::workspace::RUN_CACHE_MAX_AGE,
-            );
-            if pruned > 0 {
-                tracing::info!(pruned, "removed run_cmd caches unused for 30 days");
-            }
-            // Reconcile runs a previous hub process left behind, then keep
-            // sweeping. Only the server reaps: a short-lived `ua call` or a
-            // stdio session must not judge another process's children.
-            ua_tools::families::dispatch::startup_sweep(&hub).await;
-            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
-            // Expire waits and lapsed node leases, and retry owed command
-            // notices, for every node.
-            background.extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
-            // Poll the bound repositories' open pull requests when no webhook
-            // can reach this hub (github_poll_interval_s; 0 = off).
-            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
-            // Routine fires a previous process left mid-workflow or unstarted.
-            let h = hub.clone();
-            background.push(tokio::spawn(async move {
-                match ua_tools::families::routines::reconcile_fires(&h).await {
-                    Ok(v) => {
-                        let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
-                        if n("interrupted") + n("not_run") + n("rerun") > 0 {
-                            tracing::info!(
-                                interrupted = n("interrupted"),
-                                not_run = n("not_run"),
-                                rerun = n("rerun"),
-                                "reconciled routine fires"
-                            );
-                        }
+                Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } => {
+                    let report = if dry_run {
+                        ua_import::dry_run(&from)?
+                    } else {
+                        // Held until the import ends: no hub may run on this database.
+                        let _lock = ua_import::HubLock::acquire(&cfg.db_path(), "import")?;
+                        let db = ua_tools::hub::open_db(
+                            &cfg.db_path(),
+                            &ua_import::schema_parts(),
+                            allow_newer()?,
+                            None,
+                        )?;
+                        let opts = ua_import::Options { drop_org_scope, ..Default::default() };
+                        ua_import::import(&db, &from, &opts)?
+                    };
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Backup(args) => {
+                    ops::backup::run_backup(&cfg, args)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Restore(args) => {
+                    ops::backup::run_restore(&cfg, args)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                cmd => {
+                    // Every command that opens the hub holds a shared lock while it runs, so an
+                    // import or restore (which takes it exclusively) refuses while any of them is live.
+                    held.hub = Some(ua_import::HubLock::acquire_shared(&cfg.db_path(), "this command")?);
+                    // One `ua serve` per database (docs/ingress.md, Limits): taken before the
+                    // database is opened, a port is bound or any inbound state is touched.
+                    if let Cmd::Serve = cmd {
+                        held.serve = Some(ua_import::ServeLock::acquire(&cfg.db_path())?);
                     }
-                    Err(e) => tracing::warn!(error = %e, "could not reconcile routine fires"),
-                }
-            }));
-            let signal_ct = ct.clone();
-            tokio::spawn(async move {
-                let which = shutdown_signal().await;
-                tracing::info!(signal = which, "shutting down: draining connections and background tasks");
-                signal_ct.cancel();
-                // A second signal does not wait for the drain.
-                let again = shutdown_signal().await;
-                let killed = ua_tools::families::dispatch::executor::kill_live_groups();
-                tracing::warn!(signal = again, killed_run_groups = killed, "second signal: exiting now");
-                std::process::exit(if again == "SIGTERM" { 143 } else { 130 });
-            });
-            serve_until_shutdown(state, ct, background).await?;
-        }
-        Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
-        Cmd::Tools { names } => {
-            for t in registry.all() {
-                if names {
-                    println!("{}", t.name);
-                } else {
-                    println!("{:<28} {:<14} {}", t.name, t.family, t.description);
+                    // Refuses a database a newer build wrote, unless overridden (docs/operations.md).
+                    // `ua serve` refuses it even then: serving it reopens the replay window.
+                    let override_on = allow_newer()?;
+                    let hub = match held.serve.as_ref() {
+                        // The serving process migrates under its own serve lock.
+                        Some(serving) => open_for_serve(&cfg, override_on, serving)?,
+                        // Every other command: the default open refuses to migrate
+                        // underneath a running `ua serve`.
+                        None => Hub::open_with(cfg.clone(), override_on)?,
+                    };
+                    let registry = Arc::new(builtin_registry());
+                    let state = AppState::new(hub.clone(), registry.clone());
+
+                    match cmd {
+                        Cmd::Serve => {
+                            warn_if_locked_out(&state).await;
+                            // One token for the server and every background loop: a signal
+                            // cancels it, then `serve_until_shutdown` drains them.
+                            let ct = CancellationToken::new();
+                            let mut background = Vec::new();
+                            if cfg.routines_enabled {
+                                background.push(tokio::spawn(ua_tools::families::routines::run_ticker(
+                                    hub.clone(),
+                                    ct.clone(),
+                                )));
+                            }
+                            if let Some(w) = ua_server::login::insecure_origin_warning(&cfg) {
+                                tracing::warn!("{w}");
+                            }
+                            match ua_server::oauth::register::prune_unused_clients(&hub).await {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    tracing::info!(
+                                        pruned = n,
+                                        "removed registered OAuth clients that never got a grant"
+                                    )
+                                }
+                                Err(e) => tracing::warn!(error = %e, "could not prune unused OAuth clients"),
+                            }
+                            ua_tools::families::workspace::sweep_run_homes();
+                            if let Some(w) = ua_tools::families::workspace::cargo_config_warning(&cfg) {
+                                tracing::warn!("{w}");
+                            }
+                            // One toolchain lookup in the background, so cargo started by a
+                            // build tool or script finds the toolchain on a fresh hub.
+                            ua_tools::families::workspace::warm_host_rust(&cfg.home);
+                            let pruned = ua_tools::families::workspace::prune_run_caches(
+                                &cfg.home,
+                                ua_tools::families::workspace::RUN_CACHE_MAX_AGE,
+                            );
+                            if pruned > 0 {
+                                tracing::info!(pruned, "removed run_cmd caches unused for 30 days");
+                            }
+                            // Reconcile runs a previous hub process left behind, then keep
+                            // sweeping. Only the server reaps: a short-lived `ua call` or a
+                            // stdio session must not judge another process's children.
+                            ua_tools::families::dispatch::startup_sweep(&hub).await;
+                            background.extend(ua_tools::families::dispatch::spawn_reaper(&hub, ct.clone()));
+                            // Expire waits and lapsed node leases, and retry owed command
+                            // notices, for every node.
+                            background
+                                .extend(ua_tools::families::node_queue::spawn_sweeper(&hub, ct.clone()));
+                            // Poll the bound repositories' open pull requests when no webhook
+                            // can reach this hub (github_poll_interval_s; 0 = off).
+                            background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+                            // Routine fires a previous process left mid-workflow or unstarted.
+                            let h = hub.clone();
+                            background.push(tokio::spawn(async move {
+                                match ua_tools::families::routines::reconcile_fires(&h).await {
+                                    Ok(v) => {
+                                        let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+                                        if n("interrupted") + n("not_run") + n("rerun") > 0 {
+                                            tracing::info!(
+                                                interrupted = n("interrupted"),
+                                                not_run = n("not_run"),
+                                                rerun = n("rerun"),
+                                                "reconciled routine fires"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "could not reconcile routine fires"),
+                                }
+                            }));
+                            let signal_ct = ct.clone();
+                            tokio::spawn(async move {
+                                let which = shutdown_signal().await;
+                                tracing::info!(
+                                    signal = which,
+                                    "shutting down: draining connections and background tasks"
+                                );
+                                signal_ct.cancel();
+                                // A second signal does not wait for the drain.
+                                let again = shutdown_signal().await;
+                                let killed = ua_tools::families::dispatch::executor::kill_live_groups();
+                                tracing::warn!(
+                                    signal = again,
+                                    killed_run_groups = killed,
+                                    "second signal: exiting now"
+                                );
+                                std::process::exit(if again == "SIGTERM" { 143 } else { 130 });
+                            });
+                            serve_until_shutdown(state, ct, background).await?;
+                        }
+                        #[cfg(feature = "mcp-server")]
+                        Cmd::Mcp { label } => ua_server::mcp::serve_stdio(state, label).await?,
+                        #[cfg(not(feature = "mcp-server"))]
+                        // Refused before the hub was opened (above).
+                        Cmd::Mcp { .. } => anyhow::bail!("{NO_MCP_SERVER}"),
+                        Cmd::Tools { names } => {
+                            for t in registry.all() {
+                                if names {
+                                    println!("{}", t.name);
+                                } else {
+                                    println!("{:<28} {:<14} {}", t.name, t.family, t.description);
+                                }
+                            }
+                        }
+                        Cmd::Call { tool, args, label } => {
+                            let args: Value = match args.as_deref() {
+                                None => Value::Null,
+                                Some("-") => {
+                                    let mut s = String::new();
+                                    std::io::stdin().read_to_string(&mut s)?;
+                                    serde_json::from_str(&s)?
+                                }
+                                Some(s) => serde_json::from_str(s)?,
+                            };
+                            let caller = local_caller(&cfg, label);
+                            match registry.call(&hub, &caller, &tool, args).await {
+                                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                                Err(e) => {
+                                    eprintln!("{}", serde_json::to_string_pretty(&e.to_json())?);
+                                    return Ok(ExitCode::from(1));
+                                }
+                            }
+                        }
+                        Cmd::Token { cmd } => match cmd {
+                            TokenCmd::Issue { label, note } => {
+                                let token = issue_agent_token(&cfg, &hub, &label, note.as_deref(), "cli")?;
+                                eprintln!(
+                                    "Token for {label} (shown once; store it in the agent's secret store):"
+                                );
+                                println!("{token}");
+                            }
+                            TokenCmd::Revoke { label } => {
+                                let now = ua_core::time::now();
+                                let n = hub.db().write(|tx| {
+                                    let n = tx.execute(
+                                        "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
+                                         WHERE org_id = ?3 AND agent_label = ?1 AND status = 'active'",
+                                        rusqlite::params![label, now, ua_core::DEFAULT_ORG],
+                                    )?;
+                                    ua_store::ledger::append(
+                                        tx,
+                                        ua_store::EventInput::new(
+                                            ua_core::DEFAULT_ORG,
+                                            "agent.token.revoked",
+                                            serde_json::json!({ "agent": label }),
+                                        )
+                                        .by("cli"),
+                                    )?;
+                                    Ok(n)
+                                })?;
+                                println!("revoked {n} token(s) for {label}");
+                            }
+                        },
+                        Cmd::LoginLink { label } => {
+                            // A login link signs a browser in as a human; same bar as acting
+                            // as a human from the CLI.
+                            if std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label) {
+                                anyhow::bail!(
+                                    "a sign-in link for {label:?} needs an operator at an interactive terminal"
+                                );
+                            }
+                            let url = ua_server::login::create_login_link(&hub, &label, "cli")?;
+                            eprintln!(
+                                "Sign-in link for {label} (single use, expires in {} s; open it in the browser you will use):",
+                                cfg.login_link_ttl_secs
+                            );
+                            println!("{url}");
+                        }
+                        Cmd::Init(_)
+                        | Cmd::Doctor(_)
+                        | Cmd::Config
+                        | Cmd::Import { .. }
+                        | Cmd::Backup(_)
+                        | Cmd::Restore(_) => unreachable!(),
+                    }
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
-        Cmd::Call { tool, args, label } => {
-            let args: Value = match args.as_deref() {
-                None => Value::Null,
-                Some("-") => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    serde_json::from_str(&s)?
-                }
-                Some(s) => serde_json::from_str(s)?,
-            };
-            let caller = local_caller(&cfg, label);
-            match registry.call(&hub, &caller, &tool, args).await {
-                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
-                Err(e) => {
-                    eprintln!("{}", serde_json::to_string_pretty(&e.to_json())?);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Cmd::Token { cmd } => match cmd {
-            TokenCmd::Issue { label, note } => {
-                // A token for a human identity grants approval rights over HTTP;
-                // mint one only on an operator's explicit confirmation.
-                if cfg.is_human(&label)
-                    && (std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label))
-                {
-                    anyhow::bail!(
-                        "issuing a token for human {label:?} needs an operator at an interactive terminal"
-                    );
-                }
-                let mut raw = [0u8; 32];
-                rand::rng().fill_bytes(&mut raw);
-                let token = format!("ua_{}", hex::encode(raw));
-                let hash = hex::encode(Sha256::digest(token.as_bytes()));
-                let now = ua_core::time::now();
-                hub.db().write(|tx| {
-                    tx.execute(
-                        "INSERT INTO agent_tokens (agent_label, token_hash, issued_at, issued_by, note) \
-                         VALUES (?1, ?2, ?3, 'cli', ?4)",
-                        rusqlite::params![label, hash, now, note],
-                    )?;
-                    ua_store::ledger::append(
-                        tx,
-                        ua_store::EventInput::new(
-                            "agent.token.issued",
-                            serde_json::json!({ "agent": label }),
-                        )
-                        .by("cli"),
-                    )?;
-                    Ok(())
-                })?;
-                eprintln!("Token for {label} (shown once; store it in the agent's secret store):");
-                println!("{token}");
-            }
-            TokenCmd::Revoke { label } => {
-                let now = ua_core::time::now();
-                let n = hub.db().write(|tx| {
-                    let n = tx.execute(
-                        "UPDATE agent_tokens SET status = 'revoked', revoked_at = ?2 \
-                         WHERE agent_label = ?1 AND status = 'active'",
-                        rusqlite::params![label, now],
-                    )?;
-                    ua_store::ledger::append(
-                        tx,
-                        ua_store::EventInput::new(
-                            "agent.token.revoked",
-                            serde_json::json!({ "agent": label }),
-                        )
-                        .by("cli"),
-                    )?;
-                    Ok(n)
-                })?;
-                println!("revoked {n} token(s) for {label}");
-            }
-        },
-        Cmd::LoginLink { label } => {
-            // A login link signs a browser in as a human; same bar as acting
-            // as a human from the CLI.
-            if std::env::var_os("UA_AGENT_LABEL").is_some() || !confirm_on_tty(&label) {
-                anyhow::bail!("a sign-in link for {label:?} needs an operator at an interactive terminal");
-            }
-            let url = ua_server::login::create_login_link(&hub, &label, "cli")?;
-            eprintln!(
-                "Sign-in link for {label} (single use, expires in {} s; open it in the browser you will use):",
-                cfg.login_link_ttl_secs
-            );
-            println!("{url}");
-        }
-        Cmd::Config | Cmd::Import { .. } => unreachable!(),
     }
-    Ok(())
+}
+
+/// Whether to open a database written by a newer build anyway: the
+/// `--allow-newer-schema` flag, or `UA_ALLOW_NEWER_SCHEMA` (`value`, read from
+/// the process environment before any `.env` file was loaded) set to `1`. Any
+/// value other than an explicit yes or no is refused rather than guessed at.
+fn allow_newer_schema(flag: bool, value: Option<std::ffi::OsString>) -> anyhow::Result<bool> {
+    if flag {
+        return Ok(true);
+    }
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    let Some(v) = value else { return Ok(false) };
+    let Some(v) = v.to_str() else { anyhow::bail!("{var} must be 1 or 0") };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "" | "0" | "false" | "no" => Ok(false),
+        _ => {
+            anyhow::bail!("{var} must be 1 (open a database written by a newer build anyway) or 0, not {v:?}")
+        }
+    }
+}
+
+/// Open the hub for `ua serve`. The override never lets a serve start on a
+/// database written by a newer build: it would take GitHub and Slack
+/// deliveries while reading only the delivery tables this build knows, which
+/// reopens the replay window the fence closes. The fenced open runs first, so
+/// a refused serve has written nothing.
+fn open_for_serve(
+    cfg: &ua_core::Config,
+    override_on: bool,
+    serving: &ua_import::ServeLock,
+) -> anyhow::Result<Hub> {
+    let var = ua_tools::hub::ALLOW_NEWER_SCHEMA_ENV;
+    match Hub::open_serving(cfg.clone(), serving) {
+        Ok(hub) => {
+            if override_on {
+                tracing::warn!(
+                    "--allow-newer-schema / {var} has no effect on ua serve (and this database needs none); unset it"
+                );
+            }
+            Ok(hub)
+        }
+        Err(e) if override_on => match e.downcast_ref::<ua_store::NewerSchema>() {
+            Some(newer) => anyhow::bail!(
+                "ua serve refuses the database {} even with --allow-newer-schema / {var}: it was written by a newer \
+                 build and records schema parts this build does not know ([{}]). Serving it would take GitHub and \
+                 Slack deliveries while reading only the delivery tables this build knows, so copies of deliveries \
+                 the newer build already handled would be accepted again. The override is for recovery through the \
+                 commands that do not serve (ua call, ua tools, ua mcp, ua backup, ua doctor). Run the newer build, \
+                 or restore a backup taken before the upgrade",
+                newer.db,
+                newer.unknown.join(", ")
+            ),
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// With auth enforced and no credential configured, every non-public request
@@ -573,6 +793,36 @@ mod tests {
         fn make_writer(&'w self) -> Buf {
             self.clone()
         }
+    }
+
+    /// The Socket Mode handshake request (with the ticket in its URL) is
+    /// logged by tungstenite at trace through the `log` bridge, under module
+    /// targets; none of it passes, whatever UA_LOG says.
+    #[test]
+    fn tungstenite_never_logs_below_info() {
+        use tracing_subscriber::layer::SubscriberExt;
+        for directive in ["trace", "info,tungstenite=trace,tokio_tungstenite=trace", "debug"] {
+            let buf = Buf::default();
+            let filter = tracing_subscriber::EnvFilter::new(directive);
+            let sub = tracing_subscriber::registry().with(log_layer(filter, buf.clone()));
+            tracing::subscriber::with_default(sub, || {
+                tracing::trace!(target: "tungstenite::handshake::client", "GET /link/?ticket=SECRET-TICKET");
+                tracing::debug!(target: "tungstenite::protocol", "SECRET-FRAME");
+                tracing::trace!(target: "tokio_tungstenite::compat", "SECRET-POLL");
+                tracing::debug!(target: "tokio_tungstenite", "SECRET-ROOT");
+                tracing::info!(target: "tungstenite::protocol", "tungstenite info kept");
+                tracing::debug!(target: "tungstenitex", "lookalike kept");
+            });
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("SECRET"), "{directive}: {out}");
+            assert!(out.contains("tungstenite info kept"), "{directive}: {out}");
+            if directive != "info,tungstenite=trace,tokio_tungstenite=trace" {
+                assert!(out.contains("lookalike kept"), "{directive}: {out}");
+            }
+        }
+        assert!(capped("tungstenite::handshake::client", &tracing::Level::TRACE));
+        assert!(capped("tokio_tungstenite", &tracing::Level::DEBUG));
+        assert!(!capped("tungstenite", &tracing::Level::INFO));
     }
 
     #[test]
@@ -661,8 +911,8 @@ mod tests {
         assert!(!text.contains("SECRET"), "{text}");
         assert!(text.contains("rmcp-info-kept") && text.contains("other-debug-kept"), "{text}");
         assert!(text.contains("lookalike-kept"), "{text}");
-        assert!(rmcp_capped("rmcp::transport::worker", &tracing::Level::TRACE));
-        assert!(!rmcp_capped("rmcp", &tracing::Level::WARN));
+        assert!(capped("rmcp::transport::worker", &tracing::Level::TRACE));
+        assert!(!capped("rmcp", &tracing::Level::WARN));
     }
 
     #[test]

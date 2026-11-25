@@ -40,6 +40,7 @@ fn caller(label: &str, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some(format!("{label}-key")),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -49,6 +50,59 @@ async fn call(reg: &Registry, hub: &Hub, tool: &str, args: Value) -> Value {
 
 fn manifest_of(exported: &Value) -> Value {
     exported["manifest"].clone()
+}
+
+#[tokio::test]
+async fn manifest_listings_redact_messages_outside_the_exporters_mailbox() {
+    let e = env();
+    let reg = builtin_registry();
+    let sender = agent();
+    let recipient = caller("builder-2", Profile::Coordinator);
+    let observer = caller("builder-3", Profile::Coordinator);
+    let sent = reg
+        .call(
+            &e.hub,
+            &sender,
+            "message_send",
+            json!({
+                "act": "handoff", "to_agent": recipient.label, "body": "Draft ready",
+                "handoff": { "done": ["Drafted the report"], "next_action": "Review section two" }
+            }),
+        )
+        .await
+        .unwrap();
+    let args = json!({ "events_since_ulid": "00000000000000000000000000" });
+    let find = |manifest: &Value| {
+        manifest["event_log"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["ulid"] == sent["event_ulid"])
+            .unwrap()
+            .clone()
+    };
+    let allowed = reg.call(&e.hub, &recipient, "export_migration_manifest", args.clone()).await.unwrap();
+    let message = find(&allowed["manifest"]);
+    let payload: Value = serde_json::from_str(message["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["body"], "Draft ready");
+    assert_eq!(payload["handoff"]["next_action"], "Review section two");
+
+    let blocked = reg.call(&e.hub, &observer, "export_migration_manifest", args.clone()).await.unwrap();
+    let redacted =
+        json!({ "ulid": sent["event_ulid"], "entry_hash": message["entry_hash"], "redacted": true });
+    assert_eq!(find(&blocked["manifest"]), redacted);
+    assert_eq!(allowed["fingerprint"], blocked["fingerprint"]);
+    assert_eq!(
+        allowed["manifest"]["event_log"]["rolling_hash"],
+        blocked["manifest"]["event_log"]["rolling_hash"],
+    );
+
+    let mut file_args = args;
+    file_args["write_to_vault"] = json!(true);
+    let file = reg.call(&e.hub, &observer, "export_migration_manifest", file_args).await.unwrap();
+    let bytes = std::fs::read(e.workspace.join(file["path"].as_str().unwrap())).unwrap();
+    let manifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(find(&manifest), redacted);
 }
 
 #[tokio::test]
@@ -665,14 +719,14 @@ async fn compare_reports_rows_whose_content_differs_and_broken_chains() {
     broken["event_log"]["chain_ok"] = json!(false);
     let diff =
         call(&reg, &e.hub, "compare_migration_manifests", json!({"left": left, "right": broken})).await;
-    assert!(
-        diff["conflicts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right"),
-        "{diff}"
-    );
+    let conflict = diff["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right")
+        .unwrap_or_else(|| panic!("missing event_log_chain_broken conflict: {diff}"));
+    assert!(conflict.get("first_bad_seq").is_none(), "{diff}");
+    assert!(conflict.get("chain_error").is_none(), "{diff}");
     assert_eq!(diff["same"], false);
 }
 
@@ -719,4 +773,127 @@ async fn compare_reads_only_files_the_caller_exported() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn deleted_middle_ledger_row_sets_chain_ok_false_through_manifest_tools() {
+    let e = env();
+    let reg = builtin_registry();
+    for title in ["one", "two", "three"] {
+        call(&reg, &e.hub, "task_add", json!({"title": title})).await;
+    }
+
+    let healthy = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let healthy_log = healthy["manifest"]["event_log"].as_object().unwrap();
+    let mut keys: Vec<&str> = healthy_log.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["chain_ok", "count", "entry_hash_mismatches", "first_ulid", "last_ulid", "rolling_hash"]
+    );
+    assert_eq!(healthy_log["chain_ok"], json!(true), "{healthy}");
+    assert_eq!(healthy_log["entry_hash_mismatches"], json!(0));
+    let original_count = healthy_log["count"].as_u64().unwrap();
+    assert!(original_count >= 3);
+
+    // Drop the append-only delete trigger and remove the second row without altering
+    // the remaining rows' stored entry_hash values.
+    let next_seq = e
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_delete;")?;
+            let mid_seq: i64 =
+                tx.query_row("SELECT seq FROM event_log ORDER BY seq LIMIT 1 OFFSET 1", [], |r| r.get(0))?;
+            let next_seq: i64 = tx.query_row(
+                "SELECT seq FROM event_log WHERE seq > ?1 ORDER BY seq LIMIT 1",
+                [mid_seq],
+                |r| r.get(0),
+            )?;
+            tx.execute("DELETE FROM event_log WHERE seq = ?1", [mid_seq])?;
+            Ok(next_seq)
+        })
+        .unwrap();
+
+    let broken = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let broken_log = broken["manifest"]["event_log"].as_object().unwrap();
+    assert_eq!(broken_log["chain_ok"], json!(false), "{broken}");
+    assert_eq!(broken_log["entry_hash_mismatches"], json!(0), "{broken}");
+    assert_eq!(broken_log["count"], json!(original_count - 1));
+    assert_eq!(broken_log.get("first_bad_seq"), Some(&json!(next_seq)), "{broken}");
+    assert!(
+        broken_log.get("chain_error").and_then(Value::as_str).is_some_and(|s| s.contains("prev_hash")),
+        "{broken}"
+    );
+
+    let diff = call(
+        &reg,
+        &e.hub,
+        "compare_migration_manifests",
+        json!({"left": healthy["manifest"].clone(), "right": broken["manifest"].clone()}),
+    )
+    .await;
+    assert_eq!(diff["same"], json!(false));
+    let conflict = diff["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right")
+        .unwrap_or_else(|| panic!("missing event_log_chain_broken conflict: {diff}"));
+    assert_eq!(conflict["first_bad_seq"], json!(next_seq), "{diff}");
+    assert!(conflict["chain_error"].as_str().is_some_and(|s| s.contains("prev_hash")), "{diff}");
+}
+
+#[tokio::test]
+async fn tampered_middle_ledger_row_reports_bad_seq_and_entry_hash_mismatch() {
+    let e = env();
+    let reg = builtin_registry();
+    for title in ["one", "two", "three"] {
+        call(&reg, &e.hub, "task_add", json!({"title": title})).await;
+    }
+
+    let healthy = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let healthy_log = healthy["manifest"]["event_log"].as_object().unwrap();
+    assert_eq!(healthy_log["chain_ok"], json!(true), "{healthy}");
+
+    // Drop the append-only update trigger and tamper the second row's payload
+    // without updating its stored entry_hash.
+    let mid_seq = e
+        .hub
+        .db()
+        .write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+            let mid_seq: i64 =
+                tx.query_row("SELECT seq FROM event_log ORDER BY seq LIMIT 1 OFFSET 1", [], |r| r.get(0))?;
+            tx.execute("UPDATE event_log SET payload = '{\"tampered\":true}' WHERE seq = ?1", [mid_seq])?;
+            Ok(mid_seq)
+        })
+        .unwrap();
+
+    let broken = call(&reg, &e.hub, "export_migration_manifest", json!({})).await;
+    let broken_log = broken["manifest"]["event_log"].as_object().unwrap();
+    assert_eq!(broken_log["chain_ok"], json!(false), "{broken}");
+    assert_eq!(broken_log["entry_hash_mismatches"], json!(1), "{broken}");
+    assert_eq!(broken_log.get("first_bad_seq"), Some(&json!(mid_seq)), "{broken}");
+    assert!(
+        broken_log.get("chain_error").and_then(Value::as_str).is_some_and(|s| s.contains("entry_hash")),
+        "{broken}"
+    );
+
+    let diff = call(
+        &reg,
+        &e.hub,
+        "compare_migration_manifests",
+        json!({"left": healthy["manifest"].clone(), "right": broken["manifest"].clone()}),
+    )
+    .await;
+    assert_eq!(diff["same"], json!(false));
+    let conflict = diff["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "event_log_chain_broken" && c["side"] == "right")
+        .unwrap_or_else(|| panic!("missing event_log_chain_broken conflict: {diff}"));
+    assert_eq!(conflict["first_bad_seq"], json!(mid_seq), "{diff}");
+    assert!(conflict["chain_error"].as_str().is_some_and(|s| s.contains("entry_hash")), "{diff}");
 }

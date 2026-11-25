@@ -19,6 +19,10 @@
 //! Reads never write. A lapsed lease or a stale session heartbeat reports
 //! `abandoned` on read; the stored row is left for the reapers.
 //!
+//! Workflow runs are tenant data: only the caller's organization's are read
+//! (`organization.v1.tools.workflows`); another organization's run answers as
+//! a missing one.
+//!
 //! Visibility follows the stores' own tools: dispatch, session and workflow
 //! runs are visible to whoever may call these tools (as with
 //! `dispatch_delivery_receipts_list`, `session_list` and
@@ -44,6 +48,7 @@ use super::node_queue::{self, ITEM_COLS, item_from_row};
 use super::platform::object_ref;
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 /// Every run kind this hub records.
 pub const KINDS: [&str; 4] = ["dispatch", "session", "workflow", "node"];
@@ -104,17 +109,24 @@ pub struct GetArgs {
     pub kinds: Option<Vec<String>>,
 }
 
-/// Who is reading, for node-item visibility.
+/// Who is reading, for node-item visibility and the workflow runs'
+/// organization.
 struct Viewer {
     who: Option<String>,
-    operator: bool,
+    maintainer: bool,
+    org: String,
 }
 
 impl Viewer {
     fn of(hub: &Hub, caller: &Caller) -> Self {
         let who = verified(caller).map(str::to_string);
-        let operator = who.as_deref().is_some_and(|w| node_queue::is_operator(hub, caller, w));
-        Self { who, operator }
+        let maintainer = who.is_some()
+            && Authz::new(hub.cfg()).holds(
+                caller,
+                &[Authority::Operator, Authority::LifecycleOperator],
+                ua_core::DEFAULT_ORG,
+            );
+        Self { who, maintainer, org: caller.org_id.clone() }
     }
 }
 
@@ -180,8 +192,10 @@ fn lapsed(lease: Option<&str>, now: &str) -> bool {
 
 // --- dispatch ----------------------------------------------------------------
 
-fn dispatch_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "agent_label", "created_at", "run_id");
+fn dispatch_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "agent_label", "created_at", "run_id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT run_id, task_id, delegation_id, agent_label, harness, state, lease_expires_at, attempt, fence, \
@@ -236,8 +250,12 @@ fn dispatch_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Valu
 
 // --- sessions ------------------------------------------------------------------
 
-fn session_rows(c: &Connection, f: &Filter<'_>, stale_before: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "agent", "started_at", "id");
+/// Sessions of the reader's organization `org` only: another
+/// organization's session answers exactly as a missing run.
+fn session_rows(c: &Connection, f: &Filter<'_>, org: &str, stale_before: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "agent", "started_at", "id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT id, agent, kind, status, started_at, ended_at, last_heartbeat_at, task_id, delegation_id, \
@@ -281,8 +299,10 @@ fn session_rows(c: &Connection, f: &Filter<'_>, stale_before: &str) -> UaResult<
 
 // --- workflows -----------------------------------------------------------------
 
-fn workflow_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Value>> {
-    let (w, mut binds) = clauses(f, "owner", "created_at", "run_id");
+fn workflow_rows(c: &Connection, f: &Filter<'_>, org: &str, now: &str) -> UaResult<Vec<Value>> {
+    let (mut w, mut binds) = clauses(f, "owner", "created_at", "run_id");
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(org.to_string()));
     binds.push(SqlValue::Integer(f.limit));
     let sql = format!(
         "SELECT run_id, kind, name, task_id, owner, status, next_step, error, lease_expires_at, created_at, \
@@ -323,10 +343,13 @@ fn workflow_rows(c: &Connection, f: &Filter<'_>, now: &str) -> UaResult<Vec<Valu
 
 fn node_rows(c: &Connection, f: &Filter<'_>, viewer: &Viewer, now: &str) -> UaResult<Vec<Value>> {
     let (mut w, mut binds) = clauses(f, "agent", "created_at", "id");
-    if !viewer.operator {
+    w.push("org_id = ?".into());
+    binds.push(SqlValue::Text(viewer.org.clone()));
+    if !viewer.maintainer {
         let Some(who) = viewer.who.as_deref() else { return Ok(Vec::new()) };
         w.push(
-            "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ?))"
+            "(created_by = ? OR agent = ? OR id IN (SELECT item_id FROM node_command WHERE owner_agent = ? \
+             AND org_id = node_dispatch.org_id))"
                 .into(),
         );
         for _ in 0..3 {
@@ -416,7 +439,9 @@ fn evidence_refs(ulids: &[String]) -> Value {
 }
 
 /// Fill `links.evidence` (and a session's `links.dispatch_run`) for a page.
-fn attach_links(c: &Connection, rows: &mut [Value]) -> UaResult<()> {
+/// `org` is the reader's organization: a session links only to its node
+/// items in it.
+fn attach_links(c: &Connection, org: &str, rows: &mut [Value]) -> UaResult<()> {
     let ids_of = |rows: &[Value], kind: &str| -> Vec<String> {
         rows.iter()
             .filter(|r| r["kind"] == kind)
@@ -436,9 +461,11 @@ fn attach_links(c: &Connection, rows: &mut [Value]) -> UaResult<()> {
     for chunk in external.chunks(CHUNK) {
         let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT id, run_id, session_id FROM node_dispatch WHERE session_id IN ({marks}) ORDER BY created_at, id"
+            "SELECT id, run_id, session_id FROM node_dispatch WHERE org_id = ? AND session_id IN ({marks}) \
+             ORDER BY created_at, id"
         );
-        let binds = chunk.iter().map(|s| SqlValue::Text(s.clone())).collect();
+        let mut binds = vec![SqlValue::Text(org.to_string())];
+        binds.extend(chunk.iter().map(|s| SqlValue::Text(s.clone())));
         for (id, run, session) in query_rows(c, &sql, binds, |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
         })? {
@@ -524,13 +551,13 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
     let has = |k: &str| kinds.iter().any(|w| w == k);
     let mut rows = Vec::new();
     if has("dispatch") {
-        rows.extend(dispatch_rows(c, &f, &now)?);
+        rows.extend(dispatch_rows(c, &f, &viewer.org, &now)?);
     }
     if has("session") {
-        rows.extend(session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?);
+        rows.extend(session_rows(c, &f, &viewer.org, &ago(SESSION_ABANDON_MINUTES * 60))?);
     }
     if has("workflow") {
-        rows.extend(workflow_rows(c, &f, &now)?);
+        rows.extend(workflow_rows(c, &f, &viewer.org, &now)?);
     }
     if has("node") {
         rows.extend(node_rows(c, &f, viewer, &now)?);
@@ -546,7 +573,7 @@ fn list(c: &Connection, viewer: &Viewer, a: &ListArgs) -> UaResult<Value> {
     });
     let truncated = rows.len() as i64 > cap;
     rows.truncate(cap as usize);
-    attach_links(c, &mut rows)?;
+    attach_links(c, &viewer.org, &mut rows)?;
     let next = if truncated { rows.last().map(cursor_of) } else { None };
     Ok(json!({
         "runs": rows,
@@ -570,18 +597,18 @@ fn get(c: &Connection, viewer: &Viewer, run_id: &str, kinds: &[String]) -> UaRes
     let has = |k: &str| kinds.iter().any(|w| w == k);
     let mut rows = Vec::new();
     if has("dispatch") {
-        rows = dispatch_rows(c, &f, &now)?;
+        rows = dispatch_rows(c, &f, &viewer.org, &now)?;
     }
     if rows.is_empty() && has("session") {
-        rows = session_rows(c, &f, &ago(SESSION_ABANDON_MINUTES * 60))?;
+        rows = session_rows(c, &f, &viewer.org, &ago(SESSION_ABANDON_MINUTES * 60))?;
     }
     if rows.is_empty() && has("workflow") {
-        rows = workflow_rows(c, &f, &now)?;
+        rows = workflow_rows(c, &f, &viewer.org, &now)?;
     }
     if rows.is_empty() && has("node") {
         rows = node_rows(c, &f, viewer, &now)?;
     }
-    attach_links(c, &mut rows)?;
+    attach_links(c, &viewer.org, &mut rows)?;
     Ok(rows.into_iter().next())
 }
 

@@ -16,6 +16,7 @@ fn agent(label: &str) -> Caller {
         enforce_profile: true,
         session_key: Some(format!("{label}-key")),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -274,10 +275,13 @@ async fn lifecycle_record_capture() {
     let second = call(&reg, &hub, &a, "lifecycle_record", args).await;
     assert_eq!(second["duplicate"], true);
     assert_eq!(second["event_id"], first["event_id"]);
-    assert_eq!(count_events(&hub, "agent.lifecycle.handoff"), 1);
+    // A hook-reported handoff has its own channel; the note channel stays the
+    // handoff notes' alone.
+    assert_eq!(count_events(&hub, "agent.lifecycle.handoff_hook"), 1);
+    assert_eq!(count_events(&hub, "agent.lifecycle.handoff"), 0);
 
     let events =
-        call(&reg, &hub, &a, "event_log_query", json!({"channels": ["agent.lifecycle.handoff"]})).await;
+        call(&reg, &hub, &a, "event_log_query", json!({"channels": ["agent.lifecycle.handoff_hook"]})).await;
     let event = &events["events"][0];
     assert_eq!(event["originator"], "builder-1");
     let payload = &event["payload"]["payload"];

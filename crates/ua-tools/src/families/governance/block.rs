@@ -45,8 +45,13 @@ impl Blocked {
 /// (`node_dispatch`, `node_command_start`, node-routed dispatch),
 /// `node_claim` (for the node's owner, and per queued item to skip held
 /// ones) and `plan_step_claim` (the agent only; a plan step is not a task).
+///
+/// `task_id` is a task of organization `org`; another organization's task is
+/// read as a missing one, which blocks nothing (the caller has already
+/// resolved the task in its organization, or refuses it as missing).
 pub(crate) fn claim_block(
     tx: &mut WriteTx<'_>,
+    org: &str,
     agent: Option<&str>,
     task_id: Option<i64>,
     renewal: bool,
@@ -57,13 +62,13 @@ pub(crate) fn claim_block(
         return Ok(Some(Blocked { code: stopped.code(), message: stopped.refusal(agent) }));
     }
     if let Some(task_id) = task_id
-        && let Some(message) = continuity::parked_block(tx, task_id)?
+        && let Some(message) = continuity::parked_block(tx, org, task_id)?
     {
         return Ok(Some(Blocked { code: "task_parked", message }));
     }
     if let Some(task_id) = task_id
         && !renewal
-        && let Some(message) = holds::subtree_block(tx, task_id)?
+        && let Some(message) = holds::subtree_block(tx, org, task_id)?
     {
         return Ok(Some(Blocked { code: "task_held", message }));
     }
@@ -73,11 +78,12 @@ pub(crate) fn claim_block(
 /// [`claim_block`] as an error.
 pub(crate) fn check_claim(
     tx: &mut WriteTx<'_>,
+    org: &str,
     agent: Option<&str>,
     task_id: Option<i64>,
     renewal: bool,
 ) -> UaResult<()> {
-    match claim_block(tx, agent, task_id, renewal)? {
+    match claim_block(tx, org, agent, task_id, renewal)? {
         Some(b) => Err(b.error()),
         None => Ok(()),
     }

@@ -47,12 +47,9 @@ impl UaMcp {
             return (**c).clone();
         }
         let parts = ctx.extensions.get::<axum::http::request::Parts>();
-        let id = parts.and_then(|p| p.extensions.get::<AuthIdentity>().cloned()).unwrap_or(AuthIdentity {
-            label: LOCAL_LABEL.into(),
-            kind: ua_core::ActorKind::Anonymous,
-            verified: false,
-            grant: None,
-        });
+        let id = parts
+            .and_then(|p| p.extensions.get::<AuthIdentity>().cloned())
+            .unwrap_or_else(|| AuthIdentity::in_default(LOCAL_LABEL, ua_core::ActorKind::Anonymous, false));
         let key = parts.and_then(|p| session_key(&p.headers));
         caller_for(&self.state, &id, key, Transport::Mcp)
     }

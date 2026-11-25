@@ -40,10 +40,11 @@
 
 pub(crate) mod acceptance;
 mod claim;
-mod command;
+pub(crate) mod command;
 pub mod credentials;
 mod receipt;
 mod relay;
+mod tenant_keys;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use schemars::JsonSchema;
@@ -57,6 +58,7 @@ use super::{governance, nodes};
 use crate::approvals::{self, GateOutcome};
 use crate::hub::Hub;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub(crate) use acceptance::{
     node_acceptance_attest, node_acceptance_evaluate, node_acceptance_start, node_acceptance_status,
@@ -65,6 +67,7 @@ pub(crate) use claim::on_heartbeat;
 pub(crate) use command::{node_command_adopt, node_command_start, node_command_status};
 pub(crate) use credentials::{revoke_for_agent, session_credential_revoke};
 pub(crate) use receipt::cancel_for_run;
+pub use tenant_keys::{DISPATCH_ORG_SCOPE, DISPATCH_TENANT_PART, ORG_SCOPE, TENANT_KEYS, TENANT_PART};
 
 pub const CHANNEL: &str = "agent.node";
 
@@ -274,14 +277,122 @@ pub(crate) fn evidence_ref(node: &str, item: &str) -> String {
     format!("node:{node}:{item}")
 }
 
+/// Append an `agent.node` event about a row of organization `org`.
 pub(crate) fn record(
     tx: &mut WriteTx<'_>,
+    org: &str,
     kind: &str,
     mut payload: Value,
     by: &str,
 ) -> UaResult<Option<String>> {
     payload["kind"] = json!(kind);
-    Ok(ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?.map(|e| e.ulid))
+    emit(tx, org, CHANNEL, payload, by, None)
+}
+
+/// Keys an event about another organization's node, item, follow-up or run
+/// keeps in the default organization's ledger: hub-generated ids, counts,
+/// and states and codes the hub chooses from a fixed set. Node names, hosts,
+/// agents, actors, paths, prompts, commands, reasons, notes and outputs are
+/// dropped.
+const ORG_EVENT_KEYS: [&str; 21] = [
+    "kind",
+    "item_id",
+    "run_id",
+    "task_id",
+    "status",
+    "state",
+    "run_state",
+    "attempt",
+    "attempts",
+    "fence",
+    "retry_count",
+    "backend",
+    "seq",
+    "followup_id",
+    "credential_id",
+    "terminal",
+    "timestamp",
+    "termination_outcome",
+    "proposals",
+    "changed",
+    "executable",
+];
+
+/// An event payload as the default organization's ledger may hold it: the
+/// payload itself for the default organization, else only
+/// [`ORG_EVENT_KEYS`].
+pub(crate) fn ledger_payload(org: &str, payload: Value) -> Value {
+    if org == ua_core::DEFAULT_ORG {
+        return payload;
+    }
+    match payload {
+        Value::Object(m) => {
+            Value::Object(m.into_iter().filter(|(k, _)| ORG_EVENT_KEYS.contains(&k.as_str())).collect())
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Append a node or dispatch event about a row of organization `org`.
+///
+/// ORG-EVENT-DEFAULT: the ledger row stays in the default organization until
+/// `org_guard` admits another (the task family's `emit` rule). So another
+/// organization's event keeps only [`ORG_EVENT_KEYS`] (no node name, host,
+/// agent, path, prompt, command or output) and its originator is the neutral
+/// `system`, never the acting agent. `agent.node` and
+/// `agent.dispatch.transition` are ordinary visible channels
+/// (`VISIBLE_EVENT` restricts neither), which is why the payload is reduced
+/// here rather than hidden on read.
+pub(crate) fn emit(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    payload: Value,
+    by: &str,
+    dedupe: Option<Dedupe>,
+) -> UaResult<Option<String>> {
+    let default = org == ua_core::DEFAULT_ORG;
+    let by = if default { by } else { "system" };
+    let mut ev =
+        EventInput::new(ua_core::DEFAULT_ORG, channel, ledger_payload(org, payload)).by(by.to_string());
+    if let Some(d) = dedupe {
+        ev = ev.dedupe(if default { d.named } else { format!("org:{}", d.hub) });
+    }
+    Ok(ledger::append(tx, ev)?.map(|e| e.ulid))
+}
+
+/// A ledger dedupe key for [`emit`], in two forms.
+///
+/// `named` is the default organization's key, stored as it is: it may name
+/// a node or a node-chosen turn id. `hub` is built from hub-generated ids
+/// only (the event kind, an item id, an attempt, a ledger event id) and is
+/// stored as `org:<hub>` for any other organization, so its key carries
+/// neither a node name nor a digest a reader could test a guessed name
+/// against. Every `hub` form names a hub-generated item id, so it stays
+/// unique hub-wide.
+pub(crate) struct Dedupe {
+    pub named: String,
+    pub hub: String,
+}
+
+/// Refuse an organization `orgs` does not hold, or holds as suspended,
+/// before anything is read for a write or written. The `org_exists`
+/// triggers fire only on insert and do not read the status, so an update
+/// (a heartbeat, a cancel, a receipt) would otherwise pass.
+pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no node, node work or dispatch run was changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no node, node work or dispatch run was changed"),
+        )),
+    }
 }
 
 /// The verified agent a device-plane call acts for (the node's owner).
@@ -305,16 +416,12 @@ pub(crate) fn verified_caller(caller: &Caller, verb: &str) -> UaResult<String> {
     })
 }
 
-/// Whether `who` may act on any item: a human identity or a lifecycle
-/// operator.
-pub(crate) fn is_operator(hub: &Hub, caller: &Caller, who: &str) -> bool {
-    caller.is_human() || hub.cfg().is_human(who) || hub.cfg().is_lifecycle_operator(who)
-}
-
 // --- node rows ------------------------------------------------------------------
 
 /// A registered node as the queue needs it.
 pub(crate) struct NodeRow {
+    /// The organization that registered the node.
+    pub org_id: String,
     pub node: String,
     pub agent: String,
     pub facts: Map<String, Value>,
@@ -354,13 +461,17 @@ impl NodeRow {
     }
 }
 
-pub(crate) fn load_node(c: &Connection, node: &str) -> UaResult<Option<NodeRow>> {
+/// The node `node` of organization `org`. Another organization's node
+/// answers exactly like a missing one.
+pub(crate) fn load_node(c: &Connection, org: &str, node: &str) -> UaResult<Option<NodeRow>> {
     Ok(c.query_row(
-        "SELECT node, agent, facts_json, last_heartbeat, heartbeat_floor, retired_at FROM nodes WHERE node = ?1",
-        [node],
+        "SELECT node, agent, facts_json, last_heartbeat, heartbeat_floor, retired_at, org_id FROM nodes \
+         WHERE node = ?1 AND org_id = ?2",
+        params![node, org],
         |r| {
             let facts: String = r.get(2)?;
             Ok(NodeRow {
+                org_id: r.get(6)?,
                 node: r.get(0)?,
                 agent: r.get(1)?,
                 facts: serde_json::from_str::<Value>(&facts)
@@ -376,11 +487,13 @@ pub(crate) fn load_node(c: &Connection, node: &str) -> UaResult<Option<NodeRow>>
     .optional()?)
 }
 
-/// The node `name`, owned by `agent` and in service: the device plane's
-/// gate. Another label's node is refused before retirement is revealed.
-pub(crate) fn owned_node(c: &Connection, name: &str, agent: &str) -> UaResult<NodeRow> {
+/// The node `name` of organization `org`, owned by `agent` and in service:
+/// the device plane's gate. Another label's node is refused before
+/// retirement is revealed; another organization's answers as unregistered,
+/// so a node token of one organization never reaches another's node.
+pub(crate) fn owned_node(c: &Connection, org: &str, name: &str, agent: &str) -> UaResult<NodeRow> {
     let name = nodes::validate_node_name(name)?;
-    let Some(row) = load_node(c, &name)? else {
+    let Some(row) = load_node(c, org, &name)? else {
         return Err(UaError::not_found(format!("node {name:?} is not registered")));
     };
     nodes::check_owner(&row.agent, row.retired, &name, agent)?;
@@ -393,6 +506,8 @@ pub(crate) fn owned_node(c: &Connection, name: &str, agent: &str) -> UaResult<No
 #[derive(Debug, Clone)]
 pub(crate) struct Item {
     pub id: String,
+    /// The organization of the caller who queued the item (its node's).
+    pub org_id: String,
     pub node: String,
     pub agent: String,
     pub backend: String,
@@ -424,7 +539,7 @@ pub(crate) struct Item {
 pub(crate) const ITEM_COLS: &str = "id, node, agent, backend, prompt, cwd, cwd_realpath, model, permission_mode, \
     settings_source, timeout_s, run_id, task_id, status, attempts, cancel_requested, created_by, created_at, \
     claimed_at, lease_expires_at, completed_at, receipt_json, session_id, wait_reason, wait_last_heartbeat, \
-    wait_expires_at, updated_at";
+    wait_expires_at, updated_at, org_id";
 
 pub(crate) fn item_from_row(r: &Row<'_>) -> rusqlite::Result<Item> {
     Ok(Item {
@@ -455,12 +570,19 @@ pub(crate) fn item_from_row(r: &Row<'_>) -> rusqlite::Result<Item> {
         wait_last_heartbeat: r.get(24)?,
         wait_expires_at: r.get(25)?,
         updated_at: r.get(26)?,
+        org_id: r.get(27)?,
     })
 }
 
-pub(crate) fn load_item(c: &Connection, id: &str) -> UaResult<Option<Item>> {
-    Ok(c.query_row(&format!("SELECT {ITEM_COLS} FROM node_dispatch WHERE id = ?1"), [id], item_from_row)
-        .optional()?)
+/// The item `id` of organization `org`. Another organization's item answers
+/// exactly like a missing one.
+pub(crate) fn load_item(c: &Connection, org: &str, id: &str) -> UaResult<Option<Item>> {
+    Ok(c.query_row(
+        &format!("SELECT {ITEM_COLS} FROM node_dispatch WHERE id = ?1 AND org_id = ?2"),
+        params![id, org],
+        item_from_row,
+    )
+    .optional()?)
 }
 
 pub(crate) fn items_where(c: &Connection, filter: &str, p: impl rusqlite::Params) -> UaResult<Vec<Item>> {
@@ -550,12 +672,12 @@ impl Item {
 
 /// Every queued or claimed item of `node`: the open-work probe that keeps a
 /// node from being retired, reassigned or forgotten while it holds work.
-pub(crate) fn open_work(c: &Connection, node: &str) -> UaResult<Vec<String>> {
+pub(crate) fn open_work(c: &Connection, org: &str, node: &str) -> UaResult<Vec<String>> {
     let mut stmt = c.prepare(
-        "SELECT id FROM node_dispatch WHERE node = ?1 AND status IN ('queued','claimed') \
+        "SELECT id FROM node_dispatch WHERE org_id = ?1 AND node = ?2 AND status IN ('queued','claimed') \
          ORDER BY created_at, rowid LIMIT 20",
     )?;
-    let ids = stmt.query_map([node], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    let ids = stmt.query_map([org, node], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
     Ok(ids)
 }
 
@@ -566,9 +688,11 @@ pub(crate) fn open_work(c: &Connection, node: &str) -> UaResult<Vec<String>> {
 pub(crate) fn run_gate(c: &Connection, item: &Item) -> UaResult<Option<&'static str>> {
     let Some(run_id) = &item.run_id else { return Ok(None) };
     let row: Option<(String, Option<String>)> = c
-        .query_row("SELECT state, termination_outcome FROM dispatch_runs WHERE run_id = ?1", [run_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT state, termination_outcome FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2",
+            params![run_id, item.org_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     Ok(match row {
         None => None,
@@ -584,7 +708,11 @@ pub(crate) fn run_gate(c: &Connection, item: &Item) -> UaResult<Option<&'static 
 pub(crate) fn run_bound(c: &Connection, item: &Item) -> UaResult<bool> {
     let Some(run_id) = &item.run_id else { return Ok(false) };
     let ev: Option<Option<String>> = c
-        .query_row("SELECT evidence_ref FROM dispatch_runs WHERE run_id = ?1", [run_id], |r| r.get(0))
+        .query_row(
+            "SELECT evidence_ref FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2",
+            params![run_id, item.org_id],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(ev.flatten().as_deref() == Some(evidence_ref(&item.node, &item.id).as_str()))
 }
@@ -603,7 +731,8 @@ pub(crate) fn close_linked_run(
     if !run_bound(tx, item)? {
         return Ok(Some(json!({ "ok": false, "reason": "run_rebound", "run_id": run_id })));
     }
-    let Some(run) = super::dispatch::load_run(tx, &run_id)? else {
+    let org = item.org_id.as_str();
+    let Some(run) = super::dispatch::load_run(tx, org, &run_id)? else {
         return Ok(Some(json!({ "ok": false, "reason": "unknown_run", "run_id": run_id })));
     };
     // A cancel whose intent was recorded but never finalized (the cancelling
@@ -615,6 +744,7 @@ pub(crate) fn close_linked_run(
         let confirmed = node_confirmed || item.attempts == 0;
         let out = super::dispatch::finalize_cancellation(
             tx,
+            org,
             &run_id,
             actor,
             "node_queue",
@@ -635,6 +765,7 @@ pub(crate) fn close_linked_run(
         if node_confirmed && matches!(run.termination_outcome.as_deref(), Some("requested" | "unknown")) {
             let out = super::dispatch::finalize_cancellation(
                 tx,
+                org,
                 &run_id,
                 actor,
                 "node_receipt",
@@ -662,6 +793,7 @@ pub(crate) fn close_linked_run(
     let out = super::dispatch::record_outcome(
         tx,
         super::dispatch::Outcome {
+            org,
             run_id: &run_id,
             fence: None,
             state: if finished { "finished" } else { "failed" },
@@ -689,7 +821,7 @@ pub(crate) fn run_running(tx: &mut WriteTx<'_>, item: &Item, lease: &str) -> UaR
     if !run_bound(tx, item)? {
         return Ok(());
     }
-    let Some(run) = super::dispatch::load_run(tx, run_id)? else { return Ok(()) };
+    let Some(run) = super::dispatch::load_run(tx, &item.org_id, run_id)? else { return Ok(()) };
     if run.termination_outcome.is_some() {
         return Ok(());
     }
@@ -701,6 +833,7 @@ pub(crate) fn run_running(tx: &mut WriteTx<'_>, item: &Item, lease: &str) -> UaR
             if super::dispatch::transition(tx, &run, edge)?.is_ok() {
                 super::dispatch::record_transition(
                     tx,
+                    &item.org_id,
                     run_id,
                     "running",
                     &item.agent,
@@ -721,9 +854,9 @@ pub(crate) fn renew_run(tx: &WriteTx<'_>, item: &Item, lease: &str) -> UaResult<
         return Ok(());
     }
     tx.execute(
-        "UPDATE dispatch_runs SET lease_expires_at = ?2, updated_at = ?3 WHERE run_id = ?1 \
+        "UPDATE dispatch_runs SET lease_expires_at = ?2, updated_at = ?3 WHERE run_id = ?1 AND org_id = ?4 \
          AND state IN ('claimed','launched','running') AND termination_outcome IS NULL",
-        params![run_id, lease, now()],
+        params![run_id, lease, now(), item.org_id],
     )?;
     Ok(())
 }
@@ -844,8 +977,16 @@ fn settings_source(n: &NewItem) -> String {
 /// The node `n.node` can take this item now: registered, in service,
 /// advertising the backend (when it reports a list), with the features the
 /// item needs, and past device acceptance when `node_require_acceptance` is on.
-pub(crate) fn accepting_node(c: &Connection, cfg: &ua_core::Config, n: &NewItem) -> UaResult<NodeRow> {
-    let Some(row) = load_node(c, &n.node)? else {
+///
+/// The node must be `org`'s: another organization's node answers exactly
+/// like an unregistered one, so work is never queued across organizations.
+pub(crate) fn accepting_node(
+    c: &Connection,
+    cfg: &ua_core::Config,
+    org: &str,
+    n: &NewItem,
+) -> UaResult<NodeRow> {
+    let Some(row) = load_node(c, org, &n.node)? else {
         return Err(UaError::not_found(format!("node {:?} is not registered", n.node)));
     };
     if row.retired {
@@ -907,19 +1048,32 @@ pub(crate) fn gate_payload(n: &NewItem, caller: &str) -> Value {
 
 /// Insert a validated item (the caller has gated it). Returns the enqueue
 /// result. A wait is recorded when the node is not live.
+///
+/// `org` is the enqueuer's organization, and the item's: the node must be
+/// in it, and a bound task is looked up in it, so an item's task is always
+/// one the enqueuer can see, and the runner paths read that task by its
+/// hub-global id afterwards.
 pub(crate) fn insert_item(
     tx: &mut WriteTx<'_>,
     hub: &Hub,
+    org: &str,
     n: &NewItem,
     node: &NodeRow,
     created_by: &str,
 ) -> UaResult<Value> {
+    require_org(tx, org)?;
+    if node.org_id != org {
+        return Err(UaError::not_found(format!("node {:?} is not registered", n.node)));
+    }
     // The one claim gate, again at the enqueue itself (every path queues here).
-    governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+    governance::check_claim(tx, org, Some(&node.agent), n.task_id, false)?;
     acceptance::require_accepted(tx, hub.cfg(), node, &n.backend)?;
     if let Some(t) = n.task_id {
-        let exists: Option<String> =
-            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [t], |r| r.get(0)).optional()?;
+        let exists: Option<String> = tx
+            .query_row("SELECT status FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, t], |r| {
+                r.get(0)
+            })
+            .optional()?;
         match exists.as_deref() {
             None => return Err(UaError::not_found(format!("task {t} does not exist"))),
             Some("done" | "cancelled") => {
@@ -929,7 +1083,7 @@ pub(crate) fn insert_item(
         }
         // Node work bound to a proposal-spawned task (node_dispatch, a
         // command, node-routed dispatch) fails closed on a drifted contract.
-        governance::task_contract(tx, t)?;
+        governance::task_contract(tx, org, t)?;
     }
     let id = new_item_id();
     let ts = now();
@@ -944,8 +1098,9 @@ pub(crate) fn insert_item(
     tx.execute(
         "INSERT INTO node_dispatch (id, node, agent, backend, prompt, cwd, cwd_realpath, model, permission_mode, \
          settings_source, timeout_s, run_id, task_id, status, created_by, created_at, launch_key, wait_reason, \
-         wait_last_heartbeat, wait_expires_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'queued', ?14, ?15, ?16, ?17, ?18, ?19, ?15)",
+         wait_last_heartbeat, wait_expires_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'queued', ?14, ?15, ?16, ?17, ?18, ?19, ?15, \
+         ?20)",
         params![
             id,
             n.node,
@@ -966,10 +1121,11 @@ pub(crate) fn insert_item(
             wait_reason,
             live.live_heartbeat.clone().or(node.last_heartbeat.clone()),
             wait_expires,
+            org,
         ],
     )?;
     if let Some(c) = &n.command {
-        command::insert(tx, &id, c, &ts)?;
+        command::insert(tx, org, &id, c, &ts)?;
     }
     let mut ev = json!({
         "node": n.node,
@@ -991,16 +1147,22 @@ pub(crate) fn insert_item(
         ev["waiting"] = json!({ "reason": reason, "expires_at": wait_expires });
         out["waiting"] = waiting;
     }
-    record(tx, "enqueue", ev, created_by)?;
+    record(tx, org, "enqueue", ev, created_by)?;
     Ok(out)
 }
 
 /// A retry under a used `launch_key`: the item it queued, when the same
 /// caller asks for the same thing. Another caller's key, or the same key
 /// with other arguments, is a conflict that reveals nothing about the item.
-fn replay(c: &Connection, key: &str, who: &str, n: &NewItem) -> UaResult<Option<Value>> {
-    let Some(item) = items_where(c, "launch_key = ?1", [key])?.into_iter().next() else { return Ok(None) };
-    let cmd = command::load(c, &item.id)?.map(|c| c.argv);
+/// Launch keys are unique per organization (`node_queue.v2.tenant_keys`),
+/// so only `org`'s items are read: another organization's use of the same
+/// key is invisible and the key answers like a fresh one.
+fn replay(c: &Connection, org: &str, key: &str, who: &str, n: &NewItem) -> UaResult<Option<Value>> {
+    let Some(item) = items_where(c, "org_id = ?1 AND launch_key = ?2", params![org, key])?.into_iter().next()
+    else {
+        return Ok(None);
+    };
+    let cmd = command::load(c, org, &item.id)?.map(|c| c.argv);
     let same = item.created_by == who
         && item.node == n.node
         && item.backend == n.backend
@@ -1038,17 +1200,18 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
     let out = hub
         .db()
         .write_async(move |tx| {
+            require_org(tx, &caller.org_id)?;
             if let Some(k) = &n.launch_key
-                && let Some(prev) = replay(tx, k, &who, &n)?
+                && let Some(prev) = replay(tx, &caller.org_id, k, &who, &n)?
             {
                 return Ok(Ok(prev));
             }
-            let node = accepting_node(tx, hub2.cfg(), &n)?;
+            let node = accepting_node(tx, hub2.cfg(), &caller.org_id, &n)?;
             // Before the approval gate, so stopped, held or drifted work never
             // consumes one.
-            governance::check_claim(tx, Some(&node.agent), n.task_id, false)?;
+            governance::check_claim(tx, &caller.org_id, Some(&node.agent), n.task_id, false)?;
             if let Some(t) = n.task_id {
-                governance::task_contract(tx, t)?;
+                governance::task_contract(tx, &caller.org_id, t)?;
             }
             match approvals::gate(tx, hub2.cfg(), &caller, "node_dispatch", &gate_payload(&n, &who))? {
                 GateOutcome::Pass { .. } => {}
@@ -1060,7 +1223,7 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
                     ));
                 }
             }
-            insert_item(tx, &hub2, &n, &node, &who).map(Ok)
+            insert_item(tx, &hub2, &caller.org_id, &n, &node, &who).map(Ok)
         })
         .await?;
     match out {
@@ -1077,8 +1240,17 @@ pub(crate) async fn request_dispatch(hub: &Hub, caller: &Caller, n: NewItem) -> 
 /// Request cancellation of an item. A queued item ends `cancelled` at once;
 /// a claimed one is flagged, and the node stops it on its next heartbeat and
 /// reports a receipt. Returns `{item_id, status, cancel_requested}`.
-pub(crate) fn cancel_item(tx: &mut WriteTx<'_>, id: &str, actor: &str, reason: &str) -> UaResult<Value> {
-    let Some(item) = load_item(tx, id)? else {
+///
+/// `org` is the item's organization: the caller's, or for a hub path the
+/// organization of the row it acts on.
+pub(crate) fn cancel_item(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    id: &str,
+    actor: &str,
+    reason: &str,
+) -> UaResult<Value> {
+    let Some(item) = load_item(tx, org, id)? else {
         return Err(UaError::not_found(format!("node item {id} does not exist")));
     };
     if item.is_terminal() {
@@ -1090,17 +1262,18 @@ pub(crate) fn cancel_item(tx: &mut WriteTx<'_>, id: &str, actor: &str, reason: &
     if item.status == "queued" {
         tx.execute(
             "UPDATE node_dispatch SET status = 'cancelled', cancel_requested = 1, completed_at = ?2, updated_at = ?2 \
-             WHERE id = ?1 AND status = 'queued'",
-            params![id, ts],
+             WHERE id = ?1 AND org_id = ?3 AND status = 'queued'",
+            params![id, ts, org],
         )?;
         record(
             tx,
+            org,
             "cancelled",
             json!({ "node": item.node, "item_id": id, "actor": actor, "reason": reason }),
             actor,
         )?;
-        relay::drop_open_followups(tx, id, "item_cancelled")?;
-        credentials::revoke_for_item(tx, id, "cancelled", actor)?;
+        relay::drop_open_followups(tx, org, id, "item_cancelled")?;
+        credentials::revoke_for_item(tx, org, id, "cancelled", actor)?;
         let run = close_linked_cancel(tx, &item, actor)?;
         return Ok(
             json!({ "item_id": id, "status": "cancelled", "cancel_requested": true, "changed": true, "run_outcome": run }),
@@ -1108,17 +1281,18 @@ pub(crate) fn cancel_item(tx: &mut WriteTx<'_>, id: &str, actor: &str, reason: &
     }
     if !item.cancel_requested {
         tx.execute(
-            "UPDATE node_dispatch SET cancel_requested = 1, updated_at = ?2 WHERE id = ?1",
-            params![id, ts],
+            "UPDATE node_dispatch SET cancel_requested = 1, updated_at = ?2 WHERE id = ?1 AND org_id = ?3",
+            params![id, ts, org],
         )?;
         record(
             tx,
+            org,
             "cancel_requested",
             json!({ "node": item.node, "item_id": id, "actor": actor, "reason": reason }),
             actor,
         )?;
     }
-    credentials::revoke_for_item(tx, id, "cancelled", actor)?;
+    credentials::revoke_for_item(tx, org, id, "cancelled", actor)?;
     Ok(
         json!({ "item_id": id, "status": item.status, "cancel_requested": true, "changed": !item.cancel_requested }),
     )
@@ -1131,12 +1305,13 @@ fn close_linked_cancel(tx: &mut WriteTx<'_>, item: &Item, actor: &str) -> UaResu
         return Ok(None);
     }
     let run_id = item.run_id.clone().unwrap_or_default();
-    let Some(run) = super::dispatch::load_run(tx, &run_id)? else { return Ok(None) };
+    let Some(run) = super::dispatch::load_run(tx, &item.org_id, &run_id)? else { return Ok(None) };
     if super::dispatch::states::is_terminal(&run.state) && run.state != "cancelled" {
         return Ok(None);
     }
     Ok(Some(super::dispatch::finalize_cancellation(
         tx,
+        &item.org_id,
         &run_id,
         actor,
         "node_queue",
@@ -1158,11 +1333,21 @@ pub struct ItemArgs {
 /// Who may control an item: whoever queued it, the node's agent, the
 /// command's owner, or an operator.
 fn may_control(c: &Connection, hub: &Hub, caller: &Caller, who: &str, item: &Item) -> UaResult<bool> {
-    if is_operator(hub, caller, who) || item.created_by == who || item.agent == who {
+    if Authz::new(hub.cfg()).holds(
+        caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        ua_core::DEFAULT_ORG,
+    ) || item.created_by == who
+        || item.agent == who
+    {
         return Ok(true);
     }
     let owner: Option<String> = c
-        .query_row("SELECT owner_agent FROM node_command WHERE item_id = ?1", [&item.id], |r| r.get(0))
+        .query_row(
+            "SELECT owner_agent FROM node_command WHERE item_id = ?1 AND org_id = ?2",
+            params![item.id, item.org_id],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(owner.as_deref() == Some(who))
 }
@@ -1176,7 +1361,8 @@ pub(crate) async fn node_item_cancel(ctx: ToolCtx, a: ItemArgs) -> UaResult<Valu
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let Some(item) = load_item(tx, &id)? else {
+            require_org(tx, &caller.org_id)?;
+            let Some(item) = load_item(tx, &caller.org_id, &id)? else {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !may_control(tx, &hub, &caller, &who, &item)? {
@@ -1187,7 +1373,7 @@ pub(crate) async fn node_item_cancel(ctx: ToolCtx, a: ItemArgs) -> UaResult<Valu
                     ),
                 ));
             }
-            cancel_item(tx, &id, &who, &reason)
+            cancel_item(tx, &caller.org_id, &id, &who, &reason)
         })
         .await
 }
@@ -1221,10 +1407,18 @@ pub(crate) async fn node_item_reconcile(ctx: ToolCtx, a: ReconcileArgs) -> UaRes
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let Some(item) = load_item(tx, &id)? else {
+            require_org(tx, &caller.org_id)?;
+            let org = caller.org_id.clone();
+            let Some(item) = load_item(tx, &org, &id)? else {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
-            if !(item.agent == who || is_operator(&hub, &caller, &who)) {
+            if !(item.agent == who
+                || Authz::new(hub.cfg()).holds(
+                    &caller,
+                    &[Authority::Operator, Authority::LifecycleOperator],
+                    ua_core::DEFAULT_ORG,
+                ))
+            {
                 return Err(UaError::denied(
                     "not_item_owner",
                     format!("only the node's agent {:?} or an operator reconciles {id}", item.agent),
@@ -1247,11 +1441,12 @@ pub(crate) async fn node_item_reconcile(ctx: ToolCtx, a: ReconcileArgs) -> UaRes
                 "prior": item.receipt(),
             });
             tx.execute(
-                "UPDATE node_dispatch SET status = ?2, receipt_json = ?3, updated_at = ?4 WHERE id = ?1",
-                params![id, status, receipt.to_string(), ts],
+                "UPDATE node_dispatch SET status = ?2, receipt_json = ?3, updated_at = ?4 WHERE id = ?1 AND org_id = ?5",
+                params![id, status, receipt.to_string(), ts, org],
             )?;
             record(
                 tx,
+                &org,
                 "reconciled",
                 json!({ "node": item.node, "item_id": id, "status": status, "actor": who, "note": note }),
                 &who,
@@ -1271,7 +1466,7 @@ pub(crate) async fn node_item_restart(ctx: ToolCtx, a: ItemArgs) -> UaResult<Val
         .hub
         .db()
         .read_async(move |c| {
-            let Some(item) = load_item(c, &id)? else {
+            let Some(item) = load_item(c, &caller.org_id, &id)? else {
                 return Err(UaError::not_found(format!("node item {id} does not exist")));
             };
             if !may_control(c, &hub, &caller, &who, &item)? {
@@ -1282,7 +1477,7 @@ pub(crate) async fn node_item_restart(ctx: ToolCtx, a: ItemArgs) -> UaResult<Val
                     ),
                 ));
             }
-            let cmd = command::load(c, &id)?;
+            let cmd = command::load(c, &item.org_id, &id)?;
             Ok((item, cmd))
         })
         .await?;
@@ -1334,6 +1529,9 @@ pub(crate) async fn node_item_restart(ctx: ToolCtx, a: ItemArgs) -> UaResult<Val
 /// Expire waits, fail lapsed leases and retry undelivered command notices,
 /// for `node`'s items or every node's. Run by every claim for its node, and by
 /// `ua serve` every `node_wait_sweep_s` seconds for all nodes.
+///
+/// A hub job with no caller: it spans every organization, and each item is
+/// settled, ledgered and has its run closed in the item's own organization.
 pub fn sweep(hub: &Hub, node: Option<&str>) -> UaResult<Value> {
     let owned = node.map(str::to_string);
     let out = hub.db().write(move |tx| sweep_tx(tx, owned.as_deref(), "node-queue-sweep"))?;
@@ -1364,17 +1562,18 @@ pub(crate) fn sweep_tx(tx: &mut WriteTx<'_>, node: Option<&str>, actor: &str) ->
         let receipt = json!({ "status": "failed", "reason": WAIT_EXPIRED, "hub_generated": true });
         let n = tx.execute(
             "UPDATE node_dispatch SET status = 'failed', receipt_json = ?2, completed_at = ?3, updated_at = ?3 \
-             WHERE id = ?1 AND status = 'queued'",
-            params![item.id, receipt.to_string(), ts],
+             WHERE id = ?1 AND org_id = ?4 AND status = 'queued'",
+            params![item.id, receipt.to_string(), ts, item.org_id],
         )?;
         if n == 1 {
             record(
                 tx,
+                &item.org_id,
                 "wait_expired",
                 json!({ "node": item.node, "item_id": item.id, "reason": item.wait_reason }),
                 actor,
             )?;
-            relay::drop_open_followups(tx, &item.id, "session_ended_before_delivery")?;
+            relay::drop_open_followups(tx, &item.org_id, &item.id, "session_ended_before_delivery")?;
             close_linked_run(tx, &item, "failed", Some(WAIT_EXPIRED), actor, false)?;
             expired.push(item.id);
         }
@@ -1395,18 +1594,19 @@ pub(crate) fn sweep_tx(tx: &mut WriteTx<'_>, node: Option<&str>, actor: &str) ->
         let receipt = json!({ "status": "failed", "reason": LEASE_EXPIRED, "hub_generated": true });
         let n = tx.execute(
             "UPDATE node_dispatch SET status = 'failed', receipt_json = ?2, completed_at = ?3, updated_at = ?3 \
-             WHERE id = ?1 AND status = 'claimed' AND receipt_json IS NULL",
-            params![item.id, receipt.to_string(), ts],
+             WHERE id = ?1 AND org_id = ?4 AND status = 'claimed' AND receipt_json IS NULL",
+            params![item.id, receipt.to_string(), ts, item.org_id],
         )?;
         if n == 1 {
             record(
                 tx,
+                &item.org_id,
                 "lease_expired",
                 json!({ "node": item.node, "item_id": item.id, "attempt": item.attempts }),
                 actor,
             )?;
-            relay::drop_open_followups(tx, &item.id, "delivery_unconfirmed")?;
-            credentials::revoke_for_item(tx, &item.id, "lease_expired", actor)?;
+            relay::drop_open_followups(tx, &item.org_id, &item.id, "delivery_unconfirmed")?;
+            credentials::revoke_for_item(tx, &item.org_id, &item.id, "lease_expired", actor)?;
             close_linked_run(tx, &item, "failed", Some(LEASE_EXPIRED), actor, false)?;
             failed.push(item.id);
         }
@@ -1515,7 +1715,12 @@ pub struct ItemsArgs {
 
 async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
     let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.as_deref().is_some_and(|w| is_operator(&ctx.hub, &ctx.caller, w));
+    let maintainer = who.is_some()
+        && Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            ua_core::DEFAULT_ORG,
+        );
     let limit = a.limit.unwrap_or(25).clamp(1, 200);
     if let Some(s) = &a.status
         && s != "open"
@@ -1524,13 +1729,15 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
         return Err(UaError::invalid("status must be an item status or `open`"));
     }
     let item_id = a.item_id.as_deref().map(check_item_id).transpose()?;
+    // Only the caller's organization's items, whoever asks.
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             // An item is visible to an operator, its requester, the node's
             // agent and a command's owner.
             let visible = |item: &Item| -> UaResult<bool> {
-                if operator {
+                if maintainer {
                     return Ok(true);
                 }
                 let Some(w) = who.as_deref() else { return Ok(false) };
@@ -1538,34 +1745,37 @@ async fn node_items(ctx: ToolCtx, a: ItemsArgs) -> UaResult<Value> {
                     return Ok(true);
                 }
                 let owner: Option<String> = c
-                    .query_row("SELECT owner_agent FROM node_command WHERE item_id = ?1", [&item.id], |r| {
-                        r.get(0)
-                    })
+                    .query_row(
+                        "SELECT owner_agent FROM node_command WHERE item_id = ?1 AND org_id = ?2",
+                        params![item.id, item.org_id],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 Ok(owner.as_deref() == Some(w))
             };
             if let Some(id) = item_id {
-                let Some(item) = load_item(c, &id)?.filter(|i| visible(i).unwrap_or(false)) else {
+                let Some(item) = load_item(c, &org, &id)?.filter(|i| visible(i).unwrap_or(false)) else {
                     return Err(UaError::not_found(format!("no node item {id} visible to you")));
                 };
                 let mut v = item.public();
                 v["prompt"] = json!(item.prompt);
                 v["receipt"] = item.receipt().unwrap_or(Value::Null);
-                v["followups"] = relay::followups_of(c, &item.id)?;
-                if let Some(cmd) = command::load(c, &item.id)? {
+                v["followups"] = relay::followups_of(c, &org, &item.id)?;
+                if let Some(cmd) = command::load(c, &org, &item.id)? {
                     v["command"] = cmd.public();
                 }
                 return Ok(json!({ "item": v }));
             }
-            let mut clauses = vec!["1 = 1".to_string()];
-            let mut binds: Vec<rusqlite::types::Value> = Vec::new();
-            if !operator {
+            let mut binds: Vec<rusqlite::types::Value> = vec![org.clone().into()];
+            let mut clauses = vec!["org_id = ?1".to_string()];
+            if !maintainer {
                 let Some(w) = who.clone() else { return Ok(json!({ "items": [], "count": 0 })) };
                 binds.push(w.into());
                 let i = binds.len();
                 clauses.push(format!(
                     "(created_by = ?{i} OR agent = ?{i} OR EXISTS (SELECT 1 FROM node_command c \
-                     WHERE c.item_id = node_dispatch.id AND c.owner_agent = ?{i}))"
+                     WHERE c.item_id = node_dispatch.id AND c.org_id = node_dispatch.org_id \
+                     AND c.owner_agent = ?{i}))"
                 ));
             }
             if let Some(n) = &a.node {

@@ -204,6 +204,7 @@ fn caller(label: &str, kind: ActorKind, profile: Profile) -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -557,9 +558,12 @@ async fn a_rejected_send_is_failed_and_recorded() {
 
 #[tokio::test]
 async fn a_refused_connection_is_failed() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // Port 1 is privileged: an unprivileged process cannot bind it and the
+    // kernel never hands it out as an ephemeral port, so nothing in this or
+    // any concurrent test run can come to listen there. The connect is
+    // refused on Linux and macOS alike (a dropped ephemeral listener's port
+    // could be taken by another process before the connect).
+    let base = "http://127.0.0.1:1".to_string();
     let env = configured(&base, Some("0"));
     let err = env.approved_send("t", "nobody listens").await.unwrap_err();
     assert!(err.to_string().contains("never reached it"), "{err}");

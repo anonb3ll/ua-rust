@@ -94,19 +94,29 @@ fn rewrite_index(index: &str, line: &str) -> String {
 }
 
 async fn promote(ctx: ToolCtx, a: PromoteArgs) -> UaResult<Value> {
+    // The vault is hub-scoped, so copying a note into it is the default
+    // organization's alone (`docs/organization.md`, Scoping per subsystem):
+    // another organization's note would land where every organization reads.
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "memory_promote copies a note into the hub-wide vault and is available to the default \
+             organization only; nothing was written",
+        ));
+    }
     let v = vault(&ctx)?;
     let promoter = attributed_agent(&ctx.caller, a.agent.as_deref())?.unwrap_or_else(|| "unknown".into());
     let id = a.id.trim().to_string();
-    let id2 = id.clone();
+    let (id2, org) = (id.clone(), ctx.caller.org_id.clone());
     let row: Option<MemoryRow> = ctx
         .hub
         .db()
         .read_async(move |conn| {
             Ok(conn
                 .query_row(
-                    "SELECT title, content, author, confidence FROM memory WHERE id = ?1 \
+                    "SELECT title, content, author, confidence FROM memory WHERE id = ?1 AND org_id = ?2 \
                      AND NOT EXISTS (SELECT 1 FROM json_each(memory.tags) WHERE value = 'meta:deleted')",
-                    params![id2],
+                    params![id2, org],
                     |r| {
                         Ok(MemoryRow {
                             title: r.get(0)?,

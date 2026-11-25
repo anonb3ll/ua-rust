@@ -43,7 +43,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 
 use self::gates::{Gates, Verdict};
 use self::github::{Outcome, Target};
-use crate::approvals::{self, GateOutcome};
+use crate::approvals::{self, GateOutcome, Refusal, RefusalReason};
 use crate::families::managed_secrets;
 use crate::families::plans::parse_params;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -82,6 +82,39 @@ CREATE TABLE IF NOT EXISTS relay_messages (
 CREATE INDEX IF NOT EXISTS idx_relay_messages_status ON relay_messages(status, id);
 CREATE INDEX IF NOT EXISTS idx_relay_messages_requester ON relay_messages(requested_by, id);
 CREATE INDEX IF NOT EXISTS idx_relay_messages_content ON relay_messages(target, text_sha256);
+",
+};
+
+/// `organization.v1.tools.relay`: `org_id` on `relay_messages` and the
+/// generated `relay_messages_org_exists` / `relay_messages_org_immutable`
+/// triggers. Every existing draft takes the default organization: drafting
+/// and sending have served only the default organization's callers, and a
+/// draft's approval was created in its requester's organization. Nothing is
+/// moved or dropped. No key rebuild: a draft id is an AUTOINCREMENT id.
+pub const TENANT_PART: ua_store::Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.relay", &["relay_messages"]);
+
+/// `relay.v2.org_scope`: indexes led by `org_id` for the list, the
+/// requester's list and the one-live-attempt check, and triggers that keep
+/// a draft's approval in the draft's own organization. A draft names no
+/// task.
+pub const ORG_SCOPE: SchemaPart = SchemaPart {
+    name: "relay.v2.org_scope",
+    sql: "
+CREATE INDEX IF NOT EXISTS idx_relay_messages_org_status ON relay_messages(org_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_relay_messages_org_requester ON relay_messages(org_id, requested_by, id);
+CREATE INDEX IF NOT EXISTS idx_relay_messages_org_content ON relay_messages(org_id, target, text_sha256);
+CREATE INDEX IF NOT EXISTS idx_relay_messages_org_approval ON relay_messages(org_id, approval_id)
+    WHERE approval_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS relay_messages_org_approval BEFORE INSERT ON relay_messages
+WHEN NEW.approval_id IS NOT NULL
+ AND EXISTS (SELECT 1 FROM approvals WHERE id = NEW.approval_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'approval belongs to another organization'); END;
+CREATE TRIGGER IF NOT EXISTS relay_messages_org_approval_update BEFORE UPDATE OF approval_id ON relay_messages
+WHEN NEW.approval_id IS NOT NULL
+ AND EXISTS (SELECT 1 FROM approvals WHERE id = NEW.approval_id AND org_id IS NOT NEW.org_id)
+BEGIN SELECT RAISE(ABORT, 'approval belongs to another organization'); END;
 ",
 };
 
@@ -146,10 +179,31 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 
-fn load(c: &Connection, id: i64) -> UaResult<Row> {
-    c.query_row("SELECT * FROM relay_messages WHERE id = ?1", [id], row_from)
+/// Draft `id` of organization `org`. Another organization's draft answers
+/// exactly as a missing one.
+fn load(c: &Connection, org: &str, id: i64) -> UaResult<Row> {
+    c.query_row("SELECT * FROM relay_messages WHERE org_id = ?2 AND id = ?1", params![id, org], row_from)
         .optional()?
         .ok_or_else(|| UaError::not_found(format!("relay draft {id}")))
+}
+
+/// Refuse an organization that `orgs` does not hold, or holds suspended,
+/// before anything is written. The `org_exists` trigger fires only on
+/// insert, so a cancel or a resolve would otherwise pass.
+fn require_org(c: &Connection, org: &str) -> UaResult<()> {
+    let status: Option<String> =
+        c.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {org:?}; no relay draft was changed"),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {org:?} is suspended; no relay draft was changed"),
+        )),
+    }
 }
 
 impl Row {
@@ -221,7 +275,7 @@ const TEXT_FIELDS: [&str; 2] = ["text", "text_escaped"];
 
 /// `payload` with the text fields set to null: what an approval record keeps
 /// once it is decided.
-fn without_text(payload: &Value) -> Value {
+pub(crate) fn without_text(payload: &Value) -> Value {
     let mut p = payload.clone();
     if let Some(m) = p.as_object_mut() {
         for k in TEXT_FIELDS {
@@ -233,10 +287,10 @@ fn without_text(payload: &Value) -> Value {
     p
 }
 
-fn drop_approval_text(tx: &WriteTx<'_>, approval_id: i64, payload: &Value) -> UaResult<()> {
+fn drop_approval_text(tx: &WriteTx<'_>, org: &str, approval_id: i64, payload: &Value) -> UaResult<()> {
     tx.execute(
-        "UPDATE approvals SET payload = ?2 WHERE id = ?1",
-        params![approval_id, approvals::canonical_payload(&without_text(payload))],
+        "UPDATE approvals SET payload = ?2 WHERE org_id = ?3 AND id = ?1",
+        params![approval_id, approvals::canonical_payload(&without_text(payload)), org],
     )?;
     Ok(())
 }
@@ -245,13 +299,15 @@ fn drop_approval_text(tx: &WriteTx<'_>, approval_id: i64, payload: &Value) -> Ua
 fn cancel_withdrawn(
     tx: &mut WriteTx<'_>,
     caller: &Caller,
+    org: &str,
     row: &Row,
     approval_id: i64,
     approval_status: &str,
 ) -> UaResult<()> {
     tx.execute(
-        "UPDATE relay_messages SET status = 'cancelled', text = NULL, error = ?2, updated_at = ?3 WHERE id = ?1",
-        params![row.id, format!("approval {approval_id} was {approval_status}"), ua_core::time::now()],
+        "UPDATE relay_messages SET status = 'cancelled', text = NULL, error = ?2, updated_at = ?3 \
+         WHERE org_id = ?4 AND id = ?1",
+        params![row.id, format!("approval {approval_id} was {approval_status}"), ua_core::time::now(), org],
     )?;
     emit(
         tx,
@@ -260,6 +316,7 @@ fn cancel_withdrawn(
         json!({
             "draft_id": row.id, "approval_id": approval_id, "approval_status": approval_status,
             "target": row.target, "previous_status": row.status,
+            "transport": approvals::transport_name(caller),
         }),
     )
 }
@@ -274,17 +331,18 @@ pub fn approval_decided(
     approval: &approvals::ApprovalRow,
     status: &str,
 ) -> UaResult<()> {
-    drop_approval_text(tx, approval.id, &approval.payload)?;
+    drop_approval_text(tx, &approval.org_id, approval.id, &approval.payload)?;
     if matches!(status, "denied" | "revoked") {
         let row = tx
             .query_row(
-                "SELECT * FROM relay_messages WHERE approval_id = ?1 AND status = 'pending_approval'",
-                [approval.id],
+                "SELECT * FROM relay_messages WHERE org_id = ?2 AND approval_id = ?1 \
+                 AND status = 'pending_approval'",
+                params![approval.id, approval.org_id],
                 row_from,
             )
             .optional()?;
         if let Some(row) = row {
-            cancel_withdrawn(tx, caller, &row, approval.id, status)?;
+            cancel_withdrawn(tx, caller, &approval.org_id, &row, approval.id, status)?;
         }
     }
     Ok(())
@@ -314,8 +372,24 @@ fn throttle(c: &Connection, cfg: &Config, caller: &Caller) -> UaResult<()> {
     Ok(())
 }
 
-fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, payload: Value) -> UaResult<()> {
-    ledger::append(tx, EventInput::new(channel, payload).by(caller.label.clone()))?;
+/// Append a relay event about a draft of the caller's organization.
+///
+/// ORG-EVENT-DEFAULT: the event is written to the default organization's
+/// ledger, so another organization's event names no target and carries no
+/// reason or error text (`plans::ledger_text`), and its originator is the
+/// neutral `system`. Only status, list, cancel and resolve serve another
+/// organization, and it has no drafts to act on (see `require_hub_org`).
+fn emit(tx: &mut WriteTx<'_>, caller: &Caller, channel: &str, mut payload: Value) -> UaResult<()> {
+    let org = caller.org_id.as_str();
+    if org != ua_core::DEFAULT_ORG {
+        for k in ["target", "reason", "error"] {
+            if let Some(t) = payload.get(k).and_then(Value::as_str).map(str::to_string) {
+                payload[k] = crate::families::plans::ledger_text(org, &t);
+            }
+        }
+    }
+    let by = approvals::ledger_originator(org, &caller.label);
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, channel, payload).by(by))?;
     Ok(())
 }
 
@@ -433,6 +507,7 @@ fn prepare(cfg: &Config, p: DraftParams) -> UaResult<Prepared> {
 
 async fn check(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "check")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let d = crate::registry::blocking(move || prepare(hub.cfg(), p)).await?;
     let (hub, caller2) = (ctx.hub.clone(), caller.clone());
@@ -464,6 +539,7 @@ async fn check(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
 
 async fn draft(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "draft")?;
     let d = prepare(ctx.hub.cfg(), p)?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     ctx.hub
@@ -479,8 +555,9 @@ async fn draft(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
             // secret or personal data the gates caught.
             let stored_text = passed.then_some(d.text.as_str());
             tx.execute(
-                "INSERT INTO relay_messages (channel, target, text, text_sha256, chars, bytes, verdict, findings, \
-                 status, requested_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                "INSERT INTO relay_messages (org_id, channel, target, text, text_sha256, chars, bytes, verdict, \
+                 findings, status, requested_by, created_at, updated_at) \
+                 VALUES (?12, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     CHANNEL,
                     d.target.canonical(),
@@ -492,7 +569,8 @@ async fn draft(ctx: ToolCtx, p: DraftParams) -> UaResult<Value> {
                     report.to_string(),
                     status,
                     caller.label,
-                    now
+                    now,
+                    caller.org_id
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -552,7 +630,7 @@ fn recheck(c: &Connection, cfg: &Config, row: &Row) -> UaResult<(Target, String)
     }
     github::api_base(cfg)?;
     let name = github::secret_name(cfg)?;
-    if !managed_secrets::bound_to(c, name, github::CONSUMER)? {
+    if !managed_secrets::bound_to(c, ua_core::DEFAULT_ORG, name, github::CONSUMER)? {
         return Err(UaError::denied(
             "relay_unavailable",
             format!("managed secret {name:?} is not set or not bound to consumer {:?}", github::CONSUMER),
@@ -572,15 +650,17 @@ struct Credential {
 fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Credential> {
     let name = github::secret_name(cfg)?.to_string();
     let (token, fingerprint) =
-        managed_secrets::load_for_consumer(tx, cfg, &name, github::CONSUMER).map_err(|e| {
-            UaError::denied(
-                "relay_unavailable",
-                format!(
-                    "the relay's GitHub credential is not usable: {}",
-                    e.reason_code().unwrap_or(e.code())
-                ),
-            )
-        })?;
+        managed_secrets::load_for_consumer(tx, cfg, ua_core::DEFAULT_ORG, &name, github::CONSUMER).map_err(
+            |e| {
+                UaError::denied(
+                    "relay_unavailable",
+                    format!(
+                        "the relay's GitHub credential is not usable: {}",
+                        e.reason_code().unwrap_or(e.code())
+                    ),
+                )
+            },
+        )?;
     if token.expose_secret().trim().is_empty() || token.expose_secret().contains(['\r', '\n', '\0']) {
         return Err(UaError::denied(
             "relay_unavailable",
@@ -590,18 +670,40 @@ fn credential(tx: &rusqlite::Connection, cfg: &ua_core::Config) -> UaResult<Cred
     Ok(Credential { name, token, fingerprint })
 }
 
+/// The relay posts with the hub's GitHub credential, a managed secret of the
+/// default organization, to the hub's repository allowlist under the hub's
+/// gate configuration: another organization's caller is refused before
+/// anything is read, so it never sends under that credential. Checking and
+/// drafting are refused too: a draft could never be sent, and their events
+/// would name another organization's target and requester in the default
+/// organization's ledger. Its status, list, cancel and resolve read only its
+/// own organization's drafts, of which there are none.
+fn require_hub_org(caller: &Caller, action: &str) -> UaResult<()> {
+    if caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            format!(
+                "relay {action} posts with the hub's GitHub credential and serves the default organization only; \
+                 nothing was read or sent"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "request_send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = load(tx, p.draft_id)?;
+            let row = load(tx, &caller.org_id, p.draft_id)?;
             row.owned_by(&caller)?;
             match row.status.as_str() {
                 "draft" => {}
                 "pending_approval" => {
-                    let approval = row.approval_id.map(|a| approvals::get(tx, a)).transpose()?;
+                    let approval = row.approval_id.map(|a| approvals::get(tx, &caller.org_id, a)).transpose()?;
                     return Ok(json!({
                         "draft_id": row.id, "status": row.status, "approval_id": row.approval_id,
                         "approval_status": approval.map(|a| a.status), "already_requested": true,
@@ -629,8 +731,9 @@ async fn request_send(ctx: ToolCtx, p: IdParams) -> UaResult<Value> {
                 }
             };
             tx.execute(
-                "UPDATE relay_messages SET status = 'pending_approval', approval_id = ?2, updated_at = ?3 WHERE id = ?1",
-                params![row.id, approval_id, ua_core::time::now()],
+                "UPDATE relay_messages SET status = 'pending_approval', approval_id = ?2, updated_at = ?3 \
+                 WHERE org_id = ?4 AND id = ?1",
+                params![row.id, approval_id, ua_core::time::now(), caller.org_id],
             )?;
             emit(
                 tx,
@@ -667,6 +770,31 @@ struct Ready {
     token: SecretString,
 }
 
+/// Ledger the refusal of a send that no longer matches its draft's
+/// approval: `presented` builds what the call presented from the approved
+/// payload.
+fn refuse_send(
+    tx: &mut WriteTx<'_>,
+    caller: &Caller,
+    row: &Row,
+    reason: RefusalReason,
+    presented: impl Fn(&Value) -> Value,
+) -> UaResult<()> {
+    let mut r = Refusal::new(TOOL, reason);
+    if let Some(id) = row.approval_id {
+        let approved = approvals::get(tx, &caller.org_id, id)?.payload;
+        let shown = presented(&approved);
+        r = r
+            .approval(id)
+            .hashes(
+                Some(approvals::payload_sha256(TOOL, &approved)),
+                Some(approvals::payload_sha256(TOOL, &shown)),
+            )
+            .changed(approvals::changed_fields(&without_text(&approved), &shown));
+    }
+    approvals::refused(tx, &caller.org_id, &caller.label, &r, None)
+}
+
 fn first_difference(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -680,7 +808,7 @@ fn begin_send(
     caller: &Caller,
     p: &SendParams,
 ) -> UaResult<Result<Ready, UaError>> {
-    let row = load(tx, p.draft_id)?;
+    let row = load(tx, &caller.org_id, p.draft_id)?;
     row.owned_by(caller)?;
     match row.status.as_str() {
         "pending_approval" => {}
@@ -697,6 +825,14 @@ fn begin_send(
     }
     let stored = row.text.clone().unwrap_or_default();
     if p.text != stored {
+        let presented = |a: &Value| {
+            let mut v = without_text(a);
+            v["text_sha256"] = json!(sha256(&p.text));
+            v["chars"] = json!(p.text.chars().count());
+            v["bytes"] = json!(p.text.len());
+            v
+        };
+        refuse_send(tx, caller, &row, RefusalReason::BindingChanged, presented)?;
         return Err(UaError::denied(
             "text_mismatch",
             format!(
@@ -710,6 +846,13 @@ fn begin_send(
     if let Some(t) = p.target.as_deref()
         && github::parse_target(t).map(|t| t.canonical()).ok().as_deref() != Some(row.target.as_str())
     {
+        let presented = |a: &Value| {
+            let mut v = without_text(a);
+            v["target"] =
+                json!(github::parse_target(t).map(|t| t.canonical()).unwrap_or_else(|_| t.to_string()));
+            v
+        };
+        refuse_send(tx, caller, &row, RefusalReason::BindingChanged, presented)?;
         return Err(UaError::denied(
             "target_mismatch",
             format!("relay draft {} was approved for another target; nothing was sent", row.id),
@@ -720,9 +863,9 @@ fn begin_send(
     // outcome may already be public.
     let open: Option<i64> = tx
         .query_row(
-            "SELECT id FROM relay_messages WHERE target = ?1 AND text_sha256 = ?2 AND id != ?3 \
+            "SELECT id FROM relay_messages WHERE org_id = ?4 AND target = ?1 AND text_sha256 = ?2 AND id != ?3 \
              AND status IN ('sending','uncertain') LIMIT 1",
-            params![row.target, row.text_sha256, row.id],
+            params![row.target, row.text_sha256, row.id, caller.org_id],
             |r| r.get(0),
         )
         .optional()?;
@@ -741,7 +884,7 @@ fn begin_send(
     let id = row.approval_id.ok_or_else(|| {
         UaError::conflict(format!("relay draft {} has no approval; call request_send", row.id))
     })?;
-    let approval = approvals::get(tx, id)?;
+    let approval = approvals::get(tx, &caller.org_id, id)?;
     // The record drops the text once decided; the SHA-256 still binds it.
     let stored_text = approval.payload.get("text").filter(|t| !t.is_null());
     let bound = approval.tool == TOOL
@@ -749,6 +892,19 @@ fn begin_send(
         && without_text(&approval.payload) == without_text(&payload)
         && stored_text.is_none_or(|t| Some(t) == payload.get("text"));
     if !bound {
+        let mut changed =
+            approvals::changed_fields(&without_text(&approval.payload), &without_text(&payload));
+        if changed.is_empty() {
+            changed.push("text".into());
+        }
+        let r = Refusal::new(TOOL, RefusalReason::BindingChanged)
+            .approval(id)
+            .hashes(
+                Some(approvals::payload_sha256(TOOL, &approval.payload)),
+                Some(approvals::payload_sha256(TOOL, &payload)),
+            )
+            .changed(changed);
+        approvals::refused(tx, &caller.org_id, &caller.label, &r, None)?;
         return Err(UaError::denied(
             "approval_mismatch",
             format!(
@@ -764,23 +920,50 @@ fn begin_send(
             let now = ua_core::time::now();
             tx.execute(
                 "UPDATE approvals SET status = 'consumed', consumed_at = ?2, updated_at = ?2, payload = ?3 \
-                 WHERE id = ?1 AND status = 'approved'",
-                params![id, now, approvals::canonical_payload(&without_text(&approval.payload))],
+                 WHERE org_id = ?4 AND id = ?1 AND status = 'approved'",
+                params![
+                    id,
+                    now,
+                    approvals::canonical_payload(&without_text(&approval.payload)),
+                    approval.org_id
+                ],
             )?;
             ledger::append(
                 tx,
-                EventInput::new("agent.approval.consumed", json!({ "approval_id": id, "tool": TOOL }))
-                    .by(caller.label.clone()),
+                EventInput::new(
+                    ua_core::DEFAULT_ORG,
+                    "agent.approval.consumed",
+                    json!({
+                        "approval_id": id,
+                        "tool": TOOL,
+                        "payload_sha256": approvals::payload_sha256(TOOL, &approval.payload),
+                    }),
+                )
+                // ORG-EVENT-DEFAULT: another organization's label is not the
+                // originator in the default ledger.
+                .by(approvals::ledger_originator(&approval.org_id, &caller.label)),
             )?;
             id
         }
         "approved" => {
             // The pass expired unspent: ask a human again.
             tx.execute(
-                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE id = ?1",
-                params![id, ua_core::time::now()],
+                "UPDATE approvals SET status = 'expired', updated_at = ?2 WHERE org_id = ?3 AND id = ?1",
+                params![id, ua_core::time::now(), approval.org_id],
             )?;
-            drop_approval_text(tx, id, &approval.payload)?;
+            let sha = approvals::payload_sha256(TOOL, &approval.payload);
+            let r = Refusal::new(TOOL, RefusalReason::Expired)
+                .approval(id)
+                .hashes(Some(sha.clone()), Some(sha))
+                .expired_at(approvals::pass_expires_at(cfg, approval.resolved_at.as_deref()));
+            approvals::refused(
+                tx,
+                &approval.org_id,
+                &caller.label,
+                &r,
+                Some(format!("{}:expired:{id}", approvals::REFUSED)),
+            )?;
+            drop_approval_text(tx, &approval.org_id, id, &approval.payload)?;
             let GateOutcome::Pending { approval_id } = approvals::gate(tx, cfg, caller, TOOL, &payload)?
             else {
                 return Err(UaError::internal(format!(
@@ -789,14 +972,20 @@ fn begin_send(
                 )));
             };
             tx.execute(
-                "UPDATE relay_messages SET approval_id = ?2, updated_at = ?3 WHERE id = ?1",
-                params![row.id, approval_id, ua_core::time::now()],
+                "UPDATE relay_messages SET approval_id = ?2, updated_at = ?3 WHERE org_id = ?4 AND id = ?1",
+                params![row.id, approval_id, ua_core::time::now(), caller.org_id],
             )?;
             return Ok(Err(UaError::ApprovalRequired { tool: TOOL.into(), approval_id }));
         }
         status @ ("denied" | "revoked") => {
-            drop_approval_text(tx, id, &approval.payload)?;
-            cancel_withdrawn(tx, caller, &row, id, status)?;
+            let sha = approvals::payload_sha256(TOOL, &approval.payload);
+            let r = Refusal::new(TOOL, RefusalReason::Denied)
+                .approval(id)
+                .hashes(Some(sha.clone()), Some(sha))
+                .status(status);
+            approvals::refused(tx, &approval.org_id, &caller.label, &r, None)?;
+            drop_approval_text(tx, &approval.org_id, id, &approval.payload)?;
+            cancel_withdrawn(tx, caller, &caller.org_id, &row, id, status)?;
             return Ok(Err(UaError::denied(
                 "approval_denied",
                 format!(
@@ -813,8 +1002,9 @@ fn begin_send(
         }
     };
     tx.execute(
-        "UPDATE relay_messages SET status = 'sending', approval_id = ?2, updated_at = ?3 WHERE id = ?1",
-        params![row.id, approval_id, ua_core::time::now()],
+        "UPDATE relay_messages SET status = 'sending', approval_id = ?2, updated_at = ?3 \
+         WHERE org_id = ?4 AND id = ?1",
+        params![row.id, approval_id, ua_core::time::now(), caller.org_id],
     )?;
     emit(
         tx,
@@ -830,6 +1020,7 @@ fn begin_send(
 
 async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    require_hub_org(&ctx.caller, "send")?;
     let (hub, caller) = (ctx.hub.clone(), ctx.caller.clone());
     let ready = ctx.hub.db().write_async(move |tx| begin_send(tx, hub.cfg(), &caller, &p)).await??;
     let outcome = github::post_comment(ctx.hub.cfg(), &ready.token, &ready.target, &ready.text).await;
@@ -853,8 +1044,8 @@ async fn send(ctx: ToolCtx, p: SendParams) -> UaResult<Value> {
             let now = ua_core::time::now();
             tx.execute(
                 "UPDATE relay_messages SET status = ?2, receipt = ?3, error = ?4, updated_at = ?5, \
-                 sent_at = CASE WHEN ?2 = 'sent' THEN ?5 ELSE sent_at END WHERE id = ?1",
-                params![row2.id, status, rec.as_ref().map(Value::to_string), err, now],
+                 sent_at = CASE WHEN ?2 = 'sent' THEN ?5 ELSE sent_at END WHERE org_id = ?6 AND id = ?1",
+                params![row2.id, status, rec.as_ref().map(Value::to_string), err, now, caller.org_id],
             )?;
             emit(
                 tx,
@@ -913,10 +1104,16 @@ async fn status(ctx: ToolCtx, p: StatusParams) -> UaResult<Value> {
     ctx.hub
         .db()
         .read_async(move |c| {
+            // Another organization's draft, by id or by its approval,
+            // answers exactly as a missing one.
             let row = match (p.draft_id, p.approval_id) {
-                (Some(id), None) => load(c, id)?,
+                (Some(id), None) => load(c, &caller.org_id, id)?,
                 (None, Some(a)) => c
-                    .query_row("SELECT * FROM relay_messages WHERE approval_id = ?1", [a], row_from)
+                    .query_row(
+                        "SELECT * FROM relay_messages WHERE org_id = ?2 AND approval_id = ?1",
+                        params![a, caller.org_id],
+                        row_from,
+                    )
                     .optional()?
                     .ok_or_else(|| UaError::not_found(format!("no relay draft with approval {a}")))?,
                 _ => return Err(UaError::invalid("give exactly one of draft_id or approval_id")),
@@ -924,7 +1121,15 @@ async fn status(ctx: ToolCtx, p: StatusParams) -> UaResult<Value> {
             if !caller.is_human() && row.requested_by != caller.label {
                 return Err(UaError::not_found(format!("relay draft {}", row.id)));
             }
-            let approval = row.approval_id.map(|a| approvals::get(c, a)).transpose()?;
+            // A draft and its approval are in one organization
+            // (`relay_messages_org_approval`), the reader's. An approval
+            // that is nonetheless missing reports as none rather than
+            // failing the call.
+            let approval = match row.approval_id.map(|a| approvals::get(c, &caller.org_id, a)) {
+                Some(Ok(a)) => Some(a),
+                Some(Err(UaError::NotFound(_))) | None => None,
+                Some(Err(e)) => return Err(e),
+            };
             let mut out = row.summary();
             out["findings"] = row.findings.get("findings").cloned().unwrap_or(json!([]));
             out["approval_status"] = json!(approval.as_ref().map(|a| a.status.clone()));
@@ -947,17 +1152,18 @@ async fn list(ctx: ToolCtx, p: ListParams) -> UaResult<Value> {
         return Err(UaError::invalid(format!("status must be one of {STATUSES:?}")));
     }
     let limit = p.limit.clamp(1, 200);
-    // Humans see every draft; an agent sees its own.
+    // Humans see every draft of their organization; an agent sees its own.
     let who = (!ctx.caller.is_human()).then(|| ctx.caller.label.clone());
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut stmt = c.prepare(
-                "SELECT * FROM relay_messages WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR requested_by = ?2) \
-                 ORDER BY id DESC LIMIT ?3",
+                "SELECT * FROM relay_messages WHERE org_id = ?4 AND (?1 IS NULL OR status = ?1) \
+                 AND (?2 IS NULL OR requested_by = ?2) ORDER BY id DESC LIMIT ?3",
             )?;
             let rows: Vec<Value> = stmt
-                .query_map(params![p.status, who, limit], row_from)?
+                .query_map(params![p.status, who, limit, org], row_from)?
                 .map(|r| r.map(|r| r.summary()))
                 .collect::<Result<_, _>>()?;
             Ok(json!({ "drafts": rows, "count": rows.len() }))
@@ -971,39 +1177,60 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = load(tx, p.draft_id)?;
+            require_org(tx, &caller.org_id)?;
+            let row = load(tx, &caller.org_id, p.draft_id)?;
             if !caller.is_human() {
                 row.owned_by(&caller)?;
             }
             if !matches!(row.status.as_str(), "draft" | "blocked" | "pending_approval") {
-                return Err(UaError::conflict(format!("relay draft {} is {}; it cannot be cancelled", row.id, row.status)));
+                return Err(UaError::conflict(format!(
+                    "relay draft {} is {}; it cannot be cancelled",
+                    row.id, row.status
+                )));
             }
             let now = ua_core::time::now();
             let reason = p.reason.as_deref().map(clip).unwrap_or_else(|| "relay draft cancelled".into());
-            // Withdraw the human decision too, so it can never be spent.
+            // Withdraw the human decision too, so it can never be spent. The
+            // row records the latest decision (this withdrawal: who, when,
+            // through what), as approval_resolve's revoke does; the earlier
+            // approval stays in the ledger (`agent.approval.resolved`).
             let mut approval_status = None;
             if let Some(a) = row.approval_id {
-                let new = match approvals::get(tx, a)?.status.as_str() {
+                // Unlike `status`, a missing approval fails the cancel: the
+                // draft must not be marked cancelled while a decision that
+                // can still be spent stays live where this caller cannot
+                // withdraw it. Fail closed. (A draft's approval is in its own
+                // organization, `relay_messages_org_approval`.)
+                let approval = approvals::get(tx, &caller.org_id, a)?;
+                let new = match approval.status.as_str() {
                     "pending" => Some("denied"),
                     "approved" => Some("revoked"),
                     _ => None,
                 };
-                let approval = approvals::get(tx, a)?;
                 if let Some(new) = new {
                     tx.execute(
-                        "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = COALESCE(resolved_by, ?4), \
-                         resolved_at = COALESCE(resolved_at, ?5), updated_at = ?5 WHERE id = ?1",
-                        params![a, new, reason, caller.label, now],
+                        "UPDATE approvals SET status = ?2, reason = ?3, resolved_by = ?4, resolved_at = ?5, \
+                         updated_at = ?5, resolved_transport = ?6 WHERE org_id = ?7 AND id = ?1",
+                        params![
+                            a,
+                            new,
+                            reason,
+                            caller.label,
+                            now,
+                            approvals::transport_name(&caller),
+                            approval.org_id
+                        ],
                     )?;
                     approval_status = Some(new);
                 }
                 // Neither record keeps text that will never be sent.
-                drop_approval_text(tx, a, &approval.payload)?;
+                drop_approval_text(tx, &approval.org_id, a, &approval.payload)?;
             }
             // The text never went out; do not keep it.
             tx.execute(
-                "UPDATE relay_messages SET status = 'cancelled', text = NULL, error = ?2, updated_at = ?3 WHERE id = ?1",
-                params![row.id, reason, now],
+                "UPDATE relay_messages SET status = 'cancelled', text = NULL, error = ?2, updated_at = ?3 \
+                 WHERE org_id = ?4 AND id = ?1",
+                params![row.id, reason, now, caller.org_id],
             )?;
             emit(
                 tx,
@@ -1012,6 +1239,7 @@ async fn cancel(ctx: ToolCtx, p: CancelParams) -> UaResult<Value> {
                 json!({
                     "draft_id": row.id, "approval_id": row.approval_id, "approval_status": approval_status,
                     "target": row.target, "previous_status": row.status,
+                    "transport": approvals::transport_name(&caller),
                 }),
             )?;
             Ok(json!({
@@ -1044,7 +1272,8 @@ async fn resolve(ctx: ToolCtx, p: ResolveParams) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = load(tx, p.draft_id)?;
+            require_org(tx, &caller.org_id)?;
+            let row = load(tx, &caller.org_id, p.draft_id)?;
             let stale = ua_core::time::parse_ts(&row.updated_at)
                 .is_some_and(|t| ua_core::time::now_ms() / 1000 - t.as_second() > SENDING_STALE_SECS);
             match row.status.as_str() {
@@ -1068,8 +1297,8 @@ async fn resolve(ctx: ToolCtx, p: ResolveParams) -> UaResult<Value> {
             let receipt = json!({ "manual": true, "delivered": status == "sent", "resolved_by": caller.label });
             tx.execute(
                 "UPDATE relay_messages SET status = ?2, receipt = ?3, error = COALESCE(?4, error), updated_at = ?5, \
-                 sent_at = CASE WHEN ?2 = 'sent' THEN ?5 ELSE sent_at END WHERE id = ?1",
-                params![row.id, status, receipt.to_string(), reason, now],
+                 sent_at = CASE WHEN ?2 = 'sent' THEN ?5 ELSE sent_at END WHERE org_id = ?6 AND id = ?1",
+                params![row.id, status, receipt.to_string(), reason, now, caller.org_id],
             )?;
             emit(
                 tx,
@@ -1087,21 +1316,19 @@ async fn resolve(ctx: ToolCtx, p: ResolveParams) -> UaResult<Value> {
 
 // --- registration ------------------------------------------------------------------------------
 
-const ACTIONS: [&str; 8] = ["check", "draft", "request_send", "send", "status", "list", "cancel", "resolve"];
-
 async fn relay_manage(ctx: ToolCtx, a: ManageArgs) -> UaResult<Value> {
-    let action = a.action.trim().to_ascii_lowercase();
+    let action = crate::routes::action_of(TOOL, Some(&a.action))?;
     let f = "relay";
-    match action.as_str() {
-        "check" => check(ctx, parse_params(f, &action, a.params)?).await,
-        "draft" => draft(ctx, parse_params(f, &action, a.params)?).await,
-        "request_send" => request_send(ctx, parse_params(f, &action, a.params)?).await,
-        "send" => send(ctx, parse_params(f, &action, a.params)?).await,
-        "status" => status(ctx, parse_params(f, &action, a.params)?).await,
-        "list" => list(ctx, parse_params(f, &action, a.params)?).await,
-        "cancel" => cancel(ctx, parse_params(f, &action, a.params)?).await,
-        "resolve" => resolve(ctx, parse_params(f, &action, a.params)?).await,
-        _ => Err(UaError::invalid(format!("action must be one of {ACTIONS:?}"))),
+    match action {
+        "check" => check(ctx, parse_params(f, action, a.params)?).await,
+        "draft" => draft(ctx, parse_params(f, action, a.params)?).await,
+        "request_send" => request_send(ctx, parse_params(f, action, a.params)?).await,
+        "send" => send(ctx, parse_params(f, action, a.params)?).await,
+        "status" => status(ctx, parse_params(f, action, a.params)?).await,
+        "list" => list(ctx, parse_params(f, action, a.params)?).await,
+        "cancel" => cancel(ctx, parse_params(f, action, a.params)?).await,
+        "resolve" => resolve(ctx, parse_params(f, action, a.params)?).await,
+        other => Err(crate::routes::unhandled(TOOL, other)),
     }
 }
 

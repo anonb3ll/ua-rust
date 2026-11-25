@@ -44,6 +44,7 @@ use ua_store::{EventInput, SchemaPart, WriteTx, ledger};
 use super::agents::verified;
 use super::governance;
 use crate::registry::{Registry, ToolCtx, tool};
+use ua_org::authz::{Authority, Authz};
 
 pub const SCHEMA: SchemaPart = SchemaPart {
     name: "provider_accounts.v1",
@@ -221,7 +222,7 @@ fn future(ts: Option<&str>) -> bool {
 
 fn record(tx: &mut WriteTx<'_>, kind: &str, mut payload: Value, by: &str) -> UaResult<()> {
     payload["kind"] = json!(kind);
-    ledger::append(tx, EventInput::new(CHANNEL, payload).by(by.to_string()))?;
+    ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string()))?;
     Ok(())
 }
 
@@ -452,8 +453,14 @@ pub(crate) fn check_available(c: &Connection, name: &str, h: &HarnessConfig) -> 
 /// `signal` (`{source, line}`) a rate limit for the account's cooldown. An
 /// advisory self-report ([`QUOTA_REPORTED_CLASS`]) is ledgered and never
 /// rate-limits. Runs without an account are ignored.
+///
+/// `org` is the run's organization. Provider accounts are hub
+/// configuration, so another organization's outcome still moves the
+/// account's health, but its run id and its quota signal (a line of the
+/// harness's output) stay out of the account row and the default ledger.
 pub(crate) fn observe_outcome(
     tx: &mut WriteTx<'_>,
+    org: &str,
     run_id: &str,
     state: &str,
     class: Option<&str>,
@@ -461,9 +468,16 @@ pub(crate) fn observe_outcome(
     actor: &str,
 ) -> UaResult<()> {
     let label: Option<String> = tx
-        .query_row("SELECT provider_account FROM dispatch_runs WHERE run_id = ?1", [run_id], |r| r.get(0))
+        .query_row(
+            "SELECT provider_account FROM dispatch_runs WHERE run_id = ?1 AND org_id = ?2",
+            params![run_id, org],
+            |r| r.get(0),
+        )
         .optional()?
         .flatten();
+    let default = org == ua_core::DEFAULT_ORG;
+    let (run_ref, signal_ref, actor) =
+        if default { (Some(run_id), signal, actor) } else { (None, None, "system") };
     let Some(label) = label else { return Ok(()) };
     let Some(account) = load(tx, &label)? else { return Ok(()) };
     let ts = now();
@@ -487,14 +501,15 @@ pub(crate) fn observe_outcome(
     tx.execute(
         "UPDATE provider_accounts SET last_error_class = ?2, last_error_at = ?3, last_error_run = ?4, \
          rate_limited_until = ?5 WHERE label = ?1",
-        params![label, class, ts, run_id, until],
+        params![label, class, ts, run_ref, until],
     )?;
     if quota {
         record(
             tx,
             "rate_limited_observed",
             json!({
-                "label": label, "provider": account.provider, "run_id": run_id, "until": until, "signal": signal,
+                "label": label, "provider": account.provider, "run_id": run_ref, "until": until,
+                "signal": signal_ref,
             }),
             actor,
         )?;
@@ -502,7 +517,7 @@ pub(crate) fn observe_outcome(
         record(
             tx,
             "quota_reported",
-            json!({ "label": label, "provider": account.provider, "run_id": run_id, "advisory": true }),
+            json!({ "label": label, "provider": account.provider, "run_id": run_ref, "advisory": true }),
             actor,
         )?;
     }
@@ -558,10 +573,10 @@ fn operator(ctx: &ToolCtx, verb: &str) -> UaResult<String> {
     let who = verified(&ctx.caller).map(str::to_string).ok_or_else(|| {
         UaError::denied("identity_required", format!("{verb} requires an authenticated identity"))
     })?;
-    if !governance::is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], ua_core::DEFAULT_ORG) {
         return Err(UaError::denied(
             "operator_required",
-            format!("{verb} is for operators (a human or a lifecycle operator); {who:?} is neither"),
+            format!("{verb} is for an operator (a verified human); {who:?} is not one"),
         ));
     }
     Ok(who)
@@ -791,14 +806,24 @@ fn harnesses_by_account(cfg: &Config) -> BTreeMap<String, Vec<String>> {
 /// `(run_id, harness, state, failure_class, created_at)` of one run.
 type RunRow = (String, Option<String>, String, Option<String>, String);
 
+/// The account's recent runs. A hub-wide operator view: only the default
+/// organization's runs are listed, and the other organizations' only
+/// counted (`other_org_runs`).
 fn recent_runs(c: &Connection, label: &str, limit: i64) -> UaResult<Value> {
     let mut stmt = c.prepare(
-        "SELECT run_id, harness, state, failure_class, created_at FROM dispatch_runs WHERE provider_account = ?1 \
-         ORDER BY created_at DESC, run_id DESC LIMIT ?2",
+        "SELECT run_id, harness, state, failure_class, created_at FROM dispatch_runs \
+         WHERE org_id = ?3 AND provider_account = ?1 ORDER BY created_at DESC, run_id DESC LIMIT ?2",
     )?;
     let rows: Vec<RunRow> = stmt
-        .query_map(params![label, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .query_map(params![label, limit, ua_core::DEFAULT_ORG], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<Result<_, _>>()?;
+    let other_org_runs: i64 = c.query_row(
+        "SELECT COUNT(*) FROM dispatch_runs WHERE org_id <> ?2 AND provider_account = ?1",
+        params![label, ua_core::DEFAULT_ORG],
+        |r| r.get(0),
+    )?;
     let mut by_state: BTreeMap<String, i64> = BTreeMap::new();
     let mut by_class: BTreeMap<String, i64> = BTreeMap::new();
     for (_, _, state, class, _) in &rows {
@@ -816,6 +841,7 @@ fn recent_runs(c: &Connection, label: &str, limit: i64) -> UaResult<Value> {
         "by_failure_class": by_class,
         "quota_failures": by_class.get(QUOTA_CLASS).copied().unwrap_or(0),
         "last_run": last,
+        "other_org_runs": other_org_runs,
     }))
 }
 

@@ -29,10 +29,11 @@ use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
 use ua_store::{EventInput, ledger};
 
-use super::{clean_reason, is_operator, now, verified_actor};
+use super::{clean_reason, now, verified_actor};
 use crate::families::dispatch::live_run_for_task;
 use crate::families::tasks::{is_terminal, next_revision, require_task, str_field, task_reply};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +63,11 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             "expected_claimant is required: name the agent whose claim you release",
         ));
     }
-    if !is_operator(ctx.hub.cfg(), &ctx.caller, &who) {
+    if !Authz::new(ctx.hub.cfg()).holds(
+        &ctx.caller,
+        &[Authority::Operator, Authority::LifecycleOperator],
+        &ctx.caller.org_id,
+    ) {
         return Err(UaError::denied(
             "not_lifecycle_operator",
             format!(
@@ -71,11 +76,12 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             ),
         ));
     }
-    let authority = if ctx.caller.is_human() || ctx.hub.cfg().is_human(&who) {
-        "human_operator"
-    } else {
-        "lifecycle_operator"
-    };
+    let authority =
+        if Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], &ctx.caller.org_id) {
+            "human_operator"
+        } else {
+            "lifecycle_operator"
+        };
     let reason = clean_reason(a.reason.as_deref(), Some("release another agent's claim"))?;
     let expected_claimed_at = match a.expected_claimed_at.as_deref().map(str::trim) {
         Some("") => return Err(UaError::invalid("expected_claimed_at must be a non-empty claim generation")),
@@ -83,11 +89,13 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
     };
     let expected_run = a.expected_run_id.map(|r| r.trim().to_string());
     let id = a.task_id;
+    let org = ctx.caller.org_id.clone();
 
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let row = require_task(tx, id)?;
+            crate::families::tasks::require_org(tx, &org)?;
+            let row = require_task(tx, &org, id)?;
             let status = str_field(&row, "status").unwrap_or("open").to_string();
             let holder = str_field(&row, "claimed_by").map(String::from);
             let claimed_at = str_field(&row, "claimed_at").map(String::from);
@@ -125,7 +133,7 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                 }
                 _ => {}
             }
-            if let Some(live) = live_run_for_task(tx, id)? {
+            if let Some(live) = live_run_for_task(tx, &org, id)? {
                 return Err(UaError::conflict(format!(
                     "task {id} has a live dispatch run {live:?}; releasing the claim would not stop it. Cancel it \
                      first (dispatch_cancel) and retry once its termination is confirmed"
@@ -144,8 +152,8 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
             let n = tx.execute(
                 "UPDATE tasks SET status = ?2, claimed_by = NULL, claimed_at = NULL, lock_expires_at = NULL, \
                  next_owner = NULL, ownership_generation = ownership_generation + 1, notes = ?3, updated_at = ?4 \
-                 WHERE id = ?1 AND claimed_by = ?5 AND status = ?6",
-                params![id, status_after, notes, next_revision(str_field(&row, "updated_at")), holder, status],
+                 WHERE id = ?1 AND org_id = ?7 AND claimed_by = ?5 AND status = ?6",
+                params![id, status_after, notes, next_revision(str_field(&row, "updated_at")), holder, status, org],
             )?;
             if n != 1 {
                 return Err(UaError::conflict(format!("task {id} changed during the release; refresh and retry")));
@@ -164,11 +172,23 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                 "authority": authority,
                 "at": now(),
             });
-            let event =
-                ledger::append(tx, EventInput::new("agent.task.claim_released", released.clone()).by(who.clone()))?;
+            // ORG-EVENT-DEFAULT: another organization's labels and reason
+            // stay out of the default ledger (`tasks::emit`).
+            let mut logged = released.clone();
+            let mut by = who.clone();
+            if org != ua_core::DEFAULT_ORG {
+                by = "system".into();
+                for key in ["claimant", "previous_claimant", "reason", "actor"] {
+                    logged[key] = Value::Null;
+                }
+            }
+            let event = ledger::append(
+                tx,
+                EventInput::new(ua_core::DEFAULT_ORG, "agent.task.claim_released", logged).by(by.clone()),
+            )?;
             ledger::append(
                 tx,
-                EventInput::new(
+                EventInput::new(ua_core::DEFAULT_ORG,
                     "agent.task.updated",
                     json!({
                         "task_id": id,
@@ -177,11 +197,11 @@ pub(crate) async fn task_claim_release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult
                         "status": status_after,
                     }),
                 )
-                .by(who.clone()),
+                .by(by),
             )?;
             let mut released = released;
             released["event_ulid"] = json!(event.map(|e| e.ulid));
-            Ok(json!({ "task": task_reply(tx, id)?, "released": released }))
+            Ok(json!({ "task": task_reply(tx, &org, id)?, "released": released }))
         })
         .await
 }

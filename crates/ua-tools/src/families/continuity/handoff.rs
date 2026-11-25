@@ -49,10 +49,10 @@ use ua_store::{EventInput, WriteTx, ledger};
 
 use crate::families::agents::verified;
 use crate::families::audit::rules::redact_secrets;
-use crate::families::governance;
 use crate::families::injection::mark_untrusted;
 use crate::families::tasks::{acting_identity, row_object};
 use crate::registry::ToolCtx;
+use ua_org::authz::{Authority, Authz};
 
 const CHANNEL: &str = "agent.lifecycle.handoff";
 const COOLDOWN_SECS: i64 = 5 * 60;
@@ -135,6 +135,8 @@ fn items(value: Option<&[String]>, field: &str, required: bool) -> UaResult<Vec<
 }
 
 fn note_from(mut row: Map<String, Value>) -> Value {
+    // Replies carry no `org_id` (owner decision (d)).
+    row.remove("org_id");
     for key in ["done", "next_steps", "open_questions"] {
         let parsed = row
             .get(key)
@@ -146,15 +148,21 @@ fn note_from(mut row: Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
-fn load_note(conn: &Connection, id: i64) -> UaResult<Value> {
-    conn.query_row("SELECT * FROM session_handoff_notes WHERE id = ?1", [id], row_object)
-        .optional()?
-        .map(note_from)
-        .ok_or_else(|| UaError::not_found(format!("handoff note {id} not found")))
+/// Note `id` of organization `org`; another organization's note answers
+/// exactly as a missing one.
+fn load_note(conn: &Connection, org: &str, id: i64) -> UaResult<Value> {
+    conn.query_row(
+        "SELECT * FROM session_handoff_notes WHERE id = ?1 AND org_id = ?2",
+        params![id, org],
+        row_object,
+    )
+    .optional()?
+    .map(note_from)
+    .ok_or_else(|| UaError::not_found(format!("handoff note {id} not found")))
 }
 
-fn owned_note(conn: &Connection, id: i64, agent: &str) -> UaResult<Value> {
-    let note = load_note(conn, id)?;
+fn owned_note(conn: &Connection, org: &str, id: i64, agent: &str) -> UaResult<Value> {
+    let note = load_note(conn, org, id)?;
     if note["agent"].as_str() != Some(agent) {
         return Err(UaError::denied(
             "not_note_owner",
@@ -176,35 +184,48 @@ fn require_draft(note: &Value, action: &str) -> UaResult<()> {
     )))
 }
 
-fn emit(tx: &mut WriteTx<'_>, note: &Value, state: &str, by: &str, extra: Value) -> UaResult<()> {
+/// A handoff-note event about a note of organization `org`.
+/// ORG-EVENT-DEFAULT: another organization's event keeps only ids, states
+/// and counts: the note's agent and a receiver's label are `null`, and its
+/// originator is the neutral `system`. Its episode stays the session's
+/// hub-generated id.
+fn emit(tx: &mut WriteTx<'_>, org: &str, note: &Value, state: &str, by: &str, extra: Value) -> UaResult<()> {
+    let default = org == ua_core::DEFAULT_ORG;
     let mut payload = json!({
         "kind": "handoff",
         "state": state,
         "note_id": note["id"],
         "session_id": note["session_id"],
         "task_id": note["task_id"],
-        "agent": note["agent"],
+        "agent": if default { note["agent"].clone() } else { Value::Null },
         "epoch": note["epoch"],
     });
-    if let (Value::Object(p), Value::Object(e)) = (&mut payload, extra) {
+    if let (Value::Object(p), Value::Object(mut e)) = (&mut payload, extra) {
+        if !default && let Some(v) = e.get_mut("to_agent") {
+            *v = Value::Null;
+        }
         p.extend(e);
     }
     let session = note["session_id"].as_str().map(str::to_string);
+    let by = if default { by } else { "system" };
     ledger::append(
         tx,
-        EventInput { episode_id: session, ..EventInput::new(CHANNEL, payload).by(by.to_string()) },
+        EventInput {
+            episode_id: session,
+            ..EventInput::new(ua_core::DEFAULT_ORG, CHANNEL, payload).by(by.to_string())
+        },
     )?;
     Ok(())
 }
 
 /// Refuse a proposal inside the cooldown or past the hourly limit.
-fn check_limits(conn: &Connection, session_id: &str, now: jiff::Timestamp) -> UaResult<()> {
+fn check_limits(conn: &Connection, org: &str, session_id: &str, now: jiff::Timestamp) -> UaResult<()> {
     let mut stmt = conn.prepare(
-        "SELECT created_at FROM session_handoff_notes WHERE session_id = ?1 \
+        "SELECT created_at FROM session_handoff_notes WHERE org_id = ?3 AND session_id = ?1 \
          ORDER BY created_at DESC, id DESC LIMIT ?2",
     )?;
     let stamps: Vec<jiff::Timestamp> = stmt
-        .query_map(params![session_id, HOURLY_LIMIT as i64], |r| r.get::<_, String>(0))?
+        .query_map(params![session_id, HOURLY_LIMIT as i64, org], |r| r.get::<_, String>(0))?
         .filter_map(Result::ok)
         .filter_map(|s| ua_core::time::parse_ts(&s))
         .collect();
@@ -234,13 +255,13 @@ fn check_limits(conn: &Connection, session_id: &str, now: jiff::Timestamp) -> Ua
 }
 
 /// The session's latest committed note (sealed, assigned or delivered), never
-/// a draft, marked untrusted. For `session_handoff_recover` and the packet.
-pub(crate) fn latest_committed_note(conn: &Connection, session_id: &str) -> UaResult<Option<Value>> {
+/// a draft, marked untrusted.
+fn latest_committed_note(conn: &Connection, org: &str, session_id: &str) -> UaResult<Option<Value>> {
     let note = conn
         .query_row(
-            "SELECT * FROM session_handoff_notes WHERE session_id = ?1 \
+            "SELECT * FROM session_handoff_notes WHERE org_id = ?2 AND session_id = ?1 \
              AND state IN ('sealed','assigned','delivered') ORDER BY sealed_at DESC, id DESC LIMIT 1",
-            [session_id],
+            [session_id, org],
             row_object,
         )
         .optional()?
@@ -250,6 +271,37 @@ pub(crate) fn latest_committed_note(conn: &Connection, session_id: &str) -> UaRe
         mark_untrusted(&mut n, "handoff_note", author.as_deref());
         n
     }))
+}
+
+/// Apply the same note visibility to the recovery tool and the resume packet.
+/// Only the caller's organization's session and notes are read, so another
+/// organization's answer is exactly a missing session's.
+pub(crate) fn recover_note(conn: &Connection, session_id: &str, ctx: &ToolCtx) -> UaResult<Option<Value>> {
+    let org = ctx.caller.org_id.as_str();
+    let who = verified(&ctx.caller);
+    let maintainer = who.is_some()
+        && Authz::new(ctx.hub.cfg()).holds(
+            &ctx.caller,
+            &[Authority::Operator, Authority::LifecycleOperator],
+            org,
+        );
+    let owner: Option<String> = conn
+        .query_row("SELECT agent FROM agent_sessions WHERE id = ?1 AND org_id = ?2", [session_id, org], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let note = latest_committed_note(conn, org, session_id)?;
+    let allowed = maintainer
+        || who.is_some_and(|who| {
+            owner.as_deref() == Some(who)
+                || note.as_ref().is_some_and(|n| {
+                    ["agent", "assigned_to", "delivered_to"].iter().any(|k| n[*k].as_str() == Some(who))
+                })
+        });
+    if !allowed {
+        return Err(UaError::not_found(format!("session {session_id} not found")));
+    }
+    Ok(note)
 }
 
 // --- actions ------------------------------------------------------------------------
@@ -265,13 +317,17 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
         return Err(UaError::invalid("session_id is required"));
     }
     let (task_arg, supersede) = (a.task_id, a.supersede);
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
+            crate::families::agents::require_org(tx, &org)?;
             let session: Option<(String, Option<i64>)> = tx
-                .query_row("SELECT agent, task_id FROM agent_sessions WHERE id = ?1", [&sid], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+                .query_row(
+                    "SELECT agent, task_id FROM agent_sessions WHERE id = ?1 AND org_id = ?2",
+                    [&sid, &org],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()?;
             let Some((owner, session_task)) = session else {
                 return Err(UaError::not_found(format!("session {sid} not found")));
@@ -284,9 +340,9 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
             }
             let pending: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT id, state FROM session_handoff_notes WHERE session_id = ?1 \
+                    "SELECT id, state FROM session_handoff_notes WHERE org_id = ?2 AND session_id = ?1 \
                      AND state IN ('draft','sealed','assigned') ORDER BY state = 'draft' DESC LIMIT 1",
-                    [&sid],
+                    [&sid, &org],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -307,10 +363,14 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
                 None => None,
             };
             let now = jiff::Timestamp::now();
-            check_limits(tx, &sid, now)?;
+            check_limits(tx, &org, &sid, now)?;
             let task_id = task_arg.or(session_task);
             if let Some(t) = task_id {
-                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", [t], |r| r.get(0))?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE org_id = ?1 AND id = ?2)",
+                    params![org, t],
+                    |r| r.get(0),
+                )?;
                 if !exists {
                     return Err(UaError::not_found(format!(
                         "task {t} not found: a handoff note can only reference a task here"
@@ -319,9 +379,9 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
             }
             let stamp = ua_core::time::format_ts(now);
             tx.execute(
-                "INSERT INTO session_handoff_notes (session_id, agent, task_id, done, next_steps, open_questions, \
-                 state, epoch, supersedes, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', 0, ?7, ?8, ?8)",
+                "INSERT INTO session_handoff_notes (org_id, session_id, agent, task_id, done, next_steps, \
+                 open_questions, state, epoch, supersedes, created_at, updated_at) \
+                 VALUES (?9, ?1, ?2, ?3, ?4, ?5, ?6, 'draft', 0, ?7, ?8, ?8)",
                 params![
                     sid,
                     agent,
@@ -330,11 +390,12 @@ pub(crate) async fn session_handoff_propose(ctx: ToolCtx, a: ProposeArgs) -> UaR
                     json!(next).to_string(),
                     json!(questions).to_string(),
                     supersedes,
-                    stamp
+                    stamp,
+                    org
                 ],
             )?;
-            let note = load_note(tx, tx.last_insert_rowid())?;
-            emit(tx, &note, "drafted", &agent, json!({ "supersedes": supersedes }))?;
+            let note = load_note(tx, &org, tx.last_insert_rowid())?;
+            emit(tx, &org, &note, "drafted", &agent, json!({ "supersedes": supersedes }))?;
             Ok(note)
         })
         .await
@@ -357,24 +418,26 @@ pub(crate) async fn session_handoff_update(ctx: ToolCtx, a: UpdateArgs) -> UaRes
         return Err(UaError::invalid("nothing to update: pass done, next_steps or open_questions"));
     }
     let id = a.note_id;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let note = owned_note(tx, id, &agent)?;
+            crate::families::agents::require_org(tx, &org)?;
+            let note = owned_note(tx, &org, id, &agent)?;
             require_draft(&note, "edited")?;
             let changed: Vec<&str> = fields.iter().map(|(c, _)| *c).collect();
             for (column, value) in &fields {
                 tx.execute(
-                    &format!("UPDATE session_handoff_notes SET {column} = ?1 WHERE id = ?2"),
-                    params![value, id],
+                    &format!("UPDATE session_handoff_notes SET {column} = ?1 WHERE id = ?2 AND org_id = ?3"),
+                    params![value, id, org],
                 )?;
             }
             tx.execute(
-                "UPDATE session_handoff_notes SET updated_at = ?1 WHERE id = ?2",
-                params![ua_core::time::now(), id],
+                "UPDATE session_handoff_notes SET updated_at = ?1 WHERE id = ?2 AND org_id = ?3",
+                params![ua_core::time::now(), id, org],
             )?;
-            let note = load_note(tx, id)?;
-            emit(tx, &note, "draft_updated", &agent, json!({ "fields": changed }))?;
+            let note = load_note(tx, &org, id)?;
+            emit(tx, &org, &note, "draft_updated", &agent, json!({ "fields": changed }))?;
             Ok(note)
         })
         .await
@@ -384,17 +447,19 @@ pub(crate) async fn session_handoff_update(ctx: ToolCtx, a: UpdateArgs) -> UaRes
 pub(crate) async fn session_handoff_discard(ctx: ToolCtx, a: NoteArgs) -> UaResult<Value> {
     let agent = acting_identity(&ctx.caller, a.agent.as_deref())?;
     let id = a.note_id;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let note = owned_note(tx, id, &agent)?;
+            crate::families::agents::require_org(tx, &org)?;
+            let note = owned_note(tx, &org, id, &agent)?;
             require_draft(&note, "discarded")?;
             tx.execute(
-                "UPDATE session_handoff_notes SET state = 'discarded', updated_at = ?1 WHERE id = ?2",
-                params![ua_core::time::now(), id],
+                "UPDATE session_handoff_notes SET state = 'discarded', updated_at = ?1 WHERE id = ?2 AND org_id = ?3",
+                params![ua_core::time::now(), id, org],
             )?;
-            let note = load_note(tx, id)?;
-            emit(tx, &note, "discarded", &agent, json!({}))?;
+            let note = load_note(tx, &org, id)?;
+            emit(tx, &org, &note, "discarded", &agent, json!({}))?;
             Ok(note)
         })
         .await
@@ -406,34 +471,37 @@ pub(crate) async fn session_handoff_discard(ctx: ToolCtx, a: NoteArgs) -> UaResu
 pub(crate) async fn session_handoff_seal(ctx: ToolCtx, a: NoteArgs) -> UaResult<Value> {
     let agent = acting_identity(&ctx.caller, a.agent.as_deref())?;
     let id = a.note_id;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let note = owned_note(tx, id, &agent)?;
+            crate::families::agents::require_org(tx, &org)?;
+            let note = owned_note(tx, &org, id, &agent)?;
             require_draft(&note, "sealed")?;
             let stamp = ua_core::time::now();
             let sid = note["session_id"].as_str().unwrap_or_default().to_string();
             let superseded: Vec<i64> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id FROM session_handoff_notes WHERE session_id = ?1 AND state IN ('sealed','assigned') \
-                     ORDER BY id",
+                    "SELECT id FROM session_handoff_notes WHERE org_id = ?2 AND session_id = ?1 \
+                     AND state IN ('sealed','assigned') ORDER BY id",
                 )?;
-                stmt.query_map([&sid], |r| r.get(0))?.collect::<Result<_, _>>()?
+                stmt.query_map([&sid, &org], |r| r.get(0))?.collect::<Result<_, _>>()?
             };
             for old in &superseded {
                 tx.execute(
-                    "UPDATE session_handoff_notes SET state = 'superseded', updated_at = ?1 WHERE id = ?2",
-                    params![stamp, old],
+                    "UPDATE session_handoff_notes SET state = 'superseded', updated_at = ?1 WHERE id = ?2 AND org_id = ?3",
+                    params![stamp, old, org],
                 )?;
-                let old_note = load_note(tx, *old)?;
-                emit(tx, &old_note, "superseded", &agent, json!({ "superseded_by": id }))?;
+                let old_note = load_note(tx, &org, *old)?;
+                emit(tx, &org, &old_note, "superseded", &agent, json!({ "superseded_by": id }))?;
             }
             tx.execute(
-                "UPDATE session_handoff_notes SET state = 'sealed', sealed_at = ?1, updated_at = ?1 WHERE id = ?2",
-                params![stamp, id],
+                "UPDATE session_handoff_notes SET state = 'sealed', sealed_at = ?1, updated_at = ?1 \
+                 WHERE id = ?2 AND org_id = ?3",
+                params![stamp, id, org],
             )?;
-            let note = load_note(tx, id)?;
-            emit(tx, &note, "sealed", &agent, json!({ "superseded": superseded }))?;
+            let note = load_note(tx, &org, id)?;
+            emit(tx, &org, &note, "sealed", &agent, json!({ "superseded": superseded }))?;
             Ok(note)
         })
         .await
@@ -448,25 +516,10 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
     if sid.is_empty() {
         return Err(UaError::invalid("session_id is required"));
     }
-    let who = verified(&ctx.caller).map(str::to_string);
-    let operator = who.as_deref().is_some_and(|w| governance::is_operator(ctx.hub.cfg(), &ctx.caller, w));
-    ctx.hub
-        .db()
+    let hub = ctx.hub.clone();
+    hub.db()
         .read_async(move |c| {
-            let owner: Option<String> = c
-                .query_row("SELECT agent FROM agent_sessions WHERE id = ?1", [&sid], |r| r.get(0))
-                .optional()?;
-            let note = latest_committed_note(c, &sid)?;
-            let allowed = operator
-                || who.as_deref().is_some_and(|w| {
-                    owner.as_deref() == Some(w)
-                        || note.as_ref().is_some_and(|n| {
-                            ["agent", "assigned_to", "delivered_to"].iter().any(|k| n[*k].as_str() == Some(w))
-                        })
-                });
-            if !allowed {
-                return Err(UaError::not_found(format!("session {sid} not found")));
-            }
+            let note = recover_note(c, &sid, &ctx)?;
             Ok(json!({ "session_id": sid, "note": note }))
         })
         .await
@@ -478,10 +531,12 @@ pub(crate) async fn session_handoff_recover(ctx: ToolCtx, a: RecoverArgs) -> UaR
 pub(crate) async fn session_handoff_ack(ctx: ToolCtx, a: NoteArgs) -> UaResult<Value> {
     let agent = acting_identity(&ctx.caller, a.agent.as_deref())?;
     let id = a.note_id;
+    let org = ctx.caller.org_id.clone();
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let note = load_note(tx, id)?;
+            crate::families::agents::require_org(tx, &org)?;
+            let note = load_note(tx, &org, id)?;
             let receiver = note["delivered_to"].as_str().or(note["assigned_to"].as_str()).unwrap_or("");
             let state = note["state"].as_str().unwrap_or("");
             if !matches!(state, "assigned" | "delivered") || receiver != agent {
@@ -499,11 +554,12 @@ pub(crate) async fn session_handoff_ack(ctx: ToolCtx, a: NoteArgs) -> UaResult<V
             let stamp = ua_core::time::now();
             tx.execute(
                 "UPDATE session_handoff_notes SET state = 'delivered', delivered_to = ?1, \
-                 delivered_at = COALESCE(delivered_at, ?2), acknowledged_at = ?2, updated_at = ?2 WHERE id = ?3",
-                params![agent, stamp, id],
+                 delivered_at = COALESCE(delivered_at, ?2), acknowledged_at = ?2, updated_at = ?2 \
+                 WHERE id = ?3 AND org_id = ?4",
+                params![agent, stamp, id, org],
             )?;
-            let note = load_note(tx, id)?;
-            emit(tx, &note, "acknowledged", &agent, json!({ "to_agent": agent }))?;
+            let note = load_note(tx, &org, id)?;
+            emit(tx, &org, &note, "acknowledged", &agent, json!({ "to_agent": agent }))?;
             Ok(note)
         })
         .await

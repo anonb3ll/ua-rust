@@ -6,21 +6,29 @@
 //! and `obsidian_api_key` (`UA_OBSIDIAN_API_KEY`). Without both, every tool
 //! returns `{configured: false, reason: "not-configured", missing}`. The key
 //! is held as a secret, sent only as a bearer header and redacted from errors.
+//! The plugin serves the hub's vault, the default organization's: every tool
+//! refuses another organization's caller (`org_unsupported`) before any
+//! request is sent, configured or not.
+//!
+//! Requests go through `ua_ingress::Outbound` under `obsidian.local_rest`:
+//! loopback addresses only (checked at connect time and on the connection's
+//! peer), no redirects, no proxy, a 16 MiB body, 20 seconds. Because the
+//! plugin's certificate is self-signed, that policy does not verify TLS
+//! certificates; it is the only policy that may skip verification, and only
+//! because it reaches nothing but loopback.
 
 use std::net::IpAddr;
-use std::time::Duration;
 
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, StatusCode, Url};
 use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
+use ua_ingress::{Outbound, OutboundError, Request, Response, policy};
 
-use super::{LOCK_HEAD_BYTES, frontmatter, locked_error, record, vault, with_note_locks};
+use super::{LOCK_HEAD_BYTES, frontmatter, locked_error, record, require_hub_org, vault, with_note_locks};
 use crate::registry::{Registry, ToolCtx, blocking, tool};
-
-const TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -133,26 +141,24 @@ impl Api {
         path: &str,
         query: Option<&[(&str, &str)]>,
         body: Option<Value>,
-    ) -> UaResult<reqwest::Response> {
-        // reqwest is built without a bundled crypto provider; use ring.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            // The plugin's certificate is self-signed; the URL is loopback-only.
-            .danger_accept_invalid_certs(true)
-            .build()
+    ) -> UaResult<Response> {
+        // Pinned to the configured origin: the policy builds no other client.
+        let origin = Url::parse(&self.base).map_err(|_| self.fail("the request URL does not parse"))?;
+        let client = Outbound::pinned(policy::OBSIDIAN_LOCAL, &origin)
             .map_err(|e| UaError::internal(format!("cannot build the HTTP client: {e}")))?;
-        let mut req = client
-            .request(method, format!("{}/{}", self.base, path.trim_start_matches('/')))
-            .header("Accept", "application/json")
-            .bearer_auth(self.key.expose_secret());
+        let mut url = Url::parse(&format!("{}/{}", self.base, path.trim_start_matches('/')))
+            .map_err(|_| self.fail("the request URL does not parse"))?;
         if let Some(q) = query {
-            req = req.query(q);
+            url.query_pairs_mut().extend_pairs(q);
         }
+        let mut req = Request::new(method, url)
+            .header("Accept", "application/json")
+            .and_then(|r| r.secret_header("Authorization", &format!("Bearer {}", self.key.expose_secret())))
+            .map_err(|e| self.fail(&e.to_string()))?;
         if let Some(b) = body {
-            req = req.json(&b);
+            req = req.json(&b).map_err(|e| self.fail(&e.to_string()))?;
         }
-        let resp = req.send().await.map_err(|e| self.fail(&e.without_url().to_string()))?;
+        let resp = client.send(req).await.map_err(|e| self.fail(&e.to_string()))?;
         if resp.status() == StatusCode::PRECONDITION_FAILED {
             return Err(UaError::conflict(
                 "note changed or locked since check: the plugin refused the write (412) and nothing was written; re-read the note and retry",
@@ -171,17 +177,30 @@ impl Api {
     }
 }
 
-async fn payload(resp: reqwest::Response) -> Value {
-    if resp.status() == StatusCode::NO_CONTENT {
-        return json!({});
+/// The body as text, or an error past the policy's cap. Any other read
+/// failure reads as an empty body, as before.
+async fn text(resp: Response) -> UaResult<String> {
+    match resp.bytes().await {
+        Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+        Err(e @ OutboundError::TooLarge { .. }) => {
+            Err(UaError::invalid(format!("Obsidian request failed: {e}")))
+        }
+        Err(_) => Ok(String::new()),
     }
-    let text = resp.text().await.unwrap_or_default();
-    serde_json::from_str(&text).unwrap_or(Value::String(text))
+}
+
+async fn payload(resp: Response) -> UaResult<Value> {
+    if resp.status() == StatusCode::NO_CONTENT {
+        return Ok(json!({}));
+    }
+    let text = text(resp).await?;
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
 async fn status(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
-    let body = payload(api.send(Method::GET, "/", None, None).await?).await;
+    let body = payload(api.send(Method::GET, "/", None, None).await?).await?;
     Ok(match body {
         Value::Object(mut m) => {
             m.insert("configured".into(), json!(true));
@@ -192,6 +211,7 @@ async fn status(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
 }
 
 async fn open(ctx: ToolCtx, a: OpenArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     if a.path.trim().is_empty() {
         return Err(UaError::invalid("path must not be empty"));
@@ -200,24 +220,26 @@ async fn open(ctx: ToolCtx, a: OpenArgs) -> UaResult<Value> {
     let p = v.resolve_write(&a.path)?;
     let rel = v.rel(&p);
     let resp = api.send(Method::POST, &format!("/open/{}", encode_path(&rel)), None, None).await?;
-    Ok(json!({"path": rel, "opened": true, "response": payload(resp).await}))
+    Ok(json!({"path": rel, "opened": true, "response": payload(resp).await?}))
 }
 
 async fn active_note(ctx: ToolCtx, _: NoArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     let resp = api.send(Method::GET, "/active/", None, None).await?;
     let path = resp.headers().get("Content-Location").and_then(|h| h.to_str().ok()).map(str::to_string);
-    let content = resp.text().await.unwrap_or_default();
+    let content = text(resp).await?;
     Ok(json!({"path": path, "content": content}))
 }
 
 async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     if a.query.trim().is_empty() {
         return Err(UaError::invalid("query must not be empty"));
     }
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     let resp = api.send(Method::POST, "/search/simple/", Some(&[("query", a.query.as_str())]), None).await?;
-    Ok(json!({"query": a.query, "results": payload(resp).await}))
+    Ok(json!({"query": a.query, "results": payload(resp).await?}))
 }
 
 /// Lock verdict and the plugin's `ifMatch` version (first 6 hex chars of the
@@ -238,6 +260,7 @@ fn lock_and_version(p: &std::path::Path, shown: &str) -> UaResult<Option<(bool, 
 }
 
 async fn append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
+    require_hub_org(&ctx)?;
     let Some(api) = api(&ctx)? else { return Ok(not_configured(&ctx)) };
     if a.path.trim().is_empty() {
         return Err(UaError::invalid("path must not be empty"));
@@ -290,7 +313,9 @@ async fn append(ctx: ToolCtx, a: AppendArgs) -> UaResult<Value> {
     // changed after the check; the in-process lock is not held across the
     // network call.
     let resp = api.send(Method::PATCH, &format!("/vault/{}", encode_path(&rel)), None, Some(body)).await?;
-    let mut out = json!({"path": rel, "response": payload(resp).await});
+    // The patch was applied; an unreadable reply must not hide that.
+    let reply = payload(resp).await.unwrap_or(Value::Null);
+    let mut out = json!({"path": rel, "response": reply});
     let (p3, shown) = (p.clone(), a.path.clone());
     let locked_after = blocking(move || super::note_is_locked(&p3, &shown)).await.unwrap_or(false);
     if locked_after {

@@ -165,6 +165,7 @@ fn agent() -> Caller {
         enforce_profile: true,
         session_key: Some("s1".into()),
         transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
     }
 }
 
@@ -264,10 +265,15 @@ async fn extracts_readable_markdown() {
     );
     assert_eq!(page["untrusted"], true);
     assert_eq!(page["truncated"], false);
+    // The article is found with the readability feature; without it the
+    // whole page is converted, and the result says so.
+    let expected = if cfg!(feature = "readability") { "readability" } else { "full-page" };
+    assert_eq!(page["extraction"], expected, "{page}");
 
     let raw = env.call("web_fetch", json!({ "url": format!("{base}/article"), "raw": true })).await.unwrap();
     assert!(raw["content"].as_str().unwrap().starts_with("<!doctype html>"));
     assert_eq!(raw["title"], Value::Null);
+    assert_eq!(raw.get("extraction"), None, "raw bodies are not converted");
 
     let capped =
         env.call("web_fetch", json!({ "url": format!("{base}/article"), "max_chars": 10 })).await.unwrap();
@@ -376,4 +382,13 @@ async fn search_reports_bot_challenges_and_bad_providers() {
     let env = env_with(|c| c.search_endpoint = Some("http://10.0.0.1/html/".into()));
     let err = env.call("web_search", json!({ "query": "x" })).await.unwrap_err();
     assert_eq!(reason(&err), "ssrf_blocked");
+}
+
+#[tokio::test]
+async fn credentials_in_the_url_are_refused_before_any_request() {
+    let srv = spawn_server().await;
+    let env = env_with(|c| c.fetch_allow_loopback = true);
+    let err = env.fetch(&format!("http://user:pw@{}/article", srv.addr)).await.unwrap_err();
+    assert_eq!(err.code(), "invalid_argument", "{err}");
+    assert!(err.to_string().contains("credentials in the URL"), "{err}");
 }
