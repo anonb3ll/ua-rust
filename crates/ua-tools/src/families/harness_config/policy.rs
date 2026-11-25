@@ -335,6 +335,17 @@ fn check_text(b: &Bundle) -> UaResult<()> {
         if !findings.is_empty() {
             return refuse(format!("skill {:?} refused: {}", s.name, findings.join("; ")));
         }
+        for f in &s.files {
+            crate::families::skill_registry::validate_package_path(&f.path)?;
+            if f.encoding == "utf-8"
+                && let Some((line, c)) = hidden_chars(&f.content).first()
+            {
+                return refuse(format!(
+                    "skill {:?} file {:?} line {line} has a hidden code point U+{:04X}",
+                    s.name, f.path, *c as u32
+                ));
+            }
+        }
     }
     Ok(())
 }
