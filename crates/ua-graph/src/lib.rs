@@ -23,13 +23,15 @@ pub use query::{
     SeedExpandGraphStats, SeedExpandItem, SeedExpandRequest, SeedExpandResult, SeedInput,
     ShortestPathRequest, ShortestPathResult, k_hop, neighbors, node_get, seed_expand, shortest_path,
 };
-pub use schema::{COUNTERS_SCHEMA, COUNTERS_TENANT_PART, SCHEMA, TENANT_PART, schema_parts};
+pub use schema::{
+    COUNTERS_NO_DELETE_SCHEMA, COUNTERS_SCHEMA, COUNTERS_TENANT_PART, SCHEMA, TENANT_PART, schema_parts,
+};
 pub use types::{
     AssertedByKind, EdgeKind, EdgeState, NodeKind, OwnerType, PrincipalId, Provenance, SourceKind,
     Visibility, WalkDirection, normalize_timestamp,
 };
 pub use write::{
     AssertEdgeRequest, CYCLE_CHECK_DEADLINE_MS, CYCLE_CHECK_MAX_EDGES, CYCLE_CHECK_MAX_NODES,
-    CycleCheckBounds, EVENT_EDGE_ASSERTED, EVENT_EDGE_RETRACTED, EVENT_NODE_CREATED, EnsureNodeRequest,
-    RetractEdgeRequest, assert_edge, check_acyclic, graph_node_ensure, retract_edge,
+    CycleCheckBounds, CycleCheckPolicy, EVENT_EDGE_ASSERTED, EVENT_EDGE_RETRACTED, EVENT_NODE_CREATED,
+    EnsureNodeRequest, RetractEdgeRequest, assert_edge, check_acyclic, graph_node_ensure, retract_edge,
 };

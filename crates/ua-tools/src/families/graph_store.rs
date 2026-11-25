@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{DEFAULT_ORG, UaError, UaResult};
 use ua_graph::{
-    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, EdgeKind, EdgeState, KHopRequest, NeighborsRequest,
+    AssertEdgeRequest, AssertedByKind, CycleCheckPolicy, EdgeKind, EdgeState, KHopRequest, NeighborsRequest,
     NodeKind, PrincipalId, Provenance, RetractEdgeRequest, SeedExpandRequest, SeedInput, ShortestPathRequest,
     SourceKind, WalkDirection,
 };
@@ -488,7 +488,7 @@ async fn handle_edge_assert(ctx: ToolCtx, a: EdgeAssertArgs) -> UaResult<Value> 
         generic: true,
         max_edges_per_org,
         max_live_edges_per_node,
-        cycle_bounds: CycleCheckBounds::default(),
+        cycle_bounds: CycleCheckPolicy::default(),
     };
     ctx.hub
         .db()

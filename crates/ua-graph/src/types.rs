@@ -322,13 +322,31 @@ impl fmt::Display for EdgeKind {
 
 /// Validated opaque principal identifier (`asserted_by`).
 ///
+/// The literal `'system'` (case-insensitive) is reserved and cannot be built
+/// through [`PrincipalId::new`] or deserialized; internal hub writes must call
+/// [`PrincipalId::system`] explicitly.
+///
 /// Pre-#2790: in `'default'`, carries the verified caller label (to be
 /// backfilled by #2790); in non-default organizations, only `'system'` is
 /// permitted until #2790 provides immutable principal IDs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct PrincipalId(String);
 
+impl<'de> Deserialize<'de> for PrincipalId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 impl PrincipalId {
+    /// Construct a non-system principal identifier.
+    ///
+    /// Refuses empty strings, values over [`PRINCIPAL_ID_MAX_BYTES`], control
+    /// characters, and the reserved `'system'` identifier (case-insensitive).
     pub fn new(raw: impl Into<String>) -> UaResult<Self> {
         let s = raw.into();
         let trimmed = s.trim();
@@ -338,11 +356,21 @@ impl PrincipalId {
         if trimmed.chars().any(char::is_control) {
             return Err(UaError::invalid("principal id must not contain control characters"));
         }
+        if trimmed.eq_ignore_ascii_case("system") {
+            return Err(UaError::invalid_code(
+                "reserved_principal_id",
+                "principal id \"system\" is reserved for internal hub writes; use PrincipalId::system()",
+            ));
+        }
         Ok(Self(trimmed.to_string()))
     }
 
     pub fn system() -> Self {
         Self("system".to_string())
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.0 == "system"
     }
 
     pub fn as_str(&self) -> &str {
@@ -472,7 +500,7 @@ pub struct Provenance {
 
 impl Provenance {
     pub fn validate(&self) -> UaResult<()> {
-        let is_sys_id = self.asserted_by.as_str() == "system";
+        let is_sys_id = self.asserted_by.is_system();
         let is_sys_kind = self.asserted_by_kind == AssertedByKind::System;
         if is_sys_id != is_sys_kind {
             return Err(UaError::invalid(

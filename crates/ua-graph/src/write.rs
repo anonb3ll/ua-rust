@@ -32,12 +32,34 @@ pub const CYCLE_CHECK_MAX_EDGES: usize = 5_000;
 /// Wall-clock deadline (ms) for one write-time acyclicity check.
 pub const CYCLE_CHECK_DEADLINE_MS: u64 = 50;
 
-/// Bounds governing the write-time acyclicity check.
+/// Bounds governing one write-time acyclicity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleCheckBounds {
     pub max_nodes: usize,
     pub max_edges: usize,
     pub deadline_ms: u64,
+}
+
+impl CycleCheckBounds {
+    /// Default write-time acyclicity bounds for a specific edge kind.
+    pub const fn for_kind(kind: EdgeKind) -> Self {
+        match kind {
+            EdgeKind::DependsOn
+            | EdgeKind::SubtaskOf
+            | EdgeKind::GoalParent
+            | EdgeKind::DelegatesTo
+            | EdgeKind::EscalatesTo => Self {
+                max_nodes: CYCLE_CHECK_MAX_NODES,
+                max_edges: CYCLE_CHECK_MAX_EDGES,
+                deadline_ms: CYCLE_CHECK_DEADLINE_MS,
+            },
+            _ => Self {
+                max_nodes: CYCLE_CHECK_MAX_NODES,
+                max_edges: CYCLE_CHECK_MAX_EDGES,
+                deadline_ms: CYCLE_CHECK_DEADLINE_MS,
+            },
+        }
+    }
 }
 
 impl Default for CycleCheckBounds {
@@ -47,6 +69,73 @@ impl Default for CycleCheckBounds {
             max_edges: CYCLE_CHECK_MAX_EDGES,
             deadline_ms: CYCLE_CHECK_DEADLINE_MS,
         }
+    }
+}
+
+/// Per-edge-kind write-time acyclicity bounds (`docs/graph.md`).
+///
+/// Parameterizes node, edge, and deadline caps independently for each acyclic
+/// edge kind (`depends_on`, `subtask_of`, `goal_parent`, `delegates_to`,
+/// `escalates_to`) so individual domains (for example `depends_on` in C2+) can
+/// tune their own caps without widening other kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleCheckPolicy {
+    pub depends_on: CycleCheckBounds,
+    pub subtask_of: CycleCheckBounds,
+    pub goal_parent: CycleCheckBounds,
+    pub delegates_to: CycleCheckBounds,
+    pub escalates_to: CycleCheckBounds,
+}
+
+impl Default for CycleCheckPolicy {
+    fn default() -> Self {
+        Self {
+            depends_on: CycleCheckBounds::for_kind(EdgeKind::DependsOn),
+            subtask_of: CycleCheckBounds::for_kind(EdgeKind::SubtaskOf),
+            goal_parent: CycleCheckBounds::for_kind(EdgeKind::GoalParent),
+            delegates_to: CycleCheckBounds::for_kind(EdgeKind::DelegatesTo),
+            escalates_to: CycleCheckBounds::for_kind(EdgeKind::EscalatesTo),
+        }
+    }
+}
+
+impl CycleCheckPolicy {
+    /// Apply uniform `bounds` to every acyclic edge kind.
+    pub const fn all(bounds: CycleCheckBounds) -> Self {
+        Self {
+            depends_on: bounds,
+            subtask_of: bounds,
+            goal_parent: bounds,
+            delegates_to: bounds,
+            escalates_to: bounds,
+        }
+    }
+
+    /// Return the configured bounds for `kind`, or `None` when `kind` is not
+    /// enforced acyclic.
+    pub const fn bounds_for(&self, kind: EdgeKind) -> Option<CycleCheckBounds> {
+        match kind {
+            EdgeKind::DependsOn => Some(self.depends_on),
+            EdgeKind::SubtaskOf => Some(self.subtask_of),
+            EdgeKind::GoalParent => Some(self.goal_parent),
+            EdgeKind::DelegatesTo => Some(self.delegates_to),
+            EdgeKind::EscalatesTo => Some(self.escalates_to),
+            _ => None,
+        }
+    }
+
+    /// Return a copy of this policy with `bounds` set for `kind` (no-op for
+    /// non-acyclic kinds).
+    pub const fn with_kind(mut self, kind: EdgeKind, bounds: CycleCheckBounds) -> Self {
+        match kind {
+            EdgeKind::DependsOn => self.depends_on = bounds,
+            EdgeKind::SubtaskOf => self.subtask_of = bounds,
+            EdgeKind::GoalParent => self.goal_parent = bounds,
+            EdgeKind::DelegatesTo => self.delegates_to = bounds,
+            EdgeKind::EscalatesTo => self.escalates_to = bounds,
+            _ => {}
+        }
+        self
     }
 }
 
@@ -92,8 +181,9 @@ pub struct AssertEdgeRequest {
     pub max_edges_per_org: u64,
     /// Per-node live (`valid_to IS NULL`) incident edge cap (`0` disables the check).
     pub max_live_edges_per_node: u64,
-    /// Write-time acyclicity bounds (defaults to `1,000` nodes / `5,000` edges / `50 ms`).
-    pub cycle_bounds: CycleCheckBounds,
+    /// Per-edge-kind write-time acyclicity bounds (each acyclic kind defaults to
+    /// `1,000` nodes / `5,000` edges / `50 ms`).
+    pub cycle_bounds: CycleCheckPolicy,
 }
 
 /// Request to retract (close with `valid_to = now`) an existing live edge.
@@ -112,7 +202,7 @@ pub struct RetractEdgeRequest {
 
 fn check_non_default_org_principal(org_id: &str, prov: &Provenance) -> UaResult<()> {
     if org_id != DEFAULT_ORG {
-        let is_system_mirror_or_import = prov.asserted_by.as_str() == "system"
+        let is_system_mirror_or_import = prov.asserted_by.is_system()
             && prov.asserted_by_kind == AssertedByKind::System
             && matches!(prov.source_kind, SourceKind::Mirror | SourceKind::Import);
         if !is_system_mirror_or_import {
@@ -424,9 +514,11 @@ pub fn assert_edge<R: GraphRepo>(repo: &mut R, req: AssertEdgeRequest) -> UaResu
         }
     }
 
-    // Write-time bounded acyclicity check (fail-closed).
-    if req.kind.is_acyclic() && req.valid_to.is_none() {
-        check_acyclic(repo, &req.org_id, &src.id, &dst.id, req.kind, req.cycle_bounds)?;
+    // Write-time bounded acyclicity check (fail-closed), parameterized per edge kind.
+    if req.valid_to.is_none()
+        && let Some(bounds) = req.cycle_bounds.bounds_for(req.kind)
+    {
+        check_acyclic(repo, &req.org_id, &src.id, &dst.id, req.kind, bounds)?;
     }
 
     let edge_id = Ulid::generate().to_string();
